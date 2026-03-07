@@ -3,11 +3,11 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "claude-gateway"
+name = "ai-agent-gateway"
 version = "0.1.0"
 description = "Generic Claude agent gateway with MCP tool support and streaming"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
   "anthropic>=0.40.0",
