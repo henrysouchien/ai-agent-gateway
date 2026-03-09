@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from .event_log import EventLog
 from .mcp_client import McpClientManager
@@ -524,7 +524,7 @@ class AgentRunner:
   async def run(
     self,
     messages: List[Dict[str, Any]],
-    system_prompt: Optional[str] = None,
+    system_prompt: Optional[Union[str, List[Tuple[str, bool]]]] = None,
     model_override: Optional[str] = None,
     max_turns: Optional[int] = None,
   ) -> None:
@@ -559,7 +559,19 @@ class AgentRunner:
 
     system_blocks = None
     if system_prompt:
-      system_blocks = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+      if isinstance(system_prompt, list):
+        system_blocks = []
+        for block_text, should_cache in system_prompt:
+          if not block_text:
+            continue
+          block: Dict[str, Any] = {"type": "text", "text": block_text}
+          if should_cache:
+            block["cache_control"] = {"type": "ephemeral"}
+          system_blocks.append(block)
+        if not system_blocks:
+          system_blocks = None
+      else:
+        system_blocks = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
 
     max_tokens = self._max_tokens_override if self._max_tokens_override is not None else config["max_tokens"]
     if config["thinking"] and max_tokens >= 2048:
@@ -589,9 +601,13 @@ class AgentRunner:
     log.info("[%s] Chat start | model=%s max_tokens=%d messages=%d", self._sid, config["model"], max_tokens, len(messages))
 
     chat_t0 = time.time()
-    system_text = system_prompt or ""
+    if isinstance(system_prompt, list):
+      system_text = "\n\n".join(text for text, _should_cache in system_prompt if text)
+    else:
+      system_text = system_prompt or ""
     messages_text = json.dumps(messages, default=str)
     tools_text = json.dumps(cached_tools, default=str) if cached_tools else ""
+    system_chars = len(system_text)
     est_system = _estimate_tokens(system_text)
     est_messages = _estimate_tokens(messages_text)
     est_tools = _estimate_tokens(tools_text) if tools_text else 0
@@ -633,7 +649,6 @@ class AgentRunner:
         }
       },
     )
-    system_chars = len(system_text)
     tools_chars = len(tools_text)
     total_input_tokens = 0
     total_output_tokens = 0
@@ -728,6 +743,19 @@ class AgentRunner:
                   total_input_tokens += input_tokens
                   total_cache_creation_tokens += getattr(usage, "cache_creation_input_tokens", 0)
                   total_cache_read_tokens += getattr(usage, "cache_read_input_tokens", 0)
+                  if turn_count == 1:
+                    uncached = (
+                      input_tokens
+                      - getattr(usage, "cache_creation_input_tokens", 0)
+                      - getattr(usage, "cache_read_input_tokens", 0)
+                    )
+                    log.info(
+                      "[%s] Cache | read=%d create=%d uncached=%d",
+                      self._sid,
+                      getattr(usage, "cache_read_input_tokens", 0),
+                      getattr(usage, "cache_creation_input_tokens", 0),
+                      uncached,
+                    )
                   if turn_count == 1 and input_tokens > 0:
                     msgs_chars = len(json.dumps(current_messages, default=str))
                     total_chars = system_chars + tools_chars + msgs_chars
