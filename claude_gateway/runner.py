@@ -744,17 +744,12 @@ class AgentRunner:
                   total_cache_creation_tokens += getattr(usage, "cache_creation_input_tokens", 0)
                   total_cache_read_tokens += getattr(usage, "cache_read_input_tokens", 0)
                   if turn_count == 1:
-                    uncached = (
-                      input_tokens
-                      - getattr(usage, "cache_creation_input_tokens", 0)
-                      - getattr(usage, "cache_read_input_tokens", 0)
-                    )
                     log.info(
                       "[%s] Cache | read=%d create=%d uncached=%d",
                       self._sid,
                       getattr(usage, "cache_read_input_tokens", 0),
                       getattr(usage, "cache_creation_input_tokens", 0),
-                      uncached,
+                      input_tokens,
                     )
                   if turn_count == 1 and input_tokens > 0:
                     msgs_chars = len(json.dumps(current_messages, default=str))
