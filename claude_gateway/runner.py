@@ -29,7 +29,7 @@ def _thinking_param(model: str, max_tokens: int) -> dict | None:
     return {"type": "adaptive"}
 
   # Models that support enabled thinking (require budget_tokens)
-  if any(tag in model for tag in ("sonnet-4-5", "opus-4-5", "sonnet-4", "sonnet-3.7")):
+  if any(tag in model for tag in ("sonnet-4-5", "opus-4-5", "sonnet-4")):
     budget_tokens = min(10000, max_tokens - 1024)
     if budget_tokens >= 1024:
       return {"type": "enabled", "budget_tokens": budget_tokens}
