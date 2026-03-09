@@ -22,6 +22,23 @@ def _estimate_tokens(text: str) -> int:
   return max(1, len(text) // 4)
 
 
+def _thinking_param(model: str, max_tokens: int) -> dict | None:
+  """Return the correct thinking parameter for the given model, or None to omit."""
+  # Models that support adaptive thinking (no budget_tokens needed)
+  if any(tag in model for tag in ("sonnet-4-6", "opus-4-6")):
+    return {"type": "adaptive"}
+
+  # Models that support enabled thinking (require budget_tokens)
+  if any(tag in model for tag in ("sonnet-4-5", "opus-4-5", "sonnet-4", "sonnet-3.7")):
+    budget_tokens = min(10000, max_tokens - 1024)
+    if budget_tokens >= 1024:
+      return {"type": "enabled", "budget_tokens": budget_tokens}
+    return None  # max_tokens too low for thinking
+
+  # Unknown/unsupported models — omit thinking
+  return None
+
+
 @dataclass
 class ToolResultContext:
   tool_name: str
@@ -115,11 +132,19 @@ class AgentRunner:
     return enriched
 
   @staticmethod
-  def _make_error_result(tool_use_id: str, code: str, message: str) -> Dict[str, Any]:
+  def _make_error_result(
+    tool_use_id: str,
+    code: str,
+    message: str,
+    sub_code: str = "",
+  ) -> Dict[str, Any]:
+    error_dict = {"code": code, "message": message}
+    if sub_code:
+      error_dict["sub_code"] = sub_code
     return {
       "type": "tool_result",
       "tool_use_id": tool_use_id,
-      "content": json.dumps({"error": {"code": code, "message": message}}),
+      "content": json.dumps({"error": error_dict}),
       "is_error": True,
     }
 
@@ -392,6 +417,7 @@ class AgentRunner:
               "server": server,
               "error": True,
               "error_detail": str(error)[:200],
+              "error_sub_code": error.get("sub_code", "") if isinstance(error, dict) else "",
             }
           },
         )
@@ -469,6 +495,7 @@ class AgentRunner:
         tool_id,
         str(error.get("code", "tool_error")),
         str(error.get("message", "Tool failed")),
+        sub_code=str(error.get("sub_code", "")),
       )
     else:
       result_entry = {
@@ -535,7 +562,10 @@ class AgentRunner:
       system_blocks = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
 
     max_tokens = self._max_tokens_override if self._max_tokens_override is not None else config["max_tokens"]
-    use_thinking = config["thinking"] and max_tokens >= 2048
+    if config["thinking"] and max_tokens >= 2048:
+      thinking_param = _thinking_param(config["model"], max_tokens)
+    else:
+      thinking_param = None
 
     base_kwargs: Dict[str, Any] = {
       "model": config["model"],
@@ -545,15 +575,16 @@ class AgentRunner:
     }
     if system_blocks:
       base_kwargs["system"] = system_blocks
-    if use_thinking:
-      budget_tokens = min(10000, max_tokens - 1024)
-      base_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget_tokens}
-      log.info("[%s] Thinking enabled | budget_tokens=%d max_tokens=%d", self._sid, budget_tokens, max_tokens)
+    if thinking_param is not None:
+      base_kwargs["thinking"] = thinking_param
+      log.info("[%s] Thinking enabled | %s | max_tokens=%d", self._sid, thinking_param, max_tokens)
     else:
       if not config["thinking"]:
         log.info("[%s] Thinking disabled | thinking=false", self._sid)
-      else:
+      elif max_tokens < 2048:
         log.info("[%s] Thinking disabled | max_tokens=%d too low (need >=2048)", self._sid, max_tokens)
+      else:
+        log.info("[%s] Thinking disabled | model=%s not supported", self._sid, config["model"])
 
     log.info("[%s] Chat start | model=%s max_tokens=%d messages=%d", self._sid, config["model"], max_tokens, len(messages))
 

@@ -27,6 +27,26 @@ except Exception as exc:
 log = logging.getLogger("claude_gateway.mcp_client")
 
 
+def _classify_exception(exc: Exception, msg: str) -> str:
+  lower = msg.lower()
+  if isinstance(exc, asyncio.TimeoutError) or "timeout" in lower or "timed out" in lower:
+    return "timeout"
+  if "connection" in lower or "refused" in lower:
+    return "connection_error"
+  return "unknown"
+
+
+def _classify_mcp_error(message: str) -> str:
+  lower = message.lower()
+  if "not found" in lower or "no filing" in lower or "no data" in lower:
+    return "not_found"
+  if "parse" in lower or "invalid" in lower or "malformed" in lower:
+    return "parse_error"
+  if "timeout" in lower or "timed out" in lower:
+    return "timeout"
+  return "unknown"
+
+
 @dataclass
 class _ServerState:
   name: str
@@ -75,6 +95,7 @@ class McpClientManager:
         self._started = True
         return
 
+      connect_tasks = []
       for server_name, server_config in mcp_servers.items():
         if self._allowed_servers is not None and server_name not in self._allowed_servers:
           continue
@@ -87,16 +108,22 @@ class McpClientManager:
           log.info("Skipping MCP server %s: unsupported type %s", server_name, server_type)
           continue
 
-        try:
-          state = await self._connect(server_name, server_config)
-        except Exception as exc:
-          log.warning("MCP server %s failed to connect: %s", server_name, exc)
-          continue
+        connect_tasks.append(self._connect_or_warn(server_name, server_config))
 
-        self._servers[server_name] = state
+      if connect_tasks:
+        for state in await asyncio.gather(*connect_tasks):
+          if state is not None:
+            self._servers[state.name] = state
 
       self._apply_collision_filtering()
       self._started = True
+
+  async def _connect_or_warn(self, name: str, config: Dict[str, Any]) -> _ServerState | None:
+    try:
+      return await self._connect(name, config)
+    except Exception as exc:
+      log.warning("MCP server %s failed to connect: %s", name, exc)
+      return None
 
   async def _connect(self, name: str, config: Dict[str, Any]) -> _ServerState:
     exit_contexts: List[Any] = []
@@ -222,7 +249,12 @@ class McpClientManager:
         read_timeout_seconds=timedelta(seconds=timeout_seconds),
       )
     except Exception as exc:
-      return None, {"code": "tool_error", "message": str(exc)}
+      msg = str(exc)
+      return None, {
+        "code": "tool_error",
+        "sub_code": _classify_exception(exc, msg),
+        "message": msg,
+      }
 
     if result.isError:
       message = self._extract_text(result.content)
@@ -230,6 +262,7 @@ class McpClientManager:
         message = json.dumps(result.structuredContent, default=str)
       return None, {
         "code": "mcp_tool_error",
+        "sub_code": _classify_mcp_error(message or ""),
         "message": message or f"MCP tool failed: {name}",
       }
 
