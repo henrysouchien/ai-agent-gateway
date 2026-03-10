@@ -76,6 +76,7 @@ class ChatRuntime:
   on_tool_result: Optional[Callable[..., Any]] = None
   on_tool_timing: Optional[Callable[..., Any]] = None
   post_runner_init: Optional[Callable[[Any], None]] = None
+  max_turns: Optional[int] = None
 
 
 @dataclass
@@ -362,6 +363,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           messages=messages,
           system_prompt=runtime.system_prompt,
           model_override=runtime.model_override,
+          max_turns=runtime.max_turns,
         )
       except asyncio.CancelledError:
         raise
