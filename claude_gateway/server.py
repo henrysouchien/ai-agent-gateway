@@ -94,7 +94,7 @@ class GatewayServerConfig:
   jwt_secret: str = "dev-secret-change-me"
   session_ttl: int = 3600
   valid_api_keys: Set[str] = field(default_factory=set)
-  cors_origins: List[str] = field(default_factory=lambda: ["http://localhost:3000"])
+  cors_origins: List[str] = field(default_factory=lambda: ["http://localhost:3002"])
   cors_allow_headers: List[str] = field(
     default_factory=lambda: ["Authorization", "Content-Type", "X-MCP-Secret"]
   )
