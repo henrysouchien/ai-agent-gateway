@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-agent-gateway"
-version = "0.2.1"
+version = "0.2.2"
 description = "Generic Claude agent gateway with MCP tool support and streaming"
 readme = "README.md"
 license = "MIT"
