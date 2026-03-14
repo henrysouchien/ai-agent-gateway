@@ -18,6 +18,7 @@ CONTEXT_WARNING_PCT = 80
 STREAM_STALL_TIMEOUT = 30  # max seconds between stream events before watchdog cancels
 STREAM_RETRY_MAX = 2
 STREAM_RETRY_DELAY = 2.0
+_OAUTH_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
 
 def _estimate_tokens(text: str) -> int:
@@ -232,10 +233,16 @@ class AgentRunner:
     if actual_timeout is not None:
       client_kwargs["timeout"] = httpx.Timeout(timeout=actual_timeout, connect=5.0)
     if mode == "oauth":
+      from anthropic import Omit
       return AsyncAnthropic(
         api_key="",
         auth_token=str(config.get("auth_token", "")),
-        default_headers={"anthropic-beta": "oauth-2025-04-20"},
+        default_headers={
+          "X-Api-Key": Omit(),
+          "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
+          "user-agent": "claude-cli/2026.3.14",
+          "x-app": "cli",
+        },
         **client_kwargs,
       )
     return AsyncAnthropic(
@@ -644,10 +651,15 @@ class AgentRunner:
       if self._excluded_tools:
         cached_tools = [tool for tool in cached_tools if tool["name"] not in self._excluded_tools]
 
+      is_oauth = str(config.get("auth_mode", "api")).strip().lower() == "oauth"
       system_blocks = None
+      # OAuth requires Claude Code identity as the first system block
+      if is_oauth:
+        system_blocks = [{"type": "text", "text": _OAUTH_IDENTITY}]
       if system_prompt:
         if isinstance(system_prompt, list):
-          system_blocks = []
+          if system_blocks is None:
+            system_blocks = []
           for block_text, should_cache in system_prompt:
             if not block_text:
               continue
@@ -658,7 +670,10 @@ class AgentRunner:
           if not system_blocks:
             system_blocks = None
         else:
-          system_blocks = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+          if system_blocks is None:
+            system_blocks = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+          else:
+            system_blocks.append({"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}})
 
       max_tokens = self._max_tokens_override if self._max_tokens_override is not None else config["max_tokens"]
       if config["thinking"] and max_tokens >= 2048:
