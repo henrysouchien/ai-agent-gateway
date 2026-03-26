@@ -1,113 +1,76 @@
-# claude-gateway
+# ai-agent-gateway
 
-A Python package for building streaming Claude agent applications with MCP (Model Context Protocol) tool support. Handles the agent loop, tool dispatch, MCP server management, and SSE event streaming — so you can focus on your domain logic.
+Source directory in this monorepo: `packages/claude-gateway/`
+Import package: `claude_gateway`
+Published package name: `ai-agent-gateway`
+
+Python package for building streaming agent backends with MCP tools, approval gates, memory, skills, and multi-model provider support.
 
 ## Install
 
 ```bash
-pip install claude-gateway
+pip install ai-agent-gateway[anthropic]
 ```
 
-## Quick Start
+Or:
+
+```bash
+pip install ai-agent-gateway[openai]
+```
+
+For local development from this repo:
+
+```bash
+pip install -e .
+```
+
+## Quick Prompt Example
 
 ```python
-import asyncio
-from claude_gateway import AgentRunner, EventLog, McpClientManager, ToolDispatcher
+from claude_gateway import send_prompt_sync
 
-async def main():
-    # 1. Set up MCP client (reads ~/.claude.json for server configs)
-    mcp = McpClientManager(
-        allowed_servers={"my-mcp-server"},
-        builtin_tool_names=set(),
-    )
-    await mcp.startup()
+text = send_prompt_sync(
+    "Summarize the key risk in one sentence.",
+    model="claude-sonnet-4-6",
+    system_prompt="You are a concise analyst.",
+)
 
-    # 2. Create a tool dispatcher with local handlers + MCP tools
-    async def my_tool(tool_input, *, call_index=0):
-        return {"result": f"Hello from {tool_input.get('name', 'world')}"}, None
-
-    dispatcher = ToolDispatcher(
-        mcp_client=mcp,
-        local_tool_handlers={"greet": my_tool},
-    )
-
-    # 3. Create event log for SSE streaming
-    event_log = EventLog(session_id="session-001")
-
-    # 4. Run the agent
-    runner = AgentRunner(
-        event_log=event_log,
-        dispatcher=dispatcher,
-        session_id="session-001",
-        auth_config={"auth_mode": "api", "api_key": "sk-ant-..."},
-        mcp_client=mcp,
-        get_tool_definitions=lambda: [
-            {"name": "greet", "description": "Greet someone", "input_schema": {
-                "type": "object",
-                "properties": {"name": {"type": "string"}},
-            }},
-            *mcp.get_tool_definitions(),
-        ],
-    )
-
-    # Start streaming (non-blocking, populates event_log)
-    asyncio.create_task(runner.run(
-        messages=[{"role": "user", "content": "Say hello"}],
-        system_prompt="You are a helpful assistant.",
-    ))
-
-    # Consume SSE events
-    async for entry in event_log.iter_from():
-        print(entry.event)
-        if entry.event.get("type") == "stream_complete":
-            break
-
-    await mcp.shutdown()
-
-asyncio.run(main())
+print(text)
 ```
 
-## API Reference
+`send_prompt_sync()` is the lightest-weight entry point when you only need a single model call.
 
-### `AgentRunner`
+## Main Building Blocks
 
-Core streaming agent loop. Sends messages to Claude, processes tool calls, and emits SSE events.
+- `AgentRunner`: streaming multi-turn tool-calling loop
+- `ToolDispatcher`: local + MCP tool routing with approval hooks
+- `McpClientManager`: stdio MCP client lifecycle and tool discovery
+- `create_gateway_app()`: FastAPI server factory for SSE chat backends
+- `AnthropicProvider` / `OpenAIProvider`: model-provider implementations
+- `MemoryStore` / `MarkdownSyncManager`: persistent memory primitives
+- `SkillLoader` / `SkillStateStore`: markdown skill loading and state tracking
+- `send_prompt()` / `send_prompt_sync()`: convenience helpers for single prompts
 
-- **Hooks**: `on_tool_result`, `on_usage`, `on_tool_timing` — async callbacks for observability
-- **Sub-agents**: `sub_agent_config` + `spawn_sub_agent()` for parallel task delegation
-- **Streaming**: Emits `thinking_delta`, `text_delta`, `tool_use`, `tool_result`, `stream_complete` events
+## Typical Usage
 
-### `ToolDispatcher`
+Use this package when you want one or more of these:
 
-Routes tool calls to local handlers or MCP servers. Supports approval gates for sensitive operations.
+- a reusable SSE chat backend instead of writing the HTTP/session layer yourself
+- MCP tool discovery and dispatch from `~/.claude.json`
+- approval-gated tool execution
+- multi-channel agents that share the same backend runtime
+- persistent memory and markdown sync
+- a provider abstraction over Anthropic and OpenAI
 
-- `local_tool_handlers`: `Dict[str, handler]` — local async functions
-- `needs_approval` / `request_approval`: Optional approval flow for gated tools
-- `approved_tool_types`: Session-persistent set of pre-approved tools
+## Server Factory
 
-### `McpClientManager`
+For a full backend, compose `GatewayServerConfig`, `ChatRuntime`, and `create_gateway_app()`:
 
-Manages MCP server connections via stdio. Reads server configs from `~/.claude.json`.
+- `GatewayServerConfig` owns auth, sessions, CORS, model allowlists, and hook wiring
+- `ChatRuntime` supplies the system prompt, tool list, dispatcher builder, and optional runtime hooks
+- `create_gateway_app()` returns a FastAPI app with `/api/chat/init`, `/api/chat`, `/api/chat/tool-result`, and tool-approval endpoints
 
-- `allowed_servers`: Whitelist of server names to connect
-- `builtin_tool_names`: Tool names to skip (avoids collisions with local tools)
-- `timeout_overrides`: Per-server call timeouts
-
-### `EventLog`
-
-Async event stream for SSE. Append events, iterate from any sequence number.
-
-- `append(event)` — add an event
-- `iter_from(after_seq)` — async iterator, blocks until new events arrive
-- `close()` — emit terminal event and seal the log
-
-### Supporting Types
-
-- `ToolResult = Tuple[Optional[Any], Optional[Dict[str, Any]]]` — `(result, error)` pair
-- `ApprovalRequest` / `ApprovalDecision` — approval flow dataclasses
-- `SubAgentConfig` — excluded tools, system prompt, max turns for sub-agents
-- `ToolResultContext` — full context passed to `on_tool_result` hook
-- `LogEntry` — sequence number, timestamp, event dict
+The AI-excel-addin app in this repo is the main production example of that pattern.
 
 ## License
 

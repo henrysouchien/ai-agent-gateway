@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+log = logging.getLogger("claude_gateway.skills")
+_FRONTMATTER_DELIMITER = "---"
+
+
+@dataclass
+class SkillProfile:
+  name: str
+  system_prompt: str
+  version: str | None = None
+  model: str | None = None
+  max_turns: int | None = None
+  timeout: float | None = None
+  tool_packs: list[str] | None = None
+  persist_state: bool = False
+  scope: str | None = None
+  interactive: bool = False
+  metadata: dict[str, Any] | None = None
+
+
+def _clean_string(value: Any) -> str | None:
+  if value is None:
+    return None
+  text = str(value).strip()
+  return text or None
+
+
+def _coerce_optional_int(value: Any, *, field_name: str, path: Path) -> int | None:
+  if value is None:
+    return None
+  if isinstance(value, bool):
+    raise ValueError(f"{path}: '{field_name}' must be an integer")
+  if isinstance(value, int):
+    return value
+  if isinstance(value, float) and value.is_integer():
+    return int(value)
+  if isinstance(value, str):
+    text = value.strip()
+    if text:
+      try:
+        return int(text)
+      except ValueError as exc:
+        raise ValueError(f"{path}: '{field_name}' must be an integer") from exc
+  raise ValueError(f"{path}: '{field_name}' must be an integer")
+
+
+def _coerce_optional_float(value: Any, *, field_name: str, path: Path) -> float | None:
+  if value is None:
+    return None
+  if isinstance(value, bool):
+    raise ValueError(f"{path}: '{field_name}' must be a number")
+  if isinstance(value, (int, float)):
+    return float(value)
+  if isinstance(value, str):
+    text = value.strip()
+    if text:
+      try:
+        return float(text)
+      except ValueError as exc:
+        raise ValueError(f"{path}: '{field_name}' must be a number") from exc
+  raise ValueError(f"{path}: '{field_name}' must be a number")
+
+
+def _coerce_optional_bool(value: Any, *, field_name: str, path: Path) -> bool:
+  if value is None:
+    return False
+  if isinstance(value, bool):
+    return value
+  if isinstance(value, str):
+    normalized = value.strip().lower()
+    if normalized in {"true", "yes", "1", "on"}:
+      return True
+    if normalized in {"false", "no", "0", "off"}:
+      return False
+  raise ValueError(f"{path}: '{field_name}' must be a boolean")
+
+
+def _coerce_optional_string_list(value: Any, *, field_name: str, path: Path) -> list[str] | None:
+  if value is None:
+    return None
+  raw_items: list[Any]
+  if isinstance(value, str):
+    raw_items = [value]
+  elif isinstance(value, (list, tuple, set)):
+    raw_items = list(value)
+  else:
+    raise ValueError(f"{path}: '{field_name}' must be a list of strings")
+
+  items: list[str] = []
+  for item in raw_items:
+    text = _clean_string(item)
+    if text:
+      items.append(text)
+  return items or None
+
+
+def _coerce_optional_scope(value: Any, *, field_name: str, path: Path) -> str | None:
+  text = _clean_string(value)
+  if text is None:
+    return None
+  if text not in {"ticker", "portfolio"}:
+    raise ValueError(f"{path}: Invalid scope '{text}': must be 'ticker' or 'portfolio'")
+  return text
+
+
+def _split_frontmatter(text: str, *, path: Path) -> tuple[dict[str, Any], str]:
+  lines = text.splitlines()
+  if not lines or lines[0].strip() != _FRONTMATTER_DELIMITER:
+    return {}, text
+
+  for index, line in enumerate(lines[1:], start=1):
+    if line.strip() != _FRONTMATTER_DELIMITER:
+      continue
+    frontmatter_text = "\n".join(lines[1:index])
+    body = "\n".join(lines[index + 1 :])
+    payload = yaml.safe_load(frontmatter_text) or {}
+    if not isinstance(payload, dict):
+      raise ValueError(f"{path}: skill frontmatter must be a YAML mapping")
+    return payload, body
+
+  return {}, text
+
+
+def parse_skill_file(path: Path) -> SkillProfile:
+  text = path.read_text(encoding="utf-8")
+  frontmatter, body = _split_frontmatter(text, path=path)
+
+  raw_name = frontmatter.pop("name", None)
+  raw_version = frontmatter.pop("version", None)
+  raw_model = frontmatter.pop("model", None)
+  raw_max_turns = frontmatter.pop("max_turns", None)
+  raw_timeout = frontmatter.pop("timeout", None)
+  raw_tool_packs = frontmatter.pop("tool_packs", None)
+  raw_persist_state = frontmatter.pop("persist_state", None)
+  raw_scope = frontmatter.pop("scope", None)
+  raw_interactive = frontmatter.pop("interactive", None)
+  raw_metadata = frontmatter.pop("metadata", None)
+
+  if raw_metadata is None:
+    metadata: dict[str, Any] = {}
+  elif isinstance(raw_metadata, dict):
+    metadata = dict(raw_metadata)
+  else:
+    raise ValueError(f"{path}: 'metadata' must be a mapping when provided")
+
+  metadata.update(frontmatter)
+
+  return SkillProfile(
+    name=_clean_string(raw_name) or path.stem,
+    system_prompt=body.strip(),
+    version=_clean_string(raw_version),
+    model=_clean_string(raw_model),
+    max_turns=_coerce_optional_int(raw_max_turns, field_name="max_turns", path=path),
+    timeout=_coerce_optional_float(raw_timeout, field_name="timeout", path=path),
+    tool_packs=_coerce_optional_string_list(raw_tool_packs, field_name="tool_packs", path=path),
+    persist_state=_coerce_optional_bool(raw_persist_state, field_name="persist_state", path=path),
+    scope=_coerce_optional_scope(raw_scope, field_name="scope", path=path),
+    interactive=_coerce_optional_bool(raw_interactive, field_name="interactive", path=path),
+    metadata=metadata or None,
+  )
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+  if not path.exists():
+    return {}
+
+  try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+  except Exception as exc:
+    log.warning("Failed to parse state file %s: %s", path, exc)
+    return {}
+
+  if isinstance(payload, dict):
+    return payload
+
+  log.warning("State file %s is not a JSON object", path)
+  return {}
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}_", suffix=".tmp")
+  try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      json.dump(payload, handle, indent=2, sort_keys=True)
+      handle.write("\n")
+    os.replace(tmp_path, path)
+  except BaseException:
+    try:
+      os.unlink(tmp_path)
+    except OSError:
+      pass
+    raise
+
+
+class SkillLoader:
+  def __init__(self, skills_dir: str | Path):
+    self.skills_dir = Path(skills_dir)
+
+  def _skill_path(self, name: str) -> Path:
+    skill_name = str(name).strip()
+    if not skill_name:
+      raise ValueError("Skill name is required")
+
+    resolved_dir = self.skills_dir.resolve()
+    path = (resolved_dir / f"{skill_name}.md").resolve()
+    if path.parent != resolved_dir:
+      raise ValueError(f"Invalid skill name '{skill_name}'")
+    return path
+
+  def load(self, name: str) -> SkillProfile:
+    path = self._skill_path(name)
+    if not path.exists():
+      available = self.list_skills()
+      available_label = ", ".join(available) if available else "(none)"
+      raise FileNotFoundError(f"Skill '{name}' not found. Available: {available_label}")
+    return parse_skill_file(path)
+
+  def list_skills(self) -> list[str]:
+    if not self.skills_dir.exists():
+      return []
+    return sorted(path.stem for path in self.skills_dir.glob("*.md") if path.is_file())
+
+  def exists(self, name: str) -> bool:
+    try:
+      return self._skill_path(name).is_file()
+    except ValueError:
+      return False
+
+
+class SkillStateStore:
+  def __init__(self, state_file: str | Path):
+    self.state_file = Path(state_file)
+
+  def _read_all(self) -> dict[str, Any]:
+    return _read_json_object(self.state_file)
+
+  def get(self, skill_name: str) -> dict[str, Any]:
+    payload = self._read_all()
+    state = payload.get(skill_name)
+    if isinstance(state, dict):
+      return dict(state)
+    return {}
+
+  def set(self, skill_name: str, state: dict[str, Any]) -> None:
+    if not isinstance(state, dict):
+      raise TypeError("state must be a dict")
+    payload = self._read_all()
+    payload[str(skill_name)] = dict(state)
+    _atomic_write_json(self.state_file, payload)
+
+  def clear(self, skill_name: str) -> None:
+    if not self.state_file.exists():
+      return
+    payload = self._read_all()
+    if skill_name not in payload:
+      return
+    payload.pop(skill_name, None)
+    _atomic_write_json(self.state_file, payload)
+
+
+__all__ = [
+  "SkillLoader",
+  "SkillProfile",
+  "SkillStateStore",
+  "parse_skill_file",
+]

@@ -9,7 +9,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +18,10 @@ from pydantic import BaseModel, Field
 
 from .event_log import EventLog
 from .mcp_client import McpClientManager
+from .providers.agent_sdk import AgentSDKConfig
+from .providers import AnthropicProvider, ModelProvider
 from .runner import AgentRunner
+from .sdk_runner import AgentSDKRunner
 from .session import AuthManager, Session, SessionStore
 from .tool_dispatcher import ApprovalDecision, ApprovalRequest
 
@@ -27,6 +30,7 @@ SystemPrompt = str | List[Tuple[str, bool]]
 ExecutionLocationResolver = Callable[[str], Optional[str]]
 BuildChatRuntime = Callable[[Session, "ChatRequest", Optional[str], AuthManager], Awaitable["ChatRuntime"]]
 RequestApproval = Callable[[ApprovalRequest], Awaitable[Optional[ApprovalDecision]]]
+BuildRunner = Callable[[EventLog, str], AgentRunner | AgentSDKRunner]
 
 
 class ChatInitRequest(BaseModel):
@@ -67,8 +71,10 @@ class ToolApprovalRequest(BaseModel):
 @dataclass
 class ChatRuntime:
   system_prompt: SystemPrompt
-  get_tool_definitions: Callable[[], List[Dict[str, Any]]]
-  build_dispatcher: Callable[["RequestContext"], Any]
+  build_runner: BuildRunner
+  get_tool_definitions: Callable[[], List[Dict[str, Any]]] = field(default_factory=lambda: [])
+  build_dispatcher: Callable[["RequestContext"], Any] | None = None
+  provider: ModelProvider | None = None
   model_override: Optional[str] = None
   excluded_tools: Optional[Set[str]] = None
   execution_location: Optional[ExecutionLocationResolver] = None
@@ -77,6 +83,8 @@ class ChatRuntime:
   on_tool_timing: Optional[Callable[..., Any]] = None
   post_runner_init: Optional[Callable[[Any], None]] = None
   max_turns: Optional[int] = None
+  compaction_trigger: int | None = None
+  compaction_instructions: str | None = None
 
 
 @dataclass
@@ -91,6 +99,7 @@ class RequestContext:
 @dataclass
 class GatewayServerConfig:
   auth_manager: Optional[AuthManager] = None
+  default_provider: ModelProvider | None = None
   jwt_secret: str = "dev-secret-change-me"
   session_ttl: int = 3600
   valid_api_keys: Set[str] = field(default_factory=set)
@@ -101,7 +110,10 @@ class GatewayServerConfig:
   cors_allow_methods: List[str] = field(default_factory=lambda: ["GET", "POST", "OPTIONS"])
   auth_config: Dict[str, Any] = field(default_factory=dict)
   mcp_client: Optional[McpClientManager] = None
+  sdk_config: AgentSDKConfig | None = None
   per_turn_timeout: int = 300
+  compaction_trigger: int | None = None
+  compaction_instructions: str | None = None
   allowed_models: Set[str] = field(default_factory=lambda: {"claude-sonnet-4-6", "claude-opus-4-6"})
   build_chat_runtime: Optional[BuildChatRuntime] = None
   on_event: Optional[Callable[..., Any]] = None
@@ -131,6 +143,14 @@ def _normalize_prefix(prefix: str) -> str:
 def _route_path(prefix: str, suffix: str) -> str:
   normalized = _normalize_prefix(prefix)
   return f"{normalized}{suffix}" if normalized else suffix
+
+
+def _resolve_compaction_trigger(runtime_val: int | None, config_val: int | None) -> int | None:
+  """Resolve compaction trigger: runtime overrides config. 0 or negative = explicitly disable."""
+  raw = runtime_val if runtime_val is not None else config_val
+  if raw is None or raw <= 0:
+    return None
+  return raw
 
 
 def _sanitize_for_json(obj: Any) -> Any:
@@ -176,7 +196,7 @@ def _write_transcript(transcript_dir: Optional[Path], session_id: str, entry: Di
 async def _cleanup_sessions_loop(session_store: SessionStore) -> None:
   while True:
     await asyncio.sleep(300)
-    session_store.cleanup_expired()
+    await session_store.cleanup_expired_async()
 
 
 async def _maybe_await(callback: Optional[Callable[..., Any]]) -> None:
@@ -197,6 +217,7 @@ def _make_request_approval(session: Session, event_log: EventLog) -> RequestAppr
       "expires_at": expires_at,
       "status": "approval_pending",
       "tool_name": payload.tool_name,
+      "resolved_qualifier": payload.resolved_qualifier,
     }
     session.approval_queues[payload.tool_call_id] = approval_queue
 
@@ -208,6 +229,7 @@ def _make_request_approval(session: Session, event_log: EventLog) -> RequestAppr
         "expires_at": expires_at,
         "tool_name": payload.tool_name,
         "tool_input": payload.tool_input,
+        "resolved_qualifier": payload.resolved_qualifier,
       }
     )
 
@@ -289,8 +311,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     raw_channel = (body.context or {}).get("channel")
     channel = raw_channel.strip().lower() if isinstance(raw_channel, str) else None
 
-    if body.model and body.model not in config.allowed_models:
-      raise HTTPException(status_code=400, detail=f"Invalid model: {body.model}")
     if session.stream_active:
       raise HTTPException(status_code=409, detail="A chat stream is already active for this session")
     session.stream_active = True
@@ -319,40 +339,12 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         channel=channel,
         auth_manager=auth,
       )
+      resolved_model = runtime.model_override or body.model or str(config.auth_config.get("model", "")).strip() or None
+      if resolved_model:
+        if config.allowed_models and resolved_model not in config.allowed_models:
+          raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
       event_log = EventLog(on_event=config.on_event, session_id=sid)
-      request_approval = _make_request_approval(session, event_log)
-      if session.result_queue is None:
-        session.result_queue = asyncio.Queue()
-      req_ctx = RequestContext(
-        session=session,
-        event_log=event_log,
-        request_approval=request_approval,
-        result_queue=cast(asyncio.Queue, session.result_queue),
-        mcp_client=config.mcp_client,
-      )
-      dispatcher = runtime.build_dispatcher(req_ctx)
-
-      on_tool_result = runtime.on_tool_result or config.on_tool_result
-      on_usage = runtime.on_usage or config.on_usage
-      on_tool_timing = runtime.on_tool_timing or config.on_tool_timing
-
-      runner = AgentRunner(
-        event_log=event_log,
-        dispatcher=dispatcher,
-        session_id=sid,
-        auth_config=config.auth_config,
-        mcp_client=config.mcp_client,
-        loaded_mcp_servers=session.loaded_mcp_servers,
-        excluded_tools=runtime.excluded_tools,
-        per_turn_timeout=config.per_turn_timeout,
-        get_tool_definitions=runtime.get_tool_definitions,
-        on_tool_result=on_tool_result,
-        on_usage=on_usage,
-        on_tool_timing=on_tool_timing,
-      )
-
-      if runtime.post_runner_init is not None:
-        runtime.post_runner_init(runner)
+      runner = runtime.build_runner(event_log, sid)
     except Exception:
       session.stream_active = False
       raise

@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Optional, Set
 
 import jwt
 from fastapi import HTTPException
 
 
 JWT_ALGORITHM = "HS256"
+OnSessionExpiry = Callable[["Session"], Awaitable[None]]
 
 
 @dataclass
@@ -27,12 +29,19 @@ class Session:
   approval_queues: Dict[str, asyncio.Queue] = field(default_factory=dict)
   tool_sequence: int = 0
   result_queue: Optional[asyncio.Queue] = None
+  code_execution_work_dir: Optional[str] = None
+  background_tasks: Dict[str, Any] = field(default_factory=dict)
+  _expiring: bool = False
 
 
 class SessionStore:
   def __init__(self, ttl: int = 3600) -> None:
     self.ttl = ttl
     self.sessions: Dict[str, Session] = {}
+    self._on_expiry: OnSessionExpiry | None = None
+
+  def set_on_expiry(self, hook: OnSessionExpiry) -> None:
+    self._on_expiry = hook
 
   def create_session(self, api_key_hash: str) -> Session:
     now = int(time.time())
@@ -51,13 +60,53 @@ class SessionStore:
     return self.sessions.get(session_id)
 
   def expire_session(self, session_id: str) -> None:
+    session = self.sessions.get(session_id)
+    if session is None or session._expiring:
+      return
+    session._expiring = True
     self.sessions.pop(session_id, None)
+    if self._on_expiry is not None:
+      try:
+        loop = asyncio.get_running_loop()
+      except RuntimeError:
+        pass
+      else:
+        loop.create_task(self._safe_on_expiry(session))
+        return
+    if session.code_execution_work_dir:
+      shutil.rmtree(session.code_execution_work_dir, ignore_errors=True)
 
   def cleanup_expired(self) -> None:
     now = int(time.time())
     expired_ids = [session_id for session_id, session in self.sessions.items() if session.expires_at <= now]
     for session_id in expired_ids:
       self.expire_session(session_id)
+
+  async def expire_session_async(self, session_id: str) -> None:
+    session = self.sessions.get(session_id)
+    if session is None or session._expiring:
+      return
+    session._expiring = True
+    self.sessions.pop(session_id, None)
+    if self._on_expiry is not None:
+      await self._safe_on_expiry(session)
+      return
+    if session.code_execution_work_dir:
+      shutil.rmtree(session.code_execution_work_dir, ignore_errors=True)
+
+  async def cleanup_expired_async(self) -> None:
+    now = int(time.time())
+    expired_ids = [session_id for session_id, session in self.sessions.items() if session.expires_at <= now]
+    for session_id in expired_ids:
+      await self.expire_session_async(session_id)
+
+  async def _safe_on_expiry(self, session: Session) -> None:
+    if self._on_expiry is None:
+      return
+    try:
+      await self._on_expiry(session)
+    except Exception:
+      pass
 
 
 class AuthManager:
