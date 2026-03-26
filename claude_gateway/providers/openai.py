@@ -259,6 +259,13 @@ def _detect_compat(base_url: str | None) -> dict[str, Any]:
 
 
 class OpenAIProvider(ModelProvider):
+  """`ModelProvider` implementation for OpenAI-compatible responses APIs.
+
+  The adapter normalizes OpenAI models into the same runner contract used by the
+  Anthropic provider and supports `OPENAI_BASE_URL`-style compatibility targets
+  through the `base_url` auth config field.
+  """
+
   name = "openai"
 
   def __init__(self) -> None:

@@ -18,6 +18,13 @@ OnSessionExpiry = Callable[["Session"], Awaitable[None]]
 
 @dataclass
 class Session:
+  """Mutable per-user runtime state.
+
+  A session owns approval queues, approved tool types, loaded MCP servers, and
+  code execution state in addition to the authentication metadata used by
+  `AuthManager`.
+  """
+
   session_id: str
   api_key_hash: str
   created_at: int
@@ -35,6 +42,8 @@ class Session:
 
 
 class SessionStore:
+  """In-memory session registry with TTL-based cleanup."""
+
   def __init__(self, ttl: int = 3600) -> None:
     self.ttl = ttl
     self.sessions: Dict[str, Session] = {}
@@ -110,6 +119,8 @@ class SessionStore:
 
 
 class AuthManager:
+  """Issue and verify JWT session tokens for the gateway HTTP API."""
+
   def __init__(self, secret: str, valid_keys: Set[str], session_store: SessionStore) -> None:
     self._secret = secret
     self._valid_keys = set(valid_keys)

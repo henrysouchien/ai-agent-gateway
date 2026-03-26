@@ -25,6 +25,7 @@ except Exception as exc:
 
 
 log = logging.getLogger("claude_gateway.mcp_client")
+_UNSET = object()
 
 
 def _classify_exception(exc: Exception, msg: str) -> str:
@@ -57,11 +58,23 @@ class _ServerState:
 
 
 class McpClientManager:
+  """Manage stdio MCP server lifecycles and tool routing.
+
+  The manager can load servers from inline config, from `~/.claude.json`, or
+  from an alternate config path. On startup it connects to each allowed stdio
+  server, lists its tools, filters name collisions, and exposes a merged tool
+  catalog to the runner.
+
+  `inline_servers` is the easiest way to ship self-contained examples because it
+  avoids any dependency on the user's Claude desktop config.
+  """
+
   def __init__(
     self,
     allowed_servers: Set[str] | None = None,
     builtin_tool_names: Set[str] | None = None,
-    config_path: Path | str | None = None,
+    config_path: Path | str | None | object = _UNSET,
+    inline_servers: Dict[str, Dict[str, Any]] | None = None,
     timeout_overrides: Dict[str, int] | None = None,
     startup_timeout: int = 15,
     default_tool_timeout: int = 30,
@@ -74,7 +87,13 @@ class McpClientManager:
     self._mcp_tool_names: Set[str] = set()
     self._allowed_servers = allowed_servers
     self._builtin_tool_names = set(builtin_tool_names or set())
-    self._config_path = Path(config_path) if config_path else Path.home() / ".claude.json"
+    self._inline_servers = dict(inline_servers or {})
+    if config_path is _UNSET:
+      self._config_path: Path | None = Path.home() / ".claude.json"
+    elif config_path is None:
+      self._config_path = None
+    else:
+      self._config_path = Path(config_path).expanduser()
     self._timeout_overrides = dict(timeout_overrides or {})
     self._startup_timeout = startup_timeout
     self._default_tool_timeout = default_tool_timeout
@@ -90,8 +109,12 @@ class McpClientManager:
         return
 
       config = self._read_claude_config()
-      mcp_servers = config.get("mcpServers")
+      mcp_servers = config.get("mcpServers", {})
       if not isinstance(mcp_servers, dict):
+        mcp_servers = {}
+      mcp_servers = dict(mcp_servers)
+      mcp_servers.update(self._inline_servers)
+      if not mcp_servers:
         self._started = True
         return
 
@@ -363,7 +386,7 @@ class McpClientManager:
         log.debug("MCP context close failed: %s", exc)
 
   def _read_claude_config(self) -> Dict[str, Any]:
-    if not self._config_path.exists():
+    if self._config_path is None or not self._config_path.exists():
       return {}
 
     try:

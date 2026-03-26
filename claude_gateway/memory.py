@@ -44,6 +44,8 @@ _CORRUPTION_SIGNATURES = (
 
 @runtime_checkable
 class EmbeddingProvider(Protocol):
+  """Protocol for pluggable embedding backends used by `MemoryStore`."""
+
   async def embed(self, text: str) -> list[float]:
     """Generate an embedding vector for a single text."""
 
@@ -132,6 +134,12 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 class MemoryStore:
+  """SQLite-backed persistent memory store.
+
+  Entities are keyed by `(name, entity_type)` and may optionally carry vector
+  embeddings plus tags for semantic or keyword search.
+  """
+
   def __init__(
     self,
     db_path: str | Path,
@@ -592,6 +600,8 @@ class _SyncEventHandler(FileSystemEventHandler):
 
 
 class MarkdownSyncManager:
+  """Synchronize `MemoryStore` entities to and from markdown files."""
+
   def __init__(self, store: MemoryStore, workspace_dir: str | Path):
     self._store = store
     self._workspace_dir = Path(workspace_dir)

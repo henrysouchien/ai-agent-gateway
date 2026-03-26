@@ -8,6 +8,8 @@ from ._backends import ExecutionBackend
 
 
 class OutputRingBuffer:
+  """Bounded in-memory tail buffer for streaming task output."""
+
   _MAX_LINE_BYTES = 4096
 
   def __init__(self, max_lines: int = 200) -> None:
@@ -27,6 +29,8 @@ class OutputRingBuffer:
 
 @dataclass
 class BackgroundTask:
+  """Track an in-flight background code execution task."""
+
   task_id: str
   handle: Any
   backend: ExecutionBackend

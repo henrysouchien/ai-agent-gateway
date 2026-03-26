@@ -151,6 +151,12 @@ def _server_for_tool(tool_name: str) -> str | None:
 
 
 class AgentSDKRunner:
+  """Run a conversation through the Anthropic agent SDK.
+
+  This is an alternative to `AgentRunner` when you want to delegate tool-loop
+  execution to the pinned SDK while keeping the same gateway HTTP surface.
+  """
+
   def __init__(
     self,
     event_log: EventLog,

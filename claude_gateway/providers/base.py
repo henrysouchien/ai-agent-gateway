@@ -6,6 +6,8 @@ from typing import Any, AsyncIterator
 
 
 class ThinkingLevel(str, Enum):
+  """Provider-agnostic reasoning intensity hint."""
+
   NONE = "none"
   MINIMAL = "minimal"
   LOW = "low"
@@ -16,6 +18,8 @@ class ThinkingLevel(str, Enum):
 
 @dataclass
 class ModelInfo:
+  """Static or semi-static metadata about a model identifier."""
+
   id: str
   provider: str
   context_window: int = 200_000
@@ -32,6 +36,8 @@ class ModelInfo:
 
 @dataclass
 class StreamEvent:
+  """Normalized provider stream event consumed by runners."""
+
   type: str
   text: Any = ""
   tool_id: str = ""
@@ -51,6 +57,8 @@ class StreamEvent:
 
 @dataclass
 class CostEstimate:
+  """Estimated request cost broken down by token category."""
+
   input_cost: float = 0.0
   output_cost: float = 0.0
   cache_read_cost: float = 0.0
@@ -59,6 +67,17 @@ class CostEstimate:
 
 
 class ModelProvider:
+  """Interface implemented by model-provider adapters.
+
+  A provider is responsible for:
+
+  - creating and closing API clients
+  - validating model identifiers
+  - translating gateway messages into provider request params
+  - streaming normalized `StreamEvent` objects
+  - estimating request cost
+  """
+
   name = "provider"
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:

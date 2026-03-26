@@ -130,6 +130,12 @@ def _is_tool_result_message(message: dict[str, Any]) -> bool:
 
 
 class AnthropicProvider(ModelProvider):
+  """`ModelProvider` implementation for Anthropic's Messages API.
+
+  Supports API key and OAuth-style auth, prompt caching blocks, tool use, and
+  Anthropic thinking/compaction features when the selected model allows them.
+  """
+
   name = "anthropic"
   supports_compaction = True
 

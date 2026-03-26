@@ -50,6 +50,8 @@ SDK_GATED_BUILTINS = {"Write", "Edit", "Bash", "NotebookEdit", "BashOutput", "Ki
 
 @dataclass
 class AgentSDKConfig:
+  """Configuration for the optional Anthropic agent SDK runner."""
+
   api_key: str
   model: str | None = None
   max_budget_usd: float | None = None

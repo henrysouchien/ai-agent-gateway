@@ -6,6 +6,13 @@ from typing import Callable, Dict
 
 @dataclass
 class CodeExecutionConfig:
+  """Configuration for built-in code execution.
+
+  Fields are grouped into backend selection, script preamble generation,
+  environment preparation, working-directory management, output limits, and tool
+  description customization.
+  """
+
   # Backend
   docker_image: str = ""
   register_docker: bool = True

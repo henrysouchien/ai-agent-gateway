@@ -67,7 +67,12 @@ async def send_prompt(
   session_id: str | None = None,
   on_usage: Callable[[int, int, int, int], None] | None = None,
 ) -> str:
-  """Send a single prompt to Claude and return the response text."""
+  """Send one prompt through `AnthropicProvider` and return plain text.
+
+  This helper is useful when you want provider normalization and usage tracking
+  without standing up the full gateway server. It supports the same cached
+  system prompt block format as `create_agent()`.
+  """
   provider = AnthropicProvider()
   config = _prepare_auth_config(
     auth_config,
@@ -152,7 +157,7 @@ async def send_prompt(
 
 
 def send_prompt_sync(prompt: str, **kwargs: Any) -> str:
-  """Synchronous wrapper around send_prompt()."""
+  """Run `send_prompt()` from synchronous code."""
   try:
     asyncio.get_running_loop()
   except RuntimeError:

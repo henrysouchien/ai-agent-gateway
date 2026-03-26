@@ -12,12 +12,21 @@ OnEvent = Callable[[Dict[str, Any], str], None]
 
 @dataclass
 class LogEntry:
+  """Single event log entry with sequence number and timestamp."""
+
   seq: int
   timestamp: float
   event: Dict[str, Any]
 
 
 class EventLog:
+  """Append-only event buffer for gateway streams.
+
+  Runners write structured events here and the HTTP layer consumes them through
+  `iter_from()`. The log closes automatically when a terminal event such as
+  `stream_complete` or `error` is appended.
+  """
+
   def __init__(
     self,
     *,

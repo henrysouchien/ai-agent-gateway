@@ -16,6 +16,12 @@ _FRONTMATTER_DELIMITER = "---"
 
 @dataclass
 class SkillProfile:
+  """Parsed markdown skill definition.
+
+  Skill files may include YAML frontmatter for metadata and a markdown body that
+  becomes the sub-agent system prompt.
+  """
+
   name: str
   system_prompt: str
   version: str | None = None
@@ -133,6 +139,11 @@ def _split_frontmatter(text: str, *, path: Path) -> tuple[dict[str, Any], str]:
 
 
 def parse_skill_file(path: Path) -> SkillProfile:
+  """Parse a markdown skill file into a `SkillProfile`.
+
+  The parser accepts optional YAML frontmatter delimited by `---` and treats the
+  remaining markdown body as the skill prompt.
+  """
   text = path.read_text(encoding="utf-8")
   frontmatter, body = _split_frontmatter(text, path=path)
 
@@ -205,6 +216,12 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 class SkillLoader:
+  """Load named skill files from a directory.
+
+  Each skill must be a markdown file named `<skill>.md`. `load()` validates the
+  file and returns a parsed `SkillProfile`.
+  """
+
   def __init__(self, skills_dir: str | Path):
     self.skills_dir = Path(skills_dir)
 
@@ -240,6 +257,8 @@ class SkillLoader:
 
 
 class SkillStateStore:
+  """Persist per-skill JSON state in a single file."""
+
   def __init__(self, state_file: str | Path):
     self.state_file = Path(state_file)
 

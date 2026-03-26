@@ -19,6 +19,12 @@ from ._tool_defs import make_code_execute_status_tool_def, make_code_execute_too
 
 @dataclass
 class CodeExecutionBundle:
+  """Bundle returned by `build_code_execution()`.
+
+  It contains the local handlers, tool schemas, approval helpers, and result
+  sanitization hook needed to plug code execution into a gateway runtime.
+  """
+
   handlers: Dict[str, LocalToolHandler]
   tool_definitions: List[Dict[str, Any]]
   approval_qualifier: ApprovalKeyQualifier
@@ -30,6 +36,12 @@ def build_code_execution(
   session: Session,
   config: CodeExecutionConfig | None = None,
 ) -> CodeExecutionBundle:
+  """Create built-in code execution tools for a session.
+
+  The bundle prefers Docker when available and falls back to subprocess
+  execution when registered. The session stores the persistent work directory and
+  any background tasks created by `code_execute(background=true)`.
+  """
   cfg = config or CodeExecutionConfig()
 
   backends: Dict[str, ExecutionBackend] = {}

@@ -6,6 +6,7 @@ from ..session import Session
 
 
 async def cleanup_code_execution(session: Session) -> None:
+  """Cancel background code tasks and delete the session work directory."""
   for task in list(session.background_tasks.values()):
     try:
       await task.safe_cancel(task.backend)

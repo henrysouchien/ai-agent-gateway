@@ -45,6 +45,12 @@ async def _read_stream_to_file(
 
 
 class DockerBackend(ExecutionBackend):
+  """Docker-based code execution backend.
+
+  This backend runs Python in an isolated container with networking disabled and
+  is considered sandboxed by the approval system.
+  """
+
   def __init__(self, image: Optional[str] = None, config: CodeExecutionConfig | None = None) -> None:
     self._config = config or CodeExecutionConfig()
     self._image = image or os.getenv("CODE_EXECUTE_DOCKER_IMAGE", "ai-excel-addin-code-exec:latest")

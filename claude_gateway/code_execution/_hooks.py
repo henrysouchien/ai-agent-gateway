@@ -20,6 +20,11 @@ def _load_result_payload(ctx: ToolResultContext) -> Dict[str, Any] | None:
 
 
 def strip_code_execute_base64_hook(ctx: ToolResultContext) -> None:
+  """Replace inline image base64 payloads with filename markers.
+
+  Use this in `on_tool_result` pipelines when you want tool results to stay
+  readable in logs or downstream model messages.
+  """
   if ctx.tool_name != "code_execute" or ctx.result_entry is None or ctx.error is not None:
     return
 

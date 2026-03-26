@@ -18,10 +18,13 @@ log = logging.getLogger("claude_gateway.dispatcher")
 ToolResult = Tuple[Optional[Any], Optional[Dict[str, Any]]]
 NeedsApprovalCallback = Callable[[str, Dict[str, Any], str], bool]
 ApprovalKeyQualifier = Callable[[str, Dict[str, Any]], str]
+ToolResult.__doc__ = "Standard tool return type: `(result, error)`."
 
 
 @dataclass
 class ApprovalRequest:
+  """Approval payload sent from the dispatcher to a client or UI layer."""
+
   tool_call_id: str
   nonce: str
   tool_name: str
@@ -32,6 +35,8 @@ class ApprovalRequest:
 
 @dataclass
 class ApprovalDecision:
+  """Result returned after a user approves or denies a tool call."""
+
   approved: bool
   allow_tool_type: bool = False
 
@@ -42,6 +47,8 @@ LocalToolHandler = Callable[..., Awaitable[ToolResult]]
 
 @dataclass
 class InterceptContext:
+  """Context passed to a `ToolInterceptor` before tool execution."""
+
   tool_call_id: str
   tool_name: str
   tool_input: Dict[str, Any]
@@ -50,26 +57,53 @@ class InterceptContext:
 
 @dataclass
 class InterceptDecision:
+  """Interceptor outcome.
+
+  `action` should be one of `allow`, `warn`, or `deny`.
+  """
+
   action: str  # "allow", "deny", "warn"
   message: str = ""
   code: str = "interceptor"
 
 
 ToolInterceptor = Callable[[InterceptContext], Awaitable[InterceptDecision]]
+ToolInterceptor.__doc__ = (
+  "Async policy hook that receives `InterceptContext` and returns an `InterceptDecision`."
+)
 
 
 @dataclass
 class ToolExecutionContext:
+  """Context object passed to local tool handlers.
+
+  Local tools can call `emit()` to send additional structured events into the
+  active `EventLog`, for example incremental stdout chunks from code execution.
+  """
+
   tool_call_id: str
   tool_name: str
   event_log: EventLog
   resolved_qualifier: str = ""
 
   def emit(self, event: Dict[str, Any]) -> None:
+    """Append a custom event to the active event log."""
     self.event_log.append(event)
 
 
 class ToolDispatcher:
+  """Route tool calls to local handlers or MCP servers.
+
+  The dispatcher is the policy boundary between model output and real tool
+  execution. For each tool call it can:
+
+  1. run interceptors
+  2. request human approval
+  3. execute a local Python handler
+  4. fall back to an MCP server tool
+  5. return structured warnings or errors
+  """
+
   def __init__(
     self,
     mcp_client: "McpClientManager",
@@ -175,6 +209,23 @@ class ToolDispatcher:
     *,
     call_index: int = 0,
   ) -> ToolResult:
+    """Execute one tool call and return `(result, error)`.
+
+    Args:
+      tool_call_id: Provider-emitted tool id.
+      tool_name: Tool name selected by the model.
+      tool_input: JSON-like tool payload.
+      call_index: Zero-based tool index for the current turn.
+
+    Returns:
+      A tuple of `(result, error)` where exactly one side is usually `None`.
+
+    Notes:
+      - Local handlers receive `tool_ctx` and `call_index` keyword arguments.
+      - Approved tool types are cached in-session through `allow_tool_type`.
+      - Interceptor warnings are attached to successful dict results under
+        `_interceptor_warnings`.
+    """
     proceed, warnings, intercept_error = await self._run_interceptors(
       tool_call_id,
       tool_name,

@@ -34,27 +34,46 @@ BuildRunner = Callable[[EventLog, str], AgentRunner | AgentSDKRunner]
 
 
 class ChatInitRequest(BaseModel):
+  """Request body for `POST /chat/init`."""
+
   api_key: str = Field(..., min_length=1)
 
 
 class ChatInitResponse(BaseModel):
+  """Response body returned after a session token is issued."""
+
   session_token: str
   session_id: str
   expires_at: int
 
 
 class ChatMessage(BaseModel):
+  """Single plain-text chat message sent to the gateway."""
+
   role: str
   content: str
 
 
 class ChatRequest(BaseModel):
+  """Request body for `POST /chat`.
+
+  `messages` is the full message list for the current turn. `context` is
+  intentionally free-form; `context["channel"]` is the most common field used
+  to shape runtime behavior per frontend.
+  """
+
   messages: List[ChatMessage]
   context: Dict[str, Any] = Field(default_factory=dict)
   model: Optional[str] = None
 
 
 class ToolResultRequest(BaseModel):
+  """Submit the result of a client-executed tool call.
+
+  The built-in backend tools do not normally use this path, but the endpoint is
+  available for custom runtimes that stage tool execution on the client side.
+  """
+
   tool_call_id: str
   nonce: str
   result: Optional[Dict[str, Any]] = None
@@ -62,6 +81,8 @@ class ToolResultRequest(BaseModel):
 
 
 class ToolApprovalRequest(BaseModel):
+  """Approve or deny a pending tool call."""
+
   tool_call_id: str
   nonce: str
   approved: bool
@@ -70,6 +91,29 @@ class ToolApprovalRequest(BaseModel):
 
 @dataclass
 class ChatRuntime:
+  """Per-request runtime wiring returned by `build_chat_runtime`.
+
+  Attributes:
+    system_prompt: Prompt string or cached prompt blocks for the request.
+    build_runner: Factory that receives `(event_log, session_id)` and returns an
+      `AgentRunner` or `AgentSDKRunner`.
+    get_tool_definitions: Callback returning the tool schemas visible to the
+      model for this request.
+    build_dispatcher: Reserved callback slot for custom dispatcher builders.
+    provider: Provider handling the request, typically Anthropic or OpenAI.
+    model_override: Request-scoped model override.
+    excluded_tools: Optional tool names hidden from the runtime.
+    execution_location: Optional resolver used to annotate tool events with
+      metadata such as `backend`, `client`, or a channel-specific location.
+    on_usage: Optional request-scoped usage hook.
+    on_tool_result: Optional request-scoped tool result hook.
+    on_tool_timing: Optional request-scoped tool timing hook.
+    post_runner_init: Optional callback invoked after runner construction.
+    max_turns: Optional cap on loop iterations for this request.
+    compaction_trigger: Optional token threshold for provider-side compaction.
+    compaction_instructions: Optional provider-specific compaction instructions.
+  """
+
   system_prompt: SystemPrompt
   build_runner: BuildRunner
   get_tool_definitions: Callable[[], List[Dict[str, Any]]] = field(default_factory=lambda: [])
@@ -89,6 +133,8 @@ class ChatRuntime:
 
 @dataclass
 class RequestContext:
+  """Mutable request-scoped objects shared across dispatch layers."""
+
   session: Session
   event_log: EventLog
   request_approval: RequestApproval
@@ -98,6 +144,40 @@ class RequestContext:
 
 @dataclass
 class GatewayServerConfig:
+  """Configuration for `create_gateway_app()`.
+
+  Attributes:
+    auth_manager: Optional pre-built `AuthManager`. When omitted, the server
+      creates one from `jwt_secret`, `valid_api_keys`, and `session_ttl`.
+    default_provider: Informational default provider for the app.
+    jwt_secret: JWT signing secret used when `auth_manager` is omitted.
+    session_ttl: Session lifetime in seconds.
+    valid_api_keys: API keys accepted by `POST /chat/init`.
+    cors_origins: Allowed CORS origins.
+    cors_allow_headers: Allowed CORS headers.
+    cors_allow_methods: Allowed CORS methods.
+    auth_config: Default provider auth/model config used by convenience flows and
+      by request validation when no runtime override is present.
+    mcp_client: Optional shared `McpClientManager`.
+    sdk_config: Optional `AgentSDKConfig` when using `AgentSDKRunner`.
+    per_turn_timeout: Default per-turn timeout in seconds.
+    compaction_trigger: Default compaction threshold.
+    compaction_instructions: Default compaction instructions.
+    allowed_models: Model allowlist enforced at request time.
+    build_chat_runtime: Required async callback that returns a `ChatRuntime`.
+    on_event: Optional event observer invoked for every appended `EventLog`
+      entry.
+    on_tool_result: Optional app-level tool result hook.
+    on_usage: Optional app-level usage hook.
+    on_tool_timing: Optional app-level tool timing hook.
+    on_startup: Optional startup callback.
+    on_shutdown: Optional shutdown callback.
+    transcript_dir: Optional directory where request and event transcripts are
+      written as JSONL files.
+    log_name: Logger name for the server.
+    prefix: Route prefix, usually `/api`.
+  """
+
   auth_manager: Optional[AuthManager] = None
   default_provider: ModelProvider | None = None
   jwt_secret: str = "dev-secret-change-me"
@@ -250,6 +330,28 @@ def _make_request_approval(session: Session, event_log: EventLog) -> RequestAppr
 
 
 def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
+  """Create a FastAPI gateway application from explicit runtime configuration.
+
+  The returned app exposes:
+
+  - `POST {prefix}/chat/init`
+  - `POST {prefix}/chat`
+  - `POST {prefix}/chat/tool-result`
+  - `POST {prefix}/chat/tool-approval`
+  - `GET  {prefix}/health`
+
+  `create_gateway_app()` is the extensibility point for production deployments.
+  Unlike `create_agent()`, it does not assume Anthropic, a particular tool
+  policy, or a particular runtime builder. You provide the `build_chat_runtime`
+  callback and the server handles the HTTP, session, SSE, and approval loop.
+
+  Args:
+    config: `GatewayServerConfig` describing auth, routing, callbacks, and the
+      runtime factory.
+
+  Returns:
+    A FastAPI application ready to serve the gateway HTTP API.
+  """
   if config.build_chat_runtime is None:
     raise ValueError("GatewayServerConfig.build_chat_runtime is required")
 

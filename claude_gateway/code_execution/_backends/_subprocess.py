@@ -46,6 +46,12 @@ async def _read_stream_to_file(
 
 
 class SubprocessBackend(ExecutionBackend):
+  """Local subprocess code execution backend.
+
+  This backend is convenient for development but is intentionally marked
+  unsandboxed so callers can require explicit approval before use.
+  """
+
   def __init__(self, config: CodeExecutionConfig | None = None) -> None:
     self._config = config or CodeExecutionConfig()
 

@@ -12,6 +12,7 @@ from .code_execution import (
   strip_code_execute_base64_hook,
 )
 from .event_log import EventLog, LogEntry
+from .easy import create_agent
 from .memory import EmbeddingProvider, MarkdownSyncManager, MemoryStore
 from .mcp_client import McpClientManager
 from .providers import (
@@ -30,6 +31,7 @@ from .sdk_runner import AgentSDKRunner
 from .server import ChatRuntime, GatewayServerConfig, RequestContext, create_gateway_app
 from .session import AuthManager, Session, SessionStore
 from .skills import SkillLoader, SkillProfile, SkillStateStore, parse_skill_file
+from .sub_agent import make_run_agent_handler, make_run_agent_tool_def
 from .tool_dispatcher import (
   ApprovalDecision,
   ApprovalRequest,
@@ -87,9 +89,12 @@ __all__ = [
   "ToolResultContext",
   "build_code_execution",
   "cleanup_code_execution",
+  "create_agent",
   "create_gateway_app",
   "make_code_execute_status_tool_def",
   "make_code_execute_tool_def",
+  "make_run_agent_handler",
+  "make_run_agent_tool_def",
   "parse_skill_file",
   "strip_code_execute_base64_hook",
 ]

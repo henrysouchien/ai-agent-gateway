@@ -40,6 +40,13 @@ def _format_exc(exc: Exception) -> str:
 
 @dataclass
 class ToolResultContext:
+  """Context passed to `on_tool_result` hooks.
+
+  Hooks can inspect the original tool input, the normalized tool result, the
+  emitted result entry, and timing metadata before the runner forwards the tool
+  result back into the model conversation.
+  """
+
   tool_name: str
   tool_input: Dict[str, Any]
   result: Any | None
@@ -53,6 +60,8 @@ class ToolResultContext:
 
 @dataclass
 class SubAgentConfig:
+  """Default settings applied to spawned sub-agents."""
+
   excluded_tools: Set[str]
   system_prompt: str | None = None
   max_turns: int = 15
@@ -68,12 +77,49 @@ class StreamTurnResult:
   content_blocks: List[Dict[str, Any]] = field(default_factory=list)
 
 
+class CostAccumulator:
+  """Running cost tracker shared across parent and sub-agent runners."""
+
+  def __init__(self, budget: float) -> None:
+    self.budget = budget
+    self._total = 0.0
+
+  def add(self, cost: float) -> None:
+    self._total += cost
+
+  @property
+  def total(self) -> float:
+    return self._total
+
+  @property
+  def exceeded(self) -> bool:
+    return self._total >= self.budget
+
+
 OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | None]]
 OnUsage = Callable[[Dict[str, Any]], None]
 OnToolTiming = Callable[[str, str, str | None, int, bool, int], None]
+OnMaxTurns = Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
 
 
 class AgentRunner:
+  """Run the model/tool loop for one gateway conversation.
+
+  `AgentRunner` is responsible for streaming provider output, executing tool
+  calls through `ToolDispatcher`, collecting usage, enforcing budgets and time
+  limits, and appending client-visible events to `EventLog`.
+
+  Constructor highlights:
+
+  - `provider` supplies model-specific request/stream behavior.
+  - `dispatcher` executes local or MCP tools.
+  - `auth_config` carries provider credentials, model, and token limits.
+  - `get_tool_definitions` supplies the current tool schema visible to the
+    model.
+  - `on_tool_result`, `on_usage`, and `on_tool_timing` are observability hooks.
+  - `max_budget_usd` and `max_turns` stop the loop before it runs away.
+  """
+
   def __init__(
     self,
     event_log: EventLog,
@@ -97,7 +143,16 @@ class AgentRunner:
     compaction_trigger: int | None = None,
     compaction_instructions: str | None = None,
     tool_call_timeout: float | None = 120.0,
+    on_max_turns: OnMaxTurns | None = None,
+    max_budget_usd: float | None = None,
+    _cost_accumulator: CostAccumulator | None = None,
+    max_concurrent_sub_agents: int | None = None,
   ) -> None:
+    if max_budget_usd is not None and max_budget_usd <= 0:
+      raise ValueError("max_budget_usd must be positive when provided")
+    if max_concurrent_sub_agents is not None and max_concurrent_sub_agents <= 0:
+      raise ValueError("max_concurrent_sub_agents must be positive when provided")
+
     self._log = event_log
     self._dispatcher = dispatcher
     self._provider = provider
@@ -119,6 +174,16 @@ class AgentRunner:
     self._compaction_trigger = compaction_trigger
     self._compaction_instructions = compaction_instructions
     self._tool_call_timeout = tool_call_timeout
+    self._on_max_turns = on_max_turns
+    self._max_budget_usd = max_budget_usd if max_budget_usd is not None else (
+      _cost_accumulator.budget if _cost_accumulator is not None else None
+    )
+    self._cost_accumulator = _cost_accumulator
+    if self._cost_accumulator is None and self._max_budget_usd is not None:
+      self._cost_accumulator = CostAccumulator(self._max_budget_usd)
+    self._last_reported_cost = 0.0
+    self._max_concurrent_sub_agents = max_concurrent_sub_agents
+    self._sub_agent_semaphore: asyncio.Semaphore | None = None
     self._active_client: Any | None = None
 
   def _append(self, event: Dict[str, Any]) -> None:
@@ -237,6 +302,12 @@ class AgentRunner:
     call_index: int = 0,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
   ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+    """Run a focused sub-agent task and return its summarized result.
+
+    This method is used by the built-in `run_agent` tool. The sub-agent shares
+    the same provider and budget accounting as the parent runner, but it gets a
+    fresh `EventLog`, its own turn budget, and its own dispatcher.
+    """
     if self._sub_agent_config is not None:
       if model is None:
         model = self._sub_agent_config.model
@@ -285,6 +356,10 @@ class AgentRunner:
       compaction_trigger=self._compaction_trigger,
       compaction_instructions=None,
       tool_call_timeout=self._tool_call_timeout,
+      on_max_turns=self._on_max_turns,
+      max_budget_usd=self._max_budget_usd,
+      _cost_accumulator=self._cost_accumulator,
+      max_concurrent_sub_agents=self._max_concurrent_sub_agents,
     )
 
     timed_out = False
@@ -312,6 +387,8 @@ class AgentRunner:
     tool_calls_made: List[str] = []
     usage: Dict[str, Any] = {}
     error_msg: str | None = None
+    budget_exceeded = False
+    max_turns_hit = False
     for entry in sub_log.entries:
       event = entry.event
       event_type = event.get("type")
@@ -326,6 +403,10 @@ class AgentRunner:
         event_usage = event.get("usage")
         if isinstance(event_usage, dict):
           usage = event_usage
+      elif event_type == "budget_exceeded":
+        budget_exceeded = True
+      elif event_type == "max_turns_reached":
+        max_turns_hit = True
       elif event_type == "error":
         error_msg = str(event.get("error", "Sub-agent error"))
 
@@ -339,6 +420,10 @@ class AgentRunner:
       warnings.append(f"Sub-agent timed out after {timeout}s — partial results returned")
     elif error_msg:
       warnings.append(f"Sub-agent error: {error_msg}")
+    if budget_exceeded:
+      warnings.append("Sub-agent stopped: budget limit reached")
+    if max_turns_hit:
+      warnings.append("Sub-agent stopped: max turns reached — partial results")
     if warnings:
       result["warning"] = "; ".join(warnings)
     return result, None
@@ -387,6 +472,21 @@ class AgentRunner:
       self._on_usage(usage_payload)
     except Exception as exc:
       log.warning("[%s] on_usage hook failed (non-fatal): %s", self._sid, exc)
+
+  def _estimate_usage_cost(self, model: str, usage_totals: Dict[str, int]):
+    uncached_input = max(
+      0,
+      usage_totals["input_tokens"]
+      - usage_totals["cache_read_input_tokens"]
+      - usage_totals["cache_creation_input_tokens"],
+    )
+    return self._provider.estimate_cost(
+      model,
+      uncached_input,
+      usage_totals["output_tokens"],
+      cache_read_tokens=usage_totals["cache_read_input_tokens"],
+      cache_creation_tokens=usage_totals["cache_creation_input_tokens"],
+    )
 
   @staticmethod
   def _thinking_level(enabled: bool) -> ThinkingLevel:
@@ -772,7 +872,7 @@ class AgentRunner:
           tool_input,
           call_index=call_index,
         )
-        if self._tool_call_timeout is not None:
+        if self._tool_call_timeout is not None and tool_name != "run_agent":
           try:
             result, error = await asyncio.wait_for(dispatch_coro, timeout=self._tool_call_timeout)
           except asyncio.TimeoutError:
@@ -920,6 +1020,22 @@ class AgentRunner:
     model_override: Optional[str] = None,
     max_turns: Optional[int] = None,
   ) -> None:
+    """Execute the full chat loop and stream events into `EventLog`.
+
+    Args:
+      messages: Conversation history for the current request.
+      system_prompt: Optional prompt string or cached prompt blocks.
+      model_override: Optional per-request model override.
+      max_turns: Optional maximum number of model/tool turns.
+
+    Behavior:
+      - emits `text_delta`, `thinking_delta`, and tool lifecycle events
+      - retries transient stream failures
+      - appends `stream_complete` on success
+      - appends `error` on terminal failure
+      - appends `max_turns_reached` or `budget_exceeded` when limits stop the
+        loop early
+    """
     try:
       config = {
         "auth_mode": str(self._auth_config.get("auth_mode", "api")).strip().lower(),
@@ -1029,6 +1145,12 @@ class AgentRunner:
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
       }
+      self._last_reported_cost = 0.0
+      self._sub_agent_semaphore = (
+        asyncio.Semaphore(self._max_concurrent_sub_agents)
+        if self._max_concurrent_sub_agents is not None
+        else None
+      )
       turn_count = 0
       tools_used: List[str] = []
       current_messages = list(messages)
@@ -1037,7 +1159,17 @@ class AgentRunner:
         turn_count += 1
         if max_turns is not None and turn_count > max_turns:
           log.warning("[%s] Max turns (%d) reached, stopping", self._sid, max_turns)
-          self._append({"type": "text_delta", "text": "\n\n[Sub-agent reached maximum turn limit]"})
+          self._append({"type": "max_turns_reached", "turn_count": turn_count, "max_turns": max_turns})
+          summary_text = None
+          if self._on_max_turns is not None:
+            try:
+              summary_text = await self._on_max_turns(current_messages, turn_count)
+            except Exception as exc:
+              log.warning("[%s] on_max_turns callback failed: %s", self._sid, exc)
+          if summary_text:
+            self._append({"type": "text_delta", "text": f"\n\n[Max turns reached]\n{summary_text}"})
+          else:
+            self._append({"type": "text_delta", "text": "\n\n[Sub-agent reached maximum turn limit]"})
           break
         turn_t0 = time.time()
         turn_t0_mono = time.monotonic()
@@ -1135,6 +1267,38 @@ class AgentRunner:
           },
         )
 
+        if self._cost_accumulator is not None:
+          running_cost = self._estimate_usage_cost(config["model"], usage_totals)
+          incremental_cost = max(0.0, running_cost.total - self._last_reported_cost)
+          if incremental_cost:
+            self._cost_accumulator.add(incremental_cost)
+          self._last_reported_cost = running_cost.total
+          if self._cost_accumulator.exceeded:
+            log.warning(
+              "[%s] Budget exceeded: $%.4f >= $%.4f — stopping",
+              self._sid,
+              self._cost_accumulator.total,
+              self._cost_accumulator.budget,
+            )
+            self._append(
+              {
+                "type": "budget_exceeded",
+                "total_cost": round(self._cost_accumulator.total, 4),
+                "budget": self._cost_accumulator.budget,
+              }
+            )
+            self._append(
+              {
+                "type": "text_delta",
+                "text": (
+                  "\n\n"
+                  f"[Budget limit reached: ${self._cost_accumulator.total:.4f} >= "
+                  f"${self._cost_accumulator.budget:.4f}]"
+                ),
+              }
+            )
+            break
+
         if not turn.tool_uses:
           if turn.stop_reason == "pause_turn":
             log.info("[%s] Pause turn — continuing", self._sid)
@@ -1192,14 +1356,36 @@ class AgentRunner:
               run_agent_seq += 1
               i += 1
 
+            async def _throttled(
+              tool_call_id: str,
+              tool_call_name: str,
+              tool_call_input: Dict[str, Any],
+              current_call_index: int,
+            ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
+              if self._sub_agent_semaphore is not None:
+                async with self._sub_agent_semaphore:
+                  return await self._execute_single_tool(
+                    tool_call_id,
+                    tool_call_name,
+                    tool_call_input,
+                    base_kwargs,
+                    call_index=current_call_index,
+                  )
+              return await self._execute_single_tool(
+                tool_call_id,
+                tool_call_name,
+                tool_call_input,
+                base_kwargs,
+                call_index=current_call_index,
+              )
+
             results = await asyncio.gather(
               *[
-                self._execute_single_tool(
+                _throttled(
                   batch_tool_id,
                   batch_tool_name,
                   batch_tool_input,
-                  base_kwargs,
-                  call_index=call_index,
+                  call_index,
                 )
                 for (_, batch_tool_id, batch_tool_name, batch_tool_input), call_index in zip(batch, call_indices)
               ],
@@ -1247,19 +1433,7 @@ class AgentRunner:
       elif usage_totals["cache_creation_input_tokens"] > 0:
         cache_status = f"write ({usage_totals['cache_creation_input_tokens']} tokens written)"
 
-      uncached_input = max(
-        0,
-        usage_totals["input_tokens"]
-        - usage_totals["cache_read_input_tokens"]
-        - usage_totals["cache_creation_input_tokens"],
-      )
-      cost = self._provider.estimate_cost(
-        config["model"],
-        uncached_input,
-        usage_totals["output_tokens"],
-        cache_read_tokens=usage_totals["cache_read_input_tokens"],
-        cache_creation_tokens=usage_totals["cache_creation_input_tokens"],
-      )
+      cost = self._estimate_usage_cost(config["model"], usage_totals)
 
       log.info(
         "[%s] Chat done | %.1fs total | %d turns | tools=%s | tokens in=%d out=%d | cache=%s | cost=$%.4f",

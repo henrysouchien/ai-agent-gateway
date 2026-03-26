@@ -9,6 +9,7 @@ def make_code_execute_tool_def(
   config: CodeExecutionConfig,
   available_hosts: Sequence[str],
 ) -> Dict[str, Any]:
+  """Build the public tool schema for `code_execute`."""
   description_suffix = f" {config.tool_description_suffix.strip()}" if config.tool_description_suffix.strip() else ""
   return {
     "name": "code_execute",
@@ -48,6 +49,7 @@ def make_code_execute_tool_def(
 
 
 def make_code_execute_status_tool_def() -> Dict[str, Any]:
+  """Build the public tool schema for `code_execute_status`."""
   return {
     "name": "code_execute_status",
     "description": "Check or cancel a background code_execute task.",
