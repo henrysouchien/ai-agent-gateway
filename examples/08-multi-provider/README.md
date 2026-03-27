@@ -1,8 +1,11 @@
 # 08 Multi Provider
 
-This example serves the same gateway shape through `OpenAIProvider` instead of `AnthropicProvider`.
+This example serves the same gateway shape through `provider="openai"` on `create_agent()`.
 
-It uses `create_gateway_app()` because `create_agent()` currently supports Anthropic only.
+It shows two paths:
+
+- Simple OpenAI setup: `create_agent(..., provider="openai", model="gpt-4o")`
+- OpenAI-compatible endpoint: add `provider_config={"base_url": "..."}`
 
 ## Install
 
@@ -16,6 +19,8 @@ Optional: point the OpenAI-compatible client at another base URL.
 ```bash
 export OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
+
+When `OPENAI_BASE_URL` is set, `agent.py` forwards it as `provider_config={"base_url": OPENAI_BASE_URL}`.
 
 ## Run
 
@@ -41,12 +46,12 @@ curl -N http://127.0.0.1:8000/api/chat \
       {"role": "user", "content": "Explain in two sentences why provider abstractions matter."}
     ],
     "context": {"channel": "web"},
-    "model": "gpt-4o-mini"
+    "model": "gpt-4o"
   }'
 ```
 
 ## What It Shows
 
 - The HTTP surface does not change when you switch providers.
-- `AgentRunner` works with both `AnthropicProvider` and `OpenAIProvider`.
-- `GatewayServerConfig.allowed_models` can expose a provider-specific allowlist.
+- `create_agent()` can switch to OpenAI without dropping to `create_gateway_app()`.
+- `provider_config` can pass OpenAI-compatible settings like `base_url`.

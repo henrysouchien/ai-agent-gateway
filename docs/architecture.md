@@ -38,7 +38,7 @@ A single request usually moves through these stages:
 
 It wires together:
 
-- `AnthropicProvider`
+- a resolved `ModelProvider` (`AnthropicProvider`, `OpenAIProvider`, or your own instance)
 - `GatewayServerConfig`
 - `ChatRuntime`
 - `AgentRunner`
@@ -46,7 +46,7 @@ It wires together:
 - optional code execution
 - optional skills and `run_agent`
 
-Use it when you want the shortest path to a working Anthropic-backed agent server.
+Use it when you want the shortest path to a working Anthropic- or OpenAI-backed agent server.
 
 ### `create_gateway_app()`
 
@@ -54,10 +54,10 @@ Use it when you want the shortest path to a working Anthropic-backed agent serve
 
 Use it when you need:
 
-- OpenAI or custom providers
 - custom `needs_approval` rules
 - interceptors
 - channel-aware runtime selection
+- multiple runtime profiles
 - advanced auth, CORS, hook, or budget behavior
 - direct control over `AgentRunner` or `AgentSDKRunner`
 
@@ -272,10 +272,7 @@ Built-in providers:
 
 Both normalize messages, build request params, stream events, and estimate costs through the same contract.
 
-Important limitation:
-
-- `create_agent()` currently hard-wires `AnthropicProvider`
-- multi-provider setups require `create_gateway_app()`
+`create_agent()` can resolve the built-in provider strings or accept a `ModelProvider` instance directly. `create_gateway_app()` remains the escape hatch when you need custom runtime assembly around that provider.
 
 There is also an `AgentSDKRunner` path for SDK-based execution when you want the Anthropic agent SDK instead of the native runner.
 
@@ -295,7 +292,7 @@ Why it exists:
 Start with `create_agent()` when you want:
 
 - one prompt
-- Anthropic
+- Anthropic or OpenAI
 - optional MCP tools
 - optional local tools
 - optional code execution
@@ -303,12 +300,12 @@ Start with `create_agent()` when you want:
 
 Move to `create_gateway_app()` when you need:
 
-- OpenAI
 - custom approval for non-code tools
 - channel-aware runtimes
 - interceptors
 - custom budgets and hooks
 - multiple runtime profiles in one backend
+- full control over provider lifecycle and runtime assembly
 
 Practical sequence:
 

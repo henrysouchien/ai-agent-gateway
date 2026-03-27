@@ -4,7 +4,7 @@ import os
 import time
 from pathlib import Path
 
-from claude_gateway import (
+from agent_gateway import (
   AgentRunner,
   AnthropicProvider,
   ApprovalDecision,
@@ -240,6 +240,6 @@ app = create_gateway_app(
     on_startup=mcp_client.startup,
     on_shutdown=mcp_client.shutdown,
     transcript_dir=TRANSCRIPTS_DIR,
-    log_name="claude_gateway.production_example",
+    log_name="agent_gateway.production_example",
   )
 )

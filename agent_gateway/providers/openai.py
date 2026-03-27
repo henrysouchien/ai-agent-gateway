@@ -11,7 +11,7 @@ from typing import Any, AsyncIterator, Dict
 from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel
 
 
-log = logging.getLogger("claude_gateway.providers.openai")
+log = logging.getLogger("agent_gateway.providers.openai")
 
 _TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 _MAX_TOOL_ID_LEN = 40

@@ -11,7 +11,7 @@ from typing import Any, AsyncIterator, Dict, List
 from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel
 
 
-log = logging.getLogger("claude_gateway.providers.anthropic")
+log = logging.getLogger("agent_gateway.providers.anthropic")
 
 _OAUTH_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 _OAUTH_BETA_SLUGS = [

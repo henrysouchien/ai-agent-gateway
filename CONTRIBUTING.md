@@ -2,7 +2,7 @@
 
 ## Development Setup
 
-From `packages/claude-gateway/`:
+From `packages/agent-gateway/`:
 
 ```bash
 pip install -e ".[dev,anthropic,openai]"
@@ -12,7 +12,7 @@ If you only need one provider, install the matching extra instead.
 
 ## Running Tests
 
-From `packages/claude-gateway/`:
+From `packages/agent-gateway/`:
 
 ```bash
 pytest tests
@@ -60,12 +60,12 @@ If you change MCP, approval, or SSE behavior:
 
 ## Publishing And Sync
 
-The package lives in this monorepo under `packages/claude-gateway/`.
+The package lives in this monorepo under `packages/agent-gateway/`.
 
 The standalone distribution repo is synced with:
 
 ```bash
-../../scripts/sync_claude_gateway.sh
+../../scripts/sync_agent_gateway.sh
 ```
 
 That script copies the full package directory, including `docs/` and `examples/`.

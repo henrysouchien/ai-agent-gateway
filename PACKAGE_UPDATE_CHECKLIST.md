@@ -4,7 +4,7 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 
 ## Always (every change)
 
-- [ ] **Tests pass** — `pytest packages/claude-gateway/tests/` all green
+- [ ] **Tests pass** — `pytest packages/agent-gateway/tests/` all green
 - [ ] **Existing consumer tests pass** — `pytest tests/test_code_execute.py tests/test_tool_dispatcher.py tests/test_channel_registry.py tests/test_run_agent.py` etc.
 - [ ] **New code has docstrings** — every new public function/class gets a docstring at write time
 
@@ -17,7 +17,7 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 ## When adding new features
 
 - [ ] **`docs/architecture.md`** — update if the feature introduces a new concept, flow, or mental model change
-- [ ] **Tests for the feature** — unit tests in `packages/claude-gateway/tests/`, integration tests if it touches consumer wiring
+- [ ] **Tests for the feature** — unit tests in `packages/agent-gateway/tests/`, integration tests if it touches consumer wiring
 - [ ] **Example update or new example** — if the feature is user-facing and changes how someone would use `create_agent()` or `create_gateway_app()`
 
 ## When adding new SSE events or endpoints
@@ -45,5 +45,5 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 
 - [ ] **Commit** the feature + doc updates together
 - [ ] **Bump version** — patch for fixes, minor for features, major for breaking changes
-- [ ] **`scripts/publish_claude_gateway.sh --patch|--minor|--major --yes`**
+- [ ] **`scripts/publish_agent_gateway.sh --patch|--minor|--major --yes`**
 - [ ] **`pip install --upgrade ai-agent-gateway`** locally after publish

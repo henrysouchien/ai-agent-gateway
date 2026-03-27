@@ -5,12 +5,12 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "claude-gateway"
+PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from claude_gateway.skills import SkillLoader
-from claude_gateway.sub_agent import (
+from agent_gateway.skills import SkillLoader
+from agent_gateway.sub_agent import (
   _DEFAULT_EXCLUDED_TOOLS,
   _DEFAULT_SYSTEM_PROMPT_TEMPLATE,
   _SKILL_SYSTEM_PROMPT_TEMPLATE,

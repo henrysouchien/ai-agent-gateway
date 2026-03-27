@@ -1,4 +1,4 @@
-from claude_gateway import create_agent
+from agent_gateway import create_agent
 
 app = create_agent(
   "You can use filesystem tools to inspect and edit files in this example directory. "

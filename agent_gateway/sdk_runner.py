@@ -13,7 +13,7 @@ from .providers.agent_sdk import AgentSDKConfig, estimate_cost, _validate_sdk_ve
 from .runner import ToolResultContext
 
 
-log = logging.getLogger("claude_gateway.sdk_runner")
+log = logging.getLogger("agent_gateway.sdk_runner")
 
 OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | None]]
 OnUsage = Callable[[Dict[str, Any]], None]

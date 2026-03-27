@@ -15,7 +15,7 @@ These projects evolve quickly. Treat this page as a directional architecture com
 | Sessions/auth in core | JWT sessions in core | Bring your own | Bring your own | Bring your own | Bring your own |
 | Human-in-the-loop approval | Built into tool dispatch | Interrupt/checkpoint patterns available | Not a core runtime primitive | Human input patterns are available, but not as a gateway-native approval loop | Not a core runtime primitive |
 | Code execution in core | Docker sandbox plus subprocess fallback | Not in core | Available through integrations/community patterns | Not in core | Not in core |
-| Multi-provider story | Anthropic via `create_agent()`, broader provider control via `create_gateway_app()` | Bring your own model layer | Broad model integration ecosystem | Bring your own model layer | Bring your own model layer |
+| Multi-provider story | Anthropic and OpenAI via `create_agent()`, broader runtime control via `create_gateway_app()` | Bring your own model layer | Broad model integration ecosystem | Bring your own model layer | Bring your own model layer |
 | Best fit | Shipping a chat-facing agent backend quickly | Explicit workflow control flow and durable graph logic | LLM application composition and integration breadth | Team-style simulations and role/task collaboration | MCP-heavy automation and orchestration |
 
 ## How To Read The Differences

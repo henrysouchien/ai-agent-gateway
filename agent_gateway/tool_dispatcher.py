@@ -12,7 +12,7 @@ if TYPE_CHECKING:
   from .mcp_client import McpClientManager
 
 
-log = logging.getLogger("claude_gateway.dispatcher")
+log = logging.getLogger("agent_gateway.dispatcher")
 
 
 ToolResult = Tuple[Optional[Any], Optional[Dict[str, Any]]]

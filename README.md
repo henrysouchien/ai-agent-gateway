@@ -9,7 +9,7 @@ Start with a system prompt. Add MCP tools, local Python tools, skills, and code 
 
 ## Install + Quick Start
 
-`create_agent()` is the fastest path to a working agent server. It uses Anthropic models by default. For OpenAI or custom providers, see [`create_gateway_app()`](./docs/api-reference.md#server).
+`create_agent()` is the fastest path to a working agent server. It uses Anthropic by default, and you can switch to OpenAI with `provider="openai"`. Use [`create_gateway_app()`](./docs/api-reference.md#server) when you need lower-level runtime control.
 
 Install the package and `uvicorn`:
 
@@ -18,10 +18,17 @@ pip install "ai-agent-gateway[anthropic]" uvicorn
 export ANTHROPIC_API_KEY="your-anthropic-api-key"
 ```
 
+For OpenAI instead:
+
+```bash
+pip install "ai-agent-gateway[openai]" uvicorn
+export OPENAI_API_KEY="your-openai-api-key"
+```
+
 Create `agent.py`:
 
 ```python
-from claude_gateway import create_agent
+from agent_gateway import create_agent
 
 app = create_agent("You are a concise research assistant.")
 ```
@@ -71,7 +78,7 @@ Full 5-minute walkthrough: [Quickstart](./docs/quickstart.md)
 - Local Python tool handlers with the same dispatch loop as MCP tools
 - Code execution with Docker preferred and subprocess fallback
 - Markdown skill files (prompt + config per task) and sub-agents via the built-in `run_agent` tool
-- Anthropic and OpenAI provider abstractions when you use `create_gateway_app()`
+- Anthropic and OpenAI providers through `create_agent()` or `create_gateway_app()`
 
 You bring your system prompt, your tools (MCP servers, local Python handlers, or both), and your runtime policy. The gateway handles everything else.
 
@@ -80,7 +87,7 @@ You bring your system prompt, your tools (MCP servers, local Python handlers, or
 ### Tier 1: System Prompt Only
 
 ```python
-from claude_gateway import create_agent
+from agent_gateway import create_agent
 
 app = create_agent("You are a helpful assistant for spreadsheet users.")
 ```
@@ -90,7 +97,7 @@ app = create_agent("You are a helpful assistant for spreadsheet users.")
 This uses an inline MCP server config. The example below assumes Node.js is installed because it runs an `npx`-based MCP server.
 
 ```python
-from claude_gateway import create_agent
+from agent_gateway import create_agent
 
 app = create_agent(
   "You can inspect and edit files when needed.",
@@ -106,7 +113,7 @@ app = create_agent(
 ### Tier 3: Add Local Tools
 
 ```python
-from claude_gateway import create_agent
+from agent_gateway import create_agent
 
 
 async def summarize_csv(tool_input, **_kwargs):
@@ -138,7 +145,7 @@ app = create_agent(
 `code_execution=True` prefers Docker when available and falls back to local subprocess execution otherwise.
 
 ```python
-from claude_gateway import create_agent
+from agent_gateway import create_agent
 
 app = create_agent(
   "Use code execution for calculations and run_agent for focused subtasks.",
@@ -149,10 +156,10 @@ app = create_agent(
 
 ### Graduate: Switch to `create_gateway_app()`
 
-Use `create_gateway_app()` when you need OpenAI, custom approval logic, channel-aware runtimes, interceptors, or production hooks.
+Use `create_gateway_app()` when you need custom approval logic, channel-aware runtimes, interceptors, multiple runtime profiles, or deeper production hooks.
 
 ```python
-from claude_gateway import (
+from agent_gateway import (
   AnthropicProvider, ChatRuntime, GatewayServerConfig, create_gateway_app,
 )
 

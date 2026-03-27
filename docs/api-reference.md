@@ -1,6 +1,6 @@
 # API Reference
 
-This is a hand-written guide to the main public APIs in `claude_gateway`.
+This is a hand-written guide to the main public APIs in `agent_gateway`.
 
 For endpoint payloads and SSE event schemas, see [HTTP API](./http-api.md). For architecture and control flow, see [Architecture](./architecture.md).
 
@@ -12,19 +12,21 @@ Fastest way to create a gateway server from a system prompt.
 
 Use it when you want:
 
-- Anthropic-backed chat
+- Anthropic- or OpenAI-backed chat
 - automatic session and SSE endpoints
 - optional MCP tools
 - optional local tools
 - optional code execution
 - optional skills
 
-Important limitation:
+Key parameters:
 
-- `create_agent()` currently uses `AnthropicProvider` only
+- `provider`: `"anthropic"` (default), `"openai"`, or a `ModelProvider` instance
+- `model`: provider-specific default when omitted for string providers; required for provider instances
+- `provider_config`: merged into the provider auth config last for fields like `base_url` or `compat`
 
 ```python
-from claude_gateway import create_agent
+from agent_gateway import create_agent
 
 app = create_agent("You are a concise assistant.")
 ```
@@ -47,10 +49,10 @@ Low-level FastAPI server factory.
 
 Use it when you need:
 
-- OpenAI
 - custom approval logic
 - interceptors
 - multiple runtime profiles
+- provider lifecycle or runtime wiring beyond what `create_agent()` exposes
 - advanced auth, CORS, or transcript behavior
 
 ### `GatewayServerConfig`
@@ -277,11 +279,11 @@ It standardizes:
 
 ### `AnthropicProvider`
 
-Anthropic adapter used by `create_agent()`.
+Anthropic adapter used by `create_agent(provider="anthropic")`.
 
 ### `OpenAIProvider`
 
-OpenAI-compatible adapter used when you build the app yourself.
+OpenAI-compatible adapter used by `create_agent(provider="openai")` or when you build the app yourself.
 
 ### `ModelInfo`
 

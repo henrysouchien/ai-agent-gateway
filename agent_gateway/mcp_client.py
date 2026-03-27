@@ -24,7 +24,7 @@ except Exception as exc:
     raise RuntimeError(f"MCP client runtime unavailable: {MCP_IMPORT_ERROR}")
 
 
-log = logging.getLogger("claude_gateway.mcp_client")
+log = logging.getLogger("agent_gateway.mcp_client")
 _UNSET = object()
 
 

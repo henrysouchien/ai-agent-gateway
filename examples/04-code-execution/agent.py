@@ -1,4 +1,4 @@
-from claude_gateway import CodeExecutionConfig, create_agent
+from agent_gateway import CodeExecutionConfig, create_agent
 
 app = create_agent(
   "Use code_execute for calculations, quick scripts, and plots. "

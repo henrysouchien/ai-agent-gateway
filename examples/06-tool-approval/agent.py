@@ -3,7 +3,7 @@ import os
 import time
 from pathlib import Path
 
-from claude_gateway import (
+from agent_gateway import (
   AgentRunner,
   AnthropicProvider,
   ApprovalDecision,

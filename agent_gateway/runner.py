@@ -13,7 +13,7 @@ from .providers import ModelInfo, ModelProvider, ThinkingLevel
 from .tool_dispatcher import ToolDispatcher
 
 
-log = logging.getLogger("claude_gateway.runner")
+log = logging.getLogger("agent_gateway.runner")
 MODEL_CONTEXT_LIMIT = 200_000
 CONTEXT_WARNING_PCT = 80
 STREAM_STALL_TIMEOUT = 60  # max seconds between stream events before watchdog cancels
@@ -1279,14 +1279,15 @@ class AgentRunner:
     """
     was_cancelled = False
     try:
-      config = {
-        "auth_mode": str(self._auth_config.get("auth_mode", "api")).strip().lower(),
-        "api_key": str(self._auth_config.get("api_key", "")),
-        "auth_token": str(self._auth_config.get("auth_token", "")),
-        "model": str(self._auth_config.get("model", "claude-sonnet-4-6")),
-        "max_tokens": int(self._auth_config.get("max_tokens", 16000)),
-        "thinking": bool(self._auth_config.get("thinking", True)),
-      }
+      config = dict(self._auth_config)
+      config.update({
+        "auth_mode": str(config.get("auth_mode", "api")).strip().lower(),
+        "api_key": str(config.get("api_key", "")),
+        "auth_token": str(config.get("auth_token", "")),
+        "model": str(config.get("model", "claude-sonnet-4-6")),
+        "max_tokens": int(config.get("max_tokens", 16000)),
+        "thinking": bool(config.get("thinking", True)),
+      })
       if model_override:
         config["model"] = model_override
 

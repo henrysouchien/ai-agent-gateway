@@ -2,7 +2,7 @@
 
 This gets you from `pip install` to a streaming agent response in about five minutes.
 
-`create_agent()` uses Anthropic models by default. For OpenAI or more advanced runtime control, use `create_gateway_app()` instead.
+`create_agent()` uses Anthropic by default. Switch to OpenAI with `provider="openai"` after installing the OpenAI extra, or move to `create_gateway_app()` when you need more runtime control.
 
 ## 1. Install
 
@@ -10,7 +10,13 @@ This gets you from `pip install` to a streaming agent response in about five min
 pip install "ai-agent-gateway[anthropic]" uvicorn
 ```
 
-## 2. Set Your Anthropic API Key
+OpenAI variant:
+
+```bash
+pip install "ai-agent-gateway[openai]" uvicorn
+```
+
+## 2. Set Your Provider Credential
 
 ```bash
 export ANTHROPIC_API_KEY="your-anthropic-api-key"
@@ -18,15 +24,32 @@ export ANTHROPIC_API_KEY="your-anthropic-api-key"
 
 If you prefer OAuth-style auth, `create_agent()` also supports `ANTHROPIC_AUTH_TOKEN`.
 
+For OpenAI:
+
+```bash
+export OPENAI_API_KEY="your-openai-api-key"
+```
+
 ## 3. Create `agent.py`
 
 Save this as `agent.py`:
 
 ```python
-from claude_gateway import create_agent
+from agent_gateway import create_agent
 
 app = create_agent(
   "You are a concise assistant. Answer clearly and use short paragraphs."
+)
+```
+
+To use OpenAI instead:
+
+```python
+from agent_gateway import create_agent
+
+app = create_agent(
+  "You are a concise assistant. Answer clearly and use short paragraphs.",
+  provider="openai",
 )
 ```
 
@@ -126,7 +149,7 @@ Full event and endpoint details: [HTTP API](./http-api.md)
 
 ### The agent returns a stub response
 
-`create_agent()` emits a stub response when no Anthropic credential is configured. Make sure `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set in the shell where you start `uvicorn`.
+`create_agent()` emits a stub response when no provider credential is configured. For Anthropic, set `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. For OpenAI, set `OPENAI_API_KEY` or pass `api_key=...`.
 
 ### My MCP server will not start
 

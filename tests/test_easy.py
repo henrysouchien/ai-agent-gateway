@@ -7,13 +7,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "claude-gateway"
+PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-import claude_gateway.mcp_client as mcp_client_module
-from claude_gateway import EventLog, McpClientManager, ToolResultContext, create_agent
-from claude_gateway.server import ChatRequest
+import agent_gateway.mcp_client as mcp_client_module
+from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_agent
+from agent_gateway.providers import OpenAIProvider
+from agent_gateway.server import ChatRequest
 
 
 def _run(coro):
@@ -24,6 +25,7 @@ def _run(coro):
 def _clear_credential_env(monkeypatch: pytest.MonkeyPatch):
   monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+  monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
 
 def _build_runtime(app, *, request_model: str | None = None):
@@ -97,6 +99,75 @@ def test_create_agent_uses_explicit_auth_token() -> None:
     "auth_token": "tok-123",
     "model": "claude-sonnet-4-6",
     "max_tokens": 16000,
+  }
+
+
+def test_create_agent_openai_provider_string_uses_openai_defaults() -> None:
+  app = create_agent("test", provider="openai")
+
+  config = app.state.gateway_config
+  assert isinstance(config.default_provider, OpenAIProvider)
+  assert config.auth_config == {
+    "model": "gpt-4o",
+    "max_tokens": 16000,
+  }
+  assert config.allowed_models == set()
+
+
+def test_create_agent_accepts_provider_instance_when_model_is_explicit() -> None:
+  provider = OpenAIProvider()
+  app = create_agent("test", provider=provider, model="gpt-4o-mini")
+
+  config = app.state.gateway_config
+  assert config.default_provider is provider
+  assert config.auth_config == {
+    "model": "gpt-4o-mini",
+    "max_tokens": 16000,
+  }
+  assert config.allowed_models == set()
+
+
+def test_create_agent_provider_instance_requires_model() -> None:
+  with pytest.raises(ValueError, match="model is required when passing a ModelProvider instance"):
+    create_agent("test", provider=OpenAIProvider())
+
+
+def test_create_agent_unknown_provider_raises_value_error() -> None:
+  with pytest.raises(ValueError, match="Unknown provider: unknown"):
+    create_agent("test", provider="unknown")
+
+
+def test_create_agent_invalid_provider_type_raises_type_error() -> None:
+  with pytest.raises(TypeError, match="provider must be a string"):
+    create_agent("test", provider=123)  # type: ignore[arg-type]
+
+
+def test_create_agent_openai_does_not_eagerly_read_env_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setenv("OPENAI_API_KEY", "env-openai-key")
+  app = create_agent("test", provider="openai")
+  assert app.state.gateway_config.auth_config == {
+    "model": "gpt-4o",
+    "max_tokens": 16000,
+  }
+
+
+def test_create_agent_openai_uses_explicit_api_key_and_provider_config() -> None:
+  app = create_agent(
+    "test",
+    provider="openai",
+    api_key="sk-openai",
+    auth_token="ignored",
+    provider_config={
+      "base_url": "https://custom.example/v1",
+      "compat": {"streaming": True},
+    },
+  )
+  assert app.state.gateway_config.auth_config == {
+    "api_key": "sk-openai",
+    "model": "gpt-4o",
+    "max_tokens": 16000,
+    "base_url": "https://custom.example/v1",
+    "compat": {"streaming": True},
   }
 
 

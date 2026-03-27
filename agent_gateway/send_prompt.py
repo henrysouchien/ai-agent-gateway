@@ -9,7 +9,7 @@ from .providers.anthropic import AnthropicProvider
 from .providers.base import ThinkingLevel
 
 
-log = logging.getLogger("claude_gateway.send_prompt")
+log = logging.getLogger("agent_gateway.send_prompt")
 
 
 def _infer_auth_config_from_env() -> dict[str, Any]:

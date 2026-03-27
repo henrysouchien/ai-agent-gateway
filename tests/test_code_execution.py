@@ -5,14 +5,14 @@ from pathlib import Path
 from typing import Any, Dict
 
 ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "claude-gateway"
+PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from claude_gateway import SessionStore, ToolDispatcher
-from claude_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution
-from claude_gateway.event_log import EventLog
-from claude_gateway.runner import ToolResultContext
+from agent_gateway import SessionStore, ToolDispatcher
+from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution
+from agent_gateway.event_log import EventLog
+from agent_gateway.runner import ToolResultContext
 
 
 def _run(coro):
@@ -376,8 +376,8 @@ def test_per_bundle_backend_isolation_keeps_distinct_docker_images(monkeypatch) 
       "truncated": False,
     }
 
-  monkeypatch.setattr("claude_gateway.code_execution._backends._docker.DockerBackend.available", lambda self: True)
-  monkeypatch.setattr("claude_gateway.code_execution._backends._docker.DockerBackend.execute", _fake_execute)
+  monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.available", lambda self: True)
+  monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.execute", _fake_execute)
 
   async def _run_test() -> None:
     session_one = SessionStore(ttl=3600).create_session(api_key_hash="hash")

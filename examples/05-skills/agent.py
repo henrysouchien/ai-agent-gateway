@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from claude_gateway import create_agent
+from agent_gateway import create_agent
 
 
 SKILLS_DIR = Path(__file__).parent / "skills"

@@ -10,7 +10,7 @@ from fastapi import FastAPI
 
 from .code_execution import CodeExecutionConfig, build_code_execution
 from .mcp_client import McpClientManager
-from .providers import AnthropicProvider
+from .providers import AnthropicProvider, ModelProvider, OpenAIProvider
 from .runner import AgentRunner, ToolResultContext
 from .server import ChatRequest, ChatRuntime, GatewayServerConfig, _make_request_approval, create_gateway_app
 from .session import AuthManager, Session
@@ -29,10 +29,20 @@ class _NullMcpClient:
     return []
 
 
+_PROVIDER_DEFAULT_MODELS = {
+  "anthropic": "claude-sonnet-4-6",
+  "openai": "gpt-4o",
+}
+
+_ANTHROPIC_ALLOWED_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
+
+
 def create_agent(
   system_prompt: str | list[tuple[str, bool]],
   *,
-  model: str = "claude-sonnet-4-6",
+  provider: str | ModelProvider = "anthropic",
+  model: str | None = None,
+  provider_config: dict[str, Any] | None = None,
   api_key: str | None = None,
   auth_token: str | None = None,
   max_tokens: int = 16_000,
@@ -58,7 +68,7 @@ def create_agent(
   on_startup: Callable[..., Any] | None = None,
   on_shutdown: Callable[..., Any] | None = None,
 ) -> FastAPI:
-  """Create a ready-to-run FastAPI gateway backed by `AnthropicProvider`.
+  """Create a ready-to-run FastAPI gateway backed by a `ModelProvider`.
 
   This is the shortest path from "I have a system prompt" to a streaming agent
   server. The helper wires together:
@@ -71,16 +81,25 @@ def create_agent(
   - optional code execution
   - optional skills and `run_agent`
 
-  `create_agent()` currently supports Anthropic only. If you need OpenAI,
-  channel-specific runtimes, approval rules for arbitrary tools, or direct
-  control over runner construction, use `create_gateway_app()` instead.
+  By default it uses Anthropic, but you can switch to the built-in OpenAI
+  adapter with `provider="openai"` or pass a `ModelProvider` instance directly.
+  Use `create_gateway_app()` when you need channel-specific runtimes, approval
+  rules for arbitrary tools, or direct control over runner construction.
 
   Args:
     system_prompt: Prompt string, or a list of `(text, should_cache)` blocks for
       providers that support prompt caching.
-    model: Default Anthropic model for incoming chat requests.
-    api_key: Anthropic API key. Falls back to `ANTHROPIC_API_KEY`.
-    auth_token: Anthropic OAuth token. Falls back to `ANTHROPIC_AUTH_TOKEN`.
+    provider: Provider name (`"anthropic"` or `"openai"`) or a
+      `ModelProvider` instance.
+    model: Default model for incoming chat requests. When omitted, string
+      providers use their provider-specific default model. Required when you
+      pass a `ModelProvider` instance.
+    provider_config: Provider-specific config merged into the auth config last.
+      Use this for fields like `base_url` or `compat`.
+    api_key: Provider API key. Anthropic falls back to `ANTHROPIC_API_KEY`;
+      other providers read their own env vars internally when supported.
+    auth_token: Anthropic OAuth token. Falls back to
+      `ANTHROPIC_AUTH_TOKEN`. Ignored for non-Anthropic providers.
     max_tokens: Per-turn output token cap passed to the provider.
     mcp_servers: Inline MCP server definitions. When provided, the helper uses
       `McpClientManager(config_path=None, inline_servers=...)`.
@@ -119,15 +138,26 @@ def create_agent(
     Minimal server:
 
     ```python
-    from claude_gateway import create_agent
+    from agent_gateway import create_agent
 
     app = create_agent("You are a concise assistant.")
+    ```
+
+    Switch providers:
+
+    ```python
+    from agent_gateway import create_agent
+
+    app = create_agent(
+      "You are a concise assistant.",
+      provider="openai",
+    )
     ```
 
     Add a local tool:
 
     ```python
-    from claude_gateway import create_agent
+    from agent_gateway import create_agent
 
 
     async def read_status(_tool_input, **_kwargs):
@@ -147,30 +177,55 @@ def create_agent(
     )
     ```
   """
-  resolved_key = (api_key or "").strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip()
-  resolved_token = (auth_token or "").strip() or os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
-
-  if resolved_key:
-    auth_config: dict[str, Any] = {
-      "auth_mode": "api",
-      "api_key": resolved_key,
-      "auth_token": "",
-    }
-  elif resolved_token:
-    auth_config = {
-      "auth_mode": "oauth",
-      "api_key": "",
-      "auth_token": resolved_token,
-    }
+  provider_name: str
+  if isinstance(provider, str):
+    provider_name = provider.strip().lower()
+    if provider_name == "anthropic":
+      provider_instance: ModelProvider = AnthropicProvider()
+    elif provider_name == "openai":
+      provider_instance = OpenAIProvider()
+    else:
+      raise ValueError(f"Unknown provider: {provider}. Use 'anthropic' or 'openai'.")
+    if model is None:
+      model = _PROVIDER_DEFAULT_MODELS.get(provider_name, "gpt-4o")
+  elif isinstance(provider, ModelProvider):
+    provider_instance = provider
+    provider_name = str(getattr(provider, "name", "custom") or "custom")
+    if model is None:
+      raise ValueError("model is required when passing a ModelProvider instance")
   else:
-    auth_config = {
-      "auth_mode": "api",
-      "api_key": "",
-      "auth_token": "",
-    }
+    raise TypeError("provider must be a string ('anthropic', 'openai') or a ModelProvider instance")
+
+  if isinstance(provider_instance, AnthropicProvider):
+    resolved_key = (api_key or "").strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    resolved_token = (auth_token or "").strip() or os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
+
+    if resolved_key:
+      auth_config: dict[str, Any] = {
+        "auth_mode": "api",
+        "api_key": resolved_key,
+        "auth_token": "",
+      }
+    elif resolved_token:
+      auth_config = {
+        "auth_mode": "oauth",
+        "api_key": "",
+        "auth_token": resolved_token,
+      }
+    else:
+      auth_config = {
+        "auth_mode": "api",
+        "api_key": "",
+        "auth_token": "",
+      }
+  else:
+    resolved_key = (api_key or "").strip()
+    auth_config = {"api_key": resolved_key} if resolved_key else {}
 
   auth_config["model"] = model
   auth_config["max_tokens"] = max_tokens
+  if provider_config:
+    auth_config.update(provider_config)
 
   skill_loader = SkillLoader(skills_dir) if skills_dir else None
   mcp_client: McpClientManager | None = None
@@ -186,7 +241,6 @@ def create_agent(
       builtin_tool_names=builtin_names,
     )
 
-  provider = AnthropicProvider()
   app_ref: list[FastAPI | None] = [None]
 
   async def _build_chat_runtime(
@@ -273,7 +327,7 @@ def create_agent(
         event_log=event_log,
         dispatcher=dispatcher,
         session_id=session_id,
-        provider=provider,
+        provider=provider_instance,
         auth_config=auth_config,
         mcp_client=mcp_client,
         get_tool_definitions=_get_tool_defs,
@@ -290,7 +344,7 @@ def create_agent(
       system_prompt=system_prompt,
       build_runner=_build_runner,
       get_tool_definitions=_get_tool_defs,
-      provider=provider,
+      provider=provider_instance,
       model_override=request.model or model,
       max_turns=max_turns,
     )
@@ -317,8 +371,11 @@ def create_agent(
     if mcp_client is not None:
       await mcp_client.shutdown()
 
-  allowed_models = {"claude-sonnet-4-6", "claude-opus-4-6"}
-  allowed_models.add(model)
+  if isinstance(provider_instance, AnthropicProvider):
+    allowed_models = set(_ANTHROPIC_ALLOWED_MODELS)
+    allowed_models.add(model)
+  else:
+    allowed_models = set()
 
   app = create_gateway_app(
     GatewayServerConfig(
@@ -328,7 +385,7 @@ def create_agent(
       cors_origins=["*"] if cors_origins is None else cors_origins,
       allowed_models=allowed_models,
       build_chat_runtime=_build_chat_runtime,
-      default_provider=provider,
+      default_provider=provider_instance,
       auth_config=auth_config,
       mcp_client=mcp_client,
       per_turn_timeout=per_turn_timeout,

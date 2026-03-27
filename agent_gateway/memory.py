@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover - exercised when watchdog is unavailable
   Observer = None  # type: ignore[assignment]
 
 
-log = logging.getLogger("claude_gateway.memory")
+log = logging.getLogger("agent_gateway.memory")
 
 _SYNC_HEADER_PREFIX = "<!-- gateway-memory:"
 _TEMP_SUFFIXES = {".tmp", ".swp", ".swx", ".bak", ".part"}

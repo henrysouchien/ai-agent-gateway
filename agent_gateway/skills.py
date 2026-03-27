@@ -10,7 +10,7 @@ from typing import Any
 
 import yaml
 
-log = logging.getLogger("claude_gateway.skills")
+log = logging.getLogger("agent_gateway.skills")
 _FRONTMATTER_DELIMITER = "---"
 
 
