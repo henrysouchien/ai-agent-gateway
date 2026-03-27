@@ -237,9 +237,29 @@ Parse a standalone skill markdown file into a `SkillProfile`.
 
 Factory for the local `run_agent` handler.
 
+Key parameters:
+
+- `runner_ref`: single-element list holding the active `AgentRunner`
+- `skill_loader`: optional `SkillLoader` for named agent profiles
+- `mcp_client`: MCP client manager shared with the parent
+- `local_tool_handlers`: local handlers forwarded to the sub-agent dispatcher
+- `excluded_tools`: additional tool names to block in sub-agents
+- `on_before_background`: sync callback invoked just before a background task starts
+- `on_background_complete`: async callback invoked when a background task finishes
+
+The handler supports `background=true` in the tool input. When set, the sub-agent runs asynchronously and the tool returns immediately with a `task_id`. Use `get_background_result` to collect results later.
+
 ### `make_run_agent_tool_def(...)`
 
-Factory for the tool schema exposed to the model.
+Factory for the tool schema exposed to the model. Includes the `background` boolean property.
+
+### `make_get_background_result_handler(runner_ref)`
+
+Factory for the local `get_background_result` handler. Delegates to `AgentRunner.get_background_result()` to poll or wait for background sub-agent tasks.
+
+### `make_get_background_result_tool_def()`
+
+Factory for the `get_background_result` tool schema. The tool accepts `task_id` (or `"*"` for all tasks), an optional `wait` boolean, and an optional `timeout` (clamped to 120 seconds).
 
 ## Providers
 

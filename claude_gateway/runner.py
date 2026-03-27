@@ -77,6 +77,18 @@ class StreamTurnResult:
   content_blocks: List[Dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass
+class BackgroundTask:
+  task_id: str
+  agent_name: str | None
+  asyncio_task: asyncio.Task[Any] | None
+  started_at: float
+  result: Dict[str, Any] | None = None
+  error: Dict[str, Any] | None = None
+  completed: bool = False
+  completed_at: float | None = None
+
+
 class CostAccumulator:
   """Running cost tracker shared across parent and sub-agent runners."""
 
@@ -100,6 +112,8 @@ OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | No
 OnUsage = Callable[[Dict[str, Any]], None]
 OnToolTiming = Callable[[str, str, str | None, int, bool, int], None]
 OnMaxTurns = Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
+BackgroundTaskHandler = Callable[[Dict[str, Any]], Awaitable[Tuple[Optional[Any], Optional[Dict[str, Any]]]]]
+BackgroundTaskCallback = Callable[[BackgroundTask], Awaitable[None] | None]
 
 
 class AgentRunner:
@@ -183,8 +197,11 @@ class AgentRunner:
       self._cost_accumulator = CostAccumulator(self._max_budget_usd)
     self._last_reported_cost = 0.0
     self._max_concurrent_sub_agents = max_concurrent_sub_agents
+    self._max_background_tasks = max_concurrent_sub_agents or 3
     self._sub_agent_semaphore: asyncio.Semaphore | None = None
     self._active_client: Any | None = None
+    self._background_tasks: Dict[str, BackgroundTask] = {}
+    self._background_seq = 0
 
   def _append(self, event: Dict[str, Any]) -> None:
     self._log.append(event)
@@ -441,6 +458,230 @@ class AgentRunner:
     if isinstance(extra_blocks, list):
       return [block for block in extra_blocks if isinstance(block, dict)]
     return []
+
+  def _ensure_sub_agent_semaphore(self) -> asyncio.Semaphore | None:
+    if self._sub_agent_semaphore is None and self._max_concurrent_sub_agents is not None:
+      self._sub_agent_semaphore = asyncio.Semaphore(self._max_concurrent_sub_agents)
+    return self._sub_agent_semaphore
+
+  @staticmethod
+  def _background_timeout_value(raw_timeout: Any) -> float:
+    timeout = 60.0 if raw_timeout is None else float(raw_timeout)
+    return max(0.0, min(timeout, 120.0))
+
+  def _background_elapsed_seconds(self, bg_task: BackgroundTask) -> int:
+    end_t = bg_task.completed_at if bg_task.completed_at is not None else time.time()
+    return max(0, int(end_t - bg_task.started_at))
+
+  def _background_task_payload(self, bg_task: BackgroundTask) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+      "task_id": bg_task.task_id,
+      "status": "running",
+    }
+    if bg_task.agent_name:
+      payload["agent"] = bg_task.agent_name
+
+    elapsed = self._background_elapsed_seconds(bg_task)
+    if bg_task.completed:
+      payload["elapsed_seconds"] = elapsed
+      if bg_task.error is not None:
+        payload["status"] = "error"
+        payload["error"] = bg_task.error
+        return payload
+      payload["status"] = "completed"
+      if isinstance(bg_task.result, dict):
+        for key, value in bg_task.result.items():
+          if key not in {"task_id", "status", "agent"}:
+            payload[key] = value
+      elif bg_task.result is not None:
+        payload["result"] = bg_task.result
+      return payload
+
+    payload["elapsed_seconds"] = elapsed
+    return payload
+
+  def _background_task_reminder_text(self) -> str:
+    if not self._background_tasks:
+      return ""
+    entries: List[str] = []
+    for bg_task in sorted(self._background_tasks.values(), key=lambda task: task.started_at):
+      status = "completed"
+      if not bg_task.completed:
+        status = f"running, {self._background_elapsed_seconds(bg_task)}s"
+      elif bg_task.error is not None:
+        status = "error"
+      label = bg_task.task_id
+      if bg_task.agent_name:
+        label += f" ({bg_task.agent_name}, {status})"
+      else:
+        label += f" ({status})"
+      entries.append(label)
+    return "[Background tasks active: " + ", ".join(entries) + "]"
+
+  @staticmethod
+  def _inject_system_prompt_reminder(
+    system_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
+    reminder: str,
+  ) -> Optional[Union[str, List[Tuple[str, bool]]]]:
+    if not reminder:
+      return system_prompt
+    if isinstance(system_prompt, list):
+      return [*system_prompt, (reminder, False)]
+    base = system_prompt or ""
+    if base:
+      return f"{base}\n\n{reminder}"
+    return reminder
+
+  async def _run_background_agent(
+    self,
+    bg_task: BackgroundTask,
+    handler: BackgroundTaskHandler,
+    tool_input: Dict[str, Any],
+    call_index: int,
+    on_complete: BackgroundTaskCallback | None = None,
+  ) -> None:
+    try:
+      semaphore = self._ensure_sub_agent_semaphore()
+      if semaphore is not None:
+        async with semaphore:
+          result, error = await handler(tool_input, call_index=call_index)
+      else:
+        result, error = await handler(tool_input, call_index=call_index)
+      bg_task.result = result if isinstance(result, dict) else result
+      bg_task.error = error
+    except asyncio.CancelledError:
+      bg_task.error = {"code": "cancelled", "message": "Background task was cancelled"}
+    except Exception as exc:
+      bg_task.error = {"code": "background_error", "message": str(exc)}
+    finally:
+      bg_task.completed = True
+      bg_task.completed_at = time.time()
+      if on_complete is not None:
+        try:
+          maybe_awaitable = on_complete(bg_task)
+          if asyncio.iscoroutine(maybe_awaitable):
+            await maybe_awaitable
+        except Exception:
+          pass
+
+  async def _register_background_task(
+    self,
+    *,
+    tool_input: Dict[str, Any],
+    handler: BackgroundTaskHandler,
+    agent_name: str | None = None,
+    on_complete: BackgroundTaskCallback | None = None,
+    on_before_start: Callable[[], None] | None = None,
+  ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    active_count = sum(1 for bg_task in self._background_tasks.values() if not bg_task.completed)
+    if active_count >= self._max_background_tasks:
+      return None, {
+        "code": "max_background_tasks",
+        "message": (
+          f"Background task limit reached ({self._max_background_tasks}). "
+          "Wait for an existing background task to finish before launching another."
+        ),
+      }
+
+    call_index = self._background_seq
+    task_id = f"bg_{call_index}"
+    self._background_seq += 1
+
+    if on_before_start is not None:
+      try:
+        on_before_start()
+      except Exception as exc:
+        log.warning("[%s] on_before_start hook failed (non-fatal): %s", self._sid, exc)
+
+    bg_task = BackgroundTask(
+      task_id=task_id,
+      agent_name=agent_name,
+      asyncio_task=None,
+      started_at=time.time(),
+    )
+    self._background_tasks[task_id] = bg_task
+    bg_task.asyncio_task = asyncio.create_task(
+      self._run_background_agent(
+        bg_task,
+        handler,
+        dict(tool_input),
+        call_index,
+        on_complete=on_complete,
+      ),
+      name=task_id,
+    )
+
+    result: Dict[str, Any] = {
+      "task_id": task_id,
+      "status": "running",
+    }
+    if agent_name:
+      result["agent"] = agent_name
+    return result, None
+
+  async def get_background_result(
+    self,
+    tool_input: Dict[str, Any],
+    **_: Any,
+  ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    raw_task_id = tool_input.get("task_id")
+    if not isinstance(raw_task_id, str) or not raw_task_id.strip():
+      return None, {"code": "invalid_input", "message": "task_id is required"}
+    task_id = raw_task_id.strip()
+
+    wait = tool_input.get("wait", False)
+    if not isinstance(wait, bool):
+      return None, {"code": "invalid_input", "message": "wait must be a boolean"}
+
+    raw_timeout = tool_input.get("timeout")
+    if raw_timeout is not None and not isinstance(raw_timeout, (int, float)):
+      return None, {"code": "invalid_input", "message": "timeout must be a number"}
+    timeout = self._background_timeout_value(raw_timeout)
+
+    if task_id == "*":
+      selected = list(sorted(self._background_tasks.values(), key=lambda task: task.started_at))
+      if wait:
+        pending = [
+          bg_task.asyncio_task
+          for bg_task in selected
+          if bg_task.asyncio_task is not None and not bg_task.completed
+        ]
+        if pending:
+          await asyncio.wait(pending, timeout=timeout)
+      return {"tasks": [self._background_task_payload(bg_task) for bg_task in selected]}, None
+
+    bg_task = self._background_tasks.get(task_id)
+    if bg_task is None:
+      return None, {"code": "not_found", "message": f"Unknown background task: {task_id}"}
+
+    if wait and bg_task.asyncio_task is not None and not bg_task.completed:
+      await asyncio.wait([bg_task.asyncio_task], timeout=timeout)
+    return self._background_task_payload(bg_task), None
+
+  async def _shutdown_background_tasks(self, was_cancelled: bool) -> None:
+    pending = [
+      bg_task.asyncio_task
+      for bg_task in self._background_tasks.values()
+      if bg_task.asyncio_task is not None and not bg_task.completed
+    ]
+    if not pending:
+      return
+
+    try:
+      if was_cancelled:
+        for task in pending:
+          task.cancel()
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5.0)
+        return
+
+      _done, still_pending = await asyncio.wait(pending, timeout=30.0)
+      if not still_pending:
+        return
+      for task in still_pending:
+        task.cancel()
+      await asyncio.wait_for(asyncio.gather(*still_pending, return_exceptions=True), timeout=5.0)
+    except asyncio.TimeoutError:
+      pass
 
   def _call_on_tool_timing(
     self,
@@ -872,7 +1113,7 @@ class AgentRunner:
           tool_input,
           call_index=call_index,
         )
-        if self._tool_call_timeout is not None and tool_name != "run_agent":
+        if self._tool_call_timeout is not None and tool_name not in ("run_agent", "get_background_result"):
           try:
             result, error = await asyncio.wait_for(dispatch_coro, timeout=self._tool_call_timeout)
           except asyncio.TimeoutError:
@@ -1036,6 +1277,7 @@ class AgentRunner:
       - appends `max_turns_reached` or `budget_exceeded` when limits stop the
         loop early
     """
+    was_cancelled = False
     try:
       config = {
         "auth_mode": str(self._auth_config.get("auth_mode", "api")).strip().lower(),
@@ -1146,14 +1388,11 @@ class AgentRunner:
         "cache_read_input_tokens": 0,
       }
       self._last_reported_cost = 0.0
-      self._sub_agent_semaphore = (
-        asyncio.Semaphore(self._max_concurrent_sub_agents)
-        if self._max_concurrent_sub_agents is not None
-        else None
-      )
+      self._ensure_sub_agent_semaphore()
       turn_count = 0
       tools_used: List[str] = []
       current_messages = list(messages)
+      inject_background_task_reminder = False
 
       while True:
         turn_count += 1
@@ -1218,11 +1457,17 @@ class AgentRunner:
             },
           )
 
+        turn_system_prompt = (
+          self._inject_system_prompt_reminder(system_prompt, self._background_task_reminder_text())
+          if inject_background_task_reminder
+          else system_prompt
+        )
+        inject_background_task_reminder = False
         turn_result = await self._stream_turn(
           client=client,
           config=config,
           model_info=model_info,
-          system_prompt=system_prompt,
+          system_prompt=turn_system_prompt,
           current_messages=current_messages,
           base_kwargs=base_kwargs,
           max_tokens=max_tokens,
@@ -1325,6 +1570,7 @@ class AgentRunner:
                 "stop_reason": turn.stop_reason,
               }
             )
+            inject_background_task_reminder = True
             continue
           break
 
@@ -1362,6 +1608,24 @@ class AgentRunner:
               tool_call_input: Dict[str, Any],
               current_call_index: int,
             ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
+              if self._sub_agent_semaphore is not None:
+                if not bool(tool_call_input.get("background")):
+                  async with self._sub_agent_semaphore:
+                    return await self._execute_single_tool(
+                      tool_call_id,
+                      tool_call_name,
+                      tool_call_input,
+                      base_kwargs,
+                      call_index=current_call_index,
+                    )
+              if self._sub_agent_semaphore is not None and bool(tool_call_input.get("background")):
+                return await self._execute_single_tool(
+                  tool_call_id,
+                  tool_call_name,
+                  tool_call_input,
+                  base_kwargs,
+                  call_index=current_call_index,
+                )
               if self._sub_agent_semaphore is not None:
                 async with self._sub_agent_semaphore:
                   return await self._execute_single_tool(
@@ -1486,5 +1750,9 @@ class AgentRunner:
       )
 
       await self._close_client(client, timeout=5.0)
+    except asyncio.CancelledError:
+      was_cancelled = True
+      raise
     finally:
+      await self._shutdown_background_tasks(was_cancelled)
       await self.force_close()

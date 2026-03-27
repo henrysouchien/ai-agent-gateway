@@ -176,8 +176,9 @@ def test_create_agent_skills_dir_registers_run_agent_handler_tool_def_and_builti
   tool_defs = runtime.get_tool_definitions()
 
   assert "run_agent" in runner._dispatcher._local
-  assert any(tool["name"] == "run_agent" for tool in tool_defs)
-  assert app.state.gateway_config.mcp_client._builtin_tool_names >= {"run_agent"}
+  assert "get_background_result" in runner._dispatcher._local
+  assert {tool["name"] for tool in tool_defs} >= {"run_agent", "get_background_result"}
+  assert app.state.gateway_config.mcp_client._builtin_tool_names >= {"run_agent", "get_background_result"}
 
 
 def test_create_agent_skills_dir_does_not_duplicate_user_run_agent_tool_definition(tmp_path: Path) -> None:
@@ -193,7 +194,9 @@ def test_create_agent_skills_dir_does_not_duplicate_user_run_agent_tool_definiti
 
   _session, runtime = _build_runtime(app)
 
-  assert runtime.get_tool_definitions() == [tool_def]
+  tool_defs = runtime.get_tool_definitions()
+  assert [tool for tool in tool_defs if tool["name"] == "run_agent"] == [tool_def]
+  assert any(tool["name"] == "get_background_result" for tool in tool_defs)
 
 
 def test_create_agent_skills_dir_respects_custom_run_agent_handler_override(tmp_path: Path) -> None:

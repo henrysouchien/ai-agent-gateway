@@ -249,6 +249,18 @@ Sub-agents are intentionally constrained:
 - they inherit provider and budget context
 - they cannot recursively spawn more sub-agents because `run_agent` is excluded by default
 
+### Background Sub-Agents
+
+The agent can run sub-agents in the background for parallel research by passing `background=true` to `run_agent`. This returns immediately with a `task_id` so the parent agent can continue working, then collect results later with `get_background_result`.
+
+Key details:
+
+- background tasks are stored on the `AgentRunner`, not the session
+- a concurrency semaphore limits parallel sub-agents (default 3)
+- the runner injects a system prompt reminder listing active background tasks after compaction pauses, so the model stays aware of pending work
+- on runner shutdown, pending background tasks are awaited (up to 30 seconds) or cancelled
+- `on_before_background` and `on_background_complete` callbacks let consumers hook into the lifecycle
+
 ## Providers
 
 The provider abstraction lives under `ModelProvider`.

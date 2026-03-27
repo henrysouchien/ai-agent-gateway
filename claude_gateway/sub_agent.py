@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import datetime
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .event_log import EventLog
 from .skills import SkillLoader
 from .tool_dispatcher import ToolDispatcher
 
-_DEFAULT_EXCLUDED_TOOLS = {"run_agent"}
+_DEFAULT_EXCLUDED_TOOLS = {"run_agent", "get_background_result"}
 _SKILL_SYSTEM_PROMPT_TEMPLATE = (
   "{skill_prompt}\n\n"
   "Today's date: {date}\n\n"
@@ -37,6 +37,8 @@ def make_run_agent_handler(
   default_timeout: float = 300.0,
   default_max_tokens: int = 32000,
   allowed_models: set[str] | None = None,
+  on_before_background: Callable[[str | None], None] | None = None,
+  on_background_complete: Callable[[Any], Awaitable[None]] | None = None,
 ):
   """Build the local handler used by the `run_agent` tool.
 
@@ -66,6 +68,9 @@ def make_run_agent_handler(
     raw_model = tool_input.get("model")
     if raw_model is not None and not isinstance(raw_model, str):
       return None, {"code": "invalid_input", "message": "model must be a string"}
+    background = tool_input.get("background", False)
+    if not isinstance(background, bool):
+      return None, {"code": "invalid_input", "message": "background must be a boolean"}
 
     call_index = int(kwargs.get("call_index", 0) or 0)
 
@@ -120,21 +125,58 @@ def make_run_agent_handler(
       session_id=getattr(runner, "_full_session_id", ""),
     )
 
-    return await runner.spawn_sub_agent(
-      task,
-      model=effective_model,
-      system_prompt=system_prompt,
-      dispatcher=sub_dispatcher,
-      excluded_tools=effective_excluded,
-      max_turns=effective_max_turns,
-      timeout=effective_timeout,
-      client_timeout=90,
-      max_tokens=default_max_tokens,
-      call_index=call_index,
-      on_sub_event=lambda event, _sid: sub_log.append(event),
-    )
+    async def _dispatch_sub_agent(_background_input: dict[str, Any], **background_kwargs: Any):
+      background_call_index = int(background_kwargs.get("call_index", call_index) or 0)
+      return await runner.spawn_sub_agent(
+        task,
+        model=effective_model,
+        system_prompt=system_prompt,
+        dispatcher=sub_dispatcher,
+        excluded_tools=effective_excluded,
+        max_turns=effective_max_turns,
+        timeout=effective_timeout,
+        client_timeout=90,
+        max_tokens=default_max_tokens,
+        call_index=background_call_index,
+        on_sub_event=lambda event, _sid: sub_log.append(event),
+      )
+
+    if background:
+      return await runner._register_background_task(
+        tool_input=dict(tool_input),
+        handler=_dispatch_sub_agent,
+        agent_name=agent_name,
+        on_before_start=(lambda: on_before_background(agent_name)) if on_before_background else None,
+        on_complete=on_background_complete,
+      )
+    return await _dispatch_sub_agent(tool_input, call_index=call_index)
 
   return _handle_run_agent
+
+
+def make_get_background_result_handler(runner_ref: list[Any]):
+  """Build the local handler used by the ``get_background_result`` tool.
+
+  The returned handler delegates to ``AgentRunner.get_background_result()``,
+  which polls or waits for background sub-agent tasks registered via
+  ``run_agent(background=true)``.
+
+  Args:
+    runner_ref: Single-element list holding the active ``AgentRunner`` (or
+      ``None`` before the runner is initialized).
+
+  Returns:
+    An async handler with signature ``(tool_input, **kwargs) -> (result, error)``.
+  """
+
+  async def _handle_get_background_result(tool_input: dict[str, Any], **kwargs: Any):
+    _ = kwargs
+    runner = runner_ref[0]
+    if runner is None:
+      return None, {"code": "internal_error", "message": "Sub-agent runner not initialized"}
+    return await runner.get_background_result(tool_input)
+
+  return _handle_get_background_result
 
 
 def make_run_agent_tool_def(skill_loader: SkillLoader | None = None) -> dict[str, Any]:
@@ -170,10 +212,62 @@ def make_run_agent_tool_def(skill_loader: SkillLoader | None = None) -> dict[str
           "type": "string",
           "description": "Optional model override.",
         },
+        "background": {
+          "type": "boolean",
+          "description": (
+            "If true, run the sub-agent in the background and return immediately with a task_id. "
+            "Use get_background_result to retrieve the result later."
+          ),
+          "default": False,
+        },
       },
       "required": ["task"],
     },
   }
 
 
-__all__ = ["make_run_agent_handler", "make_run_agent_tool_def"]
+def make_get_background_result_tool_def() -> dict[str, Any]:
+  """Build the public tool schema for ``get_background_result``.
+
+  The tool lets the model poll or wait for background sub-agent tasks
+  launched via ``run_agent(background=true)``.  Pass ``task_id='*'`` to
+  inspect all tracked background tasks at once.
+
+  Returns:
+    A tool-definition dict suitable for inclusion in ``get_tool_definitions``.
+  """
+  return {
+    "name": "get_background_result",
+    "description": (
+      "Check status or wait for a background sub-agent task. Poll returns immediately. "
+      "Use task_id='*' to inspect all tracked background tasks."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "Task ID from run_agent(background=true), or '*' for all tasks.",
+        },
+        "wait": {
+          "type": "boolean",
+          "description": "If true, wait up to timeout seconds for completion.",
+          "default": False,
+        },
+        "timeout": {
+          "type": "number",
+          "description": "Maximum seconds to wait (clamped to 120).",
+          "default": 60,
+        },
+      },
+      "required": ["task_id"],
+    },
+  }
+
+
+__all__ = [
+  "make_get_background_result_handler",
+  "make_get_background_result_tool_def",
+  "make_run_agent_handler",
+  "make_run_agent_tool_def",
+]

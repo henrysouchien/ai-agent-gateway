@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "claude-gateway"
@@ -13,6 +14,8 @@ from claude_gateway.sub_agent import (
   _DEFAULT_EXCLUDED_TOOLS,
   _DEFAULT_SYSTEM_PROMPT_TEMPLATE,
   _SKILL_SYSTEM_PROMPT_TEMPLATE,
+  make_get_background_result_handler,
+  make_get_background_result_tool_def,
   make_run_agent_handler,
   make_run_agent_tool_def,
 )
@@ -38,10 +41,18 @@ class _StubRunner:
   def __init__(self) -> None:
     self._full_session_id = "session-sub-agent"
     self.calls: list[dict] = []
+    self.background_calls: list[dict] = []
 
   async def spawn_sub_agent(self, task: str, **kwargs):
     self.calls.append({"task": task, **kwargs})
     return {"response": "ok"}, None
+
+  async def _register_background_task(self, **kwargs):
+    self.background_calls.append(dict(kwargs))
+    return {"task_id": "bg_0", "status": "running"}, None
+
+  async def get_background_result(self, tool_input: dict[str, Any]):
+    return {"task_id": tool_input["task_id"], "status": "completed"}, None
 
 
 def _write_skill(skills_dir: Path, name: str, body: str) -> None:
@@ -295,3 +306,39 @@ def test_make_run_agent_tool_def_has_no_skill_suffix_without_skills() -> None:
 
   assert "Available agents:" not in tool_def["description"]
   assert "One of:" not in tool_def["input_schema"]["properties"]["agent"]["description"]
+
+
+def test_make_run_agent_handler_background_registers_task(tmp_path: Path) -> None:
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(tmp_path / "skills"),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={"keep_tool": _dummy_tool},
+  )
+
+  result, error = _run(handler({"task": "Collect", "background": True}))
+
+  assert error is None
+  assert result == {"task_id": "bg_0", "status": "running"}
+  assert runner.calls == []
+  assert len(runner.background_calls) == 1
+  assert runner.background_calls[0]["agent_name"] is None
+
+
+def test_make_get_background_result_handler_proxies_to_runner() -> None:
+  runner = _StubRunner()
+  handler = make_get_background_result_handler([runner])
+
+  result, error = _run(handler({"task_id": "bg_7"}))
+
+  assert error is None
+  assert result == {"task_id": "bg_7", "status": "completed"}
+
+
+def test_make_get_background_result_tool_def_has_expected_schema() -> None:
+  tool_def = make_get_background_result_tool_def()
+
+  assert tool_def["name"] == "get_background_result"
+  assert set(tool_def["input_schema"]["properties"]) == {"task_id", "wait", "timeout"}
+  assert tool_def["input_schema"]["required"] == ["task_id"]

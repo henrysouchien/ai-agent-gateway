@@ -178,8 +178,8 @@ def create_agent(
     builtin_names = set((tool_handlers or {}).keys())
     if code_execution:
       builtin_names |= {"code_execute", "code_execute_status"}
-    if skills_dir:
-      builtin_names.add("run_agent")
+    if skills_dir and "run_agent" not in builtin_names:
+      builtin_names |= {"run_agent", "get_background_result"}
     mcp_client = McpClientManager(
       inline_servers=mcp_servers,
       config_path=mcp_config_path,
@@ -207,7 +207,12 @@ def create_agent(
       extra_tool_defs.extend(ce_bundle.tool_definitions)
 
     if skill_loader is not None and "run_agent" not in local_handlers:
-      from .sub_agent import make_run_agent_handler, make_run_agent_tool_def
+      from .sub_agent import (
+        make_get_background_result_handler,
+        make_get_background_result_tool_def,
+        make_run_agent_handler,
+        make_run_agent_tool_def,
+      )
 
       local_handlers["run_agent"] = make_run_agent_handler(
         runner_ref,
@@ -218,8 +223,12 @@ def create_agent(
         default_model=model,
         allowed_models=allowed_models,
       )
+      if "get_background_result" not in local_handlers:
+        local_handlers["get_background_result"] = make_get_background_result_handler(runner_ref)
       if not any(definition.get("name") == "run_agent" for definition in extra_tool_defs):
         extra_tool_defs.append(make_run_agent_tool_def(skill_loader))
+      if not any(definition.get("name") == "get_background_result" for definition in extra_tool_defs):
+        extra_tool_defs.append(make_get_background_result_tool_def())
 
     def _get_tool_defs() -> list[dict[str, Any]]:
       defs: list[dict[str, Any]] = []
