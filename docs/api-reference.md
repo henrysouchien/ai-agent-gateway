@@ -24,12 +24,125 @@ Key parameters:
 - `provider`: `"anthropic"` (default), `"openai"`, or a `ModelProvider` instance
 - `model`: provider-specific default when omitted for string providers; required for provider instances
 - `provider_config`: merged into the provider auth config last for fields like `base_url` or `compat`
+- `outputs_dir`: directory for named-skill output files; stale same-day outputs are cleaned before background `run_agent` launch
 
 ```python
 from agent_gateway import create_agent
 
 app = create_agent("You are a concise assistant.")
 ```
+
+### `run_autonomous()`
+
+Run the agent loop without the HTTP server and return a `RunOutput`.
+
+Use it when you want:
+
+- one autonomous task or batch job
+- optional MCP tools and local tools
+- optional skills, state persistence, and completion delivery
+
+Key parameters:
+
+- `provider`: `"anthropic"` (default), `"openai"`, or a `ModelProvider` instance
+- `model`: provider-specific default when omitted for string providers; required for provider instances
+- `auth_config`: explicit auth dict; wins over `api_key`/`auth_token` if provided
+- `skills_dir`: directory of markdown skill files used by `run_agent`
+- `outputs_dir`: directory for named-skill output files; stale same-day outputs are cleaned before background `run_agent` launch
+- `state_dir`: optional directory for persisted run state (JSON load/save between runs)
+- `delivery`: optional `DeliveryConfig` for webhook, Telegram, briefing file, or callback output
+- `max_concurrent_sub_agents`: optional concurrency limit for sub-agents
+- `compaction_instructions`: optional instructions for context compaction
+
+Returns `RunOutput` with `response`, `tools_used`, `usage`, `error`, `timed_out`, `budget_exceeded`, `max_turns_reached`.
+
+### `run_autonomous_sync()`
+
+Synchronous wrapper around `run_autonomous()` for cron scripts and batch jobs. Same parameters, same return type.
+
+### `RunOutput`
+
+Result of an autonomous run. Fields:
+
+- `response: str` — final model response text
+- `tools_used: list[str]` — tool names called during the run
+- `usage: dict` — token usage from the provider
+- `error: str | None` — error message if the run failed
+- `timed_out: bool` — True if the run hit the wall-clock timeout
+- `budget_exceeded: bool` — True if estimated cost exceeded `max_budget_usd`
+- `max_turns_reached: bool` — True if the model loop hit `max_turns`
+
+### `DeliveryConfig`
+
+Where results go after a run completes.
+
+- `on_complete`: async/sync callback receiving `(RunOutput, state_dict)`
+- `telegram_bot_token`, `telegram_chat_id`, `telegram_label`: built-in Telegram delivery
+- `briefing_file`: path to an artifact file to send as follow-up content
+- `webhook_url`: HTTP POST endpoint for the run summary
+- `format_message`: optional custom formatter `(RunOutput, state) -> str`
+
+### `run_output_exit_code()` and `run_output_outcome()`
+
+Map a `RunOutput` to process exit codes (0/1/2/3/124) or semantic outcome strings (`"success"`, `"timeout"`, `"error"`, `"budget_exceeded"`, `"max_turns"`). Exit codes are for process semantics; outcomes are for persisted state tracking.
+
+### `HeartbeatLoop`
+
+Persistent agent loop that calls a run function at regular intervals with quiet suppression.
+
+Use it when you want:
+
+- periodic "anything need attention?" check-ins
+- automatic suppression of "nothing to report" responses via `HEARTBEAT_OK` token
+- active hours window (e.g., only run during market hours)
+- exponential backoff on errors with automatic recovery
+
+```python
+from functools import partial
+from agent_gateway import run_autonomous, HeartbeatLoop, HeartbeatConfig
+
+loop = HeartbeatLoop(
+    run_fn=partial(run_autonomous, system_prompt="...", initial_message="...", ...),
+    config=HeartbeatConfig(interval_seconds=1800, active_hours=(6, 22)),
+    on_alert=my_delivery_fn,
+)
+await loop.start()  # blocks until loop.stop()
+```
+
+Callbacks:
+
+- `on_alert(output, state)`: called when the agent has something actionable to report
+- `on_quiet(output, state)`: called when `HEARTBEAT_OK` is detected and suppressed
+- `on_error(error_or_output, state)`: called on `RunOutput.error`, `timed_out`, or exceptions
+- `on_tick(tick_result, state)`: called after every tick (including skipped/error)
+
+All callbacks are exception-safe — failures are logged but never kill the loop.
+
+### `HeartbeatConfig`
+
+- `interval_seconds`: time between ticks (default 1800 = 30 minutes)
+- `active_hours`: `(start, end)` half-open `[start, end)`, supports overnight `(22, 6)`, `None` = always active
+- `timezone`: IANA timezone for active hours (default `"UTC"`)
+- `quiet_threshold`: max chars after stripping `HEARTBEAT_OK` to classify as quiet (default 20)
+- `backoff_steps`: delay sequence on errors, replaces interval (default `[30, 60, 300, 900, 3600]`)
+- `checklist_path`: path to HEARTBEAT.md; skip run if file is empty (saves API cost)
+- `state_dir`: persist `heartbeat_state.json` (tick counts, errors)
+- `max_ticks`: optional cap for testing or bounded runs
+
+### `TickResult`
+
+Result of a single heartbeat tick. Fields: `output`, `skipped`, `skip_reason`, `alert`, `error`, `stripped_response`, `tick_number`, `started_at`, `duration_seconds`.
+
+### State and Delivery Helpers
+
+- `load_state(state_dir, state_file)` / `save_state(state_dir, state, state_file)`: atomic JSON persistence
+- `extract_state_update(text)`: parse `## STATE_UPDATE_JSON` fenced blocks from model response
+- `build_state_payload(prev, model_state, output, ...)`: merge state with run metadata
+- `deliver(config, output, state)`: dispatch to Telegram + webhook + callback
+- `format_run_summary(output, ...)`: generic run summary formatter
+- `send_telegram(message, bot_token, chat_id)`: async Telegram message via httpx
+- `send_telegram_file(path, bot_token, chat_id)`: send file content as chunked messages
+- `strip_heartbeat_ok(text)`: strip leading/trailing HEARTBEAT_OK token, return `(stripped, had_token)`
 
 ### `send_prompt()` and `send_prompt_sync()`
 

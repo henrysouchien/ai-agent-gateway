@@ -79,6 +79,8 @@ Full 5-minute walkthrough: [Quickstart](./docs/quickstart.md)
 - Code execution with Docker preferred and subprocess fallback
 - Markdown skill files (prompt + config per task) and sub-agents via the built-in `run_agent` tool
 - Anthropic and OpenAI providers through `create_agent()` or `create_gateway_app()`
+- **Headless execution** via `run_autonomous()` for cron jobs and batch agents — same tool/MCP/skill infrastructure, no HTTP server
+- **Heartbeat loop** via `HeartbeatLoop` for persistent agents that check in periodically with quiet suppression, active hours, and backoff
 
 You bring your system prompt, your tools (MCP servers, local Python handlers, or both), and your runtime policy. The gateway handles everything else.
 
@@ -154,6 +156,37 @@ app = create_agent(
 )
 ```
 
+### Tier 5: Headless / Autonomous
+
+Run the same agent loop without an HTTP server — for cron jobs, batch tasks, or persistent daemons.
+
+```python
+from agent_gateway import run_autonomous_sync, DeliveryConfig
+
+result = run_autonomous_sync(
+  "You are an operations monitor. Call check_status before replying.",
+  "Check the current status and send a summary.",
+  tool_handlers={"check_status": check_status},
+  tool_definitions=[...],
+  state_dir="./state",
+  delivery=DeliveryConfig(telegram_bot_token="...", telegram_chat_id="..."),
+)
+```
+
+For persistent agents that check in periodically, wrap with `HeartbeatLoop`:
+
+```python
+from functools import partial
+from agent_gateway import run_autonomous, HeartbeatLoop, HeartbeatConfig
+
+loop = HeartbeatLoop(
+  run_fn=partial(run_autonomous, system_prompt="...", initial_message="...", ...),
+  config=HeartbeatConfig(interval_seconds=1800, active_hours=(6, 22), timezone="America/New_York"),
+  on_alert=my_delivery_callback,  # called only when agent has something to report
+)
+await loop.start()
+```
+
 ### Graduate: Switch to `create_gateway_app()`
 
 Use `create_gateway_app()` when you need custom approval logic, channel-aware runtimes, interceptors, multiple runtime profiles, or deeper production hooks.
@@ -177,32 +210,27 @@ Runnable versions of these examples live in [`examples/`](./examples/).
 
 ## Architecture
 
+Three entry points share the same agent core:
+
 ```text
-Client
-  |
-  |-- POST /api/chat/init --> JWT session token
-  |
-  |-- POST /api/chat (Bearer token, SSE stream)
-  |       |
-  |       v
-  |   ChatRuntime (built per-request)
-  |       |
-  |       v
-  |   AgentRunner (model loop: stream -> tool calls -> dispatch -> resume)
-  |       |
-  |       v
-  |   ToolDispatcher
-  |       |-- interceptors (rate limits, custom policies)
-  |       |-- approval check (session-scoped)
-  |       |-- local Python handler
-  |       |-- MCP server (stdio)
-  |       |-- code_execute (Docker / subprocess)
-  |       |-- run_agent (sub-agent with own runner)
-  |       |
-  |       v
-  |   EventLog --> SSE events to client
-  |
-  |-- POST /api/chat/tool-approval (human-in-the-loop)
+create_agent()         --> FastAPI HTTP server (interactive chat)
+run_autonomous()       --> Headless one-shot (cron / batch)
+HeartbeatLoop          --> Persistent daemon (periodic check-in)
+        |
+        v
+    AgentRunner (model loop: stream -> tool calls -> dispatch -> resume)
+        |
+        v
+    ToolDispatcher
+        |-- interceptors (rate limits, custom policies)
+        |-- approval check (session-scoped, HTTP only)
+        |-- local Python handler
+        |-- MCP server (stdio)
+        |-- code_execute (Docker / subprocess)
+        |-- run_agent (sub-agent with own runner)
+        |
+        v
+    EventLog --> SSE events (HTTP) or RunOutput (autonomous)
 ```
 
 The same backend can serve multiple frontends. Pass `context.channel` to shape runtime behavior per client without rewriting the agent loop.

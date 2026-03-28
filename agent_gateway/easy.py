@@ -1,21 +1,24 @@
 from __future__ import annotations
 
+import logging
 import inspect
-import os
 import secrets
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI
 
+from ._provider_utils import _allowed_models_for_provider, _resolve_provider
 from .code_execution import CodeExecutionConfig, build_code_execution
 from .mcp_client import McpClientManager
-from .providers import AnthropicProvider, ModelProvider, OpenAIProvider
+from .providers import ModelProvider
 from .runner import AgentRunner, ToolResultContext
 from .server import ChatRequest, ChatRuntime, GatewayServerConfig, _make_request_approval, create_gateway_app
 from .session import AuthManager, Session
 from .skills import SkillLoader
 from .tool_dispatcher import LocalToolHandler, ToolDispatcher
+
+log = logging.getLogger("agent_gateway.easy")
 
 
 class _NullMcpClient:
@@ -29,14 +32,6 @@ class _NullMcpClient:
     return []
 
 
-_PROVIDER_DEFAULT_MODELS = {
-  "anthropic": "claude-sonnet-4-6",
-  "openai": "gpt-4o",
-}
-
-_ANTHROPIC_ALLOWED_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
-
-
 def create_agent(
   system_prompt: str | list[tuple[str, bool]],
   *,
@@ -48,10 +43,15 @@ def create_agent(
   max_tokens: int = 16_000,
   mcp_servers: dict[str, dict[str, Any]] | None = None,
   mcp_config_path: str | Path | None = None,
+  mcp_timeout_overrides: dict[str, int] | None = None,
+  mcp_default_tool_timeout: int = 30,
+  mcp_session_inject_servers: set[str] | None = None,
+  mcp_strip_input_fields: set[str] | None = None,
   tool_handlers: dict[str, LocalToolHandler] | None = None,
   tool_definitions: list[dict[str, Any]] | None = None,
   skills_dir: str | Path | None = None,
   skills_excluded_tools: set[str] | None = None,
+  outputs_dir: str | Path | None = None,
   code_execution: bool = False,
   code_execution_config: CodeExecutionConfig | None = None,
   max_turns: int | None = None,
@@ -106,11 +106,19 @@ def create_agent(
     mcp_config_path: Alternate Claude desktop config file to read MCP servers
       from. Defaults to `~/.claude.json` when omitted and `mcp_servers` is not
       provided.
+    mcp_timeout_overrides: Optional per-server MCP tool timeout overrides in
+      seconds.
+    mcp_default_tool_timeout: Default MCP tool timeout in seconds.
+    mcp_session_inject_servers: MCP servers that should receive `_session_id`
+      injected into tool inputs at dispatch time.
+    mcp_strip_input_fields: Input schema fields removed from advertised MCP
+      tool schemas after discovery.
     tool_handlers: Local async Python tool handlers keyed by tool name.
     tool_definitions: Tool schemas exposed to the model for local handlers.
     skills_dir: Directory of markdown skill files. When set, `run_agent` is
       registered automatically unless you override it yourself.
     skills_excluded_tools: Tool names hidden from spawned sub-agents.
+    outputs_dir: Directory for named-skill output files. Stale same-day outputs are cleaned before background sub-agent launch.
     code_execution: Enable built-in `code_execute` and `code_execute_status`.
       Docker is preferred; subprocess is the fallback when registered.
     code_execution_config: Optional `CodeExecutionConfig` override.
@@ -177,55 +185,15 @@ def create_agent(
     )
     ```
   """
-  provider_name: str
-  if isinstance(provider, str):
-    provider_name = provider.strip().lower()
-    if provider_name == "anthropic":
-      provider_instance: ModelProvider = AnthropicProvider()
-    elif provider_name == "openai":
-      provider_instance = OpenAIProvider()
-    else:
-      raise ValueError(f"Unknown provider: {provider}. Use 'anthropic' or 'openai'.")
-    if model is None:
-      model = _PROVIDER_DEFAULT_MODELS.get(provider_name, "gpt-4o")
-  elif isinstance(provider, ModelProvider):
-    provider_instance = provider
-    provider_name = str(getattr(provider, "name", "custom") or "custom")
-    if model is None:
-      raise ValueError("model is required when passing a ModelProvider instance")
-  else:
-    raise TypeError("provider must be a string ('anthropic', 'openai') or a ModelProvider instance")
-
-  if isinstance(provider_instance, AnthropicProvider):
-    resolved_key = (api_key or "").strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    resolved_token = (auth_token or "").strip() or os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
-
-    if resolved_key:
-      auth_config: dict[str, Any] = {
-        "auth_mode": "api",
-        "api_key": resolved_key,
-        "auth_token": "",
-      }
-    elif resolved_token:
-      auth_config = {
-        "auth_mode": "oauth",
-        "api_key": "",
-        "auth_token": resolved_token,
-      }
-    else:
-      auth_config = {
-        "auth_mode": "api",
-        "api_key": "",
-        "auth_token": "",
-      }
-  else:
-    resolved_key = (api_key or "").strip()
-    auth_config = {"api_key": resolved_key} if resolved_key else {}
-
-  auth_config["model"] = model
-  auth_config["max_tokens"] = max_tokens
-  if provider_config:
-    auth_config.update(provider_config)
+  provider_instance, _provider_name, auth_config = _resolve_provider(
+    provider,
+    model,
+    api_key,
+    auth_token,
+    provider_config,
+    max_tokens=max_tokens,
+  )
+  model = str(auth_config["model"])
 
   skill_loader = SkillLoader(skills_dir) if skills_dir else None
   mcp_client: McpClientManager | None = None
@@ -239,6 +207,9 @@ def create_agent(
       inline_servers=mcp_servers,
       config_path=mcp_config_path,
       builtin_tool_names=builtin_names,
+      timeout_overrides=mcp_timeout_overrides,
+      default_tool_timeout=mcp_default_tool_timeout,
+      strip_input_fields=mcp_strip_input_fields,
     )
 
   app_ref: list[FastAPI | None] = [None]
@@ -272,8 +243,10 @@ def create_agent(
         runner_ref,
         skill_loader=skill_loader,
         mcp_client=mcp_client or _NullMcpClient(),
+        mcp_session_inject_servers=mcp_session_inject_servers,
         local_tool_handlers=local_handlers,
         excluded_tools=skills_excluded_tools,
+        outputs_dir=Path(outputs_dir) if outputs_dir is not None else None,
         default_model=model,
         allowed_models=allowed_models,
       )
@@ -321,6 +294,7 @@ def create_agent(
         approved_tool_types=session.approved_tool_types,
         event_log=event_log,
         session_id=session_id,
+        mcp_session_inject_servers=mcp_session_inject_servers,
         approval_key_qualifier=approval_qualifier,
       )
       runner = AgentRunner(
@@ -371,11 +345,7 @@ def create_agent(
     if mcp_client is not None:
       await mcp_client.shutdown()
 
-  if isinstance(provider_instance, AnthropicProvider):
-    allowed_models = set(_ANTHROPIC_ALLOWED_MODELS)
-    allowed_models.add(model)
-  else:
-    allowed_models = set()
+  allowed_models = _allowed_models_for_provider(provider_instance, model)
 
   app = create_gateway_app(
     GatewayServerConfig(
@@ -400,16 +370,39 @@ def create_agent(
     from .code_execution import cleanup_code_execution
 
     session_store = app.state.auth.session_store
-    existing_expiry = session_store._on_expiry
+    code_execution_expiry = session_store._on_expiry
 
     async def _on_expiry_with_cleanup(session: Session) -> None:
-      if existing_expiry is not None:
-        result = existing_expiry(session)
+      if code_execution_expiry is not None:
+        result = code_execution_expiry(session)
         if inspect.isawaitable(result):
           await result
       await cleanup_code_execution(session)
 
     session_store.set_on_expiry(_on_expiry_with_cleanup)
+
+  if mcp_session_inject_servers and mcp_client is not None:
+    session_store = app.state.auth.session_store
+    mcp_session_expiry = session_store._on_expiry
+
+    async def _on_expiry_with_mcp_session_cleanup(session: Session) -> None:
+      if mcp_session_expiry is not None:
+        result = mcp_session_expiry(session)
+        if inspect.isawaitable(result):
+          await result
+      for server_name in mcp_session_inject_servers:
+        close_tool = f"{server_name}_close_session"
+        if mcp_client.is_mcp_tool(close_tool):
+          _result, err = await mcp_client.call_tool(close_tool, {"_session_id": session.session_id})
+          if err:
+            log.warning(
+              "MCP session cleanup failed for %s/%s: %s",
+              server_name,
+              session.session_id,
+              err.get("message", ""),
+            )
+
+    session_store.set_on_expiry(_on_expiry_with_mcp_session_cleanup)
 
   return app
 

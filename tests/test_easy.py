@@ -12,6 +12,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.mcp_client as mcp_client_module
+import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_agent
 from agent_gateway.providers import OpenAIProvider
 from agent_gateway.server import ChatRequest
@@ -250,6 +251,32 @@ def test_create_agent_skills_dir_registers_run_agent_handler_tool_def_and_builti
   assert "get_background_result" in runner._dispatcher._local
   assert {tool["name"] for tool in tool_defs} >= {"run_agent", "get_background_result"}
   assert app.state.gateway_config.mcp_client._builtin_tool_names >= {"run_agent", "get_background_result"}
+
+
+def test_create_agent_forwards_outputs_dir(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  skills_dir = tmp_path / "skills"
+  outputs_dir = tmp_path / "outputs"
+  skills_dir.mkdir(parents=True, exist_ok=True)
+  captured: dict[str, object] = {}
+
+  async def _fake_run_agent(_tool_input, **_kwargs):
+    return {"response": "ok"}, None
+
+  def _fake_make_run_agent_handler(*args, **kwargs):
+    _ = args
+    captured["kwargs"] = kwargs
+    return _fake_run_agent
+
+  monkeypatch.setattr(sub_agent_module, "make_run_agent_handler", _fake_make_run_agent_handler)
+
+  app = create_agent("test", skills_dir=skills_dir, outputs_dir=outputs_dir)
+
+  _build_runtime(app)
+
+  assert captured["kwargs"]["outputs_dir"] == outputs_dir
 
 
 def test_create_agent_skills_dir_does_not_duplicate_user_run_agent_tool_definition(tmp_path: Path) -> None:

@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
@@ -324,6 +326,135 @@ def test_make_run_agent_handler_background_registers_task(tmp_path: Path) -> Non
   assert runner.calls == []
   assert len(runner.background_calls) == 1
   assert runner.background_calls[0]["agent_name"] is None
+
+
+def test_background_cleans_stale_output_file(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  outputs_dir = tmp_path / "outputs"
+  agent_name = "deep-research"
+  _write_skill(
+    skills_dir,
+    agent_name,
+    "---\npersist_state: true\n---\nUse multiple sources.",
+  )
+  stale_path = outputs_dir / agent_name / f"{datetime.date.today().isoformat()}.md"
+  stale_path.parent.mkdir(parents=True, exist_ok=True)
+  stale_path.write_text("stale", encoding="utf-8")
+
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+    outputs_dir=outputs_dir,
+  )
+
+  result, error = _run(handler({"agent": agent_name, "task": "Collect", "background": True}))
+
+  assert error is None
+  assert result == {"task_id": "bg_0", "status": "running"}
+  assert not stale_path.exists()
+  assert len(runner.background_calls) == 1
+
+
+def test_background_skips_cleanup_without_outputs_dir(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  external_outputs_dir = tmp_path / "outputs"
+  agent_name = "deep-research"
+  _write_skill(
+    skills_dir,
+    agent_name,
+    "---\npersist_state: true\n---\nUse multiple sources.",
+  )
+  stale_path = external_outputs_dir / agent_name / f"{datetime.date.today().isoformat()}.md"
+  stale_path.parent.mkdir(parents=True, exist_ok=True)
+  stale_path.write_text("stale", encoding="utf-8")
+
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+  )
+
+  result, error = _run(handler({"agent": agent_name, "task": "Collect", "background": True}))
+
+  assert error is None
+  assert result == {"task_id": "bg_0", "status": "running"}
+  assert stale_path.exists()
+  assert len(runner.background_calls) == 1
+
+
+def test_background_cleans_for_non_persistent_skill_too(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  outputs_dir = tmp_path / "outputs"
+  agent_name = "deep-research"
+  _write_skill(skills_dir, agent_name, "Use multiple sources.")
+  stale_path = outputs_dir / agent_name / f"{datetime.date.today().isoformat()}.md"
+  stale_path.parent.mkdir(parents=True, exist_ok=True)
+  stale_path.write_text("stale", encoding="utf-8")
+
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+    outputs_dir=outputs_dir,
+  )
+
+  result, error = _run(handler({"agent": agent_name, "task": "Collect", "background": True}))
+
+  assert error is None
+  assert result == {"task_id": "bg_0", "status": "running"}
+  assert not stale_path.exists()
+  assert len(runner.background_calls) == 1
+
+
+def test_background_cleanup_returns_error_on_oserror(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  skills_dir = tmp_path / "skills"
+  outputs_dir = tmp_path / "outputs"
+  agent_name = "deep-research"
+  _write_skill(
+    skills_dir,
+    agent_name,
+    "---\npersist_state: true\n---\nUse multiple sources.",
+  )
+  stale_path = outputs_dir / agent_name / f"{datetime.date.today().isoformat()}.md"
+  stale_path.parent.mkdir(parents=True, exist_ok=True)
+  stale_path.write_text("stale", encoding="utf-8")
+
+  original_unlink = Path.unlink
+
+  def _broken_unlink(self: Path, *, missing_ok: bool = False) -> None:
+    if self == stale_path:
+      raise OSError("boom")
+    original_unlink(self, missing_ok=missing_ok)
+
+  monkeypatch.setattr(Path, "unlink", _broken_unlink)
+
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+    outputs_dir=outputs_dir,
+  )
+
+  result, error = _run(handler({"agent": agent_name, "task": "Collect", "background": True}))
+
+  assert result is None
+  assert error == {
+    "code": "file_cleanup_failed",
+    "message": f"Failed to clean stale output {stale_path}: boom",
+  }
+  assert len(runner.background_calls) == 0
 
 
 def test_make_get_background_result_handler_proxies_to_runner() -> None:

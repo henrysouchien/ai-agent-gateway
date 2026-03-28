@@ -48,6 +48,39 @@ It wires together:
 
 Use it when you want the shortest path to a working Anthropic- or OpenAI-backed agent server.
 
+### `run_autonomous()`
+
+`run_autonomous()` is the headless entry point for one-shot agent runs.
+
+It wires together the same components as `create_agent()` — provider, MCP, tools, skills — but without the HTTP server. Returns `RunOutput` directly. Handles its own MCP startup/shutdown lifecycle.
+
+Use it for cron jobs, batch tasks, or as the building block for `HeartbeatLoop`.
+
+### `HeartbeatLoop`
+
+`HeartbeatLoop` wraps a `run_fn` (typically a `functools.partial` of `run_autonomous()`) and calls it at regular intervals.
+
+Key behaviors:
+
+- **Quiet suppression**: if the agent replies with `HEARTBEAT_OK`, the response is suppressed (no delivery)
+- **Active hours**: skip ticks outside a configured time window
+- **Backoff**: on errors (`RunOutput.error`, `timed_out`, or exceptions), retry with exponential backoff that replaces the normal interval; reset on success
+- **Checklist skip**: if `HEARTBEAT.md` exists but is empty (only headers/blank lines), skip the tick entirely to save API cost
+- **Callback safety**: all callbacks wrapped in try/except — failures are logged but never kill the loop
+
+```text
+HeartbeatLoop
+    |
+    |-- check active hours → skip if outside window
+    |-- check checklist → skip if empty
+    |-- call run_fn() → RunOutput
+    |-- strip HEARTBEAT_OK → classify as alert or quiet
+    |-- fire on_alert / on_quiet / on_error callback
+    |-- persist heartbeat_state.json
+    |-- sleep (interval or backoff)
+    |-- repeat
+```
+
 ### `create_gateway_app()`
 
 `create_gateway_app()` is the low-level server factory.

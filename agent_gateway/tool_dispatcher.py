@@ -115,6 +115,7 @@ class ToolDispatcher:
     approval_key_qualifier: ApprovalKeyQualifier | None = None,
     interceptors: Sequence[ToolInterceptor] | None = None,
     session_id: str = "",
+    mcp_session_inject_servers: set[str] | None = None,
   ) -> None:
     self._mcp = mcp_client
     self._local = local_tool_handlers or {}
@@ -125,6 +126,7 @@ class ToolDispatcher:
     self._approval_key_qualifier = approval_key_qualifier
     self._interceptors: Sequence[ToolInterceptor] = list(interceptors or [])
     self._session_id = session_id
+    self._mcp_session_inject_servers = mcp_session_inject_servers or set()
 
   async def _run_interceptors(
     self,
@@ -276,6 +278,9 @@ class ToolDispatcher:
         )
       result, error = await self._local[tool_name](tool_input, call_index=call_index, tool_ctx=tool_ctx)
     elif self._mcp.is_mcp_tool(tool_name):
+      server = self._mcp.get_server_for_tool(tool_name)
+      if server and server in self._mcp_session_inject_servers:
+        tool_input = {**tool_input, "_session_id": self._session_id}
       result, error = await self._mcp.call_tool(tool_name, tool_input)
     else:
       result, error = None, {"code": "unknown_tool", "message": f"Unknown tool: {tool_name}"}

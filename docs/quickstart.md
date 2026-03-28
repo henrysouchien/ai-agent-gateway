@@ -143,6 +143,7 @@ Full event and endpoint details: [HTTP API](./http-api.md)
 - Add local Python tools: see [`../examples/03-local-tools/`](../examples/03-local-tools/)
 - Add code execution: see [`../examples/04-code-execution/`](../examples/04-code-execution/)
 - Add skills and sub-agents: see [`../examples/05-skills/`](../examples/05-skills/)
+- Run headless (cron/batch): see [`../examples/09-autonomous/`](../examples/09-autonomous/)
 - Move to `create_gateway_app()`: see [Architecture](./architecture.md) and [API Reference](./api-reference.md)
 
 ## Troubleshooting

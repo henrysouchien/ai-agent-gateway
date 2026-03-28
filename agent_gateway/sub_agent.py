@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .event_log import EventLog
@@ -30,6 +31,7 @@ def make_run_agent_handler(
   *,
   skill_loader: SkillLoader | None = None,
   mcp_client: Any,
+  mcp_session_inject_servers: set[str] | None = None,
   local_tool_handlers: dict[str, Any] | None = None,
   excluded_tools: set[str] | None = None,
   default_model: str = "claude-sonnet-4-6",
@@ -39,6 +41,7 @@ def make_run_agent_handler(
   allowed_models: set[str] | None = None,
   on_before_background: Callable[[str | None], None] | None = None,
   on_background_complete: Callable[[Any], Awaitable[None]] | None = None,
+  outputs_dir: Path | None = None,
 ):
   """Build the local handler used by the `run_agent` tool.
 
@@ -77,6 +80,7 @@ def make_run_agent_handler(
     if raw_model is not None and effective_allowed_models and raw_model not in effective_allowed_models:
       return None, {"code": "invalid_input", "message": f"Invalid model: {raw_model}"}
 
+    profile = None
     if agent_name and skill_loader is not None:
       try:
         profile = skill_loader.load(agent_name)
@@ -123,6 +127,7 @@ def make_run_agent_handler(
       needs_approval=lambda _name, _input, _qualifier: False,
       event_log=sub_log,
       session_id=getattr(runner, "_full_session_id", ""),
+      mcp_session_inject_servers=mcp_session_inject_servers,
     )
 
     async def _dispatch_sub_agent(_background_input: dict[str, Any], **background_kwargs: Any):
@@ -142,6 +147,16 @@ def make_run_agent_handler(
       )
 
     if background:
+      if outputs_dir is not None and agent_name:
+        today = datetime.date.today().isoformat()
+        stale_path = outputs_dir / agent_name / f"{today}.md"
+        try:
+          stale_path.unlink(missing_ok=True)
+        except OSError as exc:
+          return None, {
+            "code": "file_cleanup_failed",
+            "message": f"Failed to clean stale output {stale_path}: {exc}",
+          }
       return await runner._register_background_task(
         tool_input=dict(tool_input),
         handler=_dispatch_sub_agent,

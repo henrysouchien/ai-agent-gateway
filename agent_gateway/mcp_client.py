@@ -78,6 +78,7 @@ class McpClientManager:
     timeout_overrides: Dict[str, int] | None = None,
     startup_timeout: int = 15,
     default_tool_timeout: int = 30,
+    strip_input_fields: set[str] | None = None,
   ) -> None:
     self._lock = asyncio.Lock()
     self._started = False
@@ -97,6 +98,7 @@ class McpClientManager:
     self._timeout_overrides = dict(timeout_overrides or {})
     self._startup_timeout = startup_timeout
     self._default_tool_timeout = default_tool_timeout
+    self._strip_input_fields = strip_input_fields or set()
 
   async def startup(self) -> None:
     async with self._lock:
@@ -359,6 +361,15 @@ class McpClientManager:
       )
 
     self._tool_definitions = merged
+    if self._strip_input_fields:
+      for tool_def in self._tool_definitions:
+        schema = tool_def.get("input_schema", {})
+        props = schema.get("properties", {})
+        required = schema.get("required", [])
+        for field in self._strip_input_fields:
+          props.pop(field, None)
+          if field in required:
+            required.remove(field)
     self._mcp_tool_names = set(self._tool_to_server.keys())
 
   @staticmethod
