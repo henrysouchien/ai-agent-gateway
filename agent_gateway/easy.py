@@ -391,8 +391,8 @@ def create_agent(
         if inspect.isawaitable(result):
           await result
       for server_name in mcp_session_inject_servers:
-        close_tool = f"{server_name}_close_session"
-        if mcp_client.is_mcp_tool(close_tool):
+        close_tool = mcp_client.resolve_tool_name(server_name, f"{server_name}_close_session")
+        if close_tool:
           _result, err = await mcp_client.call_tool(close_tool, {"_session_id": session.session_id})
           if err:
             log.warning(
@@ -401,6 +401,8 @@ def create_agent(
               session.session_id,
               err.get("message", ""),
             )
+        else:
+          log.debug("No close_session tool for %s; session cleanup skipped", server_name)
 
     session_store.set_on_expiry(_on_expiry_with_mcp_session_cleanup)
 

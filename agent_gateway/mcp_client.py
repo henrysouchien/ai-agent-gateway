@@ -55,6 +55,7 @@ class _ServerState:
   exit_contexts: List[Any]
   tool_definitions: List[Dict[str, Any]]
   tool_names: Set[str]
+  tool_prefix: str = ""
 
 
 class McpClientManager:
@@ -85,6 +86,7 @@ class McpClientManager:
     self._servers: Dict[str, _ServerState] = {}
     self._tool_definitions: List[Dict[str, Any]] = []
     self._tool_to_server: Dict[str, str] = {}
+    self._prefixed_to_original: Dict[str, str] = {}
     self._mcp_tool_names: Set[str] = set()
     self._allowed_servers = allowed_servers
     self._builtin_tool_names = set(builtin_tool_names or set())
@@ -170,6 +172,7 @@ class McpClientManager:
           env[str(key)] = str(value)
 
       cwd = config.get("cwd")
+      tool_prefix = str(config.get("tool_prefix", "") or "").strip()
       server_params = StdioServerParameters(
         command=command,
         args=args,
@@ -218,6 +221,7 @@ class McpClientManager:
         exit_contexts=exit_contexts,
         tool_definitions=tool_definitions,
         tool_names={tool["name"] for tool in tool_definitions},
+        tool_prefix=tool_prefix,
       )
     finally:
       if not success:
@@ -252,6 +256,14 @@ class McpClientManager:
   def get_server_for_tool(self, name: str) -> str | None:
     return self._tool_to_server.get(name)
 
+  def resolve_tool_name(self, server_name: str, original_name: str) -> str | None:
+    """Return the exposed tool name for a server-owned tool."""
+    state = self._servers.get(server_name)
+    if state is None:
+      return None
+    exposed_name = f"{state.tool_prefix}{original_name}" if state.tool_prefix else original_name
+    return exposed_name if self._tool_to_server.get(exposed_name) == server_name else None
+
   async def call_tool(
     self,
     name: str,
@@ -264,12 +276,13 @@ class McpClientManager:
     server = self._servers.get(server_name)
     if not server:
       return None, {"code": "mcp_tool_error", "message": f"MCP server unavailable: {server_name}"}
+    original_name = self._prefixed_to_original.get(name, name)
 
     timeout_seconds = self._timeout_overrides.get(server_name, self._default_tool_timeout)
 
     try:
       result = await server.session.call_tool(
-        name,
+        original_name,
         tool_input,
         read_timeout_seconds=timedelta(seconds=timeout_seconds),
       )
@@ -314,6 +327,7 @@ class McpClientManager:
       self._servers.clear()
       self._tool_definitions = []
       self._tool_to_server = {}
+      self._prefixed_to_original = {}
       self._mcp_tool_names = set()
       self._started = False
 
@@ -323,29 +337,43 @@ class McpClientManager:
     merged: List[Dict[str, Any]] = []
 
     self._tool_to_server = {}
+    self._prefixed_to_original = {}
 
     for server_name, state in self._servers.items():
+      prefix = state.tool_prefix
       filtered: List[Dict[str, Any]] = []
       filtered_names: Set[str] = set()
 
       for tool in state.tool_definitions:
-        tool_name = tool["name"]
+        original_name = tool["name"]
+        tool_name = f"{prefix}{original_name}" if prefix else original_name
         if tool_name in existing_names:
-          log.warning("Skipping MCP tool %s from %s: collides with built-in tool", tool_name, server_name)
+          log.warning(
+            "Skipping MCP tool %s from %s: collides with built-in tool. "
+            "Fix: add \"tool_prefix\" to the \"%s\" server config to namespace its tools.",
+            tool_name,
+            server_name,
+            server_name,
+          )
           continue
 
         first_server = seen_mcp_names.get(tool_name)
         if first_server:
           log.warning(
-            "Skipping MCP tool %s from %s: collides with MCP tool from %s",
+            "Skipping MCP tool %s from %s: collides with MCP tool from %s. "
+            "Fix: add \"tool_prefix\" to the \"%s\" server config to namespace its tools.",
             tool_name,
             server_name,
             first_server,
+            server_name,
           )
           continue
 
         seen_mcp_names[tool_name] = server_name
         self._tool_to_server[tool_name] = server_name
+        if prefix:
+          self._prefixed_to_original[tool_name] = original_name
+          tool = {**tool, "name": tool_name}
         filtered.append(tool)
         filtered_names.add(tool_name)
 

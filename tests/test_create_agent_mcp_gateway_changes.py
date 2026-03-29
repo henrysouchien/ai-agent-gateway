@@ -111,6 +111,11 @@ def test_create_agent_expiry_cleanup_chains_code_execution_and_mcp_session_close
     def is_mcp_tool(self, name: str) -> bool:
       return name == "browser_close_session"
 
+    def resolve_tool_name(self, server_name: str, original_name: str) -> str | None:
+      if server_name == "browser" and original_name == "browser_close_session":
+        return original_name
+      return None
+
     async def call_tool(self, name: str, tool_input: dict[str, Any]):
       if self.cleanup_path is not None:
         self.path_checks.append(self.cleanup_path.exists())
