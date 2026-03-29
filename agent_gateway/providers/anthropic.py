@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import replace
 from typing import Any, AsyncIterator, Dict, List
@@ -178,10 +179,17 @@ class AnthropicProvider(ModelProvider):
 
     if _COMMON_BETA_SLUGS:
       client_kwargs["default_headers"] = {"anthropic-beta": ",".join(_COMMON_BETA_SLUGS)}
-    return AsyncAnthropic(
-      api_key=str(config.get("api_key", "")),
-      **client_kwargs,
-    )
+    # Suppress ANTHROPIC_AUTH_TOKEN env pickup — SDK reads it when auth_token kwarg
+    # is omitted, and auth_token="" causes LocalProtocolError (Bearer with empty token).
+    saved_token = os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+    try:
+      return AsyncAnthropic(
+        api_key=str(config.get("api_key", "")),
+        **client_kwargs,
+      )
+    finally:
+      if saved_token is not None:
+        os.environ["ANTHROPIC_AUTH_TOKEN"] = saved_token
 
   async def close_client(self, client: Any, timeout: float = 2.0) -> None:
     if client is None or not hasattr(client, "aclose"):
