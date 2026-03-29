@@ -180,7 +180,6 @@ class AnthropicProvider(ModelProvider):
       client_kwargs["default_headers"] = {"anthropic-beta": ",".join(_COMMON_BETA_SLUGS)}
     return AsyncAnthropic(
       api_key=str(config.get("api_key", "")),
-      auth_token="",
       **client_kwargs,
     )
 

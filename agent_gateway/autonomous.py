@@ -450,6 +450,8 @@ async def run_autonomous(
   max_tokens: int = 16_000,
   mcp_servers: dict[str, dict[str, Any]] | None = None,
   mcp_config_path: str | Path | None = None,
+  mcp_session_inject_servers: set[str] | None = None,
+  mcp_timeout_overrides: dict[str, int] | None = None,
   tool_handlers: dict[str, LocalToolHandler] | None = None,
   tool_definitions: list[dict[str, Any]] | None = None,
   skills_dir: str | Path | None = None,
@@ -503,6 +505,7 @@ async def run_autonomous(
       inline_servers=mcp_servers,
       config_path=mcp_config_path,
       builtin_tool_names=builtin_names,
+      timeout_overrides=mcp_timeout_overrides,
     )
 
   try:
@@ -520,6 +523,7 @@ async def run_autonomous(
         runner_ref,
         skill_loader=skill_loader,
         mcp_client=mcp_client or _NullMcpClient(),
+        mcp_session_inject_servers=mcp_session_inject_servers,
         local_tool_handlers=local_handlers,
         excluded_tools=skills_excluded_tools,
         outputs_dir=Path(outputs_dir) if outputs_dir is not None else None,
@@ -556,6 +560,7 @@ async def run_autonomous(
       event_log=event_log,
       interceptors=interceptors,
       session_id=sid,
+      mcp_session_inject_servers=mcp_session_inject_servers,
     )
     runner = AgentRunner(
       event_log=event_log,

@@ -43,6 +43,7 @@ from .providers import (
   StreamEvent,
   ThinkingLevel,
 )
+from .retry import RetryConfig, classify_outcome, run_autonomous_with_retry
 from .runner import AgentRunner, SubAgentConfig, ToolResultContext
 from .send_prompt import send_prompt, send_prompt_sync
 from .sdk_runner import AgentSDKRunner
@@ -96,6 +97,7 @@ __all__ = [
   "OpenAIProvider",
   "OutputRingBuffer",
   "RequestContext",
+  "RetryConfig",
   "RunOutput",
   "send_prompt",
   "send_prompt_sync",
@@ -119,6 +121,7 @@ __all__ = [
   "build_code_execution",
   "collect_run_output",
   "cleanup_code_execution",
+  "classify_outcome",
   "create_agent",
   "create_gateway_app",
   "deliver",
@@ -133,6 +136,7 @@ __all__ = [
   "make_run_agent_tool_def",
   "parse_skill_file",
   "run_autonomous",
+  "run_autonomous_with_retry",
   "run_autonomous_sync",
   "run_output_exit_code",
   "run_output_outcome",
