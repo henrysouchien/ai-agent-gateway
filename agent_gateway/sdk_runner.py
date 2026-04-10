@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -198,11 +199,13 @@ class AgentSDKRunner:
   def _append(self, event: Dict[str, Any]) -> None:
     self._log.append(event)
 
-  def _call_on_usage(self, usage_payload: Dict[str, Any]) -> None:
+  async def _call_on_usage(self, usage_payload: Dict[str, Any]) -> None:
     if self._on_usage is None:
       return
     try:
-      self._on_usage(usage_payload)
+      result = self._on_usage(usage_payload)
+      if inspect.isawaitable(result):
+        await result
     except Exception as exc:
       log.warning("[%s] on_usage hook failed (non-fatal): %s", self._sid, exc)
 
@@ -657,7 +660,7 @@ class AgentSDKRunner:
     if num_turns is not None:
       self._num_turns = int(num_turns)
 
-  def _emit_usage_hook(self) -> None:
+  async def _emit_usage_hook(self) -> None:
     usage_payload = {
       "session_id": self._session_id,
       "turns": self._num_turns,
@@ -667,7 +670,7 @@ class AgentSDKRunner:
       "cache_creation_input_tokens": int(self._usage.get("cache_creation_input_tokens") or 0),
       "estimated_cost": round(float(self._usage.get("estimated_cost") or 0.0), 4),
     }
-    self._call_on_usage(usage_payload)
+    await self._call_on_usage(usage_payload)
 
   async def run(
     self,
@@ -725,7 +728,7 @@ class AgentSDKRunner:
             total_cost_usd=_get_attr(message, "total_cost_usd"),
             num_turns=_get_attr(message, "num_turns"),
           )
-          self._emit_usage_hook()
+          await self._emit_usage_hook()
           self._flush_pending_tool_calls()
           self._emit_stream_complete()
           continue

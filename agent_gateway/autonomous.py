@@ -133,22 +133,23 @@ async def run_session(
   *,
   model: str,
   max_turns: int,
-  timeout_seconds: float,
+  timeout_seconds: float | None,
   initial_message: str,
   system_prompt: str | list[tuple[str, bool]],
 ) -> RunOutput:
   timed_out = False
   error_msg: str | None = None
+  coro = runner.run(
+    messages=[{"role": "user", "content": initial_message}],
+    system_prompt=system_prompt,
+    model_override=model,
+    max_turns=max_turns,
+  )
   try:
-    await asyncio.wait_for(
-      runner.run(
-        messages=[{"role": "user", "content": initial_message}],
-        system_prompt=system_prompt,
-        model_override=model,
-        max_turns=max_turns,
-      ),
-      timeout=timeout_seconds,
-    )
+    if timeout_seconds is not None and timeout_seconds > 0:
+      await asyncio.wait_for(coro, timeout=timeout_seconds)
+    else:
+      await coro
   except asyncio.TimeoutError:
     timed_out = True
     log.warning("Autonomous run timed out after %ss", timeout_seconds)
@@ -459,10 +460,10 @@ async def run_autonomous(
   outputs_dir: str | Path | None = None,
   excluded_tools: set[str] | None = None,
   interceptors: Sequence[ToolInterceptor] | None = None,
-  max_turns: int = 40,
-  timeout_seconds: float = 600,
+  max_turns: int = 80,
+  timeout_seconds: float | None = None,
   max_budget_usd: float | None = None,
-  per_turn_timeout: float | None = None,
+  per_turn_timeout: float | None = 300.0,
   client_timeout: float = 90.0,
   max_concurrent_sub_agents: int | None = None,
   compaction_instructions: str | None = None,
@@ -479,6 +480,9 @@ async def run_autonomous(
   Use for cron jobs, batch tasks, or as the building block for HeartbeatLoop.
   Supports MCP tools, local tool handlers, skills/sub-agents, state persistence,
   and delivery (Telegram, webhook, or callback) on completion.
+  The default execution control is turn-based; pass `timeout_seconds` only for
+  callers that need an explicit wall-clock SLA, and set `max_budget_usd` for
+  production cost control.
   """
   provider_instance, _provider_name, resolved_auth_config = _resolve_provider(
     provider,

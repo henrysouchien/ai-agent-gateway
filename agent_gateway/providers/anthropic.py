@@ -6,9 +6,9 @@ import json
 import logging
 import os
 import re
-from dataclasses import replace
 from typing import Any, AsyncIterator, Dict, List
 
+from ..rates import RateTable, UnknownModelError, load_rate_table
 from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel
 
 
@@ -140,6 +140,9 @@ class AnthropicProvider(ModelProvider):
   name = "anthropic"
   supports_compaction = True
 
+  def __init__(self, *, rate_table: RateTable | None = None):
+    self._rate_table = rate_table or load_rate_table()
+
   @staticmethod
   def thinking_param(model: str, max_tokens: int) -> dict[str, Any] | None:
     return _thinking_param(model, max_tokens)
@@ -205,17 +208,28 @@ class AnthropicProvider(ModelProvider):
       raise ValueError("Model is required")
     if not model_id.startswith("claude"):
       raise ValueError(f"AnthropicProvider does not recognize model: {model_id}")
-    for tags, info in _MODEL_INFO_BY_TAG:
-      if any(tag in model_id for tag in tags):
-        return replace(info, id=model_id)
+    try:
+      rates = self._rate_table.lookup(self.name, model_id)
+    except UnknownModelError:
+      return ModelInfo(
+        id=model_id,
+        provider=self.name,
+        supports_thinking=_thinking_param(model_id, 4096) is not None,
+        input_cost_per_mtok=3.00,
+        output_cost_per_mtok=15.00,
+        cache_read_cost_per_mtok=0.30,
+        cache_write_cost_per_mtok=3.75,
+      )
     return ModelInfo(
       id=model_id,
       provider=self.name,
-      supports_thinking=_thinking_param(model_id, 4096) is not None,
-      input_cost_per_mtok=3.00,
-      output_cost_per_mtok=15.00,
-      cache_read_cost_per_mtok=0.30,
-      cache_write_cost_per_mtok=3.75,
+      context_window=rates.context_window or 200_000,
+      max_output_tokens=rates.max_tokens or 16_384,
+      supports_thinking=_thinking_param(model_id, rates.max_tokens or 4096) is not None,
+      input_cost_per_mtok=rates.input_cost_per_mtok,
+      output_cost_per_mtok=rates.output_cost_per_mtok,
+      cache_read_cost_per_mtok=rates.cache_read_cost_per_mtok,
+      cache_write_cost_per_mtok=rates.cache_write_cost_per_mtok,
     )
 
   def build_request_params(
@@ -608,7 +622,12 @@ class AnthropicProvider(ModelProvider):
       return False
 
     if isinstance(exc, APIStatusError):
-      return False
+      status_code = getattr(exc, "status_code", None)
+      if status_code is None:
+        response = getattr(exc, "response", None)
+        if response is not None:
+          status_code = getattr(response, "status_code", None)
+      return status_code == 429 or (isinstance(status_code, int) and 500 <= status_code < 600)
     if isinstance(exc, APIConnectionError):
       return True
     if isinstance(exc, (httpx.TransportError, httpx.StreamError)):

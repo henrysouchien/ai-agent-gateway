@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,14 @@ class SkillProfile:
   scope: str | None = None
   interactive: bool = False
   metadata: dict[str, Any] | None = None
+  mcp_servers: list[str] | None = None
+  session_inject_servers: list[str] | None = None
+  timeout_overrides: dict[str, int] | None = None
+  state_dir: str | None = None
+  max_budget_usd: float | None = None
+  max_retries: int | None = None
+  initial_message: str | None = None
+  delivery_label: str | None = None
 
 
 def _clean_string(value: Any) -> str | None:
@@ -110,6 +119,32 @@ def _coerce_optional_string_list(value: Any, *, field_name: str, path: Path) -> 
   return items or None
 
 
+def _coerce_optional_timeout_overrides(
+  value: Any,
+  *,
+  field_name: str,
+  path: Path,
+) -> dict[str, int] | None:
+  if value is None:
+    return None
+  if not isinstance(value, dict):
+    raise ValueError(f"{path}: '{field_name}' must be a mapping of server names to timeout seconds")
+
+  overrides: dict[str, int] = {}
+  for raw_name, raw_timeout in value.items():
+    server_name = _clean_string(raw_name)
+    if server_name is None:
+      continue
+    timeout_value = _coerce_optional_int(
+      raw_timeout,
+      field_name=f"{field_name}.{server_name}",
+      path=path,
+    )
+    if timeout_value is not None:
+      overrides[server_name] = timeout_value
+  return overrides or None
+
+
 def _coerce_optional_scope(value: Any, *, field_name: str, path: Path) -> str | None:
   text = _clean_string(value)
   if text is None:
@@ -165,6 +200,58 @@ def parse_skill_file(path: Path) -> SkillProfile:
     raise ValueError(f"{path}: 'metadata' must be a mapping when provided")
 
   metadata.update(frontmatter)
+  original_metadata_keys = set(metadata.keys())
+
+  raw_mcp_servers = metadata.pop("mcp_servers", None)
+  raw_session_inject_servers = metadata.pop("session_inject_servers", None)
+  raw_timeout_overrides = metadata.pop("timeout_overrides", None)
+  raw_state_dir = metadata.pop("state_dir", None)
+  raw_max_budget_usd = metadata.pop("max_budget_usd", None)
+  raw_max_retries = metadata.pop("max_retries", None)
+  raw_initial_message = metadata.pop("initial_message", None)
+  raw_delivery_label = metadata.pop("delivery_label", None)
+
+  coerced_mcp_servers = _coerce_optional_string_list(
+    raw_mcp_servers,
+    field_name="mcp_servers",
+    path=path,
+  )
+  coerced_session_inject_servers = _coerce_optional_string_list(
+    raw_session_inject_servers,
+    field_name="session_inject_servers",
+    path=path,
+  )
+  coerced_timeout_overrides = _coerce_optional_timeout_overrides(
+    raw_timeout_overrides,
+    field_name="timeout_overrides",
+    path=path,
+  )
+  coerced_state_dir = _clean_string(raw_state_dir)
+  coerced_max_budget_usd = _coerce_optional_float(
+    raw_max_budget_usd,
+    field_name="max_budget_usd",
+    path=path,
+  )
+  coerced_max_retries = _coerce_optional_int(
+    raw_max_retries,
+    field_name="max_retries",
+    path=path,
+  )
+  coerced_initial_message = _clean_string(raw_initial_message)
+  coerced_delivery_label = _clean_string(raw_delivery_label)
+
+  for key, coerced in [
+    ("mcp_servers", coerced_mcp_servers),
+    ("session_inject_servers", coerced_session_inject_servers),
+    ("timeout_overrides", coerced_timeout_overrides),
+    ("state_dir", coerced_state_dir),
+    ("max_budget_usd", coerced_max_budget_usd),
+    ("max_retries", coerced_max_retries),
+    ("initial_message", coerced_initial_message),
+    ("delivery_label", coerced_delivery_label),
+  ]:
+    if key in original_metadata_keys:
+      metadata[key] = coerced
 
   return SkillProfile(
     name=_clean_string(raw_name) or path.stem,
@@ -178,6 +265,14 @@ def parse_skill_file(path: Path) -> SkillProfile:
     scope=_coerce_optional_scope(raw_scope, field_name="scope", path=path),
     interactive=_coerce_optional_bool(raw_interactive, field_name="interactive", path=path),
     metadata=metadata or None,
+    mcp_servers=coerced_mcp_servers,
+    session_inject_servers=coerced_session_inject_servers,
+    timeout_overrides=coerced_timeout_overrides,
+    state_dir=coerced_state_dir,
+    max_budget_usd=coerced_max_budget_usd,
+    max_retries=coerced_max_retries,
+    initial_message=coerced_initial_message,
+    delivery_label=coerced_delivery_label,
   )
 
 

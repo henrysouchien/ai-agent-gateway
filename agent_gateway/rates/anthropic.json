@@ -1,0 +1,64 @@
+{
+  "version": "2026-04-08",
+  "source": "https://docs.anthropic.com/pricing",
+  "providers": {
+    "anthropic": {
+      "models": {
+        "claude-sonnet-4-6": {
+          "display_name": "Claude Sonnet 4.6",
+          "input_cost_per_mtok": 3.0,
+          "output_cost_per_mtok": 15.0,
+          "cache_read_cost_per_mtok": 0.3,
+          "cache_write_cost_per_mtok": 3.75,
+          "max_tokens": 16384,
+          "context_window": 200000
+        },
+        "claude-opus-4-6": {
+          "display_name": "Claude Opus 4.6",
+          "input_cost_per_mtok": 15.0,
+          "output_cost_per_mtok": 75.0,
+          "cache_read_cost_per_mtok": 1.5,
+          "cache_write_cost_per_mtok": 18.75,
+          "max_tokens": 32000,
+          "context_window": 200000
+        },
+        "claude-sonnet-4-5": {
+          "display_name": "Claude Sonnet 4.5",
+          "input_cost_per_mtok": 3.0,
+          "output_cost_per_mtok": 15.0,
+          "cache_read_cost_per_mtok": 0.3,
+          "cache_write_cost_per_mtok": 3.75,
+          "max_tokens": 16384,
+          "context_window": 200000
+        },
+        "claude-opus-4-5": {
+          "display_name": "Claude Opus 4.5",
+          "input_cost_per_mtok": 15.0,
+          "output_cost_per_mtok": 75.0,
+          "cache_read_cost_per_mtok": 1.5,
+          "cache_write_cost_per_mtok": 18.75,
+          "max_tokens": 32000,
+          "context_window": 200000
+        },
+        "claude-sonnet-4": {
+          "display_name": "Claude Sonnet 4",
+          "input_cost_per_mtok": 3.0,
+          "output_cost_per_mtok": 15.0,
+          "cache_read_cost_per_mtok": 0.3,
+          "cache_write_cost_per_mtok": 3.75,
+          "max_tokens": 16384,
+          "context_window": 200000
+        },
+        "claude-haiku-4-5": {
+          "display_name": "Claude Haiku 4.5",
+          "input_cost_per_mtok": 1.0,
+          "output_cost_per_mtok": 5.0,
+          "cache_read_cost_per_mtok": 0.1,
+          "cache_write_cost_per_mtok": 1.25,
+          "max_tokens": 16384,
+          "context_window": 200000
+        }
+      }
+    }
+  }
+}

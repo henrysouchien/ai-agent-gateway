@@ -97,12 +97,10 @@ def report_tool_definitions() -> list[dict[str, object]]:
 
 def make_request_approval(session, event_log):
   async def request_approval(payload):
-    expires_at = int(time.time() + payload.timeout)
     approval_queue = asyncio.Queue(maxsize=1)
     session.pending_tools[payload.tool_call_id] = {
       "nonce": payload.nonce,
       "requested_at": int(time.time()),
-      "expires_at": expires_at,
       "status": "approval_pending",
       "tool_name": payload.tool_name,
       "resolved_qualifier": payload.resolved_qualifier,
@@ -114,7 +112,6 @@ def make_request_approval(session, event_log):
         "type": "tool_approval_request",
         "tool_call_id": payload.tool_call_id,
         "nonce": payload.nonce,
-        "expires_at": expires_at,
         "tool_name": payload.tool_name,
         "tool_input": payload.tool_input,
         "resolved_qualifier": payload.resolved_qualifier,
@@ -122,9 +119,7 @@ def make_request_approval(session, event_log):
     )
 
     try:
-      approval = await asyncio.wait_for(approval_queue.get(), timeout=payload.timeout)
-    except asyncio.TimeoutError:
-      return None
+      approval = await approval_queue.get()
     finally:
       session.pending_tools.pop(payload.tool_call_id, None)
       session.approval_queues.pop(payload.tool_call_id, None)

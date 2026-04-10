@@ -291,6 +291,18 @@ class ToolDispatcher:
 
     return result, error
 
+  def requires_approval(self, tool_name: str, tool_input: Dict[str, Any]) -> bool:
+    """Return True if dispatching this tool would block on user approval."""
+    if self._request_approval is None:
+      return False
+    qualifier = ""
+    if self._approval_key_qualifier is not None:
+      try:
+        qualifier = self._approval_key_qualifier(tool_name, tool_input) or ""
+      except Exception:
+        qualifier = ""
+    return self._should_request_approval(tool_name, tool_input, qualifier)
+
   @staticmethod
   def _normalize_needs_approval(
     needs_approval: Callable[..., bool] | None,

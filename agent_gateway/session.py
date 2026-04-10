@@ -29,6 +29,8 @@ class Session:
   api_key_hash: str
   created_at: int
   expires_at: int
+  user_id: str = "_default"
+  auth_config: dict[str, Any] | None = None
   stream_active: bool = False
   pending_tools: Dict[str, Dict] = field(default_factory=dict)
   approved_tool_types: Set[str] = field(default_factory=set)
@@ -52,7 +54,13 @@ class SessionStore:
   def set_on_expiry(self, hook: OnSessionExpiry) -> None:
     self._on_expiry = hook
 
-  def create_session(self, api_key_hash: str) -> Session:
+  def create_session(
+    self,
+    api_key_hash: str,
+    *,
+    user_id: str = "_default",
+    auth_config: dict[str, Any] | None = None,
+  ) -> Session:
     now = int(time.time())
     session_id = f"sess_{uuid.uuid4().hex}"
     session = Session(
@@ -60,6 +68,8 @@ class SessionStore:
       api_key_hash=api_key_hash,
       created_at=now,
       expires_at=now + self.ttl,
+      user_id=user_id,
+      auth_config=dict(auth_config) if auth_config is not None else None,
       result_queue=asyncio.Queue(),
     )
     self.sessions[session_id] = session
@@ -149,10 +159,11 @@ class AuthManager:
       "api_key_hash": session.api_key_hash,
       "created_at": session.created_at,
       "expires_at": session.expires_at,
+      "user_id": session.user_id,
     }
     return jwt.encode(payload, self._secret, algorithm=JWT_ALGORITHM)
 
-  def verify_token(self, token: str) -> Session:
+  def _decode_token(self, token: str) -> dict[str, Any]:
     try:
       payload = jwt.decode(token, self._secret, algorithms=[JWT_ALGORITHM])
     except jwt.PyJWTError as exc:
@@ -173,6 +184,23 @@ class AuthManager:
     session = self.session_store.get_session(session_id)
     if not session or session.api_key_hash != api_key_hash:
       raise HTTPException(status_code=401, detail="Unknown session")
+
+    token_user_id = payload.get("user_id")
+    if token_user_id is not None and str(token_user_id) != session.user_id:
+      raise HTTPException(status_code=401, detail="Session user mismatch")
+
+    return payload
+
+  def verify_token_with_payload(self, token: str) -> tuple[Session, dict[str, Any]]:
+    payload = self._decode_token(token)
+    session_id = str(payload["session_id"])
+    session = self.session_store.get_session(session_id)
+    if session is None:
+      raise HTTPException(status_code=401, detail="Unknown session")
+    return session, payload
+
+  def verify_token(self, token: str) -> Session:
+    session, _payload = self.verify_token_with_payload(token)
 
     return session
 

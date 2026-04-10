@@ -8,10 +8,13 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI
 
-from ._provider_utils import _allowed_models_for_provider, _resolve_provider
+from ._provider_utils import _resolve_provider
+from .auth import CredentialsResolver
 from .code_execution import CodeExecutionConfig, build_code_execution
 from .mcp_client import McpClientManager
-from .providers import ModelProvider
+from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, UsageEvent, UsageLedger
+from .providers import AnthropicProvider, ModelProvider
+from .rates import load_rate_table
 from .runner import AgentRunner, ToolResultContext
 from .server import ChatRequest, ChatRuntime, GatewayServerConfig, _make_request_approval, create_gateway_app
 from .session import AuthManager, Session
@@ -40,6 +43,7 @@ def create_agent(
   provider_config: dict[str, Any] | None = None,
   api_key: str | None = None,
   auth_token: str | None = None,
+  rates_file: Path | None = None,
   max_tokens: int = 16_000,
   mcp_servers: dict[str, dict[str, Any]] | None = None,
   mcp_config_path: str | Path | None = None,
@@ -62,11 +66,15 @@ def create_agent(
   session_ttl: int = 3600,
   cors_origins: list[str] | None = None,
   prefix: str = "/api",
-  on_usage: Callable[[dict[str, Any]], None] | None = None,
+  on_usage: Callable[[UsageEvent], Awaitable[Any] | Any] | None = None,
   on_tool_result: Callable[[ToolResultContext], Awaitable[Any] | Any] | None = None,
   on_tool_timing: Callable[..., None] | None = None,
   on_startup: Callable[..., Any] | None = None,
   on_shutdown: Callable[..., Any] | None = None,
+  credentials_resolver: CredentialsResolver | None = None,
+  resolver_timeout_seconds: float = 5.0,
+  usage_ledger: UsageLedger | None = None,
+  usage_ledger_dlq_path: Path | None = None,
 ) -> FastAPI:
   """Create a ready-to-run FastAPI gateway backed by a `ModelProvider`.
 
@@ -82,14 +90,15 @@ def create_agent(
   - optional skills and `run_agent`
 
   By default it uses Anthropic, but you can switch to the built-in OpenAI
-  adapter with `provider="openai"` or pass a `ModelProvider` instance directly.
-  Use `create_gateway_app()` when you need channel-specific runtimes, approval
+  adapter with `provider="openai"`, the ChatGPT Codex backend with
+  `provider="codex"`, or pass a `ModelProvider` instance directly. Use
+  `create_gateway_app()` when you need channel-specific runtimes, approval
   rules for arbitrary tools, or direct control over runner construction.
 
   Args:
     system_prompt: Prompt string, or a list of `(text, should_cache)` blocks for
       providers that support prompt caching.
-    provider: Provider name (`"anthropic"` or `"openai"`) or a
+    provider: Provider name (`"anthropic"`, `"codex"`, or `"openai"`) or a
       `ModelProvider` instance.
     model: Default model for incoming chat requests. When omitted, string
       providers use their provider-specific default model. Required when you
@@ -98,8 +107,11 @@ def create_agent(
       Use this for fields like `base_url` or `compat`.
     api_key: Provider API key. Anthropic falls back to `ANTHROPIC_API_KEY`;
       other providers read their own env vars internally when supported.
-    auth_token: Anthropic OAuth token. Falls back to
-      `ANTHROPIC_AUTH_TOKEN`. Ignored for non-Anthropic providers.
+    auth_token: OAuth bearer token. Anthropic falls back to
+      `ANTHROPIC_AUTH_TOKEN`; `provider="openai"` and `provider="codex"` use
+      it as bearer auth.
+    rates_file: Optional JSON rate-table override used for Anthropic provider
+      construction. When omitted, the helper uses env/default resolution.
     max_tokens: Per-turn output token cap passed to the provider.
     mcp_servers: Inline MCP server definitions. When provided, the helper uses
       `McpClientManager(config_path=None, inline_servers=...)`.
@@ -185,14 +197,27 @@ def create_agent(
     )
     ```
   """
-  provider_instance, _provider_name, auth_config = _resolve_provider(
-    provider,
-    model,
-    api_key,
-    auth_token,
-    provider_config,
-    max_tokens=max_tokens,
-  )
+  if credentials_resolver is None:
+    provider_instance, _provider_name, auth_config = _resolve_provider(
+      provider,
+      model,
+      api_key,
+      auth_token,
+      provider_config,
+      max_tokens=max_tokens,
+    )
+  else:
+    provider_instance, _provider_name, auth_config = _resolve_provider(
+      provider,
+      model,
+      None,
+      None,
+      provider_config,
+      auth_config={},
+      max_tokens=max_tokens,
+    )
+  if isinstance(provider, str) and provider.strip().lower() == "anthropic":
+    provider_instance = AnthropicProvider(rate_table=load_rate_table(rates_file))
   model = str(auth_config["model"])
 
   skill_loader = SkillLoader(skills_dir) if skills_dir else None
@@ -220,7 +245,7 @@ def create_agent(
     channel: str | None,
     auth_manager: AuthManager,
   ) -> ChatRuntime:
-    _ = channel, auth_manager
+    _ = auth_manager
     local_handlers = dict(tool_handlers or {})
     extra_tool_defs = list(tool_definitions or [])
     runner_ref: list[Any] = [None]
@@ -241,6 +266,7 @@ def create_agent(
 
       local_handlers["run_agent"] = make_run_agent_handler(
         runner_ref,
+        parent_session=session,
         skill_loader=skill_loader,
         mcp_client=mcp_client or _NullMcpClient(),
         mcp_session_inject_servers=mcp_session_inject_servers,
@@ -285,6 +311,30 @@ def create_agent(
         return await result
       return result
 
+    resolved_billing_mode = str((session.auth_config or auth_config).get("billing_mode", "byok"))
+    rate_table = getattr(provider_instance, "_rate_table", None)
+    resolved_rate_table_version = str(
+      (session.auth_config or auth_config).get("rate_table_version")
+      or getattr(rate_table, "version", "unknown")
+      or "unknown"
+    )
+    resolved_usage_dlq_path = (
+      Path(usage_ledger_dlq_path).expanduser() if usage_ledger_dlq_path is not None else DEFAULT_USAGE_DLQ_PATH
+    )
+
+    async def _combined_on_usage(event: UsageEvent) -> None:
+      if usage_ledger is not None:
+        await usage_ledger.record(event)
+      if on_usage is not None:
+        try:
+          result = on_usage(event)
+          if inspect.isawaitable(result):
+            await result
+        except Exception as exc:
+          if usage_ledger is None:
+            raise
+          log.warning("on_usage observer failed after ledger record (non-fatal): %s", exc)
+
     def _build_runner(event_log, session_id: str) -> AgentRunner:
       dispatcher = ToolDispatcher(
         mcp_client=mcp_client or _NullMcpClient(),
@@ -302,13 +352,19 @@ def create_agent(
         dispatcher=dispatcher,
         session_id=session_id,
         provider=provider_instance,
-        auth_config=auth_config,
+        auth_config=session.auth_config or auth_config,
         mcp_client=mcp_client,
         get_tool_definitions=_get_tool_defs,
         per_turn_timeout=per_turn_timeout,
         on_tool_result=_combined_on_tool_result,
-        on_usage=on_usage,
+        on_usage=_combined_on_usage if usage_ledger is not None or on_usage is not None else None,
         on_tool_timing=on_tool_timing,
+        user_id=session.user_id,
+        request_id=request.request_id,
+        billing_mode=resolved_billing_mode,
+        rate_table_version=resolved_rate_table_version,
+        channel=channel,
+        usage_ledger_dlq_path=resolved_usage_dlq_path,
         max_budget_usd=max_budget_usd,
       )
       runner_ref[0] = runner
@@ -345,7 +401,7 @@ def create_agent(
     if mcp_client is not None:
       await mcp_client.shutdown()
 
-  allowed_models = _allowed_models_for_provider(provider_instance, model)
+  allowed_models: set[str] = set()
 
   app = create_gateway_app(
     GatewayServerConfig(
@@ -357,6 +413,8 @@ def create_agent(
       build_chat_runtime=_build_chat_runtime,
       default_provider=provider_instance,
       auth_config=auth_config,
+      credentials_resolver=credentials_resolver,
+      resolver_timeout_seconds=resolver_timeout_seconds,
       mcp_client=mcp_client,
       per_turn_timeout=per_turn_timeout,
       on_startup=_combined_startup,

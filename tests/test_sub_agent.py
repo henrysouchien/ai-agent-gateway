@@ -12,6 +12,8 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.skills import SkillLoader
+from agent_gateway import EventLog
+from agent_gateway.session import Session
 from agent_gateway.sub_agent import (
   _DEFAULT_EXCLUDED_TOOLS,
   _DEFAULT_SYSTEM_PROMPT_TEMPLATE,
@@ -21,6 +23,7 @@ from agent_gateway.sub_agent import (
   make_run_agent_handler,
   make_run_agent_tool_def,
 )
+from agent_gateway.tool_dispatcher import ToolExecutionContext
 
 
 def _run(coro):
@@ -134,6 +137,83 @@ def test_make_run_agent_handler_uses_anonymous_defaults_for_blank_agent(tmp_path
   )
   assert call["max_turns"] == 9
   assert call["timeout"] == 42.0
+
+
+def test_make_run_agent_handler_default_timeout_is_none() -> None:
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=None,
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+  )
+
+  result, error = _run(handler({"task": "Quick question"}))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  assert runner.calls[0]["timeout"] is None
+
+
+def test_make_run_agent_handler_copies_user_id_and_auth_config_to_sub_session() -> None:
+  runner = _StubRunner()
+  parent_auth_config = {"provider": "anthropic", "billing_mode": "byok", "api_key": "key"}
+  parent_session = Session(
+    session_id="sess_parent",
+    api_key_hash="hash",
+    created_at=1,
+    expires_at=2,
+    user_id="alice",
+    auth_config=parent_auth_config,
+  )
+  handler = make_run_agent_handler(
+    [runner],
+    parent_session=parent_session,
+    skill_loader=None,
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+  )
+
+  result, error = _run(handler({"task": "Collect"}))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  sub_session = runner.calls[0]["sub_session"]
+  assert sub_session.user_id == "alice"
+  assert sub_session.auth_config is parent_auth_config
+
+
+def test_make_run_agent_handler_forwards_parent_turn_id_from_tool_context() -> None:
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    parent_session=Session(
+      session_id="sess_parent",
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="alice",
+      auth_config={"provider": "anthropic", "billing_mode": "byok", "api_key": "key"},
+    ),
+    skill_loader=None,
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+  )
+
+  result, error = _run(
+    handler(
+      {"task": "Collect"},
+      tool_ctx=ToolExecutionContext(
+        tool_call_id="tool_run_agent_1",
+        tool_name="run_agent",
+        event_log=EventLog(),
+      ),
+    )
+  )
+
+  assert error is None
+  assert result == {"response": "ok"}
+  assert runner.calls[0]["parent_turn_id"] == "tool_run_agent_1"
 
 
 def test_make_run_agent_handler_returns_not_available_for_named_agents_without_skills() -> None:

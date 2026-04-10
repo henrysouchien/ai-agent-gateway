@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-agent-gateway"
-version = "0.5.3"
+version = "0.1.0"
 description = "Generic AI agent gateway with MCP tool support and streaming"
 readme = "README.md"
 license = "MIT"
@@ -27,3 +27,6 @@ dev = ["pytest", "pytest-asyncio"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["agent_gateway*"]
+
+[tool.setuptools.package-data]
+agent_gateway = ["rates/*.json"]

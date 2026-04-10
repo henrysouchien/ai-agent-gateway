@@ -7,6 +7,7 @@ import json as json_mod
 import logging
 import math
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
@@ -16,6 +17,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from .auth import (
+  CredentialsResolver,
+  CredentialsTimeoutError,
+  CrossUserReuseError,
+  MissingUserIdError,
+  NoCredentialError,
+  StrictModeDefaultUserError,
+)
 from .event_log import EventLog
 from .mcp_client import McpClientManager
 from .providers.agent_sdk import AgentSDKConfig
@@ -37,6 +46,8 @@ class ChatInitRequest(BaseModel):
   """Request body for `POST /chat/init`."""
 
   api_key: str = Field(..., min_length=1)
+  user_id: str | None = None
+  context: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ChatInitResponse(BaseModel):
@@ -63,6 +74,8 @@ class ChatRequest(BaseModel):
   """
 
   messages: List[ChatMessage]
+  user_id: str | None = None
+  request_id: str | None = None
   context: Dict[str, Any] = Field(default_factory=dict)
   model: Optional[str] = None
 
@@ -189,6 +202,8 @@ class GatewayServerConfig:
   )
   cors_allow_methods: List[str] = field(default_factory=lambda: ["GET", "POST", "OPTIONS"])
   auth_config: Dict[str, Any] = field(default_factory=dict)
+  credentials_resolver: CredentialsResolver | None = None
+  resolver_timeout_seconds: float = 5.0
   mcp_client: Optional[McpClientManager] = None
   sdk_config: AgentSDKConfig | None = None
   per_turn_timeout: int = 300
@@ -250,6 +265,60 @@ def _json_dumps(payload: Dict[str, Any]) -> str:
   return JSONResponse(content=sanitized).body.decode("utf-8")
 
 
+def _error_payload(
+  exc: Exception,
+  *,
+  user_id: str | None = None,
+  session_id: str | None = None,
+  request_user: str | None = None,
+  session_user: str | None = None,
+  timeout_seconds: float | None = None,
+) -> tuple[int, Dict[str, Any]]:
+  if isinstance(exc, CredentialsTimeoutError):
+    payload: Dict[str, Any] = {
+      "error": "credentials_timeout",
+      "message": str(exc),
+    }
+    if user_id is not None:
+      payload["user_id"] = user_id
+    if timeout_seconds is not None:
+      payload["timeout_seconds"] = timeout_seconds
+    return 504, payload
+
+  if isinstance(exc, StrictModeDefaultUserError):
+    payload = {"error": "strict_mode_default_user", "message": str(exc)}
+    if user_id is not None:
+      payload["user_id"] = user_id
+    return 400, payload
+
+  if isinstance(exc, MissingUserIdError):
+    payload = {"error": "missing_user_id", "message": str(exc)}
+    if session_id is not None:
+      payload["session_id"] = session_id
+    return 400, payload
+
+  if isinstance(exc, CrossUserReuseError):
+    payload = {"error": "cross_user_reuse", "message": str(exc)}
+    if session_id is not None:
+      payload["session_id"] = session_id
+    if session_user is not None:
+      payload["session_user"] = session_user
+    if request_user is not None:
+      payload["request_user"] = request_user
+    return 401, payload
+
+  if isinstance(exc, NoCredentialError):
+    payload = {"error": "credentials_unavailable", "message": str(exc), "reason": str(exc)}
+    if user_id is not None:
+      payload["user_id"] = user_id
+    return 401, payload
+
+  payload = {"error": "credentials_unavailable", "message": str(exc), "reason": str(exc)}
+  if user_id is not None:
+    payload["user_id"] = user_id
+  return 500, payload
+
+
 def _drain_result_queue(queue: Optional[asyncio.Queue]) -> None:
   if queue is None:
     return
@@ -289,12 +358,10 @@ async def _maybe_await(callback: Optional[Callable[..., Any]]) -> None:
 
 def _make_request_approval(session: Session, event_log: EventLog) -> RequestApproval:
   async def request_approval(payload: ApprovalRequest) -> Optional[ApprovalDecision]:
-    expires_at = int(time.time() + payload.timeout)
     approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
     session.pending_tools[payload.tool_call_id] = {
       "nonce": payload.nonce,
       "requested_at": int(time.time()),
-      "expires_at": expires_at,
       "status": "approval_pending",
       "tool_name": payload.tool_name,
       "resolved_qualifier": payload.resolved_qualifier,
@@ -306,7 +373,6 @@ def _make_request_approval(session: Session, event_log: EventLog) -> RequestAppr
         "type": "tool_approval_request",
         "tool_call_id": payload.tool_call_id,
         "nonce": payload.nonce,
-        "expires_at": expires_at,
         "tool_name": payload.tool_name,
         "tool_input": payload.tool_input,
         "resolved_qualifier": payload.resolved_qualifier,
@@ -314,9 +380,7 @@ def _make_request_approval(session: Session, event_log: EventLog) -> RequestAppr
     )
 
     try:
-      approval = await asyncio.wait_for(approval_queue.get(), timeout=payload.timeout)
-    except asyncio.TimeoutError:
-      return None
+      approval = await approval_queue.get()
     finally:
       session.pending_tools.pop(payload.tool_call_id, None)
       session.approval_queues.pop(payload.tool_call_id, None)
@@ -397,7 +461,54 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   @router.post("/chat/init", response_model=ChatInitResponse)
   async def chat_init(payload: ChatInitRequest) -> ChatInitResponse:
     auth.validate_api_key(payload.api_key)
-    session = auth.session_store.create_session(api_key_hash=AuthManager.hash_api_key(payload.api_key))
+    resolver = config.credentials_resolver
+    resolved_user_id = payload.user_id.strip() if isinstance(payload.user_id, str) else payload.user_id
+    if resolved_user_id == "":
+      resolved_user_id = None
+    if resolved_user_id is None:
+      context_user_id = (payload.context or {}).get("user_id")
+      if isinstance(context_user_id, str) and context_user_id.strip():
+        resolved_user_id = context_user_id.strip()
+        log.warning("Chat init used deprecated context.user_id fallback; move user_id to the top-level request field.")
+    if resolved_user_id is None:
+      resolved_user_id = "_default"
+
+    resolved_auth_config: dict[str, Any] | None = None
+    if resolver is not None:
+      if resolved_user_id == "_default":
+        status, error_payload = _error_payload(
+          StrictModeDefaultUserError(
+            "Gateway is in strict multi-user mode (resolver configured). Request must include a non-default user_id. "
+            "Did you forget to thread user_id from the consumer's auth middleware to the gateway request?"
+          ),
+          user_id=resolved_user_id,
+        )
+        return JSONResponse(error_payload, status_code=status)
+      try:
+        auth_config = await asyncio.wait_for(
+          resolver(resolved_user_id, payload),
+          timeout=config.resolver_timeout_seconds,
+        )
+      except asyncio.TimeoutError as exc:
+        status, error_payload = _error_payload(
+          CredentialsTimeoutError(
+            f"Credential resolution for user '{resolved_user_id}' timed out after "
+            f"{config.resolver_timeout_seconds:.1f}s. Check the resolver latency or raise resolver_timeout_seconds."
+          ),
+          user_id=resolved_user_id,
+          timeout_seconds=config.resolver_timeout_seconds,
+        )
+        return JSONResponse(error_payload, status_code=status)
+      except Exception as exc:
+        status, error_payload = _error_payload(exc, user_id=resolved_user_id)
+        return JSONResponse(error_payload, status_code=status)
+      resolved_auth_config = auth_config.to_dict()
+
+    session = auth.session_store.create_session(
+      api_key_hash=AuthManager.hash_api_key(payload.api_key),
+      user_id=resolved_user_id,
+      auth_config=resolved_auth_config,
+    )
     token = auth.issue_token(session)
     log.info("Session created: %s", session.session_id)
     return ChatInitResponse(
@@ -409,7 +520,40 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   @router.post("/chat")
   async def chat_stream(request: Request, body: ChatRequest = Body(...)) -> StreamingResponse:
     token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
-    session = auth.verify_token(token)
+    if isinstance(body.user_id, str):
+      body.user_id = body.user_id.strip() or None
+    if isinstance(body.request_id, str):
+      body.request_id = body.request_id.strip() or None
+    session, claims = auth.verify_token_with_payload(token)
+    jwt_user_id = str(claims.get("user_id") or session.user_id)
+    strict_mode = config.credentials_resolver is not None
+    if strict_mode and jwt_user_id == "_default":
+      status, error_payload = _error_payload(
+        StrictModeDefaultUserError(
+          "Gateway is in strict multi-user mode (resolver configured). Request must include a non-default user_id. "
+          "Did you forget to thread user_id from the consumer's auth middleware to the gateway request?"
+        ),
+        user_id=jwt_user_id,
+      )
+      return JSONResponse(error_payload, status_code=status)
+    if strict_mode:
+      if body.user_id is None:
+        status, error_payload = _error_payload(MissingUserIdError(), session_id=session.session_id)
+        return JSONResponse(error_payload, status_code=status)
+      if body.user_id != jwt_user_id:
+        status, error_payload = _error_payload(
+          CrossUserReuseError(
+            f"Session for user '{jwt_user_id}' cannot be reused for user '{body.user_id}'. "
+            "Create a separate gateway session per end user."
+          ),
+          session_id=session.session_id,
+          session_user=jwt_user_id,
+          request_user=body.user_id,
+        )
+        return JSONResponse(error_payload, status_code=status)
+    else:
+      body.user_id = body.user_id or jwt_user_id
+    body.request_id = body.request_id or str(uuid.uuid4())
     raw_channel = (body.context or {}).get("channel")
     channel = raw_channel.strip().lower() if isinstance(raw_channel, str) else None
 
@@ -441,7 +585,8 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         channel=channel,
         auth_manager=auth,
       )
-      resolved_model = runtime.model_override or body.model or str(config.auth_config.get("model", "")).strip() or None
+      session_auth_config = session.auth_config or config.auth_config
+      resolved_model = runtime.model_override or body.model or str(session_auth_config.get("model", "")).strip() or None
       if resolved_model:
         if config.allowed_models and resolved_model not in config.allowed_models:
           raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
@@ -570,11 +715,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
     if pending.get("nonce") != payload.nonce:
       return JSONResponse({"error": "Nonce mismatch"}, status_code=409)
-
-    if int(time.time()) > int(pending.get("expires_at", 0)):
-      session.pending_tools.pop(payload.tool_call_id, None)
-      session.approval_queues.pop(payload.tool_call_id, None)
-      return JSONResponse({"error": "Tool approval expired"}, status_code=410)
 
     approval_queue = session.approval_queues.get(payload.tool_call_id)
     if approval_queue is None:

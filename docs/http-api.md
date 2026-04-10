@@ -382,7 +382,6 @@ Schema:
   "type": "tool_approval_request",
   "tool_call_id": "toolu_123",
   "nonce": "a1b2c3d4e5f6",
-  "expires_at": 1770000000,
   "tool_name": "code_execute",
   "tool_input": {"code": "print(1 + 1)"},
   "resolved_qualifier": "subprocess"
@@ -395,7 +394,6 @@ Fields:
 | --- | --- | --- |
 | `tool_call_id` | string | Tool call id you must echo back |
 | `nonce` | string | Anti-replay nonce |
-| `expires_at` | integer | Unix timestamp when approval expires |
 | `tool_name` | string | Tool name |
 | `tool_input` | object | Proposed tool input |
 | `resolved_qualifier` | string | Tool-type qualifier used for session approval caching |

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from .event_log import EventLog
 from .mcp_client import McpClientManager
+from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, UsageEvent, write_dlq
 from .providers import ModelInfo, ModelProvider, ThinkingLevel
 from .tool_dispatcher import ToolDispatcher
 
@@ -109,11 +113,12 @@ class CostAccumulator:
 
 
 OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | None]]
-OnUsage = Callable[[Dict[str, Any]], None]
+OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
 OnToolTiming = Callable[[str, str, str | None, int, bool, int], None]
 OnMaxTurns = Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
 BackgroundTaskHandler = Callable[[Dict[str, Any]], Awaitable[Tuple[Optional[Any], Optional[Dict[str, Any]]]]]
 BackgroundTaskCallback = Callable[[BackgroundTask], Awaitable[None] | None]
+OnMetric = Callable[[str, int], None]
 
 
 class AgentRunner:
@@ -153,6 +158,14 @@ class AgentRunner:
     on_tool_result: OnToolResult | None = None,
     on_usage: OnUsage | None = None,
     on_tool_timing: OnToolTiming | None = None,
+    user_id: str | None = None,
+    request_id: str | None = None,
+    parent_turn_id: str | None = None,
+    billing_mode: str = "byok",
+    rate_table_version: str = "unknown",
+    channel: str | None = None,
+    usage_ledger_dlq_path: Path | str | None = None,
+    on_metric: OnMetric | None = None,
     sub_agent_config: SubAgentConfig | None = None,
     compaction_trigger: int | None = None,
     compaction_instructions: str | None = None,
@@ -184,6 +197,16 @@ class AgentRunner:
     self._on_tool_result = on_tool_result
     self._on_usage = on_usage
     self._on_tool_timing = on_tool_timing
+    self._usage_user_id = str(user_id or "_default")
+    self._request_id = str(request_id or uuid.uuid4())
+    self._parent_turn_id = parent_turn_id
+    self._billing_mode = "metered" if str(billing_mode).strip().lower() == "metered" else "byok"
+    self._rate_table_version = str(rate_table_version or "unknown")
+    self._channel = channel.strip() if isinstance(channel, str) and channel.strip() else None
+    self._usage_ledger_dlq_path = (
+      Path(usage_ledger_dlq_path).expanduser() if usage_ledger_dlq_path is not None else DEFAULT_USAGE_DLQ_PATH
+    )
+    self._on_metric = on_metric
     self._sub_agent_config = sub_agent_config
     self._compaction_trigger = compaction_trigger
     self._compaction_instructions = compaction_instructions
@@ -310,6 +333,7 @@ class AgentRunner:
     model: str | None = None,
     system_prompt: str | None = None,
     dispatcher: ToolDispatcher,
+    sub_session: Any | None = None,
     excluded_tools: Set[str] | None = None,
     max_turns: int | None,
     timeout: float | None,
@@ -317,6 +341,7 @@ class AgentRunner:
     per_turn_timeout: float | None = None,
     max_tokens: int = 32000,
     call_index: int = 0,
+    parent_turn_id: str | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
   ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
     """Run a focused sub-agent task and return its summarized result.
@@ -333,7 +358,7 @@ class AgentRunner:
       if excluded_tools is None:
         excluded_tools = set(self._sub_agent_config.excluded_tools)
 
-    sub_session_id = f"sub{call_index}:{self._sid}"
+    sub_session_id = str(getattr(sub_session, "session_id", "") or f"sub{call_index}:{self._sid}")
     original_on_event = getattr(self._log, "_on_event", None)
 
     def _composed_on_event(event: Dict[str, Any], session_id: str) -> None:
@@ -357,7 +382,7 @@ class AgentRunner:
       dispatcher=dispatcher,
       session_id=sub_session_id,
       provider=self._provider,
-      auth_config=self._auth_config,
+      auth_config=getattr(sub_session, "auth_config", None) or self._auth_config,
       client_timeout=client_timeout,
       max_tokens_override=max_tokens,
       per_turn_timeout=per_turn_timeout if per_turn_timeout is not None else self._per_turn_timeout,
@@ -369,6 +394,14 @@ class AgentRunner:
       on_tool_result=self._on_tool_result,
       on_usage=self._on_usage,
       on_tool_timing=self._on_tool_timing,
+      user_id=getattr(sub_session, "user_id", None) or self._usage_user_id,
+      request_id=self._request_id,
+      parent_turn_id=parent_turn_id,
+      billing_mode=self._billing_mode,
+      rate_table_version=self._rate_table_version,
+      channel=self._channel,
+      usage_ledger_dlq_path=self._usage_ledger_dlq_path,
+      on_metric=self._on_metric,
       sub_agent_config=self._sub_agent_config,
       compaction_trigger=self._compaction_trigger,
       compaction_instructions=None,
@@ -380,16 +413,17 @@ class AgentRunner:
     )
 
     timed_out = False
+    coro = sub_runner.run(
+      messages=[{"role": "user", "content": task}],
+      system_prompt=system_prompt,
+      model_override=model,
+      max_turns=max_turns,
+    )
     try:
-      await asyncio.wait_for(
-        sub_runner.run(
-          messages=[{"role": "user", "content": task}],
-          system_prompt=system_prompt,
-          model_override=model,
-          max_turns=max_turns,
-        ),
-        timeout=timeout,
-      )
+      if timeout is not None and timeout > 0:
+        await asyncio.wait_for(coro, timeout=timeout)
+      else:
+        await coro
     except asyncio.TimeoutError:
       timed_out = True
       sub_log.append({"type": "error", "error": f"Sub-agent timed out after {timeout}s"})
@@ -706,13 +740,76 @@ class AgentRunner:
     except Exception as exc:
       log.warning("[%s] on_tool_timing hook failed (non-fatal): %s", self._sid, exc)
 
-  def _call_on_usage(self, usage_payload: Dict[str, Any]) -> None:
+  def _call_metric(self, name: str, value: int = 1) -> None:
+    if self._on_metric is None:
+      return
+    try:
+      self._on_metric(name, value)
+    except Exception as exc:
+      log.warning("[%s] metric hook failed (non-fatal): %s", self._sid, exc)
+
+  @staticmethod
+  def _usage_has_tokens(usage_totals: Dict[str, int]) -> bool:
+    return any(
+      int(usage_totals.get(key, 0) or 0) > 0
+      for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+      )
+    )
+
+  @staticmethod
+  def _usage_delta(before: Dict[str, int], after: Dict[str, int]) -> Dict[str, int]:
+    return {
+      "input_tokens": max(0, int(after.get("input_tokens", 0) or 0) - int(before.get("input_tokens", 0) or 0)),
+      "output_tokens": max(0, int(after.get("output_tokens", 0) or 0) - int(before.get("output_tokens", 0) or 0)),
+      "cache_read_input_tokens": max(
+        0,
+        int(after.get("cache_read_input_tokens", 0) or 0) - int(before.get("cache_read_input_tokens", 0) or 0),
+      ),
+      "cache_creation_input_tokens": max(
+        0,
+        int(after.get("cache_creation_input_tokens", 0) or 0)
+        - int(before.get("cache_creation_input_tokens", 0) or 0),
+      ),
+    }
+
+  def _build_usage_event(self, *, model: str, usage_totals: Dict[str, int]) -> UsageEvent:
+    cost = self._estimate_usage_cost(model, usage_totals)
+    return UsageEvent(
+      user_id=self._usage_user_id,
+      session_id=self._full_session_id,
+      request_id=self._request_id,
+      parent_turn_id=self._parent_turn_id,
+      timestamp=time.time(),
+      model=model,
+      input_tokens=int(usage_totals["input_tokens"]),
+      output_tokens=int(usage_totals["output_tokens"]),
+      cache_read_tokens=int(usage_totals["cache_read_input_tokens"]),
+      cache_creation_tokens=int(usage_totals["cache_creation_input_tokens"]),
+      cost_usd=float(cost.total),
+      rate_table_version=self._rate_table_version,
+      billing_mode=self._billing_mode,
+      channel=self._channel,
+    )
+
+  async def _call_on_usage(self, usage_event: UsageEvent) -> None:
     if self._on_usage is None:
       return
     try:
-      self._on_usage(usage_payload)
+      result = self._on_usage(usage_event)
+      if inspect.isawaitable(result):
+        await result
     except Exception as exc:
-      log.warning("[%s] on_usage hook failed (non-fatal): %s", self._sid, exc)
+      log.error("[%s] on_usage hook failed (non-fatal): %s", self._sid, exc)
+      self._call_metric("gateway.usage_event_dropped", 1)
+      if self._usage_ledger_dlq_path is not None:
+        try:
+          write_dlq(usage_event, self._usage_ledger_dlq_path)
+        except Exception as dlq_exc:
+          log.error("[%s] usage DLQ write failed (non-fatal): %s", self._sid, dlq_exc)
 
   def _estimate_usage_cost(self, model: str, usage_totals: Dict[str, int]):
     uncached_input = max(
@@ -956,6 +1053,7 @@ class AgentRunner:
         raise
       except Exception as exc:
         stream_error = exc
+        partial_usage = self._usage_delta(tokens_snapshot, usage_totals)
         usage_totals.clear()
         usage_totals.update(tokens_snapshot)
 
@@ -988,6 +1086,8 @@ class AgentRunner:
             guard_message,
             _format_exc(exc),
           )
+          if self._usage_has_tokens(partial_usage):
+            await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=partial_usage))
           self._append({"type": "error", "error": guard_error})
           await self._close_client(client, timeout=5.0)
           return None
@@ -1001,6 +1101,8 @@ class AgentRunner:
             time.time() - turn_t0,
             formatted_exc,
           )
+          if self._usage_has_tokens(partial_usage):
+            await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=partial_usage))
           self._append({"type": "error", "error": formatted_exc})
           await self._close_client(client, timeout=5.0)
           return None
@@ -1113,7 +1215,15 @@ class AgentRunner:
           tool_input,
           call_index=call_index,
         )
-        if self._tool_call_timeout is not None and tool_name not in ("run_agent", "get_background_result"):
+        needs_approval = False
+        requires_approval_fn = getattr(self._dispatcher, "requires_approval", None)
+        if requires_approval_fn is not None:
+          try:
+            needs_approval = requires_approval_fn(tool_name, tool_input)
+          except Exception:
+            pass
+        skip_timeout = tool_name in ("run_agent", "get_background_result") or needs_approval
+        if self._tool_call_timeout is not None and not skip_timeout:
           try:
             result, error = await asyncio.wait_for(dispatch_coro, timeout=self._tool_call_timeout)
           except asyncio.TimeoutError:
@@ -1464,6 +1574,7 @@ class AgentRunner:
           else system_prompt
         )
         inject_background_task_reminder = False
+        turn_usage_before = dict(usage_totals)
         turn_result = await self._stream_turn(
           client=client,
           config=config,
@@ -1482,6 +1593,9 @@ class AgentRunner:
         if turn_result is None:
           return
         client, turn = turn_result
+        turn_usage = self._usage_delta(turn_usage_before, usage_totals)
+        if self._usage_has_tokens(turn_usage):
+          await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=turn_usage))
 
         turn_elapsed = time.time() - turn_t0
         ttft = (turn.first_token_t - turn_t0) if turn.first_token_t else None
@@ -1725,17 +1839,6 @@ class AgentRunner:
           }
         },
       )
-
-      usage_payload = {
-        "session_id": self._full_session_id,
-        "turns": turn_count,
-        "input_tokens": usage_totals["input_tokens"],
-        "output_tokens": usage_totals["output_tokens"],
-        "cache_read_input_tokens": usage_totals["cache_read_input_tokens"],
-        "cache_creation_input_tokens": usage_totals["cache_creation_input_tokens"],
-        "estimated_cost": round(cost.total, 4),
-      }
-      self._call_on_usage(usage_payload)
 
       self._append(
         {

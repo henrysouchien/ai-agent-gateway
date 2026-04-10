@@ -1,0 +1,294 @@
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[3]
+PKG_DIR = ROOT / "packages" / "agent-gateway"
+API_DIR = ROOT / "api"
+if str(PKG_DIR) not in sys.path:
+  sys.path.insert(0, str(PKG_DIR))
+if str(API_DIR) not in sys.path:
+  sys.path.insert(0, str(API_DIR))
+
+from agent_gateway.skills import SkillProfile, parse_skill_file
+from agent_profiles import AgentProfile
+
+
+def _write_skill(tmp_path: Path, frontmatter: str | None, *, body: str = "# Skill\n\nPrompt") -> Path:
+  skill_path = tmp_path / "test-skill.md"
+  if frontmatter is None:
+    text = body
+  else:
+    text = f"---\n{textwrap.dedent(frontmatter).strip()}\n---\n\n{body}\n"
+  skill_path.write_text(text, encoding="utf-8")
+  return skill_path
+
+
+def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    name: typed-metadata
+    metadata:
+      mcp_servers:
+        - gmail
+        - slack
+      session_inject_servers:
+        - gmail
+      timeout_overrides:
+        gmail: "30"
+        slack: 45
+      state_dir: daily-scan
+      max_budget_usd: "0.75"
+      max_retries: 2
+      initial_message: Run the workflow.
+      delivery_label: Daily Scan
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.mcp_servers == ["gmail", "slack"]
+  assert profile.session_inject_servers == ["gmail"]
+  assert profile.timeout_overrides == {"gmail": 30, "slack": 45}
+  assert profile.state_dir == "daily-scan"
+  assert profile.max_budget_usd == 0.75
+  assert profile.max_retries == 2
+  assert profile.initial_message == "Run the workflow."
+  assert profile.delivery_label == "Daily Scan"
+  assert profile.metadata == {
+    "mcp_servers": ["gmail", "slack"],
+    "session_inject_servers": ["gmail"],
+    "timeout_overrides": {"gmail": 30, "slack": 45},
+    "state_dir": "daily-scan",
+    "max_budget_usd": 0.75,
+    "max_retries": 2,
+    "initial_message": "Run the workflow.",
+    "delivery_label": "Daily Scan",
+  }
+
+
+def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    name: typed-top-level
+    mcp_servers:
+      - github
+    session_inject_servers:
+      - github
+    timeout_overrides:
+      github: "90"
+    state_dir: top-level-state
+    max_budget_usd: 1.25
+    max_retries: 3
+    initial_message: Run from top level.
+    delivery_label: Top Level
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.mcp_servers == ["github"]
+  assert profile.session_inject_servers == ["github"]
+  assert profile.timeout_overrides == {"github": 90}
+  assert profile.state_dir == "top-level-state"
+  assert profile.max_budget_usd == 1.25
+  assert profile.max_retries == 3
+  assert profile.initial_message == "Run from top level."
+  assert profile.delivery_label == "Top Level"
+  assert profile.metadata == {
+    "mcp_servers": ["github"],
+    "session_inject_servers": ["github"],
+    "timeout_overrides": {"github": 90},
+    "state_dir": "top-level-state",
+    "max_budget_usd": 1.25,
+    "max_retries": 3,
+    "initial_message": "Run from top level.",
+    "delivery_label": "Top Level",
+  }
+
+
+def test_mixed_known_and_unknown_metadata(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    name: mixed-metadata
+    metadata:
+      mcp_servers:
+        - gmail
+      state_dir: mixed-state
+      owner: analyst
+    custom_limit: 5
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.mcp_servers == ["gmail"]
+  assert profile.state_dir == "mixed-state"
+  assert profile.metadata == {
+    "owner": "analyst",
+    "custom_limit": 5,
+    "mcp_servers": ["gmail"],
+    "state_dir": "mixed-state",
+  }
+
+
+def test_timeout_overrides_coercion(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    metadata:
+      timeout_overrides:
+        gmail: "120"
+        github: 45.0
+        "": 30
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.timeout_overrides == {"gmail": 120, "github": 45}
+  assert profile.metadata == {"timeout_overrides": {"gmail": 120, "github": 45}}
+
+
+def test_timeout_overrides_invalid(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    metadata:
+      timeout_overrides:
+        - gmail
+        - 30
+    """,
+  )
+
+  with pytest.raises(ValueError, match="timeout_overrides"):
+    parse_skill_file(skill_path)
+
+
+def test_max_budget_coercion(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    metadata:
+      max_budget_usd: "0.75"
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.max_budget_usd == 0.75
+  assert profile.metadata == {"max_budget_usd": 0.75}
+
+
+def test_max_retries_coercion(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    metadata:
+      max_retries: 3.0
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.max_retries == 3
+  assert profile.metadata == {"max_retries": 3}
+
+
+def test_none_defaults(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    name: defaults
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.metadata is None
+  assert profile.mcp_servers is None
+  assert profile.session_inject_servers is None
+  assert profile.timeout_overrides is None
+  assert profile.state_dir is None
+  assert profile.max_budget_usd is None
+  assert profile.max_retries is None
+  assert profile.initial_message is None
+  assert profile.delivery_label is None
+
+
+def test_dataclass_construction_defaults() -> None:
+  profile = SkillProfile(name="x", system_prompt="y")
+
+  assert profile.metadata is None
+  assert profile.mcp_servers is None
+  assert profile.session_inject_servers is None
+  assert profile.timeout_overrides is None
+  assert profile.state_dir is None
+  assert profile.max_budget_usd is None
+  assert profile.max_retries is None
+  assert profile.initial_message is None
+  assert profile.delivery_label is None
+
+
+def test_positional_construction_compat() -> None:
+  profile = SkillProfile("name", "prompt", None, None, None, None, None, False, None, False, {"custom": 1})
+
+  assert profile.name == "name"
+  assert profile.system_prompt == "prompt"
+  assert profile.metadata == {"custom": 1}
+  assert profile.mcp_servers is None
+  assert profile.delivery_label is None
+
+
+def test_agent_profile_subclass_compat() -> None:
+  profile = AgentProfile(name="agent", description="Agent description")
+
+  assert profile.name == "agent"
+  assert profile.description == "Agent description"
+  assert profile.metadata is None
+  assert profile.mcp_servers is None
+  assert profile.session_inject_servers is None
+  assert profile.timeout_overrides is None
+  assert profile.state_dir is None
+  assert profile.max_budget_usd is None
+  assert profile.max_retries is None
+  assert profile.initial_message is None
+  assert profile.delivery_label is None
+
+
+def test_metadata_retains_known_keys(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    metadata:
+      mcp_servers:
+        - gmail
+      delivery_label:
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.metadata is not None
+  assert profile.metadata["mcp_servers"] == ["gmail"]
+  assert "delivery_label" in profile.metadata
+  assert profile.metadata["delivery_label"] is None
+
+
+def test_empty_mcp_servers_is_none(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    mcp_servers: []
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.mcp_servers is None
+  assert profile.metadata == {"mcp_servers": None}

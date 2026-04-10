@@ -15,6 +15,17 @@ from .autonomous import (
   save_state,
   send_telegram,
 )
+from ._provider_utils import resolve_auth_config
+from .auth import (
+  AuthConfig,
+  AuthExpiredError,
+  CredentialsResolver,
+  CredentialsTimeoutError,
+  CrossUserReuseError,
+  MissingUserIdError,
+  NoCredentialError,
+  StrictModeDefaultUserError,
+)
 from .code_execution import (
   BackgroundTask,
   CodeExecutionBundle,
@@ -33,9 +44,11 @@ from .heartbeat import HeartbeatConfig, HeartbeatLoop, TickResult, strip_heartbe
 from .easy import create_agent
 from .memory import EmbeddingProvider, MarkdownSyncManager, MemoryStore
 from .mcp_client import McpClientManager
+from .multi_user.billing import SqliteUsageLedger, UsageEvent, UsageLedger, UsageTotal
 from .providers import (
   AgentSDKConfig,
   AnthropicProvider,
+  CodexProvider,
   CostEstimate,
   ModelInfo,
   ModelProvider,
@@ -43,6 +56,7 @@ from .providers import (
   StreamEvent,
   ThinkingLevel,
 )
+from .rates import ModelRates, RateTable, UnknownModelError, load_rate_table
 from .retry import RetryConfig, classify_outcome, run_autonomous_with_retry
 from .runner import AgentRunner, SubAgentConfig, ToolResultContext
 from .send_prompt import send_prompt, send_prompt_sync
@@ -74,9 +88,15 @@ __all__ = [
   "ApprovalDecision",
   "ApprovalRequest",
   "AnthropicProvider",
+  "AuthConfig",
   "AuthManager",
+  "AuthExpiredError",
   "BackgroundTask",
+  "CodexProvider",
   "CostEstimate",
+  "CredentialsResolver",
+  "CredentialsTimeoutError",
+  "CrossUserReuseError",
   "ChatRuntime",
   "CodeExecutionBundle",
   "CodeExecutionConfig",
@@ -92,13 +112,18 @@ __all__ = [
   "MarkdownSyncManager",
   "MemoryStore",
   "McpClientManager",
+  "MissingUserIdError",
+  "ModelRates",
   "ModelInfo",
   "ModelProvider",
+  "NoCredentialError",
   "OpenAIProvider",
   "OutputRingBuffer",
+  "RateTable",
   "RequestContext",
   "RetryConfig",
   "RunOutput",
+  "resolve_auth_config",
   "send_prompt",
   "send_prompt_sync",
   "Session",
@@ -107,8 +132,10 @@ __all__ = [
   "SkillProfile",
   "SkillStateStore",
   "StreamEvent",
+  "StrictModeDefaultUserError",
   "SubAgentConfig",
   "SubprocessBackend",
+  "SqliteUsageLedger",
   "EmbeddingProvider",
   "ThinkingLevel",
   "TickResult",
@@ -117,6 +144,10 @@ __all__ = [
   "ToolInterceptor",
   "ToolResult",
   "ToolResultContext",
+  "UsageEvent",
+  "UsageLedger",
+  "UsageTotal",
+  "UnknownModelError",
   "build_state_payload",
   "build_code_execution",
   "collect_run_output",
@@ -128,6 +159,7 @@ __all__ = [
   "extract_state_update",
   "format_run_summary",
   "load_state",
+  "load_rate_table",
   "make_code_execute_status_tool_def",
   "make_code_execute_tool_def",
   "make_get_background_result_handler",

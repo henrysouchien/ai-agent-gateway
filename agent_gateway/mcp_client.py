@@ -26,6 +26,23 @@ except Exception as exc:
 
 log = logging.getLogger("agent_gateway.mcp_client")
 _UNSET = object()
+# Default-deny: MCP subprocesses inherit only a small set of safe env vars.
+_DEFAULT_ENV_ALLOWLIST = {
+  "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "USER",
+  "PYTHONPATH", "NODE_PATH", "VIRTUAL_ENV",
+}
+
+
+def _build_mcp_env(server_env: Dict[str, Any] | None) -> Dict[str, str]:
+  env = {k: v for k, v in os.environ.items() if k in _DEFAULT_ENV_ALLOWLIST}
+  if not isinstance(server_env, dict):
+    return env
+
+  for key, value in server_env.items():
+    if value is None:
+      continue
+    env[str(key)] = str(value)
+  return env
 
 
 def _classify_exception(exc: Exception, msg: str) -> str:
@@ -163,13 +180,8 @@ class McpClientManager:
       args_raw = config.get("args", [])
       args = [str(arg) for arg in args_raw] if isinstance(args_raw, list) else []
 
-      env = dict(os.environ)
       env_raw = config.get("env")
-      if isinstance(env_raw, dict):
-        for key, value in env_raw.items():
-          if value is None:
-            continue
-          env[str(key)] = str(value)
+      env = _build_mcp_env(env_raw if isinstance(env_raw, dict) else None)
 
       cwd = config.get("cwd")
       tool_prefix = str(config.get("tool_prefix", "") or "").strip()

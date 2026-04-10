@@ -14,7 +14,9 @@ if str(PKG_DIR) not in sys.path:
 import agent_gateway.mcp_client as mcp_client_module
 import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_agent
-from agent_gateway.providers import OpenAIProvider
+from agent_gateway.auth import AuthConfig
+from agent_gateway._provider_utils import _resolve_provider
+from agent_gateway.providers import CodexProvider, OpenAIProvider
 from agent_gateway.server import ChatRequest
 
 
@@ -26,6 +28,7 @@ def _run(coro):
 def _clear_credential_env(monkeypatch: pytest.MonkeyPatch):
   monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+  monkeypatch.delenv("ANTHROPIC_AUTH_MODE", raising=False)
   monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
 
@@ -36,6 +39,19 @@ def _build_runtime(app, *, request_model: str | None = None):
       session=session,
       request=ChatRequest(messages=[{"role": "user", "content": "hello"}], context={}, model=request_model),
       channel=None,
+      auth_manager=app.state.auth,
+    )
+  )
+  return session, runtime
+
+
+def _build_runtime_with_request(app, *, request: ChatRequest, channel: str | None):
+  session = app.state.auth.session_store.create_session(api_key_hash="hash")
+  runtime = _run(
+    app.state.gateway_config.build_chat_runtime(
+      session=session,
+      request=request,
+      channel=channel,
       auth_manager=app.state.auth,
     )
   )
@@ -69,7 +85,7 @@ def test_create_agent_exposes_default_routes_and_open_defaults() -> None:
   assert config.auth_config["auth_token"] == ""
   assert config.auth_config["model"] == "claude-sonnet-4-6"
   assert config.cors_origins == ["*"]
-  assert "claude-sonnet-4-6" in config.allowed_models
+  assert config.allowed_models == set()
   assert len(app.state.auth._secret) == 64
 
 
@@ -103,6 +119,58 @@ def test_create_agent_uses_explicit_auth_token() -> None:
   }
 
 
+def test_create_agent_with_credentials_resolver_skips_env_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+  async def _resolver(_user_id: str, _init_request):
+    return AuthConfig.from_dict(
+      {
+        "provider": "anthropic",
+        "billing_mode": "byok",
+        "api_key": "resolver-key",
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 16000,
+      }
+    )
+
+  monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key")
+  app = create_agent("test", credentials_resolver=_resolver)
+
+  assert app.state.gateway_config.credentials_resolver is _resolver
+  assert app.state.gateway_config.auth_config == {
+    "auth_mode": "api",
+    "api_key": "",
+    "auth_token": "",
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 16000,
+  }
+
+
+def test_create_agent_threads_request_metadata_to_runner() -> None:
+  app = create_agent("test")
+  request = ChatRequest(
+    messages=[{"role": "user", "content": "hello"}],
+    request_id="req-123",
+    context={"channel": "web"},
+  )
+  session = app.state.auth.session_store.create_session(api_key_hash="hash")
+  session.user_id = "alice"
+  session.auth_config = {"api_key": "k", "model": "claude-sonnet-4-6", "billing_mode": "metered"}
+  runtime = _run(
+    app.state.gateway_config.build_chat_runtime(
+      session=session,
+      request=request,
+      channel="web",
+      auth_manager=app.state.auth,
+    )
+  )
+
+  runner = runtime.build_runner(EventLog(), session.session_id)
+
+  assert runner._request_id == "req-123"
+  assert runner._usage_user_id == "alice"
+  assert runner._billing_mode == "metered"
+  assert runner._channel == "web"
+
+
 def test_create_agent_openai_provider_string_uses_openai_defaults() -> None:
   app = create_agent("test", provider="openai")
 
@@ -110,6 +178,18 @@ def test_create_agent_openai_provider_string_uses_openai_defaults() -> None:
   assert isinstance(config.default_provider, OpenAIProvider)
   assert config.auth_config == {
     "model": "gpt-4o",
+    "max_tokens": 16000,
+  }
+  assert config.allowed_models == set()
+
+
+def test_create_agent_codex_provider_string_uses_codex_defaults() -> None:
+  app = create_agent("test", provider="codex")
+
+  config = app.state.gateway_config
+  assert isinstance(config.default_provider, CodexProvider)
+  assert config.auth_config == {
+    "model": "gpt-5.4",
     "max_tokens": 16000,
   }
   assert config.allowed_models == set()
@@ -164,11 +244,121 @@ def test_create_agent_openai_uses_explicit_api_key_and_provider_config() -> None
     },
   )
   assert app.state.gateway_config.auth_config == {
+    "auth_mode": "api",
     "api_key": "sk-openai",
+    "auth_token": "",
     "model": "gpt-4o",
     "max_tokens": 16000,
     "base_url": "https://custom.example/v1",
     "compat": {"streaming": True},
+  }
+
+
+def test_create_agent_openai_uses_explicit_auth_token() -> None:
+  app = create_agent(
+    "test",
+    provider="openai",
+    auth_token="oat-xxx",
+  )
+
+  assert app.state.gateway_config.auth_config == {
+    "auth_mode": "oauth",
+    "api_key": "",
+    "auth_token": "oat-xxx",
+    "model": "gpt-4o",
+    "max_tokens": 16000,
+  }
+
+
+def test_create_agent_codex_uses_explicit_auth_token() -> None:
+  app = create_agent(
+    "test",
+    provider="codex",
+    auth_token="oat-codex",
+  )
+
+  assert app.state.gateway_config.auth_config == {
+    "auth_mode": "oauth",
+    "api_key": "",
+    "auth_token": "oat-codex",
+    "model": "gpt-5.4",
+    "max_tokens": 16000,
+  }
+
+
+def test_resolve_provider_openai_auth_config_with_oauth() -> None:
+  _provider, _provider_name, config = _resolve_provider(
+    "openai",
+    None,
+    None,
+    None,
+    None,
+    auth_config={"auth_mode": "oauth", "auth_token": "tok"},
+  )
+
+  assert config == {
+    "auth_mode": "oauth",
+    "api_key": "",
+    "auth_token": "tok",
+    "model": "gpt-4o",
+    "max_tokens": 16000,
+  }
+
+
+def test_resolve_provider_openai_auth_config_infers_mode() -> None:
+  _provider, _provider_name, config = _resolve_provider(
+    "openai",
+    None,
+    None,
+    None,
+    None,
+    auth_config={"auth_token": "tok"},
+  )
+
+  assert config == {
+    "auth_mode": "oauth",
+    "api_key": "",
+    "auth_token": "tok",
+    "model": "gpt-4o",
+    "max_tokens": 16000,
+  }
+
+
+def test_resolve_provider_openai_auth_config_plain_passthrough() -> None:
+  _provider, _provider_name, config = _resolve_provider(
+    "openai",
+    None,
+    None,
+    None,
+    None,
+    auth_config={"api_key": "sk-x"},
+  )
+
+  assert config == {
+    "auth_mode": "api",
+    "api_key": "sk-x",
+    "auth_token": "",
+    "model": "gpt-4o",
+    "max_tokens": 16000,
+  }
+
+
+def test_resolve_provider_codex_auth_config_with_oauth() -> None:
+  _provider, _provider_name, config = _resolve_provider(
+    "codex",
+    None,
+    None,
+    None,
+    None,
+    auth_config={"auth_mode": "oauth", "auth_token": "tok"},
+  )
+
+  assert config == {
+    "auth_mode": "oauth",
+    "api_key": "",
+    "auth_token": "tok",
+    "model": "gpt-5.4",
+    "max_tokens": 16000,
   }
 
 
@@ -484,7 +674,7 @@ def test_create_agent_code_execution_cleans_up_active_sessions_on_shutdown(tmp_p
 
 def test_create_agent_model_and_cors_configuration() -> None:
   app = create_agent("test", model="claude-haiku-4-5", cors_origins=["https://x.com"])
-  assert "claude-haiku-4-5" in app.state.gateway_config.allowed_models
+  assert app.state.gateway_config.allowed_models == set()
   assert app.state.gateway_config.cors_origins == ["https://x.com"]
 
   empty_cors_app = create_agent("test", cors_origins=[])

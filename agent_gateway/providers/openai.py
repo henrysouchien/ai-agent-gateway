@@ -273,6 +273,8 @@ class OpenAIProvider(ModelProvider):
     self._last_compat_override: dict[str, Any] | None = None
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
+    if str(config.get("auth_mode", "api")).strip().lower() == "oauth":
+      return bool(str(config.get("auth_token", "")).strip())
     return bool(config.get("api_key") or os.environ.get("OPENAI_API_KEY"))
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
@@ -282,19 +284,24 @@ class OpenAIProvider(ModelProvider):
     except ImportError as exc:
       raise RuntimeError("openai dependency is required to use OpenAIProvider") from exc
 
-    api_key = str(config.get("api_key") or os.environ.get("OPENAI_API_KEY") or "")
+    mode = str(config.get("auth_mode", "api")).strip().lower()
     base_url = config.get("base_url") or config.get("baseURL") or config.get("api_base_url") or config.get("api_base")
     self._last_base_url = str(base_url) if base_url else None
     compat_override = config.get("compat")
     self._last_compat_override = dict(compat_override) if isinstance(compat_override, dict) else None
 
-    client_kwargs: Dict[str, Any] = {
-      "api_key": api_key,
-    }
+    client_kwargs: Dict[str, Any] = {}
     if base_url:
       client_kwargs["base_url"] = str(base_url)
     if timeout is not None:
       client_kwargs["timeout"] = httpx.Timeout(timeout=timeout, connect=5.0)
+
+    if mode == "oauth":
+      client_kwargs["api_key"] = str(config.get("auth_token", ""))
+      return AsyncOpenAI(**client_kwargs)
+
+    api_key = str(config.get("api_key") or os.environ.get("OPENAI_API_KEY") or "")
+    client_kwargs["api_key"] = api_key
     return AsyncOpenAI(**client_kwargs)
 
   async def close_client(self, client: Any, timeout: float = 2.0) -> None:

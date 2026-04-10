@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .event_log import EventLog
+from .session import Session
 from .skills import SkillLoader
 from .tool_dispatcher import ToolDispatcher
 
@@ -29,6 +30,7 @@ _DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
 def make_run_agent_handler(
   runner_ref: list[Any],
   *,
+  parent_session: Session | None = None,
   skill_loader: SkillLoader | None = None,
   mcp_client: Any,
   mcp_session_inject_servers: set[str] | None = None,
@@ -36,7 +38,7 @@ def make_run_agent_handler(
   excluded_tools: set[str] | None = None,
   default_model: str = "claude-sonnet-4-6",
   default_max_turns: int = 15,
-  default_timeout: float = 300.0,
+  default_timeout: float | None = None,
   default_max_tokens: int = 32000,
   allowed_models: set[str] | None = None,
   on_before_background: Callable[[str | None], None] | None = None,
@@ -57,6 +59,8 @@ def make_run_agent_handler(
     runner = runner_ref[0]
     if runner is None:
       return None, {"code": "internal_error", "message": "Sub-agent runner not initialized"}
+    tool_ctx = kwargs.get("tool_ctx")
+    parent_turn_id = getattr(tool_ctx, "tool_call_id", None)
 
     task = tool_input.get("task", "")
     if not task or not isinstance(task, str):
@@ -132,17 +136,29 @@ def make_run_agent_handler(
 
     async def _dispatch_sub_agent(_background_input: dict[str, Any], **background_kwargs: Any):
       background_call_index = int(background_kwargs.get("call_index", call_index) or 0)
+      sub_session = None
+      if parent_session is not None:
+        sub_session = Session(
+          session_id=f"sub{background_call_index}:{parent_session.session_id}",
+          api_key_hash=parent_session.api_key_hash,
+          created_at=parent_session.created_at,
+          expires_at=parent_session.expires_at,
+          user_id=parent_session.user_id,
+          auth_config=parent_session.auth_config,
+        )
       return await runner.spawn_sub_agent(
         task,
         model=effective_model,
         system_prompt=system_prompt,
         dispatcher=sub_dispatcher,
+        sub_session=sub_session,
         excluded_tools=effective_excluded,
         max_turns=effective_max_turns,
         timeout=effective_timeout,
         client_timeout=90,
         max_tokens=default_max_tokens,
         call_index=background_call_index,
+        parent_turn_id=parent_turn_id,
         on_sub_event=lambda event, _sid: sub_log.append(event),
       )
 

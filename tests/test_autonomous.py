@@ -111,6 +111,41 @@ def test_run_session_timeout() -> None:
   assert output.error is None
 
 
+@pytest.mark.parametrize("timeout_seconds", [0, None, -1])
+def test_run_session_no_wall_clock(
+  monkeypatch: pytest.MonkeyPatch,
+  timeout_seconds: float | None,
+) -> None:
+  event_log = EventLog()
+
+  class _Runner:
+    async def run(self, **kwargs: Any) -> None:
+      _ = kwargs
+      event_log.append({"type": "text_delta", "text": "completed"})
+      event_log.append({"type": "stream_complete", "usage": {}})
+
+  async def _unexpected_wait_for(*_args: Any, **_kwargs: Any) -> None:
+    raise AssertionError("asyncio.wait_for should not wrap non-positive timeouts")
+
+  monkeypatch.setattr(autonomous.asyncio, "wait_for", _unexpected_wait_for)
+
+  output = _run(
+    autonomous.run_session(
+      _Runner(),  # type: ignore[arg-type]
+      event_log,
+      model="claude-sonnet-4-6",
+      max_turns=3,
+      timeout_seconds=timeout_seconds,
+      initial_message="hello",
+      system_prompt="You are helpful.",
+    )
+  )
+
+  assert output.timed_out is False
+  assert output.error is None
+  assert output.response == "completed"
+
+
 @pytest.mark.parametrize(
   ("output", "expected"),
   [
@@ -396,6 +431,59 @@ def test_run_autonomous_simple(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
   assert saved_state["next_session"] == ["Review transcript"]
   assert saved_state["briefing_file"] == "notes/briefing.md"
   assert delivered["state"]["existing"] == "value"
+
+
+def test_run_autonomous_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+  captured: dict[str, Any] = {}
+
+  class _StubDispatcher:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+      _ = args, kwargs
+
+  class _StubRunner:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+      _ = args
+      captured["runner_kwargs"] = kwargs
+
+  async def _fake_run_session(
+    runner: Any,
+    event_log: EventLog,
+    *,
+    model: str,
+    max_turns: int,
+    timeout_seconds: float | None,
+    initial_message: str,
+    system_prompt: str | list[tuple[str, bool]],
+  ) -> autonomous.RunOutput:
+    _ = runner, event_log, model, initial_message, system_prompt
+    captured["run_session_kwargs"] = {
+      "max_turns": max_turns,
+      "timeout_seconds": timeout_seconds,
+    }
+    return autonomous.RunOutput(
+      response="Completed.",
+      tools_used=[],
+      usage={},
+      error=None,
+      timed_out=False,
+    )
+
+  monkeypatch.setattr(autonomous, "ToolDispatcher", _StubDispatcher)
+  monkeypatch.setattr(autonomous, "AgentRunner", _StubRunner)
+  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
+
+  _run(
+    autonomous.run_autonomous(
+      "You are helpful.",
+      "Run the task.",
+      provider=_StubProvider(),
+      model="stub-model",
+    )
+  )
+
+  assert captured["run_session_kwargs"]["max_turns"] == 80
+  assert captured["run_session_kwargs"]["timeout_seconds"] is None
+  assert captured["runner_kwargs"]["per_turn_timeout"] == 300.0
 
 
 def test_run_autonomous_forwards_outputs_dir(

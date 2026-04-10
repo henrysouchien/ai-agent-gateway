@@ -2,57 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Any, Callable
 
+from ._provider_utils import resolve_auth_config
 from .providers.anthropic import AnthropicProvider
 from .providers.base import ThinkingLevel
 
 
 log = logging.getLogger("agent_gateway.send_prompt")
-
-
-def _infer_auth_config_from_env() -> dict[str, Any]:
-  api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-  auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip()
-
-  if api_key:
-    return {
-      "auth_mode": "api",
-      "api_key": api_key,
-      "auth_token": "",
-    }
-  if auth_token:
-    return {
-      "auth_mode": "oauth",
-      "api_key": "",
-      "auth_token": auth_token,
-    }
-  raise RuntimeError("No Anthropic credentials found")
-
-
-def _prepare_auth_config(
-  auth_config: dict[str, Any] | None,
-  *,
-  model: str,
-  max_tokens: int,
-  thinking: bool,
-) -> dict[str, Any]:
-  config = dict(auth_config) if auth_config is not None else _infer_auth_config_from_env()
-  auth_mode = str(config.get("auth_mode", "")).strip().lower()
-  if not auth_mode:
-    if str(config.get("api_key", "")).strip():
-      auth_mode = "api"
-    elif str(config.get("auth_token", "")).strip():
-      auth_mode = "oauth"
-    else:
-      raise RuntimeError("No Anthropic credentials found")
-
-  config["auth_mode"] = auth_mode
-  config["model"] = model
-  config["max_tokens"] = max_tokens
-  config["thinking"] = thinking
-  return config
 
 
 async def send_prompt(
@@ -74,8 +31,8 @@ async def send_prompt(
   system prompt block format as `create_agent()`.
   """
   provider = AnthropicProvider()
-  config = _prepare_auth_config(
-    auth_config,
+  config = resolve_auth_config(
+    auth_config=auth_config,
     model=model,
     max_tokens=max_tokens,
     thinking=thinking,
