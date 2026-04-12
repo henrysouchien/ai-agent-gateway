@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from ..runner import ToolResultContext
-from ..session import Session
+from ..session import GatewaySession
 from ..tool_dispatcher import ApprovalKeyQualifier, LocalToolHandler
 from ._background import BackgroundTask, OutputRingBuffer
 from ._backends import DockerBackend, ExecutionBackend, SubprocessBackend
@@ -33,7 +33,7 @@ class CodeExecutionBundle:
 
 
 def build_code_execution(
-  session: Session,
+  session: GatewaySession,
   config: CodeExecutionConfig | None = None,
 ) -> CodeExecutionBundle:
   """Create built-in code execution tools for a session.

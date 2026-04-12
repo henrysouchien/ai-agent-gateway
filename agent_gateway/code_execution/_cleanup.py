@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import shutil
 
-from ..session import Session
+from ..session import GatewaySession
 
 
-async def cleanup_code_execution(session: Session) -> None:
+async def cleanup_code_execution(session: GatewaySession) -> None:
   """Cancel background code tasks and delete the session work directory."""
   for task in list(session.background_tasks.values()):
     try:

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import inspect
 import json
 import logging
+import socket
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, Union
 
+from .agent_session_log import AgentSessionLog
+from .context_builder import SessionContextBuilder
 from .event_log import EventLog
 from .mcp_client import McpClientManager
 from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, UsageEvent, write_dlq
@@ -40,6 +44,17 @@ def _format_exc(exc: Exception) -> str:
     seen.add(id(cause))
     cause = cause.__cause__
   return " | ".join(parts)
+
+
+def _get_tool_risk_value(tool_name: str) -> str:
+  try:
+    from api.agent.shared.tool_risk import get_tool_risk
+  except Exception:
+    return "side_effecting"
+  try:
+    return get_tool_risk(tool_name).value
+  except Exception:
+    return "side_effecting"
 
 
 @dataclass
@@ -174,6 +189,8 @@ class AgentRunner:
     max_budget_usd: float | None = None,
     _cost_accumulator: CostAccumulator | None = None,
     max_concurrent_sub_agents: int | None = None,
+    agent_session_log: AgentSessionLog | None = None,
+    context_builder: SessionContextBuilder | None = None,
   ) -> None:
     if max_budget_usd is not None and max_budget_usd <= 0:
       raise ValueError("max_budget_usd must be positive when provided")
@@ -225,9 +242,219 @@ class AgentRunner:
     self._active_client: Any | None = None
     self._background_tasks: Dict[str, BackgroundTask] = {}
     self._background_seq = 0
+    self._agent_session_log = agent_session_log
+    self._context_builder = context_builder
+    self._gateway_session_id = self._full_session_id
+    self._role = "sub_agent" if self._full_session_id.startswith("sub") and ":" in self._full_session_id else "writer"
+    self._sub_agent_id = self._full_session_id if self._role == "sub_agent" else None
+    self._client_kind = self._channel or ("cron" if self._agent_session_log is not None else "cli")
+    self._runner_id: str | None = None
+    self._write_lease_file: Any | None = None
+    self._durable_attach_emitted = False
+    self._last_durable_seq = 0
+    self._last_assistant_message_seq: int | None = None
 
   def _append(self, event: Dict[str, Any]) -> None:
     self._log.append(event)
+
+  def _extract_last_user_message(self, request_messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    for msg in reversed(request_messages):
+      if msg.get("role") == "user":
+        return dict(msg)
+    return None
+
+  async def _append_durable_event(self, event: Dict[str, Any]) -> Any | None:
+    if self._agent_session_log is None or self._runner_id is None:
+      return None
+    payload = dict(event)
+    payload.setdefault("runner_id", self._runner_id)
+    payload.setdefault("role", self._role)
+    if self._sub_agent_id is not None:
+      payload.setdefault("sub_agent_id", self._sub_agent_id)
+    entry = await self._agent_session_log.append(payload)
+    self._last_durable_seq = entry.seq
+    return entry
+
+  async def _emit_attach_event(self) -> None:
+    entry = await self._append_durable_event(
+      {
+        "type": "attach",
+        "gateway_session_id": self._gateway_session_id,
+        "started_at": time.time(),
+        "client_kind": self._client_kind,
+        "hostname": socket.gethostname(),
+      }
+    )
+    self._durable_attach_emitted = entry is not None
+
+  async def _append_user_message_event(self, message: Dict[str, Any]) -> None:
+    await self._append_durable_event(
+      {
+        "type": "user_message",
+        "content": message.get("content"),
+        "client_kind": self._client_kind,
+        "received_at": time.time(),
+      }
+    )
+
+  async def _append_assistant_message_event(
+    self,
+    *,
+    content_blocks: List[Dict[str, Any]],
+    stop_reason: str | None,
+    model: str,
+    usage: Dict[str, int],
+  ) -> None:
+    entry = await self._append_durable_event(
+      {
+        "type": "assistant_message",
+        "content_blocks": list(content_blocks),
+        "stop_reason": stop_reason,
+        "model": model,
+        "usage": dict(usage),
+      }
+    )
+    if entry is not None:
+      self._last_assistant_message_seq = entry.seq
+
+  async def _emit_interrupted_event(
+    self,
+    reason: str,
+    *,
+    runner_id: str | None = None,
+    role: str | None = None,
+    last_completed_seq: int | None = None,
+    recovered_by_runner_id: str | None = None,
+    recovered_at: float | None = None,
+    extra_fields: Dict[str, Any] | None = None,
+  ) -> None:
+    payload: Dict[str, Any] = {
+      "type": "interrupted",
+      "reason": reason,
+      "runner_id": runner_id or self._runner_id,
+      "role": role or self._role,
+      "last_completed_seq": self._last_durable_seq if last_completed_seq is None else last_completed_seq,
+    }
+    if recovered_by_runner_id is not None:
+      payload["recovered_by_runner_id"] = recovered_by_runner_id
+    if recovered_at is not None:
+      payload["recovered_at"] = recovered_at
+    if extra_fields:
+      payload.update(extra_fields)
+    await self._append_durable_event(payload)
+
+  async def _emit_detach_event(self, reason: str) -> None:
+    if not self._durable_attach_emitted:
+      return
+    await self._append_durable_event(
+      {
+        "type": "detach",
+        "reason": reason,
+        "ended_at": time.time(),
+      }
+    )
+
+  async def _acquire_writer_lease_and_recover(self) -> None:
+    if self._agent_session_log is None or self._role != "writer":
+      return
+
+    lease_file = self._agent_session_log.write_lease_path.open("a+b")
+    try:
+      fcntl.flock(lease_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+      lease_file.close()
+      raise RuntimeError(f"Writer lease already held for {self._agent_session_log.path}") from exc
+    self._write_lease_file = lease_file
+
+    last_known_safe_seq = 0
+    safe_entries, _ = await self._agent_session_log.query(
+      event_types={"detach", "interrupted"},
+      role="writer",
+      order="desc",
+      limit=1,
+    )
+    if safe_entries:
+      last_known_safe_seq = safe_entries[0].seq
+      self._last_durable_seq = last_known_safe_seq
+
+    prior_writer_runner_id: str | None = None
+    writer_lifecycle, _ = await self._agent_session_log.query(
+      event_types={"attach", "detach", "interrupted"},
+      role="writer",
+      order="desc",
+      limit=1,
+    )
+    if writer_lifecycle and writer_lifecycle[0].event.get("type") == "attach":
+      prior_writer_runner_id = str(writer_lifecycle[0].event.get("runner_id") or "")
+
+    orphan_entries, _ = await self._agent_session_log.query(
+      event_types={"tool_call_start", "tool_call_complete", "tool_call_interrupted"},
+      after_seq=last_known_safe_seq + 1,
+      order="asc",
+    )
+    starts: Dict[str, Dict[str, Any]] = {}
+    resolved_tool_ids: Set[str] = set()
+    for entry in orphan_entries:
+      event = entry.event
+      tool_call_id = str(event.get("tool_call_id") or "")
+      if not tool_call_id:
+        continue
+      event_type = str(event.get("type") or "")
+      if event_type == "tool_call_start":
+        starts.setdefault(tool_call_id, event)
+      elif event_type in {"tool_call_complete", "tool_call_interrupted"}:
+        resolved_tool_ids.add(tool_call_id)
+
+    discovered_at = time.time()
+    for tool_call_id, start_event in starts.items():
+      if tool_call_id in resolved_tool_ids:
+        continue
+      synthetic_event: Dict[str, Any] = {
+        "type": "tool_call_interrupted",
+        "tool_call_id": tool_call_id,
+        "tool_name": start_event.get("tool_name"),
+        "tool_input": start_event.get("tool_input"),
+        "original_started_at": start_event.get("started_at"),
+        "discovered_at": discovered_at,
+        "tool_risk": _get_tool_risk_value(str(start_event.get("tool_name") or "")),
+        "runner_id": start_event.get("runner_id"),
+        "role": start_event.get("role", "writer"),
+      }
+      if start_event.get("sub_agent_id") is not None:
+        synthetic_event["sub_agent_id"] = start_event.get("sub_agent_id")
+      await self._append_durable_event(synthetic_event)
+
+    if prior_writer_runner_id:
+      await self._emit_interrupted_event(
+        "recovered_on_attach",
+        runner_id=prior_writer_runner_id,
+        role="writer",
+        last_completed_seq=last_known_safe_seq,
+        recovered_by_runner_id=self._runner_id,
+        recovered_at=discovered_at,
+      )
+
+  def _write_lease_metadata(self) -> None:
+    if self._agent_session_log is None or self._role != "writer" or self._runner_id is None:
+      return
+    payload = {
+      "runner_id": self._runner_id,
+      "gateway_session_id": self._gateway_session_id,
+      "started_at": time.time(),
+      "hostname": socket.gethostname(),
+    }
+    self._agent_session_log.write_lease_meta_path.write_text(
+      json.dumps(payload, sort_keys=True),
+      encoding="utf-8",
+    )
+
+  def _release_write_lease(self) -> None:
+    if self._write_lease_file is None:
+      return
+    try:
+      self._write_lease_file.close()
+    finally:
+      self._write_lease_file = None
 
   @staticmethod
   def _annotate_result(result: Any, tool_name: str = "") -> Any:
@@ -410,6 +637,7 @@ class AgentRunner:
       max_budget_usd=self._max_budget_usd,
       _cost_accumulator=self._cost_accumulator,
       max_concurrent_sub_agents=self._max_concurrent_sub_agents,
+      agent_session_log=self._agent_session_log,
     )
 
     timed_out = False
@@ -1183,19 +1411,21 @@ class AgentRunner:
         }
       },
     )
-    self._append(
-      {
-        "type": "tool_call_start",
-        "tool_call_id": tool_id,
-        "tool_name": tool_name,
-        "tool_input": tool_input,
-        "execution_location": "backend",
-        "call_index": call_index,
-      }
-    )
-
     tool_t0 = time.time()
     server = self._mcp_client.get_server_for_tool(tool_name) if self._mcp_client is not None else None
+    tool_start_event = {
+      "type": "tool_call_start",
+      "tool_call_id": tool_id,
+      "tool_name": tool_name,
+      "tool_input": tool_input,
+      "execution_location": "backend",
+      "call_index": call_index,
+      "server": server,
+      "started_at": tool_t0,
+      "parent_assistant_message_seq": self._last_assistant_message_seq,
+    }
+    await self._append_durable_event(tool_start_event)
+    self._append(tool_start_event)
     result: Optional[Any] = None
     error: Optional[Dict[str, Any]] = None
     cancelled_exc: Optional[asyncio.CancelledError] = None
@@ -1294,17 +1524,17 @@ class AgentRunner:
       error = {"code": "internal_error", "message": str(exc)}
     finally:
       duration_ms = int((time.time() - tool_t0) * 1000)
-      self._append(
-        {
-          "type": "tool_call_complete",
-          "tool_call_id": tool_id,
-          "tool_name": tool_name,
-          "result": result,
-          "error": error,
-          "duration_ms": duration_ms,
-          "server": server,
-        }
-      )
+      tool_complete_event = {
+        "type": "tool_call_complete",
+        "tool_call_id": tool_id,
+        "tool_name": tool_name,
+        "result": result,
+        "error": error,
+        "duration_ms": duration_ms,
+        "server": server,
+      }
+      await self._append_durable_event(tool_complete_event)
+      self._append(tool_complete_event)
       self._call_on_tool_timing(
         tool_name=tool_name,
         server=server,
@@ -1388,7 +1618,28 @@ class AgentRunner:
         loop early
     """
     was_cancelled = False
+    run_error: BaseException | None = None
     try:
+      if self._agent_session_log is None:
+        self._runner_id = None
+        self._last_assistant_message_seq = None
+        self._durable_attach_emitted = False
+      if self._agent_session_log is not None:
+        self._runner_id = f"runner_{uuid.uuid4().hex}"
+        self._last_durable_seq = 0
+        self._last_assistant_message_seq = None
+        self._durable_attach_emitted = False
+        if self._role == "writer":
+          await self._acquire_writer_lease_and_recover()
+        await self._emit_attach_event()
+        if self._role == "writer":
+          self._write_lease_metadata()
+        prior_messages = await self._context_builder.build() if self._context_builder is not None else []
+        new_user_input = self._extract_last_user_message(messages)
+        if new_user_input is not None:
+          await self._append_user_message_event(new_user_input)
+        messages = prior_messages + ([new_user_input] if new_user_input is not None else [])
+
       config = dict(self._auth_config)
       config.update({
         "auth_mode": str(config.get("auth_mode", "api")).strip().lower(),
@@ -1510,6 +1761,7 @@ class AgentRunner:
         if max_turns is not None and turn_count > max_turns:
           log.warning("[%s] Max turns (%d) reached, stopping", self._sid, max_turns)
           self._append({"type": "max_turns_reached", "turn_count": turn_count, "max_turns": max_turns})
+          await self._emit_interrupted_event("max_turns_reached")
           summary_text = None
           if self._on_max_turns is not None:
             try:
@@ -1596,6 +1848,12 @@ class AgentRunner:
         turn_usage = self._usage_delta(turn_usage_before, usage_totals)
         if self._usage_has_tokens(turn_usage):
           await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=turn_usage))
+        await self._append_assistant_message_event(
+          content_blocks=turn.content_blocks,
+          stop_reason=turn.stop_reason,
+          model=config["model"],
+          usage=turn_usage,
+        )
 
         turn_elapsed = time.time() - turn_t0
         ttft = (turn.first_token_t - turn_t0) if turn.first_token_t else None
@@ -1657,6 +1915,7 @@ class AgentRunner:
                 ),
               }
             )
+            await self._emit_interrupted_event("budget_exceeded")
             break
 
         if not turn.tool_uses:
@@ -1854,9 +2113,37 @@ class AgentRunner:
       )
 
       await self._close_client(client, timeout=5.0)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as exc:
       was_cancelled = True
-      raise
+      run_error = exc
+    except BaseException as exc:
+      run_error = exc
     finally:
-      await self._shutdown_background_tasks(was_cancelled)
-      await self.force_close()
+      finalizer_error: BaseException | None = None
+      try:
+        await self._shutdown_background_tasks(was_cancelled)
+        if self._agent_session_log is not None and self._durable_attach_emitted:
+          if run_error is not None:
+            reason = "graceful_shutdown"
+            if isinstance(run_error, asyncio.CancelledError) and self._role == "sub_agent":
+              reason = "sub_agent_cancelled"
+            await self._emit_interrupted_event(reason)
+          detach_reason = "completed"
+          if isinstance(run_error, asyncio.CancelledError):
+            detach_reason = "cancelled"
+          elif run_error is not None:
+            detach_reason = "error"
+          await self._emit_detach_event(detach_reason)
+      except BaseException as exc:
+        finalizer_error = exc
+      finally:
+        try:
+          self._release_write_lease()
+        finally:
+          await self.force_close()
+      if run_error is not None:
+        if finalizer_error is not None:
+          raise finalizer_error from run_error
+        raise run_error
+      if finalizer_error is not None:
+        raise finalizer_error

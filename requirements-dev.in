@@ -1,0 +1,25 @@
+# Human-edited dependency intent file for agent-gateway dev/publish environment.
+# Run `make gateway-deps-lock` to regenerate requirements-dev.txt with pinned versions + hashes.
+#
+# Core deps (must match pyproject.toml [project.dependencies])
+fastapi
+PyJWT
+PyYAML
+mcp
+httpx>=0.27.0
+pydantic
+
+# Optional deps we use locally (must match pyproject.toml [project.optional-dependencies])
+anthropic>=0.40.0
+openai>=1.0.0
+
+# Build-system deps (used with --no-isolation to keep builds inside the hashed env)
+setuptools>=68
+wheel
+
+# Dev/publish tools
+pytest
+pytest-asyncio
+build
+twine
+pip-audit

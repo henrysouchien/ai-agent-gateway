@@ -11,7 +11,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner, EventLog, ModelInfo, ModelProvider, Session, ToolDispatcher
+from agent_gateway import AgentRunner, EventLog, GatewaySession, ModelInfo, ModelProvider, ToolDispatcher
 import agent_gateway.runner as gateway_runner
 from agent_gateway.multi_user.billing import UsageEvent
 from agent_gateway.providers import StreamEvent
@@ -186,7 +186,7 @@ def test_spawn_sub_agent_emits_usage_with_parent_turn_id() -> None:
     user_id="alice",
     request_id="req-123",
   )
-  sub_session = Session(
+  sub_session = GatewaySession(
     session_id="sub0:sess-parent",
     api_key_hash="hash",
     created_at=1,

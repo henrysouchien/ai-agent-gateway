@@ -13,11 +13,12 @@ from fastapi import HTTPException
 
 
 JWT_ALGORITHM = "HS256"
-OnSessionExpiry = Callable[["Session"], Awaitable[None]]
+DEFAULT_GATEWAY_USER_ID = "henry"
+OnSessionExpiry = Callable[["GatewaySession"], Awaitable[None]]
 
 
 @dataclass
-class Session:
+class GatewaySession:
   """Mutable per-user runtime state.
 
   A session owns approval queues, approved tool types, loaded MCP servers, and
@@ -29,7 +30,7 @@ class Session:
   api_key_hash: str
   created_at: int
   expires_at: int
-  user_id: str = "_default"
+  user_id: str = DEFAULT_GATEWAY_USER_ID
   auth_config: dict[str, Any] | None = None
   stream_active: bool = False
   pending_tools: Dict[str, Dict] = field(default_factory=dict)
@@ -48,7 +49,7 @@ class SessionStore:
 
   def __init__(self, ttl: int = 3600) -> None:
     self.ttl = ttl
-    self.sessions: Dict[str, Session] = {}
+    self.sessions: Dict[str, GatewaySession] = {}
     self._on_expiry: OnSessionExpiry | None = None
 
   def set_on_expiry(self, hook: OnSessionExpiry) -> None:
@@ -60,10 +61,10 @@ class SessionStore:
     *,
     user_id: str = "_default",
     auth_config: dict[str, Any] | None = None,
-  ) -> Session:
+  ) -> GatewaySession:
     now = int(time.time())
     session_id = f"sess_{uuid.uuid4().hex}"
-    session = Session(
+    session = GatewaySession(
       session_id=session_id,
       api_key_hash=api_key_hash,
       created_at=now,
@@ -75,7 +76,7 @@ class SessionStore:
     self.sessions[session_id] = session
     return session
 
-  def get_session(self, session_id: str) -> Optional[Session]:
+  def get_session(self, session_id: str) -> Optional[GatewaySession]:
     return self.sessions.get(session_id)
 
   def expire_session(self, session_id: str) -> None:
@@ -119,7 +120,7 @@ class SessionStore:
     for session_id in expired_ids:
       await self.expire_session_async(session_id)
 
-  async def _safe_on_expiry(self, session: Session) -> None:
+  async def _safe_on_expiry(self, session: GatewaySession) -> None:
     if self._on_expiry is None:
       return
     try:
@@ -153,7 +154,7 @@ class AuthManager:
     if self._valid_keys and api_key not in self._valid_keys:
       raise HTTPException(status_code=401, detail="Invalid API key")
 
-  def issue_token(self, session: Session) -> str:
+  def issue_token(self, session: GatewaySession) -> str:
     payload = {
       "session_id": session.session_id,
       "api_key_hash": session.api_key_hash,
@@ -191,7 +192,7 @@ class AuthManager:
 
     return payload
 
-  def verify_token_with_payload(self, token: str) -> tuple[Session, dict[str, Any]]:
+  def verify_token_with_payload(self, token: str) -> tuple[GatewaySession, dict[str, Any]]:
     payload = self._decode_token(token)
     session_id = str(payload["session_id"])
     session = self.session_store.get_session(session_id)
@@ -199,10 +200,14 @@ class AuthManager:
       raise HTTPException(status_code=401, detail="Unknown session")
     return session, payload
 
-  def verify_token(self, token: str) -> Session:
+  def verify_token(self, token: str) -> GatewaySession:
     session, _payload = self.verify_token_with_payload(token)
 
     return session
 
 
-__all__ = ["AuthManager", "Session", "SessionStore"]
+# Deprecated alias — use GatewaySession
+Session = GatewaySession
+
+
+__all__ = ["AuthManager", "DEFAULT_GATEWAY_USER_ID", "GatewaySession", "Session", "SessionStore"]

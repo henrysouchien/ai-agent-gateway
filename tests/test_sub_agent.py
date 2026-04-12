@@ -13,7 +13,7 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway.skills import SkillLoader
 from agent_gateway import EventLog
-from agent_gateway.session import Session
+from agent_gateway.session import GatewaySession
 from agent_gateway.sub_agent import (
   _DEFAULT_EXCLUDED_TOOLS,
   _DEFAULT_SYSTEM_PROMPT_TEMPLATE,
@@ -158,7 +158,7 @@ def test_make_run_agent_handler_default_timeout_is_none() -> None:
 def test_make_run_agent_handler_copies_user_id_and_auth_config_to_sub_session() -> None:
   runner = _StubRunner()
   parent_auth_config = {"provider": "anthropic", "billing_mode": "byok", "api_key": "key"}
-  parent_session = Session(
+  parent_session = GatewaySession(
     session_id="sess_parent",
     api_key_hash="hash",
     created_at=1,
@@ -187,7 +187,7 @@ def test_make_run_agent_handler_forwards_parent_turn_id_from_tool_context() -> N
   runner = _StubRunner()
   handler = make_run_agent_handler(
     [runner],
-    parent_session=Session(
+    parent_session=GatewaySession(
       session_id="sess_parent",
       api_key_hash="hash",
       created_at=1,

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .event_log import EventLog
-from .session import Session
+from .session import GatewaySession
 from .skills import SkillLoader
 from .tool_dispatcher import ToolDispatcher
 
@@ -30,7 +30,7 @@ _DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
 def make_run_agent_handler(
   runner_ref: list[Any],
   *,
-  parent_session: Session | None = None,
+  parent_session: GatewaySession | None = None,
   skill_loader: SkillLoader | None = None,
   mcp_client: Any,
   mcp_session_inject_servers: set[str] | None = None,
@@ -138,7 +138,7 @@ def make_run_agent_handler(
       background_call_index = int(background_kwargs.get("call_index", call_index) or 0)
       sub_session = None
       if parent_session is not None:
-        sub_session = Session(
+        sub_session = GatewaySession(
           session_id=f"sub{background_call_index}:{parent_session.session_id}",
           api_key_hash=parent_session.api_key_hash,
           created_at=parent_session.created_at,

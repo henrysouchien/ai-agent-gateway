@@ -1,0 +1,252 @@
+import asyncio
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+  sys.path.insert(0, str(ROOT))
+API_DIR = ROOT / "api"
+if str(API_DIR) not in sys.path:
+  sys.path.insert(0, str(API_DIR))
+PKG_DIR = ROOT / "packages" / "agent-gateway"
+if str(PKG_DIR) not in sys.path:
+  sys.path.insert(0, str(PKG_DIR))
+
+from agent_gateway import AgentSessionLog, EventLog
+from api.agent.autonomous import entry as autonomous_entry
+
+
+def _run(coro):
+  return asyncio.run(coro)
+
+
+def test_append_state_update_event_persists_payload(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "state-update.jsonl")
+
+  _run(
+    autonomous_entry._append_state_update_event(
+      log,
+      payload={"alerts": ["Check filings"], "active_servers": ["fmp-mcp"]},
+      runner_id="runner_test",
+      model_name="claude-sonnet-4-6",
+    )
+  )
+
+  entries, _ = _run(log.query(event_types={"state_update"}, order="asc"))
+  assert len(entries) == 1
+  assert entries[0].event["payload"] == {"alerts": ["Check filings"], "active_servers": ["fmp-mcp"]}
+  assert entries[0].event["runner_id"] == "runner_test"
+  assert entries[0].event["model"] == "claude-sonnet-4-6"
+  assert isinstance(entries[0].event["generated_at"], float)
+
+
+def test_run_once_does_not_read_or_write_state_json_and_appends_state_update(
+  monkeypatch,
+  tmp_path: Path,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "run-once.jsonl")
+  captured: dict[str, Any] = {}
+  workspace = tmp_path / "workspace"
+  state_dir = workspace / "notes" / "analyst"
+  state_dir.mkdir(parents=True, exist_ok=True)
+  state_path = state_dir / "state.json"
+  state_path.write_text("{not valid json", encoding="utf-8")
+
+  async def _fake_build_runtime_context(*args: Any, **kwargs: Any):
+    _ = args, kwargs
+    return SimpleNamespace(
+      workspace=workspace,
+      tool_catalog="catalog",
+      tool_packs_section="",
+      connected_servers={"fmp-mcp", "macro-mcp"},
+      active_servers={"fmp-mcp"},
+    )
+
+  def _fake_create_session_objects(*args: Any, **kwargs: Any):
+    _ = args, kwargs
+    return EventLog(), SimpleNamespace(_runner_id="runner_test")
+
+  async def _fake_run_agent_session(*args: Any, **kwargs: Any):
+    _ = args, kwargs
+    return autonomous_entry.RunOutput(
+      response=(
+        "Run complete.\n\n"
+        "## STATE_UPDATE_JSON\n"
+        "```json\n"
+        '{"alerts":["Check filings"],"active_servers":["fmp-mcp"]}\n'
+        "```"
+      ),
+      tools_used=["memory_write"],
+      usage={"input_tokens": 3, "output_tokens": 5},
+      error=None,
+      timed_out=False,
+    )
+
+  async def _fake_shutdown_session(_session_id: str) -> None:
+    return None
+
+  def _unexpected_read(_path: Path) -> dict[str, Any]:
+    raise AssertionError("state.json should not be read in Phase 3a")
+
+  def _unexpected_write(_path: Path, _payload: dict[str, Any]) -> None:
+    raise AssertionError("state.json should not be written in Phase 3a")
+
+  def _build_initial_user_message(today: str, state_file: Path, previous_state: dict[str, Any], briefing_file: str) -> str:
+    captured["today"] = today
+    captured["state_file"] = state_file
+    captured["previous_state"] = dict(previous_state)
+    captured["briefing_file"] = briefing_file
+    return "Run the analyst loop."
+
+  profile = SimpleNamespace(
+    name="analyst",
+    run_once_session_id_template="{profile}:{today}",
+    briefing_file_template="analyst/{date}.md",
+    run_once_excluded_tools=None,
+    excluded_tools=set(),
+    model="claude-sonnet-4-6",
+    max_turns=5,
+    timeout_seconds=60.0,
+    per_turn_timeout=None,
+    max_tokens=16000,
+    client_timeout=30.0,
+    max_budget_usd=2.0,
+    compaction_instructions=None,
+    build_workspace_context=lambda: "",
+    tool_packs=None,
+    run_once_use_tool_packs=False,
+    build_system_prompt=lambda **kwargs: "system prompt",
+    build_initial_user_message=_build_initial_user_message,
+    describe_market_status=lambda: "closed",
+    on_fallback=None,
+    retry_config=None,
+    state_subdir="analyst",
+    state_file_name="state.json",
+    format_tool_catalog=lambda *args, **kwargs: "",
+    build_tool_packs_section=lambda *args, **kwargs: "",
+  )
+
+  monkeypatch.setattr(autonomous_entry, "AgentSessionLog", lambda *args, **kwargs: log)
+  monkeypatch.setattr(autonomous_entry, "_build_runtime_context", _fake_build_runtime_context)
+  monkeypatch.setattr(autonomous_entry, "create_session_objects", _fake_create_session_objects)
+  monkeypatch.setattr(autonomous_entry, "run_agent_session", _fake_run_agent_session)
+  monkeypatch.setattr(autonomous_entry, "_shutdown_session", _fake_shutdown_session)
+  monkeypatch.setattr(autonomous_entry, "send_telegram_summary", lambda *args, **kwargs: None)
+  monkeypatch.setattr(autonomous_entry.workspace_state_io, "_safe_read_json", _unexpected_read)
+  monkeypatch.setattr(autonomous_entry.workspace_state_io, "_atomic_write_json", _unexpected_write)
+
+  exit_code = _run(autonomous_entry.run_once(profile))
+
+  assert exit_code == 0
+  assert captured["previous_state"] == {}
+  assert captured["state_file"] == state_path
+  assert state_path.read_text(encoding="utf-8") == "{not valid json"
+
+  entries, _ = _run(log.query(event_types={"state_update"}, order="asc"))
+  assert len(entries) == 1
+  assert entries[0].event["payload"] == {
+    "alerts": ["Check filings"],
+    "active_servers": ["fmp-mcp"],
+  }
+  assert entries[0].event["runner_id"] == "runner_test"
+
+
+def test_run_once_skips_summary_on_interrupted_run(
+  monkeypatch,
+  tmp_path: Path,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "run-once-interrupted.jsonl")
+  summary_calls = 0
+  workspace = tmp_path / "workspace"
+  state_dir = workspace / "notes" / "analyst"
+  state_dir.mkdir(parents=True, exist_ok=True)
+  state_path = state_dir / "state.json"
+  state_path.write_text("{still invalid json", encoding="utf-8")
+
+  async def _fake_build_runtime_context(*args: Any, **kwargs: Any):
+    _ = args, kwargs
+    return SimpleNamespace(
+      workspace=workspace,
+      tool_catalog="catalog",
+      tool_packs_section="",
+      connected_servers={"fmp-mcp"},
+      active_servers={"fmp-mcp"},
+    )
+
+  def _fake_create_session_objects(*args: Any, **kwargs: Any):
+    _ = args, kwargs
+    return EventLog(), SimpleNamespace(_runner_id="runner_test")
+
+  async def _fake_run_agent_session(*args: Any, **kwargs: Any):
+    _ = args, kwargs
+    return autonomous_entry.RunOutput(
+      response="Interrupted run.",
+      tools_used=[],
+      usage={},
+      error="budget_exceeded",
+      timed_out=True,
+    )
+
+  async def _fake_shutdown_session(_session_id: str) -> None:
+    return None
+
+  def _unexpected_read(_path: Path) -> dict[str, Any]:
+    raise AssertionError("state.json should not be read in Phase 3a/3b")
+
+  def _unexpected_write(_path: Path, _payload: dict[str, Any]) -> None:
+    raise AssertionError("state.json should not be written in Phase 3a/3b")
+
+  async def _fake_generate_summary(_log: AgentSessionLog) -> None:
+    nonlocal summary_calls
+    summary_calls += 1
+    return None
+
+  profile = SimpleNamespace(
+    name="analyst",
+    run_once_session_id_template="{profile}:{today}",
+    briefing_file_template="analyst/{date}.md",
+    run_once_excluded_tools=None,
+    excluded_tools=set(),
+    model="claude-sonnet-4-6",
+    max_turns=5,
+    timeout_seconds=60.0,
+    per_turn_timeout=None,
+    max_tokens=16000,
+    client_timeout=30.0,
+    max_budget_usd=2.0,
+    compaction_instructions=None,
+    build_workspace_context=lambda: "",
+    tool_packs=None,
+    run_once_use_tool_packs=False,
+    build_system_prompt=lambda **kwargs: "system prompt",
+    build_initial_user_message=lambda *args, **kwargs: "Run the analyst loop.",
+    describe_market_status=lambda: "closed",
+    on_fallback=None,
+    retry_config=None,
+    state_subdir="analyst",
+    state_file_name="state.json",
+    format_tool_catalog=lambda *args, **kwargs: "",
+    build_tool_packs_section=lambda *args, **kwargs: "",
+  )
+
+  monkeypatch.setattr(autonomous_entry, "AgentSessionLog", lambda *args, **kwargs: log)
+  monkeypatch.setattr(autonomous_entry, "_build_runtime_context", _fake_build_runtime_context)
+  monkeypatch.setattr(autonomous_entry, "create_session_objects", _fake_create_session_objects)
+  monkeypatch.setattr(autonomous_entry, "run_agent_session", _fake_run_agent_session)
+  monkeypatch.setattr(autonomous_entry, "_shutdown_session", _fake_shutdown_session)
+  monkeypatch.setattr(autonomous_entry, "send_telegram_summary", lambda *args, **kwargs: None)
+  monkeypatch.setattr(autonomous_entry, "generate_analyst_session_summary", _fake_generate_summary)
+  monkeypatch.setattr(autonomous_entry.workspace_state_io, "_safe_read_json", _unexpected_read)
+  monkeypatch.setattr(autonomous_entry.workspace_state_io, "_atomic_write_json", _unexpected_write)
+
+  exit_code = _run(autonomous_entry.run_once(profile))
+
+  assert exit_code != 0
+  assert summary_calls == 0
+  assert state_path.read_text(encoding="utf-8") == "{still invalid json"
+  summary_entries, _ = _run(log.query(event_types={"summary"}, order="asc"))
+  state_entries, _ = _run(log.query(event_types={"state_update"}, order="asc"))
+  assert summary_entries == []
+  assert state_entries == []

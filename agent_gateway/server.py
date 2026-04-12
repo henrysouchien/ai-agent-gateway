@@ -31,13 +31,13 @@ from .providers.agent_sdk import AgentSDKConfig
 from .providers import AnthropicProvider, ModelProvider
 from .runner import AgentRunner
 from .sdk_runner import AgentSDKRunner
-from .session import AuthManager, Session, SessionStore
+from .session import AuthManager, GatewaySession, SessionStore
 from .tool_dispatcher import ApprovalDecision, ApprovalRequest
 
 
 SystemPrompt = str | List[Tuple[str, bool]]
 ExecutionLocationResolver = Callable[[str], Optional[str]]
-BuildChatRuntime = Callable[[Session, "ChatRequest", Optional[str], AuthManager], Awaitable["ChatRuntime"]]
+BuildChatRuntime = Callable[[GatewaySession, "ChatRequest", Optional[str], AuthManager], Awaitable["ChatRuntime"]]
 RequestApproval = Callable[[ApprovalRequest], Awaitable[Optional[ApprovalDecision]]]
 BuildRunner = Callable[[EventLog, str], AgentRunner | AgentSDKRunner]
 
@@ -148,7 +148,7 @@ class ChatRuntime:
 class RequestContext:
   """Mutable request-scoped objects shared across dispatch layers."""
 
-  session: Session
+  session: GatewaySession
   event_log: EventLog
   request_approval: RequestApproval
   result_queue: asyncio.Queue
@@ -356,7 +356,7 @@ async def _maybe_await(callback: Optional[Callable[..., Any]]) -> None:
     await result
 
 
-def _make_request_approval(session: Session, event_log: EventLog) -> RequestApproval:
+def _make_request_approval(session: GatewaySession, event_log: EventLog) -> RequestApproval:
   async def request_approval(payload: ApprovalRequest) -> Optional[ApprovalDecision]:
     approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
     session.pending_tools[payload.tool_call_id] = {

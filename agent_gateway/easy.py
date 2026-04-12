@@ -17,7 +17,7 @@ from .providers import AnthropicProvider, ModelProvider
 from .rates import load_rate_table
 from .runner import AgentRunner, ToolResultContext
 from .server import ChatRequest, ChatRuntime, GatewayServerConfig, _make_request_approval, create_gateway_app
-from .session import AuthManager, Session
+from .session import AuthManager, GatewaySession
 from .skills import SkillLoader
 from .tool_dispatcher import LocalToolHandler, ToolDispatcher
 
@@ -240,7 +240,7 @@ def create_agent(
   app_ref: list[FastAPI | None] = [None]
 
   async def _build_chat_runtime(
-    session: Session,
+    session: GatewaySession,
     request: ChatRequest,
     channel: str | None,
     auth_manager: AuthManager,
@@ -430,7 +430,7 @@ def create_agent(
     session_store = app.state.auth.session_store
     code_execution_expiry = session_store._on_expiry
 
-    async def _on_expiry_with_cleanup(session: Session) -> None:
+    async def _on_expiry_with_cleanup(session: GatewaySession) -> None:
       if code_execution_expiry is not None:
         result = code_execution_expiry(session)
         if inspect.isawaitable(result):
@@ -443,7 +443,7 @@ def create_agent(
     session_store = app.state.auth.session_store
     mcp_session_expiry = session_store._on_expiry
 
-    async def _on_expiry_with_mcp_session_cleanup(session: Session) -> None:
+    async def _on_expiry_with_mcp_session_cleanup(session: GatewaySession) -> None:
       if mcp_session_expiry is not None:
         result = mcp_session_expiry(session)
         if inspect.isawaitable(result):

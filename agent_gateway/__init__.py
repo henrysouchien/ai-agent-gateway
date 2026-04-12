@@ -16,6 +16,7 @@ from .autonomous import (
   send_telegram,
 )
 from ._provider_utils import resolve_auth_config
+from .agent_session_log import AgentSessionLog, AgentSessionRef, LogEntry, QueryCursor, resolve_agent_session_id
 from .auth import (
   AuthConfig,
   AuthExpiredError,
@@ -39,7 +40,9 @@ from .code_execution import (
   make_code_execute_tool_def,
   strip_code_execute_base64_hook,
 )
-from .event_log import EventLog, LogEntry
+from .compaction import SummaryFn, generate_and_append_summary
+from .context_builder import Message, SessionContextBuilder
+from .event_log import EventLog, LogEntry as EventLogEntry
 from .heartbeat import HeartbeatConfig, HeartbeatLoop, TickResult, strip_heartbeat_ok
 from .easy import create_agent
 from .memory import EmbeddingProvider, MarkdownSyncManager, MemoryStore
@@ -62,7 +65,7 @@ from .runner import AgentRunner, SubAgentConfig, ToolResultContext
 from .send_prompt import send_prompt, send_prompt_sync
 from .sdk_runner import AgentSDKRunner
 from .server import ChatRuntime, GatewayServerConfig, RequestContext, create_gateway_app
-from .session import AuthManager, Session, SessionStore
+from .session import AuthManager, GatewaySession, Session, SessionStore
 from .skills import SkillLoader, SkillProfile, SkillStateStore, parse_skill_file
 from .sub_agent import (
   make_get_background_result_handler,
@@ -85,6 +88,8 @@ __all__ = [
   "AgentSDKConfig",
   "AgentRunner",
   "AgentSDKRunner",
+  "AgentSessionLog",
+  "AgentSessionRef",
   "ApprovalDecision",
   "ApprovalRequest",
   "AnthropicProvider",
@@ -100,9 +105,12 @@ __all__ = [
   "ChatRuntime",
   "CodeExecutionBundle",
   "CodeExecutionConfig",
+  "Message",
   "DeliveryConfig",
   "DockerBackend",
   "EventLog",
+  "EventLogEntry",
+  "GatewaySession",
   "GatewayServerConfig",
   "HeartbeatConfig",
   "HeartbeatLoop",
@@ -119,14 +127,17 @@ __all__ = [
   "NoCredentialError",
   "OpenAIProvider",
   "OutputRingBuffer",
+  "QueryCursor",
   "RateTable",
   "RequestContext",
   "RetryConfig",
   "RunOutput",
+  "resolve_agent_session_id",
   "resolve_auth_config",
   "send_prompt",
   "send_prompt_sync",
   "Session",
+  "SessionContextBuilder",
   "SessionStore",
   "SkillLoader",
   "SkillProfile",
@@ -135,6 +146,7 @@ __all__ = [
   "StrictModeDefaultUserError",
   "SubAgentConfig",
   "SubprocessBackend",
+  "SummaryFn",
   "SqliteUsageLedger",
   "EmbeddingProvider",
   "ThinkingLevel",
@@ -158,6 +170,7 @@ __all__ = [
   "deliver",
   "extract_state_update",
   "format_run_summary",
+  "generate_and_append_summary",
   "load_state",
   "load_rate_table",
   "make_code_execute_status_tool_def",
