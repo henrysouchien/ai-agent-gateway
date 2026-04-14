@@ -78,6 +78,7 @@ def _resolve_channel_tier(
 def build_disallowed_tools(
   channel: Optional[str],
   channel_tiers: Dict[Optional[str], Dict[str, set[str]]],
+  extra_blocked: set[str] | None = None,
 ) -> List[str]:
   tier = _resolve_channel_tier(channel, channel_tiers)
   allowed = set(SDK_SAFE_BUILTINS)
@@ -87,6 +88,8 @@ def build_disallowed_tools(
   blocked = set(SDK_KNOWN_BUILTINS) - allowed
   for server_name in tier.get("defer", set()):
     blocked.add(f"mcp__{server_name}__*")
+  if extra_blocked:
+    blocked |= extra_blocked
   return sorted(blocked)
 
 

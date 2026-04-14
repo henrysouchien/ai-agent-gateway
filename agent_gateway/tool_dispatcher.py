@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple, TYPE_CHECKING
 
 from .event_log import EventLog
@@ -31,6 +31,8 @@ class ApprovalRequest:
   tool_input: Dict[str, Any]
   resolved_qualifier: str = ""
   timeout: float = 120.0
+  reason: str = ""
+  allow_persistent_approval: bool = True
 
 
 @dataclass
@@ -59,18 +61,40 @@ class InterceptContext:
 class InterceptDecision:
   """Interceptor outcome.
 
-  `action` should be one of `allow`, `warn`, or `deny`.
+  `action` should be one of `allow`, `warn`, `ask`, or `deny`.
+
+  - allow: proceed normally
+  - warn: proceed, but attach the message as a policy warning in the result
+  - ask: route through the dispatcher's request_approval callback before
+    executing; in headless contexts, resolves to deny unless an
+    `on_headless_ask` hook overrides
+  - deny: block and return an error to the model
   """
 
-  action: str  # "allow", "deny", "warn"
+  action: str  # "allow", "deny", "warn", "ask"
   message: str = ""
   code: str = "interceptor"
+
+  def __post_init__(self) -> None:
+    if self.action not in {"allow", "deny", "warn", "ask"}:
+      raise ValueError(f"Invalid interceptor action: {self.action!r}")
+
+
+@dataclass
+class InterceptResult:
+  """Structured return from `_run_interceptors()`."""
+
+  proceed: bool
+  warnings: list[str] = field(default_factory=list)
+  error: dict[str, Any] | None = None
+  pending_ask: InterceptDecision | None = None
 
 
 ToolInterceptor = Callable[[InterceptContext], Awaitable[InterceptDecision]]
 ToolInterceptor.__doc__ = (
   "Async policy hook that receives `InterceptContext` and returns an `InterceptDecision`."
 )
+HeadlessAskCallback = Callable[[InterceptContext, InterceptDecision], Awaitable[str] | str]
 
 
 @dataclass
@@ -115,7 +139,10 @@ class ToolDispatcher:
     approval_key_qualifier: ApprovalKeyQualifier | None = None,
     interceptors: Sequence[ToolInterceptor] | None = None,
     session_id: str = "",
+    should_avoid_permission_prompts: bool = False,
+    on_headless_ask: HeadlessAskCallback | None = None,
     mcp_session_inject_servers: set[str] | None = None,
+    session_cache_denied_tools: frozenset[str] | None = None,
   ) -> None:
     self._mcp = mcp_client
     self._local = local_tool_handlers or {}
@@ -126,17 +153,20 @@ class ToolDispatcher:
     self._approval_key_qualifier = approval_key_qualifier
     self._interceptors: Sequence[ToolInterceptor] = list(interceptors or [])
     self._session_id = session_id
+    self._should_avoid_permission_prompts = should_avoid_permission_prompts
+    self._on_headless_ask = on_headless_ask
     self._mcp_session_inject_servers = mcp_session_inject_servers or set()
+    self._session_cache_denied = session_cache_denied_tools or frozenset()
 
   async def _run_interceptors(
     self,
     tool_call_id: str,
     tool_name: str,
     tool_input: Dict[str, Any],
-  ) -> Tuple[bool, List[str], Optional[Dict[str, Any]]]:
-    """Run interceptor chain. Returns (proceed, warnings, error_dict)."""
+  ) -> InterceptResult:
+    """Run interceptor chain and return a structured result."""
     if not self._interceptors:
-      return True, [], None
+      return InterceptResult(proceed=True)
 
     ctx = InterceptContext(
       tool_call_id=tool_call_id,
@@ -145,6 +175,7 @@ class ToolDispatcher:
       session_id=self._session_id,
     )
     warnings: List[str] = []
+    pending_ask: InterceptDecision | None = None
 
     for interceptor in self._interceptors:
       try:
@@ -164,10 +195,13 @@ class ToolDispatcher:
                 "message": f"Critical safety interceptor failed: {exc}",
               }
             )
-          return False, [], {
-            "code": "interceptor_error",
-            "message": f"Safety check failed due to an internal error. Tool '{tool_name}' was blocked.",
-          }
+          return InterceptResult(
+            proceed=False,
+            error={
+              "code": "interceptor_error",
+              "message": f"Safety check failed due to an internal error. Tool '{tool_name}' was blocked.",
+            },
+          )
         log.warning("Interceptor %s error (non-fatal): %s", interceptor, exc)
         continue
 
@@ -183,10 +217,13 @@ class ToolDispatcher:
               "message": decision.message,
             }
           )
-        return False, [], {
-          "code": decision.code,
-          "message": decision.message or f"Tool '{tool_name}' was blocked by a runtime policy",
-        }
+        return InterceptResult(
+          proceed=False,
+          error={
+            "code": decision.code,
+            "message": decision.message or f"Tool '{tool_name}' was blocked by a runtime policy",
+          },
+        )
       if decision.action == "warn":
         warnings.append(decision.message)
         if self._event_log is not None:
@@ -200,8 +237,23 @@ class ToolDispatcher:
               "message": decision.message,
             }
           )
+        continue
+      if decision.action == "ask":
+        if self._event_log is not None:
+          self._event_log.append(
+            {
+              "type": "interceptor_decision",
+              "tool_call_id": tool_call_id,
+              "tool_name": tool_name,
+              "action": "ask",
+              "code": decision.code,
+              "message": decision.message,
+            }
+          )
+        if pending_ask is None:
+          pending_ask = decision
 
-    return True, warnings, None
+    return InterceptResult(proceed=True, warnings=warnings, pending_ask=pending_ask)
 
   async def dispatch(
     self,
@@ -228,13 +280,13 @@ class ToolDispatcher:
       - Interceptor warnings are attached to successful dict results under
         `_interceptor_warnings`.
     """
-    proceed, warnings, intercept_error = await self._run_interceptors(
+    ir = await self._run_interceptors(
       tool_call_id,
       tool_name,
       tool_input,
     )
-    if not proceed:
-      return None, intercept_error
+    if not ir.proceed:
+      return None, ir.error
 
     qualifier = ""
     if self._approval_key_qualifier is not None:
@@ -243,27 +295,94 @@ class ToolDispatcher:
       except Exception:
         qualifier = ""
 
-    if self._should_request_approval(tool_name, tool_input, qualifier):
-      if self._request_approval is None:
-        return None, {
-          "code": "approval_required",
-          "message": f"Tool '{tool_name}' requires approval but no approval handler is configured",
-        }
-      decision = await self._request_approval(
-        ApprovalRequest(
-          tool_call_id=tool_call_id,
-          nonce=os.urandom(8).hex(),
-          tool_name=tool_name,
-          tool_input=tool_input,
-          resolved_qualifier=qualifier,
+    static_needs_approval = self._should_request_approval(tool_name, tool_input, qualifier)
+    dynamic_ask = ir.pending_ask is not None
+
+    if static_needs_approval or dynamic_ask:
+      if self._should_avoid_permission_prompts:
+        if static_needs_approval:
+          reason_text = (
+            ir.pending_ask.message
+            if ir.pending_ask is not None
+            else f"Tool '{tool_name}' requires static approval in headless context"
+          )
+          if self._event_log is not None:
+            self._event_log.append(
+              {
+                "type": "headless_auto_deny",
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "reason": reason_text,
+                "source": "static",
+              }
+            )
+          return None, {
+            "code": "headless_auto_deny",
+            "message": f"Tool '{tool_name}' blocked (static approval required): {reason_text}",
+          }
+
+        hook_result = "deny"
+        if self._on_headless_ask is not None and ir.pending_ask is not None:
+          headless_ctx = InterceptContext(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            session_id=self._session_id,
+          )
+          try:
+            raw = self._on_headless_ask(headless_ctx, ir.pending_ask)
+            if inspect.isawaitable(raw):
+              raw = await raw
+            hook_result = raw if raw in ("allow", "deny") else "deny"
+          except Exception as exc:
+            log.warning("Headless ask hook failed: %s — auto-denying", exc)
+            hook_result = "deny"
+
+        if hook_result != "allow":
+          reason_text = (
+            ir.pending_ask.message
+            if ir.pending_ask is not None
+            else "Approval required in headless context"
+          )
+          if self._event_log is not None:
+            self._event_log.append(
+              {
+                "type": "headless_auto_deny",
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "reason": reason_text,
+                "source": "interceptor",
+              }
+            )
+          return None, {
+            "code": "headless_auto_deny",
+            "message": f"Tool '{tool_name}' blocked: {reason_text}",
+          }
+      else:
+        if self._request_approval is None:
+          return None, {
+            "code": "approval_required",
+            "message": f"Tool '{tool_name}' requires approval but no approval handler is configured",
+          }
+        allow_persistent = not dynamic_ask
+        approval_reason = ir.pending_ask.message if ir.pending_ask is not None else ""
+        decision = await self._request_approval(
+          ApprovalRequest(
+            tool_call_id=tool_call_id,
+            nonce=os.urandom(8).hex(),
+            tool_name=tool_name,
+            tool_input=tool_input,
+            resolved_qualifier=qualifier,
+            reason=approval_reason,
+            allow_persistent_approval=allow_persistent,
+          )
         )
-      )
-      if decision is None:
-        return None, {"code": "approval_timeout", "message": "User did not respond within timeout"}
-      if not decision.approved:
-        return None, {"code": "user_denied", "message": "User denied execution"}
-      if decision.allow_tool_type:
-        self._approved_tool_types.add(self._qualified_key(tool_name, qualifier))
+        if decision is None:
+          return None, {"code": "approval_timeout", "message": "User did not respond within timeout"}
+        if not decision.approved:
+          return None, {"code": "user_denied", "message": "User denied execution"}
+        if decision.allow_tool_type and allow_persistent and tool_name not in self._session_cache_denied:
+          self._approved_tool_types.add(self._qualified_key(tool_name, qualifier))
 
     result: Optional[Any]
     error: Optional[Dict[str, Any]]
@@ -285,9 +404,9 @@ class ToolDispatcher:
     else:
       result, error = None, {"code": "unknown_tool", "message": f"Unknown tool: {tool_name}"}
 
-    if warnings and error is None and result is not None and isinstance(result, dict):
+    if ir.warnings and error is None and result is not None and isinstance(result, dict):
       result = dict(result)
-      result["_interceptor_warnings"] = warnings
+      result["_interceptor_warnings"] = ir.warnings
 
     return result, error
 
@@ -331,9 +450,10 @@ class ToolDispatcher:
     tool_input: Dict[str, Any],
     qualifier: str,
   ) -> bool:
-    qualified_key = self._qualified_key(tool_name, qualifier)
-    if qualified_key in self._approved_tool_types:
-      return False
-    if not qualifier and tool_name in self._approved_tool_types:
-      return False
+    if tool_name not in self._session_cache_denied:
+      qualified_key = self._qualified_key(tool_name, qualifier)
+      if qualified_key in self._approved_tool_types:
+        return False
+      if not qualifier and tool_name in self._approved_tool_types:
+        return False
     return self._needs_approval(tool_name, tool_input, qualifier)

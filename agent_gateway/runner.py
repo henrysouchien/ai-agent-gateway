@@ -18,6 +18,16 @@ from .event_log import EventLog
 from .mcp_client import McpClientManager
 from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, UsageEvent, write_dlq
 from .providers import ModelInfo, ModelProvider, ThinkingLevel
+from .task_registry import (
+  COORDINATOR_DEFAULT_PREAMBLE,
+  CoordinatorConfig,
+  NotificationQueue,
+  TaskEntry,
+  TaskNotification,
+  TaskRegistry,
+  TaskState,
+  make_progress_tracker,
+)
 from .tool_dispatcher import ToolDispatcher
 
 
@@ -28,6 +38,7 @@ STREAM_STALL_TIMEOUT = 60  # max seconds between stream events before watchdog c
 STREAM_RETRY_MAX = 3
 STREAM_RETRY_DELAY = 2.0
 STREAM_RETRY_BACKOFF = 2.0
+_MAX_NOTIFICATIONS_PER_TURN = 5
 
 
 def _estimate_tokens(text: str) -> int:
@@ -131,8 +142,8 @@ OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | No
 OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
 OnToolTiming = Callable[[str, str, str | None, int, bool, int], None]
 OnMaxTurns = Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
-BackgroundTaskHandler = Callable[[Dict[str, Any]], Awaitable[Tuple[Optional[Any], Optional[Dict[str, Any]]]]]
-BackgroundTaskCallback = Callable[[BackgroundTask], Awaitable[None] | None]
+BackgroundTaskHandler = Callable[..., Awaitable[Tuple[Optional[Any], Optional[Dict[str, Any]]]]]
+BackgroundTaskCallback = Callable[[BackgroundTask | TaskEntry], Awaitable[None] | None]
 OnMetric = Callable[[str, int], None]
 
 
@@ -191,6 +202,9 @@ class AgentRunner:
     max_concurrent_sub_agents: int | None = None,
     agent_session_log: AgentSessionLog | None = None,
     context_builder: SessionContextBuilder | None = None,
+    task_registry: TaskRegistry | None = None,
+    message_inbox: asyncio.Queue[str] | None = None,
+    coordinator: CoordinatorConfig | None = None,
   ) -> None:
     if max_budget_usd is not None and max_budget_usd <= 0:
       raise ValueError("max_budget_usd must be positive when provided")
@@ -236,12 +250,52 @@ class AgentRunner:
     if self._cost_accumulator is None and self._max_budget_usd is not None:
       self._cost_accumulator = CostAccumulator(self._max_budget_usd)
     self._last_reported_cost = 0.0
+    self._coordinator = coordinator
     self._max_concurrent_sub_agents = max_concurrent_sub_agents
     self._max_background_tasks = max_concurrent_sub_agents or 3
     self._sub_agent_semaphore: asyncio.Semaphore | None = None
     self._active_client: Any | None = None
-    self._background_tasks: Dict[str, BackgroundTask] = {}
-    self._background_seq = 0
+    task_registry_auto_created = task_registry is None
+    self._task_registry = task_registry or TaskRegistry(
+      max_inflight=self._max_background_tasks,
+      id_prefix="bg",
+    )
+    self._message_inbox = message_inbox
+    self._notification_queue = NotificationQueue()
+    if self._coordinator is not None and self._coordinator.enabled:
+      self._max_background_tasks = self._coordinator.max_workers
+      if task_registry_auto_created:
+        self._task_registry._max_inflight = self._max_background_tasks
+    notification_queue = self._notification_queue
+
+    class _NotificationListener:
+      def on_transition(self_listener, entry: TaskEntry, old_state: TaskState, new_state: TaskState) -> None:
+        _ = self_listener, old_state
+        if new_state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.KILLED):
+          event_name = new_state.value
+          summary = ""
+          if entry.result and isinstance(entry.result, dict):
+            summary = str(entry.result.get("response", ""))
+          elif entry.error and isinstance(entry.error, dict):
+            summary = str(entry.error.get("message", ""))
+          notification_queue.push(
+            TaskNotification(
+              task_id=entry.task_id,
+              agent_name=entry.agent_name,
+              event=event_name,
+              summary=summary,
+              timestamp=time.time(),
+              payload=entry.result or entry.error or {},
+            )
+          )
+
+    notifications_enabled = not (
+      self._coordinator is not None
+      and self._coordinator.enabled
+      and not self._coordinator.auto_notify
+    )
+    if notifications_enabled:
+      self._task_registry.add_listener(_NotificationListener())
     self._agent_session_log = agent_session_log
     self._context_builder = context_builder
     self._gateway_session_id = self._full_session_id
@@ -253,6 +307,10 @@ class AgentRunner:
     self._durable_attach_emitted = False
     self._last_durable_seq = 0
     self._last_assistant_message_seq: int | None = None
+
+  @property
+  def _background_tasks(self) -> Dict[str, TaskEntry]:
+    return self._task_registry._tasks
 
   def _append(self, event: Dict[str, Any]) -> None:
     self._log.append(event)
@@ -557,6 +615,8 @@ class AgentRunner:
     self,
     task: str,
     *,
+    provider: ModelProvider | None = None,
+    auth_config: Dict[str, Any] | None = None,
     model: str | None = None,
     system_prompt: str | None = None,
     dispatcher: ToolDispatcher,
@@ -569,13 +629,16 @@ class AgentRunner:
     max_tokens: int = 32000,
     call_index: int = 0,
     parent_turn_id: str | None = None,
+    task_entry: TaskEntry | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
   ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
     """Run a focused sub-agent task and return its summarized result.
 
     This method is used by the built-in `run_agent` tool. The sub-agent shares
-    the same provider and budget accounting as the parent runner, but it gets a
-    fresh `EventLog`, its own turn budget, and its own dispatcher.
+    the same budget accounting as the parent runner, but it gets a fresh
+    `EventLog`, its own turn budget, and its own dispatcher. By default the
+    sub-agent inherits the parent's provider, but callers may override it with
+    an explicit `provider` + `auth_config` pair.
     """
     if self._sub_agent_config is not None:
       if model is None:
@@ -585,10 +648,24 @@ class AgentRunner:
       if excluded_tools is None:
         excluded_tools = set(self._sub_agent_config.excluded_tools)
 
+    effective_provider = provider or self._provider
+    if provider is not None:
+      if auth_config is None:
+        return None, {"code": "invalid_input", "message": "auth_config required when overriding provider"}
+      effective_auth = dict(auth_config)
+    else:
+      effective_auth = getattr(sub_session, "auth_config", None) or self._auth_config
+
     sub_session_id = str(getattr(sub_session, "session_id", "") or f"sub{call_index}:{self._sid}")
     original_on_event = getattr(self._log, "_on_event", None)
+    progress_cb = make_progress_tracker(task_entry) if task_entry else None
 
     def _composed_on_event(event: Dict[str, Any], session_id: str) -> None:
+      if progress_cb is not None:
+        try:
+          progress_cb(event, session_id)
+        except Exception:
+          pass
       if original_on_event is not None:
         try:
           original_on_event(event, session_id)
@@ -608,8 +685,8 @@ class AgentRunner:
       event_log=sub_log,
       dispatcher=dispatcher,
       session_id=sub_session_id,
-      provider=self._provider,
-      auth_config=getattr(sub_session, "auth_config", None) or self._auth_config,
+      provider=effective_provider,
+      auth_config=effective_auth,
       client_timeout=client_timeout,
       max_tokens_override=max_tokens,
       per_turn_timeout=per_turn_timeout if per_turn_timeout is not None else self._per_turn_timeout,
@@ -638,6 +715,7 @@ class AgentRunner:
       _cost_accumulator=self._cost_accumulator,
       max_concurrent_sub_agents=self._max_concurrent_sub_agents,
       agent_session_log=self._agent_session_log,
+      message_inbox=task_entry.message_inbox if task_entry else None,
     )
 
     timed_out = False
@@ -731,11 +809,11 @@ class AgentRunner:
     timeout = 60.0 if raw_timeout is None else float(raw_timeout)
     return max(0.0, min(timeout, 120.0))
 
-  def _background_elapsed_seconds(self, bg_task: BackgroundTask) -> int:
+  def _background_elapsed_seconds(self, bg_task: BackgroundTask | TaskEntry) -> int:
     end_t = bg_task.completed_at if bg_task.completed_at is not None else time.time()
     return max(0, int(end_t - bg_task.started_at))
 
-  def _background_task_payload(self, bg_task: BackgroundTask) -> Dict[str, Any]:
+  def _background_task_payload(self, bg_task: BackgroundTask | TaskEntry) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
       "task_id": bg_task.task_id,
       "status": "running",
@@ -744,6 +822,10 @@ class AgentRunner:
       payload["agent"] = bg_task.agent_name
 
     elapsed = self._background_elapsed_seconds(bg_task)
+    if getattr(bg_task, "state", None) == TaskState.KILLED:
+      payload["status"] = "killed"
+      payload["elapsed_seconds"] = elapsed
+      return payload
     if bg_task.completed:
       payload["elapsed_seconds"] = elapsed
       if bg_task.error is not None:
@@ -760,18 +842,29 @@ class AgentRunner:
       return payload
 
     payload["elapsed_seconds"] = elapsed
+    progress = getattr(bg_task, "progress", None)
+    if progress is not None and progress.tool_use_count > 0:
+      payload["progress"] = {
+        "tools_used": progress.tool_use_count,
+        "turns": progress.turn_count,
+        "last_tool": progress.last_tool_name,
+        "idle_seconds": int(time.time() - progress.last_activity_at) if progress.last_activity_at else None,
+        "output_tokens": progress.output_tokens,
+      }
     return payload
 
   def _background_task_reminder_text(self) -> str:
-    if not self._background_tasks:
+    running_tasks = self._task_registry.list_tasks(state=TaskState.RUNNING)
+    if not running_tasks:
       return ""
     entries: List[str] = []
-    for bg_task in sorted(self._background_tasks.values(), key=lambda task: task.started_at):
-      status = "completed"
-      if not bg_task.completed:
-        status = f"running, {self._background_elapsed_seconds(bg_task)}s"
-      elif bg_task.error is not None:
-        status = "error"
+    for bg_task in running_tasks:
+      parts = [f"running, {self._background_elapsed_seconds(bg_task)}s"]
+      if bg_task.progress.tool_use_count > 0:
+        parts.append(f"{bg_task.progress.tool_use_count} tools")
+        if bg_task.progress.last_tool_name:
+          parts.append(f"last: {bg_task.progress.last_tool_name}")
+      status = ", ".join(parts)
       label = bg_task.task_id
       if bg_task.agent_name:
         label += f" ({bg_task.agent_name}, {status})"
@@ -779,6 +872,21 @@ class AgentRunner:
         label += f" ({status})"
       entries.append(label)
     return "[Background tasks active: " + ", ".join(entries) + "]"
+
+  def _build_notification_reminder(self) -> str:
+    """Peek notifications into system prompt text. Non-destructive."""
+    if self._notification_queue.pending_count == 0:
+      return ""
+    notifications = self._notification_queue.peek(max_count=_MAX_NOTIFICATIONS_PER_TURN)
+    parts = [notification.format_xml() for notification in notifications]
+    remaining = self._notification_queue.pending_count - len(notifications)
+    if remaining > 0:
+      parts.append(f"[{remaining} more task notification(s) pending]")
+    return "\n".join(parts)
+
+  def _consume_notifications(self, max_count: int) -> int:
+    """Drain up to max_count notifications. Returns count consumed."""
+    return len(self._notification_queue.drain(max_count=max_count))
 
   @staticmethod
   def _inject_system_prompt_reminder(
@@ -796,7 +904,7 @@ class AgentRunner:
 
   async def _run_background_agent(
     self,
-    bg_task: BackgroundTask,
+    bg_task: TaskEntry,
     handler: BackgroundTaskHandler,
     tool_input: Dict[str, Any],
     call_index: int,
@@ -809,15 +917,19 @@ class AgentRunner:
           result, error = await handler(tool_input, call_index=call_index)
       else:
         result, error = await handler(tool_input, call_index=call_index)
-      bg_task.result = result if isinstance(result, dict) else result
+      bg_task.result = result if isinstance(result, dict) else ({"result": result} if result is not None else None)
       bg_task.error = error
+      if bg_task.error is not None:
+        self._task_registry.transition(bg_task.task_id, TaskState.FAILED, error=bg_task.error)
+      else:
+        self._task_registry.transition(bg_task.task_id, TaskState.COMPLETED, result=bg_task.result)
     except asyncio.CancelledError:
       bg_task.error = {"code": "cancelled", "message": "Background task was cancelled"}
+      self._task_registry.transition(bg_task.task_id, TaskState.FAILED, error=bg_task.error)
     except Exception as exc:
       bg_task.error = {"code": "background_error", "message": str(exc)}
+      self._task_registry.transition(bg_task.task_id, TaskState.FAILED, error=bg_task.error)
     finally:
-      bg_task.completed = True
-      bg_task.completed_at = time.time()
       if on_complete is not None:
         try:
           maybe_awaitable = on_complete(bg_task)
@@ -835,8 +947,7 @@ class AgentRunner:
     on_complete: BackgroundTaskCallback | None = None,
     on_before_start: Callable[[], None] | None = None,
   ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    active_count = sum(1 for bg_task in self._background_tasks.values() if not bg_task.completed)
-    if active_count >= self._max_background_tasks:
+    if self._task_registry.inflight_count >= self._max_background_tasks:
       return None, {
         "code": "max_background_tasks",
         "message": (
@@ -845,36 +956,49 @@ class AgentRunner:
         ),
       }
 
-    call_index = self._background_seq
-    task_id = f"bg_{call_index}"
-    self._background_seq += 1
-
     if on_before_start is not None:
       try:
         on_before_start()
       except Exception as exc:
         log.warning("[%s] on_before_start hook failed (non-fatal): %s", self._sid, exc)
 
-    bg_task = BackgroundTask(
-      task_id=task_id,
-      agent_name=agent_name,
-      asyncio_task=None,
-      started_at=time.time(),
-    )
-    self._background_tasks[task_id] = bg_task
-    bg_task.asyncio_task = asyncio.create_task(
+    entry = self._task_registry.register("background_agent", agent_name=agent_name)
+    raw_provider_name = tool_input.get("provider_name", tool_input.get("provider"))
+    if isinstance(raw_provider_name, str) and raw_provider_name.strip():
+      entry.provider_name = raw_provider_name.strip()
+    else:
+      entry.provider_name = getattr(self._provider, "name", None)
+    raw_model = tool_input.get("model")
+    if isinstance(raw_model, str) and raw_model.strip():
+      entry.model = raw_model.strip()
+    else:
+      auth_model = self._auth_config.get("model")
+      if isinstance(auth_model, str) and auth_model.strip():
+        entry.model = auth_model.strip()
+
+    try:
+      call_index = int(entry.task_id.rsplit("_", 1)[-1])
+    except ValueError:
+      call_index = 0
+
+    async def _entry_aware_handler(ti: Dict[str, Any], **kwargs: Any) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+      kwargs["task_entry"] = entry
+      return await handler(ti, **kwargs)
+
+    entry.asyncio_task = asyncio.create_task(
       self._run_background_agent(
-        bg_task,
-        handler,
+        entry,
+        _entry_aware_handler,
         dict(tool_input),
         call_index,
         on_complete=on_complete,
       ),
-      name=task_id,
+      name=entry.task_id,
     )
+    self._task_registry.transition(entry.task_id, TaskState.RUNNING)
 
     result: Dict[str, Any] = {
-      "task_id": task_id,
+      "task_id": entry.task_id,
       "status": "running",
     }
     if agent_name:
@@ -901,7 +1025,7 @@ class AgentRunner:
     timeout = self._background_timeout_value(raw_timeout)
 
     if task_id == "*":
-      selected = list(sorted(self._background_tasks.values(), key=lambda task: task.started_at))
+      selected = self._task_registry.list_tasks()
       if wait:
         pending = [
           bg_task.asyncio_task
@@ -912,7 +1036,7 @@ class AgentRunner:
           await asyncio.wait(pending, timeout=timeout)
       return {"tasks": [self._background_task_payload(bg_task) for bg_task in selected]}, None
 
-    bg_task = self._background_tasks.get(task_id)
+    bg_task = self._task_registry.get(task_id)
     if bg_task is None:
       return None, {"code": "not_found", "message": f"Unknown background task: {task_id}"}
 
@@ -921,26 +1045,28 @@ class AgentRunner:
     return self._background_task_payload(bg_task), None
 
   async def _shutdown_background_tasks(self, was_cancelled: bool) -> None:
+    running_entries = self._task_registry.list_tasks(state=TaskState.RUNNING)
     pending = [
       bg_task.asyncio_task
-      for bg_task in self._background_tasks.values()
-      if bg_task.asyncio_task is not None and not bg_task.completed
+      for bg_task in running_entries
+      if bg_task.asyncio_task is not None
     ]
     if not pending:
       return
 
     try:
       if was_cancelled:
-        for task in pending:
-          task.cancel()
+        for bg_task in running_entries:
+          self._task_registry.kill(bg_task.task_id)
         await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5.0)
         return
 
       _done, still_pending = await asyncio.wait(pending, timeout=30.0)
       if not still_pending:
         return
-      for task in still_pending:
-        task.cancel()
+      for bg_task in running_entries:
+        if bg_task.asyncio_task in still_pending:
+          self._task_registry.kill(bg_task.task_id)
       await asyncio.wait_for(asyncio.gather(*still_pending, return_exceptions=True), timeout=5.0)
     except asyncio.TimeoutError:
       pass
@@ -1640,6 +1766,15 @@ class AgentRunner:
           await self._append_user_message_event(new_user_input)
         messages = prior_messages + ([new_user_input] if new_user_input is not None else [])
 
+      if self._coordinator is not None and self._coordinator.enabled:
+        preamble = self._coordinator.preamble or COORDINATOR_DEFAULT_PREAMBLE
+        if isinstance(system_prompt, list):
+          system_prompt = [(preamble, False)] + list(system_prompt)
+        elif system_prompt:
+          system_prompt = f"{preamble}\n\n{system_prompt}"
+        else:
+          system_prompt = preamble
+
       config = dict(self._auth_config)
       config.update({
         "auth_mode": str(config.get("auth_mode", "api")).strip().lower(),
@@ -1754,7 +1889,6 @@ class AgentRunner:
       turn_count = 0
       tools_used: List[str] = []
       current_messages = list(messages)
-      inject_background_task_reminder = False
 
       while True:
         turn_count += 1
@@ -1820,12 +1954,27 @@ class AgentRunner:
             },
           )
 
-        turn_system_prompt = (
-          self._inject_system_prompt_reminder(system_prompt, self._background_task_reminder_text())
-          if inject_background_task_reminder
-          else system_prompt
-        )
-        inject_background_task_reminder = False
+        bg_reminder = self._background_task_reminder_text()
+        notif_reminder = self._build_notification_reminder()
+        peeked_notification_count = min(
+          self._notification_queue.pending_count,
+          _MAX_NOTIFICATIONS_PER_TURN,
+        ) if notif_reminder else 0
+        combined_reminder = "\n\n".join(filter(None, [bg_reminder, notif_reminder]))
+        if combined_reminder:
+          turn_system_prompt = self._inject_system_prompt_reminder(system_prompt, combined_reminder)
+        else:
+          turn_system_prompt = system_prompt
+        if self._message_inbox is not None:
+          parent_messages: list[str] = []
+          while not self._message_inbox.empty():
+            try:
+              parent_messages.append(self._message_inbox.get_nowait())
+            except asyncio.QueueEmpty:
+              break
+          if parent_messages:
+            combined = "\n".join(f"[Message from parent agent]: {message}" for message in parent_messages)
+            current_messages.append({"role": "user", "content": combined})
         turn_usage_before = dict(usage_totals)
         turn_result = await self._stream_turn(
           client=client,
@@ -1853,6 +2002,13 @@ class AgentRunner:
           stop_reason=turn.stop_reason,
           model=config["model"],
           usage=turn_usage,
+        )
+        self._append(
+          {
+            "type": "turn_complete",
+            "turn": turn_count,
+            "usage": dict(turn_usage),
+          }
         )
 
         turn_elapsed = time.time() - turn_t0
@@ -1944,7 +2100,24 @@ class AgentRunner:
                 "stop_reason": turn.stop_reason,
               }
             )
-            inject_background_task_reminder = True
+            continue
+          if self._notification_queue.pending_count > 0:
+            assistant_content = list(turn.content_blocks)
+            current_messages.append(
+              {
+                "role": "assistant",
+                "content": assistant_content,
+                "provider": self._provider.name,
+                "model": config["model"],
+                "stop_reason": turn.stop_reason,
+              }
+            )
+            current_messages.append(
+              {
+                "role": "user",
+                "content": "[System: Background tasks have completed. Check results with get_background_result.]",
+              }
+            )
             continue
           break
 
@@ -2060,8 +2233,18 @@ class AgentRunner:
             i += 1
 
         current_messages.append({"role": "user", "content": tool_results_content})
+        if peeked_notification_count > 0:
+          self._consume_notifications(max_count=peeked_notification_count)
 
         if turn.stop_reason == "end_turn":
+          if self._notification_queue.pending_count > 0:
+            current_messages.append(
+              {
+                "role": "user",
+                "content": "[System: Background tasks have completed. Check results with get_background_result.]",
+              }
+            )
+            continue
           break
 
       total_elapsed = time.time() - chat_t0

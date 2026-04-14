@@ -548,3 +548,110 @@ def test_run_autonomous_forwards_outputs_dir(
   )
 
   assert captured["kwargs"]["outputs_dir"] == outputs_dir
+
+
+def test_run_autonomous_skills_dir_registers_send_message_tool_and_builtin_name(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  captured: dict[str, Any] = {}
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir(parents=True, exist_ok=True)
+
+  class _StubMcpClientManager:
+    def __init__(
+      self,
+      *,
+      inline_servers: dict[str, dict[str, Any]] | None = None,
+      config_path: str | Path | None = None,
+      builtin_tool_names: set[str] | None = None,
+      timeout_overrides: dict[str, int] | None = None,
+    ) -> None:
+      _ = inline_servers, config_path, timeout_overrides
+      self._builtin_tool_names = set(builtin_tool_names or set())
+
+    async def startup(self) -> None:
+      return None
+
+    async def shutdown(self) -> None:
+      return None
+
+    def get_server_names(self) -> list[str]:
+      return []
+
+    def get_tool_definitions(self) -> list[dict[str, Any]]:
+      return []
+
+  async def _fake_run_session(
+    runner: Any,
+    event_log: EventLog,
+    *,
+    model: str,
+    max_turns: int,
+    timeout_seconds: float,
+    initial_message: str,
+    system_prompt: str | list[tuple[str, bool]],
+  ) -> autonomous.RunOutput:
+    _ = event_log, model, max_turns, timeout_seconds, initial_message, system_prompt
+    captured["local_handlers"] = set(runner._dispatcher._local)
+    captured["tool_defs"] = {tool["name"] for tool in runner._get_tool_definitions()}
+    captured["builtin_tool_names"] = set(runner._mcp_client._builtin_tool_names)
+    return autonomous.RunOutput(
+      response="Completed.",
+      tools_used=[],
+      usage={},
+      error=None,
+      timed_out=False,
+    )
+
+  monkeypatch.setattr(autonomous, "McpClientManager", _StubMcpClientManager)
+  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
+
+  _run(
+    autonomous.run_autonomous(
+      "You are helpful.",
+      "Run the task.",
+      provider=_StubProvider(),
+      model="stub-model",
+      skills_dir=skills_dir,
+      mcp_servers={"filesystem": {"command": "npx", "args": ["-y", "server"]}},
+    )
+  )
+
+  assert captured["local_handlers"] >= {"run_agent", "get_background_result", "send_message"}
+  assert captured["tool_defs"] >= {"run_agent", "get_background_result", "send_message"}
+  assert captured["builtin_tool_names"] >= {"run_agent", "get_background_result", "send_message"}
+
+
+def test_extract_state_empty_text() -> None:
+  assert autonomous.extract_state_update("") == {}
+
+
+def test_extract_state_non_dict_json() -> None:
+  text = """
+## STATE_UPDATE_JSON
+```json
+[1, 2, 3]
+```
+"""
+
+  assert autonomous.extract_state_update(text) == {}
+
+
+def test_extract_state_malformed_json() -> None:
+  text = """
+## STATE_UPDATE_JSON
+```json
+{"alerts": [}
+```
+"""
+
+  assert autonomous.extract_state_update(text) == {}
+
+
+def test_split_messages_empty() -> None:
+  assert autonomous.split_messages("") == []
+
+
+def test_split_messages_force_split_long_line() -> None:
+  assert autonomous.split_messages("ABCDEFGHIJ", max_len=4) == ["ABCD", "EFGH", "IJ"]

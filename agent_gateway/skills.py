@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,12 @@ class SkillProfile:
   max_retries: int | None = None
   initial_message: str | None = None
   delivery_label: str | None = None
+  agent_callable: bool = False
+  agent_description: str | None = None
+  mode: str = "full"
+  extra_excluded_tools: set[str] = field(default_factory=set)
+  tool_packs_enabled: bool = True
+  provider: str | None = None
 
 
 def _clean_string(value: Any) -> str | None:
@@ -119,6 +125,25 @@ def _coerce_optional_string_list(value: Any, *, field_name: str, path: Path) -> 
   return items or None
 
 
+def _coerce_optional_string_set(value: Any, *, field_name: str, path: Path) -> set[str]:
+  if value is None:
+    return set()
+  raw_items: list[Any]
+  if isinstance(value, str):
+    raw_items = [value]
+  elif isinstance(value, (list, tuple, set)):
+    raw_items = list(value)
+  else:
+    raise ValueError(f"{path}: '{field_name}' must be a list of strings")
+
+  items: set[str] = set()
+  for item in raw_items:
+    text = _clean_string(item)
+    if text:
+      items.add(text)
+  return items
+
+
 def _coerce_optional_timeout_overrides(
   value: Any,
   *,
@@ -154,6 +179,15 @@ def _coerce_optional_scope(value: Any, *, field_name: str, path: Path) -> str | 
   return text
 
 
+def _coerce_mode(value: Any, *, field_name: str, path: Path) -> str:
+  text = _clean_string(value)
+  if text is None:
+    return "full"
+  if text not in {"full", "recommend"}:
+    raise ValueError(f"{path}: '{field_name}' must be 'full' or 'recommend'")
+  return text
+
+
 def _split_frontmatter(text: str, *, path: Path) -> tuple[dict[str, Any], str]:
   lines = text.splitlines()
   if not lines or lines[0].strip() != _FRONTMATTER_DELIMITER:
@@ -184,12 +218,18 @@ def parse_skill_file(path: Path) -> SkillProfile:
   raw_name = frontmatter.pop("name", None)
   raw_version = frontmatter.pop("version", None)
   raw_model = frontmatter.pop("model", None)
+  raw_provider = frontmatter.pop("provider", None)
   raw_max_turns = frontmatter.pop("max_turns", None)
   raw_timeout = frontmatter.pop("timeout", None)
   raw_tool_packs = frontmatter.pop("tool_packs", None)
   raw_persist_state = frontmatter.pop("persist_state", None)
   raw_scope = frontmatter.pop("scope", None)
   raw_interactive = frontmatter.pop("interactive", None)
+  raw_agent_callable = frontmatter.pop("agent_callable", None)
+  raw_agent_description = frontmatter.pop("agent_description", None)
+  raw_mode = frontmatter.pop("mode", None)
+  raw_extra_excluded_tools = frontmatter.pop("extra_excluded_tools", None)
+  raw_tool_packs_enabled = frontmatter.pop("tool_packs_enabled", None)
   raw_metadata = frontmatter.pop("metadata", None)
 
   if raw_metadata is None:
@@ -239,6 +279,27 @@ def parse_skill_file(path: Path) -> SkillProfile:
   )
   coerced_initial_message = _clean_string(raw_initial_message)
   coerced_delivery_label = _clean_string(raw_delivery_label)
+  coerced_agent_callable = _coerce_optional_bool(
+    raw_agent_callable,
+    field_name="agent_callable",
+    path=path,
+  )
+  coerced_agent_description = _clean_string(raw_agent_description)
+  coerced_mode = _coerce_mode(raw_mode, field_name="mode", path=path)
+  coerced_extra_excluded_tools = _coerce_optional_string_set(
+    raw_extra_excluded_tools,
+    field_name="extra_excluded_tools",
+    path=path,
+  )
+  coerced_tool_packs_enabled = (
+    True
+    if raw_tool_packs_enabled is None
+    else _coerce_optional_bool(
+      raw_tool_packs_enabled,
+      field_name="tool_packs_enabled",
+      path=path,
+    )
+  )
 
   for key, coerced in [
     ("mcp_servers", coerced_mcp_servers),
@@ -273,6 +334,12 @@ def parse_skill_file(path: Path) -> SkillProfile:
     max_retries=coerced_max_retries,
     initial_message=coerced_initial_message,
     delivery_label=coerced_delivery_label,
+    agent_callable=coerced_agent_callable,
+    agent_description=coerced_agent_description,
+    mode=coerced_mode,
+    extra_excluded_tools=coerced_extra_excluded_tools,
+    tool_packs_enabled=coerced_tool_packs_enabled,
+    provider=_clean_string(raw_provider),
   )
 
 

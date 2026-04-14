@@ -93,10 +93,8 @@ def test_run_once_does_not_read_or_write_state_json_and_appends_state_update(
   def _unexpected_write(_path: Path, _payload: dict[str, Any]) -> None:
     raise AssertionError("state.json should not be written in Phase 3a")
 
-  def _build_initial_user_message(today: str, state_file: Path, previous_state: dict[str, Any], briefing_file: str) -> str:
+  def _build_initial_user_message(today: str, briefing_file: str) -> str:
     captured["today"] = today
-    captured["state_file"] = state_file
-    captured["previous_state"] = dict(previous_state)
     captured["briefing_file"] = briefing_file
     return "Run the analyst loop."
 
@@ -140,8 +138,6 @@ def test_run_once_does_not_read_or_write_state_json_and_appends_state_update(
   exit_code = _run(autonomous_entry.run_once(profile))
 
   assert exit_code == 0
-  assert captured["previous_state"] == {}
-  assert captured["state_file"] == state_path
   assert state_path.read_text(encoding="utf-8") == "{not valid json"
 
   entries, _ = _run(log.query(event_types={"state_update"}, order="asc"))
@@ -221,7 +217,7 @@ def test_run_once_skips_summary_on_interrupted_run(
     tool_packs=None,
     run_once_use_tool_packs=False,
     build_system_prompt=lambda **kwargs: "system prompt",
-    build_initial_user_message=lambda *args, **kwargs: "Run the analyst loop.",
+    build_initial_user_message=lambda today, briefing_file: "Run the analyst loop.",
     describe_market_status=lambda: "closed",
     on_fallback=None,
     retry_config=None,

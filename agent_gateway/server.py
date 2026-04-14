@@ -50,12 +50,19 @@ class ChatInitRequest(BaseModel):
   context: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ModelCatalog(BaseModel):
+  default_model: str
+  allowed_models: List[str]
+  display_names: Dict[str, str]
+
+
 class ChatInitResponse(BaseModel):
   """Response body returned after a session token is issued."""
 
   session_token: str
   session_id: str
   expires_at: int
+  model_catalog: Optional[ModelCatalog] = None
 
 
 class ChatMessage(BaseModel):
@@ -177,6 +184,7 @@ class GatewayServerConfig:
     compaction_trigger: Default compaction threshold.
     compaction_instructions: Default compaction instructions.
     allowed_models: Model allowlist enforced at request time.
+    model_catalog: Optional model discovery metadata returned by `POST /chat/init`.
     build_chat_runtime: Required async callback that returns a `ChatRuntime`.
     on_event: Optional event observer invoked for every appended `EventLog`
       entry.
@@ -210,6 +218,7 @@ class GatewayServerConfig:
   compaction_trigger: int | None = None
   compaction_instructions: str | None = None
   allowed_models: Set[str] = field(default_factory=lambda: {"claude-sonnet-4-6", "claude-opus-4-6"})
+  model_catalog: Optional[ModelCatalog] = None
   build_chat_runtime: Optional[BuildChatRuntime] = None
   on_event: Optional[Callable[..., Any]] = None
   on_tool_result: Optional[Callable[..., Any]] = None
@@ -376,6 +385,8 @@ def _make_request_approval(session: GatewaySession, event_log: EventLog) -> Requ
         "tool_name": payload.tool_name,
         "tool_input": payload.tool_input,
         "resolved_qualifier": payload.resolved_qualifier,
+        "reason": payload.reason,
+        "allow_persistent_approval": payload.allow_persistent_approval,
       }
     )
 
@@ -515,6 +526,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       session_token=token,
       session_id=session.session_id,
       expires_at=session.expires_at,
+      model_catalog=config.model_catalog,
     )
 
   @router.post("/chat")
@@ -757,6 +769,7 @@ __all__ = [
   "ChatRequest",
   "ChatRuntime",
   "GatewayServerConfig",
+  "ModelCatalog",
   "RequestContext",
   "ToolApprovalRequest",
   "ToolResultRequest",

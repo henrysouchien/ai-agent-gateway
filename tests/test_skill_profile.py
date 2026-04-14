@@ -13,7 +13,6 @@ if str(API_DIR) not in sys.path:
   sys.path.insert(0, str(API_DIR))
 
 from agent_gateway.skills import SkillProfile, parse_skill_file
-from agent_profiles import AgentProfile
 
 
 def _write_skill(tmp_path: Path, frontmatter: str | None, *, body: str = "# Skill\n\nPrompt") -> Path:
@@ -109,6 +108,30 @@ def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:
     "initial_message": "Run from top level.",
     "delivery_label": "Top Level",
   }
+
+
+def test_parse_agent_fields_from_frontmatter(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    name: agent-fields
+    agent_callable: true
+    agent_description: Agent catalog description
+    mode: recommend
+    extra_excluded_tools:
+      - execute_trade
+      - preview_trade
+    tool_packs_enabled: false
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.agent_callable is True
+  assert profile.agent_description == "Agent catalog description"
+  assert profile.mode == "recommend"
+  assert profile.extra_excluded_tools == {"execute_trade", "preview_trade"}
+  assert profile.tool_packs_enabled is False
 
 
 def test_mixed_known_and_unknown_metadata(tmp_path: Path) -> None:
@@ -219,6 +242,11 @@ def test_none_defaults(tmp_path: Path) -> None:
   assert profile.max_retries is None
   assert profile.initial_message is None
   assert profile.delivery_label is None
+  assert profile.agent_callable is False
+  assert profile.agent_description is None
+  assert profile.mode == "full"
+  assert profile.extra_excluded_tools == set()
+  assert profile.tool_packs_enabled is True
 
 
 def test_dataclass_construction_defaults() -> None:
@@ -233,6 +261,11 @@ def test_dataclass_construction_defaults() -> None:
   assert profile.max_retries is None
   assert profile.initial_message is None
   assert profile.delivery_label is None
+  assert profile.agent_callable is False
+  assert profile.agent_description is None
+  assert profile.mode == "full"
+  assert profile.extra_excluded_tools == set()
+  assert profile.tool_packs_enabled is True
 
 
 def test_positional_construction_compat() -> None:
@@ -243,13 +276,17 @@ def test_positional_construction_compat() -> None:
   assert profile.metadata == {"custom": 1}
   assert profile.mcp_servers is None
   assert profile.delivery_label is None
+  assert profile.agent_callable is False
+  assert profile.mode == "full"
+  assert profile.extra_excluded_tools == set()
+  assert profile.tool_packs_enabled is True
 
 
 def test_agent_profile_subclass_compat() -> None:
-  profile = AgentProfile(name="agent", description="Agent description")
+  profile = SkillProfile(name="agent", system_prompt="", agent_description="Agent description")
 
   assert profile.name == "agent"
-  assert profile.description == "Agent description"
+  assert profile.agent_description == "Agent description"
   assert profile.metadata is None
   assert profile.mcp_servers is None
   assert profile.session_inject_servers is None
@@ -259,6 +296,18 @@ def test_agent_profile_subclass_compat() -> None:
   assert profile.max_retries is None
   assert profile.initial_message is None
   assert profile.delivery_label is None
+
+
+def test_parse_invalid_mode_raises(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    mode: bogus
+    """,
+  )
+
+  with pytest.raises(ValueError, match="mode"):
+    parse_skill_file(skill_path)
 
 
 def test_metadata_retains_known_keys(tmp_path: Path) -> None:

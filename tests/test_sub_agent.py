@@ -155,6 +155,25 @@ def test_make_run_agent_handler_default_timeout_is_none() -> None:
   assert runner.calls[0]["timeout"] is None
 
 
+def test_make_run_agent_handler_forwards_needs_approval_to_child_dispatcher() -> None:
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=None,
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={"keep_tool": _dummy_tool},
+    needs_approval=lambda name, _tool_input, _qualifier: name == "sensitive_tool",
+  )
+
+  result, error = _run(handler({"task": "Quick question"}))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  dispatcher = runner.calls[0]["dispatcher"]
+  assert dispatcher._needs_approval("sensitive_tool", {}, "") is True
+  assert dispatcher._needs_approval("keep_tool", {}, "") is False
+
+
 def test_make_run_agent_handler_copies_user_id_and_auth_config_to_sub_session() -> None:
   runner = _StubRunner()
   parent_auth_config = {"provider": "anthropic", "billing_mode": "byok", "api_key": "key"}
@@ -406,6 +425,29 @@ def test_make_run_agent_handler_background_registers_task(tmp_path: Path) -> Non
   assert runner.calls == []
   assert len(runner.background_calls) == 1
   assert runner.background_calls[0]["agent_name"] is None
+
+
+def test_make_run_agent_handler_background_handler_forwards_task_entry(tmp_path: Path) -> None:
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(tmp_path / "skills"),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={"keep_tool": _dummy_tool},
+  )
+
+  result, error = _run(handler({"task": "Collect", "background": True}))
+
+  assert error is None
+  assert result == {"task_id": "bg_0", "status": "running"}
+  background_handler = runner.background_calls[0]["handler"]
+  task_entry = object()
+
+  _run(background_handler({}, task_entry=task_entry, call_index=7))
+
+  assert len(runner.calls) == 1
+  assert runner.calls[0]["task_entry"] is task_entry
+  assert runner.calls[0]["call_index"] == 7
 
 
 def test_background_cleans_stale_output_file(tmp_path: Path) -> None:

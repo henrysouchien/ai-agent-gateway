@@ -19,6 +19,7 @@ from .runner import AgentRunner, ToolResultContext
 from .server import ChatRequest, ChatRuntime, GatewayServerConfig, _make_request_approval, create_gateway_app
 from .session import AuthManager, GatewaySession
 from .skills import SkillLoader
+from .task_registry import CoordinatorConfig
 from .tool_dispatcher import LocalToolHandler, ToolDispatcher
 
 log = logging.getLogger("agent_gateway.easy")
@@ -58,6 +59,8 @@ def create_agent(
   outputs_dir: str | Path | None = None,
   code_execution: bool = False,
   code_execution_config: CodeExecutionConfig | None = None,
+  needs_approval: Callable[..., bool] | None = None,
+  session_cache_denied_tools: frozenset[str] | None = None,
   max_turns: int | None = None,
   max_budget_usd: float | None = None,
   per_turn_timeout: int = 300,
@@ -75,6 +78,7 @@ def create_agent(
   resolver_timeout_seconds: float = 5.0,
   usage_ledger: UsageLedger | None = None,
   usage_ledger_dlq_path: Path | None = None,
+  coordinator: CoordinatorConfig | None = None,
 ) -> FastAPI:
   """Create a ready-to-run FastAPI gateway backed by a `ModelProvider`.
 
@@ -227,7 +231,7 @@ def create_agent(
     if code_execution:
       builtin_names |= {"code_execute", "code_execute_status"}
     if skills_dir and "run_agent" not in builtin_names:
-      builtin_names |= {"run_agent", "get_background_result"}
+      builtin_names |= {"run_agent", "get_background_result", "send_message"}
     mcp_client = McpClientManager(
       inline_servers=mcp_servers,
       config_path=mcp_config_path,
@@ -249,6 +253,7 @@ def create_agent(
     local_handlers = dict(tool_handlers or {})
     extra_tool_defs = list(tool_definitions or [])
     runner_ref: list[Any] = [None]
+    user_needs_approval = needs_approval
 
     ce_bundle = None
     if code_execution:
@@ -260,6 +265,8 @@ def create_agent(
       from .sub_agent import (
         make_get_background_result_handler,
         make_get_background_result_tool_def,
+        make_send_message_handler,
+        make_send_message_tool_def,
         make_run_agent_handler,
         make_run_agent_tool_def,
       )
@@ -269,19 +276,25 @@ def create_agent(
         parent_session=session,
         skill_loader=skill_loader,
         mcp_client=mcp_client or _NullMcpClient(),
+        needs_approval=user_needs_approval,
         mcp_session_inject_servers=mcp_session_inject_servers,
         local_tool_handlers=local_handlers,
         excluded_tools=skills_excluded_tools,
         outputs_dir=Path(outputs_dir) if outputs_dir is not None else None,
         default_model=model,
         allowed_models=allowed_models,
+        coordinator_config=coordinator,
       )
       if "get_background_result" not in local_handlers:
         local_handlers["get_background_result"] = make_get_background_result_handler(runner_ref)
+      if "send_message" not in local_handlers:
+        local_handlers["send_message"] = make_send_message_handler(runner_ref)
       if not any(definition.get("name") == "run_agent" for definition in extra_tool_defs):
         extra_tool_defs.append(make_run_agent_tool_def(skill_loader))
       if not any(definition.get("name") == "get_background_result" for definition in extra_tool_defs):
         extra_tool_defs.append(make_get_background_result_tool_def())
+      if not any(definition.get("name") == "send_message" for definition in extra_tool_defs):
+        extra_tool_defs.append(make_send_message_tool_def())
 
     def _get_tool_defs() -> list[dict[str, Any]]:
       defs: list[dict[str, Any]] = []
@@ -299,6 +312,8 @@ def create_agent(
     ) -> bool:
       if ce_bundle is not None and name == "code_execute":
         return ce_bundle.needs_approval(name, tool_input, qualifier)
+      if user_needs_approval is not None:
+        return bool(user_needs_approval(name, tool_input, qualifier))
       return False
 
     async def _combined_on_tool_result(ctx: ToolResultContext):
@@ -346,6 +361,7 @@ def create_agent(
         session_id=session_id,
         mcp_session_inject_servers=mcp_session_inject_servers,
         approval_key_qualifier=approval_qualifier,
+        session_cache_denied_tools=session_cache_denied_tools,
       )
       runner = AgentRunner(
         event_log=event_log,
@@ -366,6 +382,7 @@ def create_agent(
         channel=channel,
         usage_ledger_dlq_path=resolved_usage_dlq_path,
         max_budget_usd=max_budget_usd,
+        coordinator=coordinator,
       )
       runner_ref[0] = runner
       return runner

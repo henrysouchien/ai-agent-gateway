@@ -23,9 +23,12 @@ from .skills import SkillLoader
 from .sub_agent import (
   make_get_background_result_handler,
   make_get_background_result_tool_def,
+  make_send_message_handler,
+  make_send_message_tool_def,
   make_run_agent_handler,
   make_run_agent_tool_def,
 )
+from .task_registry import CoordinatorConfig
 from .tool_dispatcher import LocalToolHandler, ToolDispatcher, ToolInterceptor
 
 
@@ -458,6 +461,7 @@ async def run_autonomous(
   skills_dir: str | Path | None = None,
   skills_excluded_tools: set[str] | None = None,
   outputs_dir: str | Path | None = None,
+  needs_approval: Callable[..., bool] | None = None,
   excluded_tools: set[str] | None = None,
   interceptors: Sequence[ToolInterceptor] | None = None,
   max_turns: int = 80,
@@ -474,6 +478,7 @@ async def run_autonomous(
   on_tool_result: Callable[[ToolResultContext], Awaitable[Any] | Any] | None = None,
   on_tool_timing: Callable[..., None] | None = None,
   session_id: str | None = None,
+  coordinator: CoordinatorConfig | None = None,
 ) -> RunOutput:
   """Run a headless agent to completion without an HTTP server.
 
@@ -504,7 +509,7 @@ async def run_autonomous(
   if mcp_servers or mcp_config_path:
     builtin_names = set((tool_handlers or {}).keys())
     if skills_dir and "run_agent" not in builtin_names:
-      builtin_names |= {"run_agent", "get_background_result"}
+      builtin_names |= {"run_agent", "get_background_result", "send_message"}
     mcp_client = McpClientManager(
       inline_servers=mcp_servers,
       config_path=mcp_config_path,
@@ -527,19 +532,25 @@ async def run_autonomous(
         runner_ref,
         skill_loader=skill_loader,
         mcp_client=mcp_client or _NullMcpClient(),
+        needs_approval=needs_approval,
         mcp_session_inject_servers=mcp_session_inject_servers,
         local_tool_handlers=local_handlers,
         excluded_tools=skills_excluded_tools,
         outputs_dir=Path(outputs_dir) if outputs_dir is not None else None,
         default_model=resolved_model,
         allowed_models=allowed_models,
+        coordinator_config=coordinator,
       )
       if "get_background_result" not in local_handlers:
         local_handlers["get_background_result"] = make_get_background_result_handler(runner_ref)
+      if "send_message" not in local_handlers:
+        local_handlers["send_message"] = make_send_message_handler(runner_ref)
       if not any(definition.get("name") == "run_agent" for definition in extra_tool_defs):
         extra_tool_defs.append(make_run_agent_tool_def(skill_loader))
       if not any(definition.get("name") == "get_background_result" for definition in extra_tool_defs):
         extra_tool_defs.append(make_get_background_result_tool_def())
+      if not any(definition.get("name") == "send_message" for definition in extra_tool_defs):
+        extra_tool_defs.append(make_send_message_tool_def())
 
     def _get_tool_defs() -> list[dict[str, Any]]:
       defs: list[dict[str, Any]] = []
@@ -560,10 +571,11 @@ async def run_autonomous(
     dispatcher = ToolDispatcher(
       mcp_client=mcp_client or _NullMcpClient(),
       local_tool_handlers=local_handlers,
-      needs_approval=lambda _name, _tool_input=None, _qualifier="": False,
+      needs_approval=needs_approval,
       event_log=event_log,
       interceptors=interceptors,
       session_id=sid,
+      should_avoid_permission_prompts=True,
       mcp_session_inject_servers=mcp_session_inject_servers,
     )
     runner = AgentRunner(
@@ -585,6 +597,7 @@ async def run_autonomous(
       max_budget_usd=max_budget_usd,
       max_concurrent_sub_agents=max_concurrent_sub_agents,
       compaction_instructions=compaction_instructions,
+      coordinator=coordinator,
     )
     runner_ref[0] = runner
 

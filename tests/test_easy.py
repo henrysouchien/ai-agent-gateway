@@ -439,8 +439,9 @@ def test_create_agent_skills_dir_registers_run_agent_handler_tool_def_and_builti
 
   assert "run_agent" in runner._dispatcher._local
   assert "get_background_result" in runner._dispatcher._local
-  assert {tool["name"] for tool in tool_defs} >= {"run_agent", "get_background_result"}
-  assert app.state.gateway_config.mcp_client._builtin_tool_names >= {"run_agent", "get_background_result"}
+  assert "send_message" in runner._dispatcher._local
+  assert {tool["name"] for tool in tool_defs} >= {"run_agent", "get_background_result", "send_message"}
+  assert app.state.gateway_config.mcp_client._builtin_tool_names >= {"run_agent", "get_background_result", "send_message"}
 
 
 def test_create_agent_forwards_outputs_dir(
@@ -469,6 +470,25 @@ def test_create_agent_forwards_outputs_dir(
   assert captured["kwargs"]["outputs_dir"] == outputs_dir
 
 
+def test_create_agent_forwards_needs_approval_and_cache_denylist() -> None:
+  async def _tool(_tool_input, **_kwargs):
+    return {"ok": True}, None
+
+  app = create_agent(
+    "test",
+    tool_handlers={"execute_trade": _tool},
+    needs_approval=lambda name, _tool_input=None, _qualifier="": name == "execute_trade",
+    session_cache_denied_tools=frozenset({"execute_trade"}),
+  )
+
+  session, runtime = _build_runtime(app)
+  runner = runtime.build_runner(EventLog(), session.session_id)
+  dispatcher = runner._dispatcher
+
+  assert dispatcher._needs_approval("execute_trade", {}, "") is True
+  assert dispatcher._session_cache_denied == frozenset({"execute_trade"})
+
+
 def test_create_agent_skills_dir_does_not_duplicate_user_run_agent_tool_definition(tmp_path: Path) -> None:
   skills_dir = tmp_path / "skills"
   _write_skill(skills_dir, "deep-research", "Research deeply.")
@@ -485,6 +505,7 @@ def test_create_agent_skills_dir_does_not_duplicate_user_run_agent_tool_definiti
   tool_defs = runtime.get_tool_definitions()
   assert [tool for tool in tool_defs if tool["name"] == "run_agent"] == [tool_def]
   assert any(tool["name"] == "get_background_result" for tool in tool_defs)
+  assert any(tool["name"] == "send_message" for tool in tool_defs)
 
 
 def test_create_agent_skills_dir_respects_custom_run_agent_handler_override(tmp_path: Path) -> None:

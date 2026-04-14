@@ -258,11 +258,17 @@ Types used by the approval loop.
 
 `ApprovalDecision.allow_tool_type` persists approval for that tool type within the session.
 
-### `InterceptContext`, `InterceptDecision`, and `ToolInterceptor`
+### `InterceptContext`, `InterceptDecision`, `InterceptResult`, and `ToolInterceptor`
 
 Interceptor contract for runtime tool policy.
 
-Use interceptors when you want to warn or deny before any tool executes.
+`InterceptDecision.action` supports `allow`, `warn`, `ask`, and `deny`.
+
+`InterceptResult` is the structured return from the dispatcher's interceptor
+pipeline and exposes `proceed`, `warnings`, `error`, and `pending_ask`.
+
+Use interceptors when you want to warn, ask for approval, or deny before any
+tool executes.
 
 ## Code Execution
 

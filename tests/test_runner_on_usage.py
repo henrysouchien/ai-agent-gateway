@@ -214,6 +214,29 @@ def test_spawn_sub_agent_emits_usage_with_parent_turn_id() -> None:
   assert events[0].parent_turn_id == "tool-run-agent-1"
 
 
+def test_run_appends_turn_complete_event_to_event_log() -> None:
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log),
+    session_id="sess-parent",
+    provider=_UsageProvider(),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  turn_complete = [entry.event for entry in event_log.entries if entry.event.get("type") == "turn_complete"]
+  assert len(turn_complete) == 1
+  assert turn_complete[0]["turn"] == 1
+  assert turn_complete[0]["usage"] == {
+    "input_tokens": 100,
+    "output_tokens": 50,
+    "cache_read_input_tokens": 10,
+    "cache_creation_input_tokens": 5,
+  }
+
+
 @pytest.mark.parametrize("timeout", [0, None, -1])
 def test_spawn_sub_agent_no_wall_clock(
   monkeypatch: pytest.MonkeyPatch,
