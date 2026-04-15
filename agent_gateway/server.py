@@ -16,6 +16,7 @@ from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from .auth import (
   CredentialsResolver,
@@ -128,6 +129,8 @@ class ChatRuntime:
     on_usage: Optional request-scoped usage hook.
     on_tool_result: Optional request-scoped tool result hook.
     on_tool_timing: Optional request-scoped tool timing hook.
+    disconnect_handler: Optional request-scoped disconnect hook invoked when the
+      client connection is closed mid-stream.
     post_runner_init: Optional callback invoked after runner construction.
     max_turns: Optional cap on loop iterations for this request.
     compaction_trigger: Optional token threshold for provider-side compaction.
@@ -145,10 +148,25 @@ class ChatRuntime:
   on_usage: Optional[Callable[..., Any]] = None
   on_tool_result: Optional[Callable[..., Any]] = None
   on_tool_timing: Optional[Callable[..., Any]] = None
+  disconnect_handler: Optional[Callable[[], Awaitable[None] | None]] = None
   post_runner_init: Optional[Callable[[Any], None]] = None
   max_turns: Optional[int] = None
   compaction_trigger: int | None = None
   compaction_instructions: str | None = None
+  _disconnect_called: bool = field(default=False, init=False, repr=False)
+
+  async def on_disconnect(self) -> None:
+    if self._disconnect_called:
+      return
+    self._disconnect_called = True
+    if self.disconnect_handler is None:
+      return
+    try:
+      result = self.disconnect_handler()
+      if inspect.isawaitable(result):
+        await result
+    except Exception as exc:
+      logging.getLogger("agent_gateway.server").warning("ChatRuntime.on_disconnect failed: %s", exc)
 
 
 @dataclass
@@ -604,6 +622,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
       event_log = EventLog(on_event=config.on_event, session_id=sid)
       runner = runtime.build_runner(event_log, sid)
+      if runtime.disconnect_handler is None:
+        runner_on_disconnect = getattr(runner, "on_disconnect", None)
+        if callable(runner_on_disconnect):
+          runtime.disconnect_handler = runner_on_disconnect
     except Exception:
       session.stream_active = False
       raise
@@ -630,51 +652,56 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           return
         event_log.append({"type": "heartbeat", "timestamp": int(time.time())})
 
-    async def event_generator():
-      runner_task = asyncio.create_task(run_agent())
-      heartbeat_task = asyncio.create_task(heartbeat())
+    async def _safe_fire_disconnect() -> None:
       try:
-        async for entry in event_log.iter_from(0):
-          if await request.is_disconnected():
-            break
+        await runtime.on_disconnect()
+      except Exception as exc:
+        log.warning("on_disconnect failed for %s: %s", sid, exc)
 
-          event = dict(entry.event)
-          if event.get("type") in {"tool_call_start", "tool_call_complete"}:
-            tool_name = event.get("tool_name")
-            if isinstance(tool_name, str) and runtime.execution_location is not None:
-              execution_location = runtime.execution_location(tool_name)
-              if execution_location is not None:
-                event["execution_location"] = execution_location
+    runner_task = asyncio.create_task(run_agent())
+    heartbeat_task = asyncio.create_task(heartbeat())
 
-          if event.get("type") != "heartbeat":
-            _write_transcript(transcript_dir=transcript_dir, session_id=sid, entry=event)
+    async def response_cleanup() -> None:
+      disconnect_task = asyncio.create_task(_safe_fire_disconnect())
+      runner_task.cancel()
+      heartbeat_task.cancel()
+      await asyncio.gather(runner_task, heartbeat_task, disconnect_task, return_exceptions=True)
+      event_log.close("stream closed")
+      session.pending_tools.clear()
+      session.approval_queues.clear()
+      _drain_result_queue(session.result_queue)
+      session.stream_active = False
 
+    async def event_generator():
+      async for entry in event_log.iter_from(0):
+        event = dict(entry.event)
+        if event.get("type") in {"tool_call_start", "tool_call_complete"}:
+          tool_name = event.get("tool_name")
+          if isinstance(tool_name, str) and runtime.execution_location is not None:
+            execution_location = runtime.execution_location(tool_name)
+            if execution_location is not None:
+              event["execution_location"] = execution_location
+
+        if event.get("type") != "heartbeat":
+          _write_transcript(transcript_dir=transcript_dir, session_id=sid, entry=event)
+
+        try:
+          yield f"data: {_json_dumps(event)}\n\n".encode("utf-8")
+        except Exception as ser_exc:
+          log.error(
+            "SSE serialization failed for event type=%s: %s",
+            event.get("type"),
+            ser_exc,
+            exc_info=True,
+          )
           try:
-            yield f"data: {_json_dumps(event)}\n\n".encode("utf-8")
-          except Exception as ser_exc:
-            log.error(
-              "SSE serialization failed for event type=%s: %s",
-              event.get("type"),
-              ser_exc,
-              exc_info=True,
-            )
-            try:
-              error_event = {"type": "stream_error", "error": f"SSE serialization failed: {ser_exc}"}
-              yield f"data: {_json_dumps(error_event)}\n\n".encode("utf-8")
-            except Exception:
-              pass
-            break
-      finally:
-        runner_task.cancel()
-        heartbeat_task.cancel()
-        await asyncio.gather(runner_task, heartbeat_task, return_exceptions=True)
-        event_log.close("stream closed")
-        session.pending_tools.clear()
-        session.approval_queues.clear()
-        _drain_result_queue(session.result_queue)
-        session.stream_active = False
+            error_event = {"type": "stream_error", "error": f"SSE serialization failed: {ser_exc}"}
+            yield f"data: {_json_dumps(error_event)}\n\n".encode("utf-8")
+          except Exception:
+            pass
+          break
 
-    return StreamingResponse(event_generator(), headers=headers)
+    return StreamingResponse(event_generator(), headers=headers, background=BackgroundTask(response_cleanup))
 
   @router.post("/chat/tool-result")
   async def tool_result(request: Request, payload: ToolResultRequest) -> JSONResponse:

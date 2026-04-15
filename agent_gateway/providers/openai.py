@@ -305,10 +305,15 @@ class OpenAIProvider(ModelProvider):
     return AsyncOpenAI(**client_kwargs)
 
   async def close_client(self, client: Any, timeout: float = 2.0) -> None:
-    if client is None or not hasattr(client, "aclose"):
+    if client is None:
+      return
+    closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if closer is None:
       return
     try:
-      await asyncio.wait_for(client.aclose(), timeout=timeout)
+      result = closer()
+      if asyncio.iscoroutine(result):
+        await asyncio.wait_for(result, timeout=timeout)
     except Exception:
       pass
 

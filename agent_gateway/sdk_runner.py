@@ -637,6 +637,12 @@ class AgentSDKRunner:
     except Exception:
       pass
 
+  async def on_disconnect(self) -> None:
+    try:
+      await self._close_query_iterator()
+    except Exception as exc:
+      log.warning("[%s] query iterator close on disconnect failed (non-fatal): %s", self._sid, exc)
+
   def _update_usage(self, usage: Any, *, total_cost_usd: float | None = None, num_turns: int | None = None) -> None:
     usage_dict = _as_dict(usage)
     self._usage["input_tokens"] = int(usage_dict.get("input_tokens") or self._usage.get("input_tokens") or 0)

@@ -255,6 +255,7 @@ class AgentRunner:
     self._max_background_tasks = max_concurrent_sub_agents or 3
     self._sub_agent_semaphore: asyncio.Semaphore | None = None
     self._active_client: Any | None = None
+    self._disconnected = False
     task_registry_auto_created = task_registry is None
     self._task_registry = task_registry or TaskRegistry(
       max_inflight=self._max_background_tasks,
@@ -610,6 +611,13 @@ class AgentRunner:
     if client is not None:
       self._active_client = None
       await self._provider.close_client(client, timeout=timeout)
+
+  async def on_disconnect(self) -> None:
+    self._disconnected = True
+    try:
+      await self.force_close()
+    except Exception as exc:
+      log.warning("[%s] force_close on disconnect failed (non-fatal): %s", self._sid, exc)
 
   async def spawn_sub_agent(
     self,
@@ -1363,8 +1371,19 @@ class AgentRunner:
           return
 
     stream_error: Exception | None = None
+
+    def _raise_if_disconnected(exc: Exception | None = None) -> None:
+      if not self._disconnected:
+        return
+      if exc is not None:
+        raise exc
+      if stream_error is not None:
+        raise stream_error
+      raise asyncio.CancelledError()
+
     for attempt in range(1 + STREAM_RETRY_MAX):
       if attempt > 0:
+        _raise_if_disconnected()
         await self._close_client(client, timeout=2.0)
         client = self._provider.create_client(config, timeout=self._client_timeout)
         self._set_client(client)
@@ -1376,6 +1395,7 @@ class AgentRunner:
           turn_count,
           _format_exc(stream_error) if stream_error is not None else "unknown error",
         )
+        _raise_if_disconnected()
         delay = STREAM_RETRY_DELAY * (STREAM_RETRY_BACKOFF ** (attempt - 1))
         await asyncio.sleep(delay)
 
@@ -1420,6 +1440,7 @@ class AgentRunner:
           guard_message = guard_reason[1] if guard_reason else ""
           if action == "retry":
             stream_error = RuntimeError(guard_error)
+            _raise_if_disconnected(stream_error)
             log.warning(
               "[%s] Stream watchdog stall on turn %d after %.1fs (attempt %d/%d), retrying: %s",
               self._sid,
@@ -1471,6 +1492,7 @@ class AgentRunner:
           formatted_exc,
         )
         if attempt < STREAM_RETRY_MAX:
+          _raise_if_disconnected(exc)
           self._append({"type": "stream_retry", "attempt": attempt, "error": formatted_exc})
           continue
       else:
@@ -1485,6 +1507,7 @@ class AgentRunner:
             stream_error = RuntimeError(guard_error)
             usage_totals.clear()
             usage_totals.update(tokens_snapshot)
+            _raise_if_disconnected(stream_error)
             log.warning(
               "[%s] Stream watchdog stall on turn %d after %.1fs (attempt %d/%d), retrying: %s",
               self._sid,
