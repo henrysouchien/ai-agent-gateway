@@ -55,3 +55,25 @@ def test_make_run_agent_handler_forwards_mcp_session_inject_servers_to_dispatche
   assert error is None
   assert result == {"response": "ok"}
   assert runner.calls[0]["dispatcher"]._mcp_session_inject_servers == {"browser"}
+
+
+def test_make_run_agent_handler_forwards_meta_user_context_to_dispatcher() -> None:
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=None,
+    mcp_client=_StubMcpClient(),
+    mcp_meta_inject_servers=frozenset({"portfolio-mcp"}),
+    user_id="42",
+    credentials_resolver_active=True,
+    local_tool_handlers={"keep_tool": _dummy_tool},
+  )
+
+  result, error = _run(handler({"task": "Collect portfolio state"}))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  dispatcher = runner.calls[0]["dispatcher"]
+  assert dispatcher._mcp_meta_inject_servers == frozenset({"portfolio-mcp"})
+  assert dispatcher._user_id == "42"
+  assert dispatcher._credentials_resolver_active is True

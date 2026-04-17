@@ -206,6 +206,22 @@ def test_non_strict_mode_defaults_missing_user_id_to_jwt_bound_value() -> None:
   assert captured_requests[0]["request"].user_id == "alice"
 
 
+def test_non_strict_mode_default_operator_path_runs_end_to_end() -> None:
+  app, captured_requests, _run_calls = _make_app()
+
+  with TestClient(app) as client:
+    init_response = _init_session(client)
+    session = app.state.auth.session_store.get_session(init_response["session_id"])
+    assert session.user_id == "_default"
+    _consume_chat_stream(
+      client,
+      init_response["session_token"],
+      {"messages": [{"role": "user", "content": "hello operator path"}]},
+    )
+
+  assert captured_requests[0]["request"].user_id == "_default"
+
+
 def test_chat_request_id_uses_consumer_value_or_gateway_uuid() -> None:
   app, captured_requests, _run_calls = _make_app()
 

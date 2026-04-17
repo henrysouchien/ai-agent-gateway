@@ -36,6 +36,9 @@ def make_run_agent_handler(
   mcp_client: Any,
   needs_approval: Callable[..., bool] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
+  mcp_meta_inject_servers: frozenset[str] | None = None,
+  user_id: str | None = None,
+  credentials_resolver_active: bool = False,
   local_tool_handlers: dict[str, Any] | None = None,
   excluded_tools: set[str] | None = None,
   default_model: str = "claude-sonnet-4-6",
@@ -189,6 +192,9 @@ def make_run_agent_handler(
       session_id=getattr(runner, "_full_session_id", ""),
       should_avoid_permission_prompts=True,
       mcp_session_inject_servers=mcp_session_inject_servers,
+      mcp_meta_inject_servers=mcp_meta_inject_servers,
+      user_id=user_id or getattr(parent_session, "user_id", None),
+      credentials_resolver_active=credentials_resolver_active,
     )
 
     async def _dispatch_sub_agent(_background_input: dict[str, Any], **background_kwargs: Any):

@@ -142,6 +142,9 @@ class ToolDispatcher:
     should_avoid_permission_prompts: bool = False,
     on_headless_ask: HeadlessAskCallback | None = None,
     mcp_session_inject_servers: set[str] | None = None,
+    mcp_meta_inject_servers: frozenset[str] | None = None,
+    user_id: str | None = None,
+    credentials_resolver_active: bool = False,
     session_cache_denied_tools: frozenset[str] | None = None,
   ) -> None:
     self._mcp = mcp_client
@@ -156,6 +159,9 @@ class ToolDispatcher:
     self._should_avoid_permission_prompts = should_avoid_permission_prompts
     self._on_headless_ask = on_headless_ask
     self._mcp_session_inject_servers = mcp_session_inject_servers or set()
+    self._mcp_meta_inject_servers = mcp_meta_inject_servers or frozenset()
+    self._user_id = user_id
+    self._credentials_resolver_active = credentials_resolver_active
     self._session_cache_denied = session_cache_denied_tools or frozenset()
 
   async def _run_interceptors(
@@ -398,9 +404,17 @@ class ToolDispatcher:
       result, error = await self._local[tool_name](tool_input, call_index=call_index, tool_ctx=tool_ctx)
     elif self._mcp.is_mcp_tool(tool_name):
       server = self._mcp.get_server_for_tool(tool_name)
-      if server and server in self._mcp_session_inject_servers:
+      if server and server in self._mcp_meta_inject_servers:
+        resolved_user_id = str(self._user_id).strip() if self._user_id is not None else None
+        if self._credentials_resolver_active and not resolved_user_id:
+          raise RuntimeError("MCP meta user_id is required in strict mode")
+        meta = {"session_id": self._session_id, "user_id": resolved_user_id}
+        result, error = await self._mcp.call_tool(tool_name, tool_input, meta=meta)
+      elif server and server in self._mcp_session_inject_servers:
         tool_input = {**tool_input, "_session_id": self._session_id}
-      result, error = await self._mcp.call_tool(tool_name, tool_input)
+        result, error = await self._mcp.call_tool(tool_name, tool_input)
+      else:
+        result, error = await self._mcp.call_tool(tool_name, tool_input)
     else:
       result, error = None, {"code": "unknown_tool", "message": f"Unknown tool: {tool_name}"}
 

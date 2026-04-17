@@ -280,6 +280,7 @@ class McpClientManager:
     self,
     name: str,
     tool_input: Dict[str, Any],
+    meta: Dict[str, Any] | None = None,
   ) -> Tuple[Any | None, Dict[str, Any] | None]:
     server_name = self._tool_to_server.get(name)
     if not server_name:
@@ -293,10 +294,15 @@ class McpClientManager:
     timeout_seconds = self._timeout_overrides.get(server_name, self._default_tool_timeout)
 
     try:
+      call_kwargs = {
+        "read_timeout_seconds": timedelta(seconds=timeout_seconds),
+      }
+      if meta is not None:
+        call_kwargs["meta"] = meta
       result = await server.session.call_tool(
         original_name,
         tool_input,
-        read_timeout_seconds=timedelta(seconds=timeout_seconds),
+        **call_kwargs,
       )
     except Exception as exc:
       msg = str(exc)
