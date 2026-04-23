@@ -48,6 +48,7 @@ class ChatInitRequest(BaseModel):
 
   api_key: str = Field(..., min_length=1)
   user_id: str | None = None
+  user_email: str | None = None
   context: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -494,6 +495,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     resolved_user_id = payload.user_id.strip() if isinstance(payload.user_id, str) else payload.user_id
     if resolved_user_id == "":
       resolved_user_id = None
+    resolved_user_email = (
+      payload.user_email.strip() if isinstance(payload.user_email, str) else payload.user_email
+    )
+    if resolved_user_email == "":
+      resolved_user_email = None
     if resolved_user_id is None:
       context_user_id = (payload.context or {}).get("user_id")
       if isinstance(context_user_id, str) and context_user_id.strip():
@@ -536,6 +542,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     session = auth.session_store.create_session(
       api_key_hash=AuthManager.hash_api_key(payload.api_key),
       user_id=resolved_user_id,
+      user_email=resolved_user_email,
       auth_config=resolved_auth_config,
     )
     token = auth.issue_token(session)

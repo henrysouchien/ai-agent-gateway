@@ -26,6 +26,16 @@ _CODE_EXECUTE_IMAGE_SUFFIXES = {
 _CODE_EXECUTE_STDERR_NOISE = (
   "Matplotlib is building the font cache; this may take a moment.",
 )
+_SANDBOX_ENV_DENYLIST = frozenset(
+  {
+    "AGENT_API_USER_CLAIM_HMAC_KEY",
+    "AGENT_API_CLAIM_TTL_SECONDS",
+    "GATEWAY_RESOLVER_HMAC_KEY",
+    "CHAT_API_SECRET",
+    "CHAT_VALID_KEYS",
+    "EXCEL_MCP_SECRET",
+  }
+)
 
 
 def _error(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Tuple[None, Dict[str, Any]]:
@@ -70,6 +80,12 @@ def _build_subprocess_env(extra_env: Optional[Dict[str, str]] = None) -> Dict[st
     text_value = str(value)
     existing = env.get(key)
     env[key] = f"{text_value}{os.pathsep}{existing}" if existing else text_value
+  return _strip_sandbox_secrets(env)
+
+
+def _strip_sandbox_secrets(env: Dict[str, str]) -> Dict[str, str]:
+  for key in _SANDBOX_ENV_DENYLIST:
+    env.pop(key, None)
   return env
 
 
@@ -128,7 +144,7 @@ def _prepare_code_execute_env(config: CodeExecutionConfig) -> Dict[str, str]:
     prepared = config.prepare_env(env)
     if prepared is not None:
       env = prepared
-  return env
+  return _strip_sandbox_secrets(env)
 
 
 def _strip_code_execute_stderr_noise(stderr: str) -> str:

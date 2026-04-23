@@ -66,10 +66,18 @@ def _make_app(
   return app, captured_requests, run_calls
 
 
-def _init_session(client: TestClient, *, user_id: str | None = None, context: dict[str, Any] | None = None):
+def _init_session(
+  client: TestClient,
+  *,
+  user_id: str | None = None,
+  user_email: str | None = None,
+  context: dict[str, Any] | None = None,
+):
   payload: dict[str, Any] = {"api_key": "gateway-key"}
   if user_id is not None:
     payload["user_id"] = user_id
+  if user_email is not None:
+    payload["user_email"] = user_email
   if context is not None:
     payload["context"] = context
   response = client.post("/api/chat/init", json=payload)
@@ -104,7 +112,12 @@ def test_chat_init_resolves_user_id_top_level_then_context_then_default() -> Non
   app, _captured_requests, _run_calls = _make_app()
 
   with TestClient(app) as client:
-    top = _init_session(client, user_id="top-level", context={"user_id": "legacy"})
+    top = _init_session(
+      client,
+      user_id="top-level",
+      user_email="top@example.com",
+      context={"user_id": "legacy"},
+    )
     legacy = _init_session(client, context={"user_id": "legacy"})
     default = _init_session(client)
 
@@ -113,8 +126,11 @@ def test_chat_init_resolves_user_id_top_level_then_context_then_default() -> Non
   default_session = app.state.auth.session_store.get_session(default["session_id"])
 
   assert top_session.user_id == "top-level"
+  assert top_session.user_email == "top@example.com"
   assert legacy_session.user_id == "legacy"
+  assert legacy_session.user_email is None
   assert default_session.user_id == "_default"
+  assert default_session.user_email is None
 
 
 def test_strict_mode_rejects_default_user_at_chat_init() -> None:
@@ -140,11 +156,15 @@ def test_chat_init_calls_resolver_and_stores_auth_config() -> None:
   app, _captured_requests, _run_calls = _make_app(credentials_resolver=_resolver)
 
   with TestClient(app) as client:
-    init_response = _init_session(client, user_id="alice")
+    init_response = _init_session(client, user_id="alice", user_email="alice@example.com")
 
   session = app.state.auth.session_store.get_session(init_response["session_id"])
+  verified_session, claims = app.state.auth.verify_token_with_payload(init_response["session_token"])
   assert calls and calls[0][0] == "alice"
   assert session.user_id == "alice"
+  assert session.user_email == "alice@example.com"
+  assert verified_session.user_email == "alice@example.com"
+  assert claims["user_email"] == "alice@example.com"
   assert session.auth_config == {
     "provider": "anthropic",
     "billing_mode": "byok",

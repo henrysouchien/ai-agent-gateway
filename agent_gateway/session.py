@@ -31,6 +31,7 @@ class GatewaySession:
   created_at: int
   expires_at: int
   user_id: str = DEFAULT_GATEWAY_USER_ID
+  user_email: str | None = None
   auth_config: dict[str, Any] | None = None
   stream_active: bool = False
   pending_tools: Dict[str, Dict] = field(default_factory=dict)
@@ -60,6 +61,7 @@ class SessionStore:
     api_key_hash: str,
     *,
     user_id: str = "_default",
+    user_email: str | None = None,
     auth_config: dict[str, Any] | None = None,
   ) -> GatewaySession:
     now = int(time.time())
@@ -70,6 +72,7 @@ class SessionStore:
       created_at=now,
       expires_at=now + self.ttl,
       user_id=user_id,
+      user_email=user_email,
       auth_config=dict(auth_config) if auth_config is not None else None,
       result_queue=asyncio.Queue(),
     )
@@ -161,6 +164,7 @@ class AuthManager:
       "created_at": session.created_at,
       "expires_at": session.expires_at,
       "user_id": session.user_id,
+      "user_email": session.user_email,
     }
     return jwt.encode(payload, self._secret, algorithm=JWT_ALGORITHM)
 
@@ -189,6 +193,9 @@ class AuthManager:
     token_user_id = payload.get("user_id")
     if token_user_id is not None and str(token_user_id) != session.user_id:
       raise HTTPException(status_code=401, detail="Session user mismatch")
+    token_user_email = payload.get("user_email")
+    if token_user_email != session.user_email:
+      raise HTTPException(status_code=401, detail="Session user email mismatch")
 
     return payload
 
