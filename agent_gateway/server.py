@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
+from ._provider_utils import _get_allowed_models_for_provider_name
 from .auth import (
   CredentialsResolver,
   CredentialsTimeoutError,
@@ -236,7 +237,7 @@ class GatewayServerConfig:
   per_turn_timeout: int = 300
   compaction_trigger: int | None = None
   compaction_instructions: str | None = None
-  allowed_models: Set[str] = field(default_factory=lambda: {"claude-sonnet-4-6", "claude-opus-4-6"})
+  allowed_models: Set[str] | None = None
   model_catalog: Optional[ModelCatalog] = None
   build_chat_runtime: Optional[BuildChatRuntime] = None
   on_event: Optional[Callable[..., Any]] = None
@@ -448,6 +449,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   """
   if config.build_chat_runtime is None:
     raise ValueError("GatewayServerConfig.build_chat_runtime is required")
+  if config.allowed_models is None:
+    provider_name = str(getattr(config.default_provider, "name", "anthropic") or "anthropic")
+    config.allowed_models = _get_allowed_models_for_provider_name(provider_name)
 
   auth = config.auth_manager or AuthManager(
     secret=config.jwt_secret,

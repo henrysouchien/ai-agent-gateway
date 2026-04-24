@@ -8,16 +8,21 @@ from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
+if str(ROOT) not in sys.path:
+  sys.path.insert(0, str(ROOT))
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from api.credentials import get_default_model as get_canonical_default_model
 import agent_gateway.mcp_client as mcp_client_module
 import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_agent
 from agent_gateway.auth import AuthConfig
 from agent_gateway._provider_utils import _resolve_provider
-from agent_gateway.providers import CodexProvider, OpenAIProvider
+from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProvider
 from agent_gateway.server import ChatRequest
+
+DEFAULT_ANTHROPIC_MODEL = get_canonical_default_model("anthropic")
 
 
 def _run(coro):
@@ -83,7 +88,7 @@ def test_create_agent_exposes_default_routes_and_open_defaults() -> None:
   assert config.auth_config["auth_mode"] == "api"
   assert config.auth_config["api_key"] == ""
   assert config.auth_config["auth_token"] == ""
-  assert config.auth_config["model"] == "claude-sonnet-4-6"
+  assert config.auth_config["model"] == DEFAULT_ANTHROPIC_MODEL
   assert config.cors_origins == ["*"]
   assert config.allowed_models == set()
   assert len(app.state.auth._secret) == 64
@@ -95,7 +100,7 @@ def test_create_agent_uses_explicit_api_key() -> None:
     "auth_mode": "api",
     "api_key": "sk-123",
     "auth_token": "",
-    "model": "claude-sonnet-4-6",
+    "model": DEFAULT_ANTHROPIC_MODEL,
     "max_tokens": 16000,
   }
 
@@ -114,7 +119,7 @@ def test_create_agent_uses_explicit_auth_token() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "tok-123",
-    "model": "claude-sonnet-4-6",
+    "model": DEFAULT_ANTHROPIC_MODEL,
     "max_tokens": 16000,
   }
 
@@ -126,7 +131,7 @@ def test_create_agent_with_credentials_resolver_skips_env_bootstrap(monkeypatch:
         "provider": "anthropic",
         "billing_mode": "byok",
         "api_key": "resolver-key",
-        "model": "claude-sonnet-4-6",
+        "model": DEFAULT_ANTHROPIC_MODEL,
         "max_tokens": 16000,
       }
     )
@@ -139,9 +144,26 @@ def test_create_agent_with_credentials_resolver_skips_env_bootstrap(monkeypatch:
     "auth_mode": "api",
     "api_key": "",
     "auth_token": "",
-    "model": "claude-sonnet-4-6",
+    "model": DEFAULT_ANTHROPIC_MODEL,
     "max_tokens": 16000,
   }
+
+
+def test_create_agent_tolerates_model_free_resolved_auth_config(monkeypatch: pytest.MonkeyPatch) -> None:
+  def _fake_resolve_provider(*args, **kwargs):
+    _ = args, kwargs
+    return AnthropicProvider(), "anthropic", {
+      "auth_mode": "api",
+      "api_key": "resolver-key",
+      "max_tokens": 16000,
+    }
+
+  monkeypatch.setattr("agent_gateway.easy._resolve_provider", _fake_resolve_provider)
+
+  app = create_agent("test")
+  _session, runtime = _build_runtime(app)
+
+  assert runtime.model_override == DEFAULT_ANTHROPIC_MODEL
 
 
 def test_create_agent_threads_request_metadata_to_runner() -> None:
@@ -153,7 +175,7 @@ def test_create_agent_threads_request_metadata_to_runner() -> None:
   )
   session = app.state.auth.session_store.create_session(api_key_hash="hash")
   session.user_id = "alice"
-  session.auth_config = {"api_key": "k", "model": "claude-sonnet-4-6", "billing_mode": "metered"}
+  session.auth_config = {"api_key": "k", "model": DEFAULT_ANTHROPIC_MODEL, "billing_mode": "metered"}
   runtime = _run(
     app.state.gateway_config.build_chat_runtime(
       session=session,

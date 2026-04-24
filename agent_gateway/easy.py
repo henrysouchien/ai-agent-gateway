@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI
 
-from ._provider_utils import _resolve_provider
+from ._provider_utils import _get_default_model_for_provider, _resolve_provider
 from .auth import CredentialsResolver
 from .code_execution import CodeExecutionConfig, build_code_execution
 from .mcp_client import McpClientManager
@@ -219,10 +219,10 @@ def create_agent(
       provider_config,
       auth_config={},
       max_tokens=max_tokens,
-    )
+  )
   if isinstance(provider, str) and provider.strip().lower() == "anthropic":
     provider_instance = AnthropicProvider(rate_table=load_rate_table(rates_file))
-  model = str(auth_config["model"])
+  model = str(auth_config.get("model") or _get_default_model_for_provider(_provider_name))
 
   skill_loader = SkillLoader(skills_dir) if skills_dir else None
   mcp_client: McpClientManager | None = None

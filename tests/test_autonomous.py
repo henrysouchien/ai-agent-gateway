@@ -11,6 +11,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.autonomous as autonomous
+from agent_gateway._provider_utils import _get_default_model_for_provider
 from agent_gateway import EventLog
 from agent_gateway.providers import ModelInfo, ModelProvider
 
@@ -144,6 +145,36 @@ def test_run_session_no_wall_clock(
   assert output.timed_out is False
   assert output.error is None
   assert output.response == "completed"
+
+
+def test_run_autonomous_tolerates_model_free_auth_config(monkeypatch: pytest.MonkeyPatch) -> None:
+  captured: dict[str, Any] = {}
+
+  async def _fake_run_session(
+    runner,
+    event_log,
+    *,
+    model: str,
+    max_turns: int,
+    timeout_seconds: float | None,
+    initial_message: str,
+    system_prompt: str | list[tuple[str, bool]],
+  ) -> autonomous.RunOutput:
+    _ = runner, event_log, max_turns, timeout_seconds, initial_message, system_prompt
+    captured["model"] = model
+    return autonomous.RunOutput("ok", [], {}, None, False)
+
+  monkeypatch.setattr(
+    autonomous,
+    "_resolve_provider",
+    lambda *args, **kwargs: (_StubProvider(), "anthropic", {"api_key": "resolver-key", "max_tokens": 16000}),
+  )
+  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
+
+  output = _run(autonomous.run_autonomous("System", "Hello"))
+
+  assert output.response == "ok"
+  assert captured["model"] == _get_default_model_for_provider("anthropic")
 
 
 @pytest.mark.parametrize(

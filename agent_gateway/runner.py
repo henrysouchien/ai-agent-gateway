@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, Union
 
+from ._provider_utils import _get_default_model_for_provider
 from .agent_session_log import AgentSessionLog
 from .context_builder import SessionContextBuilder
 from .event_log import EventLog
@@ -1798,12 +1799,13 @@ class AgentRunner:
         else:
           system_prompt = preamble
 
+      default_model = _get_default_model_for_provider(getattr(self._provider, "name", None))
       config = dict(self._auth_config)
       config.update({
         "auth_mode": str(config.get("auth_mode", "api")).strip().lower(),
         "api_key": str(config.get("api_key", "")),
         "auth_token": str(config.get("auth_token", "")),
-        "model": str(config.get("model", "claude-sonnet-4-6")),
+        "model": str(config.get("model") or default_model),
         "max_tokens": int(config.get("max_tokens", 16000)),
         "thinking": bool(config.get("thinking", True)),
       })

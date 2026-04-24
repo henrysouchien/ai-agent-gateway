@@ -5,9 +5,12 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
+if str(ROOT) not in sys.path:
+  sys.path.insert(0, str(ROOT))
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from api.credentials import get_default_model as get_canonical_default_model
 from agent_gateway import resolve_auth_config
 from agent_gateway._provider_utils import _resolve_provider
 
@@ -17,6 +20,8 @@ def _clear_anthropic_env(monkeypatch: pytest.MonkeyPatch):
   monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
   monkeypatch.delenv("ANTHROPIC_AUTH_MODE", raising=False)
+  monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+  monkeypatch.delenv("ALLOWED_MODELS_ANTHROPIC", raising=False)
   monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
 
@@ -407,6 +412,19 @@ def test_resolve_provider_does_not_read_anthropic_auth_mode_env() -> None:
   assert config["auth_mode"] == "api"
   assert config["api_key"] == "env-key"
   assert config["auth_token"] == ""
+
+
+def test_resolve_provider_model_free_auth_config_uses_canonical_default() -> None:
+  _provider, _provider_name, config = _resolve_provider(
+    "anthropic",
+    None,
+    None,
+    None,
+    None,
+    auth_config={"api_key": "cfg-key"},
+  )
+
+  assert config["model"] == get_canonical_default_model("anthropic")
 
 
 def test_resolve_provider_preserves_explicit_model_via_post_processing() -> None:

@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Callable, Sequence
 import httpx
 
 from ._io import _atomic_write_json, _read_json_object
-from ._provider_utils import _allowed_models_for_provider, _resolve_provider
+from ._provider_utils import _allowed_models_for_provider, _get_default_model_for_provider, _resolve_provider
 from .event_log import EventLog
 from .mcp_client import McpClientManager
 from .providers import ModelProvider
@@ -498,7 +498,7 @@ async def run_autonomous(
     auth_config=auth_config,
     max_tokens=max_tokens,
   )
-  resolved_model = str(resolved_auth_config["model"])
+  resolved_model = str(resolved_auth_config.get("model") or _get_default_model_for_provider(_provider_name))
   allowed_models = _allowed_models_for_provider(provider_instance, resolved_model)
   sid = str(session_id or f"autonomous-{secrets.token_hex(8)}")
   skill_loader = SkillLoader(skills_dir) if skills_dir else None

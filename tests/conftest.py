@@ -43,6 +43,11 @@ class _TestAppState:
 
 
 @pytest.fixture
+def auth_config_model_free() -> dict[str, Any]:
+  return {"api_key": "test-key", "max_tokens": 256}
+
+
+@pytest.fixture
 def make_test_app():
   def _make_test_app(
     *,
@@ -58,13 +63,17 @@ def make_test_app():
     per_turn_timeout: float | None = 300.0,
     stream_stall_timeout: float | None = 60.0,
     sdk_config: AgentSDKConfig | None = None,
+    allow_model_free_auth_config: bool = False,
   ):
     state = _TestAppState()
-    resolved_auth_config = dict(auth_config or {"api_key": "test-key", "model": "claude-sonnet-4-6", "max_tokens": 256})
+    resolved_auth_config = dict(
+      auth_config if auth_config is not None else {"api_key": "test-key", "model": "claude-sonnet-4-6", "max_tokens": 256}
+    )
     resolved_tool_definitions = list(tool_definitions or [])
+    fallback_model = "" if allow_model_free_auth_config else "claude-sonnet-4-6"
     resolved_sdk_config = sdk_config or AgentSDKConfig(
       api_key="test-key",
-      model=str(resolved_auth_config.get("model") or "claude-sonnet-4-6"),
+      model=str(resolved_auth_config.get("model") or fallback_model),
     )
 
     async def _build_chat_runtime(session, request, channel, auth_manager):
@@ -129,12 +138,16 @@ def make_test_app():
           return
         await runner.on_disconnect()
 
+      runtime_model_override = request.model or str(resolved_auth_config.get("model") or "")
+      if not runtime_model_override and not allow_model_free_auth_config:
+        runtime_model_override = "claude-sonnet-4-6"
+
       runtime_kwargs: dict[str, Any] = {
         "system_prompt": "test",
         "build_runner": _build_runner,
         "get_tool_definitions": lambda: list(resolved_tool_definitions),
         "provider": provider,
-        "model_override": request.model or str(resolved_auth_config.get("model") or "claude-sonnet-4-6"),
+        "model_override": runtime_model_override or None,
       }
       if attach_disconnect_handler:
         runtime_kwargs["disconnect_handler"] = _on_disconnect

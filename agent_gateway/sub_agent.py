@@ -4,6 +4,7 @@ import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from ._provider_utils import _get_allowed_models_for_provider_name
 from .event_log import EventLog
 from .session import GatewaySession
 from .skills import SkillLoader
@@ -41,7 +42,7 @@ def make_run_agent_handler(
   credentials_resolver_active: bool = False,
   local_tool_handlers: dict[str, Any] | None = None,
   excluded_tools: set[str] | None = None,
-  default_model: str = "claude-sonnet-4-6",
+  default_model: str = "claude-opus-4-7",
   default_max_turns: int = 15,
   default_timeout: float | None = None,
   default_max_tokens: int = 32000,
@@ -59,7 +60,7 @@ def make_run_agent_handler(
   `AgentRunner.spawn_sub_agent()`.
   """
   effective_allowed_models = (
-    allowed_models if allowed_models is not None else {"claude-sonnet-4-6", "claude-opus-4-6"}
+    allowed_models if allowed_models is not None else _get_allowed_models_for_provider_name("anthropic")
   )
   effective_coordinator = coordinator_config if coordinator_config is not None and coordinator_config.enabled else None
 

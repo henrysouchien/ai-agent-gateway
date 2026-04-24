@@ -194,7 +194,7 @@ class AgentSDKRunner:
     }
     self._num_turns = 0
     self._stream_terminal_emitted = False
-    self._effective_model = sdk_config.model or os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6").strip()
+    self._effective_model = sdk_config.model or os.getenv("ANTHROPIC_MODEL", "claude-opus-4-7").strip()
 
   def _append(self, event: Dict[str, Any]) -> None:
     self._log.append(event)

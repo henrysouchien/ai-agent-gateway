@@ -27,6 +27,20 @@ _MAX_TOOL_ID_LEN = 64
 
 _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
   (
+    ("claude-opus-4-7",),
+    ModelInfo(
+      id="claude-opus-4-7",
+      provider="anthropic",
+      context_window=1_000_000,
+      max_output_tokens=32_000,
+      supports_thinking=True,
+      input_cost_per_mtok=5.00,
+      output_cost_per_mtok=25.00,
+      cache_read_cost_per_mtok=0.50,
+      cache_write_cost_per_mtok=6.25,
+    ),
+  ),
+  (
     ("claude-sonnet-4-6",),
     ModelInfo(
       id="claude-sonnet-4-6",
@@ -66,7 +80,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
 
 
 def _thinking_param(model: str, max_tokens: int) -> dict[str, Any] | None:
-  if any(tag in model for tag in ("sonnet-4-6", "opus-4-6")):
+  if any(tag in model for tag in ("sonnet-4-6", "opus-4-6", "opus-4-7")):
     return {"type": "adaptive"}
 
   if any(tag in model for tag in ("sonnet-4-5", "opus-4-5", "sonnet-4")):

@@ -6,13 +6,57 @@ from typing import Any
 from .providers import AnthropicProvider, CodexProvider, ModelProvider, OpenAIProvider
 
 
-_PROVIDER_DEFAULT_MODELS = {
-  "anthropic": "claude-sonnet-4-6",
+_FALLBACK_DEFAULT_MODELS = {
+  "anthropic": "claude-opus-4-7",
   "codex": "gpt-5.4",
   "openai": "gpt-4o",
 }
 
-_ANTHROPIC_ALLOWED_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
+_FALLBACK_ALLOWED_MODELS = {
+  "anthropic": {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"},
+  "codex": {
+    "gpt-5.1",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5.2",
+    "gpt-5.2-codex",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.4",
+  },
+  "openai": {"gpt-4o", "gpt-4o-mini", "o1", "o1-mini", "o3-mini"},
+}
+
+
+def _get_default_model_for_provider(provider: str | None = None) -> str:
+  resolved = str(provider or "anthropic").strip().lower() or "anthropic"
+  try:
+    from credentials import get_default_model as get_default_model
+  except ModuleNotFoundError:
+    try:
+      from api.credentials import get_default_model as get_default_model
+    except ModuleNotFoundError:
+      return _FALLBACK_DEFAULT_MODELS.get(resolved, _FALLBACK_DEFAULT_MODELS["anthropic"])
+  model = str(get_default_model(resolved)).strip()
+  if model:
+    return model
+  return _FALLBACK_DEFAULT_MODELS.get(resolved, _FALLBACK_DEFAULT_MODELS["anthropic"])
+
+
+def _get_allowed_models_for_provider_name(provider: str | None = None) -> set[str]:
+  resolved = str(provider or "anthropic").strip().lower() or "anthropic"
+  try:
+    from agent.shared.tool_catalog import get_allowed_models as get_allowed_models
+  except ModuleNotFoundError:
+    try:
+      from api.agent.shared.tool_catalog import get_allowed_models as get_allowed_models
+    except ModuleNotFoundError:
+      models = set(_FALLBACK_ALLOWED_MODELS.get(resolved, set()))
+      default_model = _get_default_model_for_provider(resolved)
+      if default_model:
+        models.add(default_model)
+      return models
+  return set(get_allowed_models(resolved))
 
 
 def _classify_anthropic_credential(raw: str) -> dict[str, Any]:
@@ -178,7 +222,7 @@ def _resolve_provider(
     else:
       raise ValueError(f"Unknown provider: {provider}. Use 'anthropic', 'codex', or 'openai'.")
     if model is None:
-      model = _PROVIDER_DEFAULT_MODELS.get(provider_name, "gpt-4o")
+      model = _get_default_model_for_provider(provider_name)
   elif isinstance(provider, ModelProvider):
     provider_instance = provider
     provider_name = str(getattr(provider, "name", "custom") or "custom")
@@ -237,8 +281,9 @@ def _allowed_models_for_provider(
   model: str,
 ) -> set[str]:
   if isinstance(provider, AnthropicProvider):
-    allowed_models = set(_ANTHROPIC_ALLOWED_MODELS)
-    allowed_models.add(model)
+    allowed_models = _get_allowed_models_for_provider_name("anthropic")
+    if model:
+      allowed_models.add(model)
     return allowed_models
   return set()
 
