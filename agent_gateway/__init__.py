@@ -61,7 +61,7 @@ from .providers import (
 )
 from .rates import ModelRates, RateTable, UnknownModelError, load_rate_table
 from .retry import RetryConfig, classify_outcome, run_autonomous_with_retry
-from .runner import AgentRunner, SubAgentConfig, ToolResultContext
+from .runner import AgentRunner, SubAgentConfig, ToolResultContext, _derive_sub_agent_id
 from .send_prompt import send_prompt, send_prompt_sync
 from .sdk_runner import AgentSDKRunner
 from .server import ChatRuntime, GatewayServerConfig, ModelCatalog, RequestContext, create_gateway_app
@@ -200,6 +200,7 @@ __all__ = [
   "create_agent",
   "create_gateway_app",
   "deliver",
+  "_derive_sub_agent_id",
   "extract_state_update",
   "format_run_summary",
   "generate_and_append_summary",
