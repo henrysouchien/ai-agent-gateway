@@ -10,8 +10,15 @@ from .event_log import EventLog
 from .runner import _derive_sub_agent_id
 from .session import GatewaySession
 from .skills import SkillLoader
-from .task_registry import CoordinatorConfig, ProviderResolver
+from .task_registry import CoordinatorConfig, ParentMessage, ProviderResolver
 from .tool_dispatcher import ToolDispatcher
+from .transcript import (
+  build_synthetic_tool_results,
+  detect_orphan_tool_uses,
+  place_resume_messages,
+  reconstruct_messages_for_task,
+  reconstruct_parent_messages,
+)
 
 _DEFAULT_EXCLUDED_TOOLS = frozenset({"run_agent", "get_background_result", "send_message"})
 _SKILL_SYSTEM_PROMPT_TEMPLATE = (
@@ -33,6 +40,10 @@ _RUN_AGENT_DESCRIPTION = (
   "Spawn a focused sub-agent. Pass `agent` for a named skill workflow; omit for a generic "
   "sub-agent. Sub-agents run independently with their own turn budget, cannot spawn further "
   "sub-agents, and cannot access Excel tools or trading/order-management tools."
+)
+_RESUME_AGENT_DESCRIPTION = (
+  "Resume an interrupted background sub-agent. Only resumable skills can be resumed; "
+  "check skill `resumable` flag in get_background_result response. Returns new task_id."
 )
 
 
@@ -300,6 +311,235 @@ def make_get_background_result_handler(runner_ref: list[Any]):
   return _handle_get_background_result
 
 
+def make_resume_handler(
+  runner_ref: list[Any],
+  *,
+  parent_session: GatewaySession | None = None,
+  skill_loader: SkillLoader | None = None,
+  mcp_client: Any,
+  needs_approval: Callable[..., bool] | None = None,
+  mcp_session_inject_servers: set[str] | None = None,
+  mcp_meta_inject_servers: frozenset[str] | None = None,
+  user_id: str | None = None,
+  credentials_resolver_active: bool = False,
+  local_tool_handlers: dict[str, Any] | None = None,
+  excluded_tools: set[str] | None = None,
+  default_model: str = "claude-opus-4-7",
+  default_max_turns: int = 15,
+  default_timeout: float | None = None,
+  default_max_tokens: int = 32000,
+  allowed_models: set[str] | None = None,
+  provider_resolver: ProviderResolver | None = None,
+  coordinator_config: CoordinatorConfig | None = None,
+):
+  effective_allowed_models = (
+    allowed_models if allowed_models is not None else _get_allowed_models_for_provider_name("anthropic")
+  )
+  effective_coordinator = coordinator_config if coordinator_config is not None and coordinator_config.enabled else None
+
+  async def _handle_resume(tool_input: dict[str, Any], **kwargs: Any):
+    runner = runner_ref[0]
+    if runner is None:
+      return None, {"code": "internal_error", "message": "Sub-agent runner not initialized"}
+    if skill_loader is None:
+      return None, {"code": "not_available", "message": "Named agents not available"}
+    durable_log = getattr(runner, "_agent_session_log", None)
+    if durable_log is None:
+      return None, {"code": "not_available", "message": "Durable session log not configured"}
+
+    raw_task_id = tool_input.get("task_id")
+    if not isinstance(raw_task_id, str) or not raw_task_id.strip():
+      return None, {"code": "invalid_input", "message": "task_id is required"}
+    task_id = raw_task_id.strip()
+    additional_context = tool_input.get("additional_context")
+    if additional_context is not None and not isinstance(additional_context, str):
+      return None, {"code": "invalid_input", "message": "additional_context must be a string"}
+
+    await runner._rebuild_task_registry_from_log()
+    entry = runner._task_registry.get(task_id)
+    if entry is None:
+      entry = await runner._lookup_task_in_log(task_id)
+    if entry is None:
+      return None, {"code": "not_found", "message": f"Unknown background task: {task_id}"}
+    if getattr(entry, "state", None).value != "interrupted":
+      return None, {"code": "not_interrupted", "message": f"Task {task_id} is not interrupted"}
+
+    depth = await runner._resume_chain_depth(task_id)
+    max_depth = getattr(runner, "_max_resume_chain_depth", 3)
+    if depth >= max_depth:
+      return None, {
+        "code": "max_resume_chain_depth",
+        "message": f"Resume chain depth limit reached ({max_depth}) for {task_id}",
+      }
+
+    agent_name = entry.agent_name
+    if not agent_name:
+      return None, {"code": "not_resumable", "message": f"Task {task_id} was not started with a resumable skill"}
+    try:
+      profile = skill_loader.load(agent_name)
+    except FileNotFoundError as exc:
+      return None, {"code": "not_found", "message": str(exc)}
+    except Exception as exc:
+      return None, {"code": "invalid_skill", "message": str(exc)}
+    if not profile.agent_callable:
+      return None, {"code": "invalid_skill", "message": f"Agent '{agent_name}' is not callable"}
+    if not profile.resumable:
+      return None, {"code": "not_resumable", "message": f"Agent '{agent_name}' is not resumable"}
+
+    transcript = await reconstruct_messages_for_task(durable_log, task_id)
+    orphan_ids = detect_orphan_tool_uses(transcript)
+    synthetic_results = build_synthetic_tool_results(orphan_ids)
+    parent_messages = await reconstruct_parent_messages(
+      durable_log,
+      task_id,
+      datetime.datetime.now(datetime.UTC).timestamp(),
+    )
+    reconstructed_messages = place_resume_messages(
+      transcript,
+      synthetic_results,
+      parent_messages,
+      additional_context,
+    )
+
+    raw_provider = tool_input.get("provider")
+    if raw_provider is not None:
+      if not isinstance(raw_provider, str):
+        return None, {"code": "invalid_input", "message": "provider must be a string"}
+      raw_provider = raw_provider.strip() or None
+    profile_provider = getattr(profile, "provider", None)
+    if profile_provider:
+      raw_provider = raw_provider or profile_provider
+    if raw_provider is None and effective_coordinator is not None and effective_coordinator.default_worker_provider:
+      raw_provider = effective_coordinator.default_worker_provider
+
+    effective_provider_resolver = provider_resolver
+    if effective_provider_resolver is None and effective_coordinator is not None:
+      effective_provider_resolver = effective_coordinator.provider_resolver
+
+    resolved = None
+    if raw_provider:
+      if effective_provider_resolver is None:
+        return None, {
+          "code": "provider_not_supported",
+          "message": f"Provider '{raw_provider}' requested but no provider_resolver configured",
+        }
+      try:
+        resolved = effective_provider_resolver(raw_provider)
+      except Exception as exc:
+        return None, {"code": "invalid_provider", "message": str(exc)}
+
+    raw_model = tool_input.get("model")
+    if raw_model is not None and not isinstance(raw_model, str):
+      return None, {"code": "invalid_input", "message": "model must be a string"}
+    if resolved is not None:
+      effective_allowed = resolved.allowed_models
+      effective_model = (
+        raw_model
+        or profile.model
+        or (effective_coordinator.default_worker_model if effective_coordinator is not None else None)
+        or resolved.default_model
+        or default_model
+      )
+    else:
+      effective_allowed = effective_allowed_models
+      effective_model = (
+        raw_model
+        or profile.model
+        or (effective_coordinator.default_worker_model if effective_coordinator is not None else None)
+        or default_model
+      )
+    if effective_allowed and effective_model not in effective_allowed:
+      return None, {"code": "invalid_input", "message": f"Invalid model '{effective_model}' for skill '{agent_name}'"}
+
+    system_prompt = _SKILL_SYSTEM_PROMPT_TEMPLATE.format(
+      skill_prompt=profile.system_prompt,
+      date=datetime.date.today().isoformat(),
+    )
+    effective_max_turns = profile.max_turns if profile.max_turns is not None else default_max_turns
+    effective_timeout = profile.timeout if profile.timeout is not None else default_timeout
+    effective_excluded = _DEFAULT_EXCLUDED_TOOLS | set(excluded_tools or set())
+    if effective_coordinator is not None and effective_coordinator.worker_excluded_tools:
+      effective_excluded = effective_excluded | effective_coordinator.worker_excluded_tools
+    sub_local = {
+      name: handler
+      for name, handler in (local_tool_handlers or {}).items()
+      if name not in effective_excluded
+    }
+    sub_log = EventLog()
+    sub_dispatcher = ToolDispatcher(
+      mcp_client=mcp_client,
+      local_tool_handlers=sub_local,
+      needs_approval=needs_approval,
+      event_log=sub_log,
+      session_id=getattr(runner, "_full_session_id", ""),
+      should_avoid_permission_prompts=True,
+      mcp_session_inject_servers=mcp_session_inject_servers,
+      mcp_meta_inject_servers=mcp_meta_inject_servers,
+      user_id=user_id or getattr(parent_session, "user_id", None),
+      credentials_resolver_active=credentials_resolver_active,
+    )
+    tool_ctx = kwargs.get("tool_ctx")
+    parent_turn_id = getattr(tool_ctx, "tool_call_id", None)
+    call_index = int(kwargs.get("call_index", 0) or 0)
+
+    async def _dispatch_resume(_background_input: dict[str, Any], **background_kwargs: Any):
+      background_call_index = int(background_kwargs.get("call_index", call_index) or 0)
+      task_entry = background_kwargs.get("task_entry")
+      sub_session = None
+      if parent_session is not None:
+        sub_session = GatewaySession(
+          session_id=_derive_sub_agent_id(parent_session, background_call_index),
+          api_key_hash=parent_session.api_key_hash,
+          created_at=parent_session.created_at,
+          expires_at=parent_session.expires_at,
+          user_id=parent_session.user_id,
+          auth_config=parent_session.auth_config,
+        )
+      return await runner.resume_sub_agent(
+        original_task_id=task_id,
+        reconstructed_messages=reconstructed_messages,
+        parent_messages=parent_messages,
+        provider=resolved.provider if resolved else None,
+        auth_config=resolved.auth_config if resolved else None,
+        model=effective_model,
+        system_prompt=system_prompt,
+        dispatcher=sub_dispatcher,
+        sub_session=sub_session,
+        excluded_tools=effective_excluded,
+        max_turns=effective_max_turns,
+        timeout=effective_timeout,
+        client_timeout=90,
+        max_tokens=default_max_tokens,
+        call_index=background_call_index,
+        parent_turn_id=parent_turn_id,
+        task_entry=task_entry,
+        on_sub_event=lambda event, _sid: sub_log.append(event),
+      )
+
+    result, error = await runner._register_background_task(
+      tool_input={
+        "task_id": task_id,
+        "agent": agent_name,
+        "model": effective_model,
+        "provider": raw_provider,
+        "resumable": True,
+      },
+      handler=_dispatch_resume,
+      agent_name=agent_name,
+      parent_turn_id=parent_turn_id,
+      original_task_id=task_id,
+    )
+    if error is not None:
+      return None, error
+    result = dict(result or {})
+    result["original_task_id"] = task_id
+    result["resumed_from"] = task_id
+    result["resume_chain_depth"] = depth + 1
+    return result, None
+
+  return _handle_resume
+
+
 def make_send_message_handler(runner_ref: list[Any]):
   """Build send_message handler using runner_ref late binding."""
 
@@ -342,7 +582,11 @@ def make_send_message_handler(runner_ref: list[Any]):
     if entry.completed:
       return None, {"code": "already_completed", "message": f"Agent {target} already finished"}
 
-    await entry.message_inbox.put(message)
+    message_id = str(tool_input.get("message_id") or uuid.uuid4())
+    if message_id in entry.delivered_messages:
+      return {"status": "delivered", "task_id": entry.task_id}, None
+
+    sent_at = datetime.datetime.now(datetime.UTC).timestamp()
     append_durable_event = getattr(runner, "_append_durable_event", None)
     if append_durable_event is not None:
       metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
@@ -358,15 +602,17 @@ def make_send_message_handler(runner_ref: list[Any]):
           "task_type": metadata.get("task_type", "background"),
           "provider_name": metadata.get("provider_name", entry.provider_name),
           "model": metadata.get("model", entry.model),
-          "message_id": str(uuid.uuid4()),
+          "message_id": message_id,
           "sender": {
             "session_id": getattr(runner, "_full_session_id", None),
             "user_id": getattr(runner, "_usage_user_id", None),
           },
-          "sent_at": datetime.datetime.now(datetime.UTC).timestamp(),
+          "sent_at": sent_at,
           "message": message,
         }
       )
+    await entry.message_inbox.put(ParentMessage(message_id=message_id, text=message, sent_at=sent_at))
+    entry.delivered_messages.add(message_id)
     return {"status": "delivered", "task_id": entry.task_id}, None
 
   return _handle_send_message
@@ -455,6 +701,27 @@ def make_get_background_result_tool_def() -> dict[str, Any]:
   }
 
 
+def make_resume_tool_def() -> dict[str, Any]:
+  return {
+    "name": "resume_background_agent",
+    "description": _RESUME_AGENT_DESCRIPTION,
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "Interrupted task to resume.",
+        },
+        "additional_context": {
+          "type": "string",
+          "description": "Optional message appended after transcript replay to guide continuation.",
+        },
+      },
+      "required": ["task_id"],
+    },
+  }
+
+
 def make_send_message_tool_def() -> dict[str, Any]:
   return {
     "name": "send_message",
@@ -484,6 +751,8 @@ __all__ = [
   "make_get_background_result_tool_def",
   "make_send_message_handler",
   "make_send_message_tool_def",
+  "make_resume_handler",
+  "make_resume_tool_def",
   "make_run_agent_handler",
   "make_run_agent_tool_def",
 ]

@@ -198,6 +198,47 @@ def test_parse_agent_fields_from_frontmatter(tmp_path: Path) -> None:
   assert profile.tool_packs_enabled is False
 
 
+def test_parse_resumable_defaults_load_cleanly(tmp_path: Path) -> None:
+  skill_path = _write_skill(tmp_path, None)
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.resumable is False
+  assert profile.resume_mcp_session_reset_ok is False
+
+
+def test_parse_resumable_with_session_injection_requires_reset_ack(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    resumable: true
+    session_inject_servers:
+      - browser
+    """,
+  )
+
+  with pytest.raises(ValueError, match="resume_mcp_session_reset_ok"):
+    parse_skill_file(skill_path)
+
+
+def test_parse_resumable_with_session_injection_and_reset_ack_loads(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    resumable: true
+    resume_mcp_session_reset_ok: true
+    session_inject_servers:
+      - browser
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.resumable is True
+  assert profile.resume_mcp_session_reset_ok is True
+  assert profile.session_inject_servers == ["browser"]
+
+
 def test_mixed_known_and_unknown_metadata(tmp_path: Path) -> None:
   skill_path = _write_skill(
     tmp_path,

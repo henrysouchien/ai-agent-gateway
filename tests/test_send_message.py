@@ -12,9 +12,11 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import (
   AgentRunner,
+  AgentSessionLog,
   CostEstimate,
   EventLog,
   ModelInfo,
+  ParentMessage,
   TaskRegistry,
   TaskState,
   ToolDispatcher,
@@ -54,9 +56,27 @@ class _DurableRegistryRunner(_RegistryRunner):
   def __init__(self, registry: TaskRegistry | None) -> None:
     super().__init__(registry)
     self.events: list[dict[str, Any]] = []
+    self.order: list[str] = []
 
   async def _append_durable_event(self, event: dict[str, Any]) -> None:
+    self.order.append("append")
     self.events.append(dict(event))
+
+
+class _RecordingQueue(asyncio.Queue[ParentMessage]):
+  def __init__(self, order: list[str]) -> None:
+    super().__init__()
+    self.order = order
+
+  async def put(self, item: ParentMessage) -> None:
+    self.order.append("put")
+    await super().put(item)
+
+
+class _FailingQueue(asyncio.Queue[ParentMessage]):
+  async def put(self, item: ParentMessage) -> None:
+    _ = item
+    raise RuntimeError("queue closed")
 
 
 class _StubProvider:
@@ -124,7 +144,9 @@ def test_make_send_message_handler_delivers_message_by_task_id() -> None:
 
   assert error is None
   assert result == {"status": "delivered", "task_id": entry.task_id}
-  assert entry.message_inbox.get_nowait() == "Check the appendix"
+  parent_message = entry.message_inbox.get_nowait()
+  assert parent_message.text == "Check the appendix"
+  assert parent_message.message_id in entry.delivered_messages
 
 
 def test_make_send_message_handler_emits_parent_message_sent_with_correlation() -> None:
@@ -166,6 +188,69 @@ def test_make_send_message_handler_emits_parent_message_sent_with_correlation() 
   assert event["model"] == "claude-sonnet-4-6"
   assert event["message"] == "Check the appendix"
   assert event["message_id"]
+  parent_message = entry.message_inbox.get_nowait()
+  assert parent_message.message_id == event["message_id"]
+  assert parent_message.sent_at == event["sent_at"]
+
+
+def test_make_send_message_handler_emits_before_deliver() -> None:
+  registry = TaskRegistry()
+  entry = registry.register("background_agent", agent_name="writer")
+  registry.transition(entry.task_id, TaskState.RUNNING)
+  runner = _DurableRegistryRunner(registry)
+  entry.message_inbox = _RecordingQueue(runner.order)
+  handler = make_send_message_handler([runner])
+
+  result, error = _run(handler({"to": entry.task_id, "message": "Check ordering"}))
+
+  assert error is None
+  assert result == {"status": "delivered", "task_id": entry.task_id}
+  assert runner.order == ["append", "put"]
+
+
+def test_make_send_message_handler_is_idempotent_for_delivered_message_id() -> None:
+  registry = TaskRegistry()
+  entry = registry.register("background_agent", agent_name="writer")
+  entry.delivered_messages.add("msg-existing")
+  registry.transition(entry.task_id, TaskState.RUNNING)
+  runner = _DurableRegistryRunner(registry)
+  handler = make_send_message_handler([runner])
+
+  result, error = _run(handler({"to": entry.task_id, "message": "Replay", "message_id": "msg-existing"}))
+
+  assert error is None
+  assert result == {"status": "delivered", "task_id": entry.task_id}
+  assert runner.events == []
+  assert entry.message_inbox.empty()
+
+
+def test_make_send_message_handler_updates_delivered_messages_after_successful_put() -> None:
+  registry = TaskRegistry()
+  entry = registry.register("background_agent", agent_name="writer")
+  registry.transition(entry.task_id, TaskState.RUNNING)
+  handler = make_send_message_handler([_RegistryRunner(registry)])
+
+  result, error = _run(handler({"to": entry.task_id, "message": "Track me", "message_id": "msg-new"}))
+
+  assert error is None
+  assert result == {"status": "delivered", "task_id": entry.task_id}
+  assert entry.delivered_messages == {"msg-new"}
+
+
+def test_make_send_message_handler_does_not_update_delivered_messages_when_put_raises() -> None:
+  registry = TaskRegistry()
+  entry = registry.register("background_agent", agent_name="writer")
+  entry.message_inbox = _FailingQueue()
+  registry.transition(entry.task_id, TaskState.RUNNING)
+  runner = _DurableRegistryRunner(registry)
+  handler = make_send_message_handler([runner])
+
+  with pytest.raises(RuntimeError, match="queue closed"):
+    _run(handler({"to": entry.task_id, "message": "Track me", "message_id": "msg-failed"}))
+
+  assert len(runner.events) == 1
+  assert runner.events[0]["message_id"] == "msg-failed"
+  assert "msg-failed" not in entry.delivered_messages
 
 
 def test_make_send_message_handler_delivers_message_by_agent_name() -> None:
@@ -178,7 +263,8 @@ def test_make_send_message_handler_delivers_message_by_agent_name() -> None:
 
   assert error is None
   assert result == {"status": "delivered", "task_id": entry.task_id}
-  assert entry.message_inbox.get_nowait() == "Focus on the risks"
+  parent_message = entry.message_inbox.get_nowait()
+  assert parent_message.text == "Focus on the risks"
 
 
 def test_make_send_message_handler_returns_ambiguous_target_for_duplicate_names() -> None:
@@ -276,9 +362,18 @@ def test_send_message_is_in_default_excluded_tools() -> None:
   assert _DEFAULT_EXCLUDED_TOOLS == frozenset({"run_agent", "get_background_result", "send_message"})
 
 
+def test_parent_message_dataclass_round_trips_through_queue() -> None:
+  inbox: asyncio.Queue[ParentMessage] = asyncio.Queue()
+  message = ParentMessage(message_id="msg-1", text="Check appendix", sent_at=123.0)
+
+  _run(inbox.put(message))
+
+  assert inbox.get_nowait() == message
+
+
 def test_run_drains_message_inbox_and_injects_parent_messages_between_turns() -> None:
   async def _case() -> None:
-    inbox: asyncio.Queue[str] = asyncio.Queue()
+    inbox: asyncio.Queue[ParentMessage] = asyncio.Queue()
     runner = AgentRunner(
       event_log=EventLog(),
       dispatcher=_make_dispatcher(),
@@ -293,8 +388,8 @@ def test_run_drains_message_inbox_and_injects_parent_messages_between_turns() ->
     async def _fake_stream_turn(**kwargs: Any):
       seen_messages.append(list(kwargs["current_messages"]))
       if len(seen_messages) == 1:
-        await inbox.put("Focus on regressions")
-        await inbox.put("Skip polish")
+        await inbox.put(ParentMessage(message_id="msg-1", text="Focus on regressions", sent_at=1.0))
+        await inbox.put(ParentMessage(message_id="msg-2", text="Skip polish", sent_at=2.0))
         return object(), StreamTurnResult(
           full_text="working",
           stop_reason="pause_turn",
@@ -316,9 +411,103 @@ def test_run_drains_message_inbox_and_injects_parent_messages_between_turns() ->
     assert len(seen_messages) == 2
     assert seen_messages[1][-1] == {
       "role": "user",
-      "content": "[Message from parent agent]: Focus on regressions\n[Message from parent agent]: Skip polish",
+      "content": "[Parent message id=msg-1]: Focus on regressions\n[Parent message id=msg-2]: Skip polish",
     }
     assert seen_messages[1][1]["role"] == "assistant"
     assert inbox.empty()
+
+  _run(_case())
+
+
+def test_send_message_durable_event_exists_when_queue_put_fails(tmp_path: Path) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "send-message-crash-window.jsonl")
+    registry = TaskRegistry()
+    entry = registry.register("background_agent", agent_name="writer")
+    entry.message_inbox = _FailingQueue()
+    registry.transition(entry.task_id, TaskState.RUNNING)
+    runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-send-message",
+      provider=_StubProvider(),
+      auth_config={"api_key": "k", "model": "stub-model"},
+      agent_session_log=log,
+      task_registry=registry,
+    )
+    runner._runner_id = "runner-test"
+    handler = make_send_message_handler([runner])
+
+    with pytest.raises(RuntimeError, match="queue closed"):
+      await handler({"to": entry.task_id, "message": "Persist before delivery", "message_id": "msg-crash"})
+
+    assert entry.message_inbox.empty()
+    assert "msg-crash" not in entry.delivered_messages
+    entries, _ = await log.query(event_types={"parent_message_sent"}, order="asc")
+    assert len(entries) == 1
+    assert entries[0].event["message_id"] == "msg-crash"
+    assert entries[0].event["message"] == "Persist before delivery"
+
+  _run(_case())
+
+
+def test_send_message_persists_event_and_child_sees_parent_message_envelope(tmp_path: Path) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "send-message-to-child.jsonl")
+    registry = TaskRegistry()
+    entry = registry.register("background_agent", agent_name="writer")
+    registry.transition(entry.task_id, TaskState.RUNNING)
+    parent_runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-send-message",
+      provider=_StubProvider(),
+      auth_config={"api_key": "k", "model": "stub-model"},
+      agent_session_log=log,
+      task_registry=registry,
+    )
+    parent_runner._runner_id = "runner-parent"
+    handler = make_send_message_handler([parent_runner])
+
+    result, error = await handler({"to": entry.task_id, "message": "Focus on regressions", "message_id": "msg-live"})
+
+    assert error is None
+    assert result == {"status": "delivered", "task_id": entry.task_id}
+    entries, _ = await log.query(event_types={"parent_message_sent"}, order="asc")
+    assert len(entries) == 1
+    assert entries[0].event["message_id"] == "msg-live"
+
+    child_runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-child",
+      provider=_StubProvider(),
+      auth_config={"api_key": "k", "model": "stub-model"},
+      get_tool_definitions=lambda: [],
+      message_inbox=entry.message_inbox,
+    )
+    seen_messages: list[list[dict[str, Any]]] = []
+
+    async def _fake_stream_turn(**kwargs: Any):
+      seen_messages.append(list(kwargs["current_messages"]))
+      if len(seen_messages) == 1:
+        return object(), StreamTurnResult(
+          full_text="working",
+          stop_reason="pause_turn",
+          content_blocks=[{"type": "text", "text": "working"}],
+        )
+      return object(), StreamTurnResult(
+        full_text="done",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+      )
+
+    child_runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    await child_runner.run(messages=[{"role": "user", "content": "Start"}])
+
+    assert seen_messages[0][-1] == {
+      "role": "user",
+      "content": "[Parent message id=msg-live]: Focus on regressions",
+    }
 
   _run(_case())

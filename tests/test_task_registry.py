@@ -278,6 +278,38 @@ def test_load_from_events_reconstructs_tasks_restores_seq_and_bypasses_listeners
   assert listener.transitions == []
 
 
+def test_load_from_events_ignores_resume_suffix_for_seq_base() -> None:
+  registry = TaskRegistry()
+
+  registry.load_from_events(
+    [
+      {
+        "type": "task_registered",
+        "task_id": "bg_3_r1",
+        "agent_name": "reviewer",
+        "started_at": 100.0,
+        "original_task_id": "bg_3",
+      },
+    ]
+  )
+
+  assert registry.register("background_agent").task_id == "bg_0"
+
+
+def test_register_accepts_original_task_id_and_explicit_resume_id() -> None:
+  registry = TaskRegistry()
+
+  entry = registry.register(
+    "background_agent",
+    agent_name="reviewer",
+    task_id="bg_3_r1",
+    original_task_id="bg_3",
+  )
+
+  assert entry.task_id == "bg_3_r1"
+  assert entry.original_task_id == "bg_3"
+
+
 def test_make_progress_tracker_updates_tool_usage_fields() -> None:
   entry = TaskEntry(task_id="bg_0", task_type="background_agent")
   track = make_progress_tracker(entry)

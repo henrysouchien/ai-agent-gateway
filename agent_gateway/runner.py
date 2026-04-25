@@ -30,6 +30,7 @@ from .task_registry import (
   COORDINATOR_DEFAULT_PREAMBLE,
   CoordinatorConfig,
   NotificationQueue,
+  ParentMessage,
   TaskEntry,
   TaskNotification,
   TaskRegistry,
@@ -71,12 +72,37 @@ def _format_exc(exc: Exception) -> str:
 
 
 def _get_tool_risk_value(tool_name: str) -> str:
+  normalized = str(tool_name or "").strip()
   try:
     from api.agent.shared.tool_risk import get_tool_risk
   except Exception:
+    if normalized in {"file_read", "memory_read", "memory_recall", "web_search", "web_fetch"}:
+      return "read_only"
+    if normalized.startswith(
+      (
+        "analyze_",
+        "check_",
+        "compare_",
+        "describe_",
+        "fetch_",
+        "file_read",
+        "get_",
+        "list_",
+        "preview_",
+        "query_",
+        "read_",
+        "recall_",
+        "screen_",
+        "search_",
+        "view_",
+      )
+    ):
+      return "read_only"
+    if normalized.startswith(("memory_", "set_", "sync_", "upsert_")):
+      return "idempotent_write"
     return "side_effecting"
   try:
-    return get_tool_risk(tool_name).value
+    return get_tool_risk(normalized).value
   except Exception:
     return "side_effecting"
 
@@ -220,13 +246,16 @@ class AgentRunner:
     agent_session_log: AgentSessionLog | None = None,
     context_builder: SessionContextBuilder | None = None,
     task_registry: TaskRegistry | None = None,
-    message_inbox: asyncio.Queue[str] | None = None,
+    message_inbox: asyncio.Queue[ParentMessage] | None = None,
     coordinator: CoordinatorConfig | None = None,
+    max_resume_chain_depth: int = 3,
   ) -> None:
     if max_budget_usd is not None and max_budget_usd <= 0:
       raise ValueError("max_budget_usd must be positive when provided")
     if max_concurrent_sub_agents is not None and max_concurrent_sub_agents <= 0:
       raise ValueError("max_concurrent_sub_agents must be positive when provided")
+    if max_resume_chain_depth <= 0:
+      raise ValueError("max_resume_chain_depth must be positive")
 
     self._log = event_log
     self._dispatcher = dispatcher
@@ -289,6 +318,7 @@ class AgentRunner:
       self._cost_accumulator = CostAccumulator(self._max_budget_usd)
     self._last_reported_cost = 0.0
     self._coordinator = coordinator
+    self._max_resume_chain_depth = max_resume_chain_depth
     self._max_concurrent_sub_agents = max_concurrent_sub_agents
     self._max_background_tasks = max_concurrent_sub_agents or 3
     self._sub_agent_semaphore: asyncio.Semaphore | None = None
@@ -820,6 +850,7 @@ class AgentRunner:
       max_concurrent_sub_agents=self._max_concurrent_sub_agents,
       agent_session_log=self._agent_session_log,
       message_inbox=task_entry.message_inbox if task_entry else None,
+      max_resume_chain_depth=self._max_resume_chain_depth,
     )
 
     timed_out = False
@@ -889,6 +920,180 @@ class AgentRunner:
       result["warning"] = "; ".join(warnings)
     return result, None
 
+  async def resume_sub_agent(
+    self,
+    *,
+    original_task_id: str,
+    reconstructed_messages: List[Dict[str, Any]],
+    parent_messages: list[ParentMessage],
+    provider: ModelProvider | None = None,
+    auth_config: Dict[str, Any] | None = None,
+    model: str | None = None,
+    system_prompt: str | None = None,
+    dispatcher: ToolDispatcher,
+    sub_session: Any | None = None,
+    excluded_tools: Set[str] | None = None,
+    max_turns: int | None,
+    timeout: float | None,
+    client_timeout: float = 90,
+    per_turn_timeout: float | None = None,
+    max_tokens: int = 32000,
+    call_index: int = 0,
+    parent_turn_id: str | None = None,
+    task_entry: TaskEntry | None = None,
+    on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
+  ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+    if task_entry is not None:
+      task_entry.delivered_messages.update(message.message_id for message in parent_messages)
+
+    if self._sub_agent_config is not None:
+      if model is None:
+        model = self._sub_agent_config.model
+      if system_prompt is None:
+        system_prompt = self._sub_agent_config.system_prompt
+      if excluded_tools is None:
+        excluded_tools = set(self._sub_agent_config.excluded_tools)
+
+    effective_provider = provider or self._provider
+    if provider is not None:
+      if auth_config is None:
+        return None, {"code": "invalid_input", "message": "auth_config required when overriding provider"}
+      effective_auth = dict(auth_config)
+    else:
+      effective_auth = getattr(sub_session, "auth_config", None) or self._auth_config
+
+    sub_session_id = str(getattr(sub_session, "session_id", "") or _derive_sub_agent_id(self._full_session_id, call_index))
+    original_on_event = getattr(self._log, "_on_event", None)
+    progress_cb = make_progress_tracker(task_entry) if task_entry else None
+
+    def _composed_on_event(event: Dict[str, Any], session_id: str) -> None:
+      if progress_cb is not None:
+        try:
+          progress_cb(event, session_id)
+        except Exception:
+          pass
+      if original_on_event is not None:
+        try:
+          original_on_event(event, session_id)
+        except Exception:
+          pass
+      if on_sub_event is not None:
+        try:
+          on_sub_event(event, session_id)
+        except Exception:
+          pass
+
+    sub_log = EventLog(on_event=_composed_on_event, session_id=sub_session_id)
+    sub_runner = AgentRunner(
+      event_log=sub_log,
+      dispatcher=dispatcher,
+      session_id=sub_session_id,
+      provider=effective_provider,
+      auth_config=effective_auth,
+      client_timeout=client_timeout,
+      max_tokens_override=max_tokens,
+      per_turn_timeout=per_turn_timeout if per_turn_timeout is not None else self._per_turn_timeout,
+      stream_stall_timeout=self._stream_stall_timeout,
+      mcp_client=self._mcp_client,
+      loaded_mcp_servers=self._loaded_mcp_servers,
+      excluded_tools=excluded_tools or set(),
+      get_tool_definitions=self._get_tool_definitions,
+      on_tool_result=self._on_tool_result,
+      on_usage=self._on_usage,
+      on_session_summary=None,
+      on_late_usage_event=self._on_late_usage_event,
+      on_tool_timing=self._on_tool_timing,
+      user_id=getattr(sub_session, "user_id", None) or self._usage_user_id,
+      request_id=self._request_id,
+      parent_turn_id=parent_turn_id,
+      billing_mode=self._billing_mode,
+      rate_table_version=self._rate_table_version,
+      channel=self._channel,
+      usage_ledger_dlq_path=self._usage_ledger_dlq_path,
+      on_metric=self._on_metric,
+      sub_agent_config=self._sub_agent_config,
+      compaction_trigger=self._compaction_trigger,
+      compaction_instructions=None,
+      tool_call_timeout=self._tool_call_timeout,
+      on_max_turns=self._on_max_turns,
+      max_budget_usd=self._max_budget_usd,
+      _cost_accumulator=self._cost_accumulator,
+      _parent_aggregator=self._aggregator,
+      max_concurrent_sub_agents=self._max_concurrent_sub_agents,
+      agent_session_log=self._agent_session_log,
+      message_inbox=task_entry.message_inbox if task_entry else None,
+      max_resume_chain_depth=self._max_resume_chain_depth,
+    )
+
+    timed_out = False
+    coro = sub_runner.run(
+      messages=reconstructed_messages[-1:] or [{"role": "user", "content": ""}],
+      system_prompt=system_prompt,
+      model_override=model,
+      max_turns=max_turns,
+      resume_initial_messages=reconstructed_messages,
+    )
+    try:
+      if timeout is not None and timeout > 0:
+        await asyncio.wait_for(coro, timeout=timeout)
+      else:
+        await coro
+    except asyncio.TimeoutError:
+      timed_out = True
+      sub_log.append({"type": "error", "error": f"Sub-agent timed out after {timeout}s"})
+    except asyncio.CancelledError:
+      log.warning("[%s] Resumed sub-agent cancelled (parent disconnect or shutdown)", sub_session_id)
+      sub_log.append({"type": "error", "error": "Sub-agent cancelled"})
+      raise
+    finally:
+      await sub_runner.force_close(timeout=2.0)
+
+    text_parts: List[str] = []
+    tool_calls_made: List[str] = []
+    usage: Dict[str, Any] = {}
+    error_msg: str | None = None
+    budget_exceeded = False
+    max_turns_hit = False
+    for entry in sub_log.entries:
+      event = entry.event
+      event_type = event.get("type")
+      if event_type == "stream_retry":
+        text_parts.clear()
+        tool_calls_made.clear()
+      elif event_type == "text_delta":
+        text_parts.append(str(event.get("text", "")))
+      elif event_type == "tool_call_start":
+        tool_calls_made.append(str(event.get("tool_name", "")))
+      elif event_type == "stream_complete":
+        event_usage = event.get("usage")
+        if isinstance(event_usage, dict):
+          usage = event_usage
+      elif event_type == "budget_exceeded":
+        budget_exceeded = True
+      elif event_type == "max_turns_reached":
+        max_turns_hit = True
+      elif event_type == "error":
+        error_msg = str(event.get("error", "Sub-agent error"))
+
+    result: Dict[str, Any] = {
+      "response": "".join(text_parts).strip(),
+      "tools_used": tool_calls_made,
+      "usage": usage,
+      "original_task_id": original_task_id,
+    }
+    warnings: List[str] = []
+    if timed_out:
+      warnings.append(f"Sub-agent timed out after {timeout}s — partial results returned")
+    elif error_msg:
+      warnings.append(f"Sub-agent error: {error_msg}")
+    if budget_exceeded:
+      warnings.append("Sub-agent stopped: budget limit reached")
+    if max_turns_hit:
+      warnings.append("Sub-agent stopped: max turns reached — partial results")
+    if warnings:
+      result["warning"] = "; ".join(warnings)
+    return result, None
+
   async def _call_on_tool_result(self, ctx: ToolResultContext) -> List[Dict[str, Any]]:
     if self._on_tool_result is None:
       return []
@@ -917,6 +1122,73 @@ class AgentRunner:
     end_t = bg_task.completed_at if bg_task.completed_at is not None else time.time()
     return max(0, int(end_t - bg_task.started_at))
 
+  async def _task_entry_for_chain(self, task_id: str) -> TaskEntry | None:
+    entry = self._task_registry.get(task_id)
+    if entry is not None:
+      return entry
+    return await self._lookup_task_in_log(task_id)
+
+  async def _resume_chain_depth(self, task_id: str) -> int:
+    depth = 0
+    seen: set[str] = set()
+    current_id: str | None = task_id
+    while current_id:
+      if current_id in seen:
+        break
+      seen.add(current_id)
+      entry = await self._task_entry_for_chain(current_id)
+      parent_id = entry.original_task_id if entry is not None else None
+      if not parent_id:
+        break
+      depth += 1
+      current_id = parent_id
+    return depth
+
+  async def _resume_root_task_id(self, task_id: str) -> str:
+    seen: set[str] = set()
+    current_id = task_id
+    while current_id not in seen:
+      seen.add(current_id)
+      entry = await self._task_entry_for_chain(current_id)
+      parent_id = entry.original_task_id if entry is not None else None
+      if not parent_id:
+        return current_id
+      current_id = parent_id
+    return task_id
+
+  async def _resumed_task_ids(self, task_id: str) -> list[str]:
+    await self._rebuild_task_registry_from_log()
+    root_id = await self._resume_root_task_id(task_id)
+    resumed: list[str] = []
+    for entry in self._task_registry.list_tasks():
+      if entry.task_id == root_id or entry.original_task_id is None:
+        continue
+      if await self._resume_root_task_id(entry.task_id) == root_id:
+        resumed.append(entry.task_id)
+    return resumed
+
+  def _resume_root_task_id_from_registry(self, task_id: str) -> str:
+    seen: set[str] = set()
+    current_id = task_id
+    while current_id not in seen:
+      seen.add(current_id)
+      entry = self._task_registry.get(current_id)
+      parent_id = entry.original_task_id if entry is not None else None
+      if not parent_id:
+        return current_id
+      current_id = parent_id
+    return task_id
+
+  def _resumed_task_ids_from_registry(self, task_id: str) -> list[str]:
+    root_id = self._resume_root_task_id_from_registry(task_id)
+    resumed: list[str] = []
+    for entry in self._task_registry.list_tasks():
+      if entry.task_id == root_id or entry.original_task_id is None:
+        continue
+      if self._resume_root_task_id_from_registry(entry.task_id) == root_id:
+        resumed.append(entry.task_id)
+    return resumed
+
   def _background_task_payload(self, bg_task: BackgroundTask | TaskEntry) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
       "task_id": bg_task.task_id,
@@ -928,6 +1200,7 @@ class AgentRunner:
     elapsed = self._background_elapsed_seconds(bg_task)
     if getattr(bg_task, "state", None) == TaskState.INTERRUPTED:
       metadata = getattr(bg_task, "metadata", {}) if isinstance(getattr(bg_task, "metadata", None), dict) else {}
+      resumed_as = self._resumed_task_ids_from_registry(bg_task.task_id)
       payload.update(
         {
           "status": "interrupted",
@@ -942,6 +1215,10 @@ class AgentRunner:
           "task_type": metadata.get("task_type", getattr(bg_task, "task_type", None)),
           "provider_name": metadata.get("provider_name", getattr(bg_task, "provider_name", None)),
           "model": metadata.get("model", getattr(bg_task, "model", None)),
+          "original_task_id": getattr(bg_task, "original_task_id", None),
+          "resumable": bool(metadata.get("resumable", False)),
+          "resumed_as": resumed_as,
+          "latest_resume_task_id": resumed_as[-1] if resumed_as else None,
           "message": "Background task was interrupted by a gateway restart before completion.",
         }
       )
@@ -1068,7 +1345,7 @@ class AgentRunner:
 
   def _task_correlation_payload(self, entry: TaskEntry) -> Dict[str, Any]:
     metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
-    return {
+    payload = {
       "task_id": entry.task_id,
       "owner_runner_id": metadata.get("owner_runner_id", self._runner_id),
       "owner_role": metadata.get("owner_role", self._role),
@@ -1079,6 +1356,9 @@ class AgentRunner:
       "provider_name": metadata.get("provider_name", entry.provider_name),
       "model": metadata.get("model", entry.model),
     }
+    if entry.original_task_id is not None:
+      payload["original_task_id"] = entry.original_task_id
+    return payload
 
   async def _append_task_completed_event(self, entry: TaskEntry, final_state: TaskState) -> None:
     payload = self._task_correlation_payload(entry)
@@ -1102,6 +1382,7 @@ class AgentRunner:
     parent_turn_id: str | None = None,
     on_complete: BackgroundTaskCallback | None = None,
     on_before_start: Callable[[], None] | None = None,
+    original_task_id: str | None = None,
   ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     if self._task_registry.inflight_count >= self._max_background_tasks:
       return None, {
@@ -1118,7 +1399,23 @@ class AgentRunner:
       except Exception as exc:
         log.warning("[%s] on_before_start hook failed (non-fatal): %s", self._sid, exc)
 
-    entry = self._task_registry.register("background_agent", agent_name=agent_name)
+    task_id_override = None
+    if original_task_id:
+      depth = await self._resume_chain_depth(original_task_id)
+      if depth >= self._max_resume_chain_depth:
+        return None, {
+          "code": "max_resume_chain_depth",
+          "message": f"Resume chain depth limit reached ({self._max_resume_chain_depth}) for {original_task_id}",
+        }
+      root_id = await self._resume_root_task_id(original_task_id)
+      task_id_override = f"{root_id}_r{depth + 1}"
+
+    entry = self._task_registry.register(
+      "background_agent",
+      agent_name=agent_name,
+      task_id=task_id_override,
+      original_task_id=original_task_id,
+    )
     raw_provider_name = tool_input.get("provider_name", tool_input.get("provider"))
     if isinstance(raw_provider_name, str) and raw_provider_name.strip():
       entry.provider_name = raw_provider_name.strip()
@@ -1132,8 +1429,9 @@ class AgentRunner:
       if isinstance(auth_model, str) and auth_model.strip():
         entry.model = auth_model.strip()
 
+    base_for_call_index = entry.task_id.split("_r", 1)[0]
     try:
-      call_index = int(entry.task_id.rsplit("_", 1)[-1])
+      call_index = int(base_for_call_index.rsplit("_", 1)[-1])
     except ValueError:
       call_index = 0
     sub_agent_id = _derive_sub_agent_id(self._gateway_session_id, call_index)
@@ -1147,6 +1445,10 @@ class AgentRunner:
       "provider_name": entry.provider_name,
       "model": entry.model,
     }
+    if original_task_id is not None:
+      correlation["original_task_id"] = original_task_id
+    if "resumable" in tool_input:
+      correlation["resumable"] = bool(tool_input.get("resumable"))
     entry.metadata.update(correlation)
     await self._append_durable_event(
       {
@@ -1876,13 +2178,11 @@ class AgentRunner:
         "type": "tool_call_complete",
         "tool_call_id": tool_id,
         "tool_name": tool_name,
-        "result": result,
+        "result": dict(result) if isinstance(result, dict) else result,
         "error": error,
         "duration_ms": duration_ms,
         "server": server,
       }
-      await self._append_durable_event(tool_complete_event)
-      self._append(tool_complete_event)
       self._call_on_tool_timing(
         tool_name=tool_name,
         server=server,
@@ -1892,6 +2192,15 @@ class AgentRunner:
       )
 
     if cancelled_exc is not None:
+      result_entry = self._make_error_result(
+        tool_id,
+        str(error.get("code", "tool_error")) if isinstance(error, dict) else "tool_error",
+        str(error.get("message", "Tool failed")) if isinstance(error, dict) else "Tool failed",
+        sub_code=str(error.get("sub_code", "")) if isinstance(error, dict) else "",
+      )
+      tool_complete_event["final_tool_result_blocks"] = [dict(result_entry)]
+      await self._append_durable_event(tool_complete_event)
+      self._append(tool_complete_event)
       raise cancelled_exc
 
     if error is None and isinstance(result, dict):
@@ -1940,6 +2249,11 @@ class AgentRunner:
         result_entry=result_entry,
       )
     )
+    final_tool_result_blocks = [dict(result_entry)]
+    final_tool_result_blocks.extend(dict(block) for block in extra_blocks)
+    tool_complete_event["final_tool_result_blocks"] = final_tool_result_blocks
+    await self._append_durable_event(tool_complete_event)
+    self._append(tool_complete_event)
     return result_entry, tool_name, extra_blocks
 
   async def run(
@@ -1948,6 +2262,8 @@ class AgentRunner:
     system_prompt: Optional[Union[str, List[Tuple[str, bool]]]] = None,
     model_override: Optional[str] = None,
     max_turns: Optional[int] = None,
+    *,
+    resume_initial_messages: List[Dict[str, Any]] | None = None,
   ) -> None:
     """Execute the full chat loop and stream events into `EventLog`.
 
@@ -1988,11 +2304,14 @@ class AgentRunner:
         if self._role == "writer":
           self._write_lease_metadata()
         await self._rebuild_task_registry_from_log()
-        prior_messages = await self._context_builder.build() if self._context_builder is not None else []
-        new_user_input = self._extract_last_user_message(messages)
-        if new_user_input is not None:
-          await self._append_user_message_event(new_user_input)
-        messages = prior_messages + ([new_user_input] if new_user_input is not None else [])
+        if resume_initial_messages is not None:
+          messages = [dict(message) for message in resume_initial_messages]
+        else:
+          prior_messages = await self._context_builder.build() if self._context_builder is not None else []
+          new_user_input = self._extract_last_user_message(messages)
+          if new_user_input is not None:
+            await self._append_user_message_event(new_user_input)
+          messages = prior_messages + ([new_user_input] if new_user_input is not None else [])
 
       if self._coordinator is not None and self._coordinator.enabled:
         preamble = self._coordinator.preamble or COORDINATOR_DEFAULT_PREAMBLE
@@ -2195,14 +2514,16 @@ class AgentRunner:
         else:
           turn_system_prompt = system_prompt
         if self._message_inbox is not None:
-          parent_messages: list[str] = []
+          parent_messages: list[ParentMessage] = []
           while not self._message_inbox.empty():
             try:
               parent_messages.append(self._message_inbox.get_nowait())
             except asyncio.QueueEmpty:
               break
           if parent_messages:
-            combined = "\n".join(f"[Message from parent agent]: {message}" for message in parent_messages)
+            combined = "\n".join(
+              f"[Parent message id={message.message_id}]: {message.text}" for message in parent_messages
+            )
             current_messages.append({"role": "user", "content": combined})
         turn_usage_before = dict(usage_totals)
         turn_result = await self._stream_turn(

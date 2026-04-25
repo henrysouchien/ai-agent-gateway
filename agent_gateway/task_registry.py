@@ -5,6 +5,7 @@ import html
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 from typing import Any, Callable, Protocol
 
 
@@ -29,6 +30,13 @@ class TaskProgress:
 
 
 @dataclass
+class ParentMessage:
+  message_id: str
+  text: str
+  sent_at: float
+
+
+@dataclass
 class TaskEntry:
   task_id: str
   task_type: str
@@ -43,7 +51,9 @@ class TaskEntry:
   metadata: dict[str, Any] = field(default_factory=dict)
   provider_name: str | None = None
   model: str | None = None
-  message_inbox: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
+  message_inbox: asyncio.Queue[ParentMessage] = field(default_factory=asyncio.Queue)
+  delivered_messages: set[str] = field(default_factory=set)
+  original_task_id: str | None = None
   reconstructed_from_log: bool = False
 
   @property
@@ -174,13 +184,25 @@ class TaskRegistry:
     self._id_prefix = id_prefix
     self._listeners: list[TaskLifecycleListener] = []
 
-  def register(self, task_type: str, agent_name: str | None = None, **metadata_kwargs: Any) -> TaskEntry:
-    task_id = f"{self._id_prefix}_{self._seq}"
-    self._seq += 1
+  def register(
+    self,
+    task_type: str,
+    agent_name: str | None = None,
+    *,
+    task_id: str | None = None,
+    original_task_id: str | None = None,
+    **metadata_kwargs: Any,
+  ) -> TaskEntry:
+    if task_id is None:
+      task_id = f"{self._id_prefix}_{self._seq}"
+      self._seq += 1
+    elif task_id in self._tasks:
+      raise ValueError(f"Task already registered: {task_id}")
     entry = TaskEntry(
       task_id=task_id,
       task_type=task_type,
       agent_name=agent_name,
+      original_task_id=original_task_id,
       metadata=dict(metadata_kwargs),
     )
     self._tasks[task_id] = entry
@@ -294,6 +316,7 @@ class TaskRegistry:
         "provider_name",
         "model",
         "parent_session_id",
+        "original_task_id",
       ):
         if key in registered:
           metadata[key] = registered.get(key)
@@ -324,6 +347,7 @@ class TaskRegistry:
         metadata=metadata,
         provider_name=registered.get("provider_name"),
         model=registered.get("model"),
+        original_task_id=registered.get("original_task_id"),
         reconstructed_from_log=True,
       )
       self._tasks[task_id] = entry
@@ -351,6 +375,8 @@ class TaskRegistry:
 
   @staticmethod
   def _numeric_suffix(task_id: str) -> int | None:
+    if re.search(r"_r\d+$", str(task_id)):
+      return None
     try:
       return int(str(task_id).rsplit("_", 1)[-1])
     except (TypeError, ValueError):

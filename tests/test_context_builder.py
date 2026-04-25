@@ -89,6 +89,43 @@ def test_context_builder_missing_regime_does_not_crash(tmp_path: Path) -> None:
   assert "Regime:" not in messages[0]["content"]
 
 
+def test_context_builder_tool_call_complete_backward_compat_with_final_blocks(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "tool-result-compat.jsonl")
+  _run(
+    log.append(
+      {
+        "type": "tool_call_complete",
+        "tool_call_id": "tool-1",
+        "tool_name": "lookup",
+        "result": {"ok": True},
+        "error": None,
+        "final_tool_result_blocks": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "tool-1",
+            "content": "{\"ok\": true, \"_runner_warning\": \"annotated\"}",
+          }
+        ],
+      }
+    )
+  )
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+
+  assert messages == [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "tool-1",
+          "content": "{\"ok\": true}",
+        }
+      ],
+    }
+  ]
+
+
 def test_context_builder_ignores_unknown_state_update_fields(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "unknown-fields.jsonl")
   _run(

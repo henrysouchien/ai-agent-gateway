@@ -45,6 +45,8 @@ class SkillProfile:
   delivery_label: str | None = None
   agent_callable: bool = False
   agent_description: str | None = None
+  resumable: bool = False
+  resume_mcp_session_reset_ok: bool = False
   mode: str = "full"
   extra_excluded_tools: set[str] = field(default_factory=set)
   tool_packs_enabled: bool = True
@@ -229,6 +231,8 @@ def parse_skill_file(path: Path) -> SkillProfile:
   raw_interactive = frontmatter.pop("interactive", None)
   raw_agent_callable = frontmatter.pop("agent_callable", None)
   raw_agent_description = frontmatter.pop("agent_description", None)
+  raw_resumable = frontmatter.pop("resumable", None)
+  raw_resume_mcp_session_reset_ok = frontmatter.pop("resume_mcp_session_reset_ok", None)
   raw_mode = frontmatter.pop("mode", None)
   raw_extra_excluded_tools = frontmatter.pop("extra_excluded_tools", None)
   raw_tool_packs_enabled = frontmatter.pop("tool_packs_enabled", None)
@@ -287,6 +291,12 @@ def parse_skill_file(path: Path) -> SkillProfile:
     path=path,
   )
   coerced_agent_description = _clean_string(raw_agent_description)
+  coerced_resumable = _coerce_optional_bool(raw_resumable, field_name="resumable", path=path)
+  coerced_resume_mcp_session_reset_ok = _coerce_optional_bool(
+    raw_resume_mcp_session_reset_ok,
+    field_name="resume_mcp_session_reset_ok",
+    path=path,
+  )
   coerced_mode = _coerce_mode(raw_mode, field_name="mode", path=path)
   coerced_extra_excluded_tools = _coerce_optional_string_set(
     raw_extra_excluded_tools,
@@ -316,6 +326,12 @@ def parse_skill_file(path: Path) -> SkillProfile:
     if key in original_metadata_keys:
       metadata[key] = coerced
 
+  if coerced_resumable and coerced_session_inject_servers and not coerced_resume_mcp_session_reset_ok:
+    raise ValueError(
+      f"{path}: 'resumable: true' with 'session_inject_servers' requires "
+      "'resume_mcp_session_reset_ok: true'"
+    )
+
   return SkillProfile(
     name=_clean_string(raw_name) or path.stem,
     system_prompt=body.strip(),
@@ -338,6 +354,8 @@ def parse_skill_file(path: Path) -> SkillProfile:
     delivery_label=coerced_delivery_label,
     agent_callable=coerced_agent_callable,
     agent_description=coerced_agent_description,
+    resumable=coerced_resumable,
+    resume_mcp_session_reset_ok=coerced_resume_mcp_session_reset_ok,
     mode=coerced_mode,
     extra_excluded_tools=coerced_extra_excluded_tools,
     tool_packs_enabled=coerced_tool_packs_enabled,

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,11 @@ async def _lookup_tool(tool_input: dict[str, Any], **kwargs: Any):
   return {"echo": tool_input}, None
 
 
+async def _warning_tool(tool_input: dict[str, Any], **kwargs: Any):
+  _ = kwargs
+  return {"ok": True, "low_match_warning": tool_input.get("warning", "only 20% matched")}, None
+
+
 def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "runner.jsonl")
   provider = _ScriptedProvider([
@@ -160,7 +166,106 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
   assert entries[2].event["stop_reason"] == "tool_use"
   assert entries[2].event["usage"]["input_tokens"] == 10
   assert entries[3].event["parent_assistant_message_seq"] == entries[2].seq
+  assert "final_tool_result_blocks" in entries[4].event
   assert entries[6].event["reason"] == "completed"
+
+
+def test_tool_call_complete_logs_final_model_facing_result_blocks(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "final-tool-result.jsonl")
+  provider = _ScriptedProvider([
+    _tool_turn(tool_name="warn_lookup", tool_input={"warning": "only 20% matched"}),
+    _text_turn("done"),
+  ])
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"warn_lookup": _warning_tool}),
+    session_id="sess-parent",
+    provider=provider,
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "Run lookup"}]))
+
+  entries, _ = _run(log.query(event_types={"tool_call_complete"}, order="asc"))
+  event = entries[0].event
+  assert event["result"] == {"ok": True, "low_match_warning": "only 20% matched"}
+  final_blocks = event["final_tool_result_blocks"]
+  assert len(final_blocks) == 1
+  assert final_blocks[0]["type"] == "tool_result"
+  content = final_blocks[0]["content"]
+  assert "_runner_warning" in content
+  assert "Low match rate detected: only 20% matched" in content
+
+
+def test_tool_call_complete_pre_and_final_results_differ_when_annotated(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "pre-post-tool-result.jsonl")
+  provider = _ScriptedProvider([
+    _tool_turn(tool_name="warn_lookup", tool_input={"warning": "3 of 10 rows matched"}),
+    _text_turn("done"),
+  ])
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"warn_lookup": _warning_tool}),
+    session_id="sess-parent",
+    provider=provider,
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "Run lookup"}]))
+
+  entries, _ = _run(log.query(event_types={"tool_call_complete"}, order="asc"))
+  event = entries[0].event
+  assert "_runner_warning" not in event["result"]
+  assert "_runner_warning" in event["final_tool_result_blocks"][0]["content"]
+  assert event["final_tool_result_blocks"][0]["content"] != json.dumps(event["result"], default=str)
+
+
+def test_rebuild_task_registry_ignores_tool_call_complete_final_blocks(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "rebuild-final-blocks.jsonl")
+  _run(
+    log.append(
+      {
+        "type": "task_registered",
+        "task_id": "bg_0",
+        "task_type": "background",
+        "agent_name": "writer",
+        "started_at": 1.0,
+      }
+    )
+  )
+  _run(
+    log.append(
+      {
+        "type": "tool_call_complete",
+        "tool_call_id": "tool-1",
+        "tool_name": "lookup",
+        "result": {"ok": True},
+        "error": None,
+        "final_tool_result_blocks": [
+          {"type": "tool_result", "tool_use_id": "tool-1", "content": "{\"ok\": true}"}
+        ],
+      }
+    )
+  )
+  runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(local_tool_handlers={}),
+    session_id="sess-parent",
+    provider=_ScriptedProvider([_text_turn("unused")]),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    task_registry=TaskRegistry(),
+  )
+
+  _run(runner._rebuild_task_registry_from_log())
+
+  entry = runner._task_registry.get("bg_0")
+  assert entry is not None
+  assert entry.state == TaskState.INTERRUPTED
 
 
 def test_task_durability_events_use_type_and_query_round_trips(tmp_path: Path) -> None:
