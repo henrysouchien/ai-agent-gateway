@@ -12,6 +12,8 @@ from ._io import _atomic_write_json, _read_json_object
 
 log = logging.getLogger("agent_gateway.skills")
 _FRONTMATTER_DELIMITER = "---"
+AGENT_DESCRIPTION_MAX_CHARS = 240
+AGENT_DESCRIPTION_PLACEHOLDER = "(no description)"
 
 
 @dataclass
@@ -343,6 +345,31 @@ def parse_skill_file(path: Path) -> SkillProfile:
   )
 
 
+def _cap_agent_description(description: str) -> str:
+  if len(description) <= AGENT_DESCRIPTION_MAX_CHARS:
+    return description
+  return description[: AGENT_DESCRIPTION_MAX_CHARS - 1].rstrip() + "…"
+
+
+def _warn_agent_description_if_needed(profile: SkillProfile) -> None:
+  if not profile.agent_callable:
+    return
+  if not profile.agent_description:
+    log.warning(
+      "Callable skill '%s' is missing agent_description; rendering %s",
+      profile.name,
+      AGENT_DESCRIPTION_PLACEHOLDER,
+    )
+    return
+  if len(profile.agent_description) > AGENT_DESCRIPTION_MAX_CHARS:
+    log.warning(
+      "Callable skill '%s' agent_description is %d chars; max is %d and rendered output will be truncated",
+      profile.name,
+      len(profile.agent_description),
+      AGENT_DESCRIPTION_MAX_CHARS,
+    )
+
+
 class SkillLoader:
   """Load named skill files from a directory.
 
@@ -370,12 +397,24 @@ class SkillLoader:
       available = self.list_skills()
       available_label = ", ".join(available) if available else "(none)"
       raise FileNotFoundError(f"Skill '{name}' not found. Available: {available_label}")
-    return parse_skill_file(path)
+    profile = parse_skill_file(path)
+    _warn_agent_description_if_needed(profile)
+    return profile
 
   def list_skills(self) -> list[str]:
     if not self.skills_dir.exists():
       return []
     return sorted(path.stem for path in self.skills_dir.glob("*.md") if path.is_file())
+
+  def list_callable_skills_with_descriptions(self) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for name in self.list_skills():
+      profile = self.load(name)
+      if not profile.agent_callable:
+        continue
+      description = profile.agent_description or AGENT_DESCRIPTION_PLACEHOLDER
+      entries.append((profile.name, _cap_agent_description(description)))
+    return sorted(entries, key=lambda item: item[0])
 
   def exists(self, name: str) -> bool:
     try:
@@ -418,6 +457,8 @@ class SkillStateStore:
 
 
 __all__ = [
+  "AGENT_DESCRIPTION_MAX_CHARS",
+  "AGENT_DESCRIPTION_PLACEHOLDER",
   "SkillLoader",
   "SkillProfile",
   "SkillStateStore",

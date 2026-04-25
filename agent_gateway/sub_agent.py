@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import datetime
+import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ._provider_utils import _get_allowed_models_for_provider_name
 from .event_log import EventLog
+from .runner import _derive_sub_agent_id
 from .session import GatewaySession
 from .skills import SkillLoader
 from .task_registry import CoordinatorConfig, ProviderResolver
@@ -27,6 +29,20 @@ _DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
   "spawn further sub-agents.\n\n"
   "Today's date: {date}"
 )
+_RUN_AGENT_DESCRIPTION = (
+  "Spawn a focused sub-agent. Pass `agent` for a named skill workflow; omit for a generic "
+  "sub-agent. Sub-agents run independently with their own turn budget, cannot spawn further "
+  "sub-agents, and cannot access Excel tools or trading/order-management tools."
+)
+
+
+def _render_agent_param_description(entries: list[tuple[str, str]]) -> str:
+  base = "Named agent profile to use. Omit to run without a skill."
+  if not entries:
+    return base
+  lines = [base, "", "Available agents:"]
+  lines.extend(f"- {name}: {description}" for name, description in entries)
+  return "\n".join(lines)
 
 
 def make_run_agent_handler(
@@ -103,6 +119,11 @@ def make_run_agent_handler(
         return None, {"code": "not_found", "message": str(exc)}
       except Exception as exc:
         return None, {"code": "invalid_skill", "message": str(exc)}
+      if not profile.agent_callable:
+        return None, {
+          "code": "invalid_skill",
+          "message": f"Agent '{agent_name}' is not callable. Choose a callable named agent or omit agent.",
+        }
     elif agent_name and skill_loader is None:
       return None, {"code": "not_available", "message": "Named agents not available"}
 
@@ -204,7 +225,7 @@ def make_run_agent_handler(
       sub_session = None
       if parent_session is not None:
         sub_session = GatewaySession(
-          session_id=f"sub{background_call_index}:{parent_session.session_id}",
+          session_id=_derive_sub_agent_id(parent_session, background_call_index),
           api_key_hash=parent_session.api_key_hash,
           created_at=parent_session.created_at,
           expires_at=parent_session.expires_at,
@@ -245,6 +266,7 @@ def make_run_agent_handler(
         tool_input=dict(tool_input),
         handler=_dispatch_sub_agent,
         agent_name=agent_name,
+        parent_turn_id=parent_turn_id,
         on_before_start=(lambda: on_before_background(agent_name)) if on_before_background else None,
         on_complete=on_background_complete,
       )
@@ -321,6 +343,30 @@ def make_send_message_handler(runner_ref: list[Any]):
       return None, {"code": "already_completed", "message": f"Agent {target} already finished"}
 
     await entry.message_inbox.put(message)
+    append_durable_event = getattr(runner, "_append_durable_event", None)
+    if append_durable_event is not None:
+      metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
+      await append_durable_event(
+        {
+          "type": "parent_message_sent",
+          "task_id": entry.task_id,
+          "owner_runner_id": metadata.get("owner_runner_id", getattr(runner, "_runner_id", None)),
+          "owner_role": metadata.get("owner_role", getattr(runner, "_role", None)),
+          "sub_agent_id": metadata.get("sub_agent_id"),
+          "parent_turn_id": metadata.get("parent_turn_id"),
+          "call_index": metadata.get("call_index"),
+          "task_type": metadata.get("task_type", "background"),
+          "provider_name": metadata.get("provider_name", entry.provider_name),
+          "model": metadata.get("model", entry.model),
+          "message_id": str(uuid.uuid4()),
+          "sender": {
+            "session_id": getattr(runner, "_full_session_id", None),
+            "user_id": getattr(runner, "_usage_user_id", None),
+          },
+          "sent_at": datetime.datetime.now(datetime.UTC).timestamp(),
+          "message": message,
+        }
+      )
     return {"status": "delivered", "task_id": entry.task_id}, None
 
   return _handle_send_message
@@ -329,27 +375,20 @@ def make_send_message_handler(runner_ref: list[Any]):
 def make_run_agent_tool_def(skill_loader: SkillLoader | None = None) -> dict[str, Any]:
   """Build the public tool schema for `run_agent`.
 
-  When a `SkillLoader` is provided, the description includes the currently
-  available named skills.
+  When a `SkillLoader` is provided, the agent parameter description includes
+  the currently available callable named skills.
   """
-  skills = skill_loader.list_skills() if skill_loader else []
-  skill_suffix = f" Available agents: {', '.join(skills)}." if skills else ""
+  skills = skill_loader.list_callable_skills_with_descriptions() if skill_loader else []
 
   return {
     "name": "run_agent",
-    "description": (
-      "Spawn a sub-agent to perform a focused task. The sub-agent runs independently "
-      "with its own turn budget and returns its final text response. Use this when you "
-      "need to perform a substantial task without cluttering the main conversation. "
-      "The sub-agent cannot spawn further sub-agents."
-      + skill_suffix
-    ),
+    "description": _RUN_AGENT_DESCRIPTION,
     "input_schema": {
       "type": "object",
       "properties": {
         "agent": {
           "type": "string",
-          "description": "Named agent profile to use." + (f" One of: {', '.join(skills)}." if skills else ""),
+          "description": _render_agent_param_description(skills),
         },
         "task": {
           "type": "string",

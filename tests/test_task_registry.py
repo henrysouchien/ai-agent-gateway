@@ -10,7 +10,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.task_registry import TaskEntry, TaskRegistry, TaskState, make_progress_tracker
+from agent_gateway.task_registry import TaskEntry, TaskRegistry, TaskState, _TERMINAL_STATES, make_progress_tracker
 
 
 def _run(coro):
@@ -181,6 +181,18 @@ def test_task_entry_completed_property() -> None:
   assert TaskEntry(task_id="t2", task_type="background_agent", state=TaskState.COMPLETED).completed is True
   assert TaskEntry(task_id="t3", task_type="background_agent", state=TaskState.FAILED).completed is True
   assert TaskEntry(task_id="t4", task_type="background_agent", state=TaskState.KILLED).completed is True
+  assert TaskEntry(task_id="t5", task_type="background_agent", state=TaskState.INTERRUPTED).completed is True
+
+
+def test_interrupted_is_terminal_for_send_kill_and_completion() -> None:
+  registry = TaskRegistry()
+  entry = registry.register("background_agent")
+  entry.state = TaskState.INTERRUPTED
+  entry.completed_at = time.time()
+
+  assert TaskState.INTERRUPTED in _TERMINAL_STATES
+  assert entry.completed is True
+  assert registry.kill(entry.task_id) is False
 
 
 def test_task_entry_message_inbox_exists_at_creation() -> None:
@@ -188,6 +200,82 @@ def test_task_entry_message_inbox_exists_at_creation() -> None:
 
   assert isinstance(entry.message_inbox, asyncio.Queue)
   assert entry.message_inbox.empty()
+
+
+def test_load_from_events_reconstructs_tasks_restores_seq_and_bypasses_listeners() -> None:
+  registry = TaskRegistry()
+  listener = _RecordingListener()
+  registry.add_listener(listener)
+
+  registry.load_from_events(
+    [
+      {
+        "type": "task_completed",
+        "task_id": "bg_7",
+        "final_state": "completed",
+        "completed_at": 125.0,
+        "result": {"response": "done"},
+        "owner_runner_id": "runner_old",
+        "owner_role": "writer",
+        "sub_agent_id": "sub7:sess-parent",
+        "parent_turn_id": "turn-1",
+        "call_index": 7,
+        "task_type": "background",
+        "provider_name": "anthropic",
+        "model": "claude-sonnet-4-6",
+      },
+      {
+        "type": "task_registered",
+        "task_id": "bg_7",
+        "agent_name": "writer",
+        "started_at": 100.0,
+        "metadata": {"custom": "value"},
+        "owner_runner_id": "runner_old",
+        "owner_role": "writer",
+        "sub_agent_id": "sub7:sess-parent",
+        "parent_turn_id": "turn-1",
+        "call_index": 7,
+        "task_type": "background",
+        "provider_name": "anthropic",
+        "model": "claude-sonnet-4-6",
+      },
+      {
+        "type": "task_registered",
+        "task_id": "bg_9",
+        "agent_name": "reviewer",
+        "started_at": 200.0,
+        "owner_runner_id": "runner_old",
+        "owner_role": "writer",
+        "sub_agent_id": "sub9:sess-parent",
+        "parent_turn_id": "turn-2",
+        "call_index": 9,
+        "task_type": "background",
+        "provider_name": "openai",
+        "model": "gpt-5.2",
+      },
+      {
+        "type": "parent_message_sent",
+        "task_id": "bg_9",
+        "message_id": "msg-1",
+        "message": "status",
+      },
+    ]
+  )
+
+  completed = registry.get("bg_7")
+  interrupted = registry.get("bg_9")
+  assert completed is not None
+  assert interrupted is not None
+  assert completed.state == TaskState.COMPLETED
+  assert completed.result == {"response": "done"}
+  assert completed.completed_at == 125.0
+  assert completed.metadata["custom"] == "value"
+  assert interrupted.state == TaskState.INTERRUPTED
+  assert interrupted.completed_at == 200.0
+  assert interrupted.reconstructed_from_log is True
+  assert interrupted.metadata["parent_messages"][0]["message_id"] == "msg-1"
+  assert registry.register("background_agent").task_id == "bg_10"
+  assert listener.transitions == []
 
 
 def test_make_progress_tracker_updates_tool_usage_fields() -> None:

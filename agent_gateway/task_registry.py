@@ -14,6 +14,7 @@ class TaskState(Enum):
   COMPLETED = "completed"
   FAILED = "failed"
   KILLED = "killed"
+  INTERRUPTED = "interrupted"
 
 
 @dataclass
@@ -43,6 +44,7 @@ class TaskEntry:
   provider_name: str | None = None
   model: str | None = None
   message_inbox: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
+  reconstructed_from_log: bool = False
 
   @property
   def completed(self) -> bool:
@@ -108,7 +110,7 @@ class TaskLifecycleListener(Protocol):
     ...
 
 
-_TERMINAL_STATES = {TaskState.COMPLETED, TaskState.FAILED, TaskState.KILLED}
+_TERMINAL_STATES = {TaskState.COMPLETED, TaskState.FAILED, TaskState.KILLED, TaskState.INTERRUPTED}
 
 
 class NotificationQueue:
@@ -251,6 +253,85 @@ class TaskRegistry:
   def add_listener(self, listener: TaskLifecycleListener) -> None:
     self._listeners.append(listener)
 
+  def load_from_events(self, events: list[dict[str, Any]]) -> None:
+    """Rebuild registry from durable task events without firing listeners.
+
+    Tasks that were killed in a prior process rebuild as ``interrupted`` if no
+    durable completion event exists; v1 cannot distinguish those from tasks
+    that were running when the process crashed.
+    """
+    grouped: dict[str, dict[str, Any]] = {}
+    max_suffix: int | None = None
+    for event in events:
+      task_id = str(event.get("task_id") or "")
+      if not task_id:
+        continue
+      bucket = grouped.setdefault(task_id, {"messages": []})
+      event_type = str(event.get("type") or "")
+      if event_type == "task_registered":
+        bucket["registered"] = dict(event)
+      elif event_type == "task_completed":
+        bucket["completed"] = dict(event)
+      elif event_type == "parent_message_sent":
+        bucket["messages"].append(dict(event))
+
+    for task_id, bucket in grouped.items():
+      registered = bucket.get("registered")
+      if not isinstance(registered, dict):
+        continue
+      suffix = self._numeric_suffix(task_id)
+      if suffix is not None:
+        max_suffix = suffix if max_suffix is None else max(max_suffix, suffix)
+      completed = bucket.get("completed")
+      metadata = dict(registered.get("metadata") or {})
+      for key in (
+        "owner_runner_id",
+        "owner_role",
+        "sub_agent_id",
+        "parent_turn_id",
+        "call_index",
+        "task_type",
+        "provider_name",
+        "model",
+        "parent_session_id",
+      ):
+        if key in registered:
+          metadata[key] = registered.get(key)
+      metadata["parent_messages"] = list(bucket.get("messages") or [])
+
+      state = TaskState.INTERRUPTED
+      result = None
+      error = None
+      completed_at = registered.get("started_at")
+      if isinstance(completed, dict):
+        try:
+          state = TaskState(str(completed.get("final_state") or TaskState.FAILED.value))
+        except ValueError:
+          state = TaskState.FAILED
+        result = completed.get("result")
+        error = completed.get("error")
+        completed_at = completed.get("completed_at", completed_at)
+
+      entry = TaskEntry(
+        task_id=task_id,
+        task_type=str(registered.get("task_type") or "background_agent"),
+        agent_name=registered.get("agent_name"),
+        state=state,
+        started_at=float(registered.get("started_at") or time.time()),
+        completed_at=float(completed_at or time.time()),
+        result=dict(result) if isinstance(result, dict) else result,
+        error=dict(error) if isinstance(error, dict) else error,
+        metadata=metadata,
+        provider_name=registered.get("provider_name"),
+        model=registered.get("model"),
+        reconstructed_from_log=True,
+      )
+      self._tasks[task_id] = entry
+
+    if max_suffix is not None:
+      self._seq = max(self._seq, max_suffix + 1)
+    self._auto_evict_completed()
+
   @property
   def inflight_count(self) -> int:
     return sum(1 for entry in self._tasks.values() if entry.state == TaskState.RUNNING)
@@ -267,3 +348,10 @@ class TaskRegistry:
     while len(self._tasks) > limit and completed:
       oldest = completed.pop(0)
       self._tasks.pop(oldest.task_id, None)
+
+  @staticmethod
+  def _numeric_suffix(task_id: str) -> int | None:
+    try:
+      return int(str(task_id).rsplit("_", 1)[-1])
+    except (TypeError, ValueError):
+      return None

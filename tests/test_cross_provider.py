@@ -276,7 +276,7 @@ def test_make_run_agent_handler_uses_skill_provider_and_resolved_default_model(t
   _write_skill(
     skills_dir,
     "openai-worker",
-    "---\nprovider: openai\n---\nUse the OpenAI worker.",
+    "---\nagent_callable: true\nagent_description: Uses the OpenAI worker.\nprovider: openai\n---\nUse the OpenAI worker.",
   )
   runner = _StubRunner()
   resolved_provider = _RecordingProvider("openai")

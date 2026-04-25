@@ -49,6 +49,11 @@ STREAM_RETRY_BACKOFF = 2.0
 _MAX_NOTIFICATIONS_PER_TURN = 5
 
 
+def _derive_sub_agent_id(parent_session: Any, call_index: int) -> str:
+  parent_sid = str(getattr(parent_session, "session_id", parent_session) or "")
+  return f"sub{int(call_index)}:{parent_sid}"
+
+
 def _estimate_tokens(text: str) -> int:
   """Rough token estimate: ~4 chars per token for English text + JSON overhead."""
   return max(1, len(text) // 4)
@@ -341,6 +346,8 @@ class AgentRunner:
     self._durable_attach_emitted = False
     self._last_durable_seq = 0
     self._last_assistant_message_seq: int | None = None
+    self._task_registry_rebuild_lock = asyncio.Lock()
+    self._task_registry_rebuilt = False
 
   @property
   def _background_tasks(self) -> Dict[str, TaskEntry]:
@@ -366,6 +373,59 @@ class AgentRunner:
     entry = await self._agent_session_log.append(payload)
     self._last_durable_seq = entry.seq
     return entry
+
+  async def _rebuild_task_registry_from_log(self) -> None:
+    if self._task_registry_rebuilt:
+      return
+    async with self._task_registry_rebuild_lock:
+      if self._task_registry_rebuilt:
+        return
+      if self._agent_session_log is None:
+        self._task_registry_rebuilt = True
+        return
+
+      entries, _ = await self._agent_session_log.query(
+        event_types={"task_registered", "task_completed", "parent_message_sent"},
+        order="desc",
+      )
+      events: list[dict[str, Any]] = []
+      registered_task_ids: set[str] = set()
+      max_retained = max(0, getattr(self._task_registry, "_max_retained", 50))
+      for entry in entries:
+        event = entry.event
+        task_id = str(event.get("task_id") or "")
+        if not task_id:
+          continue
+        events.append(dict(event))
+        if event.get("type") == "task_registered":
+          registered_task_ids.add(task_id)
+          if len(registered_task_ids) >= max_retained:
+            break
+      self._task_registry.load_from_events(events)
+      self._task_registry_rebuilt = True
+
+  async def _lookup_task_in_log(self, task_id: str) -> TaskEntry | None:
+    if self._agent_session_log is None:
+      return None
+    entries, _ = await self._agent_session_log.query(
+      event_types={"task_registered", "task_completed", "parent_message_sent"},
+      order="desc",
+    )
+    events: list[dict[str, Any]] = []
+    found_registration = False
+    for entry in entries:
+      event = entry.event
+      if event.get("task_id") != task_id:
+        continue
+      events.append(dict(event))
+      if event.get("type") == "task_registered":
+        found_registration = True
+        break
+    if not found_registration:
+      return None
+    registry = TaskRegistry(max_retained=max(1, getattr(self._task_registry, "_max_retained", 50)))
+    registry.load_from_events(events)
+    return registry.get(task_id)
 
   async def _emit_attach_event(self) -> None:
     entry = await self._append_durable_event(
@@ -697,7 +757,7 @@ class AgentRunner:
     else:
       effective_auth = getattr(sub_session, "auth_config", None) or self._auth_config
 
-    sub_session_id = str(getattr(sub_session, "session_id", "") or f"sub{call_index}:{self._sid}")
+    sub_session_id = str(getattr(sub_session, "session_id", "") or _derive_sub_agent_id(self._full_session_id, call_index))
     original_on_event = getattr(self._log, "_on_event", None)
     progress_cb = make_progress_tracker(task_entry) if task_entry else None
 
@@ -866,6 +926,26 @@ class AgentRunner:
       payload["agent"] = bg_task.agent_name
 
     elapsed = self._background_elapsed_seconds(bg_task)
+    if getattr(bg_task, "state", None) == TaskState.INTERRUPTED:
+      metadata = getattr(bg_task, "metadata", {}) if isinstance(getattr(bg_task, "metadata", None), dict) else {}
+      payload.update(
+        {
+          "status": "interrupted",
+          "completed": True,
+          "elapsed_seconds": elapsed,
+          "started_at": bg_task.started_at,
+          "owner_runner_id": metadata.get("owner_runner_id"),
+          "owner_role": metadata.get("owner_role"),
+          "sub_agent_id": metadata.get("sub_agent_id"),
+          "parent_turn_id": metadata.get("parent_turn_id"),
+          "call_index": metadata.get("call_index"),
+          "task_type": metadata.get("task_type", getattr(bg_task, "task_type", None)),
+          "provider_name": metadata.get("provider_name", getattr(bg_task, "provider_name", None)),
+          "model": metadata.get("model", getattr(bg_task, "model", None)),
+          "message": "Background task was interrupted by a gateway restart before completion.",
+        }
+      )
+      return payload
     if getattr(bg_task, "state", None) == TaskState.KILLED:
       payload["status"] = "killed"
       payload["elapsed_seconds"] = elapsed
@@ -964,14 +1044,18 @@ class AgentRunner:
       bg_task.result = result if isinstance(result, dict) else ({"result": result} if result is not None else None)
       bg_task.error = error
       if bg_task.error is not None:
+        await self._append_task_completed_event(bg_task, TaskState.FAILED)
         self._task_registry.transition(bg_task.task_id, TaskState.FAILED, error=bg_task.error)
       else:
+        await self._append_task_completed_event(bg_task, TaskState.COMPLETED)
         self._task_registry.transition(bg_task.task_id, TaskState.COMPLETED, result=bg_task.result)
     except asyncio.CancelledError:
       bg_task.error = {"code": "cancelled", "message": "Background task was cancelled"}
+      await self._append_task_completed_event(bg_task, TaskState.FAILED)
       self._task_registry.transition(bg_task.task_id, TaskState.FAILED, error=bg_task.error)
     except Exception as exc:
       bg_task.error = {"code": "background_error", "message": str(exc)}
+      await self._append_task_completed_event(bg_task, TaskState.FAILED)
       self._task_registry.transition(bg_task.task_id, TaskState.FAILED, error=bg_task.error)
     finally:
       if on_complete is not None:
@@ -982,12 +1066,40 @@ class AgentRunner:
         except Exception:
           pass
 
+  def _task_correlation_payload(self, entry: TaskEntry) -> Dict[str, Any]:
+    metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
+    return {
+      "task_id": entry.task_id,
+      "owner_runner_id": metadata.get("owner_runner_id", self._runner_id),
+      "owner_role": metadata.get("owner_role", self._role),
+      "sub_agent_id": metadata.get("sub_agent_id"),
+      "parent_turn_id": metadata.get("parent_turn_id"),
+      "call_index": metadata.get("call_index"),
+      "task_type": metadata.get("task_type", "background"),
+      "provider_name": metadata.get("provider_name", entry.provider_name),
+      "model": metadata.get("model", entry.model),
+    }
+
+  async def _append_task_completed_event(self, entry: TaskEntry, final_state: TaskState) -> None:
+    payload = self._task_correlation_payload(entry)
+    payload.update(
+      {
+        "type": "task_completed",
+        "final_state": final_state.value,
+        "completed_at": time.time(),
+        "result": entry.result,
+        "error": entry.error,
+      }
+    )
+    await self._append_durable_event(payload)
+
   async def _register_background_task(
     self,
     *,
     tool_input: Dict[str, Any],
     handler: BackgroundTaskHandler,
     agent_name: str | None = None,
+    parent_turn_id: str | None = None,
     on_complete: BackgroundTaskCallback | None = None,
     on_before_start: Callable[[], None] | None = None,
   ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -1024,6 +1136,28 @@ class AgentRunner:
       call_index = int(entry.task_id.rsplit("_", 1)[-1])
     except ValueError:
       call_index = 0
+    sub_agent_id = _derive_sub_agent_id(self._gateway_session_id, call_index)
+    correlation = {
+      "owner_runner_id": self._runner_id,
+      "owner_role": self._role,
+      "sub_agent_id": sub_agent_id,
+      "parent_turn_id": parent_turn_id if parent_turn_id is not None else self._parent_turn_id,
+      "call_index": call_index,
+      "task_type": "background",
+      "provider_name": entry.provider_name,
+      "model": entry.model,
+    }
+    entry.metadata.update(correlation)
+    await self._append_durable_event(
+      {
+        "type": "task_registered",
+        **self._task_correlation_payload(entry),
+        "agent_name": agent_name,
+        "parent_session_id": self._gateway_session_id,
+        "metadata": dict(entry.metadata),
+        "started_at": entry.started_at,
+      }
+    )
 
     async def _entry_aware_handler(ti: Dict[str, Any], **kwargs: Any) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
       kwargs["task_entry"] = entry
@@ -1068,6 +1202,8 @@ class AgentRunner:
       return None, {"code": "invalid_input", "message": "timeout must be a number"}
     timeout = self._background_timeout_value(raw_timeout)
 
+    await self._rebuild_task_registry_from_log()
+
     if task_id == "*":
       selected = self._task_registry.list_tasks()
       if wait:
@@ -1082,7 +1218,9 @@ class AgentRunner:
 
     bg_task = self._task_registry.get(task_id)
     if bg_task is None:
-      return None, {"code": "not_found", "message": f"Unknown background task: {task_id}"}
+      bg_task = await self._lookup_task_in_log(task_id)
+      if bg_task is None:
+        return None, {"code": "not_found", "message": f"Unknown background task: {task_id}"}
 
     if wait and bg_task.asyncio_task is not None and not bg_task.completed:
       await asyncio.wait([bg_task.asyncio_task], timeout=timeout)
@@ -1849,6 +1987,7 @@ class AgentRunner:
         await self._emit_attach_event()
         if self._role == "writer":
           self._write_lease_metadata()
+        await self._rebuild_task_registry_from_log()
         prior_messages = await self._context_builder.build() if self._context_builder is not None else []
         new_user_input = self._extract_last_user_message(messages)
         if new_user_input is not None:

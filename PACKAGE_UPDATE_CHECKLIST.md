@@ -37,7 +37,7 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 
 ## Deprecation log
 
-- `send_prompt(on_usage=...)` legacy 4-int callbacks are deprecated in favor of `UsageEvent` callbacks. Target removal: `v0.9.0`.
+- `send_prompt(on_usage=...)` legacy 4-int callbacks are deprecated in favor of `UsageEvent` callbacks (introduced 0.11.1). Target removal: `v0.12.0`.
 - Reconciler deployments require SQLite `3.35.0+` for `UPDATE ... RETURNING`.
 
 ## What NOT to update for every feature

@@ -65,12 +65,21 @@ def _write_skill(skills_dir: Path, name: str, body: str) -> None:
   (skills_dir / f"{name}.md").write_text(body, encoding="utf-8")
 
 
+def _callable_skill(frontmatter: str = "", body: str = "Use multiple sources.") -> str:
+  frontmatter = frontmatter.strip()
+  lines = ["---", "agent_callable: true", "agent_description: Callable test skill."]
+  if frontmatter:
+    lines.extend(frontmatter.splitlines())
+  lines.extend(["---", body])
+  return "\n".join(lines)
+
+
 def test_make_run_agent_handler_loads_skill_profile_and_filters_tools(tmp_path: Path) -> None:
   skills_dir = tmp_path / "skills"
   _write_skill(
     skills_dir,
     "deep-research",
-    "---\nmodel: claude-opus-4-6\nmax_turns: 7\ntimeout: 12.5\n---\nUse multiple sources.",
+    _callable_skill("model: claude-opus-4-6\nmax_turns: 7\ntimeout: 12.5"),
   )
   runner = _StubRunner()
   keep_tool = _dummy_tool
@@ -267,7 +276,7 @@ def test_make_run_agent_handler_returns_not_found_for_unknown_skill(tmp_path: Pa
 
 def test_make_run_agent_handler_validates_effective_skill_model(tmp_path: Path) -> None:
   skills_dir = tmp_path / "skills"
-  _write_skill(skills_dir, "research", "---\nmodel: custom-model\n---\nResearch.")
+  _write_skill(skills_dir, "research", _callable_skill("model: custom-model", body="Research."))
   handler = make_run_agent_handler(
     [_StubRunner()],
     skill_loader=SkillLoader(skills_dir),
@@ -391,15 +400,33 @@ def test_make_run_agent_handler_allows_any_model_when_allowed_models_empty(tmp_p
   assert runner.calls[0]["model"] == "custom-model"
 
 
-def test_make_run_agent_tool_def_includes_skill_names(tmp_path: Path) -> None:
+def test_make_run_agent_tool_def_includes_skill_descriptions_in_agent_param_only(tmp_path: Path) -> None:
   skills_dir = tmp_path / "skills"
-  _write_skill(skills_dir, "alpha", "Alpha.")
-  _write_skill(skills_dir, "beta", "Beta.")
+  _write_skill(
+    skills_dir,
+    "alpha",
+    _callable_skill("agent_description: Alpha reviews earnings.", body="Alpha."),
+  )
+  _write_skill(
+    skills_dir,
+    "beta",
+    _callable_skill("agent_description: Beta reviews risk.", body="Beta."),
+  )
+  _write_skill(
+    skills_dir,
+    "hidden",
+    "---\nagent_description: Hidden description.\n---\nHidden.",
+  )
 
   tool_def = make_run_agent_tool_def(SkillLoader(skills_dir))
+  agent_description = tool_def["input_schema"]["properties"]["agent"]["description"]
 
-  assert tool_def["description"].endswith("Available agents: alpha, beta.")
-  assert tool_def["input_schema"]["properties"]["agent"]["description"].endswith("One of: alpha, beta.")
+  assert "Available agents:" not in tool_def["description"]
+  assert "Alpha reviews earnings." not in tool_def["description"]
+  assert "Available agents:" in agent_description
+  assert "- alpha: Alpha reviews earnings." in agent_description
+  assert "- beta: Beta reviews risk." in agent_description
+  assert "hidden" not in agent_description
 
 
 def test_make_run_agent_tool_def_has_no_skill_suffix_without_skills() -> None:
@@ -407,6 +434,25 @@ def test_make_run_agent_tool_def_has_no_skill_suffix_without_skills() -> None:
 
   assert "Available agents:" not in tool_def["description"]
   assert "One of:" not in tool_def["input_schema"]["properties"]["agent"]["description"]
+
+
+def test_make_run_agent_handler_rejects_non_callable_named_skill(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  _write_skill(skills_dir, "research", "---\nagent_description: Not callable.\n---\nResearch.")
+  handler = make_run_agent_handler(
+    [_StubRunner()],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+  )
+
+  result, error = _run(handler({"agent": "research", "task": "Collect"}))
+
+  assert result is None
+  assert error == {
+    "code": "invalid_skill",
+    "message": "Agent 'research' is not callable. Choose a callable named agent or omit agent.",
+  }
 
 
 def test_make_run_agent_handler_background_registers_task(tmp_path: Path) -> None:
@@ -457,7 +503,7 @@ def test_background_cleans_stale_output_file(tmp_path: Path) -> None:
   _write_skill(
     skills_dir,
     agent_name,
-    "---\npersist_state: true\n---\nUse multiple sources.",
+    _callable_skill("persist_state: true"),
   )
   stale_path = outputs_dir / agent_name / f"{datetime.date.today().isoformat()}.md"
   stale_path.parent.mkdir(parents=True, exist_ok=True)
@@ -487,7 +533,7 @@ def test_background_skips_cleanup_without_outputs_dir(tmp_path: Path) -> None:
   _write_skill(
     skills_dir,
     agent_name,
-    "---\npersist_state: true\n---\nUse multiple sources.",
+    _callable_skill("persist_state: true"),
   )
   stale_path = external_outputs_dir / agent_name / f"{datetime.date.today().isoformat()}.md"
   stale_path.parent.mkdir(parents=True, exist_ok=True)
@@ -513,7 +559,7 @@ def test_background_cleans_for_non_persistent_skill_too(tmp_path: Path) -> None:
   skills_dir = tmp_path / "skills"
   outputs_dir = tmp_path / "outputs"
   agent_name = "deep-research"
-  _write_skill(skills_dir, agent_name, "Use multiple sources.")
+  _write_skill(skills_dir, agent_name, _callable_skill())
   stale_path = outputs_dir / agent_name / f"{datetime.date.today().isoformat()}.md"
   stale_path.parent.mkdir(parents=True, exist_ok=True)
   stale_path.write_text("stale", encoding="utf-8")
@@ -545,7 +591,7 @@ def test_background_cleanup_returns_error_on_oserror(
   _write_skill(
     skills_dir,
     agent_name,
-    "---\npersist_state: true\n---\nUse multiple sources.",
+    _callable_skill("persist_state: true"),
   )
   stale_path = outputs_dir / agent_name / f"{datetime.date.today().isoformat()}.md"
   stale_path.parent.mkdir(parents=True, exist_ok=True)

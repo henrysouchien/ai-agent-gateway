@@ -12,7 +12,13 @@ if str(PKG_DIR) not in sys.path:
 if str(API_DIR) not in sys.path:
   sys.path.insert(0, str(API_DIR))
 
-from agent_gateway.skills import SkillProfile, parse_skill_file
+from agent_gateway.skills import (
+  AGENT_DESCRIPTION_MAX_CHARS,
+  AGENT_DESCRIPTION_PLACEHOLDER,
+  SkillLoader,
+  SkillProfile,
+  parse_skill_file,
+)
 
 
 def _write_skill(tmp_path: Path, frontmatter: str | None, *, body: str = "# Skill\n\nPrompt") -> Path:
@@ -23,6 +29,15 @@ def _write_skill(tmp_path: Path, frontmatter: str | None, *, body: str = "# Skil
     text = f"---\n{textwrap.dedent(frontmatter).strip()}\n---\n\n{body}\n"
   skill_path.write_text(text, encoding="utf-8")
   return skill_path
+
+
+def _write_named_skill(skills_dir: Path, name: str, frontmatter: str | None, *, body: str = "# Skill") -> None:
+  skills_dir.mkdir(parents=True, exist_ok=True)
+  if frontmatter is None:
+    text = body
+  else:
+    text = f"---\n{textwrap.dedent(frontmatter).strip()}\n---\n\n{body}\n"
+  (skills_dir / f"{name}.md").write_text(text, encoding="utf-8")
 
 
 def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
@@ -67,6 +82,55 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
     "initial_message": "Run the workflow.",
     "delivery_label": "Daily Scan",
   }
+
+
+def test_list_callable_skills_with_descriptions_filters_truncates_and_placeholders(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  skills_dir = tmp_path / "skills"
+  long_description = "x" * (AGENT_DESCRIPTION_MAX_CHARS + 20)
+  _write_named_skill(
+    skills_dir,
+    "alpha",
+    """
+    agent_callable: true
+    agent_description: Alpha reviews earnings.
+    """,
+  )
+  _write_named_skill(
+    skills_dir,
+    "beta",
+    """
+    agent_callable: true
+    """,
+  )
+  _write_named_skill(
+    skills_dir,
+    "gamma",
+    f"""
+    agent_callable: true
+    agent_description: {long_description}
+    """,
+  )
+  _write_named_skill(
+    skills_dir,
+    "not-callable",
+    """
+    agent_description: Hidden from callable catalog.
+    """,
+  )
+
+  entries = SkillLoader(skills_dir).list_callable_skills_with_descriptions()
+
+  assert entries[0] == ("alpha", "Alpha reviews earnings.")
+  assert entries[1] == ("beta", AGENT_DESCRIPTION_PLACEHOLDER)
+  assert entries[2][0] == "gamma"
+  assert len(entries[2][1]) == AGENT_DESCRIPTION_MAX_CHARS
+  assert entries[2][1].endswith("…")
+  assert "not-callable" not in dict(entries)
+  assert "missing agent_description" in caplog.text
+  assert "rendered output will be truncated" in caplog.text
 
 
 def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:

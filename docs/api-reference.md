@@ -234,6 +234,34 @@ Alternative execution path that keeps the same gateway HTTP surface but delegate
 
 Use this when SDK parity matters more than native-runner control.
 
+`AgentSDKConfig` accepts the same identity fields as `AgentRunner` (`user_id`, `channel`, `rate_table_version`, `billing_mode`); both runners normalize values via `normalize_identity()` to the same defaults.
+
+## Usage Callbacks and Billing
+
+### `UsageEvent`
+
+Per-turn billing event emitted by both `AgentRunner` and `AgentSDKRunner`. Carries token counts, cost, identity (`user_id`, `channel`, `request_id`), and a unique `event_id` (UUID, default-generated). Fed to `UsageLedger.record()` and to user-supplied `on_usage` callbacks.
+
+### `SessionUsageSummary`
+
+Aggregated billing record emitted **once per chat** after background-task drain. Fields include summed tokens/cost, `turns`, `request_id`, plus `drain_complete: bool` and `in_flight_task_count: int` for detecting incomplete drains. Sub-agent `UsageEvent`s roll into the parent runner's summary via the internal aggregator.
+
+### `normalize_identity()`
+
+Helper that applies the same identity defaults across `AgentRunner` and `AgentSDKRunner`: `user_id or "_default"`, `billing_mode → "metered"|"byok"`, `rate_table_version or "unknown"`, `channel` stripped or `None`. Use this if you build a custom runner and want consistent ledger records.
+
+### Runner callbacks
+
+Both runners accept three usage-related callbacks at construction:
+
+- `on_usage: Callable[[UsageEvent], Awaitable[None] | None]` — fires per-turn for live cost streaming. Use for SSE telemetry, real-time UI updates.
+- `on_session_summary: Callable[[SessionUsageSummary], Awaitable[None] | None]` — fires once per chat after drain. Use for billing writes (`record_cost`).
+- `on_late_usage_event: Callable[[UsageEvent], Awaitable[None] | None]` — fires when a `UsageEvent` arrives **after** `on_session_summary` already emitted (e.g., a background sub-agent finished post-stream). Wire this to a spool table for reconciliation.
+
+### `send_prompt()` legacy callback shape
+
+Pre-0.11.1 `send_prompt(on_usage=...)` accepted a 4-int callable: `(input_tokens, output_tokens, cache_read, cache_write)`. This contract is preserved via runtime arity detection but emits `DeprecationWarning`. Migrate to the modern `Callable[[UsageEvent], ...]` shape; legacy removal targeted `v0.12.0`.
+
 ## Tools And Approval
 
 ### `ToolDispatcher`

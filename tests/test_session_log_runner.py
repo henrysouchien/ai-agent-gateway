@@ -10,8 +10,9 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner, AgentSessionLog, EventLog, GatewaySession, ModelInfo, ModelProvider, ToolDispatcher
+from agent_gateway import AgentRunner, AgentSessionLog, EventLog, GatewaySession, ModelInfo, ModelProvider, TaskRegistry, TaskState, ToolDispatcher
 from agent_gateway.providers import StreamEvent
+import agent_gateway.runner as gateway_runner
 
 
 def _run(coro):
@@ -162,6 +163,32 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
   assert entries[6].event["reason"] == "completed"
 
 
+def test_task_durability_events_use_type_and_query_round_trips(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "task-events.jsonl")
+  correlation = {
+    "task_id": "bg_0",
+    "owner_runner_id": "runner_old",
+    "owner_role": "writer",
+    "sub_agent_id": "sub0:sess-parent",
+    "parent_turn_id": "turn-1",
+    "call_index": 0,
+    "task_type": "background",
+    "provider_name": "anthropic",
+    "model": "claude-sonnet-4-6",
+  }
+
+  _run(log.append({"type": "task_registered", **correlation, "agent_name": "writer", "started_at": 1.0}))
+  _run(log.append({"type": "parent_message_sent", **correlation, "message_id": "msg-1", "message": "go"}))
+  _run(log.append({"type": "task_completed", **correlation, "final_state": "completed", "completed_at": 2.0, "result": {"response": "done"}, "error": None}))
+
+  entries, _ = _run(log.query(event_types={"task_registered", "parent_message_sent", "task_completed"}, order="asc"))
+
+  assert [entry.event["type"] for entry in entries] == ["task_registered", "parent_message_sent", "task_completed"]
+  for entry in entries:
+    for key, value in correlation.items():
+      assert entry.event[key] == value
+
+
 def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrupt(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "recovery.jsonl")
   _run(
@@ -253,6 +280,236 @@ def test_second_writer_lease_acquisition_raises(tmp_path: Path) -> None:
   _run(_exercise())
 
 
+def test_register_background_task_emits_task_registered_with_correlation(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "registered.jsonl")
+    calls: list[tuple[Any, int]] = []
+
+    def _fake_derive(parent_session: Any, call_index: int) -> str:
+      calls.append((parent_session, call_index))
+      return f"sub{call_index}:derived-parent"
+
+    monkeypatch.setattr(gateway_runner, "_derive_sub_agent_id", _fake_derive)
+    runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-parent",
+      provider=_ScriptedProvider([_text_turn("unused")]),
+      auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      agent_session_log=log,
+    )
+    runner._runner_id = "runner_new"
+
+    async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
+      return {"response": "done"}, None
+
+    result, error = await runner._register_background_task(
+      tool_input={"task": "Collect", "provider": "anthropic", "model": "claude-sonnet-4-6"},
+      handler=_handler,
+      agent_name="writer",
+      parent_turn_id="turn-1",
+    )
+    assert error is None
+    assert result is not None
+    task = runner._task_registry.get(result["task_id"])
+    assert task is not None
+    await asyncio.wait_for(task.asyncio_task, timeout=1.0)
+
+    registered, _ = await log.query(event_types={"task_registered"}, order="asc")
+    assert len(registered) == 1
+    event = registered[0].event
+    assert event["type"] == "task_registered"
+    assert event["task_id"] == result["task_id"]
+    assert event["owner_runner_id"] == "runner_new"
+    assert event["owner_role"] == "writer"
+    assert event["sub_agent_id"] == "sub0:derived-parent"
+    assert event["parent_turn_id"] == "turn-1"
+    assert event["call_index"] == 0
+    assert event["task_type"] == "background"
+    assert event["provider_name"] == "anthropic"
+    assert event["model"] == "claude-sonnet-4-6"
+    assert task.metadata["sub_agent_id"] == "sub0:derived-parent"
+    assert calls == [("sess-parent", 0)]
+
+  _run(_case())
+
+
+def test_task_completed_is_durable_before_terminal_transition() -> None:
+  async def _case() -> None:
+    runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-parent",
+      provider=_ScriptedProvider([_text_turn("unused")]),
+      auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    )
+    entry = runner._task_registry.register("background_agent")
+    entry.metadata.update(
+      {
+        "owner_runner_id": "runner_new",
+        "owner_role": "writer",
+        "sub_agent_id": "sub0:sess-parent",
+        "parent_turn_id": "turn-1",
+        "call_index": 0,
+        "task_type": "background",
+        "provider_name": "anthropic",
+        "model": "claude-sonnet-4-6",
+      }
+    )
+    ordering: list[str] = []
+
+    async def _append(event: dict[str, Any]):
+      if event.get("type") == "task_completed":
+        ordering.append("append_task_completed")
+
+    original_transition = runner._task_registry.transition
+
+    def _transition(task_id: str, new_state: TaskState, **kwargs: Any):
+      if new_state in {TaskState.COMPLETED, TaskState.FAILED}:
+        ordering.append(f"transition_{new_state.value}")
+      return original_transition(task_id, new_state, **kwargs)
+
+    runner._append_durable_event = _append  # type: ignore[method-assign]
+    runner._task_registry.transition = _transition  # type: ignore[method-assign]
+
+    async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
+      return {"response": "done"}, None
+
+    await runner._run_background_agent(entry, _handler, {}, 0)
+
+    assert ordering == ["append_task_completed", "transition_completed"]
+
+  _run(_case())
+
+
+def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "rebuild.jsonl")
+    for index in range(4):
+      await log.append(
+        {
+          "type": "task_registered",
+          "task_id": f"bg_{index}",
+          "owner_runner_id": "runner_old",
+          "owner_role": "writer",
+          "sub_agent_id": f"sub{index}:sess-parent",
+          "parent_turn_id": f"turn-{index}",
+          "call_index": index,
+          "task_type": "background",
+          "provider_name": "anthropic",
+          "model": "claude-sonnet-4-6",
+          "agent_name": f"agent-{index}",
+          "started_at": 100.0 + index,
+        }
+      )
+      if index == 1:
+        await log.append(
+          {
+            "type": "task_completed",
+            "task_id": "bg_1",
+            "owner_runner_id": "runner_old",
+            "owner_role": "writer",
+            "sub_agent_id": "sub1:sess-parent",
+            "parent_turn_id": "turn-1",
+            "call_index": 1,
+            "task_type": "background",
+            "provider_name": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "final_state": "completed",
+            "completed_at": 150.0,
+            "result": {"response": "done"},
+            "error": None,
+          }
+        )
+    await log.append(
+      {
+        "type": "parent_message_sent",
+        "task_id": "bg_99",
+        "owner_runner_id": "runner_old",
+        "owner_role": "writer",
+        "sub_agent_id": "sub99:sess-parent",
+        "parent_turn_id": "turn-99",
+        "call_index": 99,
+        "task_type": "background",
+        "provider_name": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "message_id": "msg-99",
+        "message": "dangling event should not count toward hot set cap",
+      }
+    )
+    registry = TaskRegistry(max_retained=2)
+    runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-parent",
+      provider=_ScriptedProvider([_text_turn("unused")]),
+      auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      agent_session_log=log,
+      task_registry=registry,
+    )
+
+    all_result, all_error = await runner.get_background_result({"task_id": "*"})
+    assert all_error is None
+    assert [task["task_id"] for task in all_result["tasks"]] == ["bg_2", "bg_3"]
+
+    lazy_result, lazy_error = await runner.get_background_result({"task_id": "bg_1"})
+    assert lazy_error is None
+    assert lazy_result["status"] == "completed"
+    assert lazy_result["response"] == "done"
+
+    assert registry.register("background_agent").task_id == "bg_4"
+
+  _run(_case())
+
+
+def test_rebuild_renders_interrupted_and_completed_crash_cases(tmp_path: Path) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "crash-cases.jsonl")
+    base = {
+      "owner_runner_id": "runner_old",
+      "owner_role": "writer",
+      "parent_turn_id": "turn-1",
+      "task_type": "background",
+      "provider_name": "anthropic",
+      "model": "claude-sonnet-4-6",
+    }
+    await log.append({"type": "task_registered", **base, "task_id": "bg_0", "sub_agent_id": "sub0:sess-parent", "call_index": 0, "agent_name": "running", "started_at": 100.0})
+    await log.append({"type": "task_registered", **base, "task_id": "bg_1", "sub_agent_id": "sub1:sess-parent", "call_index": 1, "agent_name": "done", "started_at": 110.0})
+    await log.append({"type": "task_completed", **base, "task_id": "bg_1", "sub_agent_id": "sub1:sess-parent", "call_index": 1, "final_state": "completed", "completed_at": 120.0, "result": {"response": "done"}, "error": None})
+    await log.append({"type": "task_registered", **base, "task_id": "bg_2", "sub_agent_id": "sub2:sess-parent", "call_index": 2, "agent_name": "killed", "started_at": 130.0})
+
+    runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=_make_dispatcher(),
+      session_id="sess-parent",
+      provider=_ScriptedProvider([_text_turn("unused")]),
+      auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      agent_session_log=log,
+    )
+
+    interrupted, interrupted_error = await runner.get_background_result({"task_id": "bg_0"})
+    completed, completed_error = await runner.get_background_result({"task_id": "bg_1"})
+    killed_as_interrupted, killed_error = await runner.get_background_result({"task_id": "bg_2"})
+
+    assert interrupted_error is None
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["completed"] is True
+    assert interrupted["agent"] == "running"
+    assert interrupted["started_at"] == 100.0
+    assert interrupted["sub_agent_id"] == "sub0:sess-parent"
+    assert interrupted["parent_turn_id"] == "turn-1"
+    assert completed_error is None
+    assert completed["status"] == "completed"
+    assert completed["response"] == "done"
+    assert killed_error is None
+    assert killed_as_interrupted["status"] == "interrupted"
+
+  _run(_case())
+
+
 def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "sub-agent.jsonl")
   parent_runner = AgentRunner(
@@ -301,3 +558,38 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
   ]
   assert {entry.event["sub_agent_id"] for entry in entries} == {"sub0:sess-parent"}
 
+
+def test_spawn_sub_agent_uses_shared_sub_agent_id_helper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "sub-agent-helper.jsonl")
+  calls: list[tuple[Any, int]] = []
+
+  def _fake_derive(parent_session: Any, call_index: int) -> str:
+    calls.append((parent_session, call_index))
+    return f"sub{call_index}:derived-parent"
+
+  monkeypatch.setattr(gateway_runner, "_derive_sub_agent_id", _fake_derive)
+  parent_runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sess-parent",
+    provider=_ScriptedProvider([_text_turn("sub done")]),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+  )
+
+  result, error = _run(
+    parent_runner.spawn_sub_agent(
+      "Collect background context",
+      dispatcher=_make_dispatcher(),
+      sub_session=None,
+      max_turns=5,
+      timeout=5.0,
+      call_index=3,
+    )
+  )
+
+  assert error is None
+  assert result is not None
+  assert calls == [("sess-parent", 3)]
+  entries, _ = _run(log.query(role="sub_agent", order="asc"))
+  assert {entry.event["sub_agent_id"] for entry in entries} == {"sub3:derived-parent"}

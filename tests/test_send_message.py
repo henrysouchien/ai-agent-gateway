@@ -45,6 +45,20 @@ class _RegistryRunner:
     self._task_registry = registry
 
 
+class _DurableRegistryRunner(_RegistryRunner):
+  _runner_id = "runner_new"
+  _role = "writer"
+  _full_session_id = "sess-parent"
+  _usage_user_id = "alice"
+
+  def __init__(self, registry: TaskRegistry | None) -> None:
+    super().__init__(registry)
+    self.events: list[dict[str, Any]] = []
+
+  async def _append_durable_event(self, event: dict[str, Any]) -> None:
+    self.events.append(dict(event))
+
+
 class _StubProvider:
   name = "stub"
 
@@ -111,6 +125,47 @@ def test_make_send_message_handler_delivers_message_by_task_id() -> None:
   assert error is None
   assert result == {"status": "delivered", "task_id": entry.task_id}
   assert entry.message_inbox.get_nowait() == "Check the appendix"
+
+
+def test_make_send_message_handler_emits_parent_message_sent_with_correlation() -> None:
+  registry = TaskRegistry()
+  entry = registry.register("background_agent", agent_name="writer")
+  entry.provider_name = "anthropic"
+  entry.model = "claude-sonnet-4-6"
+  entry.metadata.update(
+    {
+      "owner_runner_id": "runner_old",
+      "owner_role": "writer",
+      "sub_agent_id": "sub0:sess-parent",
+      "parent_turn_id": "turn-1",
+      "call_index": 0,
+      "task_type": "background",
+      "provider_name": "anthropic",
+      "model": "claude-sonnet-4-6",
+    }
+  )
+  registry.transition(entry.task_id, TaskState.RUNNING)
+  runner = _DurableRegistryRunner(registry)
+  handler = make_send_message_handler([runner])
+
+  result, error = _run(handler({"to": entry.task_id, "message": "Check the appendix"}))
+
+  assert error is None
+  assert result == {"status": "delivered", "task_id": entry.task_id}
+  assert len(runner.events) == 1
+  event = runner.events[0]
+  assert event["type"] == "parent_message_sent"
+  assert event["task_id"] == entry.task_id
+  assert event["owner_runner_id"] == "runner_old"
+  assert event["owner_role"] == "writer"
+  assert event["sub_agent_id"] == "sub0:sess-parent"
+  assert event["parent_turn_id"] == "turn-1"
+  assert event["call_index"] == 0
+  assert event["task_type"] == "background"
+  assert event["provider_name"] == "anthropic"
+  assert event["model"] == "claude-sonnet-4-6"
+  assert event["message"] == "Check the appendix"
+  assert event["message_id"]
 
 
 def test_make_send_message_handler_delivers_message_by_agent_name() -> None:
