@@ -7,7 +7,7 @@ from .providers import AnthropicProvider, CodexProvider, ModelProvider, OpenAIPr
 
 
 _FALLBACK_DEFAULT_MODELS = {
-  "anthropic": "claude-opus-4-7",
+  "anthropic": "claude-sonnet-4-6",
   "codex": "gpt-5.4",
   "openai": "gpt-4o",
 }
@@ -37,7 +37,10 @@ def _get_default_model_for_provider(provider: str | None = None) -> str:
       from api.credentials import get_default_model as get_default_model
     except ModuleNotFoundError:
       return _FALLBACK_DEFAULT_MODELS.get(resolved, _FALLBACK_DEFAULT_MODELS["anthropic"])
-  model = str(get_default_model(resolved)).strip()
+  try:
+    model = str(get_default_model(resolved)).strip()
+  except Exception:
+    model = ""
   if model:
     return model
   return _FALLBACK_DEFAULT_MODELS.get(resolved, _FALLBACK_DEFAULT_MODELS["anthropic"])

@@ -11,7 +11,14 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.multi_user.billing import SqliteUsageLedger, UsageEvent, replay_dlq, write_dlq
+from agent_gateway.multi_user.billing import (
+  SqliteUsageLedger,
+  UsageEvent,
+  _UsageAggregator,
+  normalize_identity,
+  replay_dlq,
+  write_dlq,
+)
 
 
 def _run(coro):
@@ -235,3 +242,69 @@ def test_sqlite_usage_ledger_schema_migration_is_idempotent(tmp_path: Path) -> N
 
   assert count == 1
   assert str(journal_mode).lower() == "wal"
+
+
+def test_usage_event_event_id_default_supports_old_dlq_payload() -> None:
+  payload = _event().__dict__.copy()
+  payload.pop("event_id", None)
+
+  event = UsageEvent(**payload)
+
+  assert event.event_id
+  assert event.request_id == "req-1"
+
+
+def test_normalize_identity_matches_runner_defaults() -> None:
+  assert normalize_identity(None, None, None, "  ") == ("_default", "unknown", "byok", None)
+  assert normalize_identity("alice", "v1", " metered ", " web ") == ("alice", "v1", "metered", "web")
+  assert normalize_identity("alice", "v1", "other", "cli") == ("alice", "v1", "byok", "cli")
+
+
+def test_usage_aggregator_accumulates_and_snapshots() -> None:
+  async def case() -> None:
+    aggregator = _UsageAggregator(user_id="alice", session_id="sess", request_id="req", channel="web", started_at=1.0)
+    await aggregator.record(_event(request_id="req", timestamp=2.0))
+    await aggregator.record(
+      UsageEvent(
+        user_id="alice",
+        session_id="sub:sess",
+        request_id="req",
+        parent_turn_id="tool-1",
+        timestamp=3.0,
+        model="claude-sonnet-4-6",
+        input_tokens=10,
+        output_tokens=5,
+        cache_read_tokens=1,
+        cache_creation_tokens=2,
+        cost_usd=0.025,
+        rate_table_version="2026-04-08",
+        billing_mode="metered",
+        channel="web",
+      )
+    )
+    summary = await aggregator.snapshot(ended_at=4.0, drain_complete=False, in_flight_task_count=1)
+    assert summary.input_tokens == 110
+    assert summary.output_tokens == 55
+    assert summary.cache_read_tokens == 11
+    assert summary.cache_creation_tokens == 7
+    assert summary.cost == pytest.approx(0.15)
+    assert summary.turns == 2
+    assert summary.channel == "web"
+    assert summary.started_at == 1.0
+    assert summary.ended_at == 4.0
+    assert summary.drain_complete is False
+    assert summary.in_flight_task_count == 1
+
+  _run(case())
+
+
+def test_usage_aggregator_concurrent_record_calls() -> None:
+  async def case() -> None:
+    aggregator = _UsageAggregator(user_id="alice", session_id="sess", request_id="req", channel=None)
+    await asyncio.gather(*(aggregator.record(_event(request_id=f"req-{idx}", channel=None)) for idx in range(25)))
+    summary = await aggregator.snapshot()
+    assert summary.turns == 25
+    assert summary.input_tokens == 2500
+    assert summary.output_tokens == 1250
+
+  _run(case())

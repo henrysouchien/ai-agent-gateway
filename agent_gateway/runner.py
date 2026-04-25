@@ -17,7 +17,14 @@ from .agent_session_log import AgentSessionLog
 from .context_builder import SessionContextBuilder
 from .event_log import EventLog
 from .mcp_client import McpClientManager
-from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, UsageEvent, write_dlq
+from .multi_user.billing import (
+  DEFAULT_USAGE_DLQ_PATH,
+  SessionUsageSummary,
+  UsageEvent,
+  _UsageAggregator,
+  normalize_identity,
+  write_dlq,
+)
 from .providers import ModelInfo, ModelProvider, ThinkingLevel
 from .task_registry import (
   COORDINATOR_DEFAULT_PREAMBLE,
@@ -141,6 +148,7 @@ class CostAccumulator:
 
 OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | None]]
 OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
+OnSessionSummary = Callable[[SessionUsageSummary], Awaitable[None] | None]
 OnToolTiming = Callable[[str, str, str | None, int, bool, int], None]
 OnMaxTurns = Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
 BackgroundTaskHandler = Callable[..., Awaitable[Tuple[Optional[Any], Optional[Dict[str, Any]]]]]
@@ -184,12 +192,14 @@ class AgentRunner:
     get_tool_definitions: Callable[[], List[Dict[str, Any]]] | None = None,
     on_tool_result: OnToolResult | None = None,
     on_usage: OnUsage | None = None,
+    on_session_summary: OnSessionSummary | None = None,
+    on_late_usage_event: OnUsage | None = None,
     on_tool_timing: OnToolTiming | None = None,
     user_id: str | None = None,
     request_id: str | None = None,
     parent_turn_id: str | None = None,
-    billing_mode: str = "byok",
-    rate_table_version: str = "unknown",
+    billing_mode: str | None = None,
+    rate_table_version: str | None = None,
     channel: str | None = None,
     usage_ledger_dlq_path: Path | str | None = None,
     on_metric: OnMetric | None = None,
@@ -200,6 +210,7 @@ class AgentRunner:
     on_max_turns: OnMaxTurns | None = None,
     max_budget_usd: float | None = None,
     _cost_accumulator: CostAccumulator | None = None,
+    _parent_aggregator: _UsageAggregator | None = None,
     max_concurrent_sub_agents: int | None = None,
     agent_session_log: AgentSessionLog | None = None,
     context_builder: SessionContextBuilder | None = None,
@@ -228,13 +239,34 @@ class AgentRunner:
     self._get_tool_definitions = get_tool_definitions
     self._on_tool_result = on_tool_result
     self._on_usage = on_usage
+    self._on_session_summary = on_session_summary
+    self._on_late_usage_event = on_late_usage_event
     self._on_tool_timing = on_tool_timing
-    self._usage_user_id = str(user_id or "_default")
     self._request_id = str(request_id or uuid.uuid4())
     self._parent_turn_id = parent_turn_id
-    self._billing_mode = "metered" if str(billing_mode).strip().lower() == "metered" else "byok"
-    self._rate_table_version = str(rate_table_version or "unknown")
-    self._channel = channel.strip() if isinstance(channel, str) and channel.strip() else None
+    self._usage_user_id, self._rate_table_version, self._billing_mode, self._channel = normalize_identity(
+      user_id,
+      rate_table_version,
+      billing_mode,
+      channel,
+    )
+    if user_id is None or rate_table_version is None or billing_mode is None:
+      log.debug(
+        "[%s] Usage identity defaults applied | user_id=%s rate_table_version=%s billing_mode=%s channel=%s",
+        self._sid,
+        self._usage_user_id,
+        self._rate_table_version,
+        self._billing_mode,
+        self._channel,
+      )
+    self._parent_aggregator = _parent_aggregator
+    self._aggregator = _parent_aggregator or _UsageAggregator(
+      user_id=self._usage_user_id,
+      session_id=self._full_session_id,
+      request_id=self._request_id,
+      channel=self._channel,
+    )
+    self._summary_emitted = False
     self._usage_ledger_dlq_path = (
       Path(usage_ledger_dlq_path).expanduser() if usage_ledger_dlq_path is not None else DEFAULT_USAGE_DLQ_PATH
     )
@@ -706,6 +738,8 @@ class AgentRunner:
       get_tool_definitions=self._get_tool_definitions,
       on_tool_result=self._on_tool_result,
       on_usage=self._on_usage,
+      on_session_summary=None,
+      on_late_usage_event=self._on_late_usage_event,
       on_tool_timing=self._on_tool_timing,
       user_id=getattr(sub_session, "user_id", None) or self._usage_user_id,
       request_id=self._request_id,
@@ -722,6 +756,7 @@ class AgentRunner:
       on_max_turns=self._on_max_turns,
       max_budget_usd=self._max_budget_usd,
       _cost_accumulator=self._cost_accumulator,
+      _parent_aggregator=self._aggregator,
       max_concurrent_sub_agents=self._max_concurrent_sub_agents,
       agent_session_log=self._agent_session_log,
       message_inbox=task_entry.message_inbox if task_entry else None,
@@ -1159,6 +1194,11 @@ class AgentRunner:
     )
 
   async def _call_on_usage(self, usage_event: UsageEvent) -> None:
+    recorded = await self._aggregator.record(usage_event)
+    if not recorded or self._summary_emitted:
+      log.warning("[%s] Usage event arrived after session summary emission: %s", self._sid, usage_event.event_id)
+      await self._call_on_late_usage_event(usage_event)
+      return
     if self._on_usage is None:
       return
     try:
@@ -1173,6 +1213,26 @@ class AgentRunner:
           write_dlq(usage_event, self._usage_ledger_dlq_path)
         except Exception as dlq_exc:
           log.error("[%s] usage DLQ write failed (non-fatal): %s", self._sid, dlq_exc)
+
+  async def _call_on_late_usage_event(self, usage_event: UsageEvent) -> None:
+    if self._on_late_usage_event is None:
+      return
+    try:
+      result = self._on_late_usage_event(usage_event)
+      if inspect.isawaitable(result):
+        await result
+    except Exception as exc:
+      log.error("[%s] on_late_usage_event hook failed (non-fatal): %s", self._sid, exc)
+
+  async def _call_on_session_summary(self, summary: SessionUsageSummary) -> None:
+    if self._on_session_summary is None:
+      return
+    try:
+      result = self._on_session_summary(summary)
+      if inspect.isawaitable(result):
+        await result
+    except Exception as exc:
+      log.error("[%s] on_session_summary hook failed (non-fatal): %s", self._sid, exc)
 
   def _estimate_usage_cost(self, model: str, usage_totals: Dict[str, int]):
     uncached_input = max(
@@ -1753,6 +1813,9 @@ class AgentRunner:
   ) -> None:
     """Execute the full chat loop and stream events into `EventLog`.
 
+    AgentRunner instances are single-use. Construct a new runner for each
+    subsequent run.
+
     Args:
       messages: Conversation history for the current request.
       system_prompt: Optional prompt string or cached prompt blocks.
@@ -1767,6 +1830,8 @@ class AgentRunner:
       - appends `max_turns_reached` or `budget_exceeded` when limits stop the
         loop early
     """
+    if self._summary_emitted:
+      raise RuntimeError("AgentRunner is single-use; construct a new runner for subsequent runs")
     was_cancelled = False
     run_error: BaseException | None = None
     try:
@@ -2328,8 +2393,33 @@ class AgentRunner:
       run_error = exc
     finally:
       finalizer_error: BaseException | None = None
+      drain_complete = True
+      in_flight_task_count = 0
       try:
         await self._shutdown_background_tasks(was_cancelled)
+      except BaseException as exc:
+        finalizer_error = exc
+        drain_complete = False
+      finally:
+        running_entries = self._task_registry.list_tasks(state=TaskState.RUNNING)
+        in_flight_task_count = sum(1 for task in running_entries if task.asyncio_task is not None and not task.asyncio_task.done())
+        if in_flight_task_count:
+          drain_complete = False
+        if self._parent_aggregator is None:
+          try:
+            await self._aggregator.close()
+            summary = await self._aggregator.snapshot(
+              ended_at=time.time(),
+              drain_complete=drain_complete,
+              in_flight_task_count=in_flight_task_count,
+            )
+            self._summary_emitted = True
+            await self._call_on_session_summary(summary)
+          except Exception as exc:
+            log.error("[%s] session summary emission failed (non-fatal): %s", self._sid, exc)
+        else:
+          self._summary_emitted = True
+      try:
         if self._agent_session_log is not None and self._durable_attach_emitted:
           if run_error is not None:
             reason = "graceful_shutdown"
@@ -2343,7 +2433,8 @@ class AgentRunner:
             detach_reason = "error"
           await self._emit_detach_event(detach_reason)
       except BaseException as exc:
-        finalizer_error = exc
+        if finalizer_error is None:
+          finalizer_error = exc
       finally:
         try:
           self._release_write_lease()

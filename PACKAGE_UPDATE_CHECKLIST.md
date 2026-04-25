@@ -35,6 +35,11 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 - [ ] **`docs/architecture.md`** — update the relevant section
 - [ ] **`docs/api-reference.md`** — update field docs for changed dataclasses
 
+## Deprecation log
+
+- `send_prompt(on_usage=...)` legacy 4-int callbacks are deprecated in favor of `UsageEvent` callbacks. Target removal: `v0.9.0`.
+- Reconciler deployments require SQLite `3.35.0+` for `UPDATE ... RETURNING`.
+
 ## What NOT to update for every feature
 
 - **README** — only update for major capability changes that alter the positioning or add a new tier. Incremental enhancements to existing features (e.g., background mode for sub-agents) don't need README changes.

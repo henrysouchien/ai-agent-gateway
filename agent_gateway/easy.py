@@ -12,7 +12,7 @@ from ._provider_utils import _get_default_model_for_provider, _resolve_provider
 from .auth import CredentialsResolver
 from .code_execution import CodeExecutionConfig, build_code_execution
 from .mcp_client import McpClientManager
-from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, UsageEvent, UsageLedger
+from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, SessionUsageSummary, UsageEvent, UsageLedger
 from .providers import AnthropicProvider, ModelProvider
 from .rates import load_rate_table
 from .runner import AgentRunner, ToolResultContext
@@ -70,6 +70,7 @@ def create_agent(
   cors_origins: list[str] | None = None,
   prefix: str = "/api",
   on_usage: Callable[[UsageEvent], Awaitable[Any] | Any] | None = None,
+  on_session_summary: Callable[[SessionUsageSummary], Awaitable[Any] | Any] | None = None,
   on_tool_result: Callable[[ToolResultContext], Awaitable[Any] | Any] | None = None,
   on_tool_timing: Callable[..., None] | None = None,
   on_startup: Callable[..., Any] | None = None,
@@ -148,7 +149,8 @@ def create_agent(
     session_ttl: Session lifetime in seconds.
     cors_origins: Allowed CORS origins. Defaults to `["*"]`.
     prefix: Route prefix. Defaults to `/api`.
-    on_usage: Optional usage hook invoked after each completed stream.
+    on_usage: Optional usage hook invoked after each completed stream turn.
+    on_session_summary: Optional hook invoked once with aggregate session usage.
     on_tool_result: Optional hook invoked after each tool result is prepared.
     on_tool_timing: Optional hook invoked after each tool finishes.
     on_startup: Optional async or sync startup callback.
@@ -350,6 +352,13 @@ def create_agent(
             raise
           log.warning("on_usage observer failed after ledger record (non-fatal): %s", exc)
 
+    async def _combined_on_session_summary(summary: SessionUsageSummary) -> None:
+      if on_session_summary is None:
+        return
+      result = on_session_summary(summary)
+      if inspect.isawaitable(result):
+        await result
+
     def _build_runner(event_log, session_id: str) -> AgentRunner:
       dispatcher = ToolDispatcher(
         mcp_client=mcp_client or _NullMcpClient(),
@@ -374,6 +383,7 @@ def create_agent(
         per_turn_timeout=per_turn_timeout,
         on_tool_result=_combined_on_tool_result,
         on_usage=_combined_on_usage if usage_ledger is not None or on_usage is not None else None,
+        on_session_summary=_combined_on_session_summary if on_session_summary is not None else None,
         on_tool_timing=on_tool_timing,
         user_id=session.user_id,
         request_id=request.request_id,

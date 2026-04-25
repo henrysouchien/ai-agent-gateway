@@ -17,6 +17,7 @@ from ._io import _atomic_write_json, _read_json_object
 from ._provider_utils import _allowed_models_for_provider, _get_default_model_for_provider, _resolve_provider
 from .event_log import EventLog
 from .mcp_client import McpClientManager
+from .multi_user.billing import SessionUsageSummary, UsageEvent
 from .providers import ModelProvider
 from .runner import AgentRunner, ToolResultContext
 from .skills import SkillLoader
@@ -474,7 +475,8 @@ async def run_autonomous(
   state_dir: str | Path | None = None,
   state_file: str = "state.json",
   delivery: DeliveryConfig | None = None,
-  on_usage: Callable[[dict[str, Any]], None] | None = None,
+  on_usage: Callable[[UsageEvent], Awaitable[Any] | Any] | None = None,
+  on_session_summary: Callable[[SessionUsageSummary], Awaitable[Any] | Any] | None = None,
   on_tool_result: Callable[[ToolResultContext], Awaitable[Any] | Any] | None = None,
   on_tool_timing: Callable[..., None] | None = None,
   session_id: str | None = None,
@@ -593,6 +595,7 @@ async def run_autonomous(
       get_tool_definitions=_get_tool_defs,
       on_tool_result=_combined_on_tool_result,
       on_usage=on_usage,
+      on_session_summary=on_session_summary,
       on_tool_timing=on_tool_timing,
       max_budget_usd=max_budget_usd,
       max_concurrent_sub_agents=max_concurrent_sub_agents,

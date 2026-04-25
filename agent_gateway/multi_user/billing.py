@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from dataclasses import asdict, dataclass
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -27,6 +29,32 @@ class UsageEvent:
   rate_table_version: str
   billing_mode: Literal["byok", "metered"]
   channel: str | None
+  event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+
+@dataclass(frozen=True)
+class SessionUsageSummary:
+  """Authoritative per-session billing total.
+
+  `cost` is the billing total for the completed session. Stream-level
+  `estimated_cost` values remain live per-turn estimates and can differ when
+  background tasks complete before or after the main stream completes.
+  """
+
+  user_id: str
+  session_id: str
+  request_id: str
+  input_tokens: int
+  output_tokens: int
+  cache_read_tokens: int
+  cache_creation_tokens: int
+  cost: float
+  turns: int
+  channel: str | None
+  started_at: float
+  ended_at: float
+  drain_complete: bool = True
+  in_flight_task_count: int = 0
 
 
 @dataclass
@@ -40,6 +68,98 @@ class UsageTotal:
   event_count: int
   since: float | None
   until: float | None
+
+
+def normalize_identity(
+  user_id: str | None,
+  rate_table_version: str | None,
+  billing_mode: str | None,
+  channel: str | None,
+) -> tuple[str, str, Literal["byok", "metered"], str | None]:
+  """Apply the gateway's default usage identity semantics."""
+  normalized_user_id = str(user_id or "_default")
+  normalized_rate_table_version = str(rate_table_version or "unknown")
+  normalized_billing_mode: Literal["byok", "metered"] = (
+    "metered" if str(billing_mode or "").strip().lower() == "metered" else "byok"
+  )
+  normalized_channel = channel.strip() if isinstance(channel, str) and channel.strip() else None
+  return normalized_user_id, normalized_rate_table_version, normalized_billing_mode, normalized_channel
+
+
+class _UsageAggregator:
+  """Accumulates UsageEvent objects within one asyncio event loop.
+
+  This is an internal runner coordination primitive. It is protected by an
+  asyncio.Lock and is not cross-loop or thread safe.
+  """
+
+  def __init__(
+    self,
+    *,
+    user_id: str,
+    session_id: str,
+    request_id: str,
+    channel: str | None,
+    started_at: float | None = None,
+  ) -> None:
+    self._lock = asyncio.Lock()
+    self._user_id = user_id
+    self._session_id = session_id
+    self._request_id = request_id
+    self._channel = channel
+    self._started_at = started_at if started_at is not None else time.time()
+    self._input_tokens = 0
+    self._output_tokens = 0
+    self._cache_read_tokens = 0
+    self._cache_creation_tokens = 0
+    self._cost = 0.0
+    self._turns = 0
+    self._closed = False
+
+  async def record(self, event: UsageEvent) -> bool:
+    async with self._lock:
+      if self._closed:
+        return False
+      self._input_tokens += int(event.input_tokens or 0)
+      self._output_tokens += int(event.output_tokens or 0)
+      self._cache_read_tokens += int(event.cache_read_tokens or 0)
+      self._cache_creation_tokens += int(event.cache_creation_tokens or 0)
+      self._cost += float(event.cost_usd or 0.0)
+      self._turns += 1
+      return True
+
+  async def close(self) -> None:
+    async with self._lock:
+      self._closed = True
+
+  async def set_turns(self, turns: int) -> None:
+    async with self._lock:
+      self._turns = max(0, int(turns or 0))
+
+  async def snapshot(
+    self,
+    *,
+    ended_at: float | None = None,
+    drain_complete: bool = True,
+    in_flight_task_count: int = 0,
+  ) -> SessionUsageSummary:
+    async with self._lock:
+      return SessionUsageSummary(
+        user_id=self._user_id,
+        session_id=self._session_id,
+        request_id=self._request_id,
+        input_tokens=self._input_tokens,
+        output_tokens=self._output_tokens,
+        cache_read_tokens=self._cache_read_tokens,
+        cache_creation_tokens=self._cache_creation_tokens,
+        cost=self._cost,
+        turns=self._turns,
+        channel=self._channel,
+        started_at=self._started_at,
+        ended_at=ended_at if ended_at is not None else time.time(),
+        drain_complete=drain_complete,
+        in_flight_task_count=in_flight_task_count,
+      )
 
 
 class UsageLedger(Protocol):
@@ -277,9 +397,11 @@ async def replay_dlq(ledger: UsageLedger, spool_path: Path) -> dict:
 __all__ = [
   "DEFAULT_USAGE_DLQ_PATH",
   "SqliteUsageLedger",
+  "SessionUsageSummary",
   "UsageEvent",
   "UsageLedger",
   "UsageTotal",
+  "normalize_identity",
   "replay_dlq",
   "write_dlq",
 ]

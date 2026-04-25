@@ -57,6 +57,11 @@ class AgentSDKConfig:
   max_budget_usd: float | None = None
   cwd: str | Path | None = None
   disallowed_tools: list[str] = field(default_factory=list)
+  user_id: str | None = None
+  channel: str | None = None
+  rate_table_version: str | None = None
+  billing_mode: str | None = None
+  request_id: str | None = None
 
 
 def _sdk_web_tool_channels() -> set[Optional[str]]:

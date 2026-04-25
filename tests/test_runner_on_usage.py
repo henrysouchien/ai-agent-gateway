@@ -13,7 +13,7 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import AgentRunner, EventLog, GatewaySession, ModelInfo, ModelProvider, ToolDispatcher
 import agent_gateway.runner as gateway_runner
-from agent_gateway.multi_user.billing import UsageEvent
+from agent_gateway.multi_user.billing import SessionUsageSummary, UsageEvent
 from agent_gateway.providers import StreamEvent
 
 
@@ -235,6 +235,86 @@ def test_run_appends_turn_complete_event_to_event_log() -> None:
     "cache_read_input_tokens": 10,
     "cache_creation_input_tokens": 5,
   }
+
+
+def test_runner_emits_session_summary_once_after_run() -> None:
+  summaries: list[SessionUsageSummary] = []
+  runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sess-parent",
+    provider=_UsageProvider(),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    user_id="alice",
+    request_id="req-summary",
+    channel="web",
+    on_session_summary=summaries.append,
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  assert len(summaries) == 1
+  summary = summaries[0]
+  assert summary.user_id == "alice"
+  assert summary.session_id == "sess-parent"
+  assert summary.request_id == "req-summary"
+  assert summary.input_tokens == 100
+  assert summary.output_tokens == 50
+  assert summary.cache_read_tokens == 10
+  assert summary.cache_creation_tokens == 5
+  assert summary.cost == pytest.approx(0.00019375)
+  assert summary.turns == 1
+  assert summary.channel == "web"
+  assert summary.drain_complete is True
+  assert summary.in_flight_task_count == 0
+
+
+def test_runner_is_single_use() -> None:
+  runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sess-parent",
+    provider=_UsageProvider(),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  with pytest.raises(RuntimeError, match="single-use"):
+    _run(runner.run(messages=[{"role": "user", "content": "hello again"}]))
+
+
+def test_sub_runner_with_parent_aggregator_does_not_emit_own_summary() -> None:
+  parent_summaries: list[SessionUsageSummary] = []
+  child_summaries: list[SessionUsageSummary] = []
+  parent_runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sess-parent",
+    provider=_UsageProvider(),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    user_id="alice",
+    request_id="req-parent",
+    on_session_summary=parent_summaries.append,
+  )
+  child_runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sub0:sess-parent",
+    provider=_UsageProvider(),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    user_id="alice",
+    request_id="req-parent",
+    on_session_summary=child_summaries.append,
+    _parent_aggregator=parent_runner._aggregator,
+  )
+
+  _run(child_runner.run(messages=[{"role": "user", "content": "child"}]))
+  parent_summary = _run(parent_runner._aggregator.snapshot())
+
+  assert child_summaries == []
+  assert parent_summary.input_tokens == 100
+  assert parent_summary.turns == 1
 
 
 @pytest.mark.parametrize("timeout", [0, None, -1])

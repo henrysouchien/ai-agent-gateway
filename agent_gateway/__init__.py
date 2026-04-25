@@ -47,7 +47,7 @@ from .heartbeat import HeartbeatConfig, HeartbeatLoop, TickResult, strip_heartbe
 from .easy import create_agent
 from .memory import EmbeddingProvider, MarkdownSyncManager, MemoryStore
 from .mcp_client import McpClientManager
-from .multi_user.billing import SqliteUsageLedger, UsageEvent, UsageLedger, UsageTotal
+from .multi_user.billing import SqliteUsageLedger, SessionUsageSummary, UsageEvent, UsageLedger, UsageTotal, normalize_identity
 from .providers import (
   AgentSDKConfig,
   AnthropicProvider,
@@ -160,6 +160,7 @@ __all__ = [
   "resolve_auth_config",
   "send_prompt",
   "send_prompt_sync",
+  "SessionUsageSummary",
   "Session",
   "SessionContextBuilder",
   "SessionStore",
@@ -189,6 +190,7 @@ __all__ = [
   "UsageEvent",
   "UsageLedger",
   "UsageTotal",
+  "normalize_identity",
   "UnknownModelError",
   "build_state_payload",
   "build_code_execution",

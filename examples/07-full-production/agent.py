@@ -12,6 +12,7 @@ from agent_gateway import (
   GatewayServerConfig,
   McpClientManager,
   ToolDispatcher,
+  UsageEvent,
   create_gateway_app,
 )
 
@@ -136,8 +137,8 @@ def on_event(event: dict[str, object], session_id: str) -> None:
   append_jsonl(LOGS_DIR / "events.jsonl", {"session_id": session_id, "event": event})
 
 
-def on_usage(payload: dict[str, object]) -> None:
-  append_jsonl(LOGS_DIR / "usage.jsonl", payload)
+def on_usage(event: UsageEvent) -> None:
+  append_jsonl(LOGS_DIR / "usage.jsonl", event.__dict__)
 
 
 def on_tool_timing(
