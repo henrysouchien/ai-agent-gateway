@@ -473,6 +473,105 @@ def test_make_run_agent_handler_background_registers_task(tmp_path: Path) -> Non
   assert runner.background_calls[0]["agent_name"] is None
 
 
+def test_make_run_agent_handler_background_propagates_resumable_skill_flag(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  _write_skill(skills_dir, "research", _callable_skill("resumable: true", body="Research."))
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+  )
+
+  result, error = _run(handler({"agent": "research", "task": "Collect", "background": True}))
+
+  assert error is None
+  assert result == {"task_id": "bg_0", "status": "running"}
+  assert runner.background_calls[0]["tool_input"]["resumable"] is True
+
+
+def test_make_run_agent_handler_background_propagates_non_resumable_skill_flag(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  _write_skill(skills_dir, "research", _callable_skill("resumable: false", body="Research."))
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+  )
+
+  result, error = _run(handler({"agent": "research", "task": "Collect", "background": True}))
+
+  assert error is None
+  assert result == {"task_id": "bg_0", "status": "running"}
+  assert runner.background_calls[0]["tool_input"]["resumable"] is False
+
+
+def test_make_run_agent_handler_background_resumable_caller_override_wins(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  _write_skill(skills_dir, "research", _callable_skill("resumable: true", body="Research."))
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+  )
+
+  result, error = _run(
+    handler({"agent": "research", "task": "Collect", "background": True, "resumable": False})
+  )
+
+  assert error is None
+  assert result == {"task_id": "bg_0", "status": "running"}
+  assert runner.background_calls[0]["tool_input"]["resumable"] is False
+
+
+@pytest.mark.parametrize("raw_resumable", ["false", 0, None])
+def test_make_run_agent_handler_background_rejects_non_bool_resumable_override(
+  tmp_path: Path,
+  raw_resumable: Any,
+) -> None:
+  skills_dir = tmp_path / "skills"
+  _write_skill(skills_dir, "research", _callable_skill("resumable: true", body="Research."))
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+  )
+
+  result, error = _run(
+    handler({"agent": "research", "task": "Collect", "background": True, "resumable": raw_resumable})
+  )
+
+  assert result is None
+  assert error == {
+    "code": "invalid_input",
+    "message": f"resumable must be a bool, got {type(raw_resumable).__name__}: {raw_resumable!r}",
+  }
+  assert runner.background_calls == []
+
+
+def test_make_run_agent_handler_background_without_agent_does_not_enrich_resumable(tmp_path: Path) -> None:
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(tmp_path / "skills"),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+  )
+
+  result, error = _run(handler({"task": "Collect", "background": True}))
+
+  assert error is None
+  assert result == {"task_id": "bg_0", "status": "running"}
+  assert "resumable" not in runner.background_calls[0]["tool_input"]
+
+
 def test_make_run_agent_handler_background_handler_forwards_task_entry(tmp_path: Path) -> None:
   runner = _StubRunner()
   handler = make_run_agent_handler(

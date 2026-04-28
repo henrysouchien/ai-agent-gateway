@@ -170,6 +170,56 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
   assert entries[6].event["reason"] == "completed"
 
 
+def test_runner_without_context_builder_does_not_inject_prior_durable_history(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "no-context-builder.jsonl")
+  _run(log.append({"type": "summary", "text": "PRIOR SUMMARY SENTINEL"}))
+  _run(log.append({"type": "state_update", "payload": {"alerts": ["PRIOR STATE SENTINEL"]}}))
+  _run(log.append({"type": "user_message", "content": "PRIOR USER SENTINEL"}))
+  _run(log.append({"type": "assistant_message", "content": "PRIOR ASSISTANT SENTINEL"}))
+  captured_messages: list[list[dict[str, Any]]] = []
+
+  class _CapturingProvider(_ScriptedProvider):
+    def build_request_params(
+      self,
+      *,
+      model: str,
+      messages: list[dict[str, Any]],
+      system_prompt: str | list[tuple[str, bool]] | None,
+      tools: list[dict[str, Any]],
+      max_tokens: int,
+      **kwargs: Any,
+    ) -> dict[str, Any]:
+      captured_messages.append([dict(message) for message in messages])
+      return super().build_request_params(
+        model=model,
+        messages=messages,
+        system_prompt=system_prompt,
+        tools=tools,
+        max_tokens=max_tokens,
+        **kwargs,
+      )
+
+  runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sess-parent",
+    provider=_CapturingProvider([_text_turn("done")]),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    context_builder=None,
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "fresh dev task"}]))
+
+  assert captured_messages
+  model_input = json.dumps(captured_messages[0], default=str)
+  assert "fresh dev task" in model_input
+  assert "PRIOR SUMMARY SENTINEL" not in model_input
+  assert "PRIOR STATE SENTINEL" not in model_input
+  assert "PRIOR USER SENTINEL" not in model_input
+  assert "PRIOR ASSISTANT SENTINEL" not in model_input
+
+
 def test_tool_call_complete_logs_final_model_facing_result_blocks(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "final-tool-result.jsonl")
   provider = _ScriptedProvider([

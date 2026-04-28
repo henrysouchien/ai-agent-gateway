@@ -273,8 +273,18 @@ def make_run_agent_handler(
             "code": "file_cleanup_failed",
             "message": f"Failed to clean stale output {stale_path}: {exc}",
           }
+      enriched_tool_input = dict(tool_input)
+      if "resumable" in enriched_tool_input:
+        raw_resumable = enriched_tool_input["resumable"]
+        if not isinstance(raw_resumable, bool):
+          return None, {
+            "code": "invalid_input",
+            "message": f"resumable must be a bool, got {type(raw_resumable).__name__}: {raw_resumable!r}",
+          }
+      elif profile is not None:
+        enriched_tool_input["resumable"] = profile.resumable
       return await runner._register_background_task(
-        tool_input=dict(tool_input),
+        tool_input=enriched_tool_input,
         handler=_dispatch_sub_agent,
         agent_name=agent_name,
         parent_turn_id=parent_turn_id,

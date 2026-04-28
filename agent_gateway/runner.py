@@ -2081,6 +2081,7 @@ class AgentRunner:
     cancelled_exc: Optional[asyncio.CancelledError] = None
     result_bytes = 0
     duration_ms = 0
+    load_servers_signal: Optional[List[str]] = None
 
     try:
       if tool_name in self._excluded_tools:
@@ -2122,6 +2123,14 @@ class AgentRunner:
             }
         else:
           result, error = await dispatch_coro
+
+      # Strip private control fields from result before logging, event capture, and
+      # model-bound tool_result content. _load_servers is a control signal -- capture
+      # it for _refresh_tools (called after finally), then remove from result.
+      if error is None and isinstance(result, dict):
+        popped = result.pop("_load_servers", None)
+        if isinstance(popped, list):
+          load_servers_signal = [str(server_name) for server_name in popped if server_name]
 
       tool_elapsed = time.time() - tool_t0
       if error:
@@ -2203,18 +2212,14 @@ class AgentRunner:
       self._append(tool_complete_event)
       raise cancelled_exc
 
-    if error is None and isinstance(result, dict):
-      new_servers_raw = result.pop("_load_servers", None)
-      if isinstance(new_servers_raw, list):
-        new_servers = [str(server_name) for server_name in new_servers_raw if server_name]
-        if new_servers:
-          self._refresh_tools(base_kwargs, new_servers)
-          log.info(
-            "[%s] Loaded MCP servers: %s | total tools now: %d",
-            self._sid,
-            new_servers,
-            len(base_kwargs.get("tools") or []),
-          )
+    if load_servers_signal:
+      self._refresh_tools(base_kwargs, load_servers_signal)
+      log.info(
+        "[%s] Loaded MCP servers: %s | total tools now: %d",
+        self._sid,
+        load_servers_signal,
+        len(base_kwargs.get("tools") or []),
+      )
 
     model_result = result
     if error is None:
