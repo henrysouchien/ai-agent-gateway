@@ -24,6 +24,14 @@ _COMMON_BETA_SLUGS: list[str] = []
 _COMPACTION_BETA_SLUG = "compact-2026-01-12"
 _TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 _MAX_TOOL_ID_LEN = 64
+_MAX_ERROR_DETAIL_LEN = 800
+_ERROR_REDACTION = "[redacted]"
+_SENSITIVE_ERROR_KEY_RE = re.compile(r"(api[_-]?key|auth|authorization|bearer|token|secret|password)", re.I)
+_SENSITIVE_ERROR_VALUE_RES = (
+  re.compile(r"sk-ant-api03-[A-Za-z0-9_-]+"),
+  re.compile(r"sk-ant-oat01-[A-Za-z0-9_-]+"),
+  re.compile(r"Bearer [A-Za-z0-9_.-]+"),
+)
 
 _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
   (
@@ -106,6 +114,151 @@ def _to_plain_dict(value: Any) -> Any:
   return value
 
 
+def _truncate_error_detail(value: Any, limit: int = _MAX_ERROR_DETAIL_LEN) -> str:
+  text = str(value).replace("\r", " ").replace("\n", " ").strip()
+  for pattern in _SENSITIVE_ERROR_VALUE_RES:
+    text = pattern.sub(_ERROR_REDACTION, text)
+  if len(text) <= limit:
+    return text
+  return f"{text[: limit - 3].rstrip()}..."
+
+
+def _redact_error_body(value: Any) -> Any:
+  if isinstance(value, dict):
+    redacted: dict[Any, Any] = {}
+    for key, item in value.items():
+      if _SENSITIVE_ERROR_KEY_RE.search(str(key)):
+        redacted[key] = _ERROR_REDACTION
+      else:
+        redacted[key] = _redact_error_body(item)
+    return redacted
+  if isinstance(value, list):
+    return [_redact_error_body(item) for item in value]
+  if isinstance(value, str):
+    return _truncate_error_detail(value)
+  return value
+
+
+def _response_header(response: Any, *names: str) -> str:
+  headers = getattr(response, "headers", None) or {}
+  for name in names:
+    try:
+      value = headers.get(name)
+    except Exception:
+      value = None
+    if value:
+      return _truncate_error_detail(value, limit=160)
+  return ""
+
+
+def _exception_status_code(exc: Exception) -> int | None:
+  status_code = getattr(exc, "status_code", None)
+  if status_code is None:
+    response = getattr(exc, "response", None)
+    if response is not None:
+      status_code = getattr(response, "status_code", None)
+  return status_code if isinstance(status_code, int) else None
+
+
+def _exception_body(exc: Exception) -> Any:
+  body = getattr(exc, "body", None)
+  if body is not None:
+    return body
+
+  response = getattr(exc, "response", None)
+  if response is None:
+    return None
+
+  try:
+    return response.json()
+  except Exception:
+    pass
+
+  try:
+    text = getattr(response, "text", None)
+  except Exception:
+    text = None
+  if text:
+    return text
+
+  try:
+    content = getattr(response, "content", None)
+  except Exception:
+    content = None
+  if isinstance(content, bytes):
+    return content.decode("utf-8", errors="replace")
+  return content
+
+
+def _format_anthropic_rejection_detail(exc: Exception) -> str | None:
+  status_code = _exception_status_code(exc)
+  if status_code is None or status_code < 400 or status_code == 429 or status_code >= 500:
+    return None
+
+  parts = [f"status={status_code}", f"provider_error={type(exc).__name__}"]
+  body = _redact_error_body(_exception_body(exc))
+  if isinstance(body, dict):
+    error = body.get("error") if isinstance(body.get("error"), dict) else body
+    error_type = error.get("type") if isinstance(error, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    if error_type:
+      parts.append(f"type={_truncate_error_detail(error_type, limit=160)}")
+    if message:
+      parts.append(f"message={_truncate_error_detail(message)}")
+    elif body:
+      parts.append(f"body={_truncate_error_detail(json.dumps(body, sort_keys=True, default=str))}")
+  elif body:
+    parts.append(f"body={_truncate_error_detail(body)}")
+  else:
+    message = str(exc).strip()
+    if message:
+      parts.append(f"message={_truncate_error_detail(message)}")
+
+  response = getattr(exc, "response", None)
+  request_id = _response_header(
+    response,
+    "request-id",
+    "x-request-id",
+    "anthropic-request-id",
+    "anthropic-ratelimit-request-id",
+  )
+  if request_id:
+    parts.append(f"request_id={request_id}")
+  return "; ".join(parts)
+
+
+def _stream_request_context(
+  stream_params: dict[str, Any],
+  *,
+  auth_mode: str,
+  use_compaction: bool,
+  betas: list[str],
+) -> str:
+  thinking = stream_params.get("thinking")
+  if isinstance(thinking, dict):
+    thinking_value = str(thinking.get("type") or "enabled")
+  elif thinking:
+    thinking_value = type(thinking).__name__
+  else:
+    thinking_value = "disabled"
+
+  messages = stream_params.get("messages")
+  tools = stream_params.get("tools")
+  parts = [
+    f"model={_truncate_error_detail(stream_params.get('model', ''), limit=160)}",
+    f"auth_mode={auth_mode or 'api'}",
+    f"context_management={'enabled' if use_compaction else 'disabled'}",
+    f"thinking={_truncate_error_detail(thinking_value, limit=80)}",
+  ]
+  if isinstance(messages, list):
+    parts.append(f"messages={len(messages)}")
+  if isinstance(tools, list):
+    parts.append(f"tools={len(tools)}")
+  if betas:
+    parts.append(f"betas={','.join(betas)}")
+  return "; ".join(parts)
+
+
 def _normalize_tool_call_id(tool_id: str) -> str:
   raw = str(tool_id or "").strip()
   if not raw:
@@ -126,22 +279,24 @@ def _same_model_message(message: dict[str, Any], model_info: ModelInfo) -> bool:
 
 
 def _synthetic_tool_result(tool_id: str, tool_name: str) -> dict[str, Any]:
+  error_message = "No result provided"
+  if tool_name:
+    error_message = f"No result provided for tool {tool_name}"
   return {
     "type": "tool_result",
     "tool_use_id": tool_id,
-    "content": json.dumps({"error": {"code": "missing_tool_result", "message": "No result provided"}}),
+    "content": json.dumps({"error": {"code": "missing_tool_result", "message": error_message}}),
     "is_error": True,
-    "tool_name": tool_name,
   }
 
 
-def _is_tool_result_message(message: dict[str, Any]) -> bool:
+def _has_tool_result_block(message: dict[str, Any]) -> bool:
   if message.get("role") != "user":
     return False
   content = message.get("content")
-  if not isinstance(content, list) or not content:
+  if not isinstance(content, list):
     return False
-  return all(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
+  return any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
 
 
 class AnthropicProvider(ModelProvider):
@@ -376,6 +531,7 @@ class AnthropicProvider(ModelProvider):
               continue
             if block.get("type") == "tool_result":
               next_block = dict(block)
+              next_block.pop("tool_name", None)
               tool_use_id = str(block.get("tool_use_id", ""))
               normalized_id = tool_id_map.get(tool_use_id)
               if normalized_id is not None:
@@ -421,13 +577,25 @@ class AnthropicProvider(ModelProvider):
         result.append(message)
         continue
 
-      if role == "user" and pending_tool_calls and _is_tool_result_message(message):
+      if role == "user" and pending_tool_calls and _has_tool_result_block(message):
         content = list(message.get("content") or [])
+        pending_ids = {str(block.get("id", "")) for block in pending_tool_calls}
+        filtered_content: list[Any] = []
         existing_tool_result_ids = {
           str(block.get("tool_use_id", ""))
           for block in content
-          if isinstance(block, dict) and block.get("type") == "tool_result"
+          if (
+            isinstance(block, dict)
+            and block.get("type") == "tool_result"
+            and str(block.get("tool_use_id", "")) in pending_ids
+          )
         }
+        for block in content:
+          if not isinstance(block, dict) or block.get("type") != "tool_result":
+            filtered_content.append(block)
+            continue
+          if str(block.get("tool_use_id", "")) in pending_ids:
+            filtered_content.append(block)
         missing = [
           _synthetic_tool_result(str(block.get("id", "")), str(block.get("name", "")))
           for block in pending_tool_calls
@@ -435,10 +603,12 @@ class AnthropicProvider(ModelProvider):
         ]
         if missing:
           next_message = dict(message)
-          next_message["content"] = [*content, *missing]
+          next_message["content"] = [*filtered_content, *missing]
           result.append(next_message)
         else:
-          result.append(message)
+          next_message = dict(message)
+          next_message["content"] = filtered_content
+          result.append(next_message)
         pending_tool_calls = []
         existing_tool_result_ids = set()
         continue
@@ -453,6 +623,18 @@ class AnthropicProvider(ModelProvider):
           result.append({"role": "user", "content": missing})
         pending_tool_calls = []
         existing_tool_result_ids = set()
+
+      if role == "user" and _has_tool_result_block(message):
+        content = [
+          block
+          for block in list(message.get("content") or [])
+          if not (isinstance(block, dict) and block.get("type") == "tool_result")
+        ]
+        if content:
+          next_message = dict(message)
+          next_message["content"] = content
+          result.append(next_message)
+        continue
 
       result.append(message)
 
@@ -471,6 +653,7 @@ class AnthropicProvider(ModelProvider):
     stream_params = dict(params)
     auth_mode = str(stream_params.pop("_provider_auth_mode", "api")).strip().lower()
     use_compaction = "context_management" in stream_params
+    betas: list[str] = []
     stop_reason = ""
     current_block_type: str | None = None
     current_tool_id: str | None = None
@@ -482,154 +665,176 @@ class AnthropicProvider(ModelProvider):
     current_signature = ""
     current_compaction: Any = None
 
-    if use_compaction:
-      betas = [*_COMMON_BETA_SLUGS, _COMPACTION_BETA_SLUG]
-      if auth_mode == "oauth":
-        betas = [*_OAUTH_BETA_SLUGS, *_COMMON_BETA_SLUGS, _COMPACTION_BETA_SLUG]
-      stream_cm = client.beta.messages.stream(**stream_params, betas=betas)
-    else:
-      stream_cm = client.messages.stream(**stream_params)
+    try:
+      if use_compaction:
+        betas = [*_COMMON_BETA_SLUGS, _COMPACTION_BETA_SLUG]
+        if auth_mode == "oauth":
+          betas = [*_OAUTH_BETA_SLUGS, *_COMMON_BETA_SLUGS, _COMPACTION_BETA_SLUG]
+        stream_cm = client.beta.messages.stream(**stream_params, betas=betas)
+      else:
+        stream_cm = client.messages.stream(**stream_params)
 
-    async with stream_cm as stream_obj:
-      async for event in stream_obj:
-        event_type = getattr(event, "type", None)
+      async with stream_cm as stream_obj:
+        async for event in stream_obj:
+          event_type = getattr(event, "type", None)
 
-        if event_type == "message_start":
-          message = getattr(event, "message", None)
-          usage = getattr(message, "usage", None) if message is not None else None
-          yield StreamEvent(
-            type="message_start",
-            input_tokens=getattr(usage, "input_tokens", 0) if usage is not None else 0,
-            output_tokens=getattr(usage, "output_tokens", 0) if usage is not None else 0,
-            cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) if usage is not None else 0,
-            cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) if usage is not None else 0,
-          )
-          continue
+          if event_type == "ping":
+            yield StreamEvent(type="heartbeat")
+            continue
 
-        if event_type == "content_block_start":
-          block = getattr(event, "content_block", None)
-          block_type = getattr(block, "type", None)
-          if block_type == "tool_use":
-            current_block_type = "tool_use"
-            current_tool_id = getattr(block, "id", None)
-            current_tool_name = getattr(block, "name", None)
-            current_tool_json = ""
-            current_tool_block = block
-            caller = _to_plain_dict(getattr(block, "caller", None))
+          if event_type == "message_start":
+            message = getattr(event, "message", None)
+            usage = getattr(message, "usage", None) if message is not None else None
             yield StreamEvent(
-              type="tool_use_start",
-              tool_id=str(current_tool_id or ""),
-              tool_name=str(current_tool_name or ""),
-              raw_block=_to_plain_dict(block),
-              caller=caller if isinstance(caller, dict) else None,
+              type="message_start",
+              input_tokens=getattr(usage, "input_tokens", 0) if usage is not None else 0,
+              output_tokens=getattr(usage, "output_tokens", 0) if usage is not None else 0,
+              cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) if usage is not None else 0,
+              cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) if usage is not None else 0,
             )
-          elif block_type == "thinking":
-            current_block_type = "thinking"
-            current_thinking = ""
-            current_signature = ""
-          elif block_type == "text":
-            current_block_type = "text"
-            current_text = ""
-          elif block_type == "compaction":
-            current_block_type = "compaction"
-            current_compaction = None
-          continue
+            continue
 
-        if event_type == "content_block_delta":
-          delta = getattr(event, "delta", None)
-          delta_type = getattr(delta, "type", None)
-          if delta_type == "text_delta":
-            text = getattr(delta, "text", "")
-            if text:
-              current_text += text
-              yield StreamEvent(type="text_delta", text=text)
-          elif delta_type == "input_json_delta":
-            partial = getattr(delta, "partial_json", "")
-            if partial:
-              current_tool_json += partial
-              yield StreamEvent(type="tool_use_delta", tool_input_json=partial)
-          elif delta_type == "thinking_delta":
-            thinking_text = getattr(delta, "thinking", "")
-            if thinking_text:
-              current_thinking += thinking_text
-              yield StreamEvent(type="thinking_delta", thinking_text=thinking_text)
-          elif delta_type == "signature_delta":
-            signature = getattr(delta, "signature", "")
-            if signature:
-              current_signature += signature
-          elif delta_type == "compaction_delta":
-            current_compaction = getattr(delta, "content", None)
-          continue
+          if event_type == "content_block_start":
+            block = getattr(event, "content_block", None)
+            block_type = getattr(block, "type", None)
+            if block_type == "tool_use":
+              current_block_type = "tool_use"
+              current_tool_id = getattr(block, "id", None)
+              current_tool_name = getattr(block, "name", None)
+              current_tool_json = ""
+              current_tool_block = block
+              caller = _to_plain_dict(getattr(block, "caller", None))
+              yield StreamEvent(
+                type="tool_use_start",
+                tool_id=str(current_tool_id or ""),
+                tool_name=str(current_tool_name or ""),
+                raw_block=_to_plain_dict(block),
+                caller=caller if isinstance(caller, dict) else None,
+              )
+            elif block_type == "thinking":
+              current_block_type = "thinking"
+              current_thinking = ""
+              current_signature = ""
+              yield StreamEvent(type="heartbeat")
+            elif block_type == "text":
+              current_block_type = "text"
+              current_text = ""
+            elif block_type == "compaction":
+              current_block_type = "compaction"
+              current_compaction = None
+            continue
 
-        if event_type == "content_block_stop":
-          if current_block_type == "text":
-            yield StreamEvent(
-              type="text_end",
-              text=current_text,
-              raw_block={"type": "text", "text": current_text},
-            )
-            current_text = ""
-            current_block_type = None
-          elif current_block_type == "thinking":
-            block = {
-              "type": "thinking",
-              "thinking": current_thinking,
-              "signature": current_signature,
-            }
-            yield StreamEvent(
-              type="thinking_end",
-              thinking_text=current_thinking,
-              signature=current_signature,
-              raw_block=block,
-            )
-            current_thinking = ""
-            current_signature = ""
-            current_block_type = None
-          elif current_block_type == "tool_use" and current_tool_id is not None:
-            try:
-              tool_input = json.loads(current_tool_json) if current_tool_json else {}
-            except json.JSONDecodeError:
-              tool_input = {}
-            block = _to_plain_dict(current_tool_block)
-            if not isinstance(block, dict):
-              block = {"type": "tool_use", "id": current_tool_id, "name": current_tool_name}
-            block["input"] = tool_input
-            yield StreamEvent(
-              type="tool_use_end",
-              tool_id=str(current_tool_id),
-              tool_name=str(current_tool_name or ""),
-              tool_input_json=current_tool_json,
-              tool_input=tool_input,
-              raw_block=block,
-              caller=_to_plain_dict(getattr(current_tool_block, "caller", None)),
-            )
-            current_tool_id = None
-            current_tool_name = None
-            current_tool_json = ""
-            current_tool_block = None
-            current_block_type = None
-          elif current_block_type == "compaction":
-            yield StreamEvent(
-              type="compaction",
-              text=current_compaction,
-              raw_block={"type": "compaction", "content": current_compaction},
-            )
-            current_compaction = None
-            current_block_type = None
-          continue
+          if event_type == "content_block_delta":
+            delta = getattr(event, "delta", None)
+            delta_type = getattr(delta, "type", None)
+            if delta_type == "text_delta":
+              text = getattr(delta, "text", "")
+              if text:
+                current_text += text
+                yield StreamEvent(type="text_delta", text=text)
+            elif delta_type == "input_json_delta":
+              partial = getattr(delta, "partial_json", "")
+              if partial:
+                current_tool_json += partial
+                yield StreamEvent(type="tool_use_delta", tool_input_json=partial)
+            elif delta_type == "thinking_delta":
+              thinking_text = getattr(delta, "thinking", "")
+              if thinking_text:
+                current_thinking += thinking_text
+                yield StreamEvent(type="thinking_delta", thinking_text=thinking_text)
+            elif delta_type == "signature_delta":
+              signature = getattr(delta, "signature", "")
+              if signature:
+                current_signature += signature
+                yield StreamEvent(type="heartbeat")
+            elif delta_type == "compaction_delta":
+              current_compaction = getattr(delta, "content", None)
+              yield StreamEvent(type="heartbeat")
+            continue
 
-        if event_type == "message_delta":
-          delta = getattr(event, "delta", None)
-          stop_reason = str(getattr(delta, "stop_reason", "") or "")
-          usage = getattr(event, "usage", None)
-          if usage is not None:
-            yield StreamEvent(
-              type="usage_update",
-              input_tokens=getattr(usage, "input_tokens", 0) or 0,
-              output_tokens=getattr(usage, "output_tokens", 0) or 0,
-              cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
-              cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-            )
+          if event_type == "content_block_stop":
+            if current_block_type == "text":
+              yield StreamEvent(
+                type="text_end",
+                text=current_text,
+                raw_block={"type": "text", "text": current_text},
+              )
+              current_text = ""
+              current_block_type = None
+            elif current_block_type == "thinking":
+              block = {
+                "type": "thinking",
+                "thinking": current_thinking,
+                "signature": current_signature,
+              }
+              yield StreamEvent(
+                type="thinking_end",
+                thinking_text=current_thinking,
+                signature=current_signature,
+                raw_block=block,
+              )
+              current_thinking = ""
+              current_signature = ""
+              current_block_type = None
+            elif current_block_type == "tool_use" and current_tool_id is not None:
+              try:
+                tool_input = json.loads(current_tool_json) if current_tool_json else {}
+              except json.JSONDecodeError:
+                tool_input = {}
+              block = _to_plain_dict(current_tool_block)
+              if not isinstance(block, dict):
+                block = {"type": "tool_use", "id": current_tool_id, "name": current_tool_name}
+              block["input"] = tool_input
+              yield StreamEvent(
+                type="tool_use_end",
+                tool_id=str(current_tool_id),
+                tool_name=str(current_tool_name or ""),
+                tool_input_json=current_tool_json,
+                tool_input=tool_input,
+                raw_block=block,
+                caller=_to_plain_dict(getattr(current_tool_block, "caller", None)),
+              )
+              current_tool_id = None
+              current_tool_name = None
+              current_tool_json = ""
+              current_tool_block = None
+              current_block_type = None
+            elif current_block_type == "compaction":
+              yield StreamEvent(
+                type="compaction",
+                text=current_compaction,
+                raw_block={"type": "compaction", "content": current_compaction},
+              )
+              current_compaction = None
+              current_block_type = None
+            continue
+
+          if event_type == "message_delta":
+            delta = getattr(event, "delta", None)
+            stop_reason = str(getattr(delta, "stop_reason", "") or "")
+            usage = getattr(event, "usage", None)
+            if usage is not None:
+              yield StreamEvent(
+                type="usage_update",
+                input_tokens=getattr(usage, "input_tokens", 0) or 0,
+                output_tokens=getattr(usage, "output_tokens", 0) or 0,
+                cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+                cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+              )
+    except Exception as exc:
+      if self.is_retryable_error(exc):
+        raise
+      detail = _format_anthropic_rejection_detail(exc)
+      if detail is None:
+        raise
+      context = _stream_request_context(
+        stream_params,
+        auth_mode=auth_mode,
+        use_compaction=use_compaction,
+        betas=betas,
+      )
+      log.warning("Anthropic request rejected during stream: %s; %s", detail, context)
+      raise RuntimeError(f"Anthropic request rejected (stage=stream): {detail}; {context}") from None
 
     yield StreamEvent(type="message_end", stop_reason=stop_reason)
 

@@ -119,7 +119,7 @@ class McpClientManager:
     self._default_tool_timeout = default_tool_timeout
     self._strip_input_fields = strip_input_fields or set()
 
-  async def startup(self) -> None:
+  async def startup(self, allowed_servers: Set[str] | None = None) -> None:
     async with self._lock:
       if self._started:
         return
@@ -139,9 +139,17 @@ class McpClientManager:
         self._started = True
         return
 
+      effective_allowed_servers = self._allowed_servers
+      if allowed_servers is not None:
+        requested_servers = set(allowed_servers)
+        if effective_allowed_servers is None:
+          effective_allowed_servers = requested_servers
+        else:
+          effective_allowed_servers = set(effective_allowed_servers) & requested_servers
+
       connect_tasks = []
       for server_name, server_config in mcp_servers.items():
-        if self._allowed_servers is not None and server_name not in self._allowed_servers:
+        if effective_allowed_servers is not None and server_name not in effective_allowed_servers:
           continue
         if not isinstance(server_config, dict):
           log.warning("Skipping MCP server %s: invalid config", server_name)

@@ -33,7 +33,8 @@ Request body:
 
 ```json
 {
-  "api_key": "demo-key"
+  "api_key": "demo-key",
+  "user_id": "alice"
 }
 ```
 
@@ -42,6 +43,7 @@ Schema:
 | Field | Type | Required | Notes |
 | --- | --- | --- | --- |
 | `api_key` | string | yes | Must be non-empty. |
+| `user_id` | string | no | Stable user identity. The gateway uses this for credential resolution and as the session identity. In strict multi-user mode (resolver configured), `_default` is rejected; clients must send a non-default value. Falls back to `context.user_id` (deprecated) and then to `_default` if absent. |
 
 Response body:
 
@@ -49,7 +51,12 @@ Response body:
 {
   "session_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "session_id": "sess_1234abcd5678",
-  "expires_at": 1770000000
+  "expires_at": 1770000000,
+  "model_catalog": {
+    "default_model": "claude-opus-4-7",
+    "allowed_models": ["claude-opus-4-7", "claude-sonnet-4-6"],
+    "display_names": {"claude-opus-4-7": "Opus 4.7"}
+  }
 }
 ```
 
@@ -60,13 +67,14 @@ Schema:
 | `session_token` | string | JWT bearer token for later requests |
 | `session_id` | string | Server-generated session id |
 | `expires_at` | integer | Unix timestamp |
+| `model_catalog` | object, optional | Optional model discovery metadata. Present only when `GatewayServerConfig.model_catalog` is configured. Clients tolerate absence. Contains `default_model` (string), `allowed_models` (array of strings), and `display_names` (object mapping model id to display label). |
 
 Example:
 
 ```bash
 curl -s http://127.0.0.1:8000/api/chat/init \
   -H 'Content-Type: application/json' \
-  -d '{"api_key":"demo-key"}'
+  -d '{"api_key":"demo-key","user_id":"alice"}'
 ```
 
 ### POST /api/chat
@@ -88,6 +96,7 @@ Request body:
   "context": {
     "channel": "web"
   },
+  "user_id": "alice",
   "model": "claude-sonnet-4-6"
 }
 ```
@@ -98,6 +107,7 @@ Schema:
 | --- | --- | --- | --- |
 | `messages` | array of `ChatMessage` | yes | Full message list for the current turn |
 | `context` | object | no | Free-form request context; `channel` is commonly used |
+| `user_id` | string | no | If sent, the value is used as the request identity. In strict multi-user mode (resolver configured), it must match the session's JWT identity; mismatch returns an HTTP error. In non-strict mode, the supplied value is accepted as-is. If absent: strict mode rejects the request; non-strict mode falls back to the JWT identity. Reference clients should always send `user_id` to be forward-compatible with strict mode. |
 | `model` | string or null | no | Per-request model override |
 
 `ChatMessage` schema:
@@ -111,6 +121,7 @@ Notes:
 
 - One active stream is allowed per session. A second concurrent `POST /api/chat` returns HTTP `409`.
 - The server verifies that `model` is in `GatewayServerConfig.allowed_models` when an allowlist is configured.
+- Recommended `context.channel` values: `web`, `cli`, `telegram`, `bot`. The field is free-form; gateways may route or scope behavior on the channel value, and analytics commonly use it. Planned reference dev clients (the in-flight `@ai-agent-gateway/tui` and `ai-agent-gateway-cli` packages) will send `"cli"` as the canonical dev-surface value.
 - `create_agent()` resolves the runtime for you. `create_gateway_app()` calls your `build_chat_runtime(session, request, channel, auth_manager)`.
 
 Example:
@@ -123,7 +134,8 @@ curl -N http://127.0.0.1:8000/api/chat \
     "messages": [
       {"role": "user", "content": "Explain tool approval in one paragraph."}
     ],
-    "context": {"channel": "web"}
+    "context": {"channel": "web"},
+    "user_id": "alice"
   }'
 ```
 
@@ -337,6 +349,41 @@ Fields:
 | `server` | string or null | MCP server name when relevant |
 | `execution_location` | string, optional | Added when the runtime resolves location metadata |
 
+#### `tool_call_interrupted`
+
+Synthesized when recovery finds a tool call that started but never emitted a completion event.
+
+Schema:
+
+```json
+{
+  "type": "tool_call_interrupted",
+  "tool_call_id": "toolu_123",
+  "tool_name": "code_execute",
+  "tool_input": {"code": "print(1 + 1)"},
+  "original_started_at": 1770000000.1,
+  "discovered_at": 1770000060.2,
+  "tool_risk": "dangerous",
+  "runner_id": "runner_abc",
+  "role": "writer",
+  "sub_agent_id": "sub0:sess_1234"
+}
+```
+
+Fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `tool_call_id` | string | Provider tool call id from the original `tool_call_start` |
+| `tool_name` | string or null | Original tool name |
+| `tool_input` | object or null | Original tool payload |
+| `original_started_at` | number or null | Original `tool_call_start.started_at` timestamp |
+| `discovered_at` | number | Unix timestamp when recovery synthesized this event |
+| `tool_risk` | string | Risk classification for the tool name |
+| `runner_id` | string or null | Runner that originally started the tool |
+| `role` | string | Runner role from the original tool start event. Defaults to `writer` when absent. |
+| `sub_agent_id` | string, optional | Present when the original tool start event included a sub-agent id. |
+
 #### `stream_complete`
 
 Terminal success event for the SSE stream.
@@ -355,6 +402,32 @@ Schema:
   }
 }
 ```
+
+#### `turn_complete`
+
+Emitted at the end of each agent turn within a stream. This is a per-turn lifecycle event and is distinct from `stream_complete`, which is the final success event for the whole stream.
+
+Schema:
+
+```json
+{
+  "type": "turn_complete",
+  "turn": 1,
+  "usage": {
+    "input_tokens": 123,
+    "output_tokens": 45,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0
+  }
+}
+```
+
+Fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `turn` | integer | One-based turn counter within the stream |
+| `usage` | object | Per-turn token delta emitted by the runner. Current runner emission includes `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens`. |
 
 #### `error`
 
@@ -384,7 +457,9 @@ Schema:
   "nonce": "a1b2c3d4e5f6",
   "tool_name": "code_execute",
   "tool_input": {"code": "print(1 + 1)"},
-  "resolved_qualifier": "subprocess"
+  "resolved_qualifier": "subprocess",
+  "reason": "Code execution requires explicit approval.",
+  "allow_persistent_approval": true
 }
 ```
 
@@ -397,6 +472,33 @@ Fields:
 | `tool_name` | string | Tool name |
 | `tool_input` | object | Proposed tool input |
 | `resolved_qualifier` | string | Tool-type qualifier used for session approval caching |
+| `reason` | string | Free-form context for why approval is needed. May be empty. Clients render this in the approval prompt UI when non-empty. |
+| `allow_persistent_approval` | boolean | Whether the gateway will accept `allow_tool_type=true` for this approval. When false, the client should not offer the "approve all of this tool type" option. |
+
+#### `headless_auto_deny`
+
+Emitted when a tool approval request is automatically denied because the runtime is configured to avoid permission prompts in a headless context.
+
+Schema:
+
+```json
+{
+  "type": "headless_auto_deny",
+  "tool_call_id": "toolu_123",
+  "tool_name": "code_execute",
+  "reason": "Tool 'code_execute' requires static approval in headless context",
+  "source": "static"
+}
+```
+
+Fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `tool_call_id` | string | Provider tool call id |
+| `tool_name` | string | Tool name |
+| `reason` | string | Human-readable denial reason |
+| `source` | string | `static` for static approval rules or `interceptor` for interceptor approval requests |
 
 #### `tool_output_chunk`
 
@@ -446,6 +548,35 @@ Schema:
   "timestamp": 1770000000
 }
 ```
+
+#### `interrupted`
+
+Emitted on runner-level interruption paths, including max-turns, budget limits, graceful shutdown, sub-agent cancellation, and recovery after a writer attach.
+
+Schema:
+
+```json
+{
+  "type": "interrupted",
+  "reason": "recovered_on_attach",
+  "runner_id": "runner_previous",
+  "role": "writer",
+  "last_completed_seq": 42,
+  "recovered_by_runner_id": "runner_current",
+  "recovered_at": 1770000060.2
+}
+```
+
+Fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `reason` | string | Interruption reason such as `max_turns_reached`, `budget_exceeded`, `graceful_shutdown`, `sub_agent_cancelled`, or `recovered_on_attach` |
+| `runner_id` | string or null | Interrupted runner id |
+| `role` | string or null | Runner role, typically `writer` or `sub_agent` |
+| `last_completed_seq` | integer or null | Last durable sequence number considered safe by the runner |
+| `recovered_by_runner_id` | string, optional | Present when another runner recovered the interrupted runner |
+| `recovered_at` | number, optional | Unix timestamp when recovery occurred |
 
 #### `stream_retry`
 
@@ -515,6 +646,141 @@ Schema:
 }
 ```
 
+### Background Task Events
+
+The background-task events share task-correlation fields.
+
+Task-correlation fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `task_id` | string | Background task id, for example `bg_0` |
+| `owner_runner_id` | string or null | Runner that owns the task |
+| `owner_role` | string or null | Role of the owner runner |
+| `sub_agent_id` | string or null | Derived sub-agent session id for the task |
+| `parent_turn_id` | string or null | Parent turn id associated with the task |
+| `call_index` | integer or null | Tool-call index associated with the task |
+| `task_type` | string | Task type. Current background-agent tasks use `background`. |
+| `provider_name` | string or null | Provider selected for the task |
+| `model` | string or null | Model selected for the task |
+| `original_task_id` | string, optional | Present on resumed tasks |
+
+#### `task_registered`
+
+Emitted when a background task is registered for a multi-agent or `run_agent` workflow.
+
+Schema:
+
+```json
+{
+  "type": "task_registered",
+  "task_id": "bg_0",
+  "owner_runner_id": "runner_abc",
+  "owner_role": "writer",
+  "sub_agent_id": "sub0:sess_1234",
+  "parent_turn_id": "turn-1",
+  "call_index": 0,
+  "task_type": "background",
+  "provider_name": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "agent_name": "researcher",
+  "parent_session_id": "sess_1234",
+  "metadata": {
+    "owner_runner_id": "runner_abc",
+    "owner_role": "writer",
+    "sub_agent_id": "sub0:sess_1234",
+    "parent_turn_id": "turn-1",
+    "call_index": 0,
+    "task_type": "background",
+    "provider_name": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "resumable": true
+  },
+  "started_at": 1770000000.1
+}
+```
+
+Additional fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `agent_name` | string or null | Background agent name supplied by the caller |
+| `parent_session_id` | string | Parent gateway session id |
+| `metadata` | object | Task metadata snapshot. Includes the correlation fields and may include `resumable` or `original_task_id`. |
+| `started_at` | number | Task registration timestamp |
+| `resumable` | boolean, optional | Included inside `metadata` when the tool input included `resumable` |
+
+#### `task_completed`
+
+Emitted when a background task reaches a completed or failed final state.
+
+Schema:
+
+```json
+{
+  "type": "task_completed",
+  "task_id": "bg_0",
+  "owner_runner_id": "runner_abc",
+  "owner_role": "writer",
+  "sub_agent_id": "sub0:sess_1234",
+  "parent_turn_id": "turn-1",
+  "call_index": 0,
+  "task_type": "background",
+  "provider_name": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "final_state": "completed",
+  "completed_at": 1770000030.2,
+  "result": {"response": "done"},
+  "error": null
+}
+```
+
+Additional fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `final_state` | string | Final task state. Current runner emission uses `completed` or `failed`. |
+| `completed_at` | number | Unix timestamp when the completion event was appended |
+| `result` | object or null | Background task result payload |
+| `error` | object or null | Background task error payload |
+
+#### `parent_message_sent`
+
+Emitted when the parent sends a message to a running background sub-agent.
+
+Schema:
+
+```json
+{
+  "type": "parent_message_sent",
+  "task_id": "bg_0",
+  "owner_runner_id": "runner_abc",
+  "owner_role": "writer",
+  "sub_agent_id": "sub0:sess_1234",
+  "parent_turn_id": "turn-1",
+  "call_index": 0,
+  "task_type": "background",
+  "provider_name": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "message_id": "msg_123",
+  "sender": {
+    "session_id": "sess_1234",
+    "user_id": "alice"
+  },
+  "sent_at": 1770000010.1,
+  "message": "Please narrow the search."
+}
+```
+
+Additional fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `message_id` | string | Caller-supplied id or generated UUID |
+| `sender` | object | Sender metadata with `session_id` and `user_id`, each string or null |
+| `sent_at` | number | Unix timestamp when the parent message was sent |
+| `message` | string | Message text delivered to the sub-agent |
+
 ## Session Lifecycle
 
 Typical flow:
@@ -541,7 +807,8 @@ If `allow_tool_type=true`, the server stores that approval in `session.approved_
 
 ## Notes For Frontend Clients
 
-- Treat both `stream_complete` and `error` as terminal events.
+- Treat `stream_complete`, `error`, and `stream_error` as terminal events.
+- Do not treat lifecycle and background-task events such as `turn_complete`, `interrupted`, `task_registered`, or `task_completed` as terminal.
 - Ignore `heartbeat` for rendering; it exists to keep the connection warm.
 - Do not assume every stream has `thinking_delta`, `tool_output_chunk`, or `tool_approval_request`.
 - Preserve `tool_call_id` and `nonce` exactly when you answer approval requests.

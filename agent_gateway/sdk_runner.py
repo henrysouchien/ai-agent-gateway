@@ -385,6 +385,8 @@ class AgentSDKRunner:
         )
 
     for block in extra_blocks:
+      if block.get("_event_only"):
+        continue
       block_type = str(block.get("type") or "")
       if block_type == "text":
         text = str(block.get("text") or "").strip()

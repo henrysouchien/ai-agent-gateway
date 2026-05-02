@@ -44,6 +44,7 @@ log = logging.getLogger("agent_gateway.runner")
 MODEL_CONTEXT_LIMIT = 200_000
 CONTEXT_WARNING_PCT = 80
 STREAM_STALL_TIMEOUT = 60  # max seconds between stream events before watchdog cancels
+STREAM_THINKING_STALL_TIMEOUT = 300  # extended-thinking turns can be quiet before first visible output
 STREAM_RETRY_MAX = 3
 STREAM_RETRY_DELAY = 2.0
 STREAM_RETRY_BACKOFF = 2.0
@@ -1693,6 +1694,19 @@ class AgentRunner:
   def _thinking_level(enabled: bool) -> ThinkingLevel:
     return ThinkingLevel.HIGH if enabled else ThinkingLevel.NONE
 
+  def _effective_stream_stall_timeout(
+    self,
+    *,
+    config: Dict[str, Any],
+    model_info: ModelInfo,
+    max_tokens: int,
+  ) -> float:
+    if self._stream_stall_timeout is not None:
+      return float(self._stream_stall_timeout)
+    if bool(config.get("thinking", True)) and max_tokens >= 2048 and model_info.supports_thinking:
+      return float(STREAM_THINKING_STALL_TIMEOUT)
+    return float(STREAM_STALL_TIMEOUT)
+
   @staticmethod
   def _classify_guard_outcome(
     guard_reason: tuple[str, str] | None,
@@ -1727,7 +1741,11 @@ class AgentRunner:
   ) -> Tuple[Any, StreamTurnResult] | None:
     last_event_at = time.monotonic()
     guard_reason: tuple[str, str] | None = None
-    _effective_stall_timeout = self._stream_stall_timeout or STREAM_STALL_TIMEOUT
+    _effective_stall_timeout = self._effective_stream_stall_timeout(
+      config=config,
+      model_info=model_info,
+      max_tokens=max_tokens,
+    )
 
     def _make_params() -> Dict[str, Any]:
       normalized_messages = self._provider.normalize_messages(current_messages, model_info)
@@ -1823,6 +1841,9 @@ class AgentRunner:
           if isinstance(event.raw_block, dict):
             result.content_blocks.append(event.raw_block)
           log.info("[%s] Thinking block complete | %d chars", self._sid, len(str(event.thinking_text or "")))
+          continue
+
+        if event_type == "heartbeat":
           continue
 
         if event_type == "tool_use_start":
@@ -2688,6 +2709,7 @@ class AgentRunner:
         )
 
         tool_results_content: List[Dict[str, Any]] = []
+        deferred_extras: List[Dict[str, Any]] = []
         i = 0
         run_agent_seq = 0
         while i < len(turn.tool_uses):
@@ -2773,7 +2795,7 @@ class AgentRunner:
               else:
                 result_entry, used_name, extra_blocks = result_or_exc
                 tool_results_content.append(result_entry)
-                tool_results_content.extend(extra_blocks)
+                deferred_extras.extend(block for block in extra_blocks if not block.get("_event_only"))
                 tools_used.append(used_name)
           else:
             result_entry, used_name, extra_blocks = await self._execute_single_tool(
@@ -2783,10 +2805,11 @@ class AgentRunner:
               base_kwargs,
             )
             tool_results_content.append(result_entry)
-            tool_results_content.extend(extra_blocks)
+            deferred_extras.extend(block for block in extra_blocks if not block.get("_event_only"))
             tools_used.append(used_name)
             i += 1
 
+        tool_results_content.extend(deferred_extras)
         current_messages.append({"role": "user", "content": tool_results_content})
         if peeked_notification_count > 0:
           self._consume_notifications(max_count=peeked_notification_count)

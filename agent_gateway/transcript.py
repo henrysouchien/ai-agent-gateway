@@ -56,7 +56,7 @@ def _message_from_assistant_event(event: dict[str, Any]) -> Message:
 def _tool_result_blocks_from_event(event: dict[str, Any]) -> list[ToolResultBlock]:
   final_blocks = event.get("final_tool_result_blocks")
   if isinstance(final_blocks, list):
-    return [dict(block) for block in final_blocks if isinstance(block, dict)]
+    return [dict(block) for block in final_blocks if isinstance(block, dict) and not block.get("_event_only")]
 
   tool_call_id = str(event.get("tool_call_id") or "")
   if not tool_call_id:
