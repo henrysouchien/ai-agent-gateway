@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 from fastapi import FastAPI
 
 from ._provider_utils import _get_default_model_for_provider, _resolve_provider
-from .auth import CredentialsResolver
+from .auth import CredentialsRefreshResolver, CredentialsResolver
 from .code_execution import CodeExecutionConfig, build_code_execution
 from .mcp_client import McpClientManager
 from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, SessionUsageSummary, UsageEvent, UsageLedger
@@ -76,6 +76,7 @@ def create_agent(
   on_startup: Callable[..., Any] | None = None,
   on_shutdown: Callable[..., Any] | None = None,
   credentials_resolver: CredentialsResolver | None = None,
+  credentials_refresh_resolver: CredentialsRefreshResolver | None = None,
   resolver_timeout_seconds: float = 5.0,
   usage_ledger: UsageLedger | None = None,
   usage_ledger_dlq_path: Path | None = None,
@@ -155,6 +156,9 @@ def create_agent(
     on_tool_timing: Optional hook invoked after each tool finishes.
     on_startup: Optional async or sync startup callback.
     on_shutdown: Optional async or sync shutdown callback.
+    credentials_resolver: Optional init-time resolver for per-user credentials.
+    credentials_refresh_resolver: Optional stream-time resolver for rotating
+      resolver-backed credentials after provider rate-limit, billing, or auth failures.
 
   Returns:
     A configured FastAPI application exposing session init, chat SSE streaming,
@@ -441,6 +445,7 @@ def create_agent(
       default_provider=provider_instance,
       auth_config=auth_config,
       credentials_resolver=credentials_resolver,
+      credentials_refresh_resolver=credentials_refresh_resolver,
       resolver_timeout_seconds=resolver_timeout_seconds,
       mcp_client=mcp_client,
       per_turn_timeout=per_turn_timeout,

@@ -55,14 +55,15 @@ class _FakeSession:
     )
 
 
-def test_tool_dispatcher_injects_user_id_into_mcp_meta() -> None:
-  mcp = _FakeMcpClient()
+@pytest.mark.parametrize("server_name", ["portfolio-mcp", "research-corpus-mcp"])
+def test_tool_dispatcher_injects_user_id_into_mcp_meta(server_name: str) -> None:
+  mcp = _FakeMcpClient(server_name=server_name)
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
     user_id="42",
-    mcp_meta_inject_servers=frozenset({"portfolio-mcp"}),
+    mcp_meta_inject_servers=frozenset({"portfolio-mcp", "research-corpus-mcp"}),
   )
 
   result, error = _run(dispatcher.dispatch("call-1", "portfolio_tool", {"ticker": "AAPL"}))
@@ -102,7 +103,7 @@ def test_tool_dispatcher_fails_closed_without_user_id_in_strict_mode() -> None:
     local_tool_handlers={},
     session_id="sess-1",
     user_id=None,
-    mcp_meta_inject_servers=frozenset({"portfolio-mcp"}),
+    mcp_meta_inject_servers=frozenset({"portfolio-mcp", "research-corpus-mcp"}),
     credentials_resolver_active=True,
   )
 

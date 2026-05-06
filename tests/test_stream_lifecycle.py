@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 import pytest
 
+import agent_gateway.runner as gateway_runner
 import agent_gateway.server as gateway_server
 from agent_gateway.event_log import EventLog
 from agent_gateway.providers import AnthropicProvider, OpenAIProvider
@@ -390,6 +391,53 @@ class _CompletingProvider(ModelProvider):
     yield StreamEvent(type="message_end", stop_reason="end_turn")
 
 
+class _CredentialFailureProvider(ModelProvider):
+  name = "anthropic"
+
+  def __init__(self) -> None:
+    self.stream_calls = 0
+    self.created_api_keys: list[str] = []
+
+  def has_active_credential(self, config: dict[str, Any]) -> bool:
+    return bool(config.get("api_key"))
+
+  def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
+    _ = timeout
+    self.created_api_keys.append(str(config.get("api_key", "")))
+    return _TrackingClient()
+
+  async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+    _ = timeout
+    client.closed = True
+
+  def get_model_info(self, model: str) -> ModelInfo:
+    return ModelInfo(id=model, provider=self.name)
+
+  def build_request_params(
+    self,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    system_prompt: str | list[tuple[str, bool]] | None,
+    tools: list[dict[str, Any]],
+    max_tokens: int,
+    **kwargs: Any,
+  ) -> dict[str, Any]:
+    _ = model, messages, system_prompt, tools, max_tokens, kwargs
+    return {}
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    _ = client, params
+    self.stream_calls += 1
+    if self.stream_calls == 1:
+      raise RuntimeError("429 Too Many Requests: rate limit exceeded")
+    yield StreamEvent(type="message_start", input_tokens=1)
+    yield StreamEvent(type="text_delta", text="rotated")
+    yield StreamEvent(type="text_end", raw_block={"type": "text", "text": "rotated"})
+    yield StreamEvent(type="usage_update", output_tokens=1)
+    yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+
 class _ToolCallProvider(ModelProvider):
   name = "tool-call"
 
@@ -440,9 +488,14 @@ class _HangingDispatcher:
     tool_input: dict[str, Any],
     *,
     call_index: int = 0,
+    abort_event: asyncio.Event | None = None,
   ):
     _ = tool_call_id, tool_name, tool_input, call_index
     self.dispatch_calls += 1
+    if abort_event is not None:
+      await abort_event.wait()
+      self.cancelled_calls += 1
+      raise asyncio.CancelledError()
     try:
       await asyncio.Future()
     except asyncio.CancelledError:
@@ -940,7 +993,49 @@ def test_normal_stream_completion_unchanged(make_test_app) -> None:
   _run(case())
 
 
-def test_normal_completion_leaves_no_pending_disconnect_task(make_test_app, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_credential_refresh_retries_stream_with_new_auth_config(monkeypatch: pytest.MonkeyPatch) -> None:
+  async def case() -> None:
+    monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
+    provider = _CredentialFailureProvider()
+    event_log = EventLog()
+    runner = AgentRunner(
+      event_log=event_log,
+      dispatcher=ToolDispatcher(
+        mcp_client=_NullMcpClient(),
+        local_tool_handlers={},
+        event_log=event_log,
+        session_id="sess-refresh",
+      ),
+      session_id="sess-refresh",
+      provider=provider,
+      auth_config={"api_key": "old-key", "model": "claude-sonnet-4-6", "max_tokens": 256},
+    )
+    refresh_failures = []
+
+    async def _refresh(failure):
+      refresh_failures.append(failure)
+      return {"api_key": "new-key", "provider": "anthropic", "billing_mode": "byok"}
+
+    runner.set_credential_refresher(_refresh)
+
+    await runner.run(
+      messages=[{"role": "user", "content": "hello"}],
+      system_prompt="test",
+      model_override="claude-sonnet-4-6",
+      max_turns=1,
+    )
+
+    events = [entry.event for entry in event_log.entries]
+    assert refresh_failures and refresh_failures[0].kind == "rate_limit"
+    assert provider.created_api_keys == ["old-key", "new-key"]
+    assert any(event.get("type") == "credential_refreshed" for event in events)
+    assert "".join(event.get("text", "") for event in events if event.get("type") == "text_delta") == "rotated"
+    assert any(event.get("type") == "stream_complete" for event in events)
+
+  _run(case())
+
+
+def test_normal_completion_creates_no_pending_disconnect_task(make_test_app, monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     disconnect_tasks: list[asyncio.Task[Any]] = []
     original_create_task = gateway_server.asyncio.create_task
@@ -969,7 +1064,7 @@ def test_normal_completion_leaves_no_pending_disconnect_task(make_test_app, monk
 
       await asyncio.sleep(0)
 
-      assert disconnect_tasks
+      assert disconnect_tasks == []
       assert all(task.done() for task in disconnect_tasks)
 
   _run(case())
@@ -1055,7 +1150,7 @@ def test_sdk_runner_second_request_succeeds_after_disconnect(make_test_app, monk
   _run(case())
 
 
-def test_tool_call_in_flight_waits_for_timeout_short(make_test_app) -> None:
+def test_tool_call_in_flight_disconnect_releases_lock_fast(make_test_app) -> None:
   async def case() -> None:
     dispatcher = _HangingDispatcher(cancel_delay=2.0)
     app = make_test_app(
@@ -1092,8 +1187,15 @@ def test_tool_call_in_flight_waits_for_timeout_short(make_test_app) -> None:
       elapsed = time.perf_counter() - disconnect_started
 
       assert dispatcher.cancelled_calls == 1
-      assert elapsed >= 1.5
-      assert elapsed < 4.0
+      assert elapsed < 1.0
       assert session.stream_active is False
+
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      ) as retry_response:
+        assert retry_response.status_code == 200
 
   _run(case())

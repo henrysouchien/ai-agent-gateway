@@ -20,11 +20,15 @@ from .agent_session_log import AgentSessionLog, AgentSessionRef, LogEntry, Query
 from .auth import (
   AuthConfig,
   AuthExpiredError,
+  CredentialFailureKind,
+  CredentialRefreshRequest,
+  CredentialsRefreshResolver,
   CredentialsResolver,
   CredentialsTimeoutError,
   CrossUserReuseError,
   MissingUserIdError,
   NoCredentialError,
+  ProviderCredentialFailure,
   StrictModeDefaultUserError,
 )
 from .code_execution import (
@@ -48,6 +52,14 @@ from .easy import create_agent
 from .memory import EmbeddingProvider, MarkdownSyncManager, MemoryStore
 from .mcp_client import McpClientManager
 from .multi_user.billing import SqliteUsageLedger, SessionUsageSummary, UsageEvent, UsageLedger, UsageTotal, normalize_identity
+from .package_info import (
+  CONTRACTS,
+  CONTRACT_CREDENTIAL_REFRESH_V1,
+  PACKAGE_NAME,
+  SOURCE_COMMIT,
+  __version__,
+  package_health,
+)
 from .providers import (
   AgentSDKConfig,
   AnthropicProvider,
@@ -117,10 +129,15 @@ __all__ = [
   "AuthManager",
   "AuthExpiredError",
   "BackgroundTask",
+  "CONTRACTS",
+  "CONTRACT_CREDENTIAL_REFRESH_V1",
   "CodexProvider",
   "COORDINATOR_DEFAULT_PREAMBLE",
   "CoordinatorConfig",
   "CostEstimate",
+  "CredentialFailureKind",
+  "CredentialRefreshRequest",
+  "CredentialsRefreshResolver",
   "CredentialsResolver",
   "CredentialsTimeoutError",
   "CrossUserReuseError",
@@ -152,10 +169,13 @@ __all__ = [
   "NotificationQueue",
   "OpenAIProvider",
   "OutputRingBuffer",
+  "PACKAGE_NAME",
+  "ProviderCredentialFailure",
   "ProviderResolver",
   "QueryCursor",
   "RateTable",
   "RequestContext",
+  "SOURCE_COMMIT",
   "ResolvedProvider",
   "RetryConfig",
   "RunOutput",
@@ -194,6 +214,7 @@ __all__ = [
   "UsageEvent",
   "UsageLedger",
   "UsageTotal",
+  "__version__",
   "normalize_identity",
   "UnknownModelError",
   "build_state_payload",
@@ -210,6 +231,7 @@ __all__ = [
   "generate_and_append_summary",
   "load_state",
   "load_rate_table",
+  "package_health",
   "make_code_execute_status_tool_def",
   "make_code_execute_tool_def",
   "make_get_background_result_handler",

@@ -94,6 +94,7 @@ class McpClientManager:
     config_path: Path | str | None | object = _UNSET,
     inline_servers: Dict[str, Dict[str, Any]] | None = None,
     timeout_overrides: Dict[str, int] | None = None,
+    server_aliases: Dict[str, str] | None = None,
     startup_timeout: int = 15,
     default_tool_timeout: int = 30,
     strip_input_fields: set[str] | None = None,
@@ -105,7 +106,8 @@ class McpClientManager:
     self._tool_to_server: Dict[str, str] = {}
     self._prefixed_to_original: Dict[str, str] = {}
     self._mcp_tool_names: Set[str] = set()
-    self._allowed_servers = allowed_servers
+    self._server_aliases = dict(server_aliases or {})
+    self._allowed_servers = self._canonical_server_names(allowed_servers) if allowed_servers is not None else None
     self._builtin_tool_names = set(builtin_tool_names or set())
     self._inline_servers = dict(inline_servers or {})
     if config_path is _UNSET:
@@ -114,10 +116,52 @@ class McpClientManager:
       self._config_path = None
     else:
       self._config_path = Path(config_path).expanduser()
-    self._timeout_overrides = dict(timeout_overrides or {})
+    self._timeout_overrides = {
+      self._canonical_server_name(server_name): timeout
+      for server_name, timeout in dict(timeout_overrides or {}).items()
+    }
     self._startup_timeout = startup_timeout
     self._default_tool_timeout = default_tool_timeout
     self._strip_input_fields = strip_input_fields or set()
+
+  def _canonical_server_name(self, server_name: str) -> str:
+    return self._server_aliases.get(server_name, server_name)
+
+  def _canonical_server_names(self, server_names: Set[str]) -> Set[str]:
+    return {self._canonical_server_name(server_name) for server_name in server_names}
+
+  def _canonicalize_server_configs(
+    self,
+    mcp_servers: Dict[str, Dict[str, Any]],
+  ) -> Dict[str, Dict[str, Any]]:
+    canonical_configs: Dict[str, Dict[str, Any]] = {}
+    source_names: Dict[str, str] = {}
+    for server_name, server_config in mcp_servers.items():
+      canonical_name = self._canonical_server_name(server_name)
+      existing_source = source_names.get(canonical_name)
+      if existing_source is not None:
+        if server_name == canonical_name and existing_source != canonical_name:
+          log.info(
+            "MCP server %s overrides alias %s for canonical server %s",
+            server_name,
+            existing_source,
+            canonical_name,
+          )
+          canonical_configs[canonical_name] = server_config
+          source_names[canonical_name] = server_name
+        else:
+          log.warning(
+            "Skipping MCP server %s: resolves to already configured canonical server %s",
+            server_name,
+            canonical_name,
+          )
+        continue
+
+      if server_name != canonical_name:
+        log.info("Using MCP server alias %s as %s", server_name, canonical_name)
+      canonical_configs[canonical_name] = server_config
+      source_names[canonical_name] = server_name
+    return canonical_configs
 
   async def startup(self, allowed_servers: Set[str] | None = None) -> None:
     async with self._lock:
@@ -138,10 +182,11 @@ class McpClientManager:
       if not mcp_servers:
         self._started = True
         return
+      mcp_servers = self._canonicalize_server_configs(mcp_servers)
 
       effective_allowed_servers = self._allowed_servers
       if allowed_servers is not None:
-        requested_servers = set(allowed_servers)
+        requested_servers = self._canonical_server_names(set(allowed_servers))
         if effective_allowed_servers is None:
           effective_allowed_servers = requested_servers
         else:
@@ -251,9 +296,10 @@ class McpClientManager:
     return copy.deepcopy(self._tool_definitions)
 
   def get_server_tool_definitions(self, server_names: Set[str]) -> List[Dict[str, Any]]:
+    canonical_server_names = self._canonical_server_names(set(server_names))
     tool_definitions: List[Dict[str, Any]] = []
     for server_name, state in self._servers.items():
-      if server_name in server_names:
+      if server_name in canonical_server_names:
         tool_definitions.extend(copy.deepcopy(state.tool_definitions))
     return tool_definitions
 
@@ -278,6 +324,7 @@ class McpClientManager:
 
   def resolve_tool_name(self, server_name: str, original_name: str) -> str | None:
     """Return the exposed tool name for a server-owned tool."""
+    server_name = self._canonical_server_name(server_name)
     state = self._servers.get(server_name)
     if state is None:
       return None
@@ -289,6 +336,7 @@ class McpClientManager:
     name: str,
     tool_input: Dict[str, Any],
     meta: Dict[str, Any] | None = None,
+    abort_event: asyncio.Event | None = None,
   ) -> Tuple[Any | None, Dict[str, Any] | None]:
     server_name = self._tool_to_server.get(name)
     if not server_name:
@@ -302,16 +350,36 @@ class McpClientManager:
     timeout_seconds = self._timeout_overrides.get(server_name, self._default_tool_timeout)
 
     try:
+      if abort_event is not None and abort_event.is_set():
+        raise asyncio.CancelledError()
       call_kwargs = {
         "read_timeout_seconds": timedelta(seconds=timeout_seconds),
       }
       if meta is not None:
         call_kwargs["meta"] = meta
-      result = await server.session.call_tool(
+      call_task = asyncio.create_task(server.session.call_tool(
         original_name,
         tool_input,
         **call_kwargs,
-      )
+      ))
+      abort_task: asyncio.Task[Any] | None = None
+      try:
+        if abort_event is None:
+          result = await call_task
+        else:
+          abort_task = asyncio.create_task(abort_event.wait())
+          done, _pending = await asyncio.wait(
+            {call_task, abort_task},
+            return_when=asyncio.FIRST_COMPLETED,
+          )
+          if abort_task in done and abort_event.is_set():
+            call_task.cancel()
+            await asyncio.gather(call_task, return_exceptions=True)
+            raise asyncio.CancelledError()
+          result = await call_task
+      finally:
+        if abort_task is not None:
+          abort_task.cancel()
     except Exception as exc:
       msg = str(exc)
       return None, {

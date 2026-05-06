@@ -20,15 +20,19 @@ from starlette.background import BackgroundTask
 
 from ._provider_utils import _get_allowed_models_for_provider_name
 from .auth import (
+  CredentialRefreshRequest,
   CredentialsResolver,
+  CredentialsRefreshResolver,
   CredentialsTimeoutError,
   CrossUserReuseError,
   MissingUserIdError,
   NoCredentialError,
+  ProviderCredentialFailure,
   StrictModeDefaultUserError,
 )
 from .event_log import EventLog
 from .mcp_client import McpClientManager
+from .package_info import package_health
 from .providers.agent_sdk import AgentSDKConfig
 from .providers import AnthropicProvider, ModelProvider
 from .runner import AgentRunner
@@ -198,6 +202,9 @@ class GatewayServerConfig:
     cors_allow_methods: Allowed CORS methods.
     auth_config: Default provider auth/model config used by convenience flows and
       by request validation when no runtime override is present.
+    credentials_resolver: Optional init-time resolver for per-user credentials.
+    credentials_refresh_resolver: Optional stream-time resolver used to rotate
+      credentials after provider rate-limit, billing, or auth failures.
     mcp_client: Optional shared `McpClientManager`.
     sdk_config: Optional `AgentSDKConfig` when using `AgentSDKRunner`.
     per_turn_timeout: Default per-turn timeout in seconds.
@@ -231,6 +238,7 @@ class GatewayServerConfig:
   cors_allow_methods: List[str] = field(default_factory=lambda: ["GET", "POST", "OPTIONS"])
   auth_config: Dict[str, Any] = field(default_factory=dict)
   credentials_resolver: CredentialsResolver | None = None
+  credentials_refresh_resolver: CredentialsRefreshResolver | None = None
   resolver_timeout_seconds: float = 5.0
   mcp_client: Optional[McpClientManager] = None
   sdk_config: AgentSDKConfig | None = None
@@ -619,6 +627,59 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       "Connection": "keep-alive",
     }
 
+    async def _credential_refresher(failure: ProviderCredentialFailure) -> Dict[str, Any] | None:
+      resolver = config.credentials_refresh_resolver
+      if resolver is None:
+        return None
+      session_auth_config = session.auth_config or config.auth_config
+      request = CredentialRefreshRequest(
+        user_id=session.user_id,
+        user_email=session.user_email,
+        session_id=session.session_id,
+        api_key_hash=session.api_key_hash,
+        channel=channel,
+        provider=failure.provider,
+        billing_mode=str(session_auth_config.get("billing_mode", "") or "") or None,
+        model=str(session_auth_config.get("model", "") or "") or None,
+        auth_mode=str(session_auth_config.get("auth_mode", "") or "") or None,
+        request_id=body.request_id,
+        failure=failure,
+      )
+      try:
+        auth_config = await asyncio.wait_for(
+          resolver(request),
+          timeout=config.resolver_timeout_seconds,
+        )
+      except Exception as exc:
+        log.warning(
+          "Credential refresh failed | session=%s user=%s provider=%s kind=%s detail=%s",
+          session.session_id,
+          session.user_id,
+          failure.provider,
+          failure.kind,
+          exc,
+        )
+        return None
+      if auth_config is None:
+        log.info(
+          "Credential refresh unavailable | session=%s user=%s provider=%s kind=%s",
+          session.session_id,
+          session.user_id,
+          failure.provider,
+          failure.kind,
+        )
+        return None
+      if auth_config.provider != failure.provider:
+        log.warning(
+          "Credential refresh returned provider=%s for provider=%s; ignoring",
+          auth_config.provider,
+          failure.provider,
+        )
+        return None
+      refreshed_auth_config = auth_config.to_dict()
+      session.auth_config = refreshed_auth_config
+      return dict(refreshed_auth_config)
+
     try:
       runtime = await config.build_chat_runtime(
         session=session,
@@ -633,6 +694,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
       event_log = EventLog(on_event=config.on_event, session_id=sid)
       runner = runtime.build_runner(event_log, sid)
+      set_credential_refresher = getattr(runner, "set_credential_refresher", None)
+      if callable(set_credential_refresher) and config.credentials_refresh_resolver is not None:
+        set_credential_refresher(_credential_refresher)
       if runtime.disconnect_handler is None:
         runner_on_disconnect = getattr(runner, "on_disconnect", None)
         if callable(runner_on_disconnect):
@@ -673,10 +737,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     heartbeat_task = asyncio.create_task(heartbeat())
 
     async def response_cleanup() -> None:
-      disconnect_task = asyncio.create_task(_safe_fire_disconnect())
+      await _safe_fire_disconnect()
       runner_task.cancel()
       heartbeat_task.cancel()
-      await asyncio.gather(runner_task, heartbeat_task, disconnect_task, return_exceptions=True)
+      await asyncio.gather(runner_task, heartbeat_task, return_exceptions=True)
       event_log.close("stream closed")
       session.pending_tools.clear()
       session.approval_queues.clear()
@@ -789,7 +853,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
   @router.get("/health")
   async def health() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok", "package": package_health()})
 
   app.include_router(router)
   app.state.gateway_chat_init = chat_init

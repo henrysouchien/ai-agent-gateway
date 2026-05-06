@@ -18,6 +18,7 @@ from agent_gateway.auth import (
   NoCredentialError,
   StrictModeDefaultUserError,
 )
+from agent_gateway.providers import AnthropicProvider
 
 
 def test_auth_config_round_trips_and_preserves_all_fields() -> None:
@@ -78,3 +79,21 @@ def test_auth_exceptions_have_actionable_default_messages() -> None:
     message = str(exc)
     assert message
     assert keyword in message.lower()
+
+
+@pytest.mark.parametrize(
+  ("message", "kind"),
+  [
+    ("429 Too Many Requests: rate limit exceeded", "rate_limit"),
+    ("401 Unauthorized: invalid api key", "auth"),
+    ("403 PermissionDeniedError: billing quota exhausted", "billing"),
+    ("insufficient_quota: exceeded your current quota", "billing"),
+  ],
+)
+def test_provider_classifies_credential_refresh_failures(message: str, kind: str) -> None:
+  failure = AnthropicProvider().classify_credential_failure(RuntimeError(message))
+
+  assert failure is not None
+  assert failure.provider == "anthropic"
+  assert failure.kind == kind
+  assert failure.retryable_with_new_credentials is True

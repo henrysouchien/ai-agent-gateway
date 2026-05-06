@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Literal, Mapping
 
 _VALID_PROVIDERS = {"anthropic", "openai", "codex"}
 _VALID_BILLING_MODES = {"byok", "metered"}
+CredentialFailureKind = Literal["rate_limit", "billing", "auth"]
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,41 @@ class AuthConfig:
 CredentialsResolver = Callable[
   [str, Any],
   Awaitable[AuthConfig],
+]
+
+
+@dataclass(frozen=True)
+class ProviderCredentialFailure:
+  """Sanitized provider failure that may be recoverable with fresh credentials."""
+
+  provider: str
+  kind: CredentialFailureKind
+  status_code: int | None = None
+  error_code: str | None = None
+  message: str = ""
+  retryable_with_new_credentials: bool = True
+
+
+@dataclass(frozen=True)
+class CredentialRefreshRequest:
+  """Request passed to a deployment-specific credential refresh resolver."""
+
+  user_id: str
+  user_email: str | None
+  session_id: str
+  api_key_hash: str
+  channel: str | None
+  provider: str
+  billing_mode: str | None
+  model: str | None
+  auth_mode: str | None
+  request_id: str | None
+  failure: ProviderCredentialFailure
+
+
+CredentialsRefreshResolver = Callable[
+  [CredentialRefreshRequest],
+  Awaitable[AuthConfig | None],
 ]
 
 
@@ -111,10 +147,14 @@ class AuthExpiredError(Exception):
 __all__ = [
   "AuthConfig",
   "AuthExpiredError",
+  "CredentialFailureKind",
+  "CredentialRefreshRequest",
+  "CredentialsRefreshResolver",
   "CredentialsResolver",
   "CredentialsTimeoutError",
   "CrossUserReuseError",
   "MissingUserIdError",
   "NoCredentialError",
+  "ProviderCredentialFailure",
   "StrictModeDefaultUserError",
 ]

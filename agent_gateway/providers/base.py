@@ -2,8 +2,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 from typing import Any, AsyncIterator
 
+from ..auth import ProviderCredentialFailure
+
+
+_STATUS_CODE_RE = re.compile(r"\b(400|401|403|404|429|5\d\d)\b")
+_BILLING_PATTERNS = (
+  re.compile(r"\bbilling\b", re.IGNORECASE),
+  re.compile(r"\bquota\b", re.IGNORECASE),
+  re.compile(r"\binsufficient[_\s-]+quota\b", re.IGNORECASE),
+  re.compile(r"\bcredit(?:s)?\b", re.IGNORECASE),
+  re.compile(r"\bpayment\b", re.IGNORECASE),
+  re.compile(r"\bsubscription\b", re.IGNORECASE),
+  re.compile(r"\bpermission denied\b", re.IGNORECASE),
+  re.compile(r"\bpermissiondenied\b", re.IGNORECASE),
+)
+_AUTH_PATTERNS = (
+  re.compile(r"\bunauthorized\b", re.IGNORECASE),
+  re.compile(r"\bauth(?:entication|orization)?(?:\s+failed|\s+error)?\b", re.IGNORECASE),
+  re.compile(r"\binvalid api key\b", re.IGNORECASE),
+  re.compile(r"\bexpired (?:token|credential|key)\b", re.IGNORECASE),
+)
+_RATE_LIMIT_PATTERNS = (
+  re.compile(r"\brate(?:\s+limit(?:ed|ing)?|\s+limited)\b", re.IGNORECASE),
+  re.compile(r"\btoo many requests\b", re.IGNORECASE),
+)
 
 class ThinkingLevel(str, Enum):
   """Provider-agnostic reasoning intensity hint."""
@@ -66,6 +91,98 @@ class CostEstimate:
   total: float = 0.0
 
 
+def _status_code_from_exception(exc: Exception) -> int | None:
+  status_code = getattr(exc, "status_code", None)
+  if status_code is None:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+  if isinstance(status_code, int):
+    return status_code
+  if isinstance(status_code, str) and status_code.isdigit():
+    return int(status_code)
+  return None
+
+
+def _response_text(exc: Exception) -> str:
+  response = getattr(exc, "response", None)
+  text = getattr(response, "text", "") if response is not None else ""
+  if isinstance(text, str):
+    return text
+  return ""
+
+
+def _error_code_from_exception(exc: Exception) -> str | None:
+  for attr in ("code", "error_code", "type"):
+    value = getattr(exc, attr, None)
+    if value:
+      return str(value)
+  body = _response_text(exc)
+  for pattern in (
+    re.compile(r'"code"\s*:\s*"([^"]+)"'),
+    re.compile(r'"type"\s*:\s*"([^"]+)"'),
+    re.compile(r"'code'\s*:\s*'([^']+)'"),
+    re.compile(r"'type'\s*:\s*'([^']+)'"),
+  ):
+    match = pattern.search(body)
+    if match:
+      return match.group(1)
+  return None
+
+
+def _classify_provider_credential_failure(
+  *,
+  provider: str,
+  exc: Exception,
+) -> ProviderCredentialFailure | None:
+  status_code = _status_code_from_exception(exc)
+  message = " ".join(part for part in (str(exc), _response_text(exc)) if part).strip()
+  error_code = _error_code_from_exception(exc)
+  searchable = " ".join(part for part in (message, error_code or "") if part)
+
+  if status_code is None:
+    match = _STATUS_CODE_RE.search(searchable)
+    if match:
+      status_code = int(match.group(1))
+
+  if any(pattern.search(searchable) for pattern in _BILLING_PATTERNS):
+    return ProviderCredentialFailure(
+      provider=provider,
+      kind="billing",
+      status_code=status_code,
+      error_code=error_code,
+      message=message,
+    )
+
+  if status_code in {401} or any(pattern.search(searchable) for pattern in _AUTH_PATTERNS):
+    return ProviderCredentialFailure(
+      provider=provider,
+      kind="auth",
+      status_code=status_code,
+      error_code=error_code,
+      message=message,
+    )
+
+  if status_code == 403:
+    return ProviderCredentialFailure(
+      provider=provider,
+      kind="billing",
+      status_code=status_code,
+      error_code=error_code,
+      message=message,
+    )
+
+  if status_code == 429 or any(pattern.search(searchable) for pattern in _RATE_LIMIT_PATTERNS):
+    return ProviderCredentialFailure(
+      provider=provider,
+      kind="rate_limit",
+      status_code=status_code,
+      error_code=error_code,
+      message=message,
+    )
+
+  return None
+
+
 class ModelProvider:
   """Interface implemented by model-provider adapters.
 
@@ -113,6 +230,9 @@ class ModelProvider:
 
   def is_retryable_error(self, exc: Exception) -> bool:
     return False
+
+  def classify_credential_failure(self, exc: Exception) -> ProviderCredentialFailure | None:
+    return _classify_provider_credential_failure(provider=self.name, exc=exc)
 
   def estimate_cost(
     self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import os
@@ -109,10 +110,23 @@ class ToolExecutionContext:
   tool_name: str
   event_log: EventLog
   resolved_qualifier: str = ""
+  abort_event: asyncio.Event | None = None
 
   def emit(self, event: Dict[str, Any]) -> None:
     """Append a custom event to the active event log."""
     self.event_log.append(event)
+
+  @property
+  def aborted(self) -> bool:
+    """Return True when the owning chat stream has disconnected."""
+    return self.abort_event is not None and self.abort_event.is_set()
+
+  async def wait_aborted(self) -> None:
+    """Wait until the owning chat stream disconnects."""
+    if self.abort_event is None:
+      await asyncio.Future()
+    else:
+      await self.abort_event.wait()
 
 
 class ToolDispatcher:
@@ -163,6 +177,7 @@ class ToolDispatcher:
     self._user_id = user_id
     self._credentials_resolver_active = credentials_resolver_active
     self._session_cache_denied = session_cache_denied_tools or frozenset()
+    self._mcp_accepts_abort_event = self._callable_accepts_kw(getattr(self._mcp, "call_tool", None), "abort_event")
 
   async def _run_interceptors(
     self,
@@ -268,6 +283,7 @@ class ToolDispatcher:
     tool_input: Dict[str, Any],
     *,
     call_index: int = 0,
+    abort_event: asyncio.Event | None = None,
   ) -> ToolResult:
     """Execute one tool call and return `(result, error)`.
 
@@ -286,6 +302,9 @@ class ToolDispatcher:
       - Interceptor warnings are attached to successful dict results under
         `_interceptor_warnings`.
     """
+    if abort_event is not None and abort_event.is_set():
+      raise asyncio.CancelledError()
+
     ir = await self._run_interceptors(
       tool_call_id,
       tool_name,
@@ -400,6 +419,7 @@ class ToolDispatcher:
           tool_name=tool_name,
           event_log=self._event_log,
           resolved_qualifier=qualifier,
+          abort_event=abort_event,
         )
       result, error = await self._local[tool_name](tool_input, call_index=call_index, tool_ctx=tool_ctx)
     elif self._mcp.is_mcp_tool(tool_name):
@@ -409,12 +429,12 @@ class ToolDispatcher:
         if self._credentials_resolver_active and not resolved_user_id:
           raise RuntimeError("MCP meta user_id is required in strict mode")
         meta = {"session_id": self._session_id, "user_id": resolved_user_id}
-        result, error = await self._mcp.call_tool(tool_name, tool_input, meta=meta)
+        result, error = await self._call_mcp_tool(tool_name, tool_input, meta=meta, abort_event=abort_event)
       elif server and server in self._mcp_session_inject_servers:
         tool_input = {**tool_input, "_session_id": self._session_id}
-        result, error = await self._mcp.call_tool(tool_name, tool_input)
+        result, error = await self._call_mcp_tool(tool_name, tool_input, abort_event=abort_event)
       else:
-        result, error = await self._mcp.call_tool(tool_name, tool_input)
+        result, error = await self._call_mcp_tool(tool_name, tool_input, abort_event=abort_event)
     else:
       result, error = None, {"code": "unknown_tool", "message": f"Unknown tool: {tool_name}"}
 
@@ -435,6 +455,31 @@ class ToolDispatcher:
       except Exception:
         qualifier = ""
     return self._should_request_approval(tool_name, tool_input, qualifier)
+
+  async def _call_mcp_tool(
+    self,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    *,
+    meta: Dict[str, Any] | None = None,
+    abort_event: asyncio.Event | None = None,
+  ) -> ToolResult:
+    kwargs: Dict[str, Any] = {}
+    if meta is not None:
+      kwargs["meta"] = meta
+    if abort_event is not None and self._mcp_accepts_abort_event:
+      kwargs["abort_event"] = abort_event
+    return await self._mcp.call_tool(tool_name, tool_input, **kwargs)
+
+  @staticmethod
+  def _callable_accepts_kw(callback: Any, keyword: str) -> bool:
+    if callback is None:
+      return False
+    try:
+      params = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+      return False
+    return keyword in params or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
 
   @staticmethod
   def _normalize_needs_approval(

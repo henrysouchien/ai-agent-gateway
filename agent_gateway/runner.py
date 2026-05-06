@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, U
 
 from ._provider_utils import _get_default_model_for_provider
 from .agent_session_log import AgentSessionLog
+from .auth import ProviderCredentialFailure
 from .context_builder import SessionContextBuilder
 from .event_log import EventLog
 from .mcp_client import McpClientManager
@@ -186,6 +187,7 @@ OnMaxTurns = Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
 BackgroundTaskHandler = Callable[..., Awaitable[Tuple[Optional[Any], Optional[Dict[str, Any]]]]]
 BackgroundTaskCallback = Callable[[BackgroundTask | TaskEntry], Awaitable[None] | None]
 OnMetric = Callable[[str, int], None]
+OnCredentialRefresh = Callable[[ProviderCredentialFailure], Awaitable[Dict[str, Any] | None] | Dict[str, Any] | None]
 
 
 class AgentRunner:
@@ -235,6 +237,7 @@ class AgentRunner:
     channel: str | None = None,
     usage_ledger_dlq_path: Path | str | None = None,
     on_metric: OnMetric | None = None,
+    on_credential_failure: OnCredentialRefresh | None = None,
     sub_agent_config: SubAgentConfig | None = None,
     compaction_trigger: int | None = None,
     compaction_instructions: str | None = None,
@@ -306,6 +309,7 @@ class AgentRunner:
       Path(usage_ledger_dlq_path).expanduser() if usage_ledger_dlq_path is not None else DEFAULT_USAGE_DLQ_PATH
     )
     self._on_metric = on_metric
+    self._on_credential_failure = on_credential_failure
     self._sub_agent_config = sub_agent_config
     self._compaction_trigger = compaction_trigger
     self._compaction_instructions = compaction_instructions
@@ -325,6 +329,14 @@ class AgentRunner:
     self._sub_agent_semaphore: asyncio.Semaphore | None = None
     self._active_client: Any | None = None
     self._disconnected = False
+    self._tool_abort_event = asyncio.Event()
+    try:
+      dispatch_params = inspect.signature(self._dispatcher.dispatch).parameters
+      self._dispatcher_accepts_abort_event = "abort_event" in dispatch_params or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in dispatch_params.values()
+      )
+    except (TypeError, ValueError):
+      self._dispatcher_accepts_abort_event = False
     task_registry_auto_created = task_registry is None
     self._task_registry = task_registry or TaskRegistry(
       max_inflight=self._max_background_tasks,
@@ -386,6 +398,9 @@ class AgentRunner:
 
   def _append(self, event: Dict[str, Any]) -> None:
     self._log.append(event)
+
+  def set_credential_refresher(self, callback: OnCredentialRefresh | None) -> None:
+    self._on_credential_failure = callback
 
   def _extract_last_user_message(self, request_messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     for msg in reversed(request_messages):
@@ -738,6 +753,8 @@ class AgentRunner:
 
   async def on_disconnect(self) -> None:
     self._disconnected = True
+    self._tool_abort_event.set()
+    await asyncio.sleep(0)
     try:
       await self.force_close()
     except Exception as exc:
@@ -1587,6 +1604,52 @@ class AgentRunner:
     except Exception as exc:
       log.warning("[%s] metric hook failed (non-fatal): %s", self._sid, exc)
 
+  async def _call_credential_refresher(self, failure: ProviderCredentialFailure) -> Dict[str, Any] | None:
+    if self._on_credential_failure is None or not failure.retryable_with_new_credentials:
+      return None
+    try:
+      refreshed = self._on_credential_failure(failure)
+      if inspect.isawaitable(refreshed):
+        refreshed = await refreshed
+    except Exception as exc:
+      log.warning(
+        "[%s] credential refresh failed after provider %s failure (non-fatal): %s",
+        self._sid,
+        failure.kind,
+        exc,
+      )
+      self._call_metric("gateway.credential_refresh_failed", 1)
+      return None
+    if not isinstance(refreshed, dict) or not refreshed:
+      self._call_metric("gateway.credential_refresh_unavailable", 1)
+      return None
+    return dict(refreshed)
+
+  def _apply_refreshed_auth_config(self, config: Dict[str, Any], refreshed: Dict[str, Any]) -> None:
+    # Preserve request-scoped model/runtime controls. The refresh hook rotates
+    # credentials for the already-selected provider; model changes belong to a
+    # new session/init handshake.
+    preserved = {
+      "model": config.get("model"),
+      "max_tokens": config.get("max_tokens"),
+      "thinking": config.get("thinking"),
+    }
+    merged = dict(config)
+    merged.update(refreshed)
+    for key, value in preserved.items():
+      if value is not None:
+        merged[key] = value
+    merged["auth_mode"] = str(merged.get("auth_mode", "api")).strip().lower()
+    merged["api_key"] = str(merged.get("api_key", ""))
+    merged["auth_token"] = str(merged.get("auth_token", ""))
+    merged["model"] = str(merged.get("model") or "")
+    merged["max_tokens"] = int(merged.get("max_tokens", 16000))
+    merged["thinking"] = bool(merged.get("thinking", True))
+    config.clear()
+    config.update(merged)
+    self._auth_config.clear()
+    self._auth_config.update(merged)
+
   @staticmethod
   def _usage_has_tokens(usage_totals: Dict[str, int]) -> bool:
     return any(
@@ -1903,6 +1966,8 @@ class AgentRunner:
         raise stream_error
       raise asyncio.CancelledError()
 
+    credential_refresh_attempted = False
+
     for attempt in range(1 + STREAM_RETRY_MAX):
       if attempt > 0:
         _raise_if_disconnected()
@@ -1988,6 +2053,40 @@ class AgentRunner:
           self._append({"type": "error", "error": guard_error})
           await self._close_client(client, timeout=5.0)
           return None
+
+        credential_failure: ProviderCredentialFailure | None = None
+        try:
+          credential_failure = self._provider.classify_credential_failure(exc)
+        except Exception as classify_exc:
+          log.warning("[%s] credential failure classification failed (non-fatal): %s", self._sid, classify_exc)
+        if credential_failure is not None and not credential_refresh_attempted:
+          credential_refresh_attempted = True
+          refreshed_config = await self._call_credential_refresher(credential_failure)
+          if refreshed_config is not None:
+            self._apply_refreshed_auth_config(config, refreshed_config)
+            if not self._provider.has_active_credential(config):
+              log.warning("[%s] credential refresh returned inactive credentials; falling back to normal error path", self._sid)
+            else:
+              usage_totals.clear()
+              usage_totals.update(tokens_snapshot)
+              stream_error = RuntimeError(f"credential refreshed after {credential_failure.kind}")
+              self._call_metric("gateway.credential_refresh_success", 1)
+              self._append(
+                {
+                  "type": "credential_refreshed",
+                  "provider": credential_failure.provider,
+                  "kind": credential_failure.kind,
+                  "status_code": credential_failure.status_code,
+                }
+              )
+              self._append(
+                {
+                  "type": "stream_retry",
+                  "attempt": attempt,
+                  "error": f"credential refreshed after provider {credential_failure.kind} failure",
+                }
+              )
+              continue
 
         formatted_exc = _format_exc(exc)
         if not self._provider.is_retryable_error(exc):
@@ -2111,11 +2210,14 @@ class AgentRunner:
           "message": f"Tool '{tool_name}' is not available in this context",
         }
       else:
+        dispatch_kwargs: Dict[str, Any] = {"call_index": call_index}
+        if self._dispatcher_accepts_abort_event:
+          dispatch_kwargs["abort_event"] = self._tool_abort_event
         dispatch_coro = self._dispatcher.dispatch(
           tool_id,
           tool_name,
           tool_input,
-          call_index=call_index,
+          **dispatch_kwargs,
         )
         needs_approval = False
         requires_approval_fn = getattr(self._dispatcher, "requires_approval", None)

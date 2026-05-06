@@ -11,7 +11,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.auth import AuthConfig, NoCredentialError
+from agent_gateway.auth import AuthConfig, NoCredentialError, ProviderCredentialFailure
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 
 
@@ -19,6 +19,10 @@ class _StubRunner:
   def __init__(self, event_log, run_calls: list[dict[str, Any]]) -> None:
     self._event_log = event_log
     self._run_calls = run_calls
+    self._credential_refresher = None
+
+  def set_credential_refresher(self, callback) -> None:
+    self._credential_refresher = callback
 
   async def run(
     self,
@@ -36,12 +40,22 @@ class _StubRunner:
         "max_turns": max_turns,
       }
     )
+    if self._credential_refresher is not None:
+      await self._credential_refresher(
+        ProviderCredentialFailure(
+          provider="anthropic",
+          kind="rate_limit",
+          status_code=429,
+          message="rate limit exceeded",
+        )
+      )
     self._event_log.append({"type": "stream_complete", "usage": {}})
 
 
 def _make_app(
   *,
   credentials_resolver=None,
+  credentials_refresh_resolver=None,
   resolver_timeout_seconds: float = 5.0,
 ):
   captured_requests: list[Any] = []
@@ -59,6 +73,7 @@ def _make_app(
     GatewayServerConfig(
       auth_config={"model": "claude-sonnet-4-6"},
       credentials_resolver=credentials_resolver,
+      credentials_refresh_resolver=credentials_refresh_resolver,
       resolver_timeout_seconds=resolver_timeout_seconds,
       build_chat_runtime=_build_chat_runtime,
     )
@@ -172,6 +187,45 @@ def test_chat_init_calls_resolver_and_stores_auth_config() -> None:
     "model": "claude-sonnet-4-6",
     "max_tokens": 16000,
   }
+
+
+def test_chat_refresh_resolver_updates_session_auth_config() -> None:
+  refresh_requests: list[Any] = []
+
+  async def _resolver(user_id: str, _init_request):
+    return _resolver_for(user_id)
+
+  async def _refresh(request):
+    refresh_requests.append(request)
+    return AuthConfig.from_dict(
+      {
+        "provider": "anthropic",
+        "billing_mode": "byok",
+        "api_key": "key-rotated",
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 16000,
+      }
+    )
+
+  app, _captured_requests, _run_calls = _make_app(
+    credentials_resolver=_resolver,
+    credentials_refresh_resolver=_refresh,
+  )
+
+  with TestClient(app) as client:
+    init_response = _init_session(client, user_id="alice")
+    _consume_chat_stream(
+      client,
+      init_response["session_token"],
+      {"messages": [{"role": "user", "content": "hi"}], "user_id": "alice", "request_id": "req-refresh"},
+    )
+
+  session = app.state.auth.session_store.get_session(init_response["session_id"])
+  assert session.auth_config["api_key"] == "key-rotated"
+  assert refresh_requests
+  assert refresh_requests[0].user_id == "alice"
+  assert refresh_requests[0].request_id == "req-refresh"
+  assert refresh_requests[0].failure.kind == "rate_limit"
 
 
 def test_chat_rejects_cross_user_reuse_in_strict_mode() -> None:
