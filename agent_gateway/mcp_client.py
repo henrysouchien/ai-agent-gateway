@@ -219,7 +219,8 @@ class McpClientManager:
     try:
       return await self._connect(name, config)
     except Exception as exc:
-      log.warning("MCP server %s failed to connect: %s", name, exc)
+      message = str(exc).strip() or type(exc).__name__
+      log.warning("MCP server %s failed to connect: %s", name, message)
       return None
 
   async def _connect(self, name: str, config: Dict[str, Any]) -> _ServerState:
