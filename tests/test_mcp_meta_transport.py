@@ -62,7 +62,10 @@ def test_tool_dispatcher_injects_user_id_into_mcp_meta(server_name: str) -> None
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
-    user_id="42",
+    user_id="alice",
+    risk_user_id=42,
+    channel="excel",
+    role="invite",
     mcp_meta_inject_servers=frozenset({"portfolio-mcp", "research-corpus-mcp"}),
   )
 
@@ -74,18 +77,18 @@ def test_tool_dispatcher_injects_user_id_into_mcp_meta(server_name: str) -> None
     {
       "name": "portfolio_tool",
       "tool_input": {"ticker": "AAPL"},
-      "meta": {"session_id": "sess-1", "user_id": "42"},
+      "meta": {"session_id": "sess-1", "user_id": "42", "channel": "excel", "role": "invite"},
     }
   ]
 
 
-def test_tool_dispatcher_legacy_session_injection_still_works() -> None:
-  mcp = _FakeMcpClient(server_name="legacy-server")
+def test_tool_dispatcher_session_param_injection_still_works() -> None:
+  mcp = _FakeMcpClient(server_name="session-param-server")
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
-    mcp_session_inject_servers={"legacy-server"},
+    mcp_session_inject_servers={"session-param-server"},
   )
 
   result, error = _run(dispatcher.dispatch("call-1", "portfolio_tool", {"ticker": "AAPL"}))
@@ -103,6 +106,7 @@ def test_tool_dispatcher_fails_closed_without_user_id_in_strict_mode() -> None:
     local_tool_handlers={},
     session_id="sess-1",
     user_id=None,
+    risk_user_id=None,
     mcp_meta_inject_servers=frozenset({"portfolio-mcp", "research-corpus-mcp"}),
     credentials_resolver_active=True,
   )
@@ -126,10 +130,10 @@ def test_mcp_client_call_tool_forwards_meta_to_underlying_session() -> None:
     manager.call_tool(
       "portfolio_tool",
       {"ticker": "AAPL"},
-      meta={"session_id": "sess-1", "user_id": "42"},
+      meta={"session_id": "sess-1", "user_id": "42", "channel": "excel", "role": "invite"},
     )
   )
 
   assert error is None
   assert result == {"ok": True}
-  assert session.calls[0]["meta"] == {"session_id": "sess-1", "user_id": "42"}
+  assert session.calls[0]["meta"] == {"session_id": "sess-1", "user_id": "42", "channel": "excel", "role": "invite"}

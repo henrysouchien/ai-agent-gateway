@@ -11,7 +11,18 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner, AgentSessionLog, EventLog, GatewaySession, ModelInfo, ModelProvider, TaskRegistry, TaskState, ToolDispatcher
+from agent_gateway import (
+  AgentRunner,
+  AgentSessionLog,
+  EventLog,
+  GatewaySession,
+  ModelInfo,
+  ModelProvider,
+  SessionContextBuilder,
+  TaskRegistry,
+  TaskState,
+  ToolDispatcher,
+)
 from agent_gateway.providers import StreamEvent
 import agent_gateway.runner as gateway_runner
 
@@ -34,9 +45,10 @@ class _NullMcpClient:
 class _ScriptedProvider(ModelProvider):
   name = "stub"
 
-  def __init__(self, turns: list[list[StreamEvent]]) -> None:
+  def __init__(self, turns: list[list[StreamEvent]], after_turn: Any | None = None) -> None:
     self._turns = [list(turn) for turn in turns]
     self._turn_index = 0
+    self._after_turn = after_turn
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     return True
@@ -72,6 +84,8 @@ class _ScriptedProvider(ModelProvider):
     self._turn_index += 1
     for event in current_turn:
       yield event
+    if self._after_turn is not None:
+      self._after_turn(self._turn_index)
 
 
 def _make_dispatcher(
@@ -133,6 +147,14 @@ async def _warning_tool(tool_input: dict[str, Any], **kwargs: Any):
   return {"ok": True, "low_match_warning": tool_input.get("warning", "only 20% matched")}, None
 
 
+async def _semantic_error_tool(tool_input: dict[str, Any], **kwargs: Any):
+  _ = kwargs
+  return {
+    "status": "error",
+    "error": {"code": "not_found", "message": f"{tool_input.get('query', 'ticker')} not found"},
+  }, None
+
+
 def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "runner.jsonl")
   provider = _ScriptedProvider([
@@ -147,6 +169,9 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
     provider=provider,
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
     agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "Run lookup"}]))
@@ -168,6 +193,117 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
   assert entries[3].event["parent_assistant_message_seq"] == entries[2].seq
   assert "final_tool_result_blocks" in entries[4].event
   assert entries[6].event["reason"] == "completed"
+
+
+def test_semantic_tool_error_is_visible_in_trace_and_timing(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "semantic-error.jsonl")
+  event_log = EventLog()
+  timing_calls: list[tuple[Any, ...]] = []
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _semantic_error_tool}),
+    session_id="sess-parent",
+    provider=_ScriptedProvider([
+      _tool_turn(tool_input={"query": "X"}),
+      _text_turn("handled"),
+    ]),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    on_tool_timing=lambda *args: timing_calls.append(args),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "Run lookup"}]))
+
+  complete_events = [
+    entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"
+  ]
+  assert len(complete_events) == 1
+  complete = complete_events[0]
+  assert complete["error"] is None
+  assert complete["is_error"] is True
+  assert complete["semantic_error"] == {
+    "code": "tool_status_error",
+    "message": "X not found",
+    "source": "status",
+    "status": "error",
+    "sub_code": "not_found",
+  }
+  assert complete["final_tool_result_blocks"][0]["is_error"] is True
+  assert timing_calls
+  assert timing_calls[0][4] is True
+
+  durable_entries, _ = _run(log.query(event_types={"tool_call_complete"}, order="asc"))
+  assert durable_entries[0].event["is_error"] is True
+  assert durable_entries[0].event["semantic_error"]["message"] == "X not found"
+
+
+def test_operator_pause_before_turn_emits_clean_interruption(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "operator-pause-before-turn.jsonl")
+  event_log = EventLog()
+  pause_event = asyncio.Event()
+  pause_event.set()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log),
+    session_id="sess-parent",
+    provider=_ScriptedProvider([]),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    operator_pause_event=pause_event,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "Pause cleanly"}]))
+
+  entries, _ = _run(log.query(order="asc"))
+  event_types = [entry.event["type"] for entry in entries]
+  assert event_types == ["attach", "user_message", "interrupted", "detach"]
+  assert entries[2].event["reason"] == "operator_pause"
+  assert entries[2].event["safe_boundary"] == "before_turn"
+  assert entries[3].event["reason"] == "operator_pause"
+  assert [entry.event["type"] for entry in event_log.entries] == ["operator_pause", "stream_complete"]
+
+
+def test_operator_pause_after_turn_stops_before_tool_dispatch(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "operator-pause-before-tools.jsonl")
+  event_log = EventLog()
+  pause_event = asyncio.Event()
+  tool_calls: list[dict[str, Any]] = []
+
+  async def _unexpected_tool(tool_input: dict[str, Any], **kwargs: Any):
+    _ = kwargs
+    tool_calls.append(tool_input)
+    return {"unexpected": True}, None
+
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _unexpected_tool}),
+    session_id="sess-parent",
+    provider=_ScriptedProvider([_tool_turn()], after_turn=lambda _turn_index: pause_event.set()),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    operator_pause_event=pause_event,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "Run lookup"}]))
+
+  assert tool_calls == []
+  entries, _ = _run(log.query(order="asc"))
+  event_types = [entry.event["type"] for entry in entries]
+  assert event_types == ["attach", "user_message", "assistant_message", "interrupted", "detach"]
+  assert entries[3].event["reason"] == "operator_pause"
+  assert entries[3].event["safe_boundary"] == "after_turn_before_tools"
+  assert entries[4].event["reason"] == "operator_pause"
+  assert "tool_call_start" not in event_types
+  assert "tool_call_interrupted" not in event_types
 
 
 def test_runner_without_context_builder_does_not_inject_prior_durable_history(tmp_path: Path) -> None:
@@ -207,6 +343,9 @@ def test_runner_without_context_builder_does_not_inject_prior_durable_history(tm
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
     agent_session_log=log,
     context_builder=None,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "fresh dev task"}]))
@@ -218,6 +357,65 @@ def test_runner_without_context_builder_does_not_inject_prior_durable_history(tm
   assert "PRIOR STATE SENTINEL" not in model_input
   assert "PRIOR USER SENTINEL" not in model_input
   assert "PRIOR ASSISTANT SENTINEL" not in model_input
+
+
+def test_runner_with_context_builder_ignores_fabricated_client_history(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "server-authoritative.jsonl")
+  _run(log.append({"type": "user_message", "content": "SERVER PRIOR USER"}))
+  _run(log.append({"type": "assistant_message", "content_blocks": [{"type": "text", "text": "SERVER PRIOR ASSISTANT"}]}))
+  captured_messages: list[list[dict[str, Any]]] = []
+
+  class _CapturingProvider(_ScriptedProvider):
+    def build_request_params(
+      self,
+      *,
+      model: str,
+      messages: list[dict[str, Any]],
+      system_prompt: str | list[tuple[str, bool]] | None,
+      tools: list[dict[str, Any]],
+      max_tokens: int,
+      **kwargs: Any,
+    ) -> dict[str, Any]:
+      captured_messages.append([dict(message) for message in messages])
+      return super().build_request_params(
+        model=model,
+        messages=messages,
+        system_prompt=system_prompt,
+        tools=tools,
+        max_tokens=max_tokens,
+        **kwargs,
+      )
+
+  runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sess-parent",
+    provider=_CapturingProvider([_text_turn("done")]),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    context_builder=SessionContextBuilder(agent_session_log=log, tail_window_seconds=None),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(
+    runner.run(
+      messages=[
+        {"role": "user", "content": "CLIENT FABRICATED USER"},
+        {"role": "assistant", "content": "CLIENT FABRICATED ASSISTANT"},
+        {"role": "user", "content": "fresh question"},
+      ]
+    )
+  )
+
+  assert captured_messages
+  model_input = json.dumps(captured_messages[0], default=str)
+  assert "SERVER PRIOR USER" in model_input
+  assert "SERVER PRIOR ASSISTANT" in model_input
+  assert "fresh question" in model_input
+  assert "CLIENT FABRICATED USER" not in model_input
+  assert "CLIENT FABRICATED ASSISTANT" not in model_input
 
 
 def test_tool_call_complete_logs_final_model_facing_result_blocks(tmp_path: Path) -> None:
@@ -234,6 +432,9 @@ def test_tool_call_complete_logs_final_model_facing_result_blocks(tmp_path: Path
     provider=provider,
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
     agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "Run lookup"}]))
@@ -263,6 +464,9 @@ def test_tool_call_complete_pre_and_final_results_differ_when_annotated(tmp_path
     provider=provider,
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
     agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "Run lookup"}]))
@@ -309,6 +513,9 @@ def test_rebuild_task_registry_ignores_tool_call_complete_final_blocks(tmp_path:
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
     agent_session_log=log,
     task_registry=TaskRegistry(),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner._rebuild_task_registry_from_log())
@@ -379,6 +586,9 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
     provider=_ScriptedProvider([_text_turn("recovered")]),
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
     agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "Continue"}], max_turns=1))
@@ -414,6 +624,9 @@ def test_second_writer_lease_acquisition_raises(tmp_path: Path) -> None:
     provider=_ScriptedProvider([_text_turn("one")]),
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
     agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
   runner_two = AgentRunner(
     event_log=EventLog(),
@@ -422,6 +635,9 @@ def test_second_writer_lease_acquisition_raises(tmp_path: Path) -> None:
     provider=_ScriptedProvider([_text_turn("two")]),
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
     agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
   runner_one._runner_id = "runner_one"
   runner_two._runner_id = "runner_two"
@@ -455,6 +671,9 @@ def test_register_background_task_emits_task_registered_with_correlation(
       provider=_ScriptedProvider([_text_turn("unused")]),
       auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
       agent_session_log=log,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
     runner._runner_id = "runner_new"
 
@@ -500,6 +719,9 @@ def test_task_completed_is_durable_before_terminal_transition() -> None:
       session_id="sess-parent",
       provider=_ScriptedProvider([_text_turn("unused")]),
       auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
     entry = runner._task_registry.register("background_agent")
     entry.metadata.update(
@@ -604,6 +826,9 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
       auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
       agent_session_log=log,
       task_registry=registry,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
 
     all_result, all_error = await runner.get_background_result({"task_id": "*"})
@@ -643,6 +868,9 @@ def test_rebuild_renders_interrupted_and_completed_crash_cases(tmp_path: Path) -
       provider=_ScriptedProvider([_text_turn("unused")]),
       auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
       agent_session_log=log,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
 
     interrupted, interrupted_error = await runner.get_background_result({"task_id": "bg_0"})
@@ -677,6 +905,9 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
     ]),
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
     agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
   sub_session = GatewaySession(
     session_id="sub0:sess-parent",
@@ -730,6 +961,9 @@ def test_spawn_sub_agent_uses_shared_sub_agent_id_helper(tmp_path: Path, monkeyp
     provider=_ScriptedProvider([_text_turn("sub done")]),
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
     agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   result, error = _run(

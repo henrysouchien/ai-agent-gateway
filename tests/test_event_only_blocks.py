@@ -152,6 +152,9 @@ def test_event_only_blocks_stay_in_sse_but_not_normal_tool_next_turn() -> None:
     auth_config={"api_key": "k", "model": "stub-model"},
     get_tool_definitions=lambda: [_tool_def("lookup")],
     on_tool_result=_mixed_extra_blocks,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x", max_turns=2))
@@ -183,6 +186,9 @@ def test_event_only_blocks_are_filtered_from_batched_run_agent_next_turn() -> No
     auth_config={"api_key": "k", "model": "stub-model"},
     get_tool_definitions=lambda: [_tool_def("run_agent")],
     on_tool_result=_mixed_extra_blocks,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x", max_turns=2))
@@ -219,7 +225,13 @@ def test_event_only_blocks_are_filtered_from_sdk_additional_context() -> None:
   runner = AgentSDKRunner(
     event_log=EventLog(),
     session_id="sess-sdk",
-    sdk_config=AgentSDKConfig(api_key="k", model="claude-sonnet-4-6"),
+    sdk_config=AgentSDKConfig(
+      api_key="k",
+      model="claude-sonnet-4-6",
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    ),
     system_prompt="test",
   )
 

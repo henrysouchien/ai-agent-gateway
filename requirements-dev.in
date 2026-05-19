@@ -6,6 +6,7 @@ fastapi
 PyJWT
 PyYAML
 mcp
+fastmcp>=3.2.0
 httpx>=0.27.0
 pydantic
 

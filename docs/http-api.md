@@ -43,7 +43,7 @@ Schema:
 | Field | Type | Required | Notes |
 | --- | --- | --- | --- |
 | `api_key` | string | yes | Must be non-empty. |
-| `user_id` | string | no | Stable user identity. The gateway uses this for credential resolution and as the session identity. In strict multi-user mode (resolver configured), `_default` is rejected; clients must send a non-default value. Falls back to `context.user_id` (deprecated) and then to `_default` if absent. |
+| `user_id` | string | yes without resolver | Stable user identity. The gateway uses this for credential resolution and as the session identity. When a credentials resolver is configured, the resolver may derive the user from the API key; otherwise clients must send a top-level user_id. `_default` is reserved-invalid. |
 
 Response body:
 

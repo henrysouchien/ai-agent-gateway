@@ -25,6 +25,7 @@ def _output(
   timed_out: bool = False,
   budget_exceeded: bool = False,
   max_turns_reached: bool = False,
+  operator_paused: bool = False,
 ) -> RunOutput:
   return RunOutput(
     response=response,
@@ -34,6 +35,7 @@ def _output(
     timed_out=timed_out,
     budget_exceeded=budget_exceeded,
     max_turns_reached=max_turns_reached,
+    operator_paused=operator_paused,
   )
 
 
@@ -182,6 +184,25 @@ def test_run_autonomous_with_retry_max_turns_reached_is_permanent(monkeypatch: p
   )
 
   assert output.max_turns_reached is True
+  assert sleep_calls == []
+
+
+def test_run_autonomous_with_retry_operator_pause_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+  sleep_calls: list[float] = []
+
+  async def _fake_sleep(delay: float) -> None:
+    sleep_calls.append(delay)
+
+  monkeypatch.setattr(retry.asyncio, "sleep", _fake_sleep)
+
+  output = _run(
+    run_autonomous_with_retry(
+      _sequence_run_fn([_output(operator_paused=True), _output("unused")]),
+      retry_config=RetryConfig(max_retries=3),
+    )
+  )
+
+  assert output.operator_paused is True
   assert sleep_calls == []
 
 

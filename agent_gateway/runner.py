@@ -39,6 +39,7 @@ from .task_registry import (
   make_progress_tracker,
 )
 from .tool_dispatcher import ToolDispatcher
+from .tool_result_semantics import classify_semantic_tool_error
 
 
 log = logging.getLogger("agent_gateway.runner")
@@ -50,6 +51,10 @@ STREAM_RETRY_MAX = 3
 STREAM_RETRY_DELAY = 2.0
 STREAM_RETRY_BACKOFF = 2.0
 _MAX_NOTIFICATIONS_PER_TURN = 5
+FinalAnswerGuard = Callable[
+  [List[Dict[str, Any]], str, List[str], List[Dict[str, Any]], int],
+  str | None,
+]
 
 
 def _derive_sub_agent_id(parent_session: Any, call_index: int) -> str:
@@ -243,6 +248,7 @@ class AgentRunner:
     compaction_instructions: str | None = None,
     tool_call_timeout: float | None = 120.0,
     on_max_turns: OnMaxTurns | None = None,
+    final_answer_guard: FinalAnswerGuard | None = None,
     max_budget_usd: float | None = None,
     _cost_accumulator: CostAccumulator | None = None,
     _parent_aggregator: _UsageAggregator | None = None,
@@ -253,6 +259,7 @@ class AgentRunner:
     message_inbox: asyncio.Queue[ParentMessage] | None = None,
     coordinator: CoordinatorConfig | None = None,
     max_resume_chain_depth: int = 3,
+    operator_pause_event: asyncio.Event | None = None,
   ) -> None:
     if max_budget_usd is not None and max_budget_usd <= 0:
       raise ValueError("max_budget_usd must be positive when provided")
@@ -288,15 +295,6 @@ class AgentRunner:
       billing_mode,
       channel,
     )
-    if user_id is None or rate_table_version is None or billing_mode is None:
-      log.debug(
-        "[%s] Usage identity defaults applied | user_id=%s rate_table_version=%s billing_mode=%s channel=%s",
-        self._sid,
-        self._usage_user_id,
-        self._rate_table_version,
-        self._billing_mode,
-        self._channel,
-      )
     self._parent_aggregator = _parent_aggregator
     self._aggregator = _parent_aggregator or _UsageAggregator(
       user_id=self._usage_user_id,
@@ -315,6 +313,7 @@ class AgentRunner:
     self._compaction_instructions = compaction_instructions
     self._tool_call_timeout = tool_call_timeout
     self._on_max_turns = on_max_turns
+    self._final_answer_guard = final_answer_guard
     self._max_budget_usd = max_budget_usd if max_budget_usd is not None else (
       _cost_accumulator.budget if _cost_accumulator is not None else None
     )
@@ -343,6 +342,7 @@ class AgentRunner:
       id_prefix="bg",
     )
     self._message_inbox = message_inbox
+    self._operator_pause_event = operator_pause_event
     self._notification_queue = NotificationQueue()
     if self._coordinator is not None and self._coordinator.enabled:
       self._max_background_tasks = self._coordinator.max_workers
@@ -398,6 +398,14 @@ class AgentRunner:
 
   def _append(self, event: Dict[str, Any]) -> None:
     self._log.append(event)
+
+  def request_operator_pause(self) -> None:
+    if self._operator_pause_event is None:
+      self._operator_pause_event = asyncio.Event()
+    self._operator_pause_event.set()
+
+  def _operator_pause_requested(self) -> bool:
+    return bool(self._operator_pause_event is not None and self._operator_pause_event.is_set())
 
   def set_credential_refresher(self, callback: OnCredentialRefresh | None) -> None:
     self._on_credential_failure = callback
@@ -552,6 +560,15 @@ class AgentRunner:
       }
     )
 
+  async def _emit_operator_pause_event(self, safe_boundary: str) -> None:
+    event = {
+      "type": "operator_pause",
+      "reason": "operator_pause",
+      "safe_boundary": safe_boundary,
+    }
+    self._append(event)
+    await self._emit_interrupted_event("operator_pause", extra_fields={"safe_boundary": safe_boundary})
+
   async def _acquire_writer_lease_and_recover(self) -> None:
     if self._agent_session_log is None or self._role != "writer":
       return
@@ -703,13 +720,7 @@ class AgentRunner:
 
   @staticmethod
   def _is_soft_error(result: Any) -> bool:
-    if not isinstance(result, dict):
-      return False
-    if result.get("success") is False:
-      return True
-    if result.get("status") == "error":
-      return True
-    return False
+    return classify_semantic_tool_error(result) is not None
 
   def _default_tool_definitions(self) -> List[Dict[str, Any]]:
     if self._get_tool_definitions is not None:
@@ -2198,6 +2209,7 @@ class AgentRunner:
     self._append(tool_start_event)
     result: Optional[Any] = None
     error: Optional[Dict[str, Any]] = None
+    semantic_error: Optional[Dict[str, Any]] = None
     cancelled_exc: Optional[asyncio.CancelledError] = None
     result_bytes = 0
     duration_ms = 0
@@ -2256,13 +2268,19 @@ class AgentRunner:
           load_servers_signal = [str(server_name) for server_name in popped if server_name]
 
       tool_elapsed = time.time() - tool_t0
-      if error:
+      if error is None:
+        semantic_error = classify_semantic_tool_error(result)
+      result_json = json.dumps(result, default=str) if result is not None else ""
+      result_bytes = len(result_json)
+      result_preview = result_json[:150] if result_json else "null"
+      if error or semantic_error:
+        error_detail = error if error is not None else semantic_error
         log.warning(
           "[%s] Tool %s error (%.1fs): %s",
           self._sid,
           tool_name,
           tool_elapsed,
-          error,
+          error_detail,
           extra={
             "data": {
               "event": "tool_done",
@@ -2271,15 +2289,13 @@ class AgentRunner:
               "elapsed_s": round(tool_elapsed, 1),
               "server": server,
               "error": True,
-              "error_detail": str(error)[:200],
-              "error_sub_code": error.get("sub_code", "") if isinstance(error, dict) else "",
+              "semantic_error": semantic_error is not None and error is None,
+              "error_detail": str(error_detail)[:200],
+              "error_sub_code": error_detail.get("sub_code", "") if isinstance(error_detail, dict) else "",
             }
           },
         )
       else:
-        result_json = json.dumps(result, default=str) if result is not None else ""
-        result_bytes = len(result_json)
-        result_preview = result_json[:150] if result_json else "null"
         log.info(
           "[%s] Tool %s done (%.1fs) | result=%s",
           self._sid,
@@ -2314,12 +2330,15 @@ class AgentRunner:
         "error": error,
         "duration_ms": duration_ms,
         "server": server,
+        "is_error": error is not None or semantic_error is not None,
       }
+      if semantic_error is not None:
+        tool_complete_event["semantic_error"] = dict(semantic_error)
       self._call_on_tool_timing(
         tool_name=tool_name,
         server=server,
         duration_ms=duration_ms,
-        is_error=error is not None,
+        is_error=tool_complete_event["is_error"],
         result_bytes=result_bytes,
       )
 
@@ -2361,7 +2380,7 @@ class AgentRunner:
         "tool_use_id": tool_id,
         "content": json.dumps(model_result, default=str),
       }
-      if self._is_soft_error(model_result):
+      if semantic_error is not None:
         result_entry["is_error"] = True
 
     extra_blocks = await self._call_on_tool_result(
@@ -2416,6 +2435,7 @@ class AgentRunner:
       raise RuntimeError("AgentRunner is single-use; construct a new runner for subsequent runs")
     was_cancelled = False
     run_error: BaseException | None = None
+    clean_detach_reason = "completed"
     try:
       if self._agent_session_log is None:
         self._runner_id = None
@@ -2434,12 +2454,21 @@ class AgentRunner:
         await self._rebuild_task_registry_from_log()
         if resume_initial_messages is not None:
           messages = [dict(message) for message in resume_initial_messages]
-        else:
-          prior_messages = await self._context_builder.build() if self._context_builder is not None else []
+        elif self._context_builder is not None:
+          # Autonomous / server-authoritative path: context_builder is the source
+          # of truth; the incoming `messages` carries only the new user turn.
+          prior_messages = await self._context_builder.build()
           new_user_input = self._extract_last_user_message(messages)
           if new_user_input is not None:
             await self._append_user_message_event(new_user_input)
           messages = prior_messages + ([new_user_input] if new_user_input is not None else [])
+        else:
+          # Durable-log path without a replay policy: preserve caller-provided
+          # messages without injecting prior durable history.
+          new_user_input = self._extract_last_user_message(messages)
+          if new_user_input is not None:
+            await self._append_user_message_event(new_user_input)
+          messages = [dict(message) for message in messages]
 
       if self._coordinator is not None and self._coordinator.enabled:
         preamble = self._coordinator.preamble or COORDINATOR_DEFAULT_PREAMBLE
@@ -2564,9 +2593,16 @@ class AgentRunner:
       self._ensure_sub_agent_semaphore()
       turn_count = 0
       tools_used: List[str] = []
+      final_answer_guard_fired = False
       current_messages = list(messages)
 
       while True:
+        if self._operator_pause_requested():
+          log.info("[%s] Operator pause requested before next turn; stopping at safe boundary", self._sid)
+          clean_detach_reason = "operator_pause"
+          await self._emit_operator_pause_event("before_turn")
+          break
+
         turn_count += 1
         if max_turns is not None and turn_count > max_turns:
           log.warning("[%s] Max turns (%d) reached, stopping", self._sid, max_turns)
@@ -2752,7 +2788,43 @@ class AgentRunner:
             await self._emit_interrupted_event("budget_exceeded")
             break
 
+        if self._operator_pause_requested():
+          log.info("[%s] Operator pause requested after turn; stopping before tool dispatch", self._sid)
+          clean_detach_reason = "operator_pause"
+          await self._emit_operator_pause_event("after_turn_before_tools")
+          break
+
         if not turn.tool_uses:
+          if not final_answer_guard_fired and self._final_answer_guard is not None:
+            guard_message = self._final_answer_guard(
+              current_messages,
+              turn.full_text,
+              list(tools_used),
+              list(base_kwargs.get("tools") or []),
+              turn_count,
+            )
+            if guard_message:
+              final_answer_guard_fired = True
+              log.info("[%s] Final-answer guard injected follow-up before completing turn", self._sid)
+              self._append(
+                {
+                  "type": "runtime_guard",
+                  "guard": "final_answer",
+                  "message": guard_message,
+                }
+              )
+              assistant_content = list(turn.content_blocks)
+              current_messages.append(
+                {
+                  "role": "assistant",
+                  "content": assistant_content,
+                  "provider": self._provider.name,
+                  "model": config["model"],
+                  "stop_reason": turn.stop_reason,
+                }
+              )
+              current_messages.append({"role": "user", "content": guard_message})
+              continue
           if turn.stop_reason == "pause_turn":
             log.info("[%s] Pause turn — continuing", self._sid)
             assistant_content = list(turn.content_blocks)
@@ -3016,7 +3088,7 @@ class AgentRunner:
             if isinstance(run_error, asyncio.CancelledError) and self._role == "sub_agent":
               reason = "sub_agent_cancelled"
             await self._emit_interrupted_event(reason)
-          detach_reason = "completed"
+          detach_reason = clean_detach_reason
           if isinstance(run_error, asyncio.CancelledError):
             detach_reason = "cancelled"
           elif run_error is not None:

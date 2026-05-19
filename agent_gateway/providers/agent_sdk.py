@@ -46,6 +46,7 @@ SDK_KNOWN_BUILTINS = {
 SDK_SAFE_BUILTINS = {"Read", "Glob", "Grep"}
 SDK_WEB_BUILTINS = {"WebSearch", "WebFetch"}
 SDK_GATED_BUILTINS = {"Write", "Edit", "Bash", "NotebookEdit", "BashOutput", "KillBash"}
+_UNSET = object()
 
 
 @dataclass
@@ -80,10 +81,20 @@ def _resolve_channel_tier(
   return channel_tiers.get(channel, default_tier)
 
 
+def _resolve_mcp_config_path(config_path: Path | str | None | object = _UNSET) -> Path | None:
+  if config_path is _UNSET:
+    env_path = os.getenv("MCP_CONFIG_PATH", "").strip()
+    return Path(env_path).expanduser() if env_path else Path.home() / ".claude.json"
+  if config_path is None:
+    return None
+  return Path(config_path).expanduser()
+
+
 def build_disallowed_tools(
   channel: Optional[str],
   channel_tiers: Dict[Optional[str], Dict[str, set[str]]],
   extra_blocked: set[str] | None = None,
+  session: Any | None = None,
 ) -> List[str]:
   tier = _resolve_channel_tier(channel, channel_tiers)
   allowed = set(SDK_SAFE_BUILTINS)
@@ -95,19 +106,36 @@ def build_disallowed_tools(
     blocked.add(f"mcp__{server_name}__*")
   if extra_blocked:
     blocked |= extra_blocked
+  try:
+    from agent.shared.server_policies import get_forbidden_tools_for_session, get_server_for_policy_tool
+  except Exception:
+    try:
+      from api.agent.shared.server_policies import get_forbidden_tools_for_session, get_server_for_policy_tool
+    except Exception:
+      get_forbidden_tools_for_session = None  # type: ignore[assignment]
+      get_server_for_policy_tool = None  # type: ignore[assignment]
+
+  if get_forbidden_tools_for_session is not None and get_server_for_policy_tool is not None:
+    for tool_name in get_forbidden_tools_for_session(session):
+      server_name = get_server_for_policy_tool(tool_name) or "portfolio-mcp"
+      blocked.add(f"mcp__{server_name}__{tool_name}")
   return sorted(blocked)
 
 
 def load_mcp_config_for_sdk(
   channel: Optional[str],
   channel_tiers: Dict[Optional[str], Dict[str, set[str]]],
+  config_path: Path | str | None | object = _UNSET,
+  *,
+  session: Any | None = None,
 ) -> Dict[str, Dict[str, Any]]:
-  config_path = Path.home() / ".claude.json"
-  if not config_path.exists():
+  _ = session
+  resolved_config_path = _resolve_mcp_config_path(config_path)
+  if resolved_config_path is None or not resolved_config_path.exists():
     return {}
 
   try:
-    with open(config_path, "r", encoding="utf-8") as handle:
+    with open(resolved_config_path, "r", encoding="utf-8") as handle:
       data = json.load(handle)
   except Exception:
     return {}

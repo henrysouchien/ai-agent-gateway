@@ -58,6 +58,7 @@ class RunOutput:
   timed_out: bool
   budget_exceeded: bool = False
   max_turns_reached: bool = False
+  operator_paused: bool = False
 
 
 @dataclass
@@ -98,6 +99,7 @@ def collect_run_output(event_log: EventLog, timed_out: bool) -> RunOutput:
   error_msg: str | None = None
   budget_exceeded = False
   max_turns_reached = False
+  operator_paused = False
 
   for entry in event_log.entries:
     event = entry.event
@@ -117,6 +119,10 @@ def collect_run_output(event_log: EventLog, timed_out: bool) -> RunOutput:
       budget_exceeded = True
     elif event_type == "max_turns_reached":
       max_turns_reached = True
+    elif event_type == "operator_pause":
+      operator_paused = True
+    elif event_type == "interrupted" and event.get("reason") == "operator_pause":
+      operator_paused = True
     elif event_type == "error":
       error_msg = str(event.get("error", "Autonomous run encountered an error"))
 
@@ -128,6 +134,7 @@ def collect_run_output(event_log: EventLog, timed_out: bool) -> RunOutput:
     timed_out=timed_out,
     budget_exceeded=budget_exceeded,
     max_turns_reached=max_turns_reached,
+    operator_paused=operator_paused,
   )
 
 
@@ -188,6 +195,8 @@ def run_output_outcome(run_output: RunOutput) -> str:
     return "budget_exceeded"
   if run_output.max_turns_reached:
     return "max_turns"
+  if run_output.operator_paused:
+    return "operator_pause"
   return "success"
 
 
@@ -253,6 +262,7 @@ def build_state_payload(
   state["timed_out"] = run_output.timed_out
   state["budget_exceeded"] = run_output.budget_exceeded
   state["max_turns_reached"] = run_output.max_turns_reached
+  state["operator_paused"] = run_output.operator_paused
   state["connected_servers"] = connected_server_names
   state["active_servers"] = active_server_names
   state["tools_used"] = sorted({name for name in run_output.tools_used if name})
@@ -287,6 +297,8 @@ def format_run_summary(
     status = "budget exceeded"
   elif run_output.max_turns_reached:
     status = "max turns reached"
+  elif run_output.operator_paused:
+    status = "operator paused"
 
   usage = run_output.usage if isinstance(run_output.usage, dict) else {}
   in_tokens = usage.get("input_tokens", "?")
@@ -480,6 +492,9 @@ async def run_autonomous(
   on_tool_result: Callable[[ToolResultContext], Awaitable[Any] | Any] | None = None,
   on_tool_timing: Callable[..., None] | None = None,
   session_id: str | None = None,
+  user_id: str,
+  billing_mode: str,
+  rate_table_version: str,
   coordinator: CoordinatorConfig | None = None,
 ) -> RunOutput:
   """Run a headless agent to completion without an HTTP server.
@@ -597,6 +612,9 @@ async def run_autonomous(
       on_usage=on_usage,
       on_session_summary=on_session_summary,
       on_tool_timing=on_tool_timing,
+      user_id=user_id,
+      billing_mode=billing_mode,
+      rate_table_version=rate_table_version,
       max_budget_usd=max_budget_usd,
       max_concurrent_sub_agents=max_concurrent_sub_agents,
       compaction_instructions=compaction_instructions,

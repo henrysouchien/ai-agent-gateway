@@ -19,7 +19,7 @@ def _run(coro):
 
 
 def _build_runtime(app):
-  session = app.state.auth.session_store.create_session(api_key_hash="hash")
+  session = app.state.auth.session_store.create_session(api_key_hash="hash", user_id="alice")
   runtime = _run(
     app.state.gateway_config.build_chat_runtime(
       session=session,
@@ -132,7 +132,7 @@ def test_create_agent_expiry_cleanup_chains_code_execution_and_mcp_session_close
   )
 
   mcp_client = app.state.gateway_config.mcp_client
-  session = app.state.auth.session_store.create_session(api_key_hash="hash")
+  session = app.state.auth.session_store.create_session(api_key_hash="hash", user_id="alice")
   work_dir = tmp_path / "expiry-cleanup"
   work_dir.mkdir()
   session.code_execution_work_dir = str(work_dir)

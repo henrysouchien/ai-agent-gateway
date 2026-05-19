@@ -17,7 +17,7 @@ from api.credentials import get_default_model as get_canonical_default_model
 import agent_gateway.mcp_client as mcp_client_module
 import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_agent
-from agent_gateway.auth import AuthConfig
+from agent_gateway.auth import AuthConfig, ResolverResult
 from agent_gateway._provider_utils import _resolve_provider
 from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProvider
 from agent_gateway.server import ChatRequest
@@ -38,7 +38,7 @@ def _clear_credential_env(monkeypatch: pytest.MonkeyPatch):
 
 
 def _build_runtime(app, *, request_model: str | None = None):
-  session = app.state.auth.session_store.create_session(api_key_hash="hash")
+  session = app.state.auth.session_store.create_session(api_key_hash="hash", user_id="alice")
   runtime = _run(
     app.state.gateway_config.build_chat_runtime(
       session=session,
@@ -51,7 +51,7 @@ def _build_runtime(app, *, request_model: str | None = None):
 
 
 def _build_runtime_with_request(app, *, request: ChatRequest, channel: str | None):
-  session = app.state.auth.session_store.create_session(api_key_hash="hash")
+  session = app.state.auth.session_store.create_session(api_key_hash="hash", user_id="alice")
   runtime = _run(
     app.state.gateway_config.build_chat_runtime(
       session=session,
@@ -125,15 +125,21 @@ def test_create_agent_uses_explicit_auth_token() -> None:
 
 
 def test_create_agent_with_credentials_resolver_skips_env_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
-  async def _resolver(_user_id: str, _init_request):
-    return AuthConfig.from_dict(
-      {
-        "provider": "anthropic",
-        "billing_mode": "byok",
-        "api_key": "resolver-key",
-        "model": DEFAULT_ANTHROPIC_MODEL,
-        "max_tokens": 16000,
-      }
+  async def _resolver(_api_key: str, _init_request):
+    return ResolverResult(
+      user_id="alice",
+      channel="excel",
+      auth_config=AuthConfig.from_dict(
+        {
+          "provider": "anthropic",
+          "billing_mode": "byok",
+          "api_key": "resolver-key",
+          "model": DEFAULT_ANTHROPIC_MODEL,
+          "max_tokens": 16000,
+        }
+      ),
+      risk_user_id=101,
+      role="owner",
     )
 
   monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key")
@@ -173,7 +179,7 @@ def test_create_agent_threads_request_metadata_to_runner() -> None:
     request_id="req-123",
     context={"channel": "web"},
   )
-  session = app.state.auth.session_store.create_session(api_key_hash="hash")
+  session = app.state.auth.session_store.create_session(api_key_hash="hash", user_id="alice")
   session.user_id = "alice"
   session.auth_config = {"api_key": "k", "model": DEFAULT_ANTHROPIC_MODEL, "billing_mode": "metered"}
   runtime = _run(
@@ -708,7 +714,7 @@ def test_create_agent_code_execution_cleans_up_active_sessions_on_shutdown(tmp_p
   work_dir = tmp_path / "shutdown-cleanup"
 
   with TestClient(app):
-    session = app.state.auth.session_store.create_session(api_key_hash="hash")
+    session = app.state.auth.session_store.create_session(api_key_hash="hash", user_id="alice")
     work_dir.mkdir()
     session.code_execution_work_dir = str(work_dir)
 

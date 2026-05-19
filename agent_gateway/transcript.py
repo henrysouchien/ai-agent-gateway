@@ -71,13 +71,14 @@ def _tool_result_blocks_from_event(event: dict[str, Any]) -> list[ToolResultBloc
         "is_error": True,
       }
     ]
-  return [
-    {
-      "type": "tool_result",
-      "tool_use_id": tool_call_id,
-      "content": json.dumps(event.get("result"), default=str),
-    }
-  ]
+  block = {
+    "type": "tool_result",
+    "tool_use_id": tool_call_id,
+    "content": json.dumps(event.get("result"), default=str),
+  }
+  if event.get("is_error") is True:
+    block["is_error"] = True
+  return [block]
 
 
 async def reconstruct_messages_for_task(log: AgentSessionLog, task_id: str) -> list[Message]:

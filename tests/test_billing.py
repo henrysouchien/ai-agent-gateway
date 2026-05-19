@@ -254,10 +254,16 @@ def test_usage_event_event_id_default_supports_old_dlq_payload() -> None:
   assert event.request_id == "req-1"
 
 
-def test_normalize_identity_matches_runner_defaults() -> None:
-  assert normalize_identity(None, None, None, "  ") == ("_default", "unknown", "byok", None)
+def test_normalize_identity_requires_explicit_billing_identity() -> None:
+  with pytest.raises(ValueError, match="user_id"):
+    normalize_identity(None, "v1", "byok", "  ")
+  with pytest.raises(ValueError, match="reserved"):
+    normalize_identity("_default", "v1", "byok", "  ")
+  with pytest.raises(ValueError, match="rate_table_version"):
+    normalize_identity("alice", None, "byok", "  ")
+  with pytest.raises(ValueError, match="billing_mode"):
+    normalize_identity("alice", "v1", "other", "cli")
   assert normalize_identity("alice", "v1", " metered ", " web ") == ("alice", "v1", "metered", "web")
-  assert normalize_identity("alice", "v1", "other", "cli") == ("alice", "v1", "byok", "cli")
 
 
 def test_usage_aggregator_accumulates_and_snapshots() -> None:

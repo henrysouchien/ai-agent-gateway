@@ -56,6 +56,9 @@ def _make_runner(task_registry: TaskRegistry | None = None) -> AgentRunner:
     provider=_StubProvider(),
     auth_config={"api_key": "k", "model": "stub-model"},
     task_registry=task_registry,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
 

@@ -382,6 +382,9 @@ def test_run_drains_message_inbox_and_injects_parent_messages_between_turns() ->
       auth_config={"api_key": "k", "model": "stub-model"},
       get_tool_definitions=lambda: [],
       message_inbox=inbox,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
     seen_messages: list[list[dict[str, Any]]] = []
 
@@ -434,6 +437,9 @@ def test_send_message_durable_event_exists_when_queue_put_fails(tmp_path: Path) 
       auth_config={"api_key": "k", "model": "stub-model"},
       agent_session_log=log,
       task_registry=registry,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
     runner._runner_id = "runner-test"
     handler = make_send_message_handler([runner])
@@ -465,6 +471,9 @@ def test_send_message_persists_event_and_child_sees_parent_message_envelope(tmp_
       auth_config={"api_key": "k", "model": "stub-model"},
       agent_session_log=log,
       task_registry=registry,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
     parent_runner._runner_id = "runner-parent"
     handler = make_send_message_handler([parent_runner])
@@ -485,6 +494,9 @@ def test_send_message_persists_event_and_child_sees_parent_message_envelope(tmp_
       auth_config={"api_key": "k", "model": "stub-model"},
       get_tool_definitions=lambda: [],
       message_inbox=entry.message_inbox,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
     seen_messages: list[list[dict[str, Any]]] = []
 

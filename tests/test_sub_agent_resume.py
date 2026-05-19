@@ -76,6 +76,9 @@ def _runner(tmp_path: Path, *, max_resume_chain_depth: int = 3) -> AgentRunner:
     agent_session_log=AgentSessionLog(path=tmp_path / "sessions" / "runner.jsonl"),
     task_registry=TaskRegistry(),
     max_resume_chain_depth=max_resume_chain_depth,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
 

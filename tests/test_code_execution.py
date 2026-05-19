@@ -49,7 +49,7 @@ async def _dispatch_bundle_tool(
 
 
 def test_tool_defs_default_config_include_code_execution_tools() -> None:
-  session = SessionStore(ttl=3600).create_session(api_key_hash="hash")
+  session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
   bundle = build_code_execution(session)
 
   assert [tool_def["name"] for tool_def in bundle.tool_definitions] == [
@@ -65,7 +65,7 @@ def test_tool_defs_default_config_include_code_execution_tools() -> None:
 
 def test_code_execute_basic_execution_and_work_dir_persistence() -> None:
   async def _run_test() -> None:
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash")
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
 
     first_result, first_error = await _dispatch_bundle_tool(
@@ -103,7 +103,7 @@ def test_code_execute_captures_images_and_extra_env(tmp_path: Path) -> None:
     support_dir.mkdir()
     (support_dir / "helpermod.py").write_text('VALUE = "ok"\n', encoding="utf-8")
 
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash")
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(
       session,
       config=CodeExecutionConfig(register_docker=False, extra_env={"PYTHONPATH": str(support_dir)}),
@@ -137,7 +137,7 @@ def test_code_execute_captures_images_and_extra_env(tmp_path: Path) -> None:
 
 def test_code_execute_respects_image_base64_limit() -> None:
   async def _run_test() -> None:
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash")
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(
       session,
       config=CodeExecutionConfig(register_docker=False, max_image_base64_bytes=10),
@@ -162,7 +162,7 @@ def test_code_execute_respects_image_base64_limit() -> None:
 
 def test_code_execute_streaming_emits_chunk_events() -> None:
   async def _run_test() -> None:
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash")
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     event_log = EventLog()
     bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
 
@@ -194,7 +194,7 @@ def test_code_execute_streaming_emits_chunk_events() -> None:
 
 def test_code_execute_background_status_and_cancel_flow() -> None:
   async def _run_test() -> None:
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash")
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
 
     start_result, start_error = await _dispatch_bundle_tool(
@@ -281,7 +281,7 @@ def test_code_execute_background_status_and_cancel_flow() -> None:
 
 def test_cleanup_code_execution_cancels_tasks_and_is_idempotent() -> None:
   async def _run_test() -> None:
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash")
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
 
     start_result, start_error = await _dispatch_bundle_tool(
@@ -316,7 +316,7 @@ def test_cleanup_code_execution_cancels_tasks_and_is_idempotent() -> None:
 
 
 def test_backend_qualified_approval_depends_on_sandboxing() -> None:
-  session = SessionStore(ttl=3600).create_session(api_key_hash="hash")
+  session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
   subprocess_bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
   docker_bundle = build_code_execution(
     session,
@@ -354,7 +354,7 @@ def test_strip_code_execute_base64_hook_rewrites_model_history() -> None:
     server=None,
     result_entry=result_entry,
   )
-  session = SessionStore(ttl=3600).create_session(api_key_hash="hash")
+  session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
   bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
 
   bundle.sanitize_hook(ctx)
@@ -380,8 +380,8 @@ def test_per_bundle_backend_isolation_keeps_distinct_docker_images(monkeypatch) 
   monkeypatch.setattr("agent_gateway.code_execution._backends._docker.DockerBackend.execute", _fake_execute)
 
   async def _run_test() -> None:
-    session_one = SessionStore(ttl=3600).create_session(api_key_hash="hash")
-    session_two = SessionStore(ttl=3600).create_session(api_key_hash="hash")
+    session_one = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    session_two = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle_one = build_code_execution(
       session_one,
       config=CodeExecutionConfig(register_subprocess=False, docker_image="image-one:latest"),

@@ -116,6 +116,9 @@ def _make_runner(provider: ModelProvider, *, auth_config: dict[str, Any] | None 
     session_id="sess-parent",
     provider=provider,
     auth_config=auth_config or {"api_key": "parent-key", "model": "claude-sonnet-4-6"},
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
 

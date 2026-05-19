@@ -74,6 +74,9 @@ def make_test_app():
     resolved_sdk_config = sdk_config or AgentSDKConfig(
       api_key="test-key",
       model=str(resolved_auth_config.get("model") or fallback_model),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
 
     async def _build_chat_runtime(session, request, channel, auth_manager):

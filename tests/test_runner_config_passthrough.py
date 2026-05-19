@@ -78,6 +78,9 @@ def _make_runner(*, stream_stall_timeout: float | None = None) -> AgentRunner:
     auth_config={"api_key": "k"},
     get_tool_definitions=lambda: [],
     stream_stall_timeout=stream_stall_timeout,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
 
@@ -141,6 +144,9 @@ def test_runner_preserves_extra_auth_config_keys_for_provider_create_client() ->
     },
     mcp_client=McpClientManager(config_path=None),
     get_tool_definitions=lambda: [],
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))

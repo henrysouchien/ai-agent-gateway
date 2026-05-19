@@ -158,6 +158,9 @@ class ToolDispatcher:
     mcp_session_inject_servers: set[str] | None = None,
     mcp_meta_inject_servers: frozenset[str] | None = None,
     user_id: str | None = None,
+    risk_user_id: int | None = None,
+    channel: str | None = None,
+    role: str | None = None,
     credentials_resolver_active: bool = False,
     session_cache_denied_tools: frozenset[str] | None = None,
   ) -> None:
@@ -175,6 +178,9 @@ class ToolDispatcher:
     self._mcp_session_inject_servers = mcp_session_inject_servers or set()
     self._mcp_meta_inject_servers = mcp_meta_inject_servers or frozenset()
     self._user_id = user_id
+    self._risk_user_id = risk_user_id
+    self._channel = channel
+    self._role = role or "owner"
     self._credentials_resolver_active = credentials_resolver_active
     self._session_cache_denied = session_cache_denied_tools or frozenset()
     self._mcp_accepts_abort_event = self._callable_accepts_kw(getattr(self._mcp, "call_tool", None), "abort_event")
@@ -425,10 +431,17 @@ class ToolDispatcher:
     elif self._mcp.is_mcp_tool(tool_name):
       server = self._mcp.get_server_for_tool(tool_name)
       if server and server in self._mcp_meta_inject_servers:
-        resolved_user_id = str(self._user_id).strip() if self._user_id is not None else None
-        if self._credentials_resolver_active and not resolved_user_id:
+        resolved_risk_user_id = self._risk_user_id
+        if resolved_risk_user_id is None and self._user_id is not None and str(self._user_id).isdigit():
+          resolved_risk_user_id = int(str(self._user_id))
+        if self._credentials_resolver_active and not resolved_risk_user_id:
           raise RuntimeError("MCP meta user_id is required in strict mode")
-        meta = {"session_id": self._session_id, "user_id": resolved_user_id}
+        meta = {
+          "session_id": self._session_id,
+          "user_id": str(resolved_risk_user_id) if resolved_risk_user_id is not None else None,
+          "channel": self._channel,
+          "role": self._role,
+        }
         result, error = await self._call_mcp_tool(tool_name, tool_input, meta=meta, abort_event=abort_event)
       elif server and server in self._mcp_session_inject_servers:
         tool_input = {**tool_input, "_session_id": self._session_id}

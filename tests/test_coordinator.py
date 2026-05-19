@@ -157,6 +157,9 @@ def test_coordinator_preamble_injected_into_string_system_prompt() -> None:
     provider=provider,
     auth_config={"api_key": "k", "model": "stub-model"},
     coordinator=CoordinatorConfig(enabled=True),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}], system_prompt="Base prompt"))
@@ -173,6 +176,9 @@ def test_coordinator_custom_preamble_overrides_default_for_prompt_blocks() -> No
     provider=provider,
     auth_config={"api_key": "k", "model": "stub-model"},
     coordinator=CoordinatorConfig(enabled=True, preamble="Custom coordinator preamble"),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(
@@ -194,6 +200,9 @@ def test_coordinator_disabled_does_not_inject_preamble() -> None:
     provider=provider,
     auth_config={"api_key": "k", "model": "stub-model"},
     coordinator=CoordinatorConfig(enabled=False, preamble="Should not appear"),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}], system_prompt="Base prompt"))
@@ -233,6 +242,9 @@ def test_coordinator_max_workers_overrides_max_background_tasks() -> None:
     auth_config={"api_key": "k", "model": "stub-model"},
     max_concurrent_sub_agents=1,
     coordinator=CoordinatorConfig(enabled=True, max_workers=5),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   assert runner._max_background_tasks == 5

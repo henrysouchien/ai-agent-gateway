@@ -54,9 +54,19 @@ class AuthConfig:
     return dict(self._raw)
 
 
+@dataclass
+class ResolverResult:
+  user_id: str
+  channel: str
+  auth_config: AuthConfig
+  risk_user_id: int | None = None
+  role: Literal["owner", "invite"] = "owner"
+  user_email: str | None = None
+
+
 CredentialsResolver = Callable[
   [str, Any],
-  Awaitable[AuthConfig],
+  Awaitable[ResolverResult],
 ]
 
 
@@ -111,22 +121,15 @@ class CredentialsTimeoutError(Exception):
     )
 
 
-class StrictModeDefaultUserError(Exception):
-  def __init__(self, message: str | None = None) -> None:
-    super().__init__(
-      message
-      or (
-        "Gateway is in strict multi-user mode. Supply a non-default user_id and thread it from the consumer auth "
-        "middleware into /chat/init."
-      )
-    )
-
-
 class MissingUserIdError(Exception):
   def __init__(self, message: str | None = None) -> None:
     super().__init__(
-      message or "user_id is required in strict multi-user mode. Send the end-user ID in the /chat request body."
+      message or "user_id is required. Send the stable end-user ID at the gateway boundary."
     )
+
+
+class ChannelMismatchError(Exception):
+  """Request context.channel does not match the key's bound channel."""
 
 
 class CrossUserReuseError(Exception):
@@ -147,6 +150,7 @@ class AuthExpiredError(Exception):
 __all__ = [
   "AuthConfig",
   "AuthExpiredError",
+  "ChannelMismatchError",
   "CredentialFailureKind",
   "CredentialRefreshRequest",
   "CredentialsRefreshResolver",
@@ -156,5 +160,5 @@ __all__ = [
   "MissingUserIdError",
   "NoCredentialError",
   "ProviderCredentialFailure",
-  "StrictModeDefaultUserError",
+  "ResolverResult",
 ]

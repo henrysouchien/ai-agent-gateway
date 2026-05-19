@@ -15,7 +15,7 @@ from pathlib import Path
 # Ensure the package is importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_gateway.auth import AuthConfig, CredentialsResolver
+from agent_gateway.auth import AuthConfig, CredentialsResolver, ResolverResult
 from agent_gateway.rates import RateTable, load_rate_table, UnknownModelError
 
 
@@ -103,8 +103,8 @@ def test_auth_config() -> None:
   print("  PASS")
 
 
-def test_gateway_backward_compat() -> None:
-  divider("TEST: Gateway backward compat (no resolver, single-user)")
+def test_gateway_explicit_user_id_without_resolver() -> None:
+  divider("TEST: Gateway explicit user_id without resolver")
 
   from agent_gateway import create_agent
   from starlette.testclient import TestClient
@@ -112,8 +112,14 @@ def test_gateway_backward_compat() -> None:
   app = create_agent("test-key-12345")
   client = TestClient(app)
 
-  # Init session
-  resp = client.post("/api/chat/init", json={"api_key": "test-key-12345"})
+  missing = client.post("/api/chat/init", json={"api_key": "test-key-12345"})
+  print(f"  /chat/init without user_id status: {missing.status_code}")
+  assert missing.status_code == 400, f"Expected 400, got {missing.status_code}: {missing.text}"
+  assert missing.json().get("error") == "missing_user_id"
+  print("  Missing user_id rejected — PASS")
+
+  # Init session with an explicit user identity.
+  resp = client.post("/api/chat/init", json={"api_key": "test-key-12345", "user_id": "smoke-user"})
   print(f"  /chat/init status: {resp.status_code}")
   assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
   data = resp.json()
@@ -128,11 +134,11 @@ def test_gateway_backward_compat() -> None:
     headers={"Authorization": f"Bearer {token}"},
   )
   # We expect either a streaming response or an error from the provider
-  # (no Anthropic key configured). The important thing is it doesn't 400/401
-  # from the new multi-user validation.
+  # (no Anthropic key configured). The important thing is it doesn't fail
+  # the explicit-user gateway contract.
   print(f"  /chat status: {resp.status_code}")
   if resp.status_code in (200, 500, 502, 503):
-    print(f"  Non-strict mode: no user_id required, no cross-user check — PASS")
+    print("  Explicit-user session passed gateway validation — PASS")
   else:
     print(f"  UNEXPECTED status. Body: {resp.text[:200]}")
 
@@ -143,21 +149,27 @@ def test_gateway_strict_mode() -> None:
   divider("TEST: Gateway strict mode (resolver configured)")
 
   from agent_gateway import create_agent
-  from agent_gateway.auth import AuthConfig
+  from agent_gateway.auth import AuthConfig, ResolverResult
   from starlette.testclient import TestClient
 
   call_count = 0
 
-  async def mock_resolver(user_id: str, init_request) -> AuthConfig:
+  async def mock_resolver(api_key: str, init_request) -> ResolverResult:
     nonlocal call_count
     call_count += 1
-    return AuthConfig.from_dict({
-      "provider": "anthropic",
-      "billing_mode": "byok",
-      "model": "claude-sonnet-4-6",
-      "max_tokens": 16000,
-      "api_key": "sk-ant-api03-fake-for-test",
-    })
+    return ResolverResult(
+      user_id=init_request.user_id or "",
+      channel="excel",
+      risk_user_id=101,
+      role="owner",
+      auth_config=AuthConfig.from_dict({
+        "provider": "anthropic",
+        "billing_mode": "byok",
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 16000,
+        "api_key": "sk-ant-api03-fake-for-test",
+      }),
+    )
 
   app = create_agent(
     "test-key-strict",
@@ -166,11 +178,11 @@ def test_gateway_strict_mode() -> None:
   )
   client = TestClient(app)
 
-  # 1. Init with _default user_id should fail (strict mode)
+  # 1. Init without a resolver-derived user_id should fail.
   resp = client.post("/api/chat/init", json={"api_key": "test-key-strict"})
   print(f"  /chat/init with no user_id → status {resp.status_code}")
   body = resp.json()
-  assert body.get("error") == "strict_mode_default_user", f"Expected strict error, got: {body}"
+  assert body.get("error") == "missing_user_id", f"Expected missing_user_id, got: {body}"
   print(f"  Error: {body['error']} — PASS")
 
   # 2. Init with a real user_id should succeed
@@ -183,7 +195,7 @@ def test_gateway_strict_mode() -> None:
   data = resp.json()
   token = data["session_token"]
   print(f"  Session: {data['session_id']}")
-  assert call_count == 1, f"Resolver should be called exactly once, got {call_count}"
+  assert call_count == 2, f"Resolver should be called for both init attempts, got {call_count}"
   print(f"  Resolver called: {call_count} time(s) — PASS")
 
   # 3. Chat without user_id in body should fail (strict mode: required)
@@ -236,16 +248,22 @@ def test_resolver_timeout() -> None:
   divider("TEST: Resolver timeout")
 
   from agent_gateway import create_agent
-  from agent_gateway.auth import AuthConfig
+  from agent_gateway.auth import AuthConfig, ResolverResult
   from starlette.testclient import TestClient
 
-  async def slow_resolver(user_id: str, init_request) -> AuthConfig:
+  async def slow_resolver(api_key: str, init_request) -> ResolverResult:
     await asyncio.sleep(10)  # Way over the timeout
-    return AuthConfig.from_dict({
-      "provider": "anthropic",
-      "billing_mode": "byok",
-      "api_key": "never-reached",
-    })
+    return ResolverResult(
+      user_id=init_request.user_id or "",
+      channel="excel",
+      risk_user_id=101,
+      role="owner",
+      auth_config=AuthConfig.from_dict({
+        "provider": "anthropic",
+        "billing_mode": "byok",
+        "api_key": "never-reached",
+      }),
+    )
 
   app = create_agent(
     "test-key-timeout",
@@ -357,7 +375,7 @@ def test_on_usage_fires_with_ledger() -> None:
   import tempfile
   from agent_gateway import create_agent
   from agent_gateway.multi_user.billing import SqliteUsageLedger
-  from agent_gateway.auth import AuthConfig
+  from agent_gateway.auth import AuthConfig, ResolverResult
   from starlette.testclient import TestClient
 
   with tempfile.TemporaryDirectory() as tmp:
@@ -365,14 +383,20 @@ def test_on_usage_fires_with_ledger() -> None:
     dlq_path = Path(tmp) / "dlq.jsonl"
     ledger = SqliteUsageLedger(db_path)
 
-    async def mock_resolver(user_id, init_request):
-      return AuthConfig.from_dict({
-        "provider": "anthropic",
-        "billing_mode": "metered",
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 16000,
-        "api_key": "sk-ant-api03-fake",
-      })
+    async def mock_resolver(api_key, init_request):
+      return ResolverResult(
+        user_id=init_request.user_id or "",
+        channel="web",
+        risk_user_id=101,
+        role="owner",
+        auth_config=AuthConfig.from_dict({
+          "provider": "anthropic",
+          "billing_mode": "metered",
+          "model": "claude-sonnet-4-6",
+          "max_tokens": 16000,
+          "api_key": "sk-ant-api03-fake",
+        }),
+      )
 
     app = create_agent(
       "test-key-billing",
@@ -433,7 +457,7 @@ if __name__ == "__main__":
   # Phase 1.1 tests
   test_rate_table()
   test_auth_config()
-  test_gateway_backward_compat()
+  test_gateway_explicit_user_id_without_resolver()
   test_gateway_strict_mode()
   test_resolver_timeout()
 

@@ -66,6 +66,9 @@ def make_run_agent_handler(
   mcp_session_inject_servers: set[str] | None = None,
   mcp_meta_inject_servers: frozenset[str] | None = None,
   user_id: str | None = None,
+  user_email: str | None = None,
+  parent_user_id: str | None = None,
+  parent_user_email: str | None = None,
   credentials_resolver_active: bool = False,
   local_tool_handlers: dict[str, Any] | None = None,
   excluded_tools: set[str] | None = None,
@@ -216,6 +219,17 @@ def make_run_agent_handler(
       for name, handler in (local_tool_handlers or {}).items()
       if name not in effective_excluded
     }
+    effective_parent_user_id = (
+      parent_user_id
+      or user_id
+      or getattr(parent_session, "user_id", None)
+    )
+    effective_parent_user_email = (
+      parent_user_email
+      or user_email
+      or getattr(parent_session, "user_email", None)
+    )
+
     sub_log = EventLog()
     sub_dispatcher = ToolDispatcher(
       mcp_client=mcp_client,
@@ -226,7 +240,10 @@ def make_run_agent_handler(
       should_avoid_permission_prompts=True,
       mcp_session_inject_servers=mcp_session_inject_servers,
       mcp_meta_inject_servers=mcp_meta_inject_servers,
-      user_id=user_id or getattr(parent_session, "user_id", None),
+      user_id=effective_parent_user_id,
+      risk_user_id=getattr(parent_session, "risk_user_id", None),
+      channel=getattr(parent_session, "channel", None),
+      role=getattr(parent_session, "role", None),
       credentials_resolver_active=credentials_resolver_active,
     )
 
@@ -240,8 +257,13 @@ def make_run_agent_handler(
           api_key_hash=parent_session.api_key_hash,
           created_at=parent_session.created_at,
           expires_at=parent_session.expires_at,
-          user_id=parent_session.user_id,
+          user_id=effective_parent_user_id or parent_session.user_id,
+          user_email=effective_parent_user_email,
+          risk_user_id=getattr(parent_session, "risk_user_id", 0),
+          role=getattr(parent_session, "role", "owner"),
           auth_config=parent_session.auth_config,
+          channel=getattr(parent_session, "channel", None),
+          is_public=getattr(parent_session, "is_public", False),
         )
       return await runner.spawn_sub_agent(
         task,
@@ -486,6 +508,9 @@ def make_resume_handler(
       mcp_session_inject_servers=mcp_session_inject_servers,
       mcp_meta_inject_servers=mcp_meta_inject_servers,
       user_id=user_id or getattr(parent_session, "user_id", None),
+      risk_user_id=getattr(parent_session, "risk_user_id", None),
+      channel=getattr(parent_session, "channel", None),
+      role=getattr(parent_session, "role", None),
       credentials_resolver_active=credentials_resolver_active,
     )
     tool_ctx = kwargs.get("tool_ctx")
@@ -503,7 +528,12 @@ def make_resume_handler(
           created_at=parent_session.created_at,
           expires_at=parent_session.expires_at,
           user_id=parent_session.user_id,
+          user_email=parent_session.user_email,
+          risk_user_id=getattr(parent_session, "risk_user_id", 0),
+          role=getattr(parent_session, "role", "owner"),
           auth_config=parent_session.auth_config,
+          channel=getattr(parent_session, "channel", None),
+          is_public=getattr(parent_session, "is_public", False),
         )
       return await runner.resume_sub_agent(
         original_task_id=task_id,

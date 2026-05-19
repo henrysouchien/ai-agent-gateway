@@ -76,12 +76,21 @@ def normalize_identity(
   billing_mode: str | None,
   channel: str | None,
 ) -> tuple[str, str, Literal["byok", "metered"], str | None]:
-  """Apply the gateway's default usage identity semantics."""
-  normalized_user_id = str(user_id or "_default")
-  normalized_rate_table_version = str(rate_table_version or "unknown")
-  normalized_billing_mode: Literal["byok", "metered"] = (
-    "metered" if str(billing_mode or "").strip().lower() == "metered" else "byok"
-  )
+  """Validate and normalize the usage identity attached to billing records."""
+  normalized_user_id = str(user_id or "").strip()
+  if not normalized_user_id:
+    raise ValueError("user_id is required for usage identity")
+  if normalized_user_id == "_default":
+    raise ValueError("user_id '_default' is reserved for usage identity")
+
+  normalized_rate_table_version = str(rate_table_version or "").strip()
+  if not normalized_rate_table_version:
+    raise ValueError("rate_table_version is required for usage identity")
+
+  normalized_billing_mode_raw = str(billing_mode or "").strip().lower()
+  if normalized_billing_mode_raw not in {"byok", "metered"}:
+    raise ValueError("billing_mode must be 'byok' or 'metered'")
+  normalized_billing_mode: Literal["byok", "metered"] = normalized_billing_mode_raw  # type: ignore[assignment]
   normalized_channel = channel.strip() if isinstance(channel, str) and channel.strip() else None
   return normalized_user_id, normalized_rate_table_version, normalized_billing_mode, normalized_channel
 

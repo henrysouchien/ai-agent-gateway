@@ -89,6 +89,20 @@ def test_collect_run_output() -> None:
   assert output.max_turns_reached is True
 
 
+def test_collect_run_output_detects_operator_pause() -> None:
+  event_log = EventLog()
+  event_log.append({"type": "text_delta", "text": "paused"})
+  event_log.append({"type": "operator_pause", "reason": "operator_pause"})
+  event_log.append({"type": "stream_complete", "usage": {"input_tokens": 1, "output_tokens": 2}})
+
+  output = autonomous.collect_run_output(event_log, timed_out=False)
+
+  assert output.response == "paused"
+  assert output.operator_paused is True
+  assert output.error is None
+  assert output.timed_out is False
+
+
 def test_run_session_timeout() -> None:
   class _SlowRunner:
     async def run(self, **kwargs: Any) -> None:
@@ -171,7 +185,15 @@ def test_run_autonomous_tolerates_model_free_auth_config(monkeypatch: pytest.Mon
   )
   monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
 
-  output = _run(autonomous.run_autonomous("System", "Hello"))
+  output = _run(
+    autonomous.run_autonomous(
+      "System",
+      "Hello",
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+  )
 
   assert output.response == "ok"
   assert captured["model"] == _get_default_model_for_provider("anthropic")
@@ -184,6 +206,7 @@ def test_run_autonomous_tolerates_model_free_auth_config(monkeypatch: pytest.Mon
     (autonomous.RunOutput("ok", [], {}, "boom", False), 1),
     (autonomous.RunOutput("ok", [], {}, None, False, budget_exceeded=True), 2),
     (autonomous.RunOutput("ok", [], {}, None, False, max_turns_reached=True), 3),
+    (autonomous.RunOutput("ok", [], {}, None, False, operator_paused=True), 0),
     (autonomous.RunOutput("ok", [], {}, None, True), 124),
   ],
 )
@@ -199,6 +222,7 @@ def test_run_output_exit_code(output: autonomous.RunOutput, expected: int) -> No
     (autonomous.RunOutput("ok", [], {}, "boom", False), "error"),
     (autonomous.RunOutput("ok", [], {}, None, False, budget_exceeded=True), "budget_exceeded"),
     (autonomous.RunOutput("ok", [], {}, None, False, max_turns_reached=True), "max_turns"),
+    (autonomous.RunOutput("ok", [], {}, None, False, operator_paused=True), "operator_pause"),
   ],
 )
 def test_run_output_outcome(output: autonomous.RunOutput, expected: str) -> None:
@@ -256,6 +280,7 @@ def test_build_state_payload() -> None:
   assert payload["active_servers"] == ["prices"]
   assert payload["tools_used"] == ["file_read", "web_fetch"]
   assert payload["usage"] == {"input_tokens": 5}
+  assert payload["operator_paused"] is False
   assert payload["last_summary"] == "Long summary text"
   assert payload["alerts"] == ["fresh"]
   assert payload["next_session"] == ["next"]
@@ -283,6 +308,14 @@ def test_format_run_summary() -> None:
   assert "Briefing: notes/briefing.md" in message
   assert "Ideas: 3" in message
   assert "Summary:" in message
+
+
+def test_format_run_summary_operator_paused_status() -> None:
+  output = autonomous.RunOutput("Paused cleanly.", [], {}, None, False, operator_paused=True)
+
+  message = autonomous.format_run_summary(output, label="Nightly analyst run")
+
+  assert "Status: operator paused" in message
 
 
 def test_deliver_telegram(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -446,6 +479,9 @@ def test_run_autonomous_simple(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
         briefing_file="notes/briefing.md",
       ),
       session_id="session-123",
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
   )
 
@@ -509,6 +545,9 @@ def test_run_autonomous_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
       "Run the task.",
       provider=_StubProvider(),
       model="stub-model",
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
   )
 
@@ -575,6 +614,9 @@ def test_run_autonomous_forwards_outputs_dir(
       model="stub-model",
       skills_dir=skills_dir,
       outputs_dir=outputs_dir,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
   )
 
@@ -646,6 +688,9 @@ def test_run_autonomous_skills_dir_registers_send_message_tool_and_builtin_name(
       model="stub-model",
       skills_dir=skills_dir,
       mcp_servers={"filesystem": {"command": "npx", "args": ["-y", "server"]}},
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
   )
 

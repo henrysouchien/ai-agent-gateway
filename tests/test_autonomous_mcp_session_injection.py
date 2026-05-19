@@ -112,6 +112,9 @@ def test_run_autonomous_forwards_mcp_session_inject_servers_to_dispatcher(
       model="stub-model",
       mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
       mcp_session_inject_servers={"browser"},
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
   )
 
@@ -143,6 +146,9 @@ def test_run_autonomous_forwards_mcp_timeout_overrides_to_manager(
       model="stub-model",
       mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
       mcp_timeout_overrides={"browser": 90},
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
   )
 
@@ -176,6 +182,9 @@ def test_run_autonomous_defaults_to_no_injection_and_no_timeout_overrides(
       provider=_StubProvider(),
       model="stub-model",
       mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
   )
 
@@ -225,6 +234,9 @@ def test_run_autonomous_forwards_mcp_session_inject_servers_to_sub_agents(
       mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
       skills_dir=skills_dir,
       mcp_session_inject_servers={"browser"},
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
   )
 

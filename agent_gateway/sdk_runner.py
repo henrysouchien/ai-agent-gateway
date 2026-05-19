@@ -14,6 +14,7 @@ from .event_log import EventLog
 from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator, normalize_identity
 from .providers.agent_sdk import AgentSDKConfig, estimate_cost, _validate_sdk_version
 from .runner import ToolResultContext
+from .tool_result_semantics import classify_semantic_tool_error
 
 
 log = logging.getLogger("agent_gateway.sdk_runner")
@@ -215,15 +216,6 @@ class AgentSDKRunner:
       sdk_config.billing_mode,
       sdk_config.channel,
     )
-    if sdk_config.user_id is None or sdk_config.rate_table_version is None or sdk_config.billing_mode is None:
-      log.debug(
-        "[%s] SDK usage identity defaults applied | user_id=%s rate_table_version=%s billing_mode=%s channel=%s",
-        self._sid,
-        self._usage_user_id,
-        self._rate_table_version,
-        self._billing_mode,
-        self._channel,
-      )
     self._parent_aggregator = _parent_aggregator
     self._aggregator = _parent_aggregator or _UsageAggregator(
       user_id=self._usage_user_id,
@@ -359,7 +351,7 @@ class AgentSDKRunner:
       "tool_use_id": tool_call_id,
       "content": json.dumps(result, default=str),
     }
-    if isinstance(result, dict) and (result.get("success") is False or result.get("status") == "error"):
+    if classify_semantic_tool_error(result) is not None:
       entry["is_error"] = True
     return entry
 
@@ -615,6 +607,7 @@ class AgentSDKRunner:
     server = _server_for_tool(info.tool_name)
     duration_ms = int((time.time() - info.started_at) * 1000)
     result_bytes = len(json.dumps(result, default=str)) if result is not None else 0
+    semantic_error = classify_semantic_tool_error(result) if error is None else None
     event = {
       "type": "tool_call_complete",
       "tool_call_id": tool_call_id,
@@ -623,7 +616,10 @@ class AgentSDKRunner:
       "error": error,
       "duration_ms": duration_ms,
       "server": server,
+      "is_error": error is not None or semantic_error is not None,
     }
+    if semantic_error is not None:
+      event["semantic_error"] = dict(semantic_error)
     if synthetic:
       log.info("[%s] Synthetic tool completion for %s (%s)", self._sid, info.tool_name, tool_call_id)
     self._append(event)
@@ -631,7 +627,7 @@ class AgentSDKRunner:
       tool_name=info.tool_name,
       server=server,
       duration_ms=duration_ms,
-      is_error=error is not None,
+      is_error=event["is_error"],
       result_bytes=result_bytes,
     )
 

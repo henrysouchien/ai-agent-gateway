@@ -74,6 +74,58 @@ def test_build_mcp_env_adds_explicit_server_env_and_overrides_allowlist(monkeypa
   assert "IGNORED_NONE" not in env
 
 
+def test_build_mcp_env_expands_single_env_ref(monkeypatch) -> None:
+  monkeypatch.setattr(mcp_client_module.os, "environ", {"FMP_API_KEY": "secret"})
+
+  env = _build_mcp_env({"FMP_API_KEY": "${FMP_API_KEY}"})
+
+  assert env["FMP_API_KEY"] == "secret"
+
+
+def test_build_mcp_env_expands_multiple_env_refs(monkeypatch) -> None:
+  monkeypatch.setattr(mcp_client_module.os, "environ", {"FOO": "a", "BAR": "b"})
+
+  env = _build_mcp_env({"COMBO": "${FOO}/${BAR}"})
+
+  assert env["COMBO"] == "a/b"
+
+
+def test_build_mcp_env_preserves_literal_without_refs(monkeypatch) -> None:
+  monkeypatch.setattr(mcp_client_module.os, "environ", {})
+
+  env = _build_mcp_env({"PLAIN": "no-refs-here"})
+
+  assert env["PLAIN"] == "no-refs-here"
+
+
+def test_build_mcp_env_preserves_literal_dollars_outside_refs(monkeypatch) -> None:
+  monkeypatch.setattr(mcp_client_module.os, "environ", {"FOO": "x"})
+
+  env = _build_mcp_env({"PWD": "pa$$word-$5-${FOO}"})
+
+  assert env["PWD"] == "pa$$word-$5-x"
+
+
+def test_build_mcp_env_expands_undefined_ref_to_empty_string(monkeypatch) -> None:
+  monkeypatch.setattr(mcp_client_module.os, "environ", {})
+
+  env = _build_mcp_env({"MISSING": "${UNDEFINED_XYZ}"})
+
+  assert env["MISSING"] == ""
+
+
+def test_build_mcp_env_expands_refs_once_without_recursion(monkeypatch) -> None:
+  monkeypatch.setattr(
+    mcp_client_module.os,
+    "environ",
+    {"FOO": "${BAR}", "BAR": "should-not-appear"},
+  )
+
+  env = _build_mcp_env({"NEST": "${FOO}"})
+
+  assert env["NEST"] == "${BAR}"
+
+
 def test_connect_passes_filtered_env_to_stdio_server_parameters(monkeypatch) -> None:
   monkeypatch.setattr(mcp_client_module, "MCP_IMPORT_ERROR", None)
   monkeypatch.setattr(

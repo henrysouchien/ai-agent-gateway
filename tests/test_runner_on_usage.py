@@ -77,6 +77,34 @@ class _UsageProvider(ModelProvider):
     yield StreamEvent(type="message_end", stop_reason="end_turn")
 
 
+class _TwoTurnTextProvider(_UsageProvider):
+  def __init__(self) -> None:
+    self.requests: list[list[dict[str, Any]]] = []
+
+  def build_request_params(
+    self,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    system_prompt: str | list[tuple[str, bool]] | None,
+    tools: list[dict[str, Any]],
+    max_tokens: int,
+    **kwargs: Any,
+  ) -> dict[str, Any]:
+    _ = model, system_prompt, tools, max_tokens, kwargs
+    self.requests.append([dict(message) for message in messages])
+    return {"call_index": len(self.requests)}
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    _ = client
+    yield StreamEvent(type="message_start", input_tokens=10)
+    text = "rough 25 bps" if params["call_index"] == 1 else "verified 26.1 bps"
+    yield StreamEvent(type="text_delta", text=text)
+    yield StreamEvent(type="text_end", raw_block={"type": "text", "text": text})
+    yield StreamEvent(type="usage_update", output_tokens=5)
+    yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+
 def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
   return ToolDispatcher(
     mcp_client=_NullMcpClient(),
@@ -84,6 +112,33 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
     event_log=event_log or EventLog(),
     session_id="sess-parent",
   )
+
+
+def test_final_answer_guard_can_inject_follow_up_turn() -> None:
+  event_log = EventLog()
+  provider = _TwoTurnTextProvider()
+
+  def guard(messages, answer_text, tools_used, tool_definitions, turn_count):
+    _ = messages, answer_text, tools_used, tool_definitions
+    return "verify with tools before final" if turn_count == 1 else None
+
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log),
+    session_id="sess-parent",
+    provider=provider,
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    final_answer_guard=guard,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "compare margin bps"}]))
+
+  assert len(provider.requests) == 2
+  assert provider.requests[1][-1] == {"role": "user", "content": "verify with tools before final"}
+  assert any(entry.event.get("type") == "runtime_guard" for entry in event_log.entries)
 
 
 def test_on_usage_fires_once_per_turn_with_usage_event_fields() -> None:
@@ -138,6 +193,8 @@ def test_on_usage_failure_does_not_block_chat_response(tmp_path: Path) -> None:
     user_id="alice",
     request_id="req-123",
     usage_ledger_dlq_path=tmp_path / "usage_dlq.jsonl",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
@@ -162,6 +219,8 @@ def test_on_usage_failure_writes_to_dlq_spool(tmp_path: Path) -> None:
     user_id="alice",
     request_id="req-123",
     usage_ledger_dlq_path=spool_path,
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
@@ -185,6 +244,8 @@ def test_spawn_sub_agent_emits_usage_with_parent_turn_id() -> None:
     on_usage=events.append,
     user_id="alice",
     request_id="req-123",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
   sub_session = GatewaySession(
     session_id="sub0:sess-parent",
@@ -222,6 +283,9 @@ def test_run_appends_turn_complete_event_to_event_log() -> None:
     session_id="sess-parent",
     provider=_UsageProvider(),
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
@@ -249,6 +313,8 @@ def test_runner_emits_session_summary_once_after_run() -> None:
     request_id="req-summary",
     channel="web",
     on_session_summary=summaries.append,
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
@@ -276,6 +342,9 @@ def test_runner_is_single_use() -> None:
     session_id="sess-parent",
     provider=_UsageProvider(),
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
@@ -296,6 +365,8 @@ def test_sub_runner_with_parent_aggregator_does_not_emit_own_summary() -> None:
     user_id="alice",
     request_id="req-parent",
     on_session_summary=parent_summaries.append,
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
   child_runner = AgentRunner(
     event_log=EventLog(),
@@ -307,6 +378,8 @@ def test_sub_runner_with_parent_aggregator_does_not_emit_own_summary() -> None:
     request_id="req-parent",
     on_session_summary=child_summaries.append,
     _parent_aggregator=parent_runner._aggregator,
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   _run(child_runner.run(messages=[{"role": "user", "content": "child"}]))
@@ -332,6 +405,9 @@ def test_spawn_sub_agent_no_wall_clock(
     session_id="sess-parent",
     provider=_UsageProvider(),
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
   )
 
   result, error = _run(

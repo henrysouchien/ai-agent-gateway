@@ -58,12 +58,28 @@ def test_sdk_runner_usage_event_threads_identity() -> None:
   assert event.cost_usd == pytest.approx(0.03)
 
 
-def test_sdk_runner_identity_defaults_and_summary() -> None:
+def test_sdk_runner_requires_explicit_usage_identity() -> None:
+  with pytest.raises(ValueError, match="user_id"):
+    AgentSDKRunner(
+      event_log=EventLog(),
+      session_id="sess-sdk",
+      sdk_config=AgentSDKConfig(api_key="k", model="claude-sonnet-4-6"),
+      system_prompt="test",
+    )
+
+
+def test_sdk_runner_explicit_identity_summary() -> None:
   summaries: list[SessionUsageSummary] = []
   runner = AgentSDKRunner(
     event_log=EventLog(),
     session_id="sess-sdk",
-    sdk_config=AgentSDKConfig(api_key="k", model="claude-sonnet-4-6"),
+    sdk_config=AgentSDKConfig(
+      api_key="k",
+      model="claude-sonnet-4-6",
+      user_id="alice",
+      rate_table_version="v1",
+      billing_mode="byok",
+    ),
     system_prompt="test",
     on_session_summary=summaries.append,
   )
@@ -78,8 +94,7 @@ def test_sdk_runner_identity_defaults_and_summary() -> None:
   _run(close_and_emit())
 
   assert summaries
-  assert summaries[0].user_id == "_default"
+  assert summaries[0].user_id == "alice"
   assert summaries[0].request_id
   assert summaries[0].input_tokens == 3
   assert summaries[0].turns == 1
-

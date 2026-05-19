@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import logging
 import inspect
+import logging
+import os
 import secrets
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -34,6 +35,11 @@ class _NullMcpClient:
 
   def get_tool_definitions(self) -> list[dict[str, Any]]:
     return []
+
+
+def _mcp_config_path_from_env() -> Path | None:
+  env_path = os.getenv("MCP_CONFIG_PATH", "").strip()
+  return Path(env_path).expanduser() if env_path else None
 
 
 def create_agent(
@@ -122,8 +128,9 @@ def create_agent(
     mcp_servers: Inline MCP server definitions. When provided, the helper uses
       `McpClientManager(config_path=None, inline_servers=...)`.
     mcp_config_path: Alternate Claude desktop config file to read MCP servers
-      from. Defaults to `~/.claude.json` when omitted and `mcp_servers` is not
-      provided.
+      from. When omitted, `MCP_CONFIG_PATH` is used if set; otherwise inline
+      `mcp_servers` remain inline-only and file-backed MCP config uses the
+      `McpClientManager` default of `~/.claude.json`.
     mcp_timeout_overrides: Optional per-server MCP tool timeout overrides in
       seconds.
     mcp_default_tool_timeout: Default MCP tool timeout in seconds.
@@ -232,7 +239,10 @@ def create_agent(
 
   skill_loader = SkillLoader(skills_dir) if skills_dir else None
   mcp_client: McpClientManager | None = None
-  if mcp_servers or mcp_config_path:
+  resolved_mcp_config_path = (
+    mcp_config_path if mcp_config_path is not None else _mcp_config_path_from_env()
+  )
+  if mcp_servers or resolved_mcp_config_path:
     builtin_names = set((tool_handlers or {}).keys())
     if code_execution:
       builtin_names |= {"code_execute", "code_execute_status"}
@@ -240,7 +250,7 @@ def create_agent(
       builtin_names |= {"run_agent", "get_background_result", "send_message"}
     mcp_client = McpClientManager(
       inline_servers=mcp_servers,
-      config_path=mcp_config_path,
+      config_path=resolved_mcp_config_path,
       builtin_tool_names=builtin_names,
       timeout_overrides=mcp_timeout_overrides,
       default_tool_timeout=mcp_default_tool_timeout,

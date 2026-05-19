@@ -178,8 +178,10 @@ def _coerce_optional_scope(value: Any, *, field_name: str, path: Path) -> str | 
   text = _clean_string(value)
   if text is None:
     return None
-  if text not in {"ticker", "portfolio"}:
-    raise ValueError(f"{path}: Invalid scope '{text}': must be 'ticker' or 'portfolio'")
+  if text not in {"ticker", "portfolio", "industry"}:
+    raise ValueError(
+      f"{path}: Invalid scope '{text}': must be 'ticker', 'portfolio', or 'industry'"
+    )
   return text
 
 

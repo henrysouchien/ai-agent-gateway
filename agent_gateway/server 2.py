@@ -69,7 +69,6 @@ class ModelCatalog(BaseModel):
 class ChatInitResponse(BaseModel):
   """Response body returned after a session token is issued."""
 
-  user_id: str
   session_token: str
   session_id: str
   expires_at: int
@@ -645,7 +644,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     token = auth.issue_token(session)
     log.info("Session created: %s", session.session_id)
     return ChatInitResponse(
-      user_id=resolved_user_id,
       session_token=token,
       session_id=session.session_id,
       expires_at=session.expires_at,

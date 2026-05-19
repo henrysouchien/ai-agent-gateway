@@ -158,7 +158,7 @@ def _patch_asgi_transport_streaming(monkeypatch: pytest.MonkeyPatch):
 
 
 async def _init_session(client: httpx.AsyncClient) -> dict[str, Any]:
-  response = await client.post("/api/chat/init", json={"api_key": "gateway-key"})
+  response = await client.post("/api/chat/init", json={"api_key": "gateway-key", "user_id": "alice"})
   assert response.status_code == 200, response.text
   return response.json()
 
@@ -676,6 +676,9 @@ def test_on_disconnect_agent_runner_closes_client() -> None:
       session_id="sess-disconnect",
       provider=provider,
       auth_config={"api_key": "test-key", "model": "claude-sonnet-4-6"},
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
     client = provider.create_client({}, timeout=None)
     runner._set_client(client)
@@ -700,7 +703,13 @@ def test_on_disconnect_sdk_runner_closes_iterator() -> None:
     runner = AgentSDKRunner(
       event_log=EventLog(),
       session_id="sess-sdk",
-      sdk_config=AgentSDKConfig(api_key="test-key", model="claude-sonnet-4-6"),
+      sdk_config=AgentSDKConfig(
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      ),
       system_prompt="test",
     )
     iterator = _ManualAsyncIterator()
@@ -1009,6 +1018,9 @@ def test_credential_refresh_retries_stream_with_new_auth_config(monkeypatch: pyt
       session_id="sess-refresh",
       provider=provider,
       auth_config={"api_key": "old-key", "model": "claude-sonnet-4-6", "max_tokens": 256},
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
     )
     refresh_failures = []
 
@@ -1083,7 +1095,13 @@ def test_sdk_runner_client_disconnect_releases_lock_fast(make_test_app, monkeypa
     app = make_test_app(
       provider=None,
       runner_class=AgentSDKRunner,
-      sdk_config=AgentSDKConfig(api_key="test-key", model="claude-sonnet-4-6"),
+      sdk_config=AgentSDKConfig(
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      ),
     )
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
@@ -1118,7 +1136,13 @@ def test_sdk_runner_second_request_succeeds_after_disconnect(make_test_app, monk
     app = make_test_app(
       provider=None,
       runner_class=AgentSDKRunner,
-      sdk_config=AgentSDKConfig(api_key="test-key", model="claude-sonnet-4-6"),
+      sdk_config=AgentSDKConfig(
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      ),
     )
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:

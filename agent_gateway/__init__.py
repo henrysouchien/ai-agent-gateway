@@ -20,6 +20,7 @@ from .agent_session_log import AgentSessionLog, AgentSessionRef, LogEntry, Query
 from .auth import (
   AuthConfig,
   AuthExpiredError,
+  ChannelMismatchError,
   CredentialFailureKind,
   CredentialRefreshRequest,
   CredentialsRefreshResolver,
@@ -29,7 +30,7 @@ from .auth import (
   MissingUserIdError,
   NoCredentialError,
   ProviderCredentialFailure,
-  StrictModeDefaultUserError,
+  ResolverResult,
 )
 from .code_execution import (
   BackgroundTask,
@@ -77,7 +78,7 @@ from .runner import AgentRunner, SubAgentConfig, ToolResultContext, _derive_sub_
 from .send_prompt import send_prompt, send_prompt_sync
 from .sdk_runner import AgentSDKRunner
 from .server import ChatRuntime, GatewayServerConfig, ModelCatalog, RequestContext, create_gateway_app
-from .session import AuthManager, GatewaySession, Session, SessionStore
+from .session import AuthManager, GatewaySession, SessionStore
 from .skills import SkillLoader, SkillProfile, SkillStateStore, parse_skill_file
 from .sub_agent import (
   make_get_background_result_handler,
@@ -128,6 +129,7 @@ __all__ = [
   "AuthConfig",
   "AuthManager",
   "AuthExpiredError",
+  "ChannelMismatchError",
   "BackgroundTask",
   "CONTRACTS",
   "CONTRACT_CREDENTIAL_REFRESH_V1",
@@ -175,6 +177,7 @@ __all__ = [
   "QueryCursor",
   "RateTable",
   "RequestContext",
+  "ResolverResult",
   "SOURCE_COMMIT",
   "ResolvedProvider",
   "RetryConfig",
@@ -184,14 +187,12 @@ __all__ = [
   "send_prompt",
   "send_prompt_sync",
   "SessionUsageSummary",
-  "Session",
   "SessionContextBuilder",
   "SessionStore",
   "SkillLoader",
   "SkillProfile",
   "SkillStateStore",
   "StreamEvent",
-  "StrictModeDefaultUserError",
   "SubAgentConfig",
   "SubprocessBackend",
   "SummaryFn",

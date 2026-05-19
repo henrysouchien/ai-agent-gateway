@@ -1,9 +1,11 @@
 import asyncio
+import json
 import sys
 import uuid
 from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -11,8 +13,18 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.auth import AuthConfig, NoCredentialError, ProviderCredentialFailure
-from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway import (
+  AgentRunner,
+  AgentSessionLog,
+  CostEstimate,
+  ModelInfo,
+  ModelProvider,
+  SessionContextBuilder,
+  StreamEvent,
+  ToolDispatcher,
+)
+from agent_gateway.auth import AuthConfig, NoCredentialError, ProviderCredentialFailure, ResolverResult
+from agent_gateway.server import ChatInitRequest, ChatRuntime, GatewayServerConfig, create_gateway_app
 
 
 class _StubRunner:
@@ -84,7 +96,7 @@ def _make_app(
 def _init_session(
   client: TestClient,
   *,
-  user_id: str | None = None,
+  user_id: str | None = "alice",
   user_email: str | None = None,
   context: dict[str, Any] | None = None,
 ):
@@ -111,7 +123,7 @@ def _consume_chat_stream(client: TestClient, token: str, payload: dict[str, Any]
     list(response.iter_lines())
 
 
-def _resolver_for(user_id: str) -> AuthConfig:
+def _auth_config_for(user_id: str) -> AuthConfig:
   return AuthConfig.from_dict(
     {
       "provider": "anthropic",
@@ -123,7 +135,154 @@ def _resolver_for(user_id: str) -> AuthConfig:
   )
 
 
-def test_chat_init_resolves_user_id_top_level_then_context_then_default() -> None:
+class _NoopMcpClient:
+  def is_mcp_tool(self, _name: str) -> bool:
+    return False
+
+  async def call_tool(self, name: str, _tool_input: dict[str, Any]):
+    return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
+
+  def get_tool_definitions(self) -> list[dict[str, Any]]:
+    return []
+
+
+class _ReplayProvider(ModelProvider):
+  name = "stub"
+
+  def __init__(self, responses: list[str]) -> None:
+    self.responses = list(responses)
+    self.captured_messages: list[list[dict[str, Any]]] = []
+
+  def has_active_credential(self, config: dict[str, Any]) -> bool:
+    _ = config
+    return True
+
+  def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> object:
+    _ = config, timeout
+    return object()
+
+  async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+    _ = client, timeout
+
+  def get_model_info(self, model: str) -> ModelInfo:
+    return ModelInfo(id=model, provider=self.name)
+
+  def build_request_params(
+    self,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    system_prompt: str | list[tuple[str, bool]] | None,
+    tools: list[dict[str, Any]],
+    max_tokens: int,
+    **kwargs: Any,
+  ) -> dict[str, Any]:
+    _ = model, system_prompt, tools, max_tokens, kwargs
+    self.captured_messages.append([dict(message) for message in messages])
+    return {}
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    _ = client, params
+    if not self.responses:
+      raise AssertionError("unexpected extra provider call")
+    text = self.responses.pop(0)
+    yield StreamEvent(type="message_start", input_tokens=10)
+    yield StreamEvent(type="text_delta", text=text)
+    yield StreamEvent(type="text_end", raw_block={"type": "text", "text": text})
+    yield StreamEvent(type="usage_update", output_tokens=5)
+    yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+  def estimate_cost(
+    self,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+  ) -> CostEstimate:
+    _ = model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+    return CostEstimate()
+
+
+def test_chat_stream_rebuilds_multi_turn_memory_from_session_log(tmp_path: Path) -> None:
+  provider = _ReplayProvider(["AAPL market cap is about $4.4T.", "AAPL P/E is about 36x."])
+  session_log = AgentSessionLog(path=tmp_path / "sessions" / "interactive.jsonl")
+
+  async def _build_chat_runtime(session, request, channel, auth_manager):
+    _ = session, request, channel, auth_manager
+
+    def _build_runner(event_log, session_id):
+      return AgentRunner(
+        event_log=event_log,
+        dispatcher=ToolDispatcher(
+          mcp_client=_NoopMcpClient(),
+          local_tool_handlers={},
+          event_log=event_log,
+          session_id=session_id,
+        ),
+        session_id=session_id,
+        provider=provider,
+        auth_config={"api_key": "k", "model": "stub-model"},
+        get_tool_definitions=lambda: [],
+        user_id=session.user_id,
+        billing_mode="byok",
+        rate_table_version="unknown",
+        agent_session_log=session_log,
+        context_builder=SessionContextBuilder(
+          agent_session_log=session_log,
+          tail_window_seconds=None,
+        ),
+      )
+
+    return ChatRuntime(system_prompt="system", build_runner=_build_runner)
+
+  app = create_gateway_app(
+    GatewayServerConfig(
+      auth_config={"model": "stub-model"},
+      allowed_models={"stub-model"},
+      build_chat_runtime=_build_chat_runtime,
+    )
+  )
+  client = TestClient(app)
+  init = _init_session(client)
+
+  _consume_chat_stream(
+    client,
+    init["session_token"],
+    {"messages": [{"role": "user", "content": "What is AAPL market cap?"}]},
+  )
+  _consume_chat_stream(
+    client,
+    init["session_token"],
+    {
+      "messages": [
+        {"role": "user", "content": "CLIENT FABRICATED USER"},
+        {"role": "assistant", "content": "CLIENT FABRICATED ASSISTANT"},
+        {"role": "user", "content": "What is its P/E?"},
+      ],
+    },
+  )
+
+  assert len(provider.captured_messages) == 2
+  second_input = json.dumps(provider.captured_messages[1], default=str)
+  assert "What is AAPL market cap?" in second_input
+  assert "AAPL market cap is about $4.4T." in second_input
+  assert "What is its P/E?" in second_input
+  assert "CLIENT FABRICATED USER" not in second_input
+  assert "CLIENT FABRICATED ASSISTANT" not in second_input
+
+
+def _resolver_result_for(user_id: str, *, channel: str = "excel") -> ResolverResult:
+  return ResolverResult(
+    user_id=user_id,
+    channel=channel,
+    auth_config=_auth_config_for(user_id),
+    risk_user_id=abs(hash(user_id)) % 10_000 + 1,
+    role="owner",
+  )
+
+
+def test_chat_init_requires_top_level_user_id_without_resolver() -> None:
   app, _captured_requests, _run_calls = _make_app()
 
   with TestClient(app) as client:
@@ -133,40 +292,74 @@ def test_chat_init_resolves_user_id_top_level_then_context_then_default() -> Non
       user_email="top@example.com",
       context={"user_id": "legacy"},
     )
-    legacy = _init_session(client, context={"user_id": "legacy"})
-    default = _init_session(client)
+    legacy = client.post("/api/chat/init", json={"api_key": "gateway-key", "context": {"user_id": "legacy"}})
+    missing = client.post("/api/chat/init", json={"api_key": "gateway-key"})
 
   top_session = app.state.auth.session_store.get_session(top["session_id"])
-  legacy_session = app.state.auth.session_store.get_session(legacy["session_id"])
-  default_session = app.state.auth.session_store.get_session(default["session_id"])
 
   assert top_session.user_id == "top-level"
   assert top_session.user_email == "top@example.com"
-  assert legacy_session.user_id == "legacy"
-  assert legacy_session.user_email is None
-  assert default_session.user_id == "_default"
-  assert default_session.user_email is None
+  assert legacy.status_code == 400
+  assert legacy.json()["error"] == "missing_user_id"
+  assert missing.status_code == 400
+  assert missing.json()["error"] == "missing_user_id"
 
 
-def test_strict_mode_rejects_default_user_at_chat_init() -> None:
-  async def _resolver(user_id: str, _init_request):
-    return _resolver_for(user_id)
+def test_chat_init_request_accepts_byok_fields_without_channel_field() -> None:
+  request = ChatInitRequest(
+    api_key="gateway-key",
+    anthropic_auth_mode="oauth",
+    anthropic_api_key="sk-ant-api",
+    anthropic_auth_token="sk-ant-oat",
+  )
+  fields = ChatInitRequest.model_fields if hasattr(ChatInitRequest, "model_fields") else ChatInitRequest.__fields__
+
+  assert request.anthropic_auth_mode == "oauth"
+  assert request.anthropic_api_key == "sk-ant-api"
+  assert request.anthropic_auth_token == "sk-ant-oat"
+  assert "channel" not in fields
+
+
+def test_chat_init_rejects_reserved_user_returned_by_resolver() -> None:
+  calls: list[tuple[str, Any]] = []
+
+  async def _resolver(api_key: str, init_request):
+    calls.append((api_key, init_request))
+    return _resolver_result_for("_default")
 
   app, _captured_requests, _run_calls = _make_app(credentials_resolver=_resolver)
 
   with TestClient(app) as client:
     response = client.post("/api/chat/init", json={"api_key": "gateway-key"})
 
+  assert calls and calls[0][0] == "gateway-key"
   assert response.status_code == 400
-  assert response.json()["error"] == "strict_mode_default_user"
+  assert response.json()["error"] == "missing_user_id"
+
+
+def test_chat_init_accepts_resolver_derived_user_without_request_user_id() -> None:
+  async def _resolver(api_key: str, init_request):
+    assert api_key == "gateway-key"
+    assert init_request.user_id is None
+    return _resolver_result_for("alice", channel="excel")
+
+  app, _captured_requests, _run_calls = _make_app(credentials_resolver=_resolver)
+
+  with TestClient(app) as client:
+    init_response = _init_session(client, user_id=None)
+
+  session = app.state.auth.session_store.get_session(init_response["session_id"])
+  assert session.user_id == "alice"
+  assert session.channel == "excel"
+  assert session.is_public is False
 
 
 def test_chat_init_calls_resolver_and_stores_auth_config() -> None:
   calls: list[tuple[str, Any]] = []
 
-  async def _resolver(user_id: str, init_request):
-    calls.append((user_id, init_request))
-    return _resolver_for(user_id)
+  async def _resolver(api_key: str, init_request):
+    calls.append((api_key, init_request))
+    return _resolver_result_for(init_request.user_id, channel="web")
 
   app, _captured_requests, _run_calls = _make_app(credentials_resolver=_resolver)
 
@@ -175,11 +368,15 @@ def test_chat_init_calls_resolver_and_stores_auth_config() -> None:
 
   session = app.state.auth.session_store.get_session(init_response["session_id"])
   verified_session, claims = app.state.auth.verify_token_with_payload(init_response["session_token"])
-  assert calls and calls[0][0] == "alice"
+  assert calls and calls[0][0] == "gateway-key"
   assert session.user_id == "alice"
   assert session.user_email == "alice@example.com"
+  assert session.channel == "web"
+  assert session.is_public is False
   assert verified_session.user_email == "alice@example.com"
   assert claims["user_email"] == "alice@example.com"
+  assert claims["channel"] == "web"
+  assert claims["is_public"] is False
   assert session.auth_config == {
     "provider": "anthropic",
     "billing_mode": "byok",
@@ -192,8 +389,8 @@ def test_chat_init_calls_resolver_and_stores_auth_config() -> None:
 def test_chat_refresh_resolver_updates_session_auth_config() -> None:
   refresh_requests: list[Any] = []
 
-  async def _resolver(user_id: str, _init_request):
-    return _resolver_for(user_id)
+  async def _resolver(_api_key: str, init_request):
+    return _resolver_result_for(init_request.user_id, channel="web")
 
   async def _refresh(request):
     refresh_requests.append(request)
@@ -229,8 +426,8 @@ def test_chat_refresh_resolver_updates_session_auth_config() -> None:
 
 
 def test_chat_rejects_cross_user_reuse_in_strict_mode() -> None:
-  async def _resolver(user_id: str, _init_request):
-    return _resolver_for(user_id)
+  async def _resolver(_api_key: str, init_request):
+    return _resolver_result_for(init_request.user_id)
 
   app, _captured_requests, _run_calls = _make_app(credentials_resolver=_resolver)
 
@@ -249,8 +446,8 @@ def test_chat_rejects_cross_user_reuse_in_strict_mode() -> None:
 
 
 def test_chat_requires_user_id_in_strict_mode() -> None:
-  async def _resolver(user_id: str, _init_request):
-    return _resolver_for(user_id)
+  async def _resolver(_api_key: str, init_request):
+    return _resolver_result_for(init_request.user_id)
 
   app, _captured_requests, _run_calls = _make_app(credentials_resolver=_resolver)
 
@@ -280,20 +477,14 @@ def test_non_strict_mode_defaults_missing_user_id_to_jwt_bound_value() -> None:
   assert captured_requests[0]["request"].user_id == "alice"
 
 
-def test_non_strict_mode_default_operator_path_runs_end_to_end() -> None:
-  app, captured_requests, _run_calls = _make_app()
+def test_non_strict_mode_rejects_missing_init_user_id() -> None:
+  app, _captured_requests, _run_calls = _make_app()
 
   with TestClient(app) as client:
-    init_response = _init_session(client)
-    session = app.state.auth.session_store.get_session(init_response["session_id"])
-    assert session.user_id == "_default"
-    _consume_chat_stream(
-      client,
-      init_response["session_token"],
-      {"messages": [{"role": "user", "content": "hello operator path"}]},
-    )
+    response = client.post("/api/chat/init", json={"api_key": "gateway-key"})
 
-  assert captured_requests[0]["request"].user_id == "_default"
+  assert response.status_code == 400
+  assert response.json()["error"] == "missing_user_id"
 
 
 def test_chat_request_id_uses_consumer_value_or_gateway_uuid() -> None:
@@ -322,9 +513,9 @@ def test_chat_request_id_uses_consumer_value_or_gateway_uuid() -> None:
 
 
 def test_credentials_resolver_timeout_returns_structured_error() -> None:
-  async def _resolver(_user_id: str, _init_request):
+  async def _resolver(_api_key: str, _init_request):
     await asyncio.sleep(0.05)
-    return _resolver_for("slow")
+    return _resolver_result_for("slow")
 
   app, _captured_requests, _run_calls = _make_app(
     credentials_resolver=_resolver,
@@ -340,7 +531,8 @@ def test_credentials_resolver_timeout_returns_structured_error() -> None:
 
 
 def test_credentials_resolver_raise_returns_structured_error() -> None:
-  async def _resolver(user_id: str, _init_request):
+  async def _resolver(_api_key: str, init_request):
+    user_id = init_request.user_id
     raise NoCredentialError(f"User {user_id} has no credential configured.")
 
   app, _captured_requests, _run_calls = _make_app(credentials_resolver=_resolver)
@@ -352,3 +544,75 @@ def test_credentials_resolver_raise_returns_structured_error() -> None:
   payload = response.json()
   assert payload["error"] == "credentials_unavailable"
   assert payload["reason"] == "User alice has no credential configured."
+
+
+def test_gateway_server_config_accepts_on_session_created_hook() -> None:
+  def _hook(_session, _api_key: str, _request) -> None:
+    return None
+
+  config = GatewayServerConfig(build_chat_runtime=lambda *_args, **_kwargs: None, on_session_created=_hook)
+
+  assert config.on_session_created is _hook
+
+
+def test_on_session_created_exception_expires_session_and_reraises() -> None:
+  expired_session_ids: list[str] = []
+
+  def _hook(session, _api_key: str, _request) -> None:
+    raise HTTPException(status_code=401, detail=f"reject {session.session_id}")
+
+  app, _captured_requests, _run_calls = _make_app()
+  app.state.gateway_config.on_session_created = _hook
+  original_expire_session = app.state.auth.session_store.expire_session
+
+  def _expire_session(session_id: str) -> None:
+    expired_session_ids.append(session_id)
+    original_expire_session(session_id)
+
+  app.state.auth.session_store.expire_session = _expire_session
+
+  with TestClient(app) as client:
+    response = client.post("/api/chat/init", json={"api_key": "gateway-key", "user_id": "alice"})
+
+  assert response.status_code == 401
+  assert expired_session_ids
+  assert app.state.auth.session_store.sessions == {}
+
+
+def test_auth_config_to_dict_is_called_before_create_session_boundary() -> None:
+  class _TrackedAuthConfig:
+    calls = 0
+
+    def to_dict(self) -> dict[str, Any]:
+      self.calls += 1
+      return {
+        "provider": "anthropic",
+        "billing_mode": "byok",
+        "api_key": "tracked-key",
+        "model": "claude-sonnet-4-6",
+      }
+
+  tracked = _TrackedAuthConfig()
+
+  async def _resolver(_api_key: str, _init_request):
+    return ResolverResult(
+      user_id="alice",
+      channel="excel",
+      auth_config=tracked,
+      risk_user_id=101,
+      role="owner",
+    )
+
+  app, _captured_requests, _run_calls = _make_app(credentials_resolver=_resolver)
+
+  with TestClient(app) as client:
+    init_response = _init_session(client, user_id=None)
+
+  session = app.state.auth.session_store.get_session(init_response["session_id"])
+  assert tracked.calls == 1
+  assert session.auth_config == {
+    "provider": "anthropic",
+    "billing_mode": "byok",
+    "api_key": "tracked-key",
+    "model": "claude-sonnet-4-6",
+  }

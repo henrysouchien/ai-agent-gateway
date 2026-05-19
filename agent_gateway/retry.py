@@ -123,6 +123,8 @@ def _classify_error_text(text: str | None) -> Outcome | None:
 
 def classify_outcome(exc: Exception | None, output: RunOutput | None) -> Outcome:
   if output is not None:
+    if output.operator_paused:
+      return "permanent"
     if not output.error and not output.timed_out and not output.budget_exceeded and not output.max_turns_reached:
       return "success"
     if output.budget_exceeded or output.max_turns_reached:
@@ -156,6 +158,8 @@ def _failure_description(exc: Exception | None, output: RunOutput | None) -> str
       return "Run budget exceeded"
     if output.max_turns_reached:
       return "Run reached max turns"
+    if output.operator_paused:
+      return "Run paused by operator"
     if output.timed_out:
       return "Run timed out"
   if exc is not None:

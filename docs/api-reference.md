@@ -47,6 +47,9 @@ Key parameters:
 - `provider`: `"anthropic"` (default), `"openai"`, or a `ModelProvider` instance
 - `model`: provider-specific default when omitted for string providers; required for provider instances
 - `auth_config`: explicit auth dict; wins over `api_key`/`auth_token` if provided
+- `user_id`: required stable user identity for usage accounting
+- `billing_mode`: required usage billing mode, either `byok` or `metered`
+- `rate_table_version`: required usage rate-table/version label
 - `skills_dir`: directory of markdown skill files used by `run_agent`
 - `outputs_dir`: directory for named-skill output files; stale same-day outputs are cleaned before background `run_agent` launch
 - `state_dir`: optional directory for persisted run state (JSON load/save between runs)
@@ -153,6 +156,7 @@ Use them when:
 - you want one prompt/response
 - you do not need sessions or SSE
 - you still want the same provider normalization as the gateway
+- you can provide an explicit `user_id` for usage events
 
 ## Server
 
@@ -234,7 +238,7 @@ Alternative execution path that keeps the same gateway HTTP surface but delegate
 
 Use this when SDK parity matters more than native-runner control.
 
-`AgentSDKConfig` accepts the same identity fields as `AgentRunner` (`user_id`, `channel`, `rate_table_version`, `billing_mode`); both runners normalize values via `normalize_identity()` to the same defaults.
+`AgentSDKConfig` accepts the same identity fields as `AgentRunner` (`user_id`, `channel`, `rate_table_version`, `billing_mode`); both runners require explicit usage identity before emitting billing records.
 
 ## Usage Callbacks and Billing
 
@@ -248,7 +252,7 @@ Aggregated billing record emitted **once per chat** after background-task drain.
 
 ### `normalize_identity()`
 
-Helper that applies the same identity defaults across `AgentRunner` and `AgentSDKRunner`: `user_id or "_default"`, `billing_mode → "metered"|"byok"`, `rate_table_version or "unknown"`, `channel` stripped or `None`. Use this if you build a custom runner and want consistent ledger records.
+Helper that validates and normalizes identity across `AgentRunner` and `AgentSDKRunner`. `user_id`, `rate_table_version`, and `billing_mode` are required; `_default` is reserved-invalid; `channel` is stripped or returned as `None`.
 
 ### Runner callbacks
 
@@ -257,10 +261,6 @@ Both runners accept three usage-related callbacks at construction:
 - `on_usage: Callable[[UsageEvent], Awaitable[None] | None]` — fires per-turn for live cost streaming. Use for SSE telemetry, real-time UI updates.
 - `on_session_summary: Callable[[SessionUsageSummary], Awaitable[None] | None]` — fires once per chat after drain. Use for billing writes (`record_cost`).
 - `on_late_usage_event: Callable[[UsageEvent], Awaitable[None] | None]` — fires when a `UsageEvent` arrives **after** `on_session_summary` already emitted (e.g., a background sub-agent finished post-stream). Wire this to a spool table for reconciliation.
-
-### `send_prompt()` legacy callback shape
-
-Pre-0.11.1 `send_prompt(on_usage=...)` accepted a 4-int callable: `(input_tokens, output_tokens, cache_read, cache_write)`. This contract is preserved via runtime arity detection but emits `DeprecationWarning`. Migrate to the modern `Callable[[UsageEvent], ...]` shape; legacy removal targeted `v0.12.0`.
 
 ## Tools And Approval
 

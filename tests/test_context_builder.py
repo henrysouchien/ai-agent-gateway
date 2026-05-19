@@ -207,3 +207,179 @@ def test_context_builder_without_summary_uses_temporal_fallback(
   messages = _run(builder.build())
 
   assert messages == [{"role": "user", "content": "Recent event"}]
+
+
+def test_context_builder_can_replay_full_session_without_temporal_cutoff(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "full-replay.jsonl")
+  monkeypatch.setattr(agent_session_log_module.time, "time", lambda: 100.0)
+  _run(log.append({"type": "user_message", "content": "First turn"}))
+  monkeypatch.setattr(agent_session_log_module.time, "time", lambda: 199.0)
+  _run(log.append({"type": "user_message", "content": "Second turn"}))
+
+  builder = SessionContextBuilder(agent_session_log=log, tail_window_seconds=None)
+  monkeypatch.setattr(context_builder_module.time, "time", lambda: 10_000.0)
+  messages = _run(builder.build())
+
+  assert messages == [
+    {"role": "user", "content": "First turn"},
+    {"role": "user", "content": "Second turn"},
+  ]
+
+
+def test_context_builder_surfaces_previous_writer_interruption_with_sub_agent_work(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "interrupted-run.jsonl")
+  _run(log.append({"type": "attach", "role": "writer", "runner_id": "runner_old", "started_at": 100.0}))
+  _run(
+    log.append(
+      {
+        "type": "task_registered",
+        "task_id": "bg_0",
+        "agent_name": "macro-review",
+        "sub_agent_id": "sub0:sess-parent",
+        "started_at": 101.0,
+      }
+    )
+  )
+  _run(
+    log.append(
+      {
+        "type": "assistant_message",
+        "role": "sub_agent",
+        "sub_agent_id": "sub0:sess-parent",
+        "content_blocks": [{"type": "text", "text": "partial macro work"}],
+      }
+    )
+  )
+  _run(
+    log.append(
+      {
+        "type": "tool_call_start",
+        "role": "sub_agent",
+        "sub_agent_id": "sub0:sess-parent",
+        "tool_call_id": "tool-sub",
+        "tool_name": "macro_pull",
+        "started_at": 102.0,
+      }
+    )
+  )
+  _run(
+    log.append(
+      {
+        "type": "tool_call_interrupted",
+        "role": "writer",
+        "tool_call_id": "tool-parent",
+        "tool_name": "screen_estimate_revisions",
+        "tool_risk": "read_only",
+        "original_started_at": 103.0,
+      }
+    )
+  )
+  _run(
+    log.append(
+      {
+        "type": "state_update",
+        "payload": {
+          "budget_exceeded": True,
+          "data_flags": ["estimate revisions unavailable"],
+          "alerts": ["resume macro review"],
+        },
+      }
+    )
+  )
+  _run(
+    log.append(
+      {
+        "type": "interrupted",
+        "role": "writer",
+        "reason": "budget_exceeded",
+        "runner_id": "runner_old",
+        "last_completed_seq": 4,
+      }
+    )
+  )
+  _run(log.append({"type": "detach", "role": "writer", "reason": "completed"}))
+  _run(
+    log.append(
+      {
+        "type": "summary",
+        "covers": {"from_seq": 1, "to_seq": 8},
+        "text": "Earlier clean summary.",
+      }
+    )
+  )
+  _run(log.append({"type": "attach", "role": "writer", "runner_id": "runner_new", "started_at": 200.0}))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+  combined = "\n".join(str(message["content"]) for message in messages)
+
+  assert "## Previous run interrupted" in combined
+  assert "Reason: budget_exceeded" in combined
+  assert "Runner: runner_old" in combined
+  assert "`screen_estimate_revisions` (`tool-parent`), risk read_only" in combined
+  assert "macro-review (`sub0:sess-parent`): 3 event(s), 1 tool call(s)" in combined
+  assert "- budget_exceeded: true" in combined
+  assert "- data flag: estimate revisions unavailable" in combined
+  assert "- alert: resume macro review" in combined
+
+
+def test_context_builder_does_not_surface_old_interruption_after_clean_writer_run(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "stale-interruption.jsonl")
+  _run(log.append({"type": "attach", "role": "writer", "runner_id": "runner_old"}))
+  _run(
+    log.append(
+      {
+        "type": "interrupted",
+        "role": "writer",
+        "reason": "budget_exceeded",
+        "runner_id": "runner_old",
+      }
+    )
+  )
+  _run(log.append({"type": "detach", "role": "writer", "reason": "completed"}))
+  _run(log.append({"type": "attach", "role": "writer", "runner_id": "runner_clean"}))
+  _run(log.append({"type": "user_message", "content": "Clean prior run"}))
+  _run(log.append({"type": "detach", "role": "writer", "reason": "completed"}))
+  _run(log.append({"type": "attach", "role": "writer", "runner_id": "runner_new"}))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+  combined = "\n".join(str(message["content"]) for message in messages)
+
+  assert "## Previous run interrupted" not in combined
+  assert "Clean prior run" in combined
+
+
+def test_context_builder_suppresses_duplicate_interruption_tail_lines(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "interruption-tail.jsonl")
+  _run(log.append({"type": "attach", "role": "writer", "runner_id": "runner_old"}))
+  _run(
+    log.append(
+      {
+        "type": "tool_call_interrupted",
+        "role": "writer",
+        "tool_call_id": "tool-1",
+        "tool_name": "file_read",
+        "tool_risk": "read_only",
+      }
+    )
+  )
+  _run(
+    log.append(
+      {
+        "type": "interrupted",
+        "role": "writer",
+        "reason": "recovered_on_attach",
+        "runner_id": "runner_old",
+      }
+    )
+  )
+  _run(log.append({"type": "attach", "role": "writer", "runner_id": "runner_new"}))
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+  combined = "\n".join(str(message["content"]) for message in messages)
+
+  assert combined.count("## Previous run interrupted") == 1
+  assert "[Session log] Previous run ended with interruption reason" not in combined
+  assert "[Session log] Previous run interrupted tool" not in combined

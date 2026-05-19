@@ -114,6 +114,43 @@ def test_generate_and_append_summary_returns_none_on_summarization_failure(tmp_p
   assert summaries == []
 
 
+def test_generate_and_append_summary_skips_summary_only_slice(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "summary-only.jsonl")
+  _run(
+    log.append(
+      {
+        "type": "summary",
+        "covers": {"from_seq": 1, "to_seq": 1},
+        "summary_kind": "cumulative",
+        "text": "Prior summary.",
+      }
+    )
+  )
+  calls = 0
+
+  async def _summarize(_prompt_text: str) -> str:
+    nonlocal calls
+    calls += 1
+    return "Should not be called."
+
+  result = _run(
+    generate_and_append_summary(
+      log,
+      from_seq=1,
+      to_seq=1,
+      prompt="Summarize the analyst session.",
+      model="claude-sonnet-4-6",
+      auth_config={},
+      summarize_fn=_summarize,
+    )
+  )
+
+  assert result is None
+  assert calls == 0
+  summaries, _ = _run(log.query(event_types={"summary"}, order="asc"))
+  assert len(summaries) == 1
+
+
 def test_generate_and_append_summary_is_orthogonal_to_compaction_content_blocks(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "compaction-block.jsonl")
   _run(
@@ -149,6 +186,117 @@ def test_generate_and_append_summary_is_orthogonal_to_compaction_content_blocks(
   summary_entries, _ = _run(log.query(event_types={"summary"}, order="asc"))
   assert len(assistant_entries) == 1
   assert len(summary_entries) == 1
+
+
+def test_generate_and_append_summary_preserves_thinking_blocks(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "thinking-preserved.jsonl")
+  _run(
+    log.append(
+      {
+        "type": "assistant_message",
+        "content_blocks": [
+          {"type": "thinking", "thinking": "Reasoning detail that informs the handoff."},
+          {"type": "text", "text": "The analyst reached a conclusion."},
+        ],
+        "stop_reason": "end_turn",
+      }
+    )
+  )
+  captured_prompts: list[str] = []
+
+  async def _summarize(prompt_text: str) -> str:
+    captured_prompts.append(prompt_text)
+    return "Narrative summary."
+
+  summary = _run(
+    generate_and_append_summary(
+      log,
+      from_seq=1,
+      to_seq=1,
+      prompt="Summarize the analyst session.",
+      model="claude-sonnet-4-6",
+      auth_config={},
+      summarize_fn=_summarize,
+    )
+  )
+
+  assert summary is not None
+  assert "[thinking] Reasoning detail that informs the handoff." in captured_prompts[0]
+  assert "The analyst reached a conclusion." in captured_prompts[0]
+
+
+def test_generate_and_append_summary_compacts_bulk_tool_results(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "bulk-tool-result.jsonl")
+  _run(
+    log.append(
+      {
+        "type": "tool_call_complete",
+        "tool_call_id": "toolu_bulk",
+        "tool_name": "fmp_fetch",
+        "result": {
+          "status": "success",
+          "endpoint": "earnings_calendar",
+          "row_count": 100,
+          "data": [{"symbol": f"TICK{i}", "payload": "x" * 200} for i in range(100)],
+          "summary": {"date_range": {"earliest": "2026-05-01", "latest": "2026-06-15"}},
+        },
+        "error": None,
+      }
+    )
+  )
+  captured_prompts: list[str] = []
+
+  async def _summarize(prompt_text: str) -> str:
+    captured_prompts.append(prompt_text)
+    return "Narrative summary."
+
+  summary = _run(
+    generate_and_append_summary(
+      log,
+      from_seq=1,
+      to_seq=1,
+      prompt="Summarize the analyst session.",
+      model="claude-sonnet-4-6",
+      auth_config={},
+      summarize_fn=_summarize,
+    )
+  )
+
+  assert summary is not None
+  assert '"endpoint": "earnings_calendar"' in captured_prompts[0]
+  assert '"row_count": 100' in captured_prompts[0]
+  assert '"data": "<omitted list items=100>"' in captured_prompts[0]
+  assert "TICK99" not in captured_prompts[0]
+
+
+def test_generate_and_append_summary_respects_prompt_budget_boundary(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "budget-boundary.jsonl")
+  _run(log.append({"type": "user_message", "content": "first " + ("a" * 5000)}))
+  _run(log.append({"type": "user_message", "content": "second " + ("b" * 5000)}))
+  captured_prompts: list[str] = []
+
+  async def _summarize(prompt_text: str) -> str:
+    captured_prompts.append(prompt_text)
+    return "Budgeted summary."
+
+  summary = _run(
+    generate_and_append_summary(
+      log,
+      from_seq=1,
+      to_seq=2,
+      prompt="Summarize the analyst session.",
+      model="claude-sonnet-4-6",
+      auth_config={},
+      summarize_fn=_summarize,
+      prompt_char_budget=1500,
+    )
+  )
+
+  assert summary is not None
+  assert summary.event["covers"] == {"from_seq": 1, "to_seq": 1}
+  assert len(captured_prompts[0]) <= 1500
+  assert "summary input truncated" in captured_prompts[0]
+  assert "second " not in captured_prompts[0]
 
 
 def test_generate_analyst_session_summary_applies_bootstrap_cap(
@@ -188,3 +336,28 @@ def test_generate_analyst_session_summary_applies_bootstrap_cap(
   assert summary is not None
   assert summary.event["covers"]["from_seq"] == 3
   assert summary.event["covers"]["to_seq"] == 5
+
+
+def test_generate_analyst_session_summary_catches_up_in_bounded_chunks(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "chunked-catchup.jsonl")
+  for index in range(3):
+    _run(log.append({"type": "user_message", "content": f"event-{index} " + ("x" * 5000)}))
+
+  async def _summarize(prompt_text: str) -> str:
+    return f"Chunk summary chars={len(prompt_text)}."
+
+  summary = _run(
+    generate_analyst_session_summary(
+      log,
+      auth_config={},
+      summarize_fn=_summarize,
+      max_chunks=2,
+      prompt_char_budget=1500,
+    )
+  )
+
+  assert summary is not None
+  summaries, _ = _run(log.query(event_types={"summary"}, order="asc"))
+  assert len(summaries) == 2
+  assert summaries[0].event["covers"] == {"from_seq": 1, "to_seq": 1}
+  assert summaries[1].event["covers"] == {"from_seq": 2, "to_seq": 2}

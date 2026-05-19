@@ -6,15 +6,24 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Literal, Optional, Set
 
 import jwt
 from fastapi import HTTPException
 
 
 JWT_ALGORITHM = "HS256"
-DEFAULT_GATEWAY_USER_ID = "henry"
 OnSessionExpiry = Callable[["GatewaySession"], Awaitable[None]]
+_RESERVED_USER_IDS = {"_default"}
+
+
+def _normalize_required_user_id(user_id: str | None) -> str:
+  normalized = str(user_id or "").strip()
+  if not normalized:
+    raise ValueError("user_id is required")
+  if normalized in _RESERVED_USER_IDS:
+    raise ValueError("user_id '_default' is reserved")
+  return normalized
 
 
 @dataclass
@@ -30,9 +39,13 @@ class GatewaySession:
   api_key_hash: str
   created_at: int
   expires_at: int
-  user_id: str = DEFAULT_GATEWAY_USER_ID
+  user_id: str
   user_email: str | None = None
+  risk_user_id: int = 0
+  role: Literal["owner", "invite"] = "owner"
   auth_config: dict[str, Any] | None = None
+  channel: Optional[str] = None
+  is_public: bool = False
   stream_active: bool = False
   pending_tools: Dict[str, Dict] = field(default_factory=dict)
   approved_tool_types: Set[str] = field(default_factory=set)
@@ -60,19 +73,24 @@ class SessionStore:
     self,
     api_key_hash: str,
     *,
-    user_id: str = "_default",
+    user_id: str,
     user_email: str | None = None,
+    risk_user_id: int = 0,
+    role: Literal["owner", "invite"] = "owner",
     auth_config: dict[str, Any] | None = None,
   ) -> GatewaySession:
     now = int(time.time())
     session_id = f"sess_{uuid.uuid4().hex}"
+    normalized_user_id = _normalize_required_user_id(user_id)
     session = GatewaySession(
       session_id=session_id,
       api_key_hash=api_key_hash,
       created_at=now,
       expires_at=now + self.ttl,
-      user_id=user_id,
+      user_id=normalized_user_id,
       user_email=user_email,
+      risk_user_id=risk_user_id,
+      role=role,
       auth_config=dict(auth_config) if auth_config is not None else None,
       result_queue=asyncio.Queue(),
     )
@@ -165,6 +183,10 @@ class AuthManager:
       "expires_at": session.expires_at,
       "user_id": session.user_id,
       "user_email": session.user_email,
+      "risk_user_id": session.risk_user_id,
+      "role": session.role,
+      "channel": session.channel,
+      "is_public": session.is_public,
     }
     return jwt.encode(payload, self._secret, algorithm=JWT_ALGORITHM)
 
@@ -190,12 +212,41 @@ class AuthManager:
     if not session or session.api_key_hash != api_key_hash:
       raise HTTPException(status_code=401, detail="Unknown session")
 
-    token_user_id = payload.get("user_id")
-    if token_user_id is not None and str(token_user_id) != session.user_id:
+    token_user_id = str(payload.get("user_id") or "").strip()
+    if not token_user_id:
+      raise HTTPException(status_code=401, detail="Invalid session user_id")
+    try:
+      token_user_id = _normalize_required_user_id(token_user_id)
+    except ValueError as exc:
+      raise HTTPException(status_code=401, detail=str(exc)) from exc
+    if token_user_id != session.user_id:
       raise HTTPException(status_code=401, detail="Session user mismatch")
     token_user_email = payload.get("user_email")
     if token_user_email != session.user_email:
       raise HTTPException(status_code=401, detail="Session user email mismatch")
+
+    token_risk_user_id = payload.get("risk_user_id", session.risk_user_id)
+    try:
+      token_risk_user_id = int(token_risk_user_id)
+    except (TypeError, ValueError) as exc:
+      raise HTTPException(status_code=401, detail="Invalid session risk_user_id") from exc
+    if token_risk_user_id != session.risk_user_id:
+      raise HTTPException(status_code=401, detail="Session risk user mismatch")
+
+    token_role = payload.get("role", session.role)
+    if token_role not in {"owner", "invite"}:
+      raise HTTPException(status_code=401, detail="Invalid session role")
+    if token_role != session.role:
+      raise HTTPException(status_code=401, detail="Session role mismatch")
+
+    channel = payload.get("channel")
+    is_public = payload.get("is_public", False)
+    payload["risk_user_id"] = token_risk_user_id
+    payload["role"] = token_role
+    payload["channel"] = channel if isinstance(channel, str) else None
+    payload["is_public"] = is_public if isinstance(is_public, bool) else False
+    session.channel = payload["channel"]
+    session.is_public = payload["is_public"]
 
     return payload
 
@@ -213,8 +264,4 @@ class AuthManager:
     return session
 
 
-# Deprecated alias — use GatewaySession
-Session = GatewaySession
-
-
-__all__ = ["AuthManager", "DEFAULT_GATEWAY_USER_ID", "GatewaySession", "Session", "SessionStore"]
+__all__ = ["AuthManager", "GatewaySession", "SessionStore"]

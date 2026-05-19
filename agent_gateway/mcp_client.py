@@ -5,10 +5,13 @@ import copy
 import json
 import logging
 import os
+import re
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Set, SupportsFloat, Tuple
 
 try:
   from mcp.client.session import ClientSession
@@ -23,14 +26,74 @@ except Exception as exc:
     _ = args, kwargs
     raise RuntimeError(f"MCP client runtime unavailable: {MCP_IMPORT_ERROR}")
 
+try:
+  from mcp.client.streamable_http import streamable_http_client
+  STREAMABLE_HTTP_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+  streamable_http_client = None  # type: ignore[assignment]
+  STREAMABLE_HTTP_IMPORT_ERROR = exc
+
+try:
+  import httpx
+  HTTPX_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+  httpx = Any  # type: ignore[assignment]
+  HTTPX_IMPORT_ERROR = exc
+
+try:
+  from fastmcp.client.auth.oauth import OAuth as FastMCPOAuth
+  FASTMCP_OAUTH_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+  FastMCPOAuth = None  # type: ignore[assignment]
+  FASTMCP_OAUTH_IMPORT_ERROR = exc
+
 
 log = logging.getLogger("agent_gateway.mcp_client")
 _UNSET = object()
+_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_STREAMABLE_HTTP_TYPES = {"streamable-http", "streamable_http", "http", "streamable"}
+_SUPPORTED_SERVER_TYPES = {"stdio"} | _STREAMABLE_HTTP_TYPES
 # Default-deny: MCP subprocesses inherit only a small set of safe env vars.
 _DEFAULT_ENV_ALLOWLIST = {
   "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "USER",
   "PYTHONPATH", "NODE_PATH", "VIRTUAL_ENV",
 }
+_MCP_STDIO_TERMINATION_LOGGER = "mcp.os.posix.utilities"
+_MCP_STDIO_PG_FALLBACK_PREFIX = "Process group termination failed for PID "
+_MCP_STDIO_PG_FALLBACK_MARKER = "falling back to simple terminate"
+_MCP_CLOSE_TIMEOUT_SECONDS = 5.0
+
+
+def _resolve_mcp_config_path(config_path: Path | str | None | object = _UNSET) -> Path | None:
+  if config_path is _UNSET:
+    env_path = os.getenv("MCP_CONFIG_PATH", "").strip()
+    return Path(env_path).expanduser() if env_path else Path.home() / ".claude.json"
+  if config_path is None:
+    return None
+  return Path(config_path).expanduser()
+
+
+class _McpStdioTerminationFallbackFilter(logging.Filter):
+  def filter(self, record: logging.LogRecord) -> bool:
+    if record.name != _MCP_STDIO_TERMINATION_LOGGER:
+      return True
+    message = record.getMessage()
+    return not (
+      message.startswith(_MCP_STDIO_PG_FALLBACK_PREFIX)
+      and _MCP_STDIO_PG_FALLBACK_MARKER in message
+    )
+
+
+@contextmanager
+def _suppress_mcp_stdio_termination_fallback_warnings():
+  """Suppress the MCP SDK's expected process-group fallback warning during close."""
+  upstream_logger = logging.getLogger(_MCP_STDIO_TERMINATION_LOGGER)
+  log_filter = _McpStdioTerminationFallbackFilter()
+  upstream_logger.addFilter(log_filter)
+  try:
+    yield
+  finally:
+    upstream_logger.removeFilter(log_filter)
 
 
 def _build_mcp_env(server_env: Dict[str, Any] | None) -> Dict[str, str]:
@@ -41,8 +104,165 @@ def _build_mcp_env(server_env: Dict[str, Any] | None) -> Dict[str, str]:
   for key, value in server_env.items():
     if value is None:
       continue
-    env[str(key)] = str(value)
+    env[str(key)] = _expand_env_refs(value)
   return env
+
+
+def _expand_env_refs(value: Any) -> str:
+  raw = str(value)
+  return _ENV_REF_RE.sub(lambda match: os.environ.get(match.group(1), ""), raw)
+
+
+def _build_http_headers(headers: Dict[str, Any] | None) -> Dict[str, str]:
+  if not isinstance(headers, dict):
+    return {}
+  return {
+    str(key): _expand_env_refs(value)
+    for key, value in headers.items()
+    if value is not None
+  }
+
+
+def _safe_cache_name(name: str) -> str:
+  return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "server"
+
+
+class _JsonFileKeyValue:
+  """Minimal AsyncKeyValue-compatible JSON store for FastMCP OAuth tokens."""
+
+  def __init__(self, path: Path | str, *, default_collection: str = "default") -> None:
+    self._path = Path(path).expanduser()
+    self._default_collection = default_collection
+
+  def _collection(self, collection: str | None) -> str:
+    return str(collection or self._default_collection)
+
+  def _load(self) -> dict[str, dict[str, dict[str, Any]]]:
+    try:
+      data = json.loads(self._path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+      return {}
+    except (OSError, json.JSONDecodeError):
+      return {}
+    return data if isinstance(data, dict) else {}
+
+  def _save(self, data: dict[str, dict[str, dict[str, Any]]]) -> None:
+    self._path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = self._path.with_suffix(f"{self._path.suffix}.tmp")
+    tmp_path.write_text(
+      json.dumps(data, indent=2, sort_keys=True) + "\n",
+      encoding="utf-8",
+    )
+    try:
+      tmp_path.chmod(0o600)
+    except OSError:
+      pass
+    os.replace(tmp_path, self._path)
+
+  @staticmethod
+  def _active_value(entry: Any) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+      return None
+    expires_at = entry.get("expires_at")
+    if expires_at is not None:
+      try:
+        if float(expires_at) <= time.time():
+          return None
+      except (TypeError, ValueError):
+        return None
+    value = entry.get("value")
+    return dict(value) if isinstance(value, dict) else None
+
+  async def get(self, key: str, *, collection: str | None = None) -> dict[str, Any] | None:
+    data = self._load()
+    coll = self._collection(collection)
+    value = self._active_value(data.get(coll, {}).get(str(key)))
+    if value is None and str(key) in data.get(coll, {}):
+      await self.delete(str(key), collection=coll)
+    return value
+
+  async def ttl(
+    self,
+    key: str,
+    *,
+    collection: str | None = None,
+  ) -> tuple[dict[str, Any] | None, float | None]:
+    data = self._load()
+    coll = self._collection(collection)
+    entry = data.get(coll, {}).get(str(key))
+    value = self._active_value(entry)
+    if value is None:
+      if str(key) in data.get(coll, {}):
+        await self.delete(str(key), collection=coll)
+      return None, None
+    expires_at = entry.get("expires_at") if isinstance(entry, dict) else None
+    ttl_seconds = None if expires_at is None else max(float(expires_at) - time.time(), 0.0)
+    return value, ttl_seconds
+
+  async def put(
+    self,
+    key: str,
+    value: Mapping[str, Any],
+    *,
+    collection: str | None = None,
+    ttl: SupportsFloat | None = None,
+  ) -> None:
+    data = self._load()
+    coll = self._collection(collection)
+    expires_at = None if ttl is None else time.time() + float(ttl)
+    data.setdefault(coll, {})[str(key)] = {
+      "value": dict(value),
+      "expires_at": expires_at,
+    }
+    self._save(data)
+
+  async def delete(self, key: str, *, collection: str | None = None) -> bool:
+    data = self._load()
+    coll = self._collection(collection)
+    bucket = data.get(coll, {})
+    existed = str(key) in bucket
+    if existed:
+      bucket.pop(str(key), None)
+      if not bucket:
+        data.pop(coll, None)
+      self._save(data)
+    return existed
+
+  async def get_many(
+    self,
+    keys: Sequence[str],
+    *,
+    collection: str | None = None,
+  ) -> list[dict[str, Any] | None]:
+    return [await self.get(str(key), collection=collection) for key in keys]
+
+  async def ttl_many(
+    self,
+    keys: Sequence[str],
+    *,
+    collection: str | None = None,
+  ) -> list[tuple[dict[str, Any] | None, float | None]]:
+    return [await self.ttl(str(key), collection=collection) for key in keys]
+
+  async def put_many(
+    self,
+    keys: Sequence[str],
+    values: Sequence[Mapping[str, Any]],
+    *,
+    collection: str | None = None,
+    ttl: SupportsFloat | None = None,
+  ) -> None:
+    if len(keys) != len(values):
+      raise ValueError("keys and values must have the same length")
+    for key, value in zip(keys, values):
+      await self.put(str(key), value, collection=collection, ttl=ttl)
+
+  async def delete_many(self, keys: Sequence[str], *, collection: str | None = None) -> int:
+    deleted = 0
+    for key in keys:
+      if await self.delete(str(key), collection=collection):
+        deleted += 1
+    return deleted
 
 
 def _classify_exception(exc: Exception, msg: str) -> str:
@@ -76,12 +296,12 @@ class _ServerState:
 
 
 class McpClientManager:
-  """Manage stdio MCP server lifecycles and tool routing.
+  """Manage MCP server lifecycles and tool routing.
 
-  The manager can load servers from inline config, from `~/.claude.json`, or
-  from an alternate config path. On startup it connects to each allowed stdio
-  server, lists its tools, filters name collisions, and exposes a merged tool
-  catalog to the runner.
+  The manager can load servers from inline config, from `MCP_CONFIG_PATH`, from
+  `~/.claude.json`, or from an alternate config path. On startup it connects to
+  each allowed server, lists its tools, filters name collisions, and exposes a
+  merged tool catalog to the runner.
 
   `inline_servers` is the easiest way to ship self-contained examples because it
   avoids any dependency on the user's Claude desktop config.
@@ -110,12 +330,7 @@ class McpClientManager:
     self._allowed_servers = self._canonical_server_names(allowed_servers) if allowed_servers is not None else None
     self._builtin_tool_names = set(builtin_tool_names or set())
     self._inline_servers = dict(inline_servers or {})
-    if config_path is _UNSET:
-      self._config_path: Path | None = Path.home() / ".claude.json"
-    elif config_path is None:
-      self._config_path = None
-    else:
-      self._config_path = Path(config_path).expanduser()
+    self._config_path = _resolve_mcp_config_path(config_path)
     self._timeout_overrides = {
       self._canonical_server_name(server_name): timeout
       for server_name, timeout in dict(timeout_overrides or {}).items()
@@ -201,7 +416,7 @@ class McpClientManager:
           continue
 
         server_type = str(server_config.get("type", "stdio")).strip().lower()
-        if server_type != "stdio":
+        if server_type not in _SUPPORTED_SERVER_TYPES:
           log.info("Skipping MCP server %s: unsupported type %s", server_name, server_type)
           continue
 
@@ -224,6 +439,14 @@ class McpClientManager:
       return None
 
   async def _connect(self, name: str, config: Dict[str, Any]) -> _ServerState:
+    server_type = str(config.get("type", "stdio")).strip().lower()
+    if server_type in _STREAMABLE_HTTP_TYPES:
+      return await self._connect_streamable_http(name, config)
+    if server_type == "stdio":
+      return await self._connect_stdio(name, config)
+    raise ValueError(f"unsupported type {server_type}")
+
+  async def _connect_stdio(self, name: str, config: Dict[str, Any]) -> _ServerState:
     exit_contexts: List[Any] = []
     success = False
     try:
@@ -255,43 +478,148 @@ class McpClientManager:
       await session.__aenter__()
       exit_contexts.append(session)
 
-      await asyncio.wait_for(session.initialize(), timeout=self._startup_timeout)
-
-      tools: List[Any] = []
-      cursor: str | None = None
-      while True:
-        listed = await asyncio.wait_for(
-          session.list_tools(cursor=cursor),
-          timeout=self._startup_timeout,
-        )
-        tools.extend(listed.tools or [])
-        if listed.nextCursor is None:
-          break
-        cursor = listed.nextCursor
-
-      tool_definitions: List[Dict[str, Any]] = []
-      for tool in tools:
-        input_schema = tool.inputSchema or {"type": "object", "properties": {}}
-        tool_definitions.append(
-          {
-            "name": tool.name,
-            "description": tool.description or "",
-            "input_schema": copy.deepcopy(input_schema),
-          }
-        )
-
-      success = True
-      return _ServerState(
+      state = await self._initialize_session_state(
         name=name,
         session=session,
         exit_contexts=exit_contexts,
-        tool_definitions=tool_definitions,
-        tool_names={tool["name"] for tool in tool_definitions},
         tool_prefix=tool_prefix,
       )
+      success = True
+      return state
     finally:
       if not success:
         await self._close_contexts(exit_contexts)
+
+  async def _connect_streamable_http(self, name: str, config: Dict[str, Any]) -> _ServerState:
+    if HTTPX_IMPORT_ERROR is not None:
+      raise RuntimeError(f"HTTP MCP transport unavailable: {HTTPX_IMPORT_ERROR}")
+    if STREAMABLE_HTTP_IMPORT_ERROR is not None or streamable_http_client is None:
+      raise RuntimeError(f"HTTP MCP transport unavailable: {STREAMABLE_HTTP_IMPORT_ERROR}")
+
+    exit_contexts: List[Any] = []
+    success = False
+    try:
+      url = str(config.get("url") or "").strip()
+      if not url:
+        raise ValueError("missing url")
+
+      headers_raw = config.get("headers")
+      headers = _build_http_headers(headers_raw if isinstance(headers_raw, dict) else None)
+      timeout_seconds = float(config.get("timeout", self._startup_timeout))
+      sse_read_timeout_seconds = float(config.get("sse_read_timeout", 300))
+      terminate_on_close = bool(config.get("terminate_on_close", True))
+      tool_prefix = str(config.get("tool_prefix", "") or "").strip()
+      auth = self._build_http_auth(name, url, config)
+
+      http_client = httpx.AsyncClient(
+        headers=headers,
+        timeout=httpx.Timeout(timeout_seconds, read=sse_read_timeout_seconds),
+        auth=auth,
+      )
+      await http_client.__aenter__()
+      exit_contexts.append(http_client)
+
+      stream_cm = streamable_http_client(
+        url,
+        http_client=http_client,
+        terminate_on_close=terminate_on_close,
+      )
+      read_stream, write_stream, _get_session_id = await stream_cm.__aenter__()
+      exit_contexts.append(stream_cm)
+
+      session = ClientSession(read_stream, write_stream)
+      await session.__aenter__()
+      exit_contexts.append(session)
+
+      state = await self._initialize_session_state(
+        name=name,
+        session=session,
+        exit_contexts=exit_contexts,
+        tool_prefix=tool_prefix,
+      )
+      success = True
+      return state
+    finally:
+      if not success:
+        await self._close_contexts(exit_contexts)
+
+  def _build_http_auth(self, name: str, url: str, config: Dict[str, Any]) -> Any | None:
+    oauth_raw = config.get("oauth")
+    if not oauth_raw:
+      return None
+    if FASTMCP_OAUTH_IMPORT_ERROR is not None or FastMCPOAuth is None:
+      raise RuntimeError(f"OAuth MCP transport unavailable: {FASTMCP_OAUTH_IMPORT_ERROR}")
+    if oauth_raw is True:
+      oauth_config: dict[str, Any] = {}
+    elif isinstance(oauth_raw, dict):
+      oauth_config = dict(oauth_raw)
+    else:
+      raise ValueError("oauth must be true or an object")
+
+    cache_path = oauth_config.get("cache_path")
+    if cache_path is None:
+      cache_dir = Path(
+        os.environ.get(
+          "AGENT_GATEWAY_MCP_OAUTH_CACHE_DIR",
+          str(Path.home() / ".cache" / "agent-gateway" / "mcp-oauth"),
+        )
+      )
+      cache_path = cache_dir / f"{_safe_cache_name(name)}.json"
+    storage = _JsonFileKeyValue(Path(str(cache_path)).expanduser())
+    scopes = oauth_config.get("scopes")
+    callback_port = oauth_config.get("callback_port")
+    return FastMCPOAuth(
+      mcp_url=url,
+      scopes=scopes,
+      client_name=str(oauth_config.get("client_name") or f"agent-gateway:{name}"),
+      token_storage=storage,
+      callback_port=int(callback_port) if callback_port is not None else None,
+      client_metadata_url=oauth_config.get("client_metadata_url"),
+      client_id=oauth_config.get("client_id"),
+      client_secret=oauth_config.get("client_secret"),
+    )
+
+  async def _initialize_session_state(
+    self,
+    *,
+    name: str,
+    session: ClientSession,
+    exit_contexts: List[Any],
+    tool_prefix: str,
+  ) -> _ServerState:
+    await asyncio.wait_for(session.initialize(), timeout=self._startup_timeout)
+
+    tools: List[Any] = []
+    cursor: str | None = None
+    while True:
+      listed = await asyncio.wait_for(
+        session.list_tools(cursor=cursor),
+        timeout=self._startup_timeout,
+      )
+      tools.extend(listed.tools or [])
+      if listed.nextCursor is None:
+        break
+      cursor = listed.nextCursor
+
+    tool_definitions: List[Dict[str, Any]] = []
+    for tool in tools:
+      input_schema = tool.inputSchema or {"type": "object", "properties": {}}
+      tool_definitions.append(
+        {
+          "name": tool.name,
+          "description": tool.description or "",
+          "input_schema": copy.deepcopy(input_schema),
+        }
+      )
+
+    return _ServerState(
+      name=name,
+      session=session,
+      exit_contexts=exit_contexts,
+      tool_definitions=tool_definitions,
+      tool_names={tool["name"] for tool in tool_definitions},
+      tool_prefix=tool_prefix,
+    )
 
   def get_tool_definitions(self) -> List[Dict[str, Any]]:
     return copy.deepcopy(self._tool_definitions)
@@ -511,11 +839,24 @@ class McpClientManager:
     return "\n".join(chunks).strip()
 
   @staticmethod
-  async def _close_contexts(contexts: List[Any]) -> None:
+  async def _close_contexts(
+    contexts: List[Any],
+    *,
+    close_timeout_seconds: float = _MCP_CLOSE_TIMEOUT_SECONDS,
+  ) -> None:
     while contexts:
       ctx = contexts.pop()
       try:
-        await ctx.__aexit__(None, None, None)
+        with _suppress_mcp_stdio_termination_fallback_warnings():
+          await asyncio.wait_for(
+            ctx.__aexit__(None, None, None),
+            timeout=close_timeout_seconds,
+          )
+      except asyncio.TimeoutError:
+        log.warning(
+          "MCP context close timed out after %.1fs; continuing shutdown",
+          close_timeout_seconds,
+        )
       except Exception as exc:
         log.debug("MCP context close failed: %s", exc)
 

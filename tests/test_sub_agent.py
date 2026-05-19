@@ -192,6 +192,7 @@ def test_make_run_agent_handler_copies_user_id_and_auth_config_to_sub_session() 
     created_at=1,
     expires_at=2,
     user_id="alice",
+    user_email="alice@example.com",
     auth_config=parent_auth_config,
   )
   handler = make_run_agent_handler(
@@ -208,7 +209,41 @@ def test_make_run_agent_handler_copies_user_id_and_auth_config_to_sub_session() 
   assert result == {"response": "ok"}
   sub_session = runner.calls[0]["sub_session"]
   assert sub_session.user_id == "alice"
+  assert sub_session.user_email == "alice@example.com"
   assert sub_session.auth_config is parent_auth_config
+
+
+def test_make_run_agent_handler_accepts_parent_identity_kwargs() -> None:
+  runner = _StubRunner()
+  parent_session = GatewaySession(
+    session_id="sess_parent",
+    api_key_hash="hash",
+    created_at=1,
+    expires_at=2,
+    user_id="operator",
+    user_email="operator@example.com",
+    auth_config={"provider": "anthropic", "billing_mode": "byok", "api_key": "key"},
+  )
+  handler = make_run_agent_handler(
+    [runner],
+    parent_session=parent_session,
+    skill_loader=None,
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+    user_id="operator",
+    user_email="operator@example.com",
+    parent_user_id="alice",
+    parent_user_email="alice@example.com",
+  )
+
+  result, error = _run(handler({"task": "Collect"}))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  assert runner.calls[0]["dispatcher"]._user_id == "alice"
+  sub_session = runner.calls[0]["sub_session"]
+  assert sub_session.user_id == "alice"
+  assert sub_session.user_email == "alice@example.com"
 
 
 def test_make_run_agent_handler_forwards_parent_turn_id_from_tool_context() -> None:
