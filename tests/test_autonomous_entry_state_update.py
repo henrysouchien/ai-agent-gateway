@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
   sys.path.insert(0, str(ROOT))
@@ -16,6 +18,12 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import AgentSessionLog, EventLog
 from api.agent.autonomous import entry as autonomous_entry
+
+
+@pytest.fixture(autouse=True)
+def _autonomous_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setenv("AUTONOMOUS_USER_ID", "henry")
+  monkeypatch.setenv("AUTONOMOUS_USER_EMAIL", "hc@henrychien.com")
 
 
 def _run(coro):

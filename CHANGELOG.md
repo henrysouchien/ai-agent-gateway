@@ -4,7 +4,44 @@
 
 ### Added
 
-- Theme A: return resolved_user_id from /chat/init
+- **Typed event contract for skill-framework runs.** New module
+  `agent_gateway.events` exports `SkillRunStartedEvent`, `VerdictEmittedEvent`,
+  `ArtifactReadyEvent`, `AggregateReadyEvent`, `ArtifactFailedEvent`, and
+  `ArtifactUnavailableEvent`. All carry `run_id` correlation except
+  `ArtifactUnavailableEvent` (renderer-side only, no skill run). Re-exported
+  from `agent_gateway` top-level. Spec:
+  `docs/design/demo-surface-spec.md` §2.3.
+- **Artifact read API.** Four new GET endpoints serving artifact JSON sidecars
+  and `.docx` binaries from per-user workspace storage:
+  - `/api/artifacts/{ticker}/{skill}/latest`
+  - `/api/artifacts/{ticker}/{skill}/{artifact_id}`
+  - `/api/artifacts/{ticker}`
+  - `/api/letters/{ticker}/{artifact_id}`
+
+  Signed-claim auth (reuses the credentials-resolver verifier). Path safety:
+  rejects `..`-traversal (raw and URL-encoded), symlink escape, and
+  cross-user access (returns 404 not 403 to avoid info-leak). Read-only —
+  server-side materialization writes the files. Spec:
+  `docs/design/demo-surface-spec.md` §2.5.
+- **`/chat/init` now returns `user_id: str`** on `ChatInitResponse`, populated
+  from the credentials-resolver-resolved user_id. Lets consumers thread the
+  resolved identity onto subsequent `/chat` calls (fixes `cross_user_reuse`
+  for consumers that proxy chat). Spec:
+  `docs/design/theme-a-user-claim-spec.md` §4.
+
+### Changed
+
+- **BREAKING (CORS):** Default CORS `allow_headers` no longer includes
+  `X-MCP-Secret`. Consumers that relied on browser clients sending this
+  header must either re-add it in their own CORS config or migrate to JWT
+  auth via `/api/chat/init`.
+- Internal `code_execution` env-var denylist swapped from `EXCEL_MCP_SECRET`
+  to `EXCEL_MCP_API_KEY` + `ADDIN_DISPATCH_API_KEY` to match the new auth
+  model.
+
+### Docs
+
+- Polished gateway built-in tool docstrings.
 
 ## 0.14.1
 

@@ -56,6 +56,8 @@ def test_tool_defs_default_config_include_code_execution_tools() -> None:
     "code_execute",
     "code_execute_status",
   ]
+  assert "Discovery:" in bundle.tool_definitions[0]["description"]
+  assert "Common mistakes:" in bundle.tool_definitions[0]["description"]
   assert bundle.tool_definitions[0]["input_schema"]["properties"]["host"]["enum"] == [
     "auto",
     "subprocess",

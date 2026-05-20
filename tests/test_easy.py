@@ -401,7 +401,7 @@ def test_create_agent_no_credentials_constructs_and_streams_stub_response() -> N
   app = create_agent("test")
 
   with TestClient(app) as client:
-    init_response = client.post("/api/chat/init", json={"api_key": "any-key"})
+    init_response = client.post("/api/chat/init", json={"api_key": "any-key", "user_id": "test-user"})
     assert init_response.status_code == 200
     token = init_response.json()["session_token"]
 
@@ -430,7 +430,7 @@ def test_create_agent_valid_api_keys_and_jwt_secret() -> None:
 
   with TestClient(app) as client:
     assert client.post("/api/chat/init", json={"api_key": "bad"}).status_code == 401
-    assert client.post("/api/chat/init", json={"api_key": "k1"}).status_code == 200
+    assert client.post("/api/chat/init", json={"api_key": "k1", "user_id": "test-user"}).status_code == 200
 
 
 def test_create_agent_inline_mcp_uses_inline_only_config_and_builtin_filtering() -> None:

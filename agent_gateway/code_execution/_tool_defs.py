@@ -17,7 +17,15 @@ def make_code_execute_tool_def(
       "Execute Python code and return stdout, stderr, exit code, and any generated plots/images. "
       "Use for computation, data transformation, visualization, and analysis. "
       "Pre-installed: numpy, pandas, matplotlib, scipy. "
-      "The working directory persists across calls within a session."
+      "The working directory persists across calls within a session.\n\n"
+      "Discovery: use code_execute when you need arithmetic verification, data wrangling, chart "
+      "generation, or repeatable Python analysis. For long-running work, set background=true and "
+      "poll with code_execute_status.\n\n"
+      "Sibling tools: use code_execute_status for background progress or cancellation. Use run_bash "
+      "for non-Python shell commands and file tools for simple file inspection.\n\n"
+      "Common mistakes: do not fetch external data from arbitrary network APIs inside code_execute; "
+      "use MCP data tools first, then pass the data into Python. Do not use code_execute for shell "
+      "commands or filesystem edits when a narrower tool exists."
       f"{description_suffix}"
     ),
     "input_schema": {

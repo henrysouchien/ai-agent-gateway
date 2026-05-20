@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import datetime
+import re
+import secrets
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ._provider_utils import _get_allowed_models_for_provider_name
+from .events import SkillRunStartedEvent, VerdictEmittedEvent, event_to_dict
 from .event_log import EventLog
 from .runner import _derive_sub_agent_id
 from .session import GatewaySession
@@ -19,6 +23,7 @@ from .transcript import (
   reconstruct_messages_for_task,
   reconstruct_parent_messages,
 )
+from .verdict_extractor import extract_verdict_payload
 
 _DEFAULT_EXCLUDED_TOOLS = frozenset({"run_agent", "get_background_result", "send_message"})
 _SKILL_SYSTEM_PROMPT_TEMPLATE = (
@@ -45,6 +50,48 @@ _RESUME_AGENT_DESCRIPTION = (
   "Resume an interrupted background sub-agent. Only resumable skills can be resumed; "
   "check skill `resumable` flag in get_background_result response. Returns new task_id."
 )
+_CONTEXT_TICKER_RE = re.compile(r"\b([A-Z0-9]{1,6}(?:\.[A-Z]{1,2})?)\b")
+_TICKER_STOPWORDS = {
+  "THE",
+  "AND",
+  "FOR",
+  "NOT",
+  "ALL",
+  "HAS",
+  "ARE",
+  "WAS",
+  "USE",
+  "RUN",
+  "INC",
+  "LLC",
+  "LTD",
+  "PLC",
+  "ETF",
+  "USD",
+  "YOY",
+  "QOQ",
+  "EPS",
+  "FCF",
+  "CEO",
+  "CFO",
+  "COO",
+  "CTO",
+  "IPO",
+  "SEC",
+  "FY",
+  "TTM",
+  "BPS",
+  "NAV",
+  "GDP",
+  "CPI",
+  "PPI",
+  "FMP",
+  "EDGAR",
+  "MCP",
+  "API",
+  "SQL",
+  "CLI",
+}
 
 
 def _render_agent_param_description(entries: list[tuple[str, str]]) -> str:
@@ -54,6 +101,16 @@ def _render_agent_param_description(entries: list[tuple[str, str]]) -> str:
   lines = [base, "", "Available agents:"]
   lines.extend(f"- {name}: {description}" for name, description in entries)
   return "\n".join(lines)
+
+
+def _extract_ticker_from_task(task: str) -> str:
+  for match in _CONTEXT_TICKER_RE.finditer(task):
+    candidate = match.group(1).strip().upper()
+    if candidate.startswith("20") or candidate.startswith("Q"):
+      continue
+    if candidate not in _TICKER_STOPWORDS:
+      return candidate
+  return ""
 
 
 def make_run_agent_handler(
@@ -126,6 +183,10 @@ def make_run_agent_handler(
     call_index = int(kwargs.get("call_index", 0) or 0)
 
     profile = None
+    context_ticker = ""
+    skill_run_id: str | None = None
+    skill_run_started_emitted = False
+    verdict_emitted = False
     if agent_name and skill_loader is not None:
       try:
         profile = skill_loader.load(agent_name)
@@ -138,6 +199,8 @@ def make_run_agent_handler(
           "code": "invalid_skill",
           "message": f"Agent '{agent_name}' is not callable. Choose a callable named agent or omit agent.",
         }
+      context_ticker = _extract_ticker_from_task(task)
+      skill_run_id = secrets.token_hex(16)
     elif agent_name and skill_loader is None:
       return None, {"code": "not_available", "message": "Named agents not available"}
 
@@ -247,6 +310,50 @@ def make_run_agent_handler(
       credentials_resolver_active=credentials_resolver_active,
     )
 
+    def _emit_parent_event(event: dict[str, Any]) -> None:
+      emit = getattr(tool_ctx, "emit", None)
+      if callable(emit):
+        emit(event)
+
+    def _emit_skill_run_started() -> None:
+      nonlocal skill_run_started_emitted
+      if skill_run_started_emitted or not (skill_run_id and profile is not None and agent_name):
+        return
+      _emit_parent_event(
+        event_to_dict(
+          SkillRunStartedEvent(
+            skill_run_id=skill_run_id,
+            skill=profile.name,
+            ticker=context_ticker,
+            ts=time.time(),
+          )
+        )
+      )
+      skill_run_started_emitted = True
+
+    def _emit_verdict_if_present() -> None:
+      nonlocal verdict_emitted
+      if verdict_emitted or not (skill_run_id and profile is not None and agent_name):
+        return
+      verdict = extract_verdict_payload(sub_log.entries)
+      if verdict is None:
+        return
+      _emit_parent_event(
+        event_to_dict(
+          VerdictEmittedEvent(
+            skill_run_id=skill_run_id,
+            skill=profile.name,
+            ticker=context_ticker,
+            verdict_token=verdict.verdict_token,
+            confidence=verdict.confidence,
+            materiality_cushion=verdict.materiality_cushion,
+            one_line_summary=verdict.one_line_summary,
+            ts=time.time(),
+          )
+        )
+      )
+      verdict_emitted = True
+
     async def _dispatch_sub_agent(_background_input: dict[str, Any], **background_kwargs: Any):
       background_call_index = int(background_kwargs.get("call_index", call_index) or 0)
       task_entry = background_kwargs.get("task_entry")
@@ -265,6 +372,7 @@ def make_run_agent_handler(
           channel=getattr(parent_session, "channel", None),
           is_public=getattr(parent_session, "is_public", False),
         )
+      _emit_skill_run_started()
       return await runner.spawn_sub_agent(
         task,
         provider=resolved.provider if resolved else None,
@@ -305,15 +413,23 @@ def make_run_agent_handler(
           }
       elif profile is not None:
         enriched_tool_input["resumable"] = profile.resumable
+
+      async def _on_background_complete(bg_task: Any) -> None:
+        _emit_verdict_if_present()
+        if on_background_complete is not None:
+          await on_background_complete(bg_task)
+
       return await runner._register_background_task(
         tool_input=enriched_tool_input,
         handler=_dispatch_sub_agent,
         agent_name=agent_name,
         parent_turn_id=parent_turn_id,
         on_before_start=(lambda: on_before_background(agent_name)) if on_before_background else None,
-        on_complete=on_background_complete,
+        on_complete=_on_background_complete if (skill_run_id or on_background_complete) else None,
       )
-    return await _dispatch_sub_agent(tool_input, call_index=call_index)
+    result, error = await _dispatch_sub_agent(tool_input, call_index=call_index)
+    _emit_verdict_if_present()
+    return result, error
 
   return _handle_run_agent
 

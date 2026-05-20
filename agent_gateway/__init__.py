@@ -47,6 +47,17 @@ from .code_execution import (
 )
 from .compaction import SummaryFn, generate_and_append_summary
 from .context_builder import Message, SessionContextBuilder
+from .events import (
+  AggregateReadyEvent,
+  AggregateReadyTrigger,
+  ArtifactFailedEvent,
+  ArtifactReadyEvent,
+  ArtifactUnavailableEvent,
+  SkillRunStartedEvent,
+  VerdictEmittedEvent,
+  event_from_dict,
+  event_to_dict,
+)
 from .event_log import EventLog, LogEntry as EventLogEntry
 from .heartbeat import HeartbeatConfig, HeartbeatLoop, TickResult, strip_heartbeat_ok
 from .easy import create_agent
@@ -123,9 +134,14 @@ __all__ = [
   "AgentSDKRunner",
   "AgentSessionLog",
   "AgentSessionRef",
+  "AggregateReadyEvent",
+  "AggregateReadyTrigger",
   "ApprovalDecision",
   "ApprovalRequest",
   "AnthropicProvider",
+  "ArtifactFailedEvent",
+  "ArtifactReadyEvent",
+  "ArtifactUnavailableEvent",
   "AuthConfig",
   "AuthManager",
   "AuthExpiredError",
@@ -192,6 +208,7 @@ __all__ = [
   "SkillLoader",
   "SkillProfile",
   "SkillStateStore",
+  "SkillRunStartedEvent",
   "StreamEvent",
   "SubAgentConfig",
   "SubprocessBackend",
@@ -215,6 +232,7 @@ __all__ = [
   "UsageEvent",
   "UsageLedger",
   "UsageTotal",
+  "VerdictEmittedEvent",
   "__version__",
   "normalize_identity",
   "UnknownModelError",
@@ -226,6 +244,8 @@ __all__ = [
   "create_agent",
   "create_gateway_app",
   "deliver",
+  "event_from_dict",
+  "event_to_dict",
   "_derive_sub_agent_id",
   "extract_state_update",
   "format_run_summary",

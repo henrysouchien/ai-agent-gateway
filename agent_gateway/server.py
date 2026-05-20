@@ -2,23 +2,35 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
+import hmac
 import inspect
 import json as json_mod
 import logging
 import math
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from ._provider_utils import _get_allowed_models_for_provider_name
+from .artifact_paths import (
+  ArtifactPath,
+  ArtifactPathError,
+  artifact_json_path_for_request,
+  latest_artifact_json_path_for_request,
+  letter_docx_path_for_request,
+  reject_unsafe_path,
+  ticker_artifact_index_for_request,
+)
 from .auth import (
   ChannelMismatchError,
   CredentialRefreshRequest,
@@ -46,6 +58,21 @@ ExecutionLocationResolver = Callable[[str], Optional[str]]
 BuildChatRuntime = Callable[[GatewaySession, "ChatRequest", Optional[str], AuthManager], Awaitable["ChatRuntime"]]
 RequestApproval = Callable[[ApprovalRequest], Awaitable[Optional[ApprovalDecision]]]
 BuildRunner = Callable[[EventLog, str], AgentRunner | AgentSDKRunner]
+
+_AGENT_API_CLAIM_AUDIENCE = "agent_api_v1"
+_AGENT_API_CLAIM_CLOCK_SKEW_SECONDS = 60
+_AGENT_API_CLAIM_NONCE_HEX_LENGTH = 32
+_AGENT_API_CLAIM_HEADERS = {
+  "audience": "X-Agent-Claim-Audience",
+  "issued_at": "X-Agent-Claim-Issued-At",
+  "expiry": "X-Agent-Claim-Expiry",
+  "user_id": "X-Agent-Claim-User-Id",
+  "user_email": "X-Agent-Claim-User-Email",
+  "nonce": "X-Agent-Claim-Nonce",
+  "signature": "X-Agent-Claim-Signature",
+}
+_AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT = 600
+_ARTIFACT_DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
 class ChatInitRequest(BaseModel):
@@ -239,7 +266,11 @@ class GatewayServerConfig:
   valid_api_keys: Set[str] = field(default_factory=set)
   cors_origins: List[str] = field(default_factory=lambda: ["http://localhost:3002"])
   cors_allow_headers: List[str] = field(
-    default_factory=lambda: ["Authorization", "Content-Type", "X-MCP-Secret"]
+    default_factory=lambda: [
+      "Authorization",
+      "Content-Type",
+      *_AGENT_API_CLAIM_HEADERS.values(),
+    ]
   )
   cors_allow_methods: List[str] = field(default_factory=lambda: ["GET", "POST", "OPTIONS"])
   auth_config: Dict[str, Any] = field(default_factory=dict)
@@ -307,6 +338,129 @@ def _sanitize_for_json(obj: Any) -> Any:
 def _json_dumps(payload: Dict[str, Any]) -> str:
   sanitized = _sanitize_for_json(payload)
   return JSONResponse(content=sanitized).body.decode("utf-8")
+
+
+def _claim_ttl_ceiling_seconds() -> int:
+  raw = os.getenv("AGENT_API_CLAIM_MAX_TTL_SECONDS", "").strip()
+  if not raw:
+    return _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT
+  try:
+    value = int(raw)
+  except ValueError:
+    return _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT
+  return value if value > 0 else _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT
+
+
+def _verify_signed_user_claim(request: Request) -> dict[str, Any]:
+  claim_headers = _extract_agent_claim_headers(request.headers)
+  if claim_headers is None:
+    raise HTTPException(status_code=401, detail="Signed user claim required")
+
+  hmac_key = os.getenv("AGENT_API_USER_CLAIM_HMAC_KEY", "").strip()
+  if not hmac_key:
+    raise HTTPException(
+      status_code=503,
+      detail="Agent API signed claim verifier not configured (AGENT_API_USER_CLAIM_HMAC_KEY not set)",
+    )
+
+  verified = _verify_agent_claim_headers(
+    hmac_key,
+    claim_headers,
+    ttl_ceiling=_claim_ttl_ceiling_seconds(),
+  )
+  if verified is None:
+    raise HTTPException(status_code=401, detail="Invalid signed user claim")
+  return verified
+
+
+def _extract_agent_claim_headers(headers: Mapping[str, Any]) -> dict[str, str] | None:
+  claim_headers: dict[str, str] = {}
+  for field_name, header_name in _AGENT_API_CLAIM_HEADERS.items():
+    value = headers.get(header_name)
+    if value is None:
+      return None
+    claim_headers[field_name] = str(value)
+  return claim_headers
+
+
+def _verify_agent_claim_headers(
+  hmac_key: str,
+  claim_headers: Mapping[str, str],
+  *,
+  ttl_ceiling: int,
+  now: int | None = None,
+) -> dict[str, Any] | None:
+  if claim_headers.get("audience") != _AGENT_API_CLAIM_AUDIENCE:
+    return None
+  try:
+    issued_at = int(claim_headers.get("issued_at", ""))
+    expiry = int(claim_headers.get("expiry", ""))
+  except (TypeError, ValueError):
+    return None
+
+  current_time = int(time.time()) if now is None else int(now)
+  if issued_at > current_time + _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS:
+    return None
+  if current_time > expiry:
+    return None
+  if expiry - issued_at > ttl_ceiling:
+    return None
+
+  user_id = str(claim_headers.get("user_id") or "")
+  user_email = str(claim_headers.get("user_email") or "")
+  nonce = str(claim_headers.get("nonce") or "")
+  signature = str(claim_headers.get("signature") or "")
+  if not user_id or not user_email:
+    return None
+  if len(nonce) != _AGENT_API_CLAIM_NONCE_HEX_LENGTH:
+    return None
+  try:
+    bytes.fromhex(nonce)
+  except ValueError:
+    return None
+
+  canonical = f"{_AGENT_API_CLAIM_AUDIENCE}\n{issued_at}\n{expiry}\n{user_id}\n{user_email}\n{nonce}".encode("utf-8")
+  expected = hmac.new(hmac_key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+  if not hmac.compare_digest(expected, signature):
+    return None
+  return {
+    **dict(claim_headers),
+    "issued_at": issued_at,
+    "expiry": expiry,
+    "user_id": user_id,
+    "user_email": user_email,
+  }
+
+
+def _artifact_json_response(artifact: ArtifactPath) -> JSONResponse:
+  path = _assert_artifact_path_still_safe(artifact)
+  if not path.is_file():
+    raise HTTPException(status_code=404, detail="Artifact not found")
+  with path.open("r", encoding="utf-8") as handle:
+    payload = json_mod.load(handle)
+  return JSONResponse(content=payload, headers=_file_cache_headers(path))
+
+
+def _assert_artifact_path_still_safe(artifact: ArtifactPath) -> Path:
+  try:
+    resolved = artifact.path.resolve()
+    resolved.relative_to(artifact.workspace_root.resolve())
+  except ValueError as exc:
+    raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
+  return resolved
+
+
+def _file_cache_headers(path: Path) -> dict[str, str]:
+  stat = path.stat()
+  return {
+    "Cache-Control": "private, max-age=0",
+    "ETag": f'W/"{stat.st_mtime_ns:x}-{stat.st_size:x}"',
+  }
+
+
+def _letter_filename(ticker: str, artifact_id: str) -> str:
+  date = artifact_id[:10] if len(artifact_id) >= 10 else artifact_id
+  return f"LP-letter-{ticker}-{date}.docx"
 
 
 def _normalize_request_user_id(user_id: str | None) -> str | None:
@@ -866,6 +1020,88 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
     return StreamingResponse(event_generator(), headers=headers, background=BackgroundTask(response_cleanup))
 
+  @router.get("/artifacts/{ticker}/{skill}/latest")
+  async def artifact_latest(request: Request, ticker: str, skill: str) -> JSONResponse:
+    claim = _verify_signed_user_claim(request)
+    try:
+      artifact = latest_artifact_json_path_for_request(
+        str(claim["user_id"]),
+        ticker=ticker,
+        skill=skill,
+      )
+    except ArtifactPathError as exc:
+      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
+    if artifact is None:
+      raise HTTPException(status_code=404, detail="Artifact not found")
+    return _artifact_json_response(artifact)
+
+  @router.get("/artifacts/{ticker}/{skill}/{artifact_id}")
+  async def artifact_by_id(
+    request: Request,
+    ticker: str,
+    skill: str,
+    artifact_id: str,
+  ) -> JSONResponse:
+    claim = _verify_signed_user_claim(request)
+    try:
+      artifact = artifact_json_path_for_request(
+        str(claim["user_id"]),
+        ticker=ticker,
+        skill=skill,
+        artifact_id=artifact_id,
+      )
+    except ArtifactPathError as exc:
+      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
+    return _artifact_json_response(artifact)
+
+  @router.get("/artifacts/{ticker}")
+  async def artifact_index(request: Request, ticker: str) -> JSONResponse:
+    claim = _verify_signed_user_claim(request)
+    try:
+      index = ticker_artifact_index_for_request(str(claim["user_id"]), ticker=ticker)
+    except ArtifactPathError as exc:
+      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
+    return JSONResponse(content=index)
+
+  @router.get("/letters/{ticker}/{artifact_id}")
+  async def letter_by_id(request: Request, ticker: str, artifact_id: str) -> FileResponse:
+    claim = _verify_signed_user_claim(request)
+    try:
+      artifact = letter_docx_path_for_request(
+        str(claim["user_id"]),
+        ticker=ticker,
+        artifact_id=artifact_id,
+      )
+    except ArtifactPathError as exc:
+      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
+
+    path = _assert_artifact_path_still_safe(artifact)
+    if not path.is_file():
+      raise HTTPException(status_code=404, detail="Letter artifact not found")
+    headers = _file_cache_headers(path)
+    headers["Content-Disposition"] = (
+      f'attachment; filename="{_letter_filename(artifact.ticker, artifact.artifact_id or artifact_id)}"'
+    )
+    return FileResponse(path, media_type=_ARTIFACT_DOCX_MEDIA_TYPE, headers=headers)
+
+  @router.get("/artifacts/{artifact_path:path}")
+  async def artifact_path_guard(request: Request, artifact_path: str) -> JSONResponse:
+    _verify_signed_user_claim(request)
+    try:
+      reject_unsafe_path(artifact_path)
+    except ArtifactPathError as exc:
+      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
+    raise HTTPException(status_code=404, detail="Artifact not found")
+
+  @router.get("/letters/{letter_path:path}")
+  async def letter_path_guard(request: Request, letter_path: str) -> JSONResponse:
+    _verify_signed_user_claim(request)
+    try:
+      reject_unsafe_path(letter_path)
+    except ArtifactPathError as exc:
+      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
+    raise HTTPException(status_code=404, detail="Letter artifact not found")
+
   @router.post("/chat/tool-result")
   async def tool_result(request: Request, payload: ToolResultRequest) -> JSONResponse:
     token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
@@ -946,6 +1182,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   app.include_router(router)
   app.state.gateway_chat_init = chat_init
   app.state.gateway_chat_stream = chat_stream
+  app.state.gateway_artifact_latest = artifact_latest
+  app.state.gateway_artifact_by_id = artifact_by_id
+  app.state.gateway_artifact_index = artifact_index
+  app.state.gateway_letter_by_id = letter_by_id
   app.state.gateway_tool_result = tool_result
   app.state.gateway_tool_approval = tool_approval
   app.state.gateway_health = health

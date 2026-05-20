@@ -102,6 +102,12 @@ def make_test_app():
           if provider is None:
             raise ValueError("provider is required when runner_class is AgentRunner")
 
+          session_auth_config = session.auth_config or resolved_auth_config
+          kwargs.setdefault("user_id", session.user_id)
+          kwargs.setdefault("billing_mode", str(session_auth_config.get("billing_mode") or "byok"))
+          kwargs.setdefault("rate_table_version", str(session_auth_config.get("rate_table_version") or "unknown"))
+          kwargs.setdefault("channel", session.channel)
+
           if dispatcher is None:
             dispatcher_obj = ToolDispatcher(
               mcp_client=_NullMcpClient(),
@@ -119,7 +125,7 @@ def make_test_app():
             dispatcher=dispatcher_obj,
             session_id=session_id,
             provider=provider,
-            auth_config=session.auth_config or resolved_auth_config,
+            auth_config=session_auth_config,
             get_tool_definitions=lambda: list(resolved_tool_definitions),
             per_turn_timeout=per_turn_timeout,
             stream_stall_timeout=stream_stall_timeout,
