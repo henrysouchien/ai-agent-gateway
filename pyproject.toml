@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-agent-gateway"
-version = "0.15.0"
+version = "0.15.1"
 description = "Generic AI agent gateway with MCP tool support and streaming"
 readme = "README.md"
 license = "MIT"

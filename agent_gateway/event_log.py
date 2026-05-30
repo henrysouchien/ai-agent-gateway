@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 
 TERMINAL_EVENT_TYPES = {"stream_complete", "error"}
@@ -103,3 +104,241 @@ class EventLog:
   @property
   def closed(self) -> bool:
     return self._closed
+
+
+@dataclass(frozen=True)
+class _BusEvent:
+  event: Dict[str, Any]
+  timestamp: float
+
+
+@dataclass(eq=False)
+class _Subscriber:
+  user_id: str
+  control_run_id: str | None
+  max_queue_size: int
+  queue: Deque[_BusEvent]
+  updated: asyncio.Event
+  dropped_count: int = 0
+  oldest_dropped_ts: float | None = None
+  closed: bool = False
+
+  def matches(self, user_id: str, control_run_id: str) -> bool:
+    if self.user_id != user_id:
+      return False
+    if self.control_run_id is None:
+      return True
+    return self.control_run_id == control_run_id
+
+
+class _SubscriberClosed(Exception):
+  pass
+
+
+class UserEventBus:
+  """Per-user in-process event bus with bounded per-run replay."""
+
+  def __init__(
+    self,
+    *,
+    subscriber_queue_max: int = 1000,
+    replay_buffer_max: int = 5000,
+  ):
+    if subscriber_queue_max < 1:
+      raise ValueError("subscriber_queue_max must be positive")
+    if replay_buffer_max < 1:
+      raise ValueError("replay_buffer_max must be positive")
+
+    self._subscriber_queue_max = subscriber_queue_max
+    self._replay_buffer_max = replay_buffer_max
+    self._cleanup_delay_seconds = 60.0
+    self._lock = asyncio.Lock()
+    self._subscribers: Dict[str, Set[_Subscriber]] = {}
+    self._replay_buffers: Dict[Tuple[str, str], Deque[_BusEvent]] = {}
+    self._cleanup_tasks: Dict[Tuple[str, str], asyncio.Task[None]] = {}
+    self._terminated_runs: Set[Tuple[str, str]] = set()
+    self._shutdown = False
+
+  async def publish(self, user_id: str, control_run_id: str, event: dict) -> None:
+    """Publish an event tagged with user_id + control_run_id."""
+    normalized_user_id = str(user_id)
+    normalized_run_id = str(control_run_id)
+    entry = _BusEvent(event=dict(event), timestamp=time.time())
+    key = (normalized_user_id, normalized_run_id)
+
+    async with self._lock:
+      if self._shutdown:
+        return
+
+      replay_buffer = self._replay_buffers.get(key)
+      if replay_buffer is None:
+        replay_buffer = deque(maxlen=self._replay_buffer_max)
+        self._replay_buffers[key] = replay_buffer
+      replay_buffer.append(entry)
+
+      for subscriber in list(self._subscribers.get(normalized_user_id, ())):
+        if not subscriber.matches(normalized_user_id, normalized_run_id):
+          continue
+        self._enqueue_for_subscriber(subscriber, entry)
+
+  def subscribe(
+    self,
+    user_id: str,
+    *,
+    control_run_id: str | None = None,
+  ) -> AsyncIterator[dict]:
+    """Subscribe to this user's events, optionally scoped to one run."""
+
+    async def _iterator() -> AsyncIterator[dict]:
+      subscriber = _Subscriber(
+        user_id=str(user_id),
+        control_run_id=str(control_run_id) if control_run_id is not None else None,
+        max_queue_size=self._subscriber_queue_max,
+        queue=deque(),
+        updated=asyncio.Event(),
+      )
+      replay_events: List[_BusEvent] = []
+      async with self._lock:
+        if self._shutdown:
+          return
+        self._register_subscriber_locked(subscriber)
+        if subscriber.control_run_id is None:
+          self._cancel_user_cleanup_locked(subscriber.user_id)
+        else:
+          self._cancel_cleanup_locked((subscriber.user_id, subscriber.control_run_id))
+          replay_events = list(self._replay_buffers.get((subscriber.user_id, subscriber.control_run_id), ()))
+
+      try:
+        for entry in replay_events:
+          yield dict(entry.event)
+
+        while True:
+          try:
+            event = await self._next_event(subscriber)
+          except _SubscriberClosed:
+            return
+          yield event
+      finally:
+        await asyncio.shield(self._unsubscribe(subscriber))
+
+    return _iterator()
+
+  async def cleanup_run(self, user_id: str, control_run_id: str) -> None:
+    """Schedule deferred per-run replay-buffer cleanup."""
+    key = (str(user_id), str(control_run_id))
+    async with self._lock:
+      if self._shutdown:
+        return
+      self._terminated_runs.add(key)
+      self._schedule_cleanup_locked(key)
+
+  async def shutdown(self) -> None:
+    """Close subscribers and cancel deferred cleanup tasks."""
+    async with self._lock:
+      if self._shutdown:
+        return
+      self._shutdown = True
+      cleanup_tasks = list(self._cleanup_tasks.values())
+      self._cleanup_tasks.clear()
+      for task in cleanup_tasks:
+        task.cancel()
+      for subscribers in self._subscribers.values():
+        for subscriber in subscribers:
+          subscriber.closed = True
+          subscriber.updated.set()
+      self._subscribers.clear()
+      self._terminated_runs.clear()
+      self._replay_buffers.clear()
+
+    if cleanup_tasks:
+      await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+  def _register_subscriber_locked(self, subscriber: _Subscriber) -> None:
+    subscribers = self._subscribers.setdefault(subscriber.user_id, set())
+    subscribers.add(subscriber)
+
+  async def _unsubscribe(self, subscriber: _Subscriber) -> None:
+    async with self._lock:
+      subscriber.closed = True
+      subscriber.updated.set()
+      subscribers = self._subscribers.get(subscriber.user_id)
+      if subscribers is not None:
+        subscribers.discard(subscriber)
+        if not subscribers:
+          self._subscribers.pop(subscriber.user_id, None)
+      if self._shutdown:
+        return
+
+      for key in list(self._terminated_runs):
+        if key[0] != subscriber.user_id:
+          continue
+        if subscriber.control_run_id is not None and key[1] != subscriber.control_run_id:
+          continue
+        self._schedule_cleanup_locked(key)
+
+  async def _next_event(self, subscriber: _Subscriber) -> dict:
+    while True:
+      async with self._lock:
+        if subscriber.dropped_count:
+          sentinel = {
+            "type": "events_dropped",
+            "count": subscriber.dropped_count,
+            "oldest_ts": subscriber.oldest_dropped_ts,
+          }
+          subscriber.dropped_count = 0
+          subscriber.oldest_dropped_ts = None
+          return sentinel
+        if subscriber.queue:
+          return dict(subscriber.queue.popleft().event)
+        if subscriber.closed or self._shutdown:
+          raise _SubscriberClosed()
+        subscriber.updated.clear()
+      await subscriber.updated.wait()
+
+  def _enqueue_for_subscriber(self, subscriber: _Subscriber, entry: _BusEvent) -> None:
+    if len(subscriber.queue) >= subscriber.max_queue_size:
+      dropped = subscriber.queue.popleft()
+      subscriber.dropped_count += 1
+      if subscriber.oldest_dropped_ts is None:
+        subscriber.oldest_dropped_ts = dropped.timestamp
+    subscriber.queue.append(entry)
+    subscriber.updated.set()
+
+  def _schedule_cleanup_locked(self, key: Tuple[str, str]) -> None:
+    if self._has_matching_subscriber_locked(key):
+      return
+    task = self._cleanup_tasks.get(key)
+    if task is not None and not task.done():
+      return
+    self._cleanup_tasks[key] = asyncio.create_task(self._deferred_cleanup(key))
+
+  async def _deferred_cleanup(self, key: Tuple[str, str]) -> None:
+    try:
+      await asyncio.sleep(self._cleanup_delay_seconds)
+      async with self._lock:
+        if self._cleanup_tasks.get(key) is not asyncio.current_task():
+          return
+        if self._has_matching_subscriber_locked(key):
+          return
+        self._replay_buffers.pop(key, None)
+        self._terminated_runs.discard(key)
+        self._cleanup_tasks.pop(key, None)
+    except asyncio.CancelledError:
+      raise
+
+  def _has_matching_subscriber_locked(self, key: Tuple[str, str]) -> bool:
+    user_id, control_run_id = key
+    return any(
+      subscriber.matches(user_id, control_run_id)
+      for subscriber in self._subscribers.get(user_id, ())
+    )
+
+  def _cancel_user_cleanup_locked(self, user_id: str) -> None:
+    for key in list(self._cleanup_tasks):
+      if key[0] == user_id:
+        self._cancel_cleanup_locked(key)
+
+  def _cancel_cleanup_locked(self, key: Tuple[str, str]) -> None:
+    task = self._cleanup_tasks.pop(key, None)
+    if task is not None:
+      task.cancel()

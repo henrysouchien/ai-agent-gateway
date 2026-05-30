@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from .agent_session_log import AgentSessionLog, LogEntry
+from .product_config import gateway_product_id
 from .providers import ModelProvider, ThinkingLevel
 
 
@@ -35,6 +36,17 @@ _SUMMARY_BULK_KEYS = {
   "tables",
   "text",
 }
+
+
+def _redact_tool_input_for_summary(tool_name: str, tool_input: Any) -> Any:
+  if not isinstance(tool_input, dict):
+    return tool_input
+  try:
+    from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
+
+    return redact_tool_input(tool_name, tool_input, deployment_secret=get_audit_hmac_secret())
+  except Exception:
+    return dict(tool_input)
 
 
 @dataclass(frozen=True)
@@ -115,7 +127,7 @@ def _flatten_content_blocks(content_blocks: Any) -> str:
       continue
     if block_type in {"tool_use", "server_tool_use"}:
       name = str(block.get("name") or "tool")
-      tool_input = _stringify(_compact_for_summary(block.get("input")))
+      tool_input = _stringify(_compact_for_summary(_redact_tool_input_for_summary(name, block.get("input"))))
       parts.append(f"[tool_use] {name} input={tool_input}")
       continue
     if block_type == "compaction":
@@ -153,7 +165,7 @@ def _format_entry_for_summary(entry: LogEntry) -> str | None:
   if event_type == "tool_call_start":
     tool_name = str(event.get("tool_name") or "tool")
     tool_call_id = str(event.get("tool_call_id") or "")
-    tool_input = _stringify(_compact_for_summary(event.get("tool_input")))
+    tool_input = _stringify(_compact_for_summary(_redact_tool_input_for_summary(tool_name, event.get("tool_input"))))
     return f"{prefix} tool={tool_name} tool_call_id={tool_call_id} input={tool_input}"
 
   if event_type == "tool_call_complete":
@@ -400,18 +412,20 @@ async def generate_and_append_summary(
     LOGGER.warning("Session summary generation returned empty text for %s seq=%d..%d", log.path, from_seq, to_seq)
     return None
 
-  return await log.append(
-    {
-      "type": "summary",
-      "covers": {"from_seq": from_seq, "to_seq": prompt_slice.covered_to_seq},
-      "summary_kind": "cumulative",
-      "text": generated_summary_text,
-      "source_model": model,
-      "token_estimate": max(1, len(generated_summary_text) // 4),
-      "generated_at": time.time(),
-      "supersedes_seq": prior_summary.seq if prior_summary is not None else None,
-    }
-  )
+  event = {
+    "type": "summary",
+    "covers": {"from_seq": from_seq, "to_seq": prompt_slice.covered_to_seq},
+    "summary_kind": "cumulative",
+    "text": generated_summary_text,
+    "source_model": model,
+    "token_estimate": max(1, len(generated_summary_text) // 4),
+    "generated_at": time.time(),
+    "supersedes_seq": prior_summary.seq if prior_summary is not None else None,
+  }
+  pid = gateway_product_id()
+  if pid is not None:
+    event["product_id"] = pid
+  return await log.append(event)
 
 
 __all__ = ["SummaryFn", "generate_and_append_summary"]

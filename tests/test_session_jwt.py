@@ -24,6 +24,7 @@ def test_session_channel_fields_and_jwt_round_trip_new_claims() -> None:
 
   assert session.channel is None
   assert session.is_public is False
+  assert session.kind == "chat"
 
   session.channel = "public"
   session.is_public = True
@@ -43,6 +44,24 @@ def test_session_channel_fields_and_jwt_round_trip_new_claims() -> None:
   assert claims["is_public"] is True
   assert session.channel == "public"
   assert session.is_public is True
+
+
+def test_session_store_ttl_override_and_kind_are_store_only() -> None:
+  store = SessionStore(ttl=3600)
+  auth = AuthManager(secret="jwt-secret", valid_keys={"gateway-key"}, session_store=store)
+  session = store.create_session(
+    api_key_hash="hash",
+    user_id="alice",
+    kind="control",
+    ttl_seconds=900,
+  )
+
+  token = auth.issue_token(session)
+  claims = jwt.decode(token, "jwt-secret", algorithms=[JWT_ALGORITHM])
+
+  assert session.kind == "control"
+  assert session.expires_at == session.created_at + 900
+  assert "kind" not in claims
 
 
 def test_old_jwt_without_channel_claims_still_validates_with_defaults() -> None:

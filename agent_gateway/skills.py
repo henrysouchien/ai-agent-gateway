@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,6 +13,12 @@ log = logging.getLogger("agent_gateway.skills")
 _FRONTMATTER_DELIMITER = "---"
 AGENT_DESCRIPTION_MAX_CHARS = 240
 AGENT_DESCRIPTION_PLACEHOLDER = "(no description)"
+SKILL_STATE_CLASSES = frozenset({
+  "producer",
+  "advisor-with-decision-log",
+  "advisor-no-state",
+  "deprecated",
+})
 
 
 @dataclass
@@ -36,10 +41,12 @@ class SkillProfile:
   interactive: bool = False
   metadata: dict[str, Any] | None = None
   mcp_servers: list[str] | None = None
+  mcp_tools: dict[str, list[str]] | None = None
   session_inject_servers: list[str] | None = None
   timeout_overrides: dict[str, int] | None = None
   state_dir: str | None = None
   max_budget_usd: float | None = None
+  max_tokens: int | None = None
   max_retries: int | None = None
   initial_message: str | None = None
   delivery_label: str | None = None
@@ -51,6 +58,7 @@ class SkillProfile:
   extra_excluded_tools: set[str] = field(default_factory=set)
   tool_packs_enabled: bool = True
   provider: str | None = None
+  state_class: str | None = None
 
 
 def _clean_string(value: Any) -> str | None:
@@ -148,6 +156,40 @@ def _coerce_optional_string_set(value: Any, *, field_name: str, path: Path) -> s
   return items
 
 
+def _coerce_optional_mcp_tools(
+  value: Any,
+  *,
+  field_name: str,
+  path: Path,
+) -> dict[str, list[str]] | None:
+  if value is None:
+    return None
+  if not isinstance(value, dict):
+    raise ValueError(f"{path}: '{field_name}' must be a mapping of server names to tool lists")
+
+  declared: dict[str, list[str]] = {}
+  for raw_server, raw_tools in value.items():
+    server_name = _clean_string(raw_server)
+    if server_name is None:
+      continue
+    tools = _coerce_optional_string_list(
+      raw_tools,
+      field_name=f"{field_name}.{server_name}",
+      path=path,
+    )
+    if not tools:
+      continue
+    deduped_tools: list[str] = []
+    seen: set[str] = set()
+    for tool_name in tools:
+      if tool_name in seen:
+        continue
+      seen.add(tool_name)
+      deduped_tools.append(tool_name)
+    declared[server_name] = deduped_tools
+  return declared or None
+
+
 def _coerce_optional_timeout_overrides(
   value: Any,
   *,
@@ -194,6 +236,16 @@ def _coerce_mode(value: Any, *, field_name: str, path: Path) -> str:
   return text
 
 
+def _coerce_optional_state_class(value: Any, *, field_name: str, path: Path) -> str | None:
+  text = _clean_string(value)
+  if text is None:
+    return None
+  if text not in SKILL_STATE_CLASSES:
+    allowed = ", ".join(sorted(SKILL_STATE_CLASSES))
+    raise ValueError(f"{path}: '{field_name}' must be one of: {allowed}")
+  return text
+
+
 def _split_frontmatter(text: str, *, path: Path) -> tuple[dict[str, Any], str]:
   lines = text.splitlines()
   if not lines or lines[0].strip() != _FRONTMATTER_DELIMITER:
@@ -236,6 +288,7 @@ def parse_skill_file(path: Path) -> SkillProfile:
   raw_resumable = frontmatter.pop("resumable", None)
   raw_resume_mcp_session_reset_ok = frontmatter.pop("resume_mcp_session_reset_ok", None)
   raw_mode = frontmatter.pop("mode", None)
+  raw_state_class = frontmatter.pop("state_class", None)
   raw_extra_excluded_tools = frontmatter.pop("extra_excluded_tools", None)
   raw_tool_packs_enabled = frontmatter.pop("tool_packs_enabled", None)
   raw_metadata = frontmatter.pop("metadata", None)
@@ -255,13 +308,20 @@ def parse_skill_file(path: Path) -> SkillProfile:
   raw_timeout_overrides = metadata.pop("timeout_overrides", None)
   raw_state_dir = metadata.pop("state_dir", None)
   raw_max_budget_usd = metadata.pop("max_budget_usd", None)
+  raw_max_tokens = metadata.pop("max_tokens", None)
   raw_max_retries = metadata.pop("max_retries", None)
   raw_initial_message = metadata.pop("initial_message", None)
   raw_delivery_label = metadata.pop("delivery_label", None)
+  raw_mcp_tools = metadata.pop("mcp_tools", None)
 
   coerced_mcp_servers = _coerce_optional_string_list(
     raw_mcp_servers,
     field_name="mcp_servers",
+    path=path,
+  )
+  coerced_mcp_tools = _coerce_optional_mcp_tools(
+    raw_mcp_tools,
+    field_name="mcp_tools",
     path=path,
   )
   coerced_session_inject_servers = _coerce_optional_string_list(
@@ -278,6 +338,11 @@ def parse_skill_file(path: Path) -> SkillProfile:
   coerced_max_budget_usd = _coerce_optional_float(
     raw_max_budget_usd,
     field_name="max_budget_usd",
+    path=path,
+  )
+  coerced_max_tokens = _coerce_optional_int(
+    raw_max_tokens,
+    field_name="max_tokens",
     path=path,
   )
   coerced_max_retries = _coerce_optional_int(
@@ -300,6 +365,11 @@ def parse_skill_file(path: Path) -> SkillProfile:
     path=path,
   )
   coerced_mode = _coerce_mode(raw_mode, field_name="mode", path=path)
+  coerced_state_class = _coerce_optional_state_class(
+    raw_state_class,
+    field_name="state_class",
+    path=path,
+  )
   coerced_extra_excluded_tools = _coerce_optional_string_set(
     raw_extra_excluded_tools,
     field_name="extra_excluded_tools",
@@ -317,6 +387,7 @@ def parse_skill_file(path: Path) -> SkillProfile:
 
   for key, coerced in [
     ("mcp_servers", coerced_mcp_servers),
+    ("mcp_tools", coerced_mcp_tools),
     ("session_inject_servers", coerced_session_inject_servers),
     ("timeout_overrides", coerced_timeout_overrides),
     ("state_dir", coerced_state_dir),
@@ -347,10 +418,12 @@ def parse_skill_file(path: Path) -> SkillProfile:
     interactive=_coerce_optional_bool(raw_interactive, field_name="interactive", path=path),
     metadata=metadata or None,
     mcp_servers=coerced_mcp_servers,
+    mcp_tools=coerced_mcp_tools,
     session_inject_servers=coerced_session_inject_servers,
     timeout_overrides=coerced_timeout_overrides,
     state_dir=coerced_state_dir,
     max_budget_usd=coerced_max_budget_usd,
+    max_tokens=coerced_max_tokens,
     max_retries=coerced_max_retries,
     initial_message=coerced_initial_message,
     delivery_label=coerced_delivery_label,
@@ -362,6 +435,7 @@ def parse_skill_file(path: Path) -> SkillProfile:
     extra_excluded_tools=coerced_extra_excluded_tools,
     tool_packs_enabled=coerced_tool_packs_enabled,
     provider=_clean_string(raw_provider),
+    state_class=coerced_state_class,
   )
 
 

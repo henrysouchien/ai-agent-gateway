@@ -17,6 +17,7 @@ from .base import ModelInfo, ModelProvider, StreamEvent, ThinkingLevel
 
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 JWT_CLAIM_PATH = "https://api.openai.com/auth"
+DEFAULT_INSTRUCTIONS = "Follow the user's instructions."
 _BETA_HEADER = "responses=experimental"
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _RETRYABLE_RE = re.compile(
@@ -36,6 +37,20 @@ _SURROGATE_RE = re.compile(r"[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udb
 
 
 _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
+  (
+    ("gpt-5.5",),
+    ModelInfo(
+      id="gpt-5.5",
+      provider="codex",
+      context_window=1_050_000,
+      max_output_tokens=128_000,
+      supports_thinking=True,
+      supports_vision=True,
+      input_cost_per_mtok=0.0,
+      output_cost_per_mtok=0.0,
+      cache_read_cost_per_mtok=0.0,
+    ),
+  ),
   (
     ("gpt-5.1",),
     ModelInfo(
@@ -282,7 +297,12 @@ def _map_reasoning_effort(level: ThinkingLevel) -> str | None:
 
 def _clamp_reasoning_effort(model_id: str, effort: str) -> str:
   identifier = model_id.rsplit("/", 1)[-1]
-  if (identifier.startswith("gpt-5.2") or identifier.startswith("gpt-5.3") or identifier.startswith("gpt-5.4")) and effort == "minimal":
+  if (
+    identifier.startswith("gpt-5.2")
+    or identifier.startswith("gpt-5.3")
+    or identifier.startswith("gpt-5.4")
+    or identifier.startswith("gpt-5.5")
+  ) and effort == "minimal":
     return "low"
   if identifier == "gpt-5.1-codex-mini":
     return "high" if effort == "high" else "medium"
@@ -833,11 +853,21 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
       call_id = str(item.get("call_id") or "")
       item_id = str(item.get("id") or "")
       tool_id = f"{call_id}|{item_id}" if item_id else call_id
+      try:
+        from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
+
+        redacted_tool_input = redact_tool_input(
+          str(item.get("name") or ""),
+          tool_input,
+          deployment_secret=get_audit_hmac_secret(),
+        )
+      except Exception:
+        redacted_tool_input = tool_input
       raw_block = {
         "type": "tool_use",
         "id": tool_id,
         "name": str(item.get("name") or ""),
-        "input": tool_input,
+        "input": redacted_tool_input,
       }
       state.current_block_type = None
       state.current_item = None
@@ -969,9 +999,8 @@ class CodexProvider(ModelProvider):
       "parallel_tool_calls": True,
     }
 
-    system_text = _system_prompt_text(system_prompt)
-    if system_prompt is not None:
-      params["instructions"] = _sanitize_surrogates(system_text)
+    system_text = _system_prompt_text(system_prompt).strip()
+    params["instructions"] = _sanitize_surrogates(system_text or DEFAULT_INSTRUCTIONS)
 
     session_id = str(kwargs.get("session_id") or kwargs.get("_session_id") or "")
     if session_id:
@@ -985,9 +1014,6 @@ class CodexProvider(ModelProvider):
     base_url = kwargs.get("base_url")
     if base_url:
       params["_endpoint_url"] = _resolve_codex_url(str(base_url))
-
-    if kwargs.get("temperature") is not None:
-      params["temperature"] = kwargs["temperature"]
 
     if tools:
       params["tools"] = _convert_tools(tools, strict=None)

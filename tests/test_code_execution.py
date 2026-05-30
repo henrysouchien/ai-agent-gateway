@@ -99,6 +99,27 @@ def test_code_execute_basic_execution_and_work_dir_persistence() -> None:
   asyncio.run(_run_test())
 
 
+def test_code_execute_preamble_defers_matplotlib_import() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+
+    result, error = await _dispatch_bundle_tool(
+      session,
+      bundle,
+      "code_execute",
+      {"code": 'import sys\nprint("matplotlib" in sys.modules)\nprint("matplotlib.pyplot" in sys.modules)'},
+    )
+
+    assert error is None
+    assert result is not None
+    assert result["stdout"] == "False\nFalse\n"
+    assert result["stderr"] == ""
+    assert result["return_code"] == 0
+
+  asyncio.run(_run_test())
+
+
 def test_code_execute_captures_images_and_extra_env(tmp_path: Path) -> None:
   async def _run_test() -> None:
     support_dir = tmp_path / "support"
@@ -199,84 +220,87 @@ def test_code_execute_background_status_and_cancel_flow() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
 
-    start_result, start_error = await _dispatch_bundle_tool(
-      session,
-      bundle,
-      "code_execute",
-      {
-        "code": (
-          "import time\n"
-          "print('started', flush=True)\n"
-          "time.sleep(0.5)\n"
-          "print('finished', flush=True)\n"
-        ),
-        "background": True,
-      },
-    )
+    try:
+      start_result, start_error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute",
+        {
+          "code": (
+            "import time\n"
+            "print('started', flush=True)\n"
+            "time.sleep(0.5)\n"
+            "print('finished', flush=True)\n"
+          ),
+          "background": True,
+        },
+      )
 
-    assert start_error is None
-    assert start_result is not None
-    assert start_result["status"] == "running"
-    task_id = start_result["task_id"]
+      assert start_error is None
+      assert start_result is not None
+      assert start_result["status"] == "running"
+      task_id = start_result["task_id"]
 
-    running_result = None
-    for _ in range(10):
-      await asyncio.sleep(0.05)
-      running_result, running_error = await _dispatch_bundle_tool(
+      running_result = None
+      for _ in range(10):
+        await asyncio.sleep(0.05)
+        running_result, running_error = await _dispatch_bundle_tool(
+          session,
+          bundle,
+          "code_execute_status",
+          {"task_id": task_id},
+        )
+        assert running_error is None
+        if running_result and "started" in running_result.get("stdout_tail", ""):
+          break
+      assert running_result is not None
+      assert running_result["status"] == "running"
+      assert "started" in running_result["stdout_tail"]
+
+      await asyncio.sleep(0.8)
+
+      complete_result, complete_error = await _dispatch_bundle_tool(
         session,
         bundle,
         "code_execute_status",
         {"task_id": task_id},
       )
-      assert running_error is None
-      if running_result and "started" in running_result.get("stdout_tail", ""):
-        break
-    assert running_result is not None
-    assert running_result["status"] == "running"
-    assert "started" in running_result["stdout_tail"]
+      assert complete_error is None
+      assert complete_result is not None
+      assert complete_result["stdout"] == "started\nfinished\n"
+      assert task_id not in session.background_tasks
 
-    await asyncio.sleep(0.8)
+      start_result, start_error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute",
+        {
+          "code": (
+            "import time\n"
+            "print('begin', flush=True)\n"
+            "time.sleep(30)\n"
+          ),
+          "background": True,
+        },
+      )
+      assert start_error is None
+      assert start_result is not None
+      cancel_task_id = start_result["task_id"]
+      task = session.background_tasks[cancel_task_id]
 
-    complete_result, complete_error = await _dispatch_bundle_tool(
-      session,
-      bundle,
-      "code_execute_status",
-      {"task_id": task_id},
-    )
-    assert complete_error is None
-    assert complete_result is not None
-    assert complete_result["stdout"] == "started\nfinished\n"
-    assert task_id not in session.background_tasks
+      cancel_result, cancel_error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute_status",
+        {"task_id": cancel_task_id, "cancel": True},
+      )
 
-    start_result, start_error = await _dispatch_bundle_tool(
-      session,
-      bundle,
-      "code_execute",
-      {
-        "code": (
-          "import time\n"
-          "print('begin', flush=True)\n"
-          "time.sleep(30)\n"
-        ),
-        "background": True,
-      },
-    )
-    assert start_error is None
-    assert start_result is not None
-    cancel_task_id = start_result["task_id"]
-    task = session.background_tasks[cancel_task_id]
-
-    cancel_result, cancel_error = await _dispatch_bundle_tool(
-      session,
-      bundle,
-      "code_execute_status",
-      {"task_id": cancel_task_id, "cancel": True},
-    )
-
-    assert cancel_error is None
-    assert cancel_result == {"status": "cancelled", "task_id": cancel_task_id}
-    assert cancel_task_id not in session.background_tasks
-    assert task.handle._backend_data["process"].returncode is not None
+      assert cancel_error is None
+      assert cancel_result == {"status": "cancelled", "task_id": cancel_task_id}
+      assert cancel_task_id not in session.background_tasks
+      assert task.handle._backend_data["process"].returncode is not None
+    finally:
+      await cleanup_code_execution(session)
 
   asyncio.run(_run_test())
 

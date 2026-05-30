@@ -50,10 +50,15 @@ from .context_builder import Message, SessionContextBuilder
 from .events import (
   AggregateReadyEvent,
   AggregateReadyTrigger,
+  ApprovalDecisionSource,
+  ApprovalOutcome,
   ArtifactFailedEvent,
   ArtifactReadyEvent,
   ArtifactUnavailableEvent,
   SkillRunStartedEvent,
+  ToolApprovalDecidedEvent,
+  ToolApprovalRequestEvent,
+  TypedRecommendationsExtractedEvent,
   VerdictEmittedEvent,
   event_from_dict,
   event_to_dict,
@@ -88,8 +93,17 @@ from .retry import RetryConfig, classify_outcome, run_autonomous_with_retry
 from .runner import AgentRunner, SubAgentConfig, ToolResultContext, _derive_sub_agent_id
 from .send_prompt import send_prompt, send_prompt_sync
 from .sdk_runner import AgentSDKRunner
-from .server import ChatRuntime, GatewayServerConfig, ModelCatalog, RequestContext, create_gateway_app
+from .server import (
+  ChatRuntime,
+  ChatTurnInputs,
+  ChatTurnResult,
+  GatewayServerConfig,
+  ModelCatalog,
+  RequestContext,
+  create_gateway_app,
+)
 from .session import AuthManager, GatewaySession, SessionStore
+from .session_event_history import SessionEventHistory
 from .skills import SkillLoader, SkillProfile, SkillStateStore, parse_skill_file
 from .sub_agent import (
   make_get_background_result_handler,
@@ -126,6 +140,17 @@ from .tool_dispatcher import (
   ToolExecutionContext,
   ToolInterceptor,
   ToolResult,
+  TransportApprovalRequest,
+  TransportApprovalResult,
+)
+from .approval_policy import (
+  ApprovalDecision as PolicyApprovalDecision,
+  ApprovalPolicy,
+  ApprovalRequest as PolicyApprovalRequest,
+  ApprovalRequestPayload,
+  ApprovalVote,
+  PersistentGrant,
+  RunContext,
 )
 
 __all__ = [
@@ -137,7 +162,12 @@ __all__ = [
   "AggregateReadyEvent",
   "AggregateReadyTrigger",
   "ApprovalDecision",
+  "ApprovalDecisionSource",
+  "ApprovalOutcome",
+  "ApprovalPolicy",
+  "ApprovalRequestPayload",
   "ApprovalRequest",
+  "ApprovalVote",
   "AnthropicProvider",
   "ArtifactFailedEvent",
   "ArtifactReadyEvent",
@@ -160,6 +190,8 @@ __all__ = [
   "CredentialsTimeoutError",
   "CrossUserReuseError",
   "ChatRuntime",
+  "ChatTurnInputs",
+  "ChatTurnResult",
   "CodeExecutionBundle",
   "CodeExecutionConfig",
   "Message",
@@ -193,6 +225,9 @@ __all__ = [
   "QueryCursor",
   "RateTable",
   "RequestContext",
+  "PersistentGrant",
+  "PolicyApprovalDecision",
+  "PolicyApprovalRequest",
   "ResolverResult",
   "SOURCE_COMMIT",
   "ResolvedProvider",
@@ -204,6 +239,7 @@ __all__ = [
   "send_prompt_sync",
   "SessionUsageSummary",
   "SessionContextBuilder",
+  "SessionEventHistory",
   "SessionStore",
   "SkillLoader",
   "SkillProfile",
@@ -225,9 +261,15 @@ __all__ = [
   "TaskRegistry",
   "TaskState",
   "ToolDispatcher",
+  "ToolApprovalDecidedEvent",
+  "ToolApprovalRequestEvent",
   "ToolExecutionContext",
   "ToolInterceptor",
   "ToolResult",
+  "TypedRecommendationsExtractedEvent",
+  "TransportApprovalRequest",
+  "TransportApprovalResult",
+  "RunContext",
   "ToolResultContext",
   "UsageEvent",
   "UsageLedger",

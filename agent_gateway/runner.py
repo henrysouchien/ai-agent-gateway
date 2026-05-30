@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import functools
 import inspect
 import json
 import logging
+import os
 import socket
 import time
 import uuid
@@ -26,6 +28,7 @@ from .multi_user.billing import (
   normalize_identity,
   write_dlq,
 )
+from .product_config import gateway_product_id
 from .providers import ModelInfo, ModelProvider, ThinkingLevel
 from .task_registry import (
   COORDINATOR_DEFAULT_PREAMBLE,
@@ -45,6 +48,9 @@ from .tool_result_semantics import classify_semantic_tool_error
 log = logging.getLogger("agent_gateway.runner")
 MODEL_CONTEXT_LIMIT = 200_000
 CONTEXT_WARNING_PCT = 80
+MODEL_TOOL_RESULT_MAX_CHARS = 60_000
+MODEL_TOOL_RESULT_MAX_CHARS_ENV = "AGENT_GATEWAY_MAX_MODEL_TOOL_RESULT_CHARS"
+MODEL_TOOL_RESULT_MIN_CHARS = 4_000
 STREAM_STALL_TIMEOUT = 60  # max seconds between stream events before watchdog cancels
 STREAM_THINKING_STALL_TIMEOUT = 300  # extended-thinking turns can be quiet before first visible output
 STREAM_RETRY_MAX = 3
@@ -76,6 +82,115 @@ def _format_exc(exc: Exception) -> str:
     seen.add(id(cause))
     cause = cause.__cause__
   return " | ".join(parts)
+
+
+def _detect_user_id_param(fn) -> bool:
+  """True iff fn accepts user_id as a keyword argument.
+
+  Returns True for POSITIONAL_OR_KEYWORD, KEYWORD_ONLY, and **kwargs.
+  Returns False for None, positional-only params, and uninspectable callables.
+  """
+  if fn is None:
+    return False
+  if isinstance(fn, functools.partial):
+    return False
+  try:
+    sig = inspect.signature(fn)
+  except (TypeError, ValueError):
+    return False
+  for name, param in sig.parameters.items():
+    if param.kind is inspect.Parameter.VAR_KEYWORD:
+      return True
+    if name == "user_id" and param.kind in (
+      inspect.Parameter.POSITIONAL_OR_KEYWORD,
+      inspect.Parameter.KEYWORD_ONLY,
+    ):
+      return True
+  return False
+
+
+def _model_tool_result_max_chars() -> int:
+  raw = os.getenv(MODEL_TOOL_RESULT_MAX_CHARS_ENV)
+  if raw is None or not raw.strip():
+    return MODEL_TOOL_RESULT_MAX_CHARS
+  try:
+    value = int(raw)
+  except ValueError:
+    return MODEL_TOOL_RESULT_MAX_CHARS
+  if value <= 0:
+    return 0
+  return max(MODEL_TOOL_RESULT_MIN_CHARS, value)
+
+
+def _scalar_preview_fields(value: Any) -> Dict[str, Any]:
+  if not isinstance(value, dict):
+    return {}
+  preview: Dict[str, Any] = {}
+  for key, item in value.items():
+    if isinstance(item, str):
+      preview[str(key)] = item if len(item) <= 500 else f"{item[:500]}... <truncated chars={len(item)}>"
+    elif isinstance(item, (int, float, bool)) or item is None:
+      preview[str(key)] = item
+    if len(preview) >= 24:
+      break
+  return preview
+
+
+def _truncate_model_tool_result_content(
+  content: str,
+  *,
+  tool_name: str,
+  max_chars: int,
+) -> tuple[str, bool]:
+  if max_chars <= 0 or len(content) <= max_chars:
+    return content, False
+
+  parsed: Any | None = None
+  try:
+    parsed = json.loads(content)
+  except Exception:
+    parsed = None
+
+  payload: Dict[str, Any] = {
+    "_runner_truncated": True,
+    "tool_name": tool_name,
+    "original_chars": len(content),
+    "message": (
+      "The full tool result was retained in the gateway event log, but this "
+      "model-bound preview was truncated to stay within the provider context "
+      "window. Use a narrower tool query or a file-backed output mode if more "
+      "detail is needed."
+    ),
+  }
+  if isinstance(parsed, dict):
+    payload["top_level_keys"] = list(parsed.keys())[:50]
+    scalar_fields = _scalar_preview_fields(parsed)
+    if scalar_fields:
+      payload["scalar_fields"] = scalar_fields
+  elif isinstance(parsed, list):
+    payload["top_level_type"] = "list"
+    payload["top_level_items"] = len(parsed)
+
+  prefix_budget = max(0, max_chars - len(json.dumps(payload, default=str)) - 200)
+  payload["content_prefix"] = content[:prefix_budget]
+  payload["retained_prefix_chars"] = len(payload["content_prefix"])
+
+  truncated = json.dumps(payload, default=str)
+  while len(truncated) > max_chars and prefix_budget > 0:
+    prefix_budget = max(0, prefix_budget - (len(truncated) - max_chars) - 100)
+    payload["content_prefix"] = content[:prefix_budget]
+    payload["retained_prefix_chars"] = len(payload["content_prefix"])
+    truncated = json.dumps(payload, default=str)
+  if len(truncated) <= max_chars:
+    return truncated, True
+
+  fallback_payload = {
+    "_runner_truncated": True,
+    "tool_name": tool_name,
+    "original_chars": len(content),
+    "message": "Tool result omitted from model context because it exceeded the configured payload limit.",
+  }
+  return json.dumps(fallback_payload, default=str), True
 
 
 def _get_tool_risk_value(tool_name: str) -> str:
@@ -112,6 +227,15 @@ def _get_tool_risk_value(tool_name: str) -> str:
     return get_tool_risk(normalized).value
   except Exception:
     return "side_effecting"
+
+
+def _redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
+  try:
+    from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
+
+    return redact_tool_input(tool_name, tool_input, deployment_secret=get_audit_hmac_secret())
+  except Exception:
+    return dict(tool_input)
 
 
 @dataclass
@@ -187,7 +311,8 @@ class CostAccumulator:
 OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | None]]
 OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
 OnSessionSummary = Callable[[SessionUsageSummary], Awaitable[None] | None]
-OnToolTiming = Callable[[str, str, str | None, int, bool, int], None]
+OnBeforeStreamComplete = Callable[[EventLog], Awaitable[None] | None]
+OnToolTiming = Callable[..., None]
 OnMaxTurns = Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
 BackgroundTaskHandler = Callable[..., Awaitable[Tuple[Optional[Any], Optional[Dict[str, Any]]]]]
 BackgroundTaskCallback = Callable[[BackgroundTask | TaskEntry], Awaitable[None] | None]
@@ -233,6 +358,7 @@ class AgentRunner:
     on_usage: OnUsage | None = None,
     on_session_summary: OnSessionSummary | None = None,
     on_late_usage_event: OnUsage | None = None,
+    on_before_stream_complete: OnBeforeStreamComplete | None = None,
     on_tool_timing: OnToolTiming | None = None,
     user_id: str | None = None,
     request_id: str | None = None,
@@ -286,7 +412,9 @@ class AgentRunner:
     self._on_usage = on_usage
     self._on_session_summary = on_session_summary
     self._on_late_usage_event = on_late_usage_event
+    self._on_before_stream_complete = on_before_stream_complete
     self._on_tool_timing = on_tool_timing
+    self._on_tool_timing_accepts_user_id = _detect_user_id_param(on_tool_timing)
     self._request_id = str(request_id or uuid.uuid4())
     self._parent_turn_id = parent_turn_id
     self._usage_user_id, self._rate_table_version, self._billing_mode, self._channel = normalize_identity(
@@ -424,6 +552,9 @@ class AgentRunner:
     payload.setdefault("role", self._role)
     if self._sub_agent_id is not None:
       payload.setdefault("sub_agent_id", self._sub_agent_id)
+    pid = gateway_product_id()
+    if pid is not None:
+      payload["product_id"] = pid
     entry = await self._agent_session_log.append(payload)
     self._last_durable_seq = entry.seq
     return entry
@@ -522,6 +653,16 @@ class AgentRunner:
     )
     if entry is not None:
       self._last_assistant_message_seq = entry.seq
+
+  async def _emit_stream_retry_event(self, *, attempt: int, error: str) -> None:
+    event = {"type": "stream_retry", "attempt": attempt, "error": error}
+    await self._append_durable_event(event)
+    self._append(event)
+
+  async def _emit_error_event(self, error: str) -> None:
+    event = {"type": "error", "error": error}
+    await self._append_durable_event(event)
+    self._append(event)
 
   async def _emit_interrupted_event(
     self,
@@ -717,6 +858,47 @@ class AgentRunner:
       "content": json.dumps({"error": error_dict}),
       "is_error": True,
     }
+
+  def _compact_model_tool_result_entry(
+    self,
+    result_entry: Dict[str, Any],
+    *,
+    tool_name: str,
+  ) -> Dict[str, Any]:
+    content = result_entry.get("content")
+    if not isinstance(content, str):
+      return result_entry
+
+    max_chars = _model_tool_result_max_chars()
+    compacted_content, was_truncated = _truncate_model_tool_result_content(
+      content,
+      tool_name=tool_name,
+      max_chars=max_chars,
+    )
+    if not was_truncated:
+      return result_entry
+
+    compacted_entry = dict(result_entry)
+    compacted_entry["content"] = compacted_content
+    log.info(
+      "[%s] Tool %s result compacted for model context | original_chars=%d compacted_chars=%d limit=%d",
+      self._sid,
+      tool_name,
+      len(content),
+      len(compacted_content),
+      max_chars,
+      extra={
+        "data": {
+          "event": "tool_result_compacted",
+          "session_id": self._sid,
+          "tool": tool_name,
+          "original_chars": len(content),
+          "compacted_chars": len(compacted_content),
+          "limit": max_chars,
+        }
+      },
+    )
+    return compacted_entry
 
   @staticmethod
   def _is_soft_error(result: Any) -> bool:
@@ -1136,6 +1318,16 @@ class AgentRunner:
     if isinstance(extra_blocks, list):
       return [block for block in extra_blocks if isinstance(block, dict)]
     return []
+
+  async def _call_on_before_stream_complete(self) -> None:
+    if self._on_before_stream_complete is None:
+      return
+    try:
+      result = self._on_before_stream_complete(self._log)
+      if inspect.isawaitable(result):
+        await result
+    except Exception as exc:
+      log.warning("[%s] on_before_stream_complete hook failed (non-fatal): %s", self._sid, exc)
 
   def _ensure_sub_agent_semaphore(self) -> asyncio.Semaphore | None:
     if self._sub_agent_semaphore is None and self._max_concurrent_sub_agents is not None:
@@ -1596,14 +1788,25 @@ class AgentRunner:
     if self._on_tool_timing is None:
       return
     try:
-      self._on_tool_timing(
-        self._full_session_id,
-        tool_name,
-        server,
-        duration_ms,
-        is_error,
-        result_bytes,
-      )
+      if self._on_tool_timing_accepts_user_id:
+        self._on_tool_timing(
+          self._full_session_id,
+          tool_name,
+          server,
+          duration_ms,
+          is_error,
+          result_bytes,
+          user_id=self._usage_user_id,
+        )
+      else:
+        self._on_tool_timing(
+          self._full_session_id,
+          tool_name,
+          server,
+          duration_ms,
+          is_error,
+          result_bytes,
+        )
     except Exception as exc:
       log.warning("[%s] on_tool_timing hook failed (non-fatal): %s", self._sid, exc)
 
@@ -2048,7 +2251,7 @@ class AgentRunner:
               1 + STREAM_RETRY_MAX,
               guard_message,
             )
-            self._append({"type": "stream_retry", "attempt": attempt, "error": guard_error})
+            await self._emit_stream_retry_event(attempt=attempt, error=guard_error)
             continue
           log.error(
             "[%s] Stream watchdog on turn %d after %.1fs (%s): %s | %s",
@@ -2061,7 +2264,7 @@ class AgentRunner:
           )
           if self._usage_has_tokens(partial_usage):
             await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=partial_usage))
-          self._append({"type": "error", "error": guard_error})
+          await self._emit_error_event(guard_error)
           await self._close_client(client, timeout=5.0)
           return None
 
@@ -2090,12 +2293,9 @@ class AgentRunner:
                   "status_code": credential_failure.status_code,
                 }
               )
-              self._append(
-                {
-                  "type": "stream_retry",
-                  "attempt": attempt,
-                  "error": f"credential refreshed after provider {credential_failure.kind} failure",
-                }
+              await self._emit_stream_retry_event(
+                attempt=attempt,
+                error=f"credential refreshed after provider {credential_failure.kind} failure",
               )
               continue
 
@@ -2110,7 +2310,7 @@ class AgentRunner:
           )
           if self._usage_has_tokens(partial_usage):
             await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=partial_usage))
-          self._append({"type": "error", "error": formatted_exc})
+          await self._emit_error_event(formatted_exc)
           await self._close_client(client, timeout=5.0)
           return None
 
@@ -2125,7 +2325,7 @@ class AgentRunner:
         )
         if attempt < STREAM_RETRY_MAX:
           _raise_if_disconnected(exc)
-          self._append({"type": "stream_retry", "attempt": attempt, "error": formatted_exc})
+          await self._emit_stream_retry_event(attempt=attempt, error=formatted_exc)
           continue
       else:
         action, guard_error, _ = self._classify_guard_outcome(
@@ -2149,9 +2349,9 @@ class AgentRunner:
               1 + STREAM_RETRY_MAX,
               guard_message,
             )
-            self._append({"type": "stream_retry", "attempt": attempt, "error": guard_error})
+            await self._emit_stream_retry_event(attempt=attempt, error=guard_error)
             continue
-          self._append({"type": "error", "error": guard_error})
+          await self._emit_error_event(guard_error)
           await self._close_client(client, timeout=5.0)
           return None
         return client, result
@@ -2165,7 +2365,7 @@ class AgentRunner:
         STREAM_RETRY_MAX,
         formatted_exc,
       )
-      self._append({"type": "error", "error": formatted_exc})
+      await self._emit_error_event(formatted_exc)
       await self._close_client(client, timeout=5.0)
     return None
 
@@ -2177,7 +2377,8 @@ class AgentRunner:
     base_kwargs: Dict[str, Any],
     call_index: int = 0,
   ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
-    tool_input_preview = json.dumps(tool_input, default=str)[:200]
+    redacted_tool_input = _redact_tool_input_for_event(tool_name, tool_input)
+    tool_input_preview = json.dumps(redacted_tool_input, default=str)[:200]
     log.info(
       "[%s] Tool call: %s | input=%s",
       self._sid,
@@ -2198,7 +2399,7 @@ class AgentRunner:
       "type": "tool_call_start",
       "tool_call_id": tool_id,
       "tool_name": tool_name,
-      "tool_input": tool_input,
+      "tool_input": redacted_tool_input,
       "execution_location": "backend",
       "call_index": call_index,
       "server": server,
@@ -2238,7 +2439,10 @@ class AgentRunner:
             needs_approval = requires_approval_fn(tool_name, tool_input)
           except Exception:
             pass
-        skip_timeout = tool_name in ("run_agent", "get_background_result") or needs_approval
+        # MCP tools already carry per-server read timeouts in McpClientManager.
+        # Applying the runner's generic cap here would mask longer server policy.
+        has_mcp_server_timeout = server is not None
+        skip_timeout = tool_name in ("run_agent", "get_background_result") or needs_approval or has_mcp_server_timeout
         if self._tool_call_timeout is not None and not skip_timeout:
           try:
             result, error = await asyncio.wait_for(dispatch_coro, timeout=self._tool_call_timeout)
@@ -2396,6 +2600,7 @@ class AgentRunner:
         result_entry=result_entry,
       )
     )
+    result_entry = self._compact_model_tool_result_entry(result_entry, tool_name=tool_name)
     final_tool_result_blocks = [dict(result_entry)]
     final_tool_result_blocks.extend(dict(block) for block in extra_blocks)
     tool_complete_event["final_tool_result_blocks"] = final_tool_result_blocks
@@ -3034,6 +3239,8 @@ class AgentRunner:
         },
       )
 
+      await self._call_on_before_stream_complete()
+
       self._append(
         {
           "type": "stream_complete",
@@ -3057,6 +3264,12 @@ class AgentRunner:
       finalizer_error: BaseException | None = None
       drain_complete = True
       in_flight_task_count = 0
+      try:
+        from .skill_context import clear_current_skill
+
+        clear_current_skill()
+      except Exception:
+        pass
       try:
         await self._shutdown_background_tasks(was_cancelled)
       except BaseException as exc:

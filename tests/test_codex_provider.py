@@ -56,6 +56,47 @@ def test_codex_has_active_credential_accepts_auth_token() -> None:
   assert provider.has_active_credential({"auth_mode": "oauth", "auth_token": "   "}) is False
 
 
+def test_codex_gpt55_uses_gpt5_family_metadata() -> None:
+  provider = CodexProvider()
+
+  model_info = provider.get_model_info("gpt-5.5")
+
+  assert model_info.id == "gpt-5.5"
+  assert model_info.provider == "codex"
+  assert model_info.context_window == 1_050_000
+  assert model_info.supports_thinking is True
+  assert model_info.supports_vision is True
+
+
+def test_build_request_params_supplies_default_instructions_when_system_prompt_missing() -> None:
+  provider = CodexProvider()
+
+  params = provider.build_request_params(
+    model="gpt-5.5",
+    messages=[{"role": "user", "content": "hello"}],
+    system_prompt=None,
+    tools=[],
+    max_tokens=1024,
+  )
+
+  assert params["instructions"] == "Follow the user's instructions."
+
+
+def test_build_request_params_omits_unsupported_temperature() -> None:
+  provider = CodexProvider()
+
+  params = provider.build_request_params(
+    model="gpt-5.5",
+    messages=[{"role": "user", "content": "hello"}],
+    system_prompt="system",
+    tools=[],
+    max_tokens=1024,
+    temperature=0.0,
+  )
+
+  assert "temperature" not in params
+
+
 def test_resolve_codex_url_normalizes_backend_api_variants() -> None:
   assert _resolve_codex_url("https://chatgpt.com/backend-api") == "https://chatgpt.com/backend-api/codex/responses"
   assert _resolve_codex_url("https://chatgpt.com/backend-api/codex") == "https://chatgpt.com/backend-api/codex/responses"

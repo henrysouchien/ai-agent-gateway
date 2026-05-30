@@ -51,3 +51,8 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 - [ ] **Bump version** — patch for fixes, minor for features, major for breaking changes
 - [ ] **`scripts/publish_agent_gateway.sh --patch|--minor|--major --yes`**
 - [ ] **`pip install --upgrade ai-agent-gateway`** locally after publish
+
+### Publish-script notes
+
+- The script's `pip-audit` gate fails closed on any CVE. Disputed/wontfix advisories with no fix version can be added to `AUDIT_IGNORES` in `scripts/publish_guards.sh` (`check_build_integrity` function). Each entry requires the advisory ID, a one-line reason it's safe to ignore here, and the date added. Audit logs print `NOTICE: ignoring advisory <ID>` per entry so the bypass is visible.
+- If a publish run partially fails (sync_commit lands but `integrity_check` / `wheel_smoke` / `upload` fails), re-running the script is safe. `check_publish_owed` in `publish_guards.sh` detects the recovery state via last-commit-message ("not a `chore: bump version`") and skips re-running `sync_commit`, going straight to bump → build → upload → version_commit. No manual recovery needed.

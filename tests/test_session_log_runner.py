@@ -88,6 +88,23 @@ class _ScriptedProvider(ModelProvider):
       self._after_turn(self._turn_index)
 
 
+class _RetryableFailingProvider(_ScriptedProvider):
+  def __init__(self, message: str = "Anthropic API error (status=200)") -> None:
+    super().__init__([])
+    self.message = message
+    self.calls = 0
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    _ = client, params
+    self.calls += 1
+    raise RuntimeError(self.message)
+    yield  # pragma: no cover
+
+  def is_retryable_error(self, exc: Exception) -> bool:
+    _ = exc
+    return True
+
+
 def _make_dispatcher(
   *,
   event_log: EventLog | None = None,
@@ -145,6 +162,12 @@ async def _lookup_tool(tool_input: dict[str, Any], **kwargs: Any):
 async def _warning_tool(tool_input: dict[str, Any], **kwargs: Any):
   _ = kwargs
   return {"ok": True, "low_match_warning": tool_input.get("warning", "only 20% matched")}, None
+
+
+async def _large_result_tool(tool_input: dict[str, Any], **kwargs: Any):
+  _ = kwargs
+  size = int(tool_input.get("size", 10_000))
+  return {"status": "success", "ticker": "BIG", "payload": "x" * size}, None
 
 
 async def _semantic_error_tool(tool_input: dict[str, Any], **kwargs: Any):
@@ -418,6 +441,46 @@ def test_runner_with_context_builder_ignores_fabricated_client_history(tmp_path:
   assert "CLIENT FABRICATED ASSISTANT" not in model_input
 
 
+def test_stream_retry_and_terminal_error_are_durable(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 2)
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
+  provider = _RetryableFailingProvider()
+  log = AgentSessionLog(path=tmp_path / "sessions" / "stream-retry.jsonl")
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log),
+    session_id="sess-parent",
+    provider=provider,
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "review allocation"}]))
+
+  assert provider.calls == 3
+  entries, _ = _run(log.query(order="asc"))
+  retry_events = [entry.event for entry in entries if entry.event.get("type") == "stream_retry"]
+  error_events = [entry.event for entry in entries if entry.event.get("type") == "error"]
+  visible_events = [entry.event for entry in event_log.entries]
+
+  assert [event["attempt"] for event in retry_events] == [0, 1]
+  assert all("Anthropic API error (status=200)" in event["error"] for event in retry_events)
+  assert len(error_events) == 1
+  assert "Anthropic API error (status=200)" in error_events[0]["error"]
+  assert [event["type"] for event in visible_events if event["type"] in {"stream_retry", "error"}] == [
+    "stream_retry",
+    "stream_retry",
+    "error",
+  ]
+
+
 def test_tool_call_complete_logs_final_model_facing_result_blocks(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "final-tool-result.jsonl")
   provider = _ScriptedProvider([
@@ -476,6 +539,41 @@ def test_tool_call_complete_pre_and_final_results_differ_when_annotated(tmp_path
   assert "_runner_warning" not in event["result"]
   assert "_runner_warning" in event["final_tool_result_blocks"][0]["content"]
   assert event["final_tool_result_blocks"][0]["content"] != json.dumps(event["result"], default=str)
+
+
+def test_large_tool_result_is_compacted_only_for_model_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setenv(gateway_runner.MODEL_TOOL_RESULT_MAX_CHARS_ENV, "4000")
+  log = AgentSessionLog(path=tmp_path / "sessions" / "large-tool-result.jsonl")
+  provider = _ScriptedProvider([
+    _tool_turn(tool_name="large_lookup", tool_input={"size": 12_000}),
+    _text_turn("done"),
+  ])
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"large_lookup": _large_result_tool}),
+    session_id="sess-parent",
+    provider=provider,
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "Run large lookup"}]))
+
+  entries, _ = _run(log.query(event_types={"tool_call_complete"}, order="asc"))
+  event = entries[0].event
+  assert event["result"]["payload"] == "x" * 12_000
+  final_content = event["final_tool_result_blocks"][0]["content"]
+  assert len(final_content) <= 4000
+  parsed = json.loads(final_content)
+  assert parsed["_runner_truncated"] is True
+  assert parsed["tool_name"] == "large_lookup"
+  assert parsed["scalar_fields"]["status"] == "success"
+  assert parsed["scalar_fields"]["ticker"] == "BIG"
+  assert parsed["original_chars"] > 4000
 
 
 def test_rebuild_task_registry_ignores_tool_call_complete_final_blocks(tmp_path: Path) -> None:

@@ -69,7 +69,7 @@ def _sdk_web_tool_channels() -> set[Optional[str]]:
   try:
     from api.tool_catalog import WEB_TOOL_CHANNELS
   except Exception:
-    return {"web", "telegram", "cli"}
+    return {"web", "telegram", "cli", "tui"}
   return set(WEB_TOOL_CHANNELS)
 
 

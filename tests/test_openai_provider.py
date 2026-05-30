@@ -76,6 +76,20 @@ def test_openai_has_active_credential_api_mode() -> None:
   assert provider.has_active_credential({"api_key": "sk-x"}) is True
 
 
+def test_openai_gpt55_uses_gpt5_family_metadata() -> None:
+  provider = OpenAIProvider()
+
+  model_info = provider.get_model_info("gpt-5.5")
+
+  assert model_info.id == "gpt-5.5"
+  assert model_info.provider == "openai"
+  assert model_info.context_window == 1_050_000
+  assert model_info.input_cost_per_mtok == 5.00
+  assert model_info.output_cost_per_mtok == 30.00
+  assert model_info.supports_thinking is True
+  assert model_info.supports_vision is True
+
+
 def test_openai_create_client_api_mode_uses_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
   class _FakeAsyncOpenAI:
     def __init__(self, **kwargs):

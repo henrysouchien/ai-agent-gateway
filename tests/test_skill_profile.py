@@ -15,6 +15,7 @@ if str(API_DIR) not in sys.path:
 from agent_gateway.skills import (
   AGENT_DESCRIPTION_MAX_CHARS,
   AGENT_DESCRIPTION_PLACEHOLDER,
+  SKILL_STATE_CLASSES,
   SkillLoader,
   SkillProfile,
   parse_skill_file,
@@ -49,6 +50,12 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
       mcp_servers:
         - gmail
         - slack
+      mcp_tools:
+        gmail:
+          - search_messages
+          - search_messages
+          - send_message
+        slack: post_message
       session_inject_servers:
         - gmail
       timeout_overrides:
@@ -65,6 +72,10 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
   profile = parse_skill_file(skill_path)
 
   assert profile.mcp_servers == ["gmail", "slack"]
+  assert profile.mcp_tools == {
+    "gmail": ["search_messages", "send_message"],
+    "slack": ["post_message"],
+  }
   assert profile.session_inject_servers == ["gmail"]
   assert profile.timeout_overrides == {"gmail": 30, "slack": 45}
   assert profile.state_dir == "daily-scan"
@@ -74,6 +85,10 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
   assert profile.delivery_label == "Daily Scan"
   assert profile.metadata == {
     "mcp_servers": ["gmail", "slack"],
+    "mcp_tools": {
+      "gmail": ["search_messages", "send_message"],
+      "slack": ["post_message"],
+    },
     "session_inject_servers": ["gmail"],
     "timeout_overrides": {"gmail": 30, "slack": 45},
     "state_dir": "daily-scan",
@@ -198,6 +213,33 @@ def test_parse_agent_fields_from_frontmatter(tmp_path: Path) -> None:
   assert profile.tool_packs_enabled is False
 
 
+def test_parse_state_class_from_frontmatter(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    name: stateful-skill
+    state_class: producer
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.state_class == "producer"
+  assert "producer" in SKILL_STATE_CLASSES
+
+
+def test_parse_invalid_state_class_raises(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    state_class: writes-sometimes
+    """,
+  )
+
+  with pytest.raises(ValueError, match="state_class"):
+    parse_skill_file(skill_path)
+
+
 def test_parse_resumable_defaults_load_cleanly(tmp_path: Path) -> None:
   skill_path = _write_skill(tmp_path, None)
 
@@ -205,6 +247,7 @@ def test_parse_resumable_defaults_load_cleanly(tmp_path: Path) -> None:
 
   assert profile.resumable is False
   assert profile.resume_mcp_session_reset_ok is False
+  assert profile.state_class is None
 
 
 def test_parse_resumable_with_session_injection_requires_reset_ack(tmp_path: Path) -> None:
@@ -352,6 +395,7 @@ def test_none_defaults(tmp_path: Path) -> None:
   assert profile.mode == "full"
   assert profile.extra_excluded_tools == set()
   assert profile.tool_packs_enabled is True
+  assert profile.state_class is None
 
 
 def test_dataclass_construction_defaults() -> None:
@@ -371,6 +415,7 @@ def test_dataclass_construction_defaults() -> None:
   assert profile.mode == "full"
   assert profile.extra_excluded_tools == set()
   assert profile.tool_packs_enabled is True
+  assert profile.state_class is None
 
 
 def test_positional_construction_compat() -> None:
@@ -446,3 +491,31 @@ def test_empty_mcp_servers_is_none(tmp_path: Path) -> None:
 
   assert profile.mcp_servers is None
   assert profile.metadata == {"mcp_servers": None}
+
+
+def test_empty_mcp_tools_is_none(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    mcp_tools:
+      portfolio-mcp: []
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.mcp_tools is None
+  assert profile.metadata == {"mcp_tools": None}
+
+
+def test_invalid_mcp_tools_shape_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    mcp_tools:
+      - get_model_insights
+    """,
+  )
+
+  with pytest.raises(ValueError, match="mcp_tools"):
+    parse_skill_file(skill_path)

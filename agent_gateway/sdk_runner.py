@@ -7,13 +7,27 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from dataclasses import dataclass, replace
+from datetime import timedelta
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .approval_policy import (
+  ApprovalDecision as PolicyApprovalDecision,
+  ApprovalPolicy,
+  ApprovalRequest as PolicyApprovalRequest,
+  RunContext,
+  apply_decision_to_request,
+  build_approval_request,
+  call_policy_safely,
+  sha256_args,
+  utc_now,
+)
 from .event_log import EventLog
 from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator, normalize_identity
+from .product_config import gateway_product_id
 from .providers.agent_sdk import AgentSDKConfig, estimate_cost, _validate_sdk_version
-from .runner import ToolResultContext
+from .runner import ToolResultContext, _detect_user_id_param
+from .skill_context import current_skill
 from .tool_result_semantics import classify_semantic_tool_error
 
 
@@ -22,7 +36,7 @@ log = logging.getLogger("agent_gateway.sdk_runner")
 OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | None]]
 OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
 OnSessionSummary = Callable[[SessionUsageSummary], Awaitable[None] | None]
-OnToolTiming = Callable[[str, str, str | None, int, bool, int], None]
+OnToolTiming = Callable[..., None]
 
 
 @dataclass
@@ -39,6 +53,26 @@ class _ActiveToolUse:
   tool_name: str
   input_json: str = ""
   raw_block: Any = None
+
+
+class _PromptMessages:
+  def __init__(self, text: str) -> None:
+    self.text = text
+
+  def __contains__(self, needle: object) -> bool:
+    return isinstance(needle, str) and needle in self.text
+
+  def __str__(self) -> str:
+    return self.text
+
+  async def __aiter__(self) -> AsyncIterator[dict[str, Any]]:
+    yield {
+      "type": "user",
+      "message": {
+        "role": "user",
+        "content": [{"type": "text", "text": self.text}],
+      },
+    }
 
 
 def _as_plain_dict(value: Any) -> Any:
@@ -155,6 +189,23 @@ def _server_for_tool(tool_name: str) -> str | None:
   return parts[1]
 
 
+def _redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
+  try:
+    from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
+
+    return redact_tool_input(tool_name, tool_input, deployment_secret=get_audit_hmac_secret())
+  except Exception:
+    return dict(tool_input)
+
+
+def _policy_tool_name(tool_name: str) -> str:
+  if tool_name.startswith("mcp__"):
+    parts = tool_name.split("__", 2)
+    if len(parts) == 3:
+      return parts[2]
+  return tool_name
+
+
 class AgentSDKRunner:
   """Run a conversation through the Anthropic agent SDK.
 
@@ -178,6 +229,10 @@ class AgentSDKRunner:
     on_tool_result: Callable[..., Any] | None = None,
     on_tool_timing: Callable[..., Any] | None = None,
     _parent_aggregator: _UsageAggregator | None = None,
+    session: Any | None = None,
+    store: Any | None = None,
+    policy: ApprovalPolicy | None = None,
+    run_context: RunContext | None = None,
   ) -> None:
     self._log = event_log
     self._session_id = session_id or "no-session"
@@ -192,6 +247,7 @@ class AgentSDKRunner:
     self._on_late_usage_event = on_late_usage_event
     self._on_tool_result = on_tool_result
     self._on_tool_timing = on_tool_timing
+    self._on_tool_timing_accepts_user_id = _detect_user_id_param(on_tool_timing)
     self._pending_tool_calls: Dict[str, ToolCallInfo] = {}
     self._active_tool_use: _ActiveToolUse | None = None
     self._query_iter: Any = None
@@ -224,9 +280,17 @@ class AgentSDKRunner:
       channel=self._channel,
     )
     self._summary_emitted = False
+    self._session = session
+    self._approval_store = store or getattr(session, "approval_store", None)
+    self._approval_policy = policy or getattr(session, "approval_policy", None)
+    self._run_context = run_context
 
   def _append(self, event: Dict[str, Any]) -> None:
-    self._log.append(event)
+    payload = dict(event)
+    pid = gateway_product_id()
+    if pid is not None:
+      payload["product_id"] = pid
+    self._log.append(payload)
 
   async def _call_on_usage(self, usage_event: UsageEvent) -> None:
     recorded = await self._aggregator.record(usage_event)
@@ -276,14 +340,25 @@ class AgentSDKRunner:
     if self._on_tool_timing is None:
       return
     try:
-      self._on_tool_timing(
-        self._session_id,
-        tool_name,
-        server,
-        duration_ms,
-        is_error,
-        result_bytes,
-      )
+      if self._on_tool_timing_accepts_user_id:
+        self._on_tool_timing(
+          self._session_id,
+          tool_name,
+          server,
+          duration_ms,
+          is_error,
+          result_bytes,
+          user_id=self._usage_user_id,
+        )
+      else:
+        self._on_tool_timing(
+          self._session_id,
+          tool_name,
+          server,
+          duration_ms,
+          is_error,
+          result_bytes,
+        )
     except Exception as exc:
       log.warning("[%s] on_tool_timing hook failed (non-fatal): %s", self._sid, exc)
 
@@ -543,12 +618,13 @@ class AgentSDKRunner:
         tool_input=tool_input,
         started_at=time.time(),
       )
+      redacted_tool_input = _redact_tool_input_for_event(tool_name, tool_input)
       self._append(
         {
           "type": "tool_call_start",
           "tool_call_id": tool_call_id,
           "tool_name": tool_name,
-          "tool_input": tool_input,
+          "tool_input": redacted_tool_input,
         }
       )
       self._active_tool_use = None
@@ -599,6 +675,7 @@ class AgentSDKRunner:
     result: Any | None = None,
     error: Dict[str, Any] | None = None,
     synthetic: bool = False,
+    outcome: str | None = None,
   ) -> None:
     info = self._pending_tool_calls.pop(tool_call_id, None)
     if info is None:
@@ -631,9 +708,9 @@ class AgentSDKRunner:
       result_bytes=result_bytes,
     )
 
-  def _flush_pending_tool_calls(self) -> None:
+  def _flush_pending_tool_calls(self, *, outcome: str | None = None) -> None:
     for tool_call_id in list(self._pending_tool_calls.keys()):
-      self._complete_tool_call(tool_call_id, synthetic=True)
+      self._complete_tool_call(tool_call_id, synthetic=True, outcome=outcome)
 
   def _handle_user_message(self, message: Any) -> None:
     for block in self._extract_tool_result_blocks(message):
@@ -675,6 +752,164 @@ class AgentSDKRunner:
     }
     self._append({"type": "stream_complete", "usage": usage})
     self._stream_terminal_emitted = True
+
+  def _approval_lifecycle_configured(self) -> bool:
+    return self._approval_store is not None and self._approval_policy is not None and self._session is not None
+
+  def _resolve_run_context(self) -> RunContext:
+    if self._run_context is not None:
+      return self._run_context
+    return RunContext(
+      user_id=str(self._usage_user_id or getattr(self._session, "user_id", "") or "unknown"),
+      request_id=self._request_id,
+      session_id=self._session_id,
+      profile="chat",
+      channel=str(self._channel or getattr(self._session, "channel", None) or "web"),
+      decider_role=str(getattr(self._session, "role", "owner") or "owner"),
+      policy_bundle_hash=str(getattr(self._approval_policy, "policy_bundle_hash", "unknown")),
+      model_id=self._effective_model,
+    )
+
+  def _resolve_tool_class(self, tool_name: str) -> str:
+    policy_tool = _policy_tool_name(tool_name)
+    try:
+      from agent.shared.server_policies import get_tool_class
+
+      server = _server_for_tool(tool_name)
+      if server:
+        cls = get_tool_class(server, policy_tool)
+        if cls is not None:
+          return cls
+    except Exception:
+      pass
+    return "state_write"
+
+  def _redact_for_approval_request(self, tool_name: str, tool_input: Dict[str, Any]) -> tuple[dict[str, Any], str]:
+    try:
+      from agent.shared.tool_redaction import get_audit_hmac_secret, get_audit_hmac_key_id, hmac_value, redact_tool_input
+
+      secret = get_audit_hmac_secret()
+      key_id = get_audit_hmac_key_id()
+      return (
+        redact_tool_input(tool_name, tool_input, deployment_secret=secret, key_id=key_id),
+        hmac_value(tool_input, deployment_secret=secret, key_id=key_id),
+      )
+    except Exception:
+      return {}, sha256_args(tool_input)
+
+  async def _await_user_approval_via_pending_tools(
+    self,
+    request: PolicyApprovalRequest,
+    decision: PolicyApprovalDecision,
+    *,
+    nonce: str,
+  ) -> dict[str, Any] | None:
+    session = self._session
+    if session is None:
+      return None
+    approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+    session.pending_tools[request.tool_call_id] = {
+      "approval_id": request.approval_id,
+      "nonce": nonce,
+      "requested_at": int(time.time()),
+      "status": "approval_pending",
+      "tool_name": request.tool_name,
+      "resolved_qualifier": "",
+    }
+    session.approval_queues[request.tool_call_id] = approval_queue
+    approval_event = {
+      "type": "tool_approval_request",
+      "tool_call_id": request.tool_call_id,
+      "approval_id": request.approval_id,
+      "nonce": nonce,
+      "tool_name": request.tool_name,
+      "tool_input": request.tool_args_redacted,
+      "resolved_qualifier": "",
+      "reason": decision.reason,
+      "allow_persistent_approval": decision.allow_persistent_grant,
+      "ts": time.time(),
+    }
+    self._append(approval_event)
+    session_log = getattr(session, "agent_session_log", None)
+    if session_log is not None:
+      try:
+        await session_log.append(approval_event)
+      except Exception:
+        log.warning("Failed to persist approval request event for %s", request.tool_call_id, exc_info=True)
+    try:
+      return await approval_queue.get()
+    finally:
+      session.pending_tools.pop(request.tool_call_id, None)
+      session.approval_queues.pop(request.tool_call_id, None)
+
+  async def _can_use_tool_callback(self, tool_name: str, input_data: dict[str, Any], _context: Any) -> Any:
+    import claude_agent_sdk
+
+    allow_cls = getattr(claude_agent_sdk, "PermissionResultAllow")
+    deny_cls = getattr(claude_agent_sdk, "PermissionResultDeny")
+    if not self._approval_lifecycle_configured():
+      return allow_cls()
+    store = self._approval_store
+    policy = self._approval_policy
+    assert store is not None and policy is not None
+    run_context = self._resolve_run_context()
+    active_skill = current_skill()
+    if active_skill and run_context.skill is None:
+      run_context = replace(run_context, skill=active_skill)
+    policy_tool = _policy_tool_name(tool_name)
+    redacted, args_hash = self._redact_for_approval_request(tool_name, input_data)
+    request = build_approval_request(
+      tool_call_id=f"sdk-{uuid.uuid4().hex}",
+      tool_name=policy_tool,
+      tool_class=self._resolve_tool_class(tool_name),
+      tool_args_redacted=redacted,
+      args_hash=args_hash,
+      run_context=run_context,
+    )
+    await store.create(request)
+    raw_args = dict(input_data)
+    try:
+      decision = await call_policy_safely(policy, request, raw_args, run_context)
+    finally:
+      raw_args.clear()
+      del raw_args
+    request = apply_decision_to_request(request, decision)
+    await store.update_request(request)
+
+    if decision.outcome == "auto_approve":
+      request = await store.transition_state(request.approval_id, "auto_approved", expected_state_version=request.state_version)
+      await policy.on_resolve(request=request)
+      if decision.modified_tool_args is not None:
+        return allow_cls(updated_input=decision.modified_tool_args)
+      return allow_cls()
+    if decision.outcome == "auto_deny":
+      request = await store.transition_state(request.approval_id, "auto_denied", expected_state_version=request.state_version)
+      await policy.on_resolve(request=request)
+      return deny_cls(message=decision.reason)
+    if decision.outcome == "route_external":
+      await store.transition_state(
+        request.approval_id,
+        "routed_external",
+        route_target=decision.route_target,
+        route_target_type=decision.route_target_type,
+        expires_at=utc_now() + timedelta(seconds=decision.expiry_seconds or 600),
+        expected_state_version=request.state_version,
+      )
+      return deny_cls(message="external approval route is pending")
+
+    request = await store.transition_state(
+      request.approval_id,
+      "pending_user",
+      route_target_type="pending_tools",
+      expires_at=utc_now() + timedelta(seconds=decision.expiry_seconds or 600),
+      expected_state_version=request.state_version,
+    )
+    approval = await self._await_user_approval_via_pending_tools(request, decision, nonce=os.urandom(8).hex())
+    if approval and approval.get("approved"):
+      if decision.modified_tool_args is not None:
+        return allow_cls(updated_input=decision.modified_tool_args)
+      return allow_cls()
+    return deny_cls(message="user denied")
 
   async def _close_query_iterator(self) -> None:
     iterator = self._query_iter
@@ -762,7 +997,8 @@ class AgentSDKRunner:
       self._append({"type": "error", "error": "claude-agent-sdk dependency is required"})
       raise RuntimeError("claude-agent-sdk dependency is required") from exc
 
-    prompt = self._build_prompt(messages)
+    prompt_text = self._build_prompt(messages)
+    prompt = _PromptMessages(prompt_text)
     effective_system_prompt = _join_system_prompt(system_prompt or self._system_prompt)
     effective_model = str(model_override or self._sdk_config.model or self._effective_model).strip()
     if effective_model:
@@ -772,7 +1008,6 @@ class AgentSDKRunner:
     options_kwargs: Dict[str, Any] = {
       "system_prompt": effective_system_prompt or None,
       "mcp_servers": dict(self._mcp_server_configs),
-      "permission_mode": "bypassPermissions",
       "continue_conversation": False,
       "max_turns": max_turns if max_turns is not None else self._max_turns,
       "max_budget_usd": self._sdk_config.max_budget_usd,
@@ -781,6 +1016,7 @@ class AgentSDKRunner:
       "cwd": str(self._sdk_config.cwd) if self._sdk_config.cwd is not None else None,
       "include_partial_messages": True,
       "hooks": hooks or None,
+      "can_use_tool": self._can_use_tool_callback if self._approval_lifecycle_configured() else None,
     }
     options_kwargs = {key: value for key, value in options_kwargs.items() if value is not None}
     options = getattr(claude_agent_sdk, "ClaudeAgentOptions")(**options_kwargs)
@@ -805,7 +1041,7 @@ class AgentSDKRunner:
             num_turns=_get_attr(message, "num_turns"),
           )
           await self._emit_usage_hook()
-          self._flush_pending_tool_calls()
+          self._flush_pending_tool_calls(outcome="success")
           self._emit_stream_complete()
           continue
 
@@ -820,15 +1056,15 @@ class AgentSDKRunner:
         if hasattr(message, "content"):
           self._handle_user_message(message)
 
-      self._flush_pending_tool_calls()
+      self._flush_pending_tool_calls(outcome="success")
       self._emit_stream_complete()
     except asyncio.CancelledError:
       await self._close_query_iterator()
-      self._flush_pending_tool_calls()
+      self._flush_pending_tool_calls(outcome="cancelled")
       self._emit_stream_complete()
     except Exception as exc:
       await self._close_query_iterator()
-      self._flush_pending_tool_calls()
+      self._flush_pending_tool_calls(outcome="tool_error")
       self._append({"type": "error", "error": str(exc)})
       self._stream_terminal_emitted = True
       raise

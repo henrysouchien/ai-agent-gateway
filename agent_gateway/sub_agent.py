@@ -6,7 +6,7 @@ import secrets
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, FrozenSet
 
 from ._provider_utils import _get_allowed_models_for_provider_name
 from .events import SkillRunStartedEvent, VerdictEmittedEvent, event_to_dict
@@ -26,6 +26,8 @@ from .transcript import (
 from .verdict_extractor import extract_verdict_payload
 
 _DEFAULT_EXCLUDED_TOOLS = frozenset({"run_agent", "get_background_result", "send_message"})
+ExcludedToolsResolver = Callable[[], FrozenSet[str]]
+NeedsApprovalResolver = Callable[[FrozenSet[str]], Callable[..., bool] | None]
 _SKILL_SYSTEM_PROMPT_TEMPLATE = (
   "{skill_prompt}\n\n"
   "Today's date: {date}\n\n"
@@ -466,11 +468,13 @@ def make_resume_handler(
   skill_loader: SkillLoader | None = None,
   mcp_client: Any,
   needs_approval: Callable[..., bool] | None = None,
+  needs_approval_resolver: NeedsApprovalResolver | None = None,
   mcp_session_inject_servers: set[str] | None = None,
   mcp_meta_inject_servers: frozenset[str] | None = None,
   user_id: str | None = None,
   credentials_resolver_active: bool = False,
   local_tool_handlers: dict[str, Any] | None = None,
+  excluded_tools_resolver: ExcludedToolsResolver | None = None,
   excluded_tools: set[str] | None = None,
   default_model: str = "claude-opus-4-7",
   default_max_turns: int = 15,
@@ -480,6 +484,20 @@ def make_resume_handler(
   provider_resolver: ProviderResolver | None = None,
   coordinator_config: CoordinatorConfig | None = None,
 ):
+  if excluded_tools is not None:
+    import warnings
+
+    warnings.warn(
+      "excluded_tools= is deprecated; use excluded_tools_resolver= so resume reapplies current policy.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+    if excluded_tools_resolver is None:
+      captured_excluded = frozenset(excluded_tools)
+      excluded_tools_resolver = lambda: captured_excluded
+  if excluded_tools_resolver is None:
+    raise ValueError("make_resume_handler requires excluded_tools_resolver")
+
   effective_allowed_models = (
     allowed_models if allowed_models is not None else _get_allowed_models_for_provider_name("anthropic")
   )
@@ -605,9 +623,14 @@ def make_resume_handler(
     )
     effective_max_turns = profile.max_turns if profile.max_turns is not None else default_max_turns
     effective_timeout = profile.timeout if profile.timeout is not None else default_timeout
-    effective_excluded = _DEFAULT_EXCLUDED_TOOLS | set(excluded_tools or set())
+    effective_excluded = set(_DEFAULT_EXCLUDED_TOOLS | excluded_tools_resolver())
     if effective_coordinator is not None and effective_coordinator.worker_excluded_tools:
       effective_excluded = effective_excluded | effective_coordinator.worker_excluded_tools
+    child_needs_approval = (
+      needs_approval_resolver(frozenset(effective_excluded))
+      if needs_approval_resolver is not None
+      else needs_approval
+    )
     sub_local = {
       name: handler
       for name, handler in (local_tool_handlers or {}).items()
@@ -617,7 +640,7 @@ def make_resume_handler(
     sub_dispatcher = ToolDispatcher(
       mcp_client=mcp_client,
       local_tool_handlers=sub_local,
-      needs_approval=needs_approval,
+      needs_approval=child_needs_approval,
       event_log=sub_log,
       session_id=getattr(runner, "_full_session_id", ""),
       should_avoid_permission_prompts=True,

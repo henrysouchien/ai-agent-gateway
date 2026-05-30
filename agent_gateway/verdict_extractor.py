@@ -83,6 +83,48 @@ def extract_verdict_payload(entries: Iterable[Any]) -> VerdictPayload | None:
   )
 
 
+def extract_verdict_payload_from_text(content: str) -> VerdictPayload | None:
+  try:
+    docs = _yaml_mappings_from_content(content)
+  except _MalformedVerdictYaml:
+    return None
+
+  verdict_doc: dict[str, Any] | None = None
+  summary_doc: dict[str, Any] | None = None
+  summary_text: str | None = None
+
+  for doc in reversed(docs):
+    if summary_doc is None:
+      candidate_summary = _summary_from_doc(doc)
+      if candidate_summary:
+        summary_doc = doc
+        summary_text = candidate_summary
+    if verdict_doc is None and _explicit_verdict_token_from_doc(doc):
+      verdict_doc = doc
+    if verdict_doc is not None and summary_text is not None:
+      break
+
+  if verdict_doc is None and summary_doc is not None and _decision_token_from_doc(summary_doc):
+    verdict_doc = summary_doc
+  if verdict_doc is None:
+    return None
+
+  token = _verdict_token_from_doc(verdict_doc)
+  if not token:
+    return None
+
+  confidence = _confidence_from_doc(verdict_doc)
+  if confidence is None and summary_doc is not None:
+    confidence = _confidence_from_doc(summary_doc)
+
+  return VerdictPayload(
+    verdict_token=token,
+    confidence=confidence,
+    materiality_cushion=_materiality_cushion_from_doc(verdict_doc),
+    one_line_summary=summary_text or _summary_from_doc(verdict_doc) or token,
+  )
+
+
 def _entry_event(entry: Any) -> dict[str, Any]:
   event = getattr(entry, "event", entry)
   return dict(event) if isinstance(event, dict) else {}
@@ -299,4 +341,5 @@ def _coerce_float(value: Any) -> float | None:
 __all__ = [
   "VerdictPayload",
   "extract_verdict_payload",
+  "extract_verdict_payload_from_text",
 ]

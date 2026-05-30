@@ -35,6 +35,21 @@ def _base_compat(*, supports_reasoning_effort: bool) -> dict[str, Any]:
 
 _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
   (
+    ("gpt-5.5",),
+    ModelInfo(
+      id="gpt-5.5",
+      provider="openai",
+      context_window=1_050_000,
+      max_output_tokens=128_000,
+      supports_thinking=True,
+      supports_vision=True,
+      input_cost_per_mtok=5.00,
+      output_cost_per_mtok=30.00,
+      cache_read_cost_per_mtok=0.50,
+      compat=_base_compat(supports_reasoning_effort=True),
+    ),
+  ),
+  (
     ("gpt-4o-mini",),
     ModelInfo(
       id="gpt-4o-mini",
@@ -324,6 +339,16 @@ class OpenAIProvider(ModelProvider):
     for tags, info in _MODEL_INFO_BY_TAG:
       if any(_model_matches_tag(model_id, tag) for tag in tags):
         return replace(info, id=model_id)
+    if "gpt-5" in model_id:
+      return ModelInfo(
+        id=model_id,
+        provider=self.name,
+        context_window=400_000,
+        max_output_tokens=128_000,
+        supports_thinking=True,
+        supports_vision=True,
+        compat=_base_compat(supports_reasoning_effort=True),
+      )
     raise ValueError(f"OpenAIProvider does not recognize model: {model_id}")
 
   def _resolved_compat(
@@ -786,11 +811,21 @@ class OpenAIProvider(ModelProvider):
           tool_input = json.loads(current_tool_json) if current_tool_json else {}
         except json.JSONDecodeError:
           tool_input = {}
+        try:
+          from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
+
+          redacted_tool_input = redact_tool_input(
+            str(current_tool_name or ""),
+            tool_input,
+            deployment_secret=get_audit_hmac_secret(),
+          )
+        except Exception:
+          redacted_tool_input = tool_input
         raw_block = {
           "type": "tool_use",
           "id": current_tool_id,
           "name": current_tool_name,
-          "input": tool_input,
+          "input": redacted_tool_input,
         }
         if current_tool_signature:
           raw_block["thought_signature"] = current_tool_signature

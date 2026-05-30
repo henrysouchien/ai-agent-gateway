@@ -410,6 +410,56 @@ Factory for the local `get_background_result` handler. Delegates to `AgentRunner
 
 Factory for the `get_background_result` tool schema. The tool accepts `task_id` (or `"*"` for all tasks), an optional `wait` boolean, and an optional `timeout` (clamped to 120 seconds).
 
+## Typed Events
+
+Added in 0.15.0. Frozen dataclasses for the six skill-framework events emitted on the `/api/chat` SSE stream when the host wires up a `SkillProfile` and a `skill_run_id`. The six event classes plus `event_to_dict` are re-exported from `agent_gateway` top-level; the rest live in `agent_gateway.events`. Wire format (JSON shape on the SSE stream) is documented in `http-api.md` → "Skill Framework Events".
+
+### `SkillRunStartedEvent`
+
+Emitted once at the start of a skill-framework sub-agent run.
+
+Fields: `skill_run_id`, `skill`, `ticker`, `ts`. `type` is fixed to `"skill_run_started"`.
+
+### `VerdictEmittedEvent`
+
+Emitted when the skill writes a verdict YAML through `memory_write` (extracted in reverse order from `tool_call_complete.final_tool_result_blocks`).
+
+Fields: `skill_run_id`, `skill`, `ticker`, `verdict_token`, `confidence` (`"HIGH" | "MEDIUM" | "LOW" | None`), `materiality_cushion` (`float | None`), `one_line_summary`, `ts`.
+
+### `ArtifactReadyEvent`
+
+Emitted when the materializer writes a JSON sidecar (and optionally a `.docx` letter) to per-user workspace storage. Pairs with the artifact read endpoints documented in `http-api.md`.
+
+Fields: `skill_run_id`, `ticker`, `skill`, `artifact_id`, `artifact_path`, `binary_artifact_path` (`str | None`), `contract_name`, `data_source` (`"live" | "fixture"`), `ts`.
+
+### `AggregateReadyEvent`
+
+Emitted when an aggregate view-model has all its source artifacts.
+
+Fields: `skill_run_id`, `ticker`, `view_model_id`, `trigger` (`AggregateReadyTrigger` with `kind: "artifact_ready" | "tool_response"` + `source: str`), `sources_complete`, `ts`.
+
+### `ArtifactFailedEvent`
+
+Emitted when the materializer fails to produce an artifact.
+
+Fields: `skill_run_id`, `ticker`, `skill`, `error_code` (`"yaml_parse" | "validation" | "missing_contract" | "schema_drift" | "other"`), `error_detail`, `source_path`, `ts`.
+
+### `ArtifactUnavailableEvent`
+
+Renderer-side event. No `skill_run_id` — surfaced when the UI/aggregator looks up an artifact for `(ticker, skill)` and finds it absent.
+
+Fields: `ticker`, `skill`, `reason` (`"no_runs_yet" | "stale" | "fixture_only" | "auth_blocked"`), `affordance` (short user-facing hint), `ts`.
+
+### `event_to_dict(event)` and `event_from_dict(payload)`
+
+Serialize a typed event to a JSON-ready dict (with `type` set from the class's frozen `type` field) and parse one back. Round-trips `data_source` literals, `AggregateReadyTrigger` nesting, and optional `binary_artifact_path` / `materiality_cushion` / `confidence`. `event_from_dict` raises `ValueError` on unknown `type`.
+
+### Helper constants
+
+- `TYPED_EVENT_TYPES` — frozenset of all six event-type strings.
+- `RUN_SCOPED_EVENT_TYPES` — frozenset of the five that carry a `skill_run_id` (excludes `artifact_unavailable`).
+- `TypedEvent` — union over the six event classes.
+
 ## Providers
 
 ### `ModelProvider`

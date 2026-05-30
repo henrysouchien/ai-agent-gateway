@@ -148,6 +148,8 @@ def on_tool_timing(
   duration_ms: int,
   is_error: bool,
   result_bytes: int,
+  *,
+  user_id: str | None = None,
 ) -> None:
   append_jsonl(
     LOGS_DIR / "tool_timing.jsonl",
@@ -158,6 +160,7 @@ def on_tool_timing(
       "duration_ms": duration_ms,
       "is_error": is_error,
       "result_bytes": result_bytes,
+      "user_id": user_id,
     },
   )
 

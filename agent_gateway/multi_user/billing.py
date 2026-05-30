@@ -29,6 +29,7 @@ class UsageEvent:
   rate_table_version: str
   billing_mode: Literal["byok", "metered"]
   channel: str | None
+  product_id: str | None = None
   event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
@@ -55,6 +56,7 @@ class SessionUsageSummary:
   ended_at: float
   drain_complete: bool = True
   in_flight_task_count: int = 0
+  product_id: str | None = None
 
 
 @dataclass

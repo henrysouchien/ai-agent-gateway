@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -17,6 +18,17 @@ from agent_gateway.providers.anthropic import _format_anthropic_rejection_detail
 
 def _model_info() -> ModelInfo:
   return ModelInfo(id="claude-sonnet-4-6", provider="anthropic")
+
+
+def _make_anthropic_api_status_error(status_code: int, message: str):
+  anthropic = pytest.importorskip("anthropic")
+  request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+  response = httpx.Response(status_code, request=request)
+  return anthropic.APIStatusError(
+    message,
+    response=response,
+    body={"error": {"message": message}},
+  )
 
 
 def test_normalize_messages_synthetic_tool_result_has_no_internal_tool_name() -> None:
@@ -231,6 +243,24 @@ def test_stream_wraps_anthropic_rejection_with_sanitized_context(caplog) -> None
   assert "tools=1" in message
   assert "compact-2026-01-12" in message
   assert raw_key not in caplog.text
+
+
+def test_stream_status_200_api_error_remains_retryable() -> None:
+  provider = AnthropicProvider()
+  error = _make_anthropic_api_status_error(200, "stream failed")
+  client = _FakeClient(error)
+  params = {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 4096,
+    "messages": [{"role": "user", "content": "hello"}],
+    "tools": [],
+  }
+
+  with pytest.raises(Exception) as exc_info:
+    asyncio.run(_drain_stream(provider, client, params))
+
+  assert exc_info.value is error
+  assert provider.is_retryable_error(error) is True
 
 
 def test_stream_surfaces_ping_and_silent_thinking_as_internal_heartbeats() -> None:

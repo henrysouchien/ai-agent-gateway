@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,11 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentSessionLog, EventLog
+# entry.py calls validate_product_id_or_raise() at import (app fail-fast).
+# Provide a valid placeholder so the module imports in CI / fresh checkouts
+# where PRODUCT_ID (a deployment env var) is unset. setdefault never overrides
+# a real value; nothing in the suite asserts PRODUCT_ID-unset behavior.
+os.environ.setdefault("PRODUCT_ID", "hank-test")
 from api.agent.autonomous import entry as autonomous_entry
 
 
@@ -243,7 +249,15 @@ def test_run_once_skips_summary_on_interrupted_run(
   monkeypatch.setattr(autonomous_entry, "run_agent_session", _fake_run_agent_session)
   monkeypatch.setattr(autonomous_entry, "_shutdown_session", _fake_shutdown_session)
   monkeypatch.setattr(autonomous_entry, "send_telegram_summary", lambda *args, **kwargs: None)
-  monkeypatch.setattr(autonomous_entry, "generate_analyst_session_summary", _fake_generate_summary)
+  # entry.py imports generate_analyst_session_summary lazily inside
+  # _analyst_context_helpers(); patch that seam (both run_once call sites use it)
+  # rather than a module-level attr that does not exist.
+  _real_builder, _ = autonomous_entry._analyst_context_helpers()
+  monkeypatch.setattr(
+    autonomous_entry,
+    "_analyst_context_helpers",
+    lambda: (_real_builder, _fake_generate_summary),
+  )
   monkeypatch.setattr(autonomous_entry.workspace_state_io, "_safe_read_json", _unexpected_read)
   monkeypatch.setattr(autonomous_entry.workspace_state_io, "_atomic_write_json", _unexpected_write)
 
@@ -337,7 +351,14 @@ def test_run_once_times_out_session_summary(
   monkeypatch.setattr(autonomous_entry, "run_agent_session", _fake_run_agent_session)
   monkeypatch.setattr(autonomous_entry, "_shutdown_session", _fake_shutdown_session)
   monkeypatch.setattr(autonomous_entry, "send_telegram_summary", lambda *args, **kwargs: None)
-  monkeypatch.setattr(autonomous_entry, "generate_analyst_session_summary", _hanging_generate_summary)
+  # See note in test_run_once_skips_summary_on_interrupted_run: patch the lazy
+  # _analyst_context_helpers() seam, not a nonexistent module-level attr.
+  _real_builder, _ = autonomous_entry._analyst_context_helpers()
+  monkeypatch.setattr(
+    autonomous_entry,
+    "_analyst_context_helpers",
+    lambda: (_real_builder, _hanging_generate_summary),
+  )
   caplog.set_level("WARNING", logger="chat.autonomous_entry")
 
   exit_code = _run(autonomous_entry.run_once(profile))

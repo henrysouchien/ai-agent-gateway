@@ -15,6 +15,7 @@ _FALLBACK_DEFAULT_MODELS = {
 _FALLBACK_ALLOWED_MODELS = {
   "anthropic": {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"},
   "codex": {
+    "gpt-5.5",
     "gpt-5.1",
     "gpt-5.1-codex-max",
     "gpt-5.1-codex-mini",
@@ -24,7 +25,7 @@ _FALLBACK_ALLOWED_MODELS = {
     "gpt-5.3-codex-spark",
     "gpt-5.4",
   },
-  "openai": {"gpt-4o", "gpt-4o-mini", "o1", "o1-mini", "o3-mini"},
+  "openai": {"gpt-5.5", "gpt-4o", "gpt-4o-mini", "o1", "o1-mini", "o3-mini"},
 }
 
 

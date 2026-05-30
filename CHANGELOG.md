@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased (post-0.15.0)
+
+### Added — Agent Control Plane v1 (10 PRs + 1 fix, 2026-05-20 → 2026-05-28)
+
+Channel-agnostic HTTP control surface under `/control/...` for skill discovery, run dispatch (chat + autonomous), monitoring, schedule management, approval handling, and artifact browsing. The TUI (and future Telegram + Excel add-in tab) consume this surface; agents-mcp's autonomous tools (`agent_run_start/status/wait/logs/cancel`) become HTTP relays to the same endpoints (Claude's behavior unchanged).
+
+**New endpoint families:**
+- `POST /control/session` — mints a lightweight `kind="control"` session JWT from a channel-bound API key (15-min default TTL).
+- `GET /control/health` — returns `{status, version, endpoints}`; emits `X-Control-Plane-Version: 1` response header on all `/control/*` responses.
+- `GET /control/skills`, `GET /control/skills/:name` — read-only catalog of frontmatter + resolved body (excludes `catalog: false`).
+- `POST /control/runs` — discriminated dispatch for chat or autonomous runs (returns `ChatDispatchResponse` with new chat-session token, or `AutonomousDispatchResponse` with `task_id`).
+- `POST /control/runs/:id/messages` — chat continuation.
+- `GET /control/runs`, `GET /control/runs/:id`, `GET /control/runs/:id/logs`, `DELETE /control/runs/:id` — unified read + cancel across chat and autonomous.
+- `GET /control/events` — unified SSE stream subscribing to the new `UserEventBus`; replays per-run buffered events on attach.
+- `GET /control/schedules`, `:name`, `:name/logs`, `POST`, `PUT :name/enabled`, `DELETE :name?confirm=true` — full schedule CRUD across launchd + jobs-mcp backends (operator-global scope).
+- `GET /control/approvals`, `POST /control/runs/:run_id/approvals/:approval_id` — list + path-scoped resolve over the shipped F131 `ApprovalRequestStore`.
+- `GET /control/artifacts` — cross-cutting recent artifact list across all skills (capped at 50, filterable by ticker + skill).
+
+**Internal additions:**
+- `agent_gateway.session.GatewaySession.kind` — `"chat" | "control"` discriminator. `SessionStore.create_session(..., ttl_seconds=N)` per-session TTL override.
+- `agent_gateway.event_log.UserEventBus` — in-process per-user pub/sub with per-session ordering, bounded 1000-event subscriber queues (oldest-drop with `events_dropped` sentinel), per-run replay buffer (5000 events keyed by `(user_id, control_run_id)`, 60s grace after run termination), shielded `BackgroundTask` cleanup.
+- `agent_gateway.session_event_history.SessionEventHistory` — append-only bounded 5000-event retention attached to `GatewaySession`; survives across chat turns until session expiry. Distinct from per-stream `EventLog`.
+- `agent_gateway.autonomous_runner` (relocated from `mcp_servers/agents_mcp/subprocess_runner.py`) — gateway-owned `AutonomousRegistry` with per-user identity (`user_id`, `user_email`, `events_path`, `control_run_id` on `AutonomousTask`). Eager-tail tail task on spawn; events written to `{task_id}.events.jsonl` by the child runner and published into `UserEventBus`.
+- `agent_gateway.approvals._record_vote_and_unblock` — shared helper extracted from `/chat/tool-approval`; called by both the legacy chat path and the new control-plane endpoint. Role-class precheck via `ApprovalPolicy.role_authorized_for_class` gated to approvals only (denials/cancellations skip the check so low-role users can cancel `irreversible`-class held approvals).
+- `_dispatch_chat_turn()` non-ASGI helper extracted from the `/chat` handler; both `/chat` and `POST /control/runs {kind:"chat"}` call it. Stream-lifecycle (`stream_active` flag) managed inside the helper with `try/finally`.
+
+### Changed
+
+- Existing `/artifacts/{ticker}/{skill}/...` and `/letters/...` endpoints now accept **bearer JWT OR signed-claim** auth via a shared `_artifact_auth_dependency` (bearer-first; signed-claim only when no `Authorization` header is present). Existing signed-claim callers continue to work unchanged.
+- `agents-mcp` autonomous tools (`agent_run_start/status/wait/logs/cancel`) — internal cutover to HTTP relays against the control plane. Claude-facing behavior unchanged (`agent_run_start` still returns `task_id` etc.).
+- `mcp_servers/agents_mcp/subprocess_runner.py` — DELETED (logic relocated to `packages/agent-gateway/agent_gateway/autonomous_runner.py`).
+- `/chat/tool-approval` handler refactored to call the shared `_record_vote_and_unblock` helper; role-class precheck added (strictly more restrictive on approvals; unchanged on denials).
+- `tui` channel added to `GATEWAY_USER_KEYS` v2 channel taxonomy. Wired through channel registry, credential resolver, `WEB_TOOL_CHANNELS`, agents-mcp validator, and chat_costs attribution. **Note:** the actual SSM key entry (`sk_henry_tui_<token>`) was not added in this round — open follow-up; e2e currently uses `cli` channel for testing.
+
+### Fixed
+
+- **Autonomous subprocess boot regression.** PR6 declared `from mcp_servers.scheduler_mcp import server` and `from investment_tools.jobs import api` at module top in `control_plane/schedules.py`. The autonomous child (`python -m agent.autonomous`) transitively imports the gateway code chain and hit `ModuleNotFoundError` because `mcp_servers` isn't on the child's restricted `PYTHONPATH`. Fix: convert both to `@functools.cache` lazy module-level getters (`_scheduler_mcp()` / `_jobs_api()`); schedule endpoints lazy-load on first call (gateway has the modules on path); other consumers can import `control_plane/schedules.py` without triggering the chain.
+
+### Spec / docs
+
+- `docs/design/completed/agent-control-plane-spec.md` — round 8 CODEX PASS.
+- `docs/design/completed/agent-control-plane-impl-plan.md` — round 8 CODEX PASS.
+- `docs/design/completed/skill-run-id-rename-spec.md` — round 2 CODEX PASS. Renamed demo-surface's per-skill-invocation `run_id` field to `skill_run_id` (frees the unqualified `run_id` for the control plane outer Run ID).
+- `docs/design/completed/schedules-lazy-imports-task.md` — round 2 CODEX PASS. Lazy-imports fix for PR6 autonomous subprocess boot regression.
+
 ## 0.15.0
 
 ### Added

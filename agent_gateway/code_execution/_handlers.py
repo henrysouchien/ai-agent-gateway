@@ -194,17 +194,19 @@ def build_code_execution(
         session.background_tasks.pop(task_id, None)
       return {"status": "cancelled", "task_id": task_id}, None
 
-    if poll_result.get("status") == "completed":
+    if poll_result.get("status") == "completed" or _handle_has_exited(task.handle):
       result = await task.safe_collect(backend)
       if task._terminated:
         session.background_tasks.pop(task_id, None)
       return result, None
 
+    stdout_tail = task.stdout_buf.tail(20) or str(poll_result.get("stdout_tail") or "")
+    stderr_tail = task.stderr_buf.tail(5) or str(poll_result.get("stderr_tail") or "")
     return {
       "status": "running",
       "task_id": task_id,
-      "stdout_tail": task.stdout_buf.tail(20),
-      "stderr_tail": task.stderr_buf.tail(5),
+      "stdout_tail": stdout_tail,
+      "stderr_tail": stderr_tail,
     }, None
 
   def _approval_qualifier(tool_name: str, tool_input: Dict[str, Any]) -> str:

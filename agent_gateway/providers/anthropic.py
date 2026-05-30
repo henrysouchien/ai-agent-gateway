@@ -784,7 +784,16 @@ class AnthropicProvider(ModelProvider):
               block = _to_plain_dict(current_tool_block)
               if not isinstance(block, dict):
                 block = {"type": "tool_use", "id": current_tool_id, "name": current_tool_name}
-              block["input"] = tool_input
+              try:
+                from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
+
+                block["input"] = redact_tool_input(
+                  str(current_tool_name or ""),
+                  tool_input,
+                  deployment_secret=get_audit_hmac_secret(),
+                )
+              except Exception:
+                block["input"] = tool_input
               yield StreamEvent(
                 type="tool_use_end",
                 tool_id=str(current_tool_id),
@@ -851,7 +860,7 @@ class AnthropicProvider(ModelProvider):
         response = getattr(exc, "response", None)
         if response is not None:
           status_code = getattr(response, "status_code", None)
-      return status_code == 429 or (isinstance(status_code, int) and 500 <= status_code < 600)
+      return status_code in {200, 429} or (isinstance(status_code, int) and 500 <= status_code < 600)
     if isinstance(exc, APIConnectionError):
       return True
     if isinstance(exc, (httpx.TransportError, httpx.StreamError)):

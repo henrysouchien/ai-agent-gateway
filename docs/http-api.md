@@ -49,6 +49,7 @@ Response body:
 
 ```json
 {
+  "user_id": "alice",
   "session_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "session_id": "sess_1234abcd5678",
   "expires_at": 1770000000,
@@ -64,6 +65,7 @@ Schema:
 
 | Field | Type | Notes |
 | --- | --- | --- |
+| `user_id` | string | Resolved end-user identity. When the request body `user_id` is set, this echoes it. When a credentials resolver derives identity from the API key, this is the resolver's resolved value. Clients should thread this value onto subsequent `POST /api/chat` calls so the gateway can enforce strict-mode identity checks. Added in 0.15.0. |
 | `session_token` | string | JWT bearer token for later requests |
 | `session_id` | string | Server-generated session id |
 | `expires_at` | integer | Unix timestamp |
@@ -258,6 +260,70 @@ Example:
 ```bash
 curl -s http://127.0.0.1:8000/api/health
 ```
+
+### Artifact endpoints
+
+Added in 0.15.0. Four read-only GET endpoints serve artifact JSON sidecars and `.docx` letter binaries from per-user workspace storage (`data/users/<user>/workspace/artifacts/` and `.../letters/`). The artifact files are written server-side by the skill-framework materializer — these endpoints are read-only.
+
+**Auth: signed end-user claim, not session JWT.** Each request must carry seven `X-Agent-Claim-*` headers (`Audience`, `Issued-At`, `Expiry`, `User-Id`, `User-Email`, `Nonce`, `Signature`). The signature is HMAC-SHA256 over `audience\nissued_at\nexpiry\nuser_id\nuser_email\nnonce` using a key the gateway operator pre-shares with the artifact client. This is the same signed-claim scheme Theme A introduced for `POST /api/chat/init`; the verifier is shared.
+
+**Path safety.** All four endpoints reject:
+- `..`-traversal (raw and URL-encoded)
+- Symlink escape outside the user's workspace
+- Cross-user access (404, not 403, to avoid info-leak)
+
+Two additional path-traversal-guard routes (`GET /api/artifacts/{path:path}` and `GET /api/letters/{path:path}`) catch all unsafe paths and return 400 or 404.
+
+#### GET /api/artifacts/{ticker}/{skill}/latest
+
+Return the JSON sidecar of the most recent artifact for `(ticker, skill)`.
+
+Response: the raw JSON sidecar payload (shape depends on the skill's contract).
+
+Status codes:
+- `200` — artifact found, body is the JSON content
+- `400` — unsafe path
+- `404` — no artifact for this `(ticker, skill)`
+
+Response headers:
+- `Cache-Control: private, max-age=0`
+- `ETag: W/"<mtime>-<size>"` (weak ETag for cheap re-fetch checks)
+
+#### GET /api/artifacts/{ticker}/{skill}/{artifact_id}
+
+Return the JSON sidecar of a specific artifact.
+
+Response: the raw JSON sidecar payload.
+
+Status codes: as above. `artifact_id` matches the JSON filename stem.
+
+#### GET /api/artifacts/{ticker}
+
+Return an index of available skills + their latest artifact ids for a ticker.
+
+Response body:
+
+```json
+[
+  {"skill": "fundamental-research", "latest_artifact_id": "20260520T173401"},
+  {"skill": "earnings-scenarios", "latest_artifact_id": "20260518T091200"}
+]
+```
+
+Returns an empty array (`200`) when the ticker directory does not exist.
+
+#### GET /api/letters/{ticker}/{artifact_id}
+
+Return the `.docx` letter binary.
+
+Response: `FileResponse` with media type `application/vnd.openxmlformats-officedocument.wordprocessingml.document`.
+
+Status codes:
+- `200` — letter found
+- `400` — unsafe path
+- `404` — letter not found
+
+Response headers: `Cache-Control: private, max-age=0` + weak `ETag` (same scheme as JSON endpoints).
 
 ## SSE Event Types
 
@@ -780,6 +846,119 @@ Additional fields:
 | `sender` | object | Sender metadata with `session_id` and `user_id`, each string or null |
 | `sent_at` | number | Unix timestamp when the parent message was sent |
 | `message` | string | Message text delivered to the sub-agent |
+
+### Skill Framework Events
+
+Added in 0.15.0. Six typed events emitted when the host wires up the skill-framework profile contract — running an embedder that does not set `skill_run_id` + `profile` on sub-agent calls will never see these. Five carry a `skill_run_id` for run correlation; `artifact_unavailable` is renderer-side only and has no run. The Python dataclasses live in `agent_gateway.events` (see api-reference.md).
+
+#### `skill_run_started`
+
+Emitted once at the start of a skill-framework sub-agent run.
+
+```json
+{
+  "type": "skill_run_started",
+  "skill_run_id": "run_8a3f",
+  "skill": "fundamental-research",
+  "ticker": "AAPL",
+  "ts": 1770000000.0
+}
+```
+
+#### `verdict_emitted`
+
+Emitted when the skill writes a verdict YAML through its `memory_write` (extracted from the most recent verdict-bearing tool result).
+
+```json
+{
+  "type": "verdict_emitted",
+  "skill_run_id": "run_8a3f",
+  "skill": "fundamental-research",
+  "ticker": "AAPL",
+  "verdict_token": "MATERIAL_POSITIVE",
+  "confidence": "HIGH",
+  "materiality_cushion": 0.15,
+  "one_line_summary": "Capital allocation continues to compound at ~22% ROIC.",
+  "ts": 1770000005.2
+}
+```
+
+Field types: `confidence` is `"HIGH" | "MEDIUM" | "LOW" | null`. `materiality_cushion` is a float or null.
+
+#### `artifact_ready`
+
+Emitted when the materializer writes a JSON sidecar artifact (and optionally a `.docx` binary) to per-user workspace storage. Pairs with the artifact-read endpoints documented above.
+
+```json
+{
+  "type": "artifact_ready",
+  "skill_run_id": "run_8a3f",
+  "ticker": "AAPL",
+  "skill": "fundamental-research",
+  "artifact_id": "20260520T173401",
+  "artifact_path": "data/users/alice/workspace/artifacts/AAPL/fundamental-research/20260520T173401.json",
+  "binary_artifact_path": "data/users/alice/workspace/letters/AAPL/20260520T173401.docx",
+  "contract_name": "fundamental_research_v1",
+  "data_source": "live",
+  "ts": 1770000010.0
+}
+```
+
+Field types: `binary_artifact_path` is a string or null. `data_source` is `"live" | "fixture"`.
+
+#### `aggregate_ready`
+
+Emitted when an aggregate view-model reaches the sources-complete state.
+
+```json
+{
+  "type": "aggregate_ready",
+  "skill_run_id": "run_8a3f",
+  "ticker": "AAPL",
+  "view_model_id": "ticker_summary_v1",
+  "trigger": {"kind": "artifact_ready", "source": "fundamental-research"},
+  "sources_complete": true,
+  "ts": 1770000011.0
+}
+```
+
+`trigger.kind` is `"artifact_ready" | "tool_response"`.
+
+#### `artifact_failed`
+
+Emitted when the materializer fails to produce an artifact (YAML parse error, schema-drift, validation, etc.).
+
+```json
+{
+  "type": "artifact_failed",
+  "skill_run_id": "run_8a3f",
+  "ticker": "AAPL",
+  "skill": "fundamental-research",
+  "error_code": "schema_drift",
+  "error_detail": "expected field 'confidence' missing from verdict block",
+  "source_path": "memory/verdict.yaml",
+  "ts": 1770000010.0
+}
+```
+
+`error_code` is one of `"yaml_parse" | "validation" | "missing_contract" | "schema_drift" | "other"`.
+
+#### `artifact_unavailable`
+
+Renderer-side event with no associated skill run. Surfaced when the UI/aggregator looks up an artifact for `(ticker, skill)` and finds it absent. The `affordance` field is a short user-facing hint.
+
+```json
+{
+  "type": "artifact_unavailable",
+  "ticker": "AAPL",
+  "skill": "fundamental-research",
+  "reason": "no_runs_yet",
+  "affordance": "Run /research to populate this view.",
+  "ts": 1770000020.0
+}
+```
+
+`reason` is one of `"no_runs_yet" | "stale" | "fixture_only" | "auth_blocked"`.
 
 ## Session Lifecycle
 

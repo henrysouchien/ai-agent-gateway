@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from datetime import UTC, datetime
 import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -73,6 +76,43 @@ def resolve_agent_session_id(user_id: str, agent_id: str) -> str:
   return f"agentsess_{slugify(agent_id)}_{slugify(user_id)}"
 
 
+def _now_iso() -> str:
+  return datetime.now(UTC).isoformat()
+
+
+def _fsync_parent_dir(path: Path) -> None:
+  fd = os.open(str(path), os.O_RDONLY)
+  try:
+    os.fsync(fd)
+  finally:
+    os.close(fd)
+
+
+def _atomic_write_sidecar(meta_path: Path, meta: dict[str, Any]) -> None:
+  """Write a sidecar atomically on local POSIX filesystems."""
+  if meta_path.exists():
+    return
+  parent = meta_path.parent
+  parent.mkdir(parents=True, exist_ok=True)
+  fd, tmp_name = tempfile.mkstemp(prefix=f"{meta_path.name}.", suffix=".tmp", dir=parent)
+  try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      json.dump(meta, handle, separators=(",", ":"), ensure_ascii=True)
+      handle.write("\n")
+      handle.flush()
+      os.fsync(handle.fileno())
+    if meta_path.exists():
+      with contextlib.suppress(OSError):
+        os.unlink(tmp_name)
+      return
+    os.replace(tmp_name, meta_path)
+    _fsync_parent_dir(parent)
+  except Exception:
+    with contextlib.suppress(OSError):
+      os.unlink(tmp_name)
+    raise
+
+
 class AgentSessionLog:
   """Durable JSONL-backed event log for one `(user_id, agent_id)` pair."""
 
@@ -103,6 +143,9 @@ class AgentSessionLog:
     self._max_cached_seq = 0
     self._cache_complete = False
 
+    if session_ref is not None:
+      self._write_meta_sidecar(session_ref)
+
   @staticmethod
   def path_for_session(base_dir: str | Path, session_ref: AgentSessionRef) -> Path:
     expected_agent_session_id = resolve_agent_session_id(session_ref.user_id, session_ref.agent_id)
@@ -110,6 +153,30 @@ class AgentSessionLog:
       raise ValueError("agent_session_id does not match canonical resolution")
     agent_dir = Path(base_dir).expanduser() / slugify(session_ref.agent_id)
     return agent_dir / f"{expected_agent_session_id}.jsonl"
+
+  def _write_meta_sidecar(self, session_ref: AgentSessionRef) -> None:
+    meta_path = self.path.with_suffix(".meta.json")
+    if meta_path.exists():
+      return
+    try:
+      from .product_config import gateway_product_id
+
+      _atomic_write_sidecar(
+        meta_path,
+        {
+          "schema_version": 1,
+          "agent_session_id": session_ref.agent_session_id,
+          "agent_id": session_ref.agent_id,
+          "user_id": session_ref.user_id,
+          "product_id": gateway_product_id() or None,
+          "file_kind": "canonical",
+          "channel": None,
+          "profile": None,
+          "created_at": _now_iso(),
+        },
+      )
+    except Exception:
+      log.warning("Sidecar write failed for %s (telemetry-only)", meta_path, exc_info=True)
 
   async def append(self, event: dict[str, Any]) -> LogEntry:
     return await asyncio.to_thread(self._append_sync, dict(event))
@@ -422,6 +489,7 @@ __all__ = [
   "AgentSessionRef",
   "LogEntry",
   "QueryCursor",
+  "_atomic_write_sidecar",
   "resolve_agent_session_id",
   "slugify",
 ]

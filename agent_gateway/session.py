@@ -11,6 +11,8 @@ from typing import Any, Awaitable, Callable, Dict, Literal, Optional, Set
 import jwt
 from fastapi import HTTPException
 
+from .session_event_history import SessionEventHistory
+
 
 JWT_ALGORITHM = "HS256"
 OnSessionExpiry = Callable[["GatewaySession"], Awaitable[None]]
@@ -43,6 +45,7 @@ class GatewaySession:
   user_email: str | None = None
   risk_user_id: int = 0
   role: Literal["owner", "invite"] = "owner"
+  kind: Literal["chat", "control"] = "chat"
   auth_config: dict[str, Any] | None = None
   channel: Optional[str] = None
   is_public: bool = False
@@ -51,10 +54,15 @@ class GatewaySession:
   approved_tool_types: Set[str] = field(default_factory=set)
   loaded_mcp_servers: Set[str] = field(default_factory=set)
   approval_queues: Dict[str, asyncio.Queue] = field(default_factory=dict)
+  approval_store: Any | None = None
+  approval_policy: Any | None = None
+  approval_expire_pending_task: asyncio.Task[Any] | None = None
   tool_sequence: int = 0
   result_queue: Optional[asyncio.Queue] = None
   code_execution_work_dir: Optional[str] = None
   background_tasks: Dict[str, Any] = field(default_factory=dict)
+  event_history: SessionEventHistory = field(default_factory=SessionEventHistory)
+  initial_message: str = ""
   _expiring: bool = False
 
 
@@ -77,20 +85,24 @@ class SessionStore:
     user_email: str | None = None,
     risk_user_id: int = 0,
     role: Literal["owner", "invite"] = "owner",
+    kind: Literal["chat", "control"] = "chat",
     auth_config: dict[str, Any] | None = None,
+    ttl_seconds: int | None = None,
   ) -> GatewaySession:
     now = int(time.time())
+    ttl = self.ttl if ttl_seconds is None else int(ttl_seconds)
     session_id = f"sess_{uuid.uuid4().hex}"
     normalized_user_id = _normalize_required_user_id(user_id)
     session = GatewaySession(
       session_id=session_id,
       api_key_hash=api_key_hash,
       created_at=now,
-      expires_at=now + self.ttl,
+      expires_at=now + ttl,
       user_id=normalized_user_id,
       user_email=user_email,
       risk_user_id=risk_user_id,
       role=role,
+      kind=kind,
       auth_config=dict(auth_config) if auth_config is not None else None,
       result_queue=asyncio.Queue(),
     )

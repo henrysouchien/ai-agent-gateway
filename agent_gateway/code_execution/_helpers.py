@@ -35,6 +35,7 @@ _SANDBOX_ENV_DENYLIST = frozenset(
     "CHAT_VALID_KEYS",
     "EXCEL_MCP_API_KEY",
     "ADDIN_DISPATCH_API_KEY",
+    "RISK_API_KEY",
   }
 )
 
@@ -93,28 +94,71 @@ def _strip_sandbox_secrets(env: Dict[str, str]) -> Dict[str, str]:
 def _default_code_execute_preamble(task_id: str = "") -> str:
   plot_prefix = f"_plot_{task_id}_" if task_id else "_plot_"
   return f"""\
+import importlib.abc as _importlib_abc
 import os as _os
+import sys as _sys
+
 _WORK_DIR = _os.getcwd()
 _PLOT_PREFIX = {plot_prefix!r}
+_PLOT_COUNTER = [0]
+_os.environ.setdefault("MPLBACKEND", "Agg")
 
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as _plt
-    _plot_counter = [0]
-    _original_show = _plt.show
+
+def _code_execute_patch_pyplot(_plt):
+    if getattr(_plt, "_code_execute_show_patched", False):
+        return
+
     def _patched_show(*args, **kwargs):
         for _fig_num in _plt.get_fignums():
             _fig = _plt.figure(_fig_num)
-            _plot_counter[0] += 1
+            _PLOT_COUNTER[0] += 1
             _fig.savefig(
-                _os.path.join(_WORK_DIR, f"{{_PLOT_PREFIX}}{{_plot_counter[0]}}.png"),
+                _os.path.join(_WORK_DIR, f"{{_PLOT_PREFIX}}{{_PLOT_COUNTER[0]}}.png"),
                 dpi=150, bbox_inches="tight",
             )
         _plt.close("all")
+
     _plt.show = _patched_show
-except ImportError:
-    pass
+    _plt._code_execute_show_patched = True
+
+
+class _CodeExecutePyplotLoader(_importlib_abc.Loader):
+    def __init__(self, loader):
+        self._loader = loader
+
+    def create_module(self, spec):
+        create_module = getattr(self._loader, "create_module", None)
+        if create_module is None:
+            return None
+        return create_module(spec)
+
+    def exec_module(self, module):
+        self._loader.exec_module(module)
+        _code_execute_patch_pyplot(module)
+
+
+class _CodeExecutePyplotFinder(_importlib_abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname != "matplotlib.pyplot":
+            return None
+        for finder in list(_sys.meta_path):
+            if finder is self:
+                continue
+            find_spec = getattr(finder, "find_spec", None)
+            if find_spec is None:
+                continue
+            spec = find_spec(fullname, path, target)
+            if spec is None:
+                continue
+            if spec.loader is not None:
+                spec.loader = _CodeExecutePyplotLoader(spec.loader)
+            return spec
+        return None
+
+
+_sys.meta_path.insert(0, _CodeExecutePyplotFinder())
+if "matplotlib.pyplot" in _sys.modules:
+    _code_execute_patch_pyplot(_sys.modules["matplotlib.pyplot"])
 """
 
 

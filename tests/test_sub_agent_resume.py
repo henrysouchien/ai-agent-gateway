@@ -270,7 +270,12 @@ def test_resume_handler_rejects_non_interrupted_task(tmp_path: Path) -> None:
       "---\nagent_callable: true\nagent_description: Earnings.\nresumable: true\n---\nPrompt",
       encoding="utf-8",
     )
-    handler = make_resume_handler([runner], skill_loader=SkillLoader(skills_dir), mcp_client=_NullMcpClient())
+    handler = make_resume_handler(
+      [runner],
+      skill_loader=SkillLoader(skills_dir),
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+    )
 
     result, error = await handler({"task_id": "bg_3"})
 
@@ -291,7 +296,12 @@ def test_resume_handler_rejects_non_resumable_skill(tmp_path: Path) -> None:
       "---\nagent_callable: true\nagent_description: Email.\n---\nPrompt",
       encoding="utf-8",
     )
-    handler = make_resume_handler([runner], skill_loader=SkillLoader(skills_dir), mcp_client=_NullMcpClient())
+    handler = make_resume_handler(
+      [runner],
+      skill_loader=SkillLoader(skills_dir),
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+    )
 
     result, error = await handler({"task_id": "bg_3"})
 
