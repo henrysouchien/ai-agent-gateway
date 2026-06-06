@@ -73,14 +73,21 @@ def _runner_with_log(_event_log: EventLog) -> _NoopRunner:
   return _NoopRunner()
 
 
-def _control_session(client: TestClient, user_id: str, *, email: str | None = None) -> dict[str, Any]:
+def _control_session(
+  client: TestClient,
+  user_id: str,
+  *,
+  email: str | None = None,
+  channel: str | None = "tui",
+) -> dict[str, Any]:
+  context = {"channel": channel} if channel is not None else {}
   response = client.post(
     "/api/control/session",
     json={
       "api_key": API_KEY,
       "user_id": user_id,
       "user_email": email or f"{user_id}@example.com",
-      "context": {"channel": "tui"},
+      "context": context,
     },
   )
   assert response.status_code == 200, response.text
@@ -187,6 +194,103 @@ def test_autonomous_control_endpoints_spawn_read_logs_cancel_and_enforce_user_sc
     assert processes[0].returncode == -15
 
 
+def test_autonomous_dispatch_requires_control_session(monkeypatch, tmp_path) -> None:
+  _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    chat_session = app.state.auth.session_store.create_session(
+      api_key_hash="test-hash",
+      user_id="alice",
+      user_email="alice@example.com",
+      kind="chat",
+    )
+    chat_session.channel = "tui"
+    chat_token = app.state.auth.issue_token(chat_session)
+
+    response = client.post(
+      "/api/control/runs",
+      headers={"Authorization": f"Bearer {chat_token}"},
+      json={"kind": "autonomous", "profile": "analyst", "mode": "task", "task": "summarize"},
+    )
+
+    assert response.status_code == 401
+    assert app.state.subprocess_registry._tasks == {}
+
+
+def test_autonomous_dispatch_rejects_control_session_channel_override(monkeypatch, tmp_path) -> None:
+  _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice", channel="web")
+
+    response = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "_fixture",
+        "mode": "skill",
+        "skill": "fixture-sleep",
+        "channel": "tui",
+      },
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Channel mismatch"
+    assert app.state.subprocess_registry._tasks == {}
+
+
+def test_autonomous_dispatch_rejects_web_fixture_and_dev_mode_before_spawn(monkeypatch, tmp_path) -> None:
+  processes, envs = _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+  cases = [
+    {"profile": "_fixture", "skill": "earnings-review"},
+    {"profile": "analyst", "skill": "fixture-sleep"},
+    {"profile": "analyst", "skill": "earnings-review", "dev_mode": True},
+    {"profile": "analyst", "skill": "earnings-review", "dev_mode": False},
+  ]
+
+  with TestClient(app) as client:
+    web_session = _control_session(client, "alice", channel="web")
+    payload_web_session = _control_session(client, "bob", channel=None)
+
+    for session, payload_channel in (
+      (web_session, None),
+      (payload_web_session, "web"),
+    ):
+      for overrides in cases:
+        payload = {
+          "kind": "autonomous",
+          "profile": "analyst",
+          "mode": "skill",
+          "skill": "earnings-review",
+          "context": "Exercise fixture guard.",
+          "ticker": "AAPL",
+          **overrides,
+        }
+        if payload_channel is not None:
+          payload["channel"] = payload_channel
+        response = client.post(
+          "/api/control/runs",
+          headers=_headers(session),
+          json=payload,
+        )
+
+        assert response.status_code == 403
+        assert response.json() == {
+          "detail": {
+            "error": "web_control_dev_dispatch_forbidden",
+            "message": "Web Agent Control cannot launch fixture or dev-mode autonomous runs.",
+          }
+        }
+
+  assert app.state.subprocess_registry._tasks == {}
+  assert processes == []
+  assert envs == []
+
+
 def test_gateway_shutdown_terminates_inflight_autonomous_process(monkeypatch, tmp_path) -> None:
   processes, _envs = _install_fake_spawn(monkeypatch)
   app = _make_app(monkeypatch, tmp_path)
@@ -243,7 +347,7 @@ def test_agents_mcp_relay_round_trips_all_autonomous_tools(monkeypatch, tmp_path
         profile="analyst",
         mode="task",
         task="summarize",
-        channel="tui",
+        channel=None,
       )
     )
     assert start["task_id"] == "bg_0"

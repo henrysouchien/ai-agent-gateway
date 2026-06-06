@@ -32,6 +32,7 @@ class ControlSessionResponse(BaseModel):
   expires_at: int
   kind: Literal["control"]
   user_id: str
+  channel: str | None = None
 
 
 def _normalize_user_id(user_id: str | None) -> str | None:
@@ -85,6 +86,13 @@ def _claimed_channel(payload: ControlSessionRequest) -> str | None:
   if isinstance(raw, str) and raw.strip():
     return raw.strip().lower()
   return None
+
+
+def _normalize_channel(channel: str | None) -> str | None:
+  normalized = channel.strip().lower() if isinstance(channel, str) else channel
+  if normalized == "":
+    return None
+  return normalized
 
 
 def _resolver_contract_error(message: str, *, user_id: str | None) -> JSONResponse:
@@ -146,7 +154,7 @@ def build_session_router(
       if resolved_user_id is None:
         return _error_response(MissingUserIdError("credential resolver must return user_id."))
 
-      resolved_channel = result.channel
+      resolved_channel = _normalize_channel(result.channel)
       resolved_user_email = result.user_email or resolved_user_email
       try:
         resolved_risk_user_id = int(result.risk_user_id) if result.risk_user_id is not None else 0
@@ -178,6 +186,8 @@ def build_session_router(
       return _error_response(
         MissingUserIdError("user_id is required in /control/session when no credentials resolver is configured.")
       )
+    else:
+      resolved_channel = _claimed_channel(payload)
 
     session = auth.session_store.create_session(
       api_key_hash=AuthManager.hash_api_key(payload.api_key),
@@ -200,6 +210,7 @@ def build_session_router(
       expires_at=session.expires_at,
       kind="control",
       user_id=session.user_id,
+      channel=session.channel,
     )
 
   return router

@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
 from agent_gateway.event_log import EventLog
+from agent_gateway.fixture_gate import is_fixture_profile_name, is_fixture_skill_name
 from agent_gateway.session import AuthManager, GatewaySession
 
 
@@ -342,6 +343,38 @@ def _normalize_channel(channel: str | None) -> str | None:
   return normalized or None
 
 
+def _payload_field_was_set(payload: BaseModel, field_name: str) -> bool:
+  fields_set = getattr(payload, "model_fields_set", None)
+  if fields_set is None:
+    fields_set = getattr(payload, "__fields_set__", set())
+  return field_name in fields_set
+
+
+def _require_web_safe_autonomous_dispatch(
+  payload: AutonomousDispatchRequest,
+  *,
+  channel: str | None,
+) -> None:
+  if _normalize_channel(channel) != "web":
+    return
+
+  profile = str(payload.profile or "").strip()
+  skill = str(payload.skill or "").strip()
+  if (
+    _payload_field_was_set(payload, "dev_mode")
+    or bool(payload.dev_mode)
+    or is_fixture_profile_name(profile)
+    or is_fixture_skill_name(skill)
+  ):
+    raise HTTPException(
+      status_code=403,
+      detail={
+        "error": "web_control_dev_dispatch_forbidden",
+        "message": "Web Agent Control cannot launch fixture or dev-mode autonomous runs.",
+      },
+    )
+
+
 def _require_control_session(session: GatewaySession) -> None:
   if session.kind != "control":
     raise HTTPException(status_code=401, detail="Control session required")
@@ -643,6 +676,14 @@ def build_runs_router(*, auth: AuthManager, autonomous_registry: AutonomousRegis
         chat_session_expires_at=chat_session.expires_at,
       )
 
+    _require_control_session(authenticated)
+    requested_channel = _normalize_channel(payload.channel)
+    session_channel = _normalize_channel(authenticated.channel)
+    if session_channel is not None and requested_channel is not None and session_channel != requested_channel:
+      raise HTTPException(status_code=401, detail="Channel mismatch")
+    channel = session_channel or requested_channel
+    _require_web_safe_autonomous_dispatch(payload, channel=channel)
+
     if not payload.profile or not payload.mode:
       raise HTTPException(status_code=422, detail="profile and mode are required")
 
@@ -655,7 +696,7 @@ def build_runs_router(*, auth: AuthManager, autonomous_registry: AutonomousRegis
       skill=payload.skill,
       context=payload.context,
       ticker=payload.ticker,
-      channel=payload.channel or authenticated.channel,
+      channel=channel,
       dev_mode=payload.dev_mode,
       user_id=authenticated.user_id,
       user_email=authenticated.user_email,
