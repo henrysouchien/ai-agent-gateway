@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +94,22 @@ def _dispatch_chat(client: TestClient, control: dict[str, Any], message: str = "
   return response.json()
 
 
+async def _collect_available_user_events(app: Any, user_id: str, control_run_id: str) -> list[dict[str, Any]]:
+  subscription = app.state.user_event_bus.subscribe(user_id, control_run_id=control_run_id)
+  events: list[dict[str, Any]] = []
+  try:
+    while True:
+      try:
+        events.append(await asyncio.wait_for(subscription.__anext__(), timeout=0.1))
+      except asyncio.TimeoutError:
+        return events
+  finally:
+    close = getattr(subscription, "aclose", None)
+    if callable(close):
+      await close()
+  return events
+
+
 def test_chat_messages_continue_with_chat_session_token_and_full_transcript() -> None:
   turns: list[list[dict[str, Any]]] = []
   app = _make_app(turns)
@@ -110,11 +127,15 @@ def test_chat_messages_continue_with_chat_session_token_and_full_transcript() ->
           {"role": "user", "content": "second"},
         ],
         "context": {"channel": "tui"},
+        "request_id": "continue-second",
       },
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["run"]["state"] == "completed"
+    response_body = response.json()
+    assert response_body["run"]["state"] == "completed"
+    assert response_body["message_id"] == "continue-second"
+    assert response_body["delivery_status"] == "delivered"
     assert turns == [
       [{"role": "user", "content": "first"}],
       [
@@ -126,8 +147,69 @@ def test_chat_messages_continue_with_chat_session_token_and_full_transcript() ->
 
     session = app.state.auth.session_store.get_session(dispatched["chat_session_id"])
     assert session is not None
-    retained_text = [event.get("text") for event in session.event_history.snapshot() if event.get("type") == "text_delta"]
+    retained = session.event_history.snapshot()
+    retained_text = [event.get("text") for event in retained if event.get("type") == "text_delta"]
     assert retained_text == ["echo:first", "echo:second"]
+
+    parent_events = [event for event in retained if event.get("type") == "parent_message_sent"]
+    assert parent_events == [
+      {
+        "type": "parent_message_sent",
+        "run_id": dispatched["chat_session_id"],
+        "control_run_id": dispatched["chat_session_id"],
+        "session_id": dispatched["chat_session_id"],
+        "message_id": "continue-second",
+        "request_id": "continue-second",
+        "message": "second",
+        "channel": "tui",
+        "sender": {
+          "session_id": dispatched["chat_session_id"],
+          "user_id": "alice",
+        },
+        "sent_at": parent_events[0]["sent_at"],
+        "ts": parent_events[0]["ts"],
+      }
+    ]
+
+    logs = client.get(
+      f"/api/control/runs/{dispatched['chat_session_id']}/logs?tail=20",
+      headers=_headers(control),
+    )
+    assert logs.status_code == 200, logs.text
+    log_events = [json.loads(line) for line in logs.json()["log_lines"]]
+    assert any(event == parent_events[0] for event in log_events)
+
+    replayed = asyncio.run(_collect_available_user_events(app, "alice", dispatched["chat_session_id"]))
+    assert any(event == parent_events[0] for event in replayed)
+
+    duplicate = client.post(
+      f"/api/control/runs/{dispatched['chat_session_id']}/messages",
+      headers={"Authorization": f"Bearer {dispatched['chat_session_token']}"},
+      json={
+        "messages": [
+          {"role": "user", "content": "first"},
+          {"role": "assistant", "content": "echo:first"},
+          {"role": "user", "content": "different duplicate text"},
+        ],
+        "context": {"channel": "tui"},
+        "request_id": "continue-second",
+      },
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["delivery_status"] == "duplicate"
+    assert duplicate.json()["message_id"] == "continue-second"
+    assert turns == [
+      [{"role": "user", "content": "first"}],
+      [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "echo:first"},
+        {"role": "user", "content": "second"},
+      ],
+    ]
+    retained_after_duplicate = session.event_history.snapshot()
+    assert [
+      event for event in retained_after_duplicate if event.get("type") == "parent_message_sent"
+    ] == parent_events
 
 
 def test_chat_messages_reject_wrong_or_control_session_token() -> None:

@@ -74,10 +74,10 @@ def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
   )
 
 
-def _control_session(client: TestClient, user_id: str) -> dict[str, Any]:
+def _control_session(client: TestClient, user_id: str, *, channel: str = "tui") -> dict[str, Any]:
   response = client.post(
     "/api/control/session",
-    json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": "tui"}},
+    json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": channel}},
   )
   assert response.status_code == 200, response.text
   return response.json()
@@ -204,6 +204,26 @@ def test_control_events_scopes_chat_tokens_to_their_own_run(monkeypatch, tmp_pat
       headers={"Authorization": f"Bearer {first.json()['chat_session_token']}"},
     )
     assert denied.status_code == 401
+
+
+def test_control_events_rejects_wrong_channel_control_token_for_chat_run(monkeypatch, tmp_path: Path) -> None:
+  app = _make_app(monkeypatch, tmp_path, [])
+  with TestClient(app) as client:
+    control = _control_session(client, "alice", channel="tui")
+    chat = client.post(
+      "/api/control/runs",
+      headers=_headers(control),
+      json={"kind": "chat", "message": "first", "channel": "tui"},
+    )
+    assert chat.status_code == 200, chat.text
+
+    wrong_channel = _control_session(client, "alice", channel="excel")
+    denied = client.get(
+      f"/api/control/events?control_run_id={chat.json()['chat_session_id']}",
+      headers=_headers(wrong_channel),
+    )
+
+    assert denied.status_code == 404
 
 
 def test_autonomous_runner_event_log_writes_events_jsonl(tmp_path: Path) -> None:

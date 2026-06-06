@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal, Union
@@ -148,6 +149,8 @@ class ChatContinuationRequest(BaseModel):
 
 class RunEnvelopeResponse(BaseModel):
   run: RunResponse
+  message_id: str | None = None
+  delivery_status: Literal["delivered", "duplicate"] | None = None
 
 
 def _iso_from_unix(timestamp: int | float | None) -> str:
@@ -374,6 +377,29 @@ def _event_for_run(event: dict[str, Any], control_run_id: str) -> dict[str, Any]
   return event_copy
 
 
+def _latest_user_message_content(messages: list[ChatMessage]) -> str | None:
+  for message in reversed(messages):
+    if message.role.strip().lower() != "user":
+      continue
+    content = message.content.strip()
+    if content:
+      return content
+  return None
+
+
+def _control_message_id(request_id: str | None) -> str:
+  normalized = request_id.strip() if isinstance(request_id, str) else ""
+  return normalized or str(uuid.uuid4())
+
+
+def _has_parent_message_event(session: GatewaySession, message_id: str) -> bool:
+  return any(
+    event.get("type") == "parent_message_sent"
+    and (event.get("message_id") == message_id or event.get("request_id") == message_id)
+    for event in session.event_history.snapshot()
+  )
+
+
 async def _maybe_call_on_event(callback: Any, event: dict[str, Any], control_run_id: str) -> None:
   if not callable(callback):
     return
@@ -399,6 +425,43 @@ async def _cleanup_run_buffer(app_state: Any, user_id: str, control_run_id: str)
   user_event_bus = getattr(app_state, "user_event_bus", None)
   if user_event_bus is not None:
     await user_event_bus.cleanup_run(user_id, control_run_id)
+
+
+async def _record_chat_parent_message_event(
+  *,
+  app_state: Any,
+  session: GatewaySession,
+  messages: list[ChatMessage],
+  request_id: str | None,
+) -> None:
+  message = _latest_user_message_content(messages)
+  if message is None:
+    return
+
+  control_run_id = session.session_id
+  message_id = _control_message_id(request_id)
+  if _has_parent_message_event(session, message_id):
+    return
+
+  sent_at = time.time()
+  event = {
+    "type": "parent_message_sent",
+    "run_id": control_run_id,
+    "control_run_id": control_run_id,
+    "session_id": control_run_id,
+    "message_id": message_id,
+    "request_id": message_id,
+    "message": message,
+    "channel": session.channel or "web",
+    "sender": {
+      "session_id": control_run_id,
+      "user_id": session.user_id,
+    },
+    "sent_at": sent_at,
+    "ts": sent_at,
+  }
+  session.event_history.append(event)
+  await _publish_control_event(app_state, session.user_id, control_run_id, event)
 
 
 async def _finalize_control_chat_task(
@@ -435,6 +498,7 @@ async def _dispatch_control_chat_turn(
   context: dict[str, Any],
   model: str | None,
   deadline_sec: int | None,
+  record_parent_message: bool = False,
 ) -> ChatRunResponse:
   from agent_gateway.server import ChatMessage as ServerChatMessage
   from agent_gateway.server import ChatTurnInputs, _dispatch_chat_turn
@@ -446,6 +510,8 @@ async def _dispatch_control_chat_turn(
     message if isinstance(message, ServerChatMessage) else ServerChatMessage(role=message.role, content=message.content)
     for message in messages
   ]
+  if session.stream_active:
+    raise HTTPException(status_code=409, detail="A chat stream is already active for this session")
 
   async def _on_event(event: dict[str, Any]) -> None:
     event_with_run = _event_for_run(event, control_run_id)
@@ -459,6 +525,13 @@ async def _dispatch_control_chat_turn(
       )
       pending_seen.set()
 
+  if record_parent_message:
+    await _record_chat_parent_message_event(
+      app_state=app_state,
+      session=session,
+      messages=messages,
+      request_id=request_id,
+    )
   await _publish_control_event(app_state, session.user_id, control_run_id, _run_state_event(control_run_id, "running"))
 
   event_log = EventLog(session_id=control_run_id)
@@ -622,16 +695,29 @@ def build_runs_router(*, auth: AuthManager, autonomous_registry: AutonomousRegis
     context = dict(payload.context or {})
     if target_session.channel is not None:
       context.setdefault("channel", target_session.channel)
+    latest_user_message = _latest_user_message_content(list(payload.messages))
+    message_id = _control_message_id(payload.request_id) if latest_user_message is not None else None
+    if message_id is not None and _has_parent_message_event(target_session, message_id):
+      return RunEnvelopeResponse(
+        run=_chat_run_from_session(target_session),
+        message_id=message_id,
+        delivery_status="duplicate",
+      )
     run = await _dispatch_control_chat_turn(
       request=request,
       session=target_session,
       messages=list(payload.messages),
-      request_id=payload.request_id,
+      request_id=message_id or payload.request_id,
       context=context,
       model=payload.model,
       deadline_sec=payload.deadline_sec,
+      record_parent_message=True,
     )
-    return RunEnvelopeResponse(run=run)
+    return RunEnvelopeResponse(
+      run=run,
+      message_id=message_id,
+      delivery_status="delivered" if message_id is not None else None,
+    )
 
   @router.get("", response_model=RunsListResponse)
   async def list_runs(
