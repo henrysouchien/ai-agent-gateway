@@ -13,6 +13,7 @@ from .approval_policy import (
   ApprovalRequest,
   ApprovalState,
   ApprovalVote,
+  DelegationGrant,
   PersistentGrant,
   ToolClass,
   utc_now,
@@ -79,6 +80,17 @@ class ApprovalRequestStore(Protocol):
     now: datetime | None = None,
   ) -> PersistentGrant | None: ...
   async def revoke_persistent_grant(self, grant_id: str, *, revoked_at: datetime | None = None) -> None: ...
+  async def create_delegation_grant(self, grant: DelegationGrant) -> DelegationGrant: ...
+  async def get_delegation_grant(self, delegation_id: str) -> DelegationGrant | None: ...
+  async def claim_delegation_grant(
+    self,
+    *,
+    delegation_id: str,
+    bound_relay_request_id: str,
+    bound_excel_session_id: str,
+    now: datetime | None = None,
+  ) -> DelegationGrant | None: ...
+  async def revoke_delegation_grant(self, delegation_id: str, *, revoked_at: datetime | None = None) -> None: ...
   async def expire_pending(self, *, now: datetime | None = None) -> int: ...
 
 
@@ -112,6 +124,7 @@ class SQLiteApprovalStore:
           tool_call_id TEXT NOT NULL,
           parent_approval_id TEXT,
           approval_chain_id TEXT NOT NULL,
+          delegation_id TEXT,
           request_id TEXT NOT NULL,
           session_id TEXT,
           run_id TEXT,
@@ -187,11 +200,35 @@ class SQLiteApprovalStore:
         );
         CREATE INDEX IF NOT EXISTS idx_persistent_grants_lookup
           ON persistent_grants(user_id, tool_name, scope_hint, revoked_at, expires_at);
+
+        CREATE TABLE IF NOT EXISTS delegation_grants (
+          delegation_id TEXT PRIMARY KEY,
+          delegator_user_id TEXT NOT NULL,
+          delegator_run_id TEXT,
+          delegator_session_id TEXT,
+          delegator_profile TEXT NOT NULL,
+          delegator_channel TEXT NOT NULL,
+          bound_excel_session_id TEXT NOT NULL,
+          bound_relay_request_id TEXT NOT NULL,
+          bound_workbook TEXT,
+          tool_class_ceiling TEXT NOT NULL,
+          args_predicate TEXT,
+          window_seconds INTEGER NOT NULL,
+          exclude_external_write_bypass INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          expires_at TEXT,
+          revoked_at TEXT,
+          consumed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_delegation_grants_lookup
+          ON delegation_grants(delegator_user_id, bound_excel_session_id, bound_relay_request_id);
         """
       )
       columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(approval_requests)").fetchall()}
       if "skill" not in columns:
         conn.execute("ALTER TABLE approval_requests ADD COLUMN skill TEXT")
+      if "delegation_id" not in columns:
+        conn.execute("ALTER TABLE approval_requests ADD COLUMN delegation_id TEXT")
 
   async def create(self, request: ApprovalRequest) -> ApprovalRequest:
     async with self._lock:
@@ -201,7 +238,7 @@ class SQLiteApprovalStore:
           """
           INSERT INTO approval_requests (
             approval_id, tool_call_id, parent_approval_id, approval_chain_id,
-            request_id, session_id, run_id, user_id, profile, channel,
+            delegation_id, request_id, session_id, run_id, user_id, profile, channel,
             tool_name, tool_class, tool_args_redacted, args_hash, reason,
             blast_radius_summary, state, state_version, requested_at, decided_at,
             expires_at, decider_id, decider_role, decision, decision_reason,
@@ -212,7 +249,7 @@ class SQLiteApprovalStore:
             system_prompt_hash, tool_schema_version, mcp_server_version, skill
           ) VALUES (
             :approval_id, :tool_call_id, :parent_approval_id, :approval_chain_id,
-            :request_id, :session_id, :run_id, :user_id, :profile, :channel,
+            :delegation_id, :request_id, :session_id, :run_id, :user_id, :profile, :channel,
             :tool_name, :tool_class, :tool_args_redacted, :args_hash, :reason,
             :blast_radius_summary, :state, :state_version, :requested_at, :decided_at,
             :expires_at, :decider_id, :decider_role, :decision, :decision_reason,
@@ -514,6 +551,103 @@ class SQLiteApprovalStore:
         request=await self.get(grant.granted_via_approval_id),
       )
 
+  async def create_delegation_grant(self, grant: DelegationGrant) -> DelegationGrant:
+    async with self._lock:
+      with self._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+          """
+          INSERT INTO delegation_grants (
+            delegation_id, delegator_user_id, delegator_run_id, delegator_session_id,
+            delegator_profile, delegator_channel, bound_excel_session_id,
+            bound_relay_request_id, bound_workbook, tool_class_ceiling,
+            args_predicate, window_seconds, exclude_external_write_bypass,
+            created_at, expires_at, revoked_at, consumed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          """,
+          (
+            grant.delegation_id,
+            grant.delegator_user_id,
+            grant.delegator_run_id,
+            grant.delegator_session_id,
+            grant.delegator_profile,
+            grant.delegator_channel,
+            grant.bound_excel_session_id,
+            grant.bound_relay_request_id,
+            grant.bound_workbook,
+            _json_dumps(sorted(grant.tool_class_ceiling)),
+            _json_dumps(grant.args_predicate) if grant.args_predicate is not None else None,
+            grant.window_seconds,
+            1 if grant.exclude_external_write_bypass else 0,
+            _dt_to_text(grant.created_at),
+            _dt_to_text(grant.expires_at),
+            _dt_to_text(grant.revoked_at),
+            _dt_to_text(grant.consumed_at),
+          ),
+        )
+        conn.commit()
+    return grant
+
+  async def get_delegation_grant(self, delegation_id: str) -> DelegationGrant | None:
+    with self._connect() as conn:
+      row = conn.execute(
+        "SELECT * FROM delegation_grants WHERE delegation_id = ?",
+        (delegation_id,),
+      ).fetchone()
+    return self._row_to_delegation_grant(row) if row is not None else None
+
+  async def claim_delegation_grant(
+    self,
+    *,
+    delegation_id: str,
+    bound_relay_request_id: str,
+    bound_excel_session_id: str,
+    now: datetime | None = None,
+  ) -> DelegationGrant | None:
+    now_value = now or utc_now()
+    now_text = _dt_to_text(now_value)
+    async with self._lock:
+      with self._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+          """
+          UPDATE delegation_grants
+          SET consumed_at = :now
+          WHERE delegation_id = :delegation_id
+            AND bound_relay_request_id = :rid
+            AND bound_excel_session_id = :sid
+            AND consumed_at IS NULL
+            AND revoked_at IS NULL
+            AND (expires_at IS NULL OR expires_at > :now)
+          """,
+          {
+            "now": now_text,
+            "delegation_id": delegation_id,
+            "rid": bound_relay_request_id,
+            "sid": bound_excel_session_id,
+          },
+        )
+        if cursor.rowcount == 1:
+          row = conn.execute(
+            "SELECT * FROM delegation_grants WHERE delegation_id = ?",
+            (delegation_id,),
+          ).fetchone()
+          conn.commit()
+          return self._row_to_delegation_grant(row) if row is not None else None
+        conn.commit()
+    return None
+
+  async def revoke_delegation_grant(self, delegation_id: str, *, revoked_at: datetime | None = None) -> None:
+    when = revoked_at or utc_now()
+    async with self._lock:
+      with self._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+          "UPDATE delegation_grants SET revoked_at = ? WHERE delegation_id = ?",
+          (_dt_to_text(when), delegation_id),
+        )
+        conn.commit()
+
   async def expire_pending(self, *, now: datetime | None = None) -> int:
     now_value = now or utc_now()
     expired: list[ApprovalRequest] = []
@@ -597,6 +731,7 @@ class SQLiteApprovalStore:
       "tool_call_id": request.tool_call_id,
       "parent_approval_id": request.parent_approval_id,
       "approval_chain_id": request.approval_chain_id,
+      "delegation_id": request.delegation_id,
       "request_id": request.request_id,
       "session_id": request.session_id,
       "run_id": request.run_id,
@@ -646,6 +781,7 @@ class SQLiteApprovalStore:
       tool_call_id=str(row["tool_call_id"]),
       parent_approval_id=row["parent_approval_id"],
       approval_chain_id=str(row["approval_chain_id"]),
+      delegation_id=row["delegation_id"] if "delegation_id" in row.keys() else None,
       request_id=str(row["request_id"]),
       session_id=row["session_id"],
       run_id=row["run_id"],
@@ -701,6 +837,28 @@ class SQLiteApprovalStore:
       revoked_at=_dt_from_text(row["revoked_at"]),
       granted_via_approval_id=str(row["granted_via_approval_id"]),
       policy_id=str(row["policy_id"]),
+    )
+
+  @staticmethod
+  def _row_to_delegation_grant(row: sqlite3.Row) -> DelegationGrant:
+    return DelegationGrant(
+      delegation_id=str(row["delegation_id"]),
+      delegator_user_id=str(row["delegator_user_id"]),
+      delegator_run_id=row["delegator_run_id"],
+      delegator_session_id=row["delegator_session_id"],
+      delegator_profile=str(row["delegator_profile"]),
+      delegator_channel=str(row["delegator_channel"]),
+      bound_excel_session_id=str(row["bound_excel_session_id"]),
+      bound_relay_request_id=str(row["bound_relay_request_id"]),
+      bound_workbook=row["bound_workbook"],
+      tool_class_ceiling=frozenset(_json_loads(row["tool_class_ceiling"]) or []),  # type: ignore[arg-type]
+      args_predicate=_json_loads(row["args_predicate"]),
+      window_seconds=int(row["window_seconds"]),
+      exclude_external_write_bypass=bool(row["exclude_external_write_bypass"]),
+      created_at=_dt_from_text(row["created_at"]) or utc_now(),
+      expires_at=_dt_from_text(row["expires_at"]),
+      revoked_at=_dt_from_text(row["revoked_at"]),
+      consumed_at=_dt_from_text(row["consumed_at"]),
     )
 
 

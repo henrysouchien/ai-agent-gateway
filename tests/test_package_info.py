@@ -9,7 +9,12 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway
-from agent_gateway.package_info import CONTRACT_CREDENTIAL_REFRESH_V1, PACKAGE_NAME
+from agent_gateway.package_info import (
+  CONTRACT_AUTONOMOUS_OPERATOR_MESSAGES_V1,
+  CONTRACT_CONTROL_CHAT_CONTINUATION_V1,
+  CONTRACT_CREDENTIAL_REFRESH_V1,
+  PACKAGE_NAME,
+)
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 
 
@@ -30,6 +35,8 @@ def test_package_exports_contract_metadata() -> None:
   assert isinstance(agent_gateway.__version__, str)
   assert agent_gateway.__version__
   assert CONTRACT_CREDENTIAL_REFRESH_V1 in agent_gateway.CONTRACTS
+  assert CONTRACT_AUTONOMOUS_OPERATOR_MESSAGES_V1 in agent_gateway.CONTRACTS
+  assert CONTRACT_CONTROL_CHAT_CONTINUATION_V1 in agent_gateway.CONTRACTS
   assert agent_gateway.package_health()["contracts"] == sorted(agent_gateway.CONTRACTS)
 
 
@@ -44,3 +51,5 @@ def test_health_reports_package_contracts() -> None:
   assert payload["status"] == "ok"
   assert payload["package"]["name"] == PACKAGE_NAME
   assert CONTRACT_CREDENTIAL_REFRESH_V1 in payload["package"]["contracts"]
+  assert CONTRACT_AUTONOMOUS_OPERATOR_MESSAGES_V1 in payload["package"]["contracts"]
+  assert CONTRACT_CONTROL_CHAT_CONTINUATION_V1 in payload["package"]["contracts"]

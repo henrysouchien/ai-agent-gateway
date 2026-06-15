@@ -64,6 +64,7 @@ async def _record_vote_and_unblock(
   allow_tool_type: bool,
   reason: str | None,
   app_state: Any,
+  denied_by: str | None = None,
 ) -> dict[str, Any]:
   approval_queue = _validate_pending_entry(
     pending_entry=pending_entry,
@@ -73,10 +74,11 @@ async def _record_vote_and_unblock(
   )
   approval_id = pending_entry.get("approval_id")
   store, policy = _resolve_store_and_policy(target_session=target_session, app_state=app_state)
+  effective_denied_by = denied_by if not approved else None
 
   if not approval_id:
     pending_entry["status"] = "approval_received"
-    await approval_queue.put({"approved": approved, "allow_tool_type": allow_tool_type})
+    await approval_queue.put({"approved": approved, "allow_tool_type": allow_tool_type, "denied_by": effective_denied_by})
     return {"status": "ok"}
 
   if store is None or policy is None:
@@ -121,7 +123,7 @@ async def _record_vote_and_unblock(
     decider_id=decider_id,
     decider_role=decider_role,
     decision="approved" if approved else "denied",
-    decision_reason=reason,
+    decision_reason="Auto-denied by relay chat policy" if effective_denied_by == "relay_policy" and reason is None else reason,
     decided_at=utc_now(),
     external_callback_id=None,
   )
@@ -161,6 +163,7 @@ async def _record_vote_and_unblock(
       "approved": request_record.state == "approved",
       "allow_tool_type": allow_tool_type,
       "approval_id": str(approval_id),
+      "denied_by": effective_denied_by,
     }
   )
   log.info(

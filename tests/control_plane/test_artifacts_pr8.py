@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import hmac
 import json
@@ -34,6 +35,22 @@ CLAIM_HEADERS = {
 class ArtifactPr8Fixture:
   app: Any
   data_dir: Path
+
+
+@dataclass(frozen=True)
+class _FakeAutonomousTask:
+  user_id: str
+  control_run_id: str
+  event_lines: list[dict[str, Any]]
+  started_at: float | None = None
+
+
+class _FakeAutonomousRegistry:
+  def __init__(self, tasks: list[_FakeAutonomousTask]) -> None:
+    self._tasks = {task.control_run_id: task for task in tasks}
+
+  async def shutdown(self) -> None:
+    return None
 
 
 @pytest.fixture
@@ -104,7 +121,292 @@ def test_control_artifacts_lists_recent_50_sorted_and_scoped(artifact_pr8: Artif
     "data_source",
     "created_at",
     "skill_run_id",
+    "run_id",
   }
+  assert artifacts[0]["run_id"] is None
+
+
+def test_control_artifacts_list_includes_html_artifact_sidecars(
+  artifact_pr8: ArtifactPr8Fixture,
+) -> None:
+  json_artifact_id = "2026-05-20T120000.000-run-json"
+  html_artifact_id = "20260605T142435-cabbb60fece34f28"
+  _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    json_artifact_id,
+    mtime=1_800_000_001,
+  )
+  _write_html_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    html_artifact_id,
+    mtime=1_800_000_002,
+  )
+
+  with TestClient(artifact_pr8.app) as client:
+    headers = _bearer_headers(client, USER_ID)
+    response = client.get("/api/control/artifacts", headers=headers)
+    skill_response = client.get("/api/control/artifacts?skill=fixture-html-artifact", headers=headers)
+
+  assert response.status_code == 200
+  artifacts = response.json()["artifacts"]
+  assert [artifact["artifact_id"] for artifact in artifacts] == [html_artifact_id, json_artifact_id]
+  html_artifact = artifacts[0]
+  assert html_artifact == {
+    "ticker": "PCTY",
+    "skill": "fixture-html-artifact",
+    "artifact_id": html_artifact_id,
+    "artifact_path": f"artifacts/_html/{html_artifact_id}.json",
+    "binary_artifact_path": f"artifacts/_html/{html_artifact_id}.html",
+    "contract_name": "HtmlArtifact",
+    "data_source": "live",
+    "created_at": "2026-06-05T14:24:35.683368+00:00",
+    "skill_run_id": "fixture-session",
+    "run_id": "fixture-session",
+  }
+  assert skill_response.status_code == 200
+  assert [artifact["artifact_id"] for artifact in skill_response.json()["artifacts"]] == [html_artifact_id]
+
+
+def test_control_artifacts_list_includes_dashboard_artifact_sidecars(
+  artifact_pr8: ArtifactPr8Fixture,
+) -> None:
+  json_artifact_id = "2026-05-20T120000.000-run-json"
+  dashboard_artifact_id = "20260605T142435-cabbb60fece34f28"
+  _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    json_artifact_id,
+    mtime=1_800_000_001,
+  )
+  _write_dashboard_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    dashboard_artifact_id,
+    mtime=1_800_000_002,
+  )
+
+  with TestClient(artifact_pr8.app) as client:
+    headers = _bearer_headers(client, USER_ID)
+    response = client.get("/api/control/artifacts", headers=headers)
+    skill_response = client.get("/api/control/artifacts?skill=fixture-dashboard-artifact", headers=headers)
+
+  assert response.status_code == 200
+  artifacts = response.json()["artifacts"]
+  assert [artifact["artifact_id"] for artifact in artifacts] == [dashboard_artifact_id, json_artifact_id]
+  dashboard_artifact = artifacts[0]
+  assert dashboard_artifact == {
+    "ticker": "PCTY",
+    "skill": "fixture-dashboard-artifact",
+    "artifact_id": dashboard_artifact_id,
+    "artifact_path": f"artifacts/_dashboards/{dashboard_artifact_id}.json",
+    "binary_artifact_path": f"artifacts/_dashboards/{dashboard_artifact_id}.payload.json",
+    "contract_name": "DashboardArtifact",
+    "data_source": "live",
+    "created_at": "2026-06-05T14:24:35.683368+00:00",
+    "skill_run_id": dashboard_artifact_id,
+    "run_id": None,
+  }
+  assert skill_response.status_code == 200
+  assert [artifact["artifact_id"] for artifact in skill_response.json()["artifacts"]] == [dashboard_artifact_id]
+
+
+def test_control_artifacts_filters_by_control_run_id_from_autonomous_events(
+  artifact_pr8: ArtifactPr8Fixture,
+) -> None:
+  json_artifact_id = "2026-05-20T120000.000-run-json"
+  html_artifact_id = "20260605T142435-cabbb60fece34f28"
+  _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    json_artifact_id,
+    mtime=1_800_000_001,
+  )
+  _write_html_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    html_artifact_id,
+    mtime=1_800_000_002,
+    session_id=None,
+  )
+
+  artifact_pr8.app.state.subprocess_registry = _FakeAutonomousRegistry([
+    _FakeAutonomousTask(
+      user_id=USER_ID,
+      control_run_id="bg_1",
+      event_lines=[
+        {
+          "type": "artifact_ready",
+          "artifact_id": json_artifact_id,
+          "artifact_path": f"artifacts/PCTY/earnings-scenarios/{json_artifact_id}.json",
+          "skill_run_id": "skill-json",
+        },
+        {
+          "type": "artifact_ready",
+          "artifact_id": html_artifact_id,
+          "artifact_path": f"artifacts/_html/{html_artifact_id}.json",
+          "skill_run_id": "skill-html",
+        },
+      ],
+    ),
+    _FakeAutonomousTask(
+      user_id="bob",
+      control_run_id="bg_bob",
+      event_lines=[
+        {
+          "type": "artifact_ready",
+          "artifact_id": html_artifact_id,
+          "artifact_path": f"artifacts/_html/{html_artifact_id}.json",
+          "skill_run_id": "skill-bob",
+        },
+      ],
+    ),
+  ])
+
+  with TestClient(artifact_pr8.app) as client:
+    headers = _bearer_headers(client, USER_ID)
+    run_response = client.get("/api/control/artifacts?run_id=bg_1", headers=headers)
+    other_run_response = client.get("/api/control/artifacts?run_id=bg_missing", headers=headers)
+
+  assert run_response.status_code == 200
+  artifacts = run_response.json()["artifacts"]
+  assert [artifact["artifact_id"] for artifact in artifacts] == [html_artifact_id, json_artifact_id]
+  assert all(artifact["run_id"] == "bg_1" for artifact in artifacts)
+  assert [artifact["skill_run_id"] for artifact in artifacts] == ["skill-html", "skill-json"]
+  assert other_run_response.status_code == 200
+  assert other_run_response.json()["artifacts"] == []
+
+
+def test_control_artifacts_prefers_registry_run_context_over_sidecar_context(
+  artifact_pr8: ArtifactPr8Fixture,
+) -> None:
+  json_artifact_id = "2026-05-20T120000.000-run-json"
+  html_artifact_id = "20260605T142435-cabbb60fece34f28"
+  _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    json_artifact_id,
+    mtime=1_800_000_001,
+    run_id="bg_stale",
+  )
+  _write_html_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    html_artifact_id,
+    mtime=1_800_000_002,
+    session_id="bg_stale",
+  )
+  artifact_pr8.app.state.subprocess_registry = _FakeAutonomousRegistry([
+    _FakeAutonomousTask(
+      user_id=USER_ID,
+      control_run_id="bg_1",
+      event_lines=[
+        {
+          "type": "artifact_ready",
+          "artifact_id": json_artifact_id,
+          "artifact_path": f"artifacts/PCTY/earnings-scenarios/{json_artifact_id}.json",
+          "skill_run_id": "skill-json",
+        },
+        {
+          "type": "artifact_ready",
+          "artifact_id": html_artifact_id,
+          "artifact_path": f"artifacts/_html/{html_artifact_id}.json",
+          "skill_run_id": "skill-html",
+        },
+      ],
+    ),
+  ])
+
+  with TestClient(artifact_pr8.app) as client:
+    headers = _bearer_headers(client, USER_ID)
+    run_response = client.get("/api/control/artifacts?run_id=bg_1", headers=headers)
+    stale_response = client.get("/api/control/artifacts?run_id=bg_stale", headers=headers)
+
+  assert run_response.status_code == 200
+  artifacts = run_response.json()["artifacts"]
+  assert [artifact["artifact_id"] for artifact in artifacts] == [html_artifact_id, json_artifact_id]
+  assert all(artifact["run_id"] == "bg_1" for artifact in artifacts)
+  assert [artifact["skill_run_id"] for artifact in artifacts] == ["skill-html", "skill-json"]
+  assert stale_response.status_code == 200
+  assert stale_response.json()["artifacts"] == []
+
+
+def test_control_artifacts_run_filter_rejects_stale_reused_run_id_sidecars(
+  artifact_pr8: ArtifactPr8Fixture,
+) -> None:
+  fresh_id = "20260605T142435-cabbb60fece34f28"
+  stale_id = "20260605T135000-cabbb60fece34f28"
+  _write_html_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    fresh_id,
+    mtime=1_800_000_002,
+    session_id="bg_1",
+    ts="2026-06-05T14:24:35.683368+00:00",
+  )
+  _write_html_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    stale_id,
+    mtime=1_800_000_001,
+    session_id="bg_1",
+    ts="2026-06-05T13:50:00+00:00",
+  )
+  artifact_pr8.app.state.subprocess_registry = _FakeAutonomousRegistry([
+    _FakeAutonomousTask(
+      user_id=USER_ID,
+      control_run_id="bg_1",
+      event_lines=[],
+      started_at=datetime.fromisoformat("2026-06-05T14:00:00+00:00").timestamp(),
+    ),
+  ])
+
+  with TestClient(artifact_pr8.app) as client:
+    response = client.get("/api/control/artifacts?run_id=bg_1", headers=_bearer_headers(client, USER_ID))
+
+  assert response.status_code == 200
+  assert [artifact["artifact_id"] for artifact in response.json()["artifacts"]] == [fresh_id]
+
+
+def test_control_artifacts_run_filter_rejects_artifacts_before_reused_run_start(
+  artifact_pr8: ArtifactPr8Fixture,
+) -> None:
+  html_artifact_id = "20260605T142435-cabbb60fece34f28"
+  _write_html_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    html_artifact_id,
+    mtime=1_800_000_002,
+    session_id="bg_reused",
+  )
+
+  artifact_pr8.app.state.subprocess_registry = _FakeAutonomousRegistry([
+    _FakeAutonomousTask(
+      user_id=USER_ID,
+      control_run_id="bg_reused",
+      started_at=1_900_000_000,
+      event_lines=[],
+    ),
+  ])
+
+  with TestClient(artifact_pr8.app) as client:
+    headers = _bearer_headers(client, USER_ID)
+    run_response = client.get("/api/control/artifacts?run_id=bg_reused", headers=headers)
+    global_response = client.get("/api/control/artifacts", headers=headers)
+
+  assert run_response.status_code == 200
+  assert run_response.json()["artifacts"] == []
+  assert global_response.status_code == 200
+  assert [artifact["artifact_id"] for artifact in global_response.json()["artifacts"]] == [html_artifact_id]
 
 
 def test_control_artifacts_filters_by_ticker_and_skill(artifact_pr8: ArtifactPr8Fixture) -> None:
@@ -163,6 +465,49 @@ def test_control_artifacts_filters_by_ticker_and_skill(artifact_pr8: ArtifactPr8
   assert [artifact["artifact_id"] for artifact in combined_response.json()["artifacts"]] == [pcty_earnings]
 
 
+def test_control_artifacts_read_latest_and_specific_sidecar(artifact_pr8: ArtifactPr8Fixture) -> None:
+  old_id = "2026-05-20T120000.000-run-old"
+  latest_id = "2026-05-20T130000.000-run-latest"
+  _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    old_id,
+    mtime=1_800_000_001,
+  )
+  latest_payload = _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    latest_id,
+    mtime=1_800_000_002,
+  )
+
+  with TestClient(artifact_pr8.app) as client:
+    headers = _bearer_headers(client, USER_ID)
+    latest_response = client.get("/api/control/artifacts/PCTY/earnings-scenarios/latest", headers=headers)
+    specific_response = client.get(
+      f"/api/control/artifacts/PCTY/earnings-scenarios/{old_id}",
+      headers=headers,
+    )
+    missing_response = client.get(
+      "/api/control/artifacts/PCTY/earnings-scenarios/2026-05-20T140000.000-run-missing",
+      headers=headers,
+    )
+
+  assert latest_response.status_code == 200
+  assert latest_response.json() == latest_payload
+  assert latest_response.headers["etag"]
+  assert latest_response.headers["cache-control"] == "private, max-age=0"
+
+  assert specific_response.status_code == 200
+  assert specific_response.json()["artifact_id"] == old_id
+
+  assert missing_response.status_code == 404
+
+
 @pytest.mark.parametrize("auth_mode", ["bearer", "signed"])
 def test_artifact_and_letter_endpoints_accept_bearer_and_signed_claim(
   artifact_pr8: ArtifactPr8Fixture,
@@ -196,6 +541,8 @@ def test_artifact_and_letter_endpoints_accept_bearer_and_signed_claim(
     "/api/artifacts/PCTY/earnings-scenarios/2026-05-20T120000.000-run-a/extra",
     "/api/letters/PCTY/2026-05-20T120000.000-run-a/extra",
     "/api/control/artifacts",
+    "/api/control/artifacts/PCTY/earnings-scenarios/latest",
+    "/api/control/artifacts/PCTY/earnings-scenarios/2026-05-20T120000.000-run-a",
   ],
 )
 def test_invalid_bearer_never_falls_back_to_signed_claim(
@@ -230,6 +577,8 @@ def _artifact_endpoint_cases(artifact_id: str) -> list[tuple[str, int]]:
     (f"/api/artifacts/PCTY/earnings-scenarios/{artifact_id}/extra", 404),
     (f"/api/letters/PCTY/{artifact_id}/extra", 404),
     ("/api/control/artifacts", 200),
+    ("/api/control/artifacts/PCTY/earnings-scenarios/latest", 200),
+    (f"/api/control/artifacts/PCTY/earnings-scenarios/{artifact_id}", 200),
   ]
 
 
@@ -281,6 +630,7 @@ def _write_artifact(
   *,
   mtime: int,
   include_artifact_path: bool = True,
+  run_id: str | None = None,
 ) -> dict[str, Any]:
   payload = {
     "artifact_id": artifact_id,
@@ -292,6 +642,8 @@ def _write_artifact(
     "skill_run_id": artifact_id.split("-", 3)[-1],
     "ticker": ticker,
   }
+  if run_id is not None:
+    payload["run_id"] = run_id
   if include_artifact_path:
     payload["artifact_path"] = f"artifacts/{ticker}/{skill}/{artifact_id}.json"
 
@@ -307,6 +659,83 @@ def _write_letter(data_dir: Path, user_id: str, ticker: str, artifact_id: str, c
   path.parent.mkdir(parents=True, exist_ok=True)
   path.write_bytes(content)
   return path
+
+
+def _write_html_artifact(
+  data_dir: Path,
+  user_id: str,
+  artifact_id: str,
+  *,
+  mtime: int,
+  session_id: str | None = "fixture-session",
+  ts: str = "2026-06-05T14:24:35.683368+00:00",
+) -> None:
+  path = _workspace(data_dir, user_id) / "artifacts" / "_html" / f"{artifact_id}.json"
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(
+    json.dumps(
+      {
+        "artifact_id": artifact_id,
+        "title": "Fixture HTML Artifact",
+        "purpose": "report",
+        "content_ref": f"artifacts/_html/{artifact_id}.html",
+        "summary": "Deterministic dev-only HTML artifact fixture for Hank web live QA.",
+        "ticker": "PCTY",
+        "session_id": session_id,
+        "source_skill": "fixture-html-artifact",
+        "sources": [],
+        "exports": {
+          "copy_as_prompt": None,
+          "copy_as_markdown": None,
+          "copy_as_json": None,
+        },
+        "ts": ts,
+        "contract_name": "HtmlArtifact",
+      }
+    ),
+    encoding="utf-8",
+  )
+  html_path = path.with_suffix(".html")
+  html_path.write_text("<main><h1>Fixture HTML Artifact</h1></main>", encoding="utf-8")
+  os.utime(path, (mtime, mtime))
+  os.utime(html_path, (mtime, mtime))
+
+
+def _write_dashboard_artifact(
+  data_dir: Path,
+  user_id: str,
+  artifact_id: str,
+  *,
+  mtime: int,
+  ts: str = "2026-06-05T14:24:35.683368+00:00",
+) -> None:
+  path = _workspace(data_dir, user_id) / "artifacts" / "_dashboards" / f"{artifact_id}.json"
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(
+    json.dumps(
+      {
+        "artifact_id": artifact_id,
+        "title": "Fixture Dashboard Artifact",
+        "summary": "Deterministic dev-only DashboardArtifact fixture for Hank web live QA.",
+        "ticker": "PCTY",
+        "scope_label": None,
+        "source_skill": "fixture-dashboard-artifact",
+        "readiness_posture": "decision_ready",
+        "profile": "production",
+        "payload_ref": f"{artifact_id}.payload.json",
+        "ts": ts,
+        "contract_name": "DashboardArtifact",
+      }
+    ),
+    encoding="utf-8",
+  )
+  payload_path = path.with_suffix(".payload.json")
+  payload_path.write_text(
+    json.dumps({"kind": "hank_dashboard.v1", "title": "Fixture Dashboard Artifact"}),
+    encoding="utf-8",
+  )
+  os.utime(path, (mtime, mtime))
+  os.utime(payload_path, (mtime, mtime))
 
 
 def _workspace(data_dir: Path, user_id: str) -> Path:

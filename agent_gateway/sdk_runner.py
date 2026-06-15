@@ -22,12 +22,22 @@ from .approval_policy import (
   sha256_args,
   utc_now,
 )
+from . import approval_settings
 from .event_log import EventLog
 from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator, normalize_identity
 from .product_config import gateway_product_id
 from .providers.agent_sdk import AgentSDKConfig, estimate_cost, _validate_sdk_version
-from .runner import ToolResultContext, _detect_user_id_param
-from .skill_context import current_skill
+from .runner import (
+  ToolResultContext,
+  _ACTIVE_SKILL_DENY_RESULT_KEY,
+  _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY,
+  _REPORT_DOOR_CLEAR_SUCCESS_STATUSES,
+  _detect_user_id_param,
+)
+from .session_recap import emit_recap_then_terminal
+from .skill_context import clear_current_skill, current_skill
+from .tool_dispatcher import RELAY_POLICY_DENIED_MESSAGE, RELAY_POLICY_DENIED_SUB_CODE
+from .tool_display import resolve_display
 from .tool_result_semantics import classify_semantic_tool_error
 
 
@@ -37,6 +47,10 @@ OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | No
 OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
 OnSessionSummary = Callable[[SessionUsageSummary], Awaitable[None] | None]
 OnToolTiming = Callable[..., None]
+
+
+def _approval_queue_timeout_seconds(expiry_seconds: float | int | None) -> float:
+  return min(float(expiry_seconds or 600), approval_settings.approval_wait_seconds())
 
 
 @dataclass
@@ -206,6 +220,17 @@ def _policy_tool_name(tool_name: str) -> str:
   return tool_name
 
 
+_PATCH_OP_RAW_INPUT_TOOLS = frozenset({
+  "apply_patch_ops",
+  "preview_patch_ops",
+  "publish_price_target",
+})
+
+
+def _should_escrow_raw_tool_input(tool_name: str) -> bool:
+  return _policy_tool_name(tool_name) in _PATCH_OP_RAW_INPUT_TOOLS
+
+
 class AgentSDKRunner:
   """Run a conversation through the Anthropic agent SDK.
 
@@ -233,10 +258,16 @@ class AgentSDKRunner:
     store: Any | None = None,
     policy: ApprovalPolicy | None = None,
     run_context: RunContext | None = None,
+    skill_run_id: str | None = None,
+    workspace_dir: str | None = None,
+    started_at: float | None = None,
+    emit_session_recap: bool = True,
   ) -> None:
     self._log = event_log
     self._session_id = session_id or "no-session"
     self._sid = self._session_id[:12]
+    self._session_started_at = float(started_at if started_at is not None else time.time())
+    self._emit_session_recap = bool(emit_session_recap)
     self._sdk_config = sdk_config
     self._system_prompt = system_prompt
     self._disallowed_tools = list(disallowed_tools or sdk_config.disallowed_tools)
@@ -250,6 +281,8 @@ class AgentSDKRunner:
     self._on_tool_timing_accepts_user_id = _detect_user_id_param(on_tool_timing)
     self._pending_tool_calls: Dict[str, ToolCallInfo] = {}
     self._active_tool_use: _ActiveToolUse | None = None
+    self._active_skill_deny: set[str] = set()
+    self._active_skill_report_doors: dict[str, str] = {}
     self._query_iter: Any = None
     self._usage: Dict[str, Any] = {
       "input_tokens": 0,
@@ -284,12 +317,23 @@ class AgentSDKRunner:
     self._approval_store = store or getattr(session, "approval_store", None)
     self._approval_policy = policy or getattr(session, "approval_policy", None)
     self._run_context = run_context
+    self._skill_run_id = skill_run_id
+    self._workspace_dir = workspace_dir
 
   def _append(self, event: Dict[str, Any]) -> None:
     payload = dict(event)
     pid = gateway_product_id()
     if pid is not None:
       payload["product_id"] = pid
+    if payload.get("type") in {"stream_complete", "error"}:
+      emit_recap_then_terminal(
+        self._log,
+        payload,
+        session_id=self._session_id,
+        started_at=self._session_started_at,
+        emit_recap=self._emit_session_recap,
+      )
+      return
     self._log.append(payload)
 
   async def _call_on_usage(self, usage_event: UsageEvent) -> None:
@@ -489,6 +533,8 @@ class AgentSDKRunner:
         session_id=self._session_id,
         server=_server_for_tool(tool_name),
         result_entry=result_entry,
+        skill_run_id=self._skill_run_id,
+        workspace_dir=self._workspace_dir,
       )
     )
     additional_context = self._format_additional_context(
@@ -499,6 +545,72 @@ class AgentSDKRunner:
     if additional_context:
       log.info("[%s] Injecting additionalContext for %s", self._sid, tool_name)
     return additional_context
+
+  def _effective_disallowed_tools(self) -> set[str]:
+    if not self._active_skill_deny:
+      return set(self._disallowed_tools)
+    return set(self._disallowed_tools) | set(self._active_skill_deny)
+
+  def _activate_skill_deny(self, tool_names: Any) -> None:
+    if isinstance(tool_names, str):
+      candidates = [tool_names]
+    elif isinstance(tool_names, (list, tuple, set, frozenset)):
+      candidates = list(tool_names)
+    else:
+      return
+    denied = {normalized for name in candidates if (normalized := str(name or "").strip())}
+    self._active_skill_deny = denied
+
+  def _activate_skill_report_doors(self, value: Any) -> None:
+    if isinstance(value, dict):
+      self._active_skill_report_doors = {
+        str(tool_name).strip(): str(skill_name).strip()
+        for tool_name, skill_name in value.items()
+        if str(tool_name).strip() and str(skill_name).strip()
+      }
+      return
+    if value is not None:
+      self._active_skill_report_doors = {}
+
+  def _clear_active_skill_if_report_door_completed(
+    self,
+    *,
+    tool_name: str,
+    result: Any,
+    error: Dict[str, Any] | None,
+  ) -> bool:
+    if error is not None:
+      return False
+    normalized_tool_name = str(tool_name or "").strip()
+    expected_skill = self._active_skill_report_doors.get(normalized_tool_name)
+    if not expected_skill:
+      return False
+    if not (
+      isinstance(result, dict)
+      and "subcommand" in result
+      and str(result.get("mutation_mode") or "").strip() == "preview"
+    ):
+      return False
+    if str(result.get("status") or "").strip().lower() not in _REPORT_DOOR_CLEAR_SUCCESS_STATUSES:
+      return False
+    if current_skill() != expected_skill:
+      return False
+    clear_current_skill()
+    self._active_skill_deny.clear()
+    self._active_skill_report_doors.clear()
+    return True
+
+  def _consume_private_tool_result_fields(self, result: Any, *, tool_name: str | None = None) -> Any:
+    if isinstance(result, dict):
+      self._activate_skill_report_doors(result.pop(_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY, None))
+      self._activate_skill_deny(result.pop(_ACTIVE_SKILL_DENY_RESULT_KEY, None))
+      if tool_name is not None:
+        self._clear_active_skill_if_report_door_completed(
+          tool_name=tool_name,
+          result=result,
+          error=None,
+        )
+    return result
 
   async def _post_tool_use_hook(
     self,
@@ -511,6 +623,7 @@ class AgentSDKRunner:
     result = _parse_result_payload(
       input_data.get("result", input_data.get("tool_result", input_data.get("output")))
     )
+    result = self._consume_private_tool_result_fields(result, tool_name=tool_name)
     additional_context = await self._build_hook_additional_context(
       tool_call_id=str(tool_use_id or input_data.get("tool_use_id") or ""),
       tool_name=tool_name,
@@ -618,15 +731,25 @@ class AgentSDKRunner:
         tool_input=tool_input,
         started_at=time.time(),
       )
+      if _should_escrow_raw_tool_input(tool_name):
+        record_raw_tool_input = getattr(self._log, "record_raw_tool_input", None)
+        if callable(record_raw_tool_input):
+          record_raw_tool_input(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+          )
       redacted_tool_input = _redact_tool_input_for_event(tool_name, tool_input)
-      self._append(
-        {
-          "type": "tool_call_start",
-          "tool_call_id": tool_call_id,
-          "tool_name": tool_name,
-          "tool_input": redacted_tool_input,
-        }
-      )
+      display = resolve_display(tool_name, redacted_tool_input)
+      tool_start_event = {
+        "type": "tool_call_start",
+        "tool_call_id": tool_call_id,
+        "tool_name": tool_name,
+        "tool_input": redacted_tool_input,
+      }
+      if display is not None:
+        tool_start_event["display"] = display
+      self._append(tool_start_event)
       self._active_tool_use = None
 
   def _extract_tool_result_blocks(self, message: Any) -> List[Dict[str, Any]]:
@@ -666,7 +789,7 @@ class AgentSDKRunner:
           "message": _summarize_error_payload(parsed),
         }
       return None, {"code": "tool_error", "message": _summarize_error_payload(parsed)}
-    return parsed, None
+    return self._consume_private_tool_result_fields(parsed), None
 
   def _complete_tool_call(
     self,
@@ -697,6 +820,11 @@ class AgentSDKRunner:
     }
     if semantic_error is not None:
       event["semantic_error"] = dict(semantic_error)
+    self._clear_active_skill_if_report_door_completed(
+      tool_name=info.tool_name,
+      result=result,
+      error=error,
+    )
     if synthetic:
       log.info("[%s] Synthetic tool completion for %s (%s)", self._sid, info.tool_name, tool_call_id)
     self._append(event)
@@ -837,7 +965,25 @@ class AgentSDKRunner:
       except Exception:
         log.warning("Failed to persist approval request event for %s", request.tool_call_id, exc_info=True)
     try:
-      return await approval_queue.get()
+      return await asyncio.wait_for(
+        approval_queue.get(),
+        timeout=max(0.1, _approval_queue_timeout_seconds(decision.expiry_seconds)),
+      )
+    except asyncio.TimeoutError:
+      store = self._approval_store
+      if store is not None:
+        try:
+          latest = await store.get(request.approval_id)
+          if latest is not None and latest.state == "pending_user":
+            await store.transition_state(
+              latest.approval_id,
+              "expired",
+              expected_state_version=latest.state_version,
+              decision_reason="Timed out waiting for user approval",
+            )
+        except Exception:
+          log.warning("Failed to expire timed-out approval request %s", request.approval_id, exc_info=True)
+      return None
     finally:
       session.pending_tools.pop(request.tool_call_id, None)
       session.approval_queues.pop(request.tool_call_id, None)
@@ -847,6 +993,8 @@ class AgentSDKRunner:
 
     allow_cls = getattr(claude_agent_sdk, "PermissionResultAllow")
     deny_cls = getattr(claude_agent_sdk, "PermissionResultDeny")
+    if tool_name in self._effective_disallowed_tools():
+      return deny_cls(message=f"Tool '{tool_name}' is not available in this context")
     if not self._approval_lifecycle_configured():
       return allow_cls()
     store = self._approval_store
@@ -909,6 +1057,8 @@ class AgentSDKRunner:
       if decision.modified_tool_args is not None:
         return allow_cls(updated_input=decision.modified_tool_args)
       return allow_cls()
+    if approval and approval.get("denied_by") == "relay_policy":
+      return deny_cls(message=f"[{RELAY_POLICY_DENIED_SUB_CODE}] {RELAY_POLICY_DENIED_MESSAGE}")
     return deny_cls(message="user denied")
 
   async def _close_query_iterator(self) -> None:
@@ -970,6 +1120,7 @@ class AgentSDKRunner:
       parent_turn_id=None,
       timestamp=time.time(),
       model=self._effective_model,
+      provider="agent-sdk",
       input_tokens=int(self._usage.get("input_tokens") or 0),
       output_tokens=int(self._usage.get("output_tokens") or 0),
       cache_read_tokens=int(self._usage.get("cache_read_input_tokens") or 0),
@@ -1016,15 +1167,20 @@ class AgentSDKRunner:
       "cwd": str(self._sdk_config.cwd) if self._sdk_config.cwd is not None else None,
       "include_partial_messages": True,
       "hooks": hooks or None,
-      "can_use_tool": self._can_use_tool_callback if self._approval_lifecycle_configured() else None,
+      "can_use_tool": self._can_use_tool_callback,
     }
     options_kwargs = {key: value for key, value in options_kwargs.items() if value is not None}
     options = getattr(claude_agent_sdk, "ClaudeAgentOptions")(**options_kwargs)
 
     original_api_key = os.environ.get("ANTHROPIC_API_KEY")
     original_auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
-    os.environ["ANTHROPIC_API_KEY"] = self._sdk_config.api_key
-    os.environ["ANTHROPIC_AUTH_TOKEN"] = ""
+    auth_mode = str(self._sdk_config.auth_mode or "api").strip().lower()
+    if auth_mode == "oauth":
+      os.environ["ANTHROPIC_API_KEY"] = ""
+      os.environ["ANTHROPIC_AUTH_TOKEN"] = str(self._sdk_config.auth_token or "")
+    else:
+      os.environ["ANTHROPIC_API_KEY"] = self._sdk_config.api_key
+      os.environ["ANTHROPIC_AUTH_TOKEN"] = ""
 
     try:
       query_iter = getattr(claude_agent_sdk, "query")(prompt=prompt, options=options)
@@ -1069,6 +1225,9 @@ class AgentSDKRunner:
       self._stream_terminal_emitted = True
       raise
     finally:
+      clear_current_skill()
+      self._active_skill_deny.clear()
+      self._active_skill_report_doors.clear()
       if self._parent_aggregator is None:
         try:
           await self._aggregator.close()

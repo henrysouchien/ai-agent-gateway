@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import builtins
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from typing import Any
 
 from agent_gateway.approval_audit import build_audit_entry
@@ -11,6 +16,78 @@ from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gatewa
 async def _build_chat_runtime(*, session, request, channel, auth_manager):
   _ = session, request, channel, auth_manager
   return ChatRuntime(system_prompt="test", build_runner=lambda *_args: None)
+
+
+def test_leaf_imports_do_not_require_monorepo_schema(tmp_path: Path) -> None:
+  package_dir = Path(__file__).resolve().parents[1]
+  script = textwrap.dedent(
+    """
+    import importlib
+    import importlib.util
+
+    if importlib.util.find_spec("schema") is not None:
+      raise SystemExit("schema unexpectedly importable before agent_gateway import")
+
+    import agent_gateway
+    from agent_gateway.code_execution import CodeExecutionConfig
+    from agent_gateway.session import GatewaySession
+
+    if importlib.util.find_spec("schema") is not None:
+      raise SystemExit("schema unexpectedly importable after leaf imports")
+
+    assert CodeExecutionConfig is not None
+    assert GatewaySession is not None
+    assert agent_gateway.__version__
+    """
+  )
+  env = os.environ.copy()
+  env["PYTHONPATH"] = str(package_dir)
+  env.pop("PRODUCT_ID", None)
+
+  result = subprocess.run(
+    [sys.executable, "-c", script],
+    cwd=tmp_path,
+    env=env,
+    capture_output=True,
+    text=True,
+    check=False,
+  )
+
+  assert result.returncode == 0, result.stderr
+
+
+def test_create_agent_does_not_require_monorepo_schema(tmp_path: Path) -> None:
+  package_dir = Path(__file__).resolve().parents[1]
+  script = textwrap.dedent(
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("schema") is not None:
+      raise SystemExit("schema unexpectedly importable before create_agent import")
+
+    from agent_gateway import create_agent
+
+    app = create_agent("test")
+    if importlib.util.find_spec("schema") is not None:
+      raise SystemExit("schema unexpectedly importable after create_agent app build")
+
+    assert app.routes
+    """
+  )
+  env = os.environ.copy()
+  env["PYTHONPATH"] = str(package_dir)
+  env.pop("PRODUCT_ID", None)
+
+  result = subprocess.run(
+    [sys.executable, "-c", script],
+    cwd=tmp_path,
+    env=env,
+    capture_output=True,
+    text=True,
+    check=False,
+  )
+
+  assert result.returncode == 0, result.stderr
 
 
 def test_create_gateway_app_does_not_import_monorepo_agent_modules(monkeypatch) -> None:
@@ -25,7 +102,7 @@ def test_create_gateway_app_does_not_import_monorepo_agent_modules(monkeypatch) 
 
   app = create_gateway_app(
     GatewayServerConfig(
-      jwt_secret="package-boundary-test-secret",
+      jwt_secret="package-boundary-test-secret-012345",
       valid_api_keys={"test-key"},
       allowed_models=set(),
       build_chat_runtime=_build_chat_runtime,

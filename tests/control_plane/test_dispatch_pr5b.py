@@ -108,12 +108,17 @@ def test_chat_dispatch_mints_chat_session_token_and_returns_chat_run() -> None:
     assert run["channel"] == "tui"
     assert run["user_id"] == "alice"
     assert run["state"] == "completed"
+    assert run["ended_at"] is not None
     assert run["initial_message"] == "review AAPL"
 
     session = app.state.auth.session_store.get_session(payload["chat_session_id"])
     assert session is not None
     assert session.kind == "chat"
     assert session.channel == "tui"
+    lifecycle_states = [
+      event.get("state") for event in session.event_history.snapshot() if event.get("type") == "run_state_changed"
+    ]
+    assert lifecycle_states == ["running", "completed"]
     assert captured["messages"] == [{"role": "user", "content": "review AAPL"}]
     assert captured["request_context"]["skill"] == "earnings-review"
     assert captured["request_context"]["ticker"] == "AAPL"

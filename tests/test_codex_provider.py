@@ -64,8 +64,21 @@ def test_codex_gpt55_uses_gpt5_family_metadata() -> None:
   assert model_info.id == "gpt-5.5"
   assert model_info.provider == "codex"
   assert model_info.context_window == 1_050_000
+  assert model_info.input_cost_per_mtok == 5.00
+  assert model_info.output_cost_per_mtok == 30.00
   assert model_info.supports_thinking is True
   assert model_info.supports_vision is True
+
+
+def test_codex_gpt55_cost_estimation_is_non_zero() -> None:
+  provider = CodexProvider()
+
+  estimate = provider.estimate_cost("gpt-5.5", 1_000, 500, cache_read_tokens=100)
+
+  assert estimate.total > 0
+  assert estimate.input_cost > 0
+  assert estimate.output_cost > 0
+  assert estimate.cache_read_cost > 0
 
 
 def test_build_request_params_supplies_default_instructions_when_system_prompt_missing() -> None:
@@ -307,3 +320,31 @@ def test_parse_sse_and_map_event_translate_responses_stream() -> None:
 
   message_end = events[11]
   assert message_end.stop_reason == "tool_use"
+
+
+def test_normalize_messages_converts_compaction_to_text_and_truncates() -> None:
+  provider = CodexProvider()
+  model_info = provider.get_model_info("gpt-5.5")
+  messages = [
+    {"role": "user", "content": "old history"},
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "compaction", "content": "summary"},
+        {"type": "text", "text": "answer"},
+      ],
+    },
+    {"role": "user", "content": "next"},
+  ]
+
+  normalized = provider.normalize_messages(messages, model_info)
+
+  assert len(normalized) == 2
+  first_block = normalized[0]["content"][0]
+  assert first_block["type"] == "text"
+  assert "summary" in first_block["text"]
+  assert not any(
+    isinstance(b, dict) and b.get("type") == "compaction"
+    for m in normalized
+    for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+  )

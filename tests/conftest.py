@@ -1,4 +1,5 @@
 import inspect
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -6,17 +7,40 @@ from typing import Any, Callable
 
 import pytest
 
+os.environ["SUB_AGENT_DEFAULT_MODEL"] = ""
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.event_log import EventLog
+from agent_gateway import _provider_utils
 from agent_gateway.providers.agent_sdk import AgentSDKConfig
 from agent_gateway.runner import AgentRunner
 from agent_gateway.sdk_runner import AgentSDKRunner
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.tool_dispatcher import ToolDispatcher
+
+_MODEL_DEFAULT_ENV_KEYS = ("SUB_AGENT_DEFAULT_MODEL",)
+
+
+@pytest.fixture(autouse=True)
+def _restore_model_default_env() -> None:
+  snapshot = {key: os.environ.get(key) for key in _MODEL_DEFAULT_ENV_KEYS}
+  present = {key for key in _MODEL_DEFAULT_ENV_KEYS if key in os.environ}
+  _provider_utils._SUB_AGENT_DEFAULT_MODEL_WARNED.clear()
+  yield
+  for key in _MODEL_DEFAULT_ENV_KEYS:
+    if key in present:
+      value = snapshot[key]
+      if value is None:
+        os.environ.pop(key, None)
+      else:
+        os.environ[key] = value
+    else:
+      os.environ.pop(key, None)
+  _provider_utils._SUB_AGENT_DEFAULT_MODEL_WARNED.clear()
 
 
 class _NullMcpClient:
@@ -64,6 +88,7 @@ def make_test_app():
     stream_stall_timeout: float | None = 60.0,
     sdk_config: AgentSDKConfig | None = None,
     allow_model_free_auth_config: bool = False,
+    transcript_dir: str | Path | None = None,
   ):
     state = _TestAppState()
     resolved_auth_config = dict(
@@ -83,7 +108,8 @@ def make_test_app():
       _ = channel, auth_manager
       state.session = session
 
-      def _build_runner(event_log: EventLog, session_id: str):
+      def _build_runner(event_log: EventLog, session_id: str, started_at: float | None = None):
+        resolved_started_at = float(started_at if started_at is not None else session.created_at)
         state.event_log = event_log
         kwargs = dict(runner_kwargs or {})
 
@@ -91,6 +117,7 @@ def make_test_app():
           runner = runner_class(
             event_log=event_log,
             session_id=session_id,
+            started_at=resolved_started_at,
             sdk_config=resolved_sdk_config,
             system_prompt="test",
             on_usage=None,
@@ -124,6 +151,7 @@ def make_test_app():
             event_log=event_log,
             dispatcher=dispatcher_obj,
             session_id=session_id,
+            started_at=resolved_started_at,
             provider=provider,
             auth_config=session_auth_config,
             get_tool_definitions=lambda: list(resolved_tool_definitions),
@@ -174,6 +202,7 @@ def make_test_app():
         valid_api_keys={"gateway-key"},
         allowed_models=set(),
         build_chat_runtime=_build_chat_runtime,
+        transcript_dir=transcript_dir,
       )
     )
     app.state.test_state = state

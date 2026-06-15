@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
@@ -175,6 +176,7 @@ def test_on_usage_fires_once_per_turn_with_usage_event_fields() -> None:
   assert event.rate_table_version == "2026-04-08"
   assert event.billing_mode == "metered"
   assert event.channel == "web"
+  assert event.provider == "stub"
 
 
 def test_on_usage_failure_does_not_block_chat_response(tmp_path: Path) -> None:
@@ -273,10 +275,12 @@ def test_spawn_sub_agent_emits_usage_with_parent_turn_id() -> None:
   assert events[0].session_id == "sub0:sess-parent"
   assert events[0].request_id == "req-123"
   assert events[0].parent_turn_id == "tool-run-agent-1"
+  assert events[0].provider == "stub"
 
 
 def test_run_appends_turn_complete_event_to_event_log() -> None:
   event_log = EventLog()
+  durable_events: list[dict[str, Any]] = []
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
@@ -288,10 +292,18 @@ def test_run_appends_turn_complete_event_to_event_log() -> None:
     rate_table_version="unknown",
   )
 
+  async def _append_durable_event(event: dict[str, Any]):
+    durable_events.append(dict(event))
+    return SimpleNamespace(seq=len(durable_events))
+
+  runner._append_durable_event = _append_durable_event  # type: ignore[method-assign]
+
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
 
   turn_complete = [entry.event for entry in event_log.entries if entry.event.get("type") == "turn_complete"]
+  assistant_messages = [event for event in durable_events if event.get("type") == "assistant_message"]
   assert len(turn_complete) == 1
+  assert len(assistant_messages) == 1
   assert turn_complete[0]["turn"] == 1
   assert turn_complete[0]["usage"] == {
     "input_tokens": 100,
@@ -299,6 +311,8 @@ def test_run_appends_turn_complete_event_to_event_log() -> None:
     "cache_read_input_tokens": 10,
     "cache_creation_input_tokens": 5,
   }
+  assert assistant_messages[0]["model"] == "claude-sonnet-4-6"
+  assert assistant_messages[0]["provider"] == "stub"
 
 
 def test_runner_emits_session_summary_once_after_run() -> None:
@@ -333,6 +347,8 @@ def test_runner_emits_session_summary_once_after_run() -> None:
   assert summary.channel == "web"
   assert summary.drain_complete is True
   assert summary.in_flight_task_count == 0
+  assert summary.model == "claude-sonnet-4-6"
+  assert summary.provider == "stub"
 
 
 def test_runner_is_single_use() -> None:
@@ -388,6 +404,8 @@ def test_sub_runner_with_parent_aggregator_does_not_emit_own_summary() -> None:
   assert child_summaries == []
   assert parent_summary.input_tokens == 100
   assert parent_summary.turns == 1
+  assert parent_summary.model == "claude-sonnet-4-6"
+  assert parent_summary.provider == "stub"
 
 
 @pytest.mark.parametrize("timeout", [0, None, -1])

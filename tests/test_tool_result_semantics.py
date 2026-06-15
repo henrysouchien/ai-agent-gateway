@@ -35,6 +35,69 @@ def test_classifies_success_false_payload() -> None:
   }
 
 
+def test_classifies_status_error_payload_with_validation_details() -> None:
+  payload = {
+    "status": "error",
+    "error": "decisions-log entry is invalid",
+    "error_code": "invalid_decisions_log_entry",
+    "validation_error": True,
+    "validation_errors": [
+      {"type": "missing", "loc": ["date"], "msg": "Field required"},
+      {
+        "type": "dict_type",
+        "loc": ["patch_ops_applied", 0],
+        "msg": "Input should be a valid dictionary",
+      },
+    ],
+    "required_fields": ["date", "skill", "decision", "rationale"],
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error is not None
+  assert semantic_error["code"] == "tool_status_error"
+  assert semantic_error["source"] == "status"
+  assert semantic_error["status"] == "error"
+  assert semantic_error["sub_code"] == "invalid_decisions_log_entry"
+  assert "decisions-log entry is invalid" in semantic_error["message"]
+  assert "date: Field required" in semantic_error["message"]
+  assert "patch_ops_applied.0: Input should be a valid dictionary" in semantic_error["message"]
+  assert "required_fields: date, skill, decision, rationale" in semantic_error["message"]
+
+
+def test_classifies_status_error_payload_with_errors_alias() -> None:
+  payload = {
+    "status": "error",
+    "error": "price target validation failed",
+    "error_type": "price_target_validation_error",
+    "errors": [
+      {"type": "missing", "loc": ["as_of"], "msg": "Field required"},
+      {
+        "type": "extra_forbidden",
+        "loc": ["ranges", "currency"],
+        "msg": "Extra inputs are not permitted",
+      },
+      {
+        "type": "missing",
+        "loc": ["driver_sensitivities", 0, "driver_key"],
+        "msg": "Field required",
+      },
+    ],
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error is not None
+  assert semantic_error["code"] == "tool_status_error"
+  assert semantic_error["source"] == "status"
+  assert semantic_error["status"] == "error"
+  assert semantic_error["sub_code"] == "price_target_validation_error"
+  assert "price target validation failed" in semantic_error["message"]
+  assert "as_of: Field required" in semantic_error["message"]
+  assert "ranges.currency: Extra inputs are not permitted" in semantic_error["message"]
+  assert "driver_sensitivities.0.driver_key: Field required" in semantic_error["message"]
+
+
 def test_warning_only_payload_is_not_semantic_error() -> None:
   assert classify_semantic_tool_error({"status": "success", "warning": "partial data"}) is None
   assert classify_semantic_tool_error({"response": "", "warning": "timed out"}) is None

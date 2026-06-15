@@ -12,7 +12,7 @@ from weakref import WeakKeyDictionary
 
 import httpx
 
-from .base import ModelInfo, ModelProvider, StreamEvent, ThinkingLevel
+from .base import ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
 
 
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
@@ -46,9 +46,9 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
-      input_cost_per_mtok=0.0,
-      output_cost_per_mtok=0.0,
-      cache_read_cost_per_mtok=0.0,
+      input_cost_per_mtok=5.00,
+      output_cost_per_mtok=30.00,
+      cache_read_cost_per_mtok=0.50,
     ),
   ),
   (
@@ -1187,7 +1187,7 @@ class CodexProvider(ModelProvider):
 
       result.append(message)
 
-    return result
+    return truncate_to_last_compaction(result, compaction_as_text=True)
 
   async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
     if not isinstance(client, httpx.AsyncClient):

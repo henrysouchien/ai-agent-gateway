@@ -9,10 +9,13 @@ By default the API is mounted under `/api`. If you set `GatewayServerConfig.pref
 - `POST /chat/init` returns JSON
 - `POST /chat/tool-result` returns JSON
 - `POST /chat/tool-approval` returns JSON
+- `POST /chat/cancel` returns JSON
+- `GET /chat/subscribe` returns an SSE stream for an active turn
 - `GET /health` returns JSON
 - `POST /chat` returns an SSE stream
 
 The chat stream uses standard server-sent events with `Content-Type: text/event-stream`. The server writes JSON payloads as `data:` lines and does not currently set named SSE event types.
+Stream schema version is selected once at `POST /chat/init` and echoed on every stream envelope. `GET /chat/subscribe` reuses the session's stored schema version; clients must create a new session to change versions.
 
 ## Auth Flow
 
@@ -34,6 +37,7 @@ Request body:
 ```json
 {
   "api_key": "demo-key",
+  "schema_version": 1,
   "user_id": "alice"
 }
 ```
@@ -43,6 +47,7 @@ Schema:
 | Field | Type | Required | Notes |
 | --- | --- | --- | --- |
 | `api_key` | string | yes | Must be non-empty. |
+| `schema_version` | integer | no | Wire schema version requested for this session. Defaults to `1`. Unsupported versions return HTTP `400` with `{"error":"unsupported_schema_version", "message":"Unsupported schema_version <N>; supported: [1]"}`. |
 | `user_id` | string | yes without resolver | Stable user identity. The gateway uses this for credential resolution and as the session identity. When a credentials resolver is configured, the resolver may derive the user from the API key; otherwise clients must send a top-level user_id. `_default` is reserved-invalid. |
 
 Response body:
@@ -53,6 +58,7 @@ Response body:
   "session_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "session_id": "sess_1234abcd5678",
   "expires_at": 1770000000,
+  "schema_version": 1,
   "model_catalog": {
     "default_model": "claude-opus-4-7",
     "allowed_models": ["claude-opus-4-7", "claude-sonnet-4-6"],
@@ -69,6 +75,7 @@ Schema:
 | `session_token` | string | JWT bearer token for later requests |
 | `session_id` | string | Server-generated session id |
 | `expires_at` | integer | Unix timestamp |
+| `schema_version` | integer | Negotiated wire schema version for this session. Every `/chat` and `/chat/subscribe` SSE envelope echoes this value. |
 | `model_catalog` | object, optional | Optional model discovery metadata. Present only when `GatewayServerConfig.model_catalog` is configured. Clients tolerate absence. Contains `default_model` (string), `allowed_models` (array of strings), and `display_names` (object mapping model id to display label). |
 
 Example:
@@ -76,7 +83,7 @@ Example:
 ```bash
 curl -s http://127.0.0.1:8000/api/chat/init \
   -H 'Content-Type: application/json' \
-  -d '{"api_key":"demo-key","user_id":"alice"}'
+  -d '{"api_key":"demo-key","schema_version":1,"user_id":"alice"}'
 ```
 
 ### POST /api/chat
@@ -122,6 +129,7 @@ Schema:
 Notes:
 
 - One active stream is allowed per session. A second concurrent `POST /api/chat` returns HTTP `409`.
+- Stream envelopes have the shape `{seq, session_id, schema_version, event}`. For schema v1, the server projects each event through the v1 adapter, strips fields added after the v1 freeze, and skips event types not in the v1 wire contract while preserving cursor sequence gaps.
 - The server verifies that `model` is in `GatewayServerConfig.allowed_models` when an allowlist is configured.
 - Recommended `context.channel` values: `web`, `cli`, `telegram`, `bot`. The field is free-form; gateways may route or scope behavior on the channel value, and analytics commonly use it. Planned reference dev clients (the in-flight `@ai-agent-gateway/tui` and `ai-agent-gateway-cli` packages) will send `"cli"` as the canonical dev-surface value.
 - `create_agent()` resolves the runtime for you. `create_gateway_app()` calls your `build_chat_runtime(session, request, channel, auth_manager)`.
@@ -139,6 +147,23 @@ curl -N http://127.0.0.1:8000/api/chat \
     "context": {"channel": "web"},
     "user_id": "alice"
   }'
+```
+
+### POST /api/chat/cancel
+
+Explicitly cancel the active turn for the bearer-token session. Passive SSE disconnects remain resumable through `/chat/subscribe`; use this endpoint for user-initiated Stop/cancel actions.
+
+Headers:
+
+- `Authorization: Bearer <session_token>`
+- `Content-Type: application/json`
+
+Request body:
+
+```json
+{
+  "session_id": "sess_1234abcd5678"
+}
 ```
 
 ### POST /api/chat/tool-result
@@ -263,7 +288,7 @@ curl -s http://127.0.0.1:8000/api/health
 
 ### Artifact endpoints
 
-Added in 0.15.0. Four read-only GET endpoints serve artifact JSON sidecars and `.docx` letter binaries from per-user workspace storage (`data/users/<user>/workspace/artifacts/` and `.../letters/`). The artifact files are written server-side by the skill-framework materializer — these endpoints are read-only.
+Added in 0.15.0. Four read-only GET endpoints serve artifact JSON sidecars and `.docx` letter binaries from per-user workspace storage (`data/users/<user>/workspace/artifacts/` and `.../letters/`). The artifact files are written server-side by structured report doors or artifact-producing tools; these endpoints are read-only.
 
 **Auth: signed end-user claim, not session JWT.** Each request must carry seven `X-Agent-Claim-*` headers (`Audience`, `Issued-At`, `Expiry`, `User-Id`, `User-Email`, `Nonce`, `Signature`). The signature is HMAC-SHA256 over `audience\nissued_at\nexpiry\nuser_id\nuser_email\nnonce` using a key the gateway operator pre-shares with the artifact client. This is the same signed-claim scheme Theme A introduced for `POST /api/chat/init`; the verifier is shared.
 
@@ -299,14 +324,27 @@ Status codes: as above. `artifact_id` matches the JSON filename stem.
 
 #### GET /api/artifacts/{ticker}
 
-Return an index of available skills + their latest artifact ids for a ticker.
+Return an index of available skills, latest artifact ids, and bounded recent
+artifact ids for a ticker. Use `recent_artifact_ids` with
+`GET /api/artifacts/{ticker}/{skill}/{artifact_id}` when a downstream reviewer
+needs a non-latest producer sidecar without filesystem globbing.
 
 Response body:
 
 ```json
 [
-  {"skill": "fundamental-research", "latest_artifact_id": "20260520T173401"},
-  {"skill": "earnings-scenarios", "latest_artifact_id": "20260518T091200"}
+  {
+    "skill": "fundamental-research",
+    "latest_artifact_id": "20260520T173401",
+    "artifact_count": 2,
+    "recent_artifact_ids": ["20260520T173401", "20260519T104455"]
+  },
+  {
+    "skill": "earnings-scenarios",
+    "latest_artifact_id": "20260518T091200",
+    "artifact_count": 1,
+    "recent_artifact_ids": ["20260518T091200"]
+  }
 ]
 ```
 
@@ -865,29 +903,42 @@ Emitted once at the start of a skill-framework sub-agent run.
 }
 ```
 
-#### `verdict_emitted`
+#### `skill_result_captured`
 
-Emitted when the skill writes a verdict YAML through its `memory_write` (extracted from the most recent verdict-bearing tool result).
+Emitted when the runtime captures a structured skill result envelope.
 
 ```json
 {
-  "type": "verdict_emitted",
+  "type": "skill_result_captured",
   "skill_run_id": "run_8a3f",
   "skill": "fundamental-research",
   "ticker": "AAPL",
-  "verdict_token": "MATERIAL_POSITIVE",
-  "confidence": "HIGH",
-  "materiality_cushion": 0.15,
-  "one_line_summary": "Capital allocation continues to compound at ~22% ROIC.",
-  "ts": 1770000005.2
+  "exit_code": 0,
+  "outcome": "success",
+  "status": "noop",
+  "gate_code": "PROCEED",
+  "artifact_refs": ["artifacts/AAPL/fundamental-research/result.json"],
+  "proposal_ids": [],
+  "verdict_echo": {
+    "verdict": "MATERIAL_POSITIVE",
+    "confidence": "HIGH",
+    "one_line_summary": "Capital allocation continues to compound at about 22% ROIC."
+  },
+  "fms_results": [],
+  "artifact_events": [],
+  "output_memory_file": null,
+  "cost_usd": 0.12,
+  "duration_s": 18.4,
+  "error": null,
+  "warnings": []
 }
 ```
 
-Field types: `confidence` is `"HIGH" | "MEDIUM" | "LOW" | null`. `materiality_cushion` is a float or null.
+`verdict_echo` is optional; when present it is the UI/control-plane verdict summary source. It is produced by structured tools and FMS envelopes, not by parsing final markdown.
 
 #### `artifact_ready`
 
-Emitted when the materializer writes a JSON sidecar artifact (and optionally a `.docx` binary) to per-user workspace storage. Pairs with the artifact-read endpoints documented above.
+Emitted when a structured report door or artifact-producing tool writes a JSON sidecar artifact (and optionally a binary artifact such as a `.docx`) to per-user workspace storage. Pairs with the artifact-read endpoints documented above.
 
 ```json
 {
@@ -926,7 +977,7 @@ Emitted when an aggregate view-model reaches the sources-complete state.
 
 #### `artifact_failed`
 
-Emitted when the materializer fails to produce an artifact (YAML parse error, schema-drift, validation, etc.).
+Emitted when a structured report door or artifact-producing tool fails to produce an artifact.
 
 ```json
 {
@@ -935,13 +986,13 @@ Emitted when the materializer fails to produce an artifact (YAML parse error, sc
   "ticker": "AAPL",
   "skill": "fundamental-research",
   "error_code": "schema_drift",
-  "error_detail": "expected field 'confidence' missing from verdict block",
-  "source_path": "memory/verdict.yaml",
+  "error_detail": "expected field 'confidence' missing from structured artifact payload",
+  "source_path": "artifacts/AAPL/fundamental-research/20260520T173401.json",
   "ts": 1770000010.0
 }
 ```
 
-`error_code` is one of `"yaml_parse" | "validation" | "missing_contract" | "schema_drift" | "other"`.
+`error_code` is one of `"validation" | "missing_contract" | "schema_drift" | "tool_write_failed" | "other"`.
 
 #### `artifact_unavailable`
 

@@ -6,7 +6,13 @@ from typing import Any
 
 PACKAGE_NAME = "ai-agent-gateway"
 CONTRACT_CREDENTIAL_REFRESH_V1 = "credential-refresh-v1"
-CONTRACTS = frozenset({CONTRACT_CREDENTIAL_REFRESH_V1})
+CONTRACT_AUTONOMOUS_OPERATOR_MESSAGES_V1 = "autonomous-operator-messages-v1"
+CONTRACT_CONTROL_CHAT_CONTINUATION_V1 = "control-chat-continuation-v1"
+CONTRACTS = frozenset({
+  CONTRACT_CREDENTIAL_REFRESH_V1,
+  CONTRACT_AUTONOMOUS_OPERATOR_MESSAGES_V1,
+  CONTRACT_CONTROL_CHAT_CONTINUATION_V1,
+})
 
 
 def _package_version() -> str:
@@ -31,6 +37,8 @@ def package_health() -> dict[str, Any]:
 
 __all__ = [
   "CONTRACTS",
+  "CONTRACT_AUTONOMOUS_OPERATOR_MESSAGES_V1",
+  "CONTRACT_CONTROL_CHAT_CONTINUATION_V1",
   "CONTRACT_CREDENTIAL_REFRESH_V1",
   "PACKAGE_NAME",
   "SOURCE_COMMIT",

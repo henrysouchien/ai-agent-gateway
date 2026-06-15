@@ -2,20 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Literal, Optional, Set
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Literal, Optional, Set
 
 import jwt
 from fastapi import HTTPException
 
+from .events import DEFAULT_SCHEMA_VERSION
+from .event_log import EventLog
 from .session_event_history import SessionEventHistory
+
+if TYPE_CHECKING:
+  from .multi_user.billing import SessionUsageSummary
 
 
 JWT_ALGORITHM = "HS256"
-OnSessionExpiry = Callable[["GatewaySession"], Awaitable[None]]
+JWT_HS256_MIN_SECRET_BYTES = 32
+OnSessionExpiry = Callable[["GatewaySession"], Awaitable[None] | None]
 _RESERVED_USER_IDS = {"_default"}
 
 
@@ -26,6 +33,34 @@ def _normalize_required_user_id(user_id: str | None) -> str:
   if normalized in _RESERVED_USER_IDS:
     raise ValueError("user_id '_default' is reserved")
   return normalized
+
+
+@dataclass
+class StreamSubscriber:
+  """One connected client reading a session's active turn stream."""
+
+  subscriber_id: str
+  connected_at: float
+  last_sent_seq: int
+  queue: asyncio.Queue
+  client_label: str | None = None
+  pump_task: asyncio.Task[Any] | None = None
+  disconnect_reason: str | None = None
+
+
+@dataclass
+class SessionStream:
+  """Live and grace-window state for the current chat turn."""
+
+  event_log: EventLog
+  runner_task: asyncio.Task[Any] | None
+  subscribers: Dict[str, StreamSubscriber] = field(default_factory=dict)
+  transcript_written_seqs: set[int] = field(default_factory=set)
+  cleanup_handle: asyncio.TimerHandle | None = None
+
+  @property
+  def is_running(self) -> bool:
+    return self.runner_task is not None and not self.runner_task.done()
 
 
 @dataclass
@@ -49,7 +84,10 @@ class GatewaySession:
   auth_config: dict[str, Any] | None = None
   channel: Optional[str] = None
   is_public: bool = False
+  schema_version: int = DEFAULT_SCHEMA_VERSION
   stream_active: bool = False
+  active_turn: Optional[SessionStream] = None
+  cached_usage: SessionUsageSummary | None = None
   pending_tools: Dict[str, Dict] = field(default_factory=dict)
   approved_tool_types: Set[str] = field(default_factory=set)
   loaded_mcp_servers: Set[str] = field(default_factory=set)
@@ -61,6 +99,7 @@ class GatewaySession:
   result_queue: Optional[asyncio.Queue] = None
   code_execution_work_dir: Optional[str] = None
   background_tasks: Dict[str, Any] = field(default_factory=dict)
+  control_chat_tasks: Dict[str, asyncio.Task[Any]] = field(default_factory=dict)
   event_history: SessionEventHistory = field(default_factory=SessionEventHistory)
   initial_message: str = ""
   _expiring: bool = False
@@ -73,9 +112,19 @@ class SessionStore:
     self.ttl = ttl
     self.sessions: Dict[str, GatewaySession] = {}
     self._on_expiry: OnSessionExpiry | None = None
+    self._on_expiry_hooks: list[OnSessionExpiry] = []
 
   def set_on_expiry(self, hook: OnSessionExpiry) -> None:
+    """Replace the session-expiry cleanup hook.
+
+    Prefer ``add_on_expiry`` when composing multiple cleanup owners.
+    """
     self._on_expiry = hook
+    self._on_expiry_hooks = [hook]
+
+  def add_on_expiry(self, hook: OnSessionExpiry) -> None:
+    """Register an additional session-expiry cleanup hook."""
+    self._on_expiry_hooks.append(hook)
 
   def create_session(
     self,
@@ -88,6 +137,7 @@ class SessionStore:
     kind: Literal["chat", "control"] = "chat",
     auth_config: dict[str, Any] | None = None,
     ttl_seconds: int | None = None,
+    schema_version: int = DEFAULT_SCHEMA_VERSION,
   ) -> GatewaySession:
     now = int(time.time())
     ttl = self.ttl if ttl_seconds is None else int(ttl_seconds)
@@ -104,6 +154,7 @@ class SessionStore:
       role=role,
       kind=kind,
       auth_config=dict(auth_config) if auth_config is not None else None,
+      schema_version=int(schema_version),
       result_queue=asyncio.Queue(),
     )
     self.sessions[session_id] = session
@@ -118,7 +169,7 @@ class SessionStore:
       return
     session._expiring = True
     self.sessions.pop(session_id, None)
-    if self._on_expiry is not None:
+    if self._on_expiry_hooks or self._on_expiry is not None:
       try:
         loop = asyncio.get_running_loop()
       except RuntimeError:
@@ -126,8 +177,7 @@ class SessionStore:
       else:
         loop.create_task(self._safe_on_expiry(session))
         return
-    if session.code_execution_work_dir:
-      shutil.rmtree(session.code_execution_work_dir, ignore_errors=True)
+    self._cleanup_session_files(session)
 
   def cleanup_expired(self) -> None:
     now = int(time.time())
@@ -141,11 +191,7 @@ class SessionStore:
       return
     session._expiring = True
     self.sessions.pop(session_id, None)
-    if self._on_expiry is not None:
-      await self._safe_on_expiry(session)
-      return
-    if session.code_execution_work_dir:
-      shutil.rmtree(session.code_execution_work_dir, ignore_errors=True)
+    await self._safe_on_expiry(session)
 
   async def cleanup_expired_async(self) -> None:
     now = int(time.time())
@@ -154,18 +200,33 @@ class SessionStore:
       await self.expire_session_async(session_id)
 
   async def _safe_on_expiry(self, session: GatewaySession) -> None:
-    if self._on_expiry is None:
-      return
-    try:
-      await self._on_expiry(session)
-    except Exception:
-      pass
+    hooks = list(self._on_expiry_hooks)
+    if not hooks and self._on_expiry is not None:
+      hooks = [self._on_expiry]
+    for hook in hooks:
+      try:
+        result = hook(session)
+        if inspect.isawaitable(result):
+          await result
+      except Exception:
+        pass
+    self._cleanup_session_files(session)
+
+  @staticmethod
+  def _cleanup_session_files(session: GatewaySession) -> None:
+    if session.code_execution_work_dir:
+      shutil.rmtree(session.code_execution_work_dir, ignore_errors=True)
+      session.code_execution_work_dir = None
 
 
 class AuthManager:
   """Issue and verify JWT session tokens for the gateway HTTP API."""
 
   def __init__(self, secret: str, valid_keys: Set[str], session_store: SessionStore) -> None:
+    if len(secret.encode("utf-8")) < JWT_HS256_MIN_SECRET_BYTES:
+      raise ValueError(
+        f"JWT signing secret must be at least {JWT_HS256_MIN_SECRET_BYTES} bytes for {JWT_ALGORITHM}"
+      )
     self._secret = secret
     self._valid_keys = set(valid_keys)
     self.session_store = session_store
@@ -199,6 +260,7 @@ class AuthManager:
       "role": session.role,
       "channel": session.channel,
       "is_public": session.is_public,
+      "schema_version": session.schema_version,
     }
     return jwt.encode(payload, self._secret, algorithm=JWT_ALGORITHM)
 
@@ -259,6 +321,14 @@ class AuthManager:
     payload["is_public"] = is_public if isinstance(is_public, bool) else False
     session.channel = payload["channel"]
     session.is_public = payload["is_public"]
+    token_schema_version = payload.get("schema_version", session.schema_version)
+    try:
+      token_schema_version = int(token_schema_version)
+    except (TypeError, ValueError) as exc:
+      raise HTTPException(status_code=401, detail="Invalid session schema_version") from exc
+    if token_schema_version != session.schema_version:
+      raise HTTPException(status_code=401, detail="Session schema version mismatch")
+    payload["schema_version"] = token_schema_version
 
     return payload
 

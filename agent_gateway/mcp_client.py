@@ -314,6 +314,7 @@ class McpClientManager:
     config_path: Path | str | None | object = _UNSET,
     inline_servers: Dict[str, Dict[str, Any]] | None = None,
     timeout_overrides: Dict[str, int] | None = None,
+    tool_timeout_overrides: Dict[str, int] | None = None,
     server_aliases: Dict[str, str] | None = None,
     startup_timeout: int = 15,
     default_tool_timeout: int = 30,
@@ -335,6 +336,10 @@ class McpClientManager:
       self._canonical_server_name(server_name): timeout
       for server_name, timeout in dict(timeout_overrides or {}).items()
     }
+    self._tool_timeout_overrides = {
+      self._canonical_tool_timeout_key(tool_name): timeout
+      for tool_name, timeout in dict(tool_timeout_overrides or {}).items()
+    }
     self._startup_timeout = startup_timeout
     self._default_tool_timeout = default_tool_timeout
     self._strip_input_fields = strip_input_fields or set()
@@ -344,6 +349,24 @@ class McpClientManager:
 
   def _canonical_server_names(self, server_names: Set[str]) -> Set[str]:
     return {self._canonical_server_name(server_name) for server_name in server_names}
+
+  def _canonical_tool_timeout_key(self, tool_name: str) -> str:
+    if "." not in tool_name:
+      return tool_name
+    server_name, original_name = tool_name.split(".", 1)
+    return f"{self._canonical_server_name(server_name)}.{original_name}"
+
+  def _timeout_for_tool(self, server_name: str, exposed_name: str, original_name: str) -> int:
+    for key in (
+      f"{server_name}.{original_name}",
+      f"{server_name}.{exposed_name}",
+      original_name,
+      exposed_name,
+    ):
+      timeout = self._tool_timeout_overrides.get(key)
+      if timeout is not None:
+        return timeout
+    return self._timeout_overrides.get(server_name, self._default_tool_timeout)
 
   def _canonicalize_server_configs(
     self,
@@ -676,7 +699,7 @@ class McpClientManager:
       return None, {"code": "mcp_tool_error", "message": f"MCP server unavailable: {server_name}"}
     original_name = self._prefixed_to_original.get(name, name)
 
-    timeout_seconds = self._timeout_overrides.get(server_name, self._default_tool_timeout)
+    timeout_seconds = self._timeout_for_tool(server_name, name, original_name)
 
     try:
       if abort_event is not None and abort_event.is_set():

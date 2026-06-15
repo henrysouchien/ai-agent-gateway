@@ -87,6 +87,24 @@ def test_collect_run_output() -> None:
   assert output.timed_out is False
   assert output.budget_exceeded is True
   assert output.max_turns_reached is True
+  assert output.max_tokens_reached is False
+
+
+def test_collect_run_output_detects_max_tokens_stop_reason() -> None:
+  event_log = EventLog()
+  event_log.append({"type": "text_delta", "text": "partial"})
+  event_log.append({
+    "type": "assistant_message",
+    "content_blocks": [{"type": "text", "text": "partial"}],
+    "stop_reason": "max_tokens",
+  })
+  event_log.append({"type": "stream_complete", "usage": {"input_tokens": 1, "output_tokens": 2}})
+
+  output = autonomous.collect_run_output(event_log, timed_out=False)
+
+  assert output.response == "partial"
+  assert output.max_tokens_reached is True
+  assert output.error is None
 
 
 def test_collect_run_output_detects_operator_pause() -> None:
@@ -206,7 +224,9 @@ def test_run_autonomous_tolerates_model_free_auth_config(monkeypatch: pytest.Mon
     (autonomous.RunOutput("ok", [], {}, "boom", False), 1),
     (autonomous.RunOutput("ok", [], {}, None, False, budget_exceeded=True), 2),
     (autonomous.RunOutput("ok", [], {}, None, False, max_turns_reached=True), 3),
+    (autonomous.RunOutput("ok", [], {}, None, False, max_tokens_reached=True), 4),
     (autonomous.RunOutput("ok", [], {}, None, False, operator_paused=True), 0),
+    (autonomous.RunOutput("ok", [], {}, "guard failed", False, exit_reason="post_run_guard_failed"), 1),
     (autonomous.RunOutput("ok", [], {}, None, True), 124),
   ],
 )
@@ -222,11 +242,40 @@ def test_run_output_exit_code(output: autonomous.RunOutput, expected: int) -> No
     (autonomous.RunOutput("ok", [], {}, "boom", False), "error"),
     (autonomous.RunOutput("ok", [], {}, None, False, budget_exceeded=True), "budget_exceeded"),
     (autonomous.RunOutput("ok", [], {}, None, False, max_turns_reached=True), "max_turns"),
+    (autonomous.RunOutput("ok", [], {}, None, False, max_tokens_reached=True), "max_tokens"),
     (autonomous.RunOutput("ok", [], {}, None, False, operator_paused=True), "operator_pause"),
+    (
+      autonomous.RunOutput("ok", [], {}, "guard failed", False, exit_reason="post_run_guard_failed"),
+      "post_run_guard_failed",
+    ),
   ],
 )
 def test_run_output_outcome(output: autonomous.RunOutput, expected: str) -> None:
   assert autonomous.run_output_outcome(output) == expected
+
+
+def test_post_run_guard_failure_marks_exit_reason_and_summary() -> None:
+  output = autonomous.RunOutput("Agent completed.", [], {}, None, False)
+
+  autonomous.mark_post_run_guard_failure(
+    output,
+    guard="producer_skill_artifact_postcondition",
+    message="Missing standard artifact.",
+    details={"expected_file": "skills/demo/out.md"},
+  )
+
+  assert autonomous.run_output_exit_code(output) == 1
+  assert autonomous.run_output_outcome(output) == "post_run_guard_failed"
+  assert output.post_run_guard == {
+    "guard": "producer_skill_artifact_postcondition",
+    "message": "Missing standard artifact.",
+    "expected_file": "skills/demo/out.md",
+  }
+  summary = autonomous.format_run_summary(output)
+  assert "Status: post-run guard failed" in summary
+  assert "Exit reason: post_run_guard_failed" in summary
+  assert "Post-run guard: producer_skill_artifact_postcondition" in summary
+  assert "Error: Missing standard artifact." in summary
 
 
 def test_extract_state_update() -> None:
@@ -281,6 +330,7 @@ def test_build_state_payload() -> None:
   assert payload["tools_used"] == ["file_read", "web_fetch"]
   assert payload["usage"] == {"input_tokens": 5}
   assert payload["operator_paused"] is False
+  assert payload["max_tokens_reached"] is False
   assert payload["last_summary"] == "Long summary text"
   assert payload["alerts"] == ["fresh"]
   assert payload["next_session"] == ["next"]
@@ -316,6 +366,14 @@ def test_format_run_summary_operator_paused_status() -> None:
   message = autonomous.format_run_summary(output, label="Nightly analyst run")
 
   assert "Status: operator paused" in message
+
+
+def test_format_run_summary_max_tokens_status() -> None:
+  output = autonomous.RunOutput("Partial.", [], {}, None, False, max_tokens_reached=True)
+
+  message = autonomous.format_run_summary(output, label="Nightly analyst run")
+
+  assert "Status: max tokens reached" in message
 
 
 def test_deliver_telegram(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -553,7 +611,7 @@ def test_run_autonomous_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 
   assert captured["run_session_kwargs"]["max_turns"] == 80
   assert captured["run_session_kwargs"]["timeout_seconds"] is None
-  assert captured["runner_kwargs"]["per_turn_timeout"] == 300.0
+  assert captured["runner_kwargs"]["per_turn_timeout"] is None
 
 
 def test_run_autonomous_forwards_outputs_dir(

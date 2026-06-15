@@ -12,6 +12,7 @@ from .approvals import build_approvals_router
 from .artifacts import build_artifacts_router
 from .events import build_events_router
 from .health import build_health_router
+from .profiles import build_profiles_router
 from .runs import build_runs_router
 from .schedules import build_schedules_router
 from .session import build_session_router
@@ -40,12 +41,16 @@ def create_control_plane_router(
       approval_policy=approval_policy,
     )
   )
+  router.include_router(build_profiles_router(auth=auth))
   router.include_router(build_skills_router(auth=auth, skills_dir=skills_dir))
   router.include_router(build_schedules_router(auth=auth))
-  router.include_router(build_runs_router(auth=auth, autonomous_registry=autonomous_registry))
-  router.include_router(build_approvals_router(auth=auth))
+  router.include_router(build_runs_router(auth=auth, autonomous_registry=autonomous_registry, skills_dir=skills_dir))
+  router.include_router(build_approvals_router(auth=auth, autonomous_registry=autonomous_registry))
   router.include_router(build_events_router(auth=auth))
-  router.include_router(build_artifacts_router(artifact_auth_dependency=artifact_auth_dependency))
+  router.include_router(build_artifacts_router(
+    artifact_auth_dependency=artifact_auth_dependency,
+    autonomous_registry=autonomous_registry,
+  ))
   router.include_router(build_health_router(route_prefix=route_prefix))
   return router
 

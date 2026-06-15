@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import socket
 import time
 import uuid
@@ -29,7 +30,8 @@ from .multi_user.billing import (
   write_dlq,
 )
 from .product_config import gateway_product_id
-from .providers import ModelInfo, ModelProvider, ThinkingLevel
+from .providers import ModelInfo, ModelProvider, ThinkingLevel, truncate_to_last_compaction
+from .session_recap import emit_recap_then_terminal
 from .task_registry import (
   COORDINATOR_DEFAULT_PREAMBLE,
   CoordinatorConfig,
@@ -39,24 +41,60 @@ from .task_registry import (
   TaskNotification,
   TaskRegistry,
   TaskState,
+  format_parent_messages_for_model,
   make_progress_tracker,
 )
 from .tool_dispatcher import ToolDispatcher
+from .tool_display import resolve_display
 from .tool_result_semantics import classify_semantic_tool_error
 
 
 log = logging.getLogger("agent_gateway.runner")
 MODEL_CONTEXT_LIMIT = 200_000
 CONTEXT_WARNING_PCT = 80
+# Server-side compaction fires when submitted input crosses the trigger. A fixed
+# trigger calibrated to the old 200k-window era fires on every turn once the
+# static system+tool surface alone exceeds it on a large-window model (e.g. 1M),
+# so the API re-compacts each request for no benefit. Scale the trigger and the
+# context-usage warning to the model's real window instead.
+COMPACTION_TRIGGER_PCT = 80
 MODEL_TOOL_RESULT_MAX_CHARS = 60_000
 MODEL_TOOL_RESULT_MAX_CHARS_ENV = "AGENT_GATEWAY_MAX_MODEL_TOOL_RESULT_CHARS"
 MODEL_TOOL_RESULT_MIN_CHARS = 4_000
-STREAM_STALL_TIMEOUT = 60  # max seconds between stream events before watchdog cancels
+SPILL_TRUNCATED_TOOL_RESULTS_ENV = "AGENT_GATEWAY_SPILL_TRUNCATED_TOOL_RESULTS"
+STREAM_STALL_TIMEOUT = 60  # max seconds between stream progress events before watchdog cancels
 STREAM_THINKING_STALL_TIMEOUT = 300  # extended-thinking turns can be quiet before first visible output
+STREAM_GUARD_POLL_INTERVAL = 2.0
+# Liveness is guarded by event-gap stall detection (retryable), NOT wall clock:
+# thinking-turn duration is unpredictable, so per_turn_timeout should be None on
+# thinking surfaces. If a caller does set it, it must comfortably EXCEED the
+# stall allowance above or the terminal per-turn abort preempts the retryable
+# stall guard on a slow first token (both timers start near turn start;
+# per-turn always leads). See ACUI-25.
 STREAM_RETRY_MAX = 3
 STREAM_RETRY_DELAY = 2.0
 STREAM_RETRY_BACKOFF = 2.0
 _MAX_NOTIFICATIONS_PER_TURN = 5
+# Backstop cap for inline run_agent dispatch (ACUI-1). Must comfortably exceed
+# sub_agent.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS (1800s) so the inner spawn
+# timeout fires first and returns a clean tool error; this only triggers if
+# that inner await itself never resolves.
+_RUN_AGENT_DISPATCH_TIMEOUT_SECONDS = 2100.0
+# A turn that exhausts max_tokens with no usable tool call (e.g. long interleaved
+# thinking + a very large tool-call JSON truncated mid-stream) must not silently
+# end the run (ACUI-27): nudge and continue, bounded to avoid loops.
+_MAX_TOKENS_CONTINUATIONS = 2
+_MAX_TOKENS_NUDGE = (
+  "[System: Your previous response hit the output-token limit and was truncated; "
+  "any partial tool call was discarded. Continue the task now. If you were emitting "
+  "a large tool call, re-issue it more concisely (trim verbose narrative fields) or "
+  "split the submission into smaller steps. Do not restate prior reasoning.]"
+)
+_ACTIVE_SKILL_DENY_RESULT_KEY = "_active_skill_deny"
+_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
+# Report doors are the only auto-clear doors in scope and normally return noop;
+# staged is included defensively for preview-mode doors that stage artifacts.
+_REPORT_DOOR_CLEAR_SUCCESS_STATUSES = frozenset({"noop", "staged"})
 FinalAnswerGuard = Callable[
   [List[Dict[str, Any]], str, List[str], List[Dict[str, Any]], int],
   str | None,
@@ -73,7 +111,26 @@ def _estimate_tokens(text: str) -> int:
   return max(1, len(text) // 4)
 
 
-def _format_exc(exc: Exception) -> str:
+def _model_context_window(model_info: Any) -> int:
+  window = getattr(model_info, "context_window", None)
+  return int(window) if window else MODEL_CONTEXT_LIMIT
+
+
+def _effective_compaction_trigger(compaction_trigger: int | None, model_info: Any) -> int | None:
+  """Scale a fixed compaction trigger up to the model's real context window.
+
+  Keeps the configured value as a floor (never compacts later than legacy on a
+  small window) but raises it to ``COMPACTION_TRIGGER_PCT`` of a larger window so
+  it only fires near genuine capacity instead of on every turn once the static
+  system+tool surface alone already exceeds the legacy trigger.
+  """
+  if compaction_trigger is None:
+    return None
+  window_trigger = int(_model_context_window(model_info) * COMPACTION_TRIGGER_PCT / 100)
+  return max(window_trigger, int(compaction_trigger))
+
+
+def _format_exc(exc: BaseException) -> str:
   parts = [f"{type(exc).__name__}: {repr(exc)}"]
   seen = {id(exc)}
   cause = exc.__cause__
@@ -122,6 +179,13 @@ def _model_tool_result_max_chars() -> int:
   return max(MODEL_TOOL_RESULT_MIN_CHARS, value)
 
 
+def _spill_truncated_tool_results_enabled() -> bool:
+  raw = os.getenv(SPILL_TRUNCATED_TOOL_RESULTS_ENV)
+  if raw is None:
+    return True
+  return raw.strip().lower() not in {"0", "false", "no"}
+
+
 def _scalar_preview_fields(value: Any) -> Dict[str, Any]:
   if not isinstance(value, dict):
     return {}
@@ -141,6 +205,8 @@ def _truncate_model_tool_result_content(
   *,
   tool_name: str,
   max_chars: int,
+  spill_filename: str | None = None,
+  spill_abspath: str | None = None,
 ) -> tuple[str, bool]:
   if max_chars <= 0 or len(content) <= max_chars:
     return content, False
@@ -158,10 +224,20 @@ def _truncate_model_tool_result_content(
     "message": (
       "The full tool result was retained in the gateway event log, but this "
       "model-bound preview was truncated to stay within the provider context "
-      "window. Use a narrower tool query or a file-backed output mode if more "
-      "detail is needed."
+      "window. Narrow the tool query (filters, pagination, fewer fields) if you "
+      "need more detail. If a spill file is listed below, read it for the full result."
     ),
   }
+  if spill_filename is not None:
+    payload["spill_file"] = spill_filename
+    payload["spill_abspath"] = spill_abspath
+    payload["spill_hint"] = (
+      "The FULL, untruncated result was written to this file in your code_execute "
+      "working directory. Read it there instead of relying on this preview - e.g. "
+      f"in code_execute: `import pandas as pd; df = pd.read_json('{spill_filename}')` "
+      f"(or `json.load(open('{spill_filename}'))`). In run_bash/file_read, use the "
+      "absolute path (spill_abspath) instead of the bare name."
+    )
   if isinstance(parsed, dict):
     payload["top_level_keys"] = list(parsed.keys())[:50]
     scalar_fields = _scalar_preview_fields(parsed)
@@ -190,6 +266,12 @@ def _truncate_model_tool_result_content(
     "original_chars": len(content),
     "message": "Tool result omitted from model context because it exceeded the configured payload limit.",
   }
+  if spill_filename is not None:
+    fallback_payload["spill_file"] = spill_filename
+    fallback_payload["spill_abspath"] = spill_abspath
+    fallback_payload["spill_hint"] = (
+      "The FULL, untruncated result was written to this file in your code_execute working directory."
+    )
   return json.dumps(fallback_payload, default=str), True
 
 
@@ -256,6 +338,8 @@ class ToolResultContext:
   session_id: str
   server: str | None
   result_entry: Dict[str, Any] | None
+  skill_run_id: str | None = None
+  workspace_dir: str | None = None
 
 
 @dataclass
@@ -275,6 +359,51 @@ class StreamTurnResult:
   stop_reason: str | None = None
   first_token_t: float | None = None
   content_blocks: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def _system_prompt_text(system_prompt: Optional[Union[str, List[Tuple[str, bool]]]]) -> str:
+  if isinstance(system_prompt, str):
+    return system_prompt
+  if isinstance(system_prompt, list):
+    return "\n".join(str(part[0]) for part in system_prompt if part)
+  return ""
+
+
+def _system_prompt_requires_tool_only_turns(system_prompt: Optional[Union[str, List[Tuple[str, bool]]]]) -> bool:
+  text = _system_prompt_text(system_prompt).lower()
+  return (
+    "tool-call messages are tool-only" in text
+    or "every assistant message that contains any tool call must contain zero visible text" in text
+  )
+
+
+def _message_content_text(content: Any) -> str:
+  if isinstance(content, str):
+    return content
+  if isinstance(content, list):
+    parts: list[str] = []
+    for block in content:
+      if isinstance(block, dict):
+        text = block.get("text")
+        if isinstance(text, str):
+          parts.append(text)
+      elif isinstance(block, str):
+        parts.append(block)
+    return "\n".join(parts)
+  return ""
+
+
+def _messages_require_tool_only_turns(messages: List[Dict[str, Any]]) -> bool:
+  for message in messages:
+    if not isinstance(message, dict):
+      continue
+    text = _message_content_text(message.get("content")).lower()
+    if (
+      "tool-call messages are tool-only" in text
+      or "every assistant message that contains any tool call must contain zero visible text" in text
+    ):
+      return True
+  return False
 
 
 @dataclass
@@ -308,16 +437,66 @@ class CostAccumulator:
     return self._total >= self.budget
 
 
+class ChildCostAccumulator(CostAccumulator):
+  """Child-local budget tracker that forwards spend to the parent."""
+
+  def __init__(self, parent: CostAccumulator | None, budget: float) -> None:
+    super().__init__(budget)
+    self._parent = parent
+
+  def add(self, cost: float) -> None:
+    super().add(cost)
+    if self._parent is not None:
+      self._parent.add(cost)
+
+  @property
+  def _local_exceeded(self) -> bool:
+    return self.total >= self.budget
+
+  @property
+  def exceeded(self) -> bool:
+    return self._local_exceeded or bool(self._parent is not None and self._parent.exceeded)
+
+  @property
+  def exceeded_reason(self) -> str | None:
+    if self._local_exceeded:
+      return "child_budget"
+    if self._parent is not None and self._parent.exceeded:
+      return "parent_budget"
+    return None
+
+  @property
+  def effective_total(self) -> float:
+    if not self._local_exceeded and self._parent is not None and self._parent.exceeded:
+      return self._parent.total
+    return self.total
+
+  @property
+  def effective_budget(self) -> float:
+    if not self._local_exceeded and self._parent is not None and self._parent.exceeded:
+      return self._parent.budget
+    return self.budget
+
+
+def _budget_reason_suffix(reason: Any) -> str:
+  if reason == "child_budget":
+    return " (child budget)"
+  if reason == "parent_budget":
+    return " (parent budget)"
+  return ""
+
+
 OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | None]]
 OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
 OnSessionSummary = Callable[[SessionUsageSummary], Awaitable[None] | None]
-OnBeforeStreamComplete = Callable[[EventLog], Awaitable[None] | None]
+OnBeforeStreamComplete = Callable[..., Awaitable[None] | None]
 OnToolTiming = Callable[..., None]
 OnMaxTurns = Callable[[List[Dict[str, Any]], int], Awaitable[str | None]]
 BackgroundTaskHandler = Callable[..., Awaitable[Tuple[Optional[Any], Optional[Dict[str, Any]]]]]
 BackgroundTaskCallback = Callable[[BackgroundTask | TaskEntry], Awaitable[None] | None]
 OnMetric = Callable[[str, int], None]
 OnCredentialRefresh = Callable[[ProviderCredentialFailure], Awaitable[Dict[str, Any] | None] | Dict[str, Any] | None]
+ShutdownSignalProvider = Callable[[], Dict[str, Any] | None]
 
 
 class AgentRunner:
@@ -386,6 +565,12 @@ class AgentRunner:
     coordinator: CoordinatorConfig | None = None,
     max_resume_chain_depth: int = 3,
     operator_pause_event: asyncio.Event | None = None,
+    shutdown_signal_provider: ShutdownSignalProvider | None = None,
+    started_at: float | None = None,
+    emit_session_recap: bool = True,
+    code_execution_spill_dir_provider: Callable[[], str] | None = None,
+    skill_run_id: str | None = None,
+    workspace_dir: str | Path | None = None,
   ) -> None:
     if max_budget_usd is not None and max_budget_usd <= 0:
       raise ValueError("max_budget_usd must be positive when provided")
@@ -396,9 +581,14 @@ class AgentRunner:
 
     self._log = event_log
     self._dispatcher = dispatcher
+    self._spill_dir_provider = code_execution_spill_dir_provider
     self._provider = provider
     self._full_session_id = session_id or "no-session"
     self._sid = self._full_session_id[:12]
+    self._session_started_at = float(started_at if started_at is not None else time.time())
+    self._emit_session_recap = bool(emit_session_recap)
+    self._skill_run_id = str(skill_run_id).strip() if skill_run_id else None
+    self._workspace_dir = str(workspace_dir) if workspace_dir is not None else None
     self._auth_config = dict(auth_config or {})
     self._client_timeout = client_timeout
     self._max_tokens_override = max_tokens_override
@@ -407,6 +597,8 @@ class AgentRunner:
     self._mcp_client = mcp_client
     self._loaded_mcp_servers = loaded_mcp_servers if loaded_mcp_servers is not None else set()
     self._excluded_tools = set(excluded_tools or set())
+    self._active_skill_deny: set[str] = set()
+    self._active_skill_report_doors: dict[str, str] = {}
     self._get_tool_definitions = get_tool_definitions
     self._on_tool_result = on_tool_result
     self._on_usage = on_usage
@@ -462,8 +654,14 @@ class AgentRunner:
       self._dispatcher_accepts_abort_event = "abort_event" in dispatch_params or any(
         param.kind == inspect.Parameter.VAR_KEYWORD for param in dispatch_params.values()
       )
+      self._dispatcher_accepts_skill_run_context = (
+        "skill_run_id" in dispatch_params
+        or "workspace_dir" in dispatch_params
+        or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in dispatch_params.values())
+      )
     except (TypeError, ValueError):
       self._dispatcher_accepts_abort_event = False
+      self._dispatcher_accepts_skill_run_context = False
     task_registry_auto_created = task_registry is None
     self._task_registry = task_registry or TaskRegistry(
       max_inflight=self._max_background_tasks,
@@ -471,6 +669,7 @@ class AgentRunner:
     )
     self._message_inbox = message_inbox
     self._operator_pause_event = operator_pause_event
+    self._shutdown_signal_provider = shutdown_signal_provider
     self._notification_queue = NotificationQueue()
     if self._coordinator is not None and self._coordinator.enabled:
       self._max_background_tasks = self._coordinator.max_workers
@@ -525,6 +724,15 @@ class AgentRunner:
     return self._task_registry._tasks
 
   def _append(self, event: Dict[str, Any]) -> None:
+    if event.get("type") in {"stream_complete", "error"}:
+      emit_recap_then_terminal(
+        self._log,
+        event,
+        session_id=self._full_session_id,
+        started_at=self._session_started_at,
+        emit_recap=self._emit_session_recap,
+      )
+      return
     self._log.append(event)
 
   def request_operator_pause(self) -> None:
@@ -648,6 +856,7 @@ class AgentRunner:
         "content_blocks": list(content_blocks),
         "stop_reason": stop_reason,
         "model": model,
+        "provider": getattr(self._provider, "name", None),
         "usage": dict(usage),
       }
     )
@@ -661,8 +870,19 @@ class AgentRunner:
 
   async def _emit_error_event(self, error: str) -> None:
     event = {"type": "error", "error": error}
+    await self._call_on_before_stream_complete(event)
     await self._append_durable_event(event)
     self._append(event)
+
+  async def _emit_run_error_event(self, exc: BaseException, *, phase: str = "run") -> None:
+    await self._append_durable_event(
+      {
+        "type": "run_error",
+        "phase": phase,
+        "error_type": type(exc).__name__,
+        "error": _format_exc(exc),
+      }
+    )
 
   async def _emit_interrupted_event(
     self,
@@ -689,6 +909,27 @@ class AgentRunner:
     if extra_fields:
       payload.update(extra_fields)
     await self._append_durable_event(payload)
+
+  def _shutdown_interrupted_reason(self) -> tuple[str, Dict[str, Any]]:
+    if self._shutdown_signal_provider is None:
+      return "graceful_shutdown", {}
+    try:
+      signal_payload = self._shutdown_signal_provider()
+    except Exception as exc:
+      log.warning("[%s] shutdown signal provider failed (non-fatal): %s", self._sid, exc)
+      return "graceful_shutdown", {}
+    if not isinstance(signal_payload, dict) or not signal_payload:
+      return "graceful_shutdown", {}
+
+    payload = dict(signal_payload)
+    signal_name = str(payload.get("signal_name") or "").strip()
+    signal_number = payload.get("signal")
+    suffix = signal_name
+    if not suffix and signal_number is not None:
+      suffix = f"SIG{signal_number}"
+    if not suffix:
+      suffix = "unknown"
+    return f"signal_{suffix}", {"shutdown": payload}
 
   async def _emit_detach_event(self, reason: str) -> None:
     if not self._durable_attach_emitted:
@@ -864,28 +1105,60 @@ class AgentRunner:
     result_entry: Dict[str, Any],
     *,
     tool_name: str,
-  ) -> Dict[str, Any]:
+  ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     content = result_entry.get("content")
     if not isinstance(content, str):
-      return result_entry
+      return result_entry, result_entry
 
     max_chars = _model_tool_result_max_chars()
-    compacted_content, was_truncated = _truncate_model_tool_result_content(
+    plain_compacted_content, was_truncated = _truncate_model_tool_result_content(
       content,
       tool_name=tool_name,
       max_chars=max_chars,
     )
     if not was_truncated:
-      return result_entry
+      return result_entry, result_entry
 
-    compacted_entry = dict(result_entry)
-    compacted_entry["content"] = compacted_content
+    plain_compacted_entry = dict(result_entry)
+    plain_compacted_entry["content"] = plain_compacted_content
+    live_entry = plain_compacted_entry
+    durable_entry = plain_compacted_entry
+    if (
+      self._spill_dir_provider is not None
+      and _spill_truncated_tool_results_enabled()
+      and not self._is_error_tool_result_entry(result_entry, content)
+    ):
+      try:
+        work_dir = self._spill_dir_provider()
+        filename, spill_abspath = self._write_tool_result_spill(
+          work_dir=work_dir,
+          tool_name=tool_name,
+          tool_use_id=result_entry.get("tool_use_id"),
+          content=content,
+        )
+        live_compacted_content, _ = _truncate_model_tool_result_content(
+          content,
+          tool_name=tool_name,
+          max_chars=max_chars,
+          spill_filename=filename,
+          spill_abspath=spill_abspath,
+        )
+        live_entry = dict(result_entry)
+        live_entry["content"] = live_compacted_content
+      except Exception as exc:
+        log.warning(
+          "[%s] Tool %s result spill failed; using compacted preview only: %s",
+          self._sid,
+          tool_name,
+          exc,
+          exc_info=True,
+        )
     log.info(
       "[%s] Tool %s result compacted for model context | original_chars=%d compacted_chars=%d limit=%d",
       self._sid,
       tool_name,
       len(content),
-      len(compacted_content),
+      len(str(live_entry.get("content", ""))),
       max_chars,
       extra={
         "data": {
@@ -893,12 +1166,56 @@ class AgentRunner:
           "session_id": self._sid,
           "tool": tool_name,
           "original_chars": len(content),
-          "compacted_chars": len(compacted_content),
+          "compacted_chars": len(str(live_entry.get("content", ""))),
           "limit": max_chars,
         }
       },
     )
-    return compacted_entry
+    return live_entry, durable_entry
+
+  @staticmethod
+  def _is_error_tool_result_entry(result_entry: Dict[str, Any], content: str) -> bool:
+    if result_entry.get("is_error") or "error" in result_entry:
+      return True
+    try:
+      parsed = json.loads(content)
+    except Exception:
+      return False
+    # Only a *truthy* top-level "error" marks a genuine error result. A successful
+    # data payload that merely carries `"error": null` (or empty) must still spill —
+    # the authoritative tool-error signal is the is_error flag checked above.
+    return isinstance(parsed, dict) and bool(parsed.get("error"))
+
+  @staticmethod
+  def _write_tool_result_spill(
+    *,
+    work_dir: str,
+    tool_name: str,
+    tool_use_id: Any,
+    content: str,
+  ) -> tuple[str, str]:
+    raw = f"{tool_name}_{tool_use_id or uuid.uuid4().hex}"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw)[:120]
+    try:
+      json.loads(content)
+      ext = "json"
+    except Exception:
+      ext = "txt"
+
+    filename = f"{safe}.{ext}"
+    for attempt in range(2):
+      if attempt:
+        filename = f"{safe}_{uuid.uuid4().hex[:8]}.{ext}"
+      spill_abspath = os.path.join(work_dir, filename)
+      try:
+        with open(spill_abspath, "x", encoding="utf-8") as handle:
+          handle.write(content)
+        return filename, spill_abspath
+      except FileExistsError:
+        if attempt == 0:
+          continue
+        raise
+    raise FileExistsError(filename)
 
   @staticmethod
   def _is_soft_error(result: Any) -> bool:
@@ -911,12 +1228,77 @@ class AgentRunner:
       return self._mcp_client.get_tool_definitions()
     return []
 
+  def _effective_excluded_tools(self) -> set[str]:
+    if not self._active_skill_deny:
+      return set(self._excluded_tools)
+    return set(self._excluded_tools) | set(self._active_skill_deny)
+
+  def _filter_excluded_tool_definitions(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    excluded_tools = self._effective_excluded_tools()
+    if not excluded_tools:
+      return list(tools)
+    return [tool for tool in tools if tool["name"] not in excluded_tools]
+
+  def _rebuild_filtered_tool_definitions(self, base_kwargs: Dict[str, Any]) -> None:
+    base_kwargs["tools"] = self._filter_excluded_tool_definitions(self._default_tool_definitions())
+
+  def _activate_skill_report_doors(self, value: Any) -> None:
+    if isinstance(value, dict):
+      self._active_skill_report_doors = {
+        str(tool_name).strip(): str(skill_name).strip()
+        for tool_name, skill_name in value.items()
+        if str(tool_name).strip() and str(skill_name).strip()
+      }
+      return
+    if value is not None:
+      self._active_skill_report_doors = {}
+
+  def _activate_skill_deny(self, tool_names: Any, base_kwargs: Dict[str, Any]) -> None:
+    if isinstance(tool_names, str):
+      candidates = [tool_names]
+    elif isinstance(tool_names, (list, tuple, set, frozenset)):
+      candidates = list(tool_names)
+    else:
+      return
+    denied = {normalized for name in candidates if (normalized := str(name or "").strip())}
+    if denied == self._active_skill_deny:
+      return
+    self._active_skill_deny = denied
+    self._rebuild_filtered_tool_definitions(base_kwargs)
+
+  def _clear_active_skill_if_report_door_completed(self, event: Dict[str, Any], base_kwargs: Dict[str, Any]) -> bool:
+    if event.get("type") != "tool_call_complete" or event.get("error") is not None:
+      return False
+    tool_name = str(event.get("tool_name") or "").strip()
+    expected_skill = self._active_skill_report_doors.get(tool_name)
+    if not expected_skill:
+      return False
+    result = event.get("result")
+    if not (
+      isinstance(result, dict)
+      and "subcommand" in result
+      and str(result.get("mutation_mode") or "").strip() == "preview"
+    ):
+      return False
+    if str(result.get("status") or "").strip().lower() not in _REPORT_DOOR_CLEAR_SUCCESS_STATUSES:
+      return False
+    try:
+      from .skill_context import clear_current_skill, current_skill
+
+      active_skill = current_skill()
+      if active_skill != expected_skill:
+        return False
+      clear_current_skill()
+    except Exception:
+      return False
+    self._active_skill_deny.clear()
+    self._active_skill_report_doors.clear()
+    self._rebuild_filtered_tool_definitions(base_kwargs)
+    return True
+
   def _refresh_tools(self, base_kwargs: Dict[str, Any], new_servers: List[str]) -> None:
     self._loaded_mcp_servers.update(new_servers)
-    new_tools = self._default_tool_definitions()
-    if self._excluded_tools:
-      new_tools = [tool for tool in new_tools if tool["name"] not in self._excluded_tools]
-    base_kwargs["tools"] = new_tools
+    self._rebuild_filtered_tool_definitions(base_kwargs)
 
   async def _emit_stub_response(self, messages: List[Dict[str, Any]]) -> None:
     last_user = next((msg for msg in reversed(messages) if msg.get("role") == "user"), {})
@@ -968,10 +1350,11 @@ class AgentRunner:
     timeout: float | None,
     client_timeout: float = 90,
     per_turn_timeout: float | None = None,
-    max_tokens: int = 32000,
+    max_tokens: int = 64000,
     call_index: int = 0,
     parent_turn_id: str | None = None,
     task_entry: TaskEntry | None = None,
+    max_budget_usd: float | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
   ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
     """Run a focused sub-agent task and return its summarized result.
@@ -1003,19 +1386,21 @@ class AgentRunner:
     progress_cb = make_progress_tracker(task_entry) if task_entry else None
 
     def _composed_on_event(event: Dict[str, Any], session_id: str) -> None:
+      event_copy = dict(event)
+      event_copy.setdefault("sub_agent_id", session_id)
       if progress_cb is not None:
         try:
-          progress_cb(event, session_id)
+          progress_cb(event_copy, session_id)
         except Exception:
           pass
       if original_on_event is not None:
         try:
-          original_on_event(event, session_id)
+          original_on_event(event_copy, session_id)
         except Exception:
           pass
       if on_sub_event is not None:
         try:
-          on_sub_event(event, session_id)
+          on_sub_event(event_copy, session_id)
         except Exception:
           pass
 
@@ -1023,6 +1408,11 @@ class AgentRunner:
       on_event=_composed_on_event,
       session_id=sub_session_id,
     )
+    child_max_budget_usd = self._max_budget_usd
+    child_cost_accumulator = self._cost_accumulator
+    if max_budget_usd is not None:
+      child_max_budget_usd = max_budget_usd
+      child_cost_accumulator = ChildCostAccumulator(self._cost_accumulator, max_budget_usd)
     sub_runner = AgentRunner(
       event_log=sub_log,
       dispatcher=dispatcher,
@@ -1055,13 +1445,17 @@ class AgentRunner:
       compaction_instructions=None,
       tool_call_timeout=self._tool_call_timeout,
       on_max_turns=self._on_max_turns,
-      max_budget_usd=self._max_budget_usd,
-      _cost_accumulator=self._cost_accumulator,
+      max_budget_usd=child_max_budget_usd,
+      _cost_accumulator=child_cost_accumulator,
       _parent_aggregator=self._aggregator,
       max_concurrent_sub_agents=self._max_concurrent_sub_agents,
       agent_session_log=self._agent_session_log,
       message_inbox=task_entry.message_inbox if task_entry else None,
       max_resume_chain_depth=self._max_resume_chain_depth,
+      emit_session_recap=False,
+      code_execution_spill_dir_provider=self._spill_dir_provider,
+      skill_run_id=self._skill_run_id,
+      workspace_dir=self._workspace_dir,
     )
 
     timed_out = False
@@ -1091,6 +1485,7 @@ class AgentRunner:
     usage: Dict[str, Any] = {}
     error_msg: str | None = None
     budget_exceeded = False
+    budget_exceeded_reason: str | None = None
     max_turns_hit = False
     for entry in sub_log.entries:
       event = entry.event
@@ -1108,6 +1503,9 @@ class AgentRunner:
           usage = event_usage
       elif event_type == "budget_exceeded":
         budget_exceeded = True
+        raw_reason = event.get("reason")
+        if isinstance(raw_reason, str) and raw_reason:
+          budget_exceeded_reason = raw_reason
       elif event_type == "max_turns_reached":
         max_turns_hit = True
       elif event_type == "error":
@@ -1124,7 +1522,8 @@ class AgentRunner:
     elif error_msg:
       warnings.append(f"Sub-agent error: {error_msg}")
     if budget_exceeded:
-      warnings.append("Sub-agent stopped: budget limit reached")
+      budget_exceeded_reason = budget_exceeded_reason or getattr(child_cost_accumulator, "exceeded_reason", None)
+      warnings.append(f"Sub-agent stopped: budget limit reached{_budget_reason_suffix(budget_exceeded_reason)}")
     if max_turns_hit:
       warnings.append("Sub-agent stopped: max turns reached — partial results")
     if warnings:
@@ -1148,10 +1547,11 @@ class AgentRunner:
     timeout: float | None,
     client_timeout: float = 90,
     per_turn_timeout: float | None = None,
-    max_tokens: int = 32000,
+    max_tokens: int = 64000,
     call_index: int = 0,
     parent_turn_id: str | None = None,
     task_entry: TaskEntry | None = None,
+    max_budget_usd: float | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
   ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
     if task_entry is not None:
@@ -1178,23 +1578,30 @@ class AgentRunner:
     progress_cb = make_progress_tracker(task_entry) if task_entry else None
 
     def _composed_on_event(event: Dict[str, Any], session_id: str) -> None:
+      event_copy = dict(event)
+      event_copy.setdefault("sub_agent_id", session_id)
       if progress_cb is not None:
         try:
-          progress_cb(event, session_id)
+          progress_cb(event_copy, session_id)
         except Exception:
           pass
       if original_on_event is not None:
         try:
-          original_on_event(event, session_id)
+          original_on_event(event_copy, session_id)
         except Exception:
           pass
       if on_sub_event is not None:
         try:
-          on_sub_event(event, session_id)
+          on_sub_event(event_copy, session_id)
         except Exception:
           pass
 
     sub_log = EventLog(on_event=_composed_on_event, session_id=sub_session_id)
+    child_max_budget_usd = self._max_budget_usd
+    child_cost_accumulator = self._cost_accumulator
+    if max_budget_usd is not None:
+      child_max_budget_usd = max_budget_usd
+      child_cost_accumulator = ChildCostAccumulator(self._cost_accumulator, max_budget_usd)
     sub_runner = AgentRunner(
       event_log=sub_log,
       dispatcher=dispatcher,
@@ -1227,13 +1634,17 @@ class AgentRunner:
       compaction_instructions=None,
       tool_call_timeout=self._tool_call_timeout,
       on_max_turns=self._on_max_turns,
-      max_budget_usd=self._max_budget_usd,
-      _cost_accumulator=self._cost_accumulator,
+      max_budget_usd=child_max_budget_usd,
+      _cost_accumulator=child_cost_accumulator,
       _parent_aggregator=self._aggregator,
       max_concurrent_sub_agents=self._max_concurrent_sub_agents,
       agent_session_log=self._agent_session_log,
       message_inbox=task_entry.message_inbox if task_entry else None,
       max_resume_chain_depth=self._max_resume_chain_depth,
+      emit_session_recap=False,
+      code_execution_spill_dir_provider=self._spill_dir_provider,
+      skill_run_id=self._skill_run_id,
+      workspace_dir=self._workspace_dir,
     )
 
     timed_out = False
@@ -1264,6 +1675,7 @@ class AgentRunner:
     usage: Dict[str, Any] = {}
     error_msg: str | None = None
     budget_exceeded = False
+    budget_exceeded_reason: str | None = None
     max_turns_hit = False
     for entry in sub_log.entries:
       event = entry.event
@@ -1281,6 +1693,9 @@ class AgentRunner:
           usage = event_usage
       elif event_type == "budget_exceeded":
         budget_exceeded = True
+        raw_reason = event.get("reason")
+        if isinstance(raw_reason, str) and raw_reason:
+          budget_exceeded_reason = raw_reason
       elif event_type == "max_turns_reached":
         max_turns_hit = True
       elif event_type == "error":
@@ -1298,7 +1713,8 @@ class AgentRunner:
     elif error_msg:
       warnings.append(f"Sub-agent error: {error_msg}")
     if budget_exceeded:
-      warnings.append("Sub-agent stopped: budget limit reached")
+      budget_exceeded_reason = budget_exceeded_reason or getattr(child_cost_accumulator, "exceeded_reason", None)
+      warnings.append(f"Sub-agent stopped: budget limit reached{_budget_reason_suffix(budget_exceeded_reason)}")
     if max_turns_hit:
       warnings.append("Sub-agent stopped: max turns reached — partial results")
     if warnings:
@@ -1319,11 +1735,26 @@ class AgentRunner:
       return [block for block in extra_blocks if isinstance(block, dict)]
     return []
 
-  async def _call_on_before_stream_complete(self) -> None:
+  async def _call_on_before_stream_complete(self, terminal_event: Dict[str, Any] | None = None) -> None:
     if self._on_before_stream_complete is None:
       return
     try:
-      result = self._on_before_stream_complete(self._log)
+      params = inspect.signature(self._on_before_stream_complete).parameters
+      accepts_terminal_event = (
+        any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params.values())
+        or "terminal_event" in params
+        or len([
+          param
+          for param in params.values()
+          if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]) >= 2
+      )
+      if isinstance(terminal_event, dict) and terminal_event.get("type") != "stream_complete" and not accepts_terminal_event:
+        return
+      if accepts_terminal_event:
+        result = self._on_before_stream_complete(self._log, terminal_event)
+      else:
+        result = self._on_before_stream_complete(self._log)
       if inspect.isawaitable(result):
         await result
     except Exception as exc:
@@ -1649,6 +2080,15 @@ class AgentRunner:
       auth_model = self._auth_config.get("model")
       if isinstance(auth_model, str) and auth_model.strip():
         entry.model = auth_model.strip()
+    child_budget_usd: float | None = None
+    raw_child_budget = tool_input.get("child_budget_usd")
+    if raw_child_budget is not None and not isinstance(raw_child_budget, bool):
+      try:
+        parsed_child_budget = float(raw_child_budget)
+      except (TypeError, ValueError):
+        parsed_child_budget = 0.0
+      if parsed_child_budget > 0:
+        child_budget_usd = parsed_child_budget
 
     base_for_call_index = entry.task_id.split("_r", 1)[0]
     try:
@@ -1666,6 +2106,8 @@ class AgentRunner:
       "provider_name": entry.provider_name,
       "model": entry.model,
     }
+    if child_budget_usd is not None:
+      correlation["child_budget_usd"] = child_budget_usd
     if original_task_id is not None:
       correlation["original_task_id"] = original_task_id
     if "resumable" in tool_input:
@@ -1901,6 +2343,7 @@ class AgentRunner:
       parent_turn_id=self._parent_turn_id,
       timestamp=time.time(),
       model=model,
+      provider=getattr(self._provider, "name", None),
       input_tokens=int(usage_totals["input_tokens"]),
       output_tokens=int(usage_totals["output_tokens"]),
       cache_read_tokens=int(usage_totals["cache_read_input_tokens"]),
@@ -2016,7 +2459,7 @@ class AgentRunner:
     tools_chars: int,
     usage_totals: Dict[str, int],
   ) -> Tuple[Any, StreamTurnResult] | None:
-    last_event_at = time.monotonic()
+    last_progress_at = time.monotonic()
     guard_reason: tuple[str, str] | None = None
     _effective_stall_timeout = self._effective_stream_stall_timeout(
       config=config,
@@ -2034,18 +2477,24 @@ class AgentRunner:
         max_tokens=max_tokens,
         thinking_level=self._thinking_level(bool(config.get("thinking", True))),
         auth_mode=config["auth_mode"],
-        compaction_trigger=self._compaction_trigger,
+        compaction_trigger=_effective_compaction_trigger(self._compaction_trigger, model_info),
         compaction_instructions=self._compaction_instructions,
-      )
+    )
+
+    suppress_tool_turn_text = (
+      _system_prompt_requires_tool_only_turns(system_prompt)
+      or _messages_require_tool_only_turns(current_messages)
+    )
 
     async def _consume_stream(params: Dict[str, Any], result: StreamTurnResult) -> None:
-      nonlocal last_event_at
+      nonlocal last_progress_at
       first_turn = turn_count == 1
       log.debug("[%s] Turn %d stream open", self._sid, turn_count)
 
       async for event in self._provider.stream(client, params):
-        last_event_at = time.monotonic()
         event_type = event.type
+        if event_type != "heartbeat":
+          last_progress_at = time.monotonic()
 
         if event_type == "message_start":
           usage_totals["input_tokens"] += event.input_tokens
@@ -2100,7 +2549,8 @@ class AgentRunner:
           if result.first_token_t is None:
             result.first_token_t = time.time()
           text = str(event.text or "")
-          self._append({"type": "text_delta", "text": text})
+          if not suppress_tool_turn_text:
+            self._append({"type": "text_delta", "text": text})
           result.full_text += text
           continue
 
@@ -2121,6 +2571,9 @@ class AgentRunner:
           continue
 
         if event_type == "heartbeat":
+          continue
+
+        if event_type == "stream_progress":
           continue
 
         if event_type == "tool_use_start":
@@ -2153,13 +2606,13 @@ class AgentRunner:
     async def _stream_guard(task: asyncio.Task, turn_start_mono: float) -> None:
       nonlocal guard_reason
       while not task.done():
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(STREAM_GUARD_POLL_INTERVAL)
         if task.done():
           return
         now = time.monotonic()
-        stall = now - last_event_at
+        stall = now - last_progress_at
         if stall > _effective_stall_timeout:
-          guard_reason = ("stall", f"no stream events for {stall:.0f}s")
+          guard_reason = ("stall", f"no stream progress for {stall:.0f}s")
           log.error("[%s] Turn %d watchdog (%s): %s", self._sid, turn_count, guard_reason[0], guard_reason[1])
           task.cancel()
           return
@@ -2200,7 +2653,7 @@ class AgentRunner:
         delay = STREAM_RETRY_DELAY * (STREAM_RETRY_BACKOFF ** (attempt - 1))
         await asyncio.sleep(delay)
 
-      last_event_at = time.monotonic()
+      last_progress_at = time.monotonic()
       params = _make_params()
       result = StreamTurnResult()
       tokens_snapshot = dict(usage_totals)
@@ -2354,6 +2807,23 @@ class AgentRunner:
           await self._emit_error_event(guard_error)
           await self._close_client(client, timeout=5.0)
           return None
+        if suppress_tool_turn_text:
+          if result.tool_uses:
+            if result.full_text:
+              log.info(
+                "[%s] Suppressed %d chars of assistant text from tool-use turn %d",
+                self._sid,
+                len(result.full_text),
+                turn_count,
+              )
+            result.full_text = ""
+            result.content_blocks = [
+              block
+              for block in result.content_blocks
+              if not (isinstance(block, dict) and block.get("type") == "text")
+            ]
+          elif result.full_text:
+            self._append({"type": "text_delta", "text": result.full_text})
         return client, result
 
     if stream_error is not None:
@@ -2393,8 +2863,33 @@ class AgentRunner:
         }
       },
     )
+    if tool_name == "emit_html_artifact":
+      html_bytes = len((tool_input.get("html") or "").encode("utf-8"))
+      if html_bytes > 512 * 1024:
+        return (
+          self._make_error_result(
+            tool_id,
+            "invalid_input",
+            f"emit_html_artifact: html payload {html_bytes} bytes exceeds 512KB limit",
+          ),
+          tool_name,
+          [],
+        )
+    if tool_name == "emit_dashboard_artifact":
+      payload_bytes = len(json.dumps(tool_input.get("payload") or {}).encode("utf-8"))
+      if payload_bytes > 256 * 1024:
+        return (
+          self._make_error_result(
+            tool_id,
+            "invalid_input",
+            f"emit_dashboard_artifact: payload {payload_bytes} bytes exceeds 256KB limit",
+          ),
+          tool_name,
+          [],
+        )
     tool_t0 = time.time()
     server = self._mcp_client.get_server_for_tool(tool_name) if self._mcp_client is not None else None
+    display = resolve_display(tool_name, redacted_tool_input)
     tool_start_event = {
       "type": "tool_call_start",
       "tool_call_id": tool_id,
@@ -2406,6 +2901,8 @@ class AgentRunner:
       "started_at": tool_t0,
       "parent_assistant_message_seq": self._last_assistant_message_seq,
     }
+    if display is not None:
+      tool_start_event["display"] = display
     await self._append_durable_event(tool_start_event)
     self._append(tool_start_event)
     result: Optional[Any] = None
@@ -2417,7 +2914,7 @@ class AgentRunner:
     load_servers_signal: Optional[List[str]] = None
 
     try:
-      if tool_name in self._excluded_tools:
+      if tool_name in self._effective_excluded_tools():
         error = {
           "code": "tool_excluded",
           "message": f"Tool '{tool_name}' is not available in this context",
@@ -2426,6 +2923,9 @@ class AgentRunner:
         dispatch_kwargs: Dict[str, Any] = {"call_index": call_index}
         if self._dispatcher_accepts_abort_event:
           dispatch_kwargs["abort_event"] = self._tool_abort_event
+        if self._dispatcher_accepts_skill_run_context:
+          dispatch_kwargs["skill_run_id"] = self._skill_run_id
+          dispatch_kwargs["workspace_dir"] = self._workspace_dir
         dispatch_coro = self._dispatcher.dispatch(
           tool_id,
           tool_name,
@@ -2442,10 +2942,20 @@ class AgentRunner:
         # MCP tools already carry per-server read timeouts in McpClientManager.
         # Applying the runner's generic cap here would mask longer server policy.
         has_mcp_server_timeout = server is not None
-        skip_timeout = tool_name in ("run_agent", "get_background_result") or needs_approval or has_mcp_server_timeout
-        if self._tool_call_timeout is not None and not skip_timeout:
+        skip_timeout = tool_name == "get_background_result" or needs_approval or has_mcp_server_timeout
+        effective_tool_timeout = self._tool_call_timeout
+        if tool_name == "run_agent":
+          # Sub-agents legitimately outrun the generic tool cap, but skipping the
+          # cap entirely let a wedged run_agent hold the chat turn open forever
+          # (ACUI-1). The inner spawn timeout (DEFAULT_SUB_AGENT_TIMEOUT_SECONDS)
+          # is the primary bound and returns a clean tool error; this widened cap
+          # is the backstop if that inner await never resolves. It applies even
+          # when the generic tool_call_timeout is disabled (None) so inline
+          # run_agent is never unbounded.
+          effective_tool_timeout = max(effective_tool_timeout or 0.0, _RUN_AGENT_DISPATCH_TIMEOUT_SECONDS)
+        if effective_tool_timeout is not None and not skip_timeout:
           try:
-            result, error = await asyncio.wait_for(dispatch_coro, timeout=self._tool_call_timeout)
+            result, error = await asyncio.wait_for(dispatch_coro, timeout=effective_tool_timeout)
           except asyncio.TimeoutError:
             elapsed = time.time() - tool_t0
             log.error(
@@ -2453,12 +2963,12 @@ class AgentRunner:
               self._sid,
               tool_name,
               elapsed,
-              self._tool_call_timeout,
+              effective_tool_timeout,
             )
             error = {
               "code": "tool_timeout",
               "sub_code": "timeout",
-              "message": f"Tool '{tool_name}' timed out after {self._tool_call_timeout:.0f}s. The tool call was cancelled. You may retry or skip this tool.",
+              "message": f"Tool '{tool_name}' timed out after {effective_tool_timeout:.0f}s. The tool call was cancelled. You may retry or skip this tool.",
             }
         else:
           result, error = await dispatch_coro
@@ -2470,6 +2980,8 @@ class AgentRunner:
         popped = result.pop("_load_servers", None)
         if isinstance(popped, list):
           load_servers_signal = [str(server_name) for server_name in popped if server_name]
+        self._activate_skill_report_doors(result.pop(_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY, None))
+        self._activate_skill_deny(result.pop(_ACTIVE_SKILL_DENY_RESULT_KEY, None), base_kwargs)
 
       tool_elapsed = time.time() - tool_t0
       if error is None:
@@ -2538,6 +3050,8 @@ class AgentRunner:
       }
       if semantic_error is not None:
         tool_complete_event["semantic_error"] = dict(semantic_error)
+      if error is None:
+        self._clear_active_skill_if_report_door_completed(tool_complete_event, base_kwargs)
       self._call_on_tool_timing(
         tool_name=tool_name,
         server=server,
@@ -2598,15 +3112,17 @@ class AgentRunner:
         session_id=self._full_session_id,
         server=server,
         result_entry=result_entry,
+        skill_run_id=self._skill_run_id,
+        workspace_dir=self._workspace_dir,
       )
     )
-    result_entry = self._compact_model_tool_result_entry(result_entry, tool_name=tool_name)
-    final_tool_result_blocks = [dict(result_entry)]
+    live_entry, durable_entry = self._compact_model_tool_result_entry(result_entry, tool_name=tool_name)
+    final_tool_result_blocks = [dict(durable_entry)]
     final_tool_result_blocks.extend(dict(block) for block in extra_blocks)
     tool_complete_event["final_tool_result_blocks"] = final_tool_result_blocks
     await self._append_durable_event(tool_complete_event)
     self._append(tool_complete_event)
-    return result_entry, tool_name, extra_blocks
+    return live_entry, tool_name, extra_blocks
 
   async def run(
     self,
@@ -2711,15 +3227,20 @@ class AgentRunner:
       try:
         model_info = self._provider.get_model_info(config["model"])
       except Exception as exc:
-        self._append({"type": "error", "error": str(exc)})
+        await self._emit_error_event(str(exc))
         await self._close_client(client, timeout=5.0)
         return
 
-      cached_tools = self._default_tool_definitions()
-      if self._excluded_tools:
-        cached_tools = [tool for tool in cached_tools if tool["name"] not in self._excluded_tools]
+      cached_tools = self._filter_excluded_tool_definitions(self._default_tool_definitions())
 
       max_tokens = self._max_tokens_override if self._max_tokens_override is not None else config["max_tokens"]
+      model_max_output = int(getattr(model_info, "max_output_tokens", 0) or 0)
+      if model_max_output > 0 and int(max_tokens) > model_max_output:
+        log.info(
+          "[%s] max_tokens %d clamped to model max_output_tokens %d",
+          self._sid, int(max_tokens), model_max_output,
+        )
+        max_tokens = model_max_output
 
       base_kwargs: Dict[str, Any] = {
         "tools": cached_tools,
@@ -2733,8 +3254,10 @@ class AgentRunner:
       else:
         log.info("[%s] Thinking disabled | model=%s not supported", self._sid, config["model"])
 
-      if self._compaction_trigger is not None:
-        log.info("[%s] Compaction enabled | trigger=%d tokens", self._sid, self._compaction_trigger)
+      effective_compaction_trigger = _effective_compaction_trigger(self._compaction_trigger, model_info)
+      if effective_compaction_trigger is not None:
+        log.info("[%s] Compaction enabled | trigger=%d tokens", self._sid, effective_compaction_trigger)
+      context_limit = _model_context_window(model_info)
 
       log.info("[%s] Chat start | model=%s max_tokens=%d messages=%d", self._sid, config["model"], max_tokens, len(messages))
 
@@ -2743,27 +3266,27 @@ class AgentRunner:
         system_text = "\n\n".join(text for text, _should_cache in system_prompt if text)
       else:
         system_text = system_prompt or ""
-      messages_text = json.dumps(messages, default=str)
+      messages_text = json.dumps(truncate_to_last_compaction(messages), default=str)
       tools_text = json.dumps(cached_tools, default=str) if cached_tools else ""
       system_chars = len(system_text)
       est_system = _estimate_tokens(system_text)
       est_messages = _estimate_tokens(messages_text)
       est_tools = _estimate_tokens(tools_text) if tools_text else 0
       est_total = est_system + est_messages + est_tools
-      if est_total > MODEL_CONTEXT_LIMIT * CONTEXT_WARNING_PCT / 100:
+      if est_total > context_limit * CONTEXT_WARNING_PCT / 100:
         log.warning(
           "[%s] Context usage high | est=%d tokens (%.0f%% of %dk limit)",
           self._sid,
           est_total,
-          est_total / MODEL_CONTEXT_LIMIT * 100,
-          MODEL_CONTEXT_LIMIT // 1000,
+          est_total / context_limit * 100,
+          context_limit // 1000,
           extra={
             "data": {
               "event": "context_warning",
               "session_id": self._sid,
               "est_tokens": est_total,
-              "limit": MODEL_CONTEXT_LIMIT,
-              "pct": round(est_total / MODEL_CONTEXT_LIMIT * 100, 1),
+              "limit": context_limit,
+              "pct": round(est_total / context_limit * 100, 1),
             }
           },
         )
@@ -2799,6 +3322,7 @@ class AgentRunner:
       turn_count = 0
       tools_used: List[str] = []
       final_answer_guard_fired = False
+      max_tokens_continuations = 0
       current_messages = list(messages)
 
       while True:
@@ -2828,26 +3352,26 @@ class AgentRunner:
         turn_t0_mono = time.monotonic()
 
         if turn_count > 1:
-          turn_messages_text = json.dumps(current_messages, default=str)
+          turn_messages_text = json.dumps(truncate_to_last_compaction(current_messages), default=str)
           est_messages_turn = _estimate_tokens(turn_messages_text)
           current_tools = base_kwargs.get("tools") or []
           est_tools_turn = _estimate_tokens(json.dumps(current_tools, default=str)) if current_tools else 0
           est_turn = est_system + est_messages_turn + est_tools_turn
-          if est_turn > MODEL_CONTEXT_LIMIT * CONTEXT_WARNING_PCT / 100:
+          if est_turn > context_limit * CONTEXT_WARNING_PCT / 100:
             log.warning(
               "[%s] Context usage high | est=%d tokens (%.0f%% of %dk limit)",
               self._sid,
               est_turn,
-              est_turn / MODEL_CONTEXT_LIMIT * 100,
-              MODEL_CONTEXT_LIMIT // 1000,
+              est_turn / context_limit * 100,
+              context_limit // 1000,
               extra={
                 "data": {
                   "event": "context_warning",
                   "session_id": self._sid,
                   "turn": turn_count,
                   "est_tokens": est_turn,
-                  "limit": MODEL_CONTEXT_LIMIT,
-                  "pct": round(est_turn / MODEL_CONTEXT_LIMIT * 100, 1),
+                  "limit": context_limit,
+                  "pct": round(est_turn / context_limit * 100, 1),
                 }
               },
             )
@@ -2890,10 +3414,7 @@ class AgentRunner:
             except asyncio.QueueEmpty:
               break
           if parent_messages:
-            combined = "\n".join(
-              f"[Parent message id={message.message_id}]: {message.text}" for message in parent_messages
-            )
-            current_messages.append({"role": "user", "content": combined})
+            current_messages.append({"role": "user", "content": format_parent_messages_for_model(parent_messages)})
         turn_usage_before = dict(usage_totals)
         turn_result = await self._stream_turn(
           client=client,
@@ -2967,17 +3488,23 @@ class AgentRunner:
             self._cost_accumulator.add(incremental_cost)
           self._last_reported_cost = running_cost.total
           if self._cost_accumulator.exceeded:
+            effective_total = getattr(self._cost_accumulator, "effective_total", self._cost_accumulator.total)
+            effective_budget = getattr(self._cost_accumulator, "effective_budget", self._cost_accumulator.budget)
+            exceeded_reason = getattr(self._cost_accumulator, "exceeded_reason", None)
+            reason_suffix = _budget_reason_suffix(exceeded_reason)
             log.warning(
-              "[%s] Budget exceeded: $%.4f >= $%.4f — stopping",
+              "[%s] Budget exceeded: $%.4f >= $%.4f%s — stopping",
               self._sid,
-              self._cost_accumulator.total,
-              self._cost_accumulator.budget,
+              effective_total,
+              effective_budget,
+              reason_suffix,
             )
             self._append(
               {
                 "type": "budget_exceeded",
-                "total_cost": round(self._cost_accumulator.total, 4),
-                "budget": self._cost_accumulator.budget,
+                "total_cost": round(effective_total, 4),
+                "budget": effective_budget,
+                "reason": exceeded_reason,
               }
             )
             self._append(
@@ -2985,8 +3512,8 @@ class AgentRunner:
                 "type": "text_delta",
                 "text": (
                   "\n\n"
-                  f"[Budget limit reached: ${self._cost_accumulator.total:.4f} >= "
-                  f"${self._cost_accumulator.budget:.4f}]"
+                  f"[Budget limit reached: ${effective_total:.4f} >= "
+                  f"${effective_budget:.4f}{reason_suffix}]"
                 ),
               }
             )
@@ -3056,6 +3583,54 @@ class AgentRunner:
               }
             )
             continue
+          if turn.stop_reason == "max_tokens":
+            # No usable tool call and no end_turn: the output budget ran out
+            # (typically mid-tool-call). Ending the run here silently drops the
+            # whole task's deliverable (ACUI-27) — nudge and continue instead.
+            max_tokens_continuations += 1
+            if max_tokens_continuations <= _MAX_TOKENS_CONTINUATIONS:
+              log.warning(
+                "[%s] Turn %d hit max_tokens with no usable tool call; continuing with truncation nudge (%d/%d)",
+                self._sid,
+                turn_count,
+                max_tokens_continuations,
+                _MAX_TOKENS_CONTINUATIONS,
+              )
+              self._append(
+                {
+                  "type": "runtime_guard",
+                  "guard": "max_tokens_truncation",
+                  "message": _MAX_TOKENS_NUDGE,
+                }
+              )
+              # Partial tool_use blocks are unusable (no result will follow) and
+              # would make the request invalid — keep only completed content.
+              assistant_content = [
+                block
+                for block in turn.content_blocks
+                if not (isinstance(block, dict) and block.get("type") == "tool_use")
+              ]
+              if assistant_content:
+                current_messages.append(
+                  {
+                    "role": "assistant",
+                    "content": assistant_content,
+                    "provider": self._provider.name,
+                    "model": config["model"],
+                    "stop_reason": turn.stop_reason,
+                  }
+                )
+              current_messages.append({"role": "user", "content": _MAX_TOKENS_NUDGE})
+              continue
+            log.error(
+              "[%s] Turn %d hit max_tokens with no usable tool call after %d continuation attempts; ending run",
+              self._sid,
+              turn_count,
+              _MAX_TOKENS_CONTINUATIONS,
+            )
+            # Terminal: do NOT fall through to the notification branch, whose
+            # `continue` would bypass the continuation cap.
+            break
           if self._notification_queue.pending_count > 0:
             assistant_content = list(turn.content_blocks)
             current_messages.append(
@@ -3093,12 +3668,13 @@ class AgentRunner:
         run_agent_seq = 0
         while i < len(turn.tool_uses):
           tool_id, tool_name, tool_input = turn.tool_uses[i]
-          if tool_name == "run_agent" and "run_agent" not in self._excluded_tools:
+          effective_excluded_tools = self._effective_excluded_tools()
+          if tool_name == "run_agent" and "run_agent" not in effective_excluded_tools:
             batch: List[Tuple[int, str, str, Dict[str, Any]]] = []
             call_indices: List[int] = []
             while i < len(turn.tool_uses):
               batch_tool_id, batch_tool_name, batch_tool_input = turn.tool_uses[i]
-              if batch_tool_name != "run_agent" or "run_agent" in self._excluded_tools:
+              if batch_tool_name != "run_agent" or "run_agent" in self._effective_excluded_tools():
                 break
               batch.append((i, batch_tool_id, batch_tool_name, batch_tool_input))
               call_indices.append(run_agent_seq)
@@ -3129,15 +3705,6 @@ class AgentRunner:
                   base_kwargs,
                   call_index=current_call_index,
                 )
-              if self._sub_agent_semaphore is not None:
-                async with self._sub_agent_semaphore:
-                  return await self._execute_single_tool(
-                    tool_call_id,
-                    tool_call_name,
-                    tool_call_input,
-                    base_kwargs,
-                    call_index=current_call_index,
-                  )
               return await self._execute_single_tool(
                 tool_call_id,
                 tool_call_name,
@@ -3239,22 +3806,29 @@ class AgentRunner:
         },
       )
 
-      await self._call_on_before_stream_complete()
+      terminal_event = {
+        "type": "stream_complete",
+        "usage": {
+          "input_tokens": usage_totals["input_tokens"],
+          "output_tokens": usage_totals["output_tokens"],
+          "cache_creation_input_tokens": usage_totals["cache_creation_input_tokens"],
+          "cache_read_input_tokens": usage_totals["cache_read_input_tokens"],
+          "estimated_cost": round(cost.total, 4),
+        },
+      }
+      await self._call_on_before_stream_complete(terminal_event)
 
-      self._append(
-        {
-          "type": "stream_complete",
-          "usage": {
-            "input_tokens": usage_totals["input_tokens"],
-            "output_tokens": usage_totals["output_tokens"],
-            "cache_creation_input_tokens": usage_totals["cache_creation_input_tokens"],
-            "cache_read_input_tokens": usage_totals["cache_read_input_tokens"],
-            "estimated_cost": round(cost.total, 4),
-          },
-        }
-      )
+      self._append(terminal_event)
 
-      await self._close_client(client, timeout=5.0)
+      try:
+        await self._close_client(client, timeout=5.0)
+      except Exception as exc:
+        log.warning(
+          "[%s] client close after completed stream failed (non-fatal): %s",
+          self._sid,
+          exc,
+        )
+        await self._emit_run_error_event(exc, phase="client_close_after_stream_complete")
     except asyncio.CancelledError as exc:
       was_cancelled = True
       run_error = exc
@@ -3270,6 +3844,8 @@ class AgentRunner:
         clear_current_skill()
       except Exception:
         pass
+      self._active_skill_deny.clear()
+      self._active_skill_report_doors.clear()
       try:
         await self._shutdown_background_tasks(was_cancelled)
       except BaseException as exc:
@@ -3297,10 +3873,12 @@ class AgentRunner:
       try:
         if self._agent_session_log is not None and self._durable_attach_emitted:
           if run_error is not None:
-            reason = "graceful_shutdown"
+            await self._emit_run_error_event(run_error)
+            reason, extra_fields = self._shutdown_interrupted_reason()
             if isinstance(run_error, asyncio.CancelledError) and self._role == "sub_agent":
               reason = "sub_agent_cancelled"
-            await self._emit_interrupted_event(reason)
+              extra_fields = {}
+            await self._emit_interrupted_event(reason, extra_fields=extra_fields or None)
           detach_reason = clean_detach_reason
           if isinstance(run_error, asyncio.CancelledError):
             detach_reason = "cancelled"

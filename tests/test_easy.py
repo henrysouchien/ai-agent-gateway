@@ -67,8 +67,15 @@ def _collect_sse_events(response) -> list[dict]:
   events = []
   for line in response.iter_lines():
     if line.startswith("data: "):
-      events.append(json.loads(line[6:]))
+      events.append(_unwrap_sse_payload(json.loads(line[6:])))
   return events
+
+
+def _unwrap_sse_payload(payload: dict) -> dict:
+  candidate = payload.get("event")
+  if isinstance(payload.get("seq"), int) and isinstance(candidate, dict) and isinstance(candidate.get("type"), str):
+    return candidate
+  return payload
 
 
 def _write_skill(skills_dir: Path, name: str, body: str) -> None:
@@ -425,8 +432,9 @@ def test_create_agent_no_credentials_constructs_and_streams_stub_response() -> N
 
 
 def test_create_agent_valid_api_keys_and_jwt_secret() -> None:
-  app = create_agent("test", valid_api_keys={"k1"}, jwt_secret="s")
-  assert app.state.auth._secret == "s"
+  jwt_secret = "easy-test-secret-with-at-least-32-bytes"
+  app = create_agent("test", valid_api_keys={"k1"}, jwt_secret=jwt_secret)
+  assert app.state.auth._secret == jwt_secret
 
   with TestClient(app) as client:
     assert client.post("/api/chat/init", json={"api_key": "bad"}).status_code == 401

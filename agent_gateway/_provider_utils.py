@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
-from .providers import AnthropicProvider, CodexProvider, ModelProvider, OpenAIProvider
+from .fixture_gate import FIXTURE_MODEL_ID, require_fixture_provider_available
+from .providers import AnthropicProvider, CodexProvider, FixtureProvider, ModelProvider, OpenAIProvider
 
+log = logging.getLogger("agent_gateway.provider_utils")
+_SUB_AGENT_DEFAULT_MODEL_WARNED: set[str] = set()
 
 _FALLBACK_DEFAULT_MODELS = {
+  "agent-sdk": "claude-sonnet-4-6",
   "anthropic": "claude-sonnet-4-6",
   "codex": "gpt-5.4",
+  "fixture": FIXTURE_MODEL_ID,
   "openai": "gpt-4o",
 }
 
 _FALLBACK_ALLOWED_MODELS = {
-  "anthropic": {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"},
+  "agent-sdk": {"claude-fable-5", "claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"},
+  "anthropic": {"claude-fable-5", "claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"},
   "codex": {
     "gpt-5.5",
     "gpt-5.1",
@@ -25,6 +32,7 @@ _FALLBACK_ALLOWED_MODELS = {
     "gpt-5.3-codex-spark",
     "gpt-5.4",
   },
+  "fixture": {FIXTURE_MODEL_ID},
   "openai": {"gpt-5.5", "gpt-4o", "gpt-4o-mini", "o1", "o1-mini", "o3-mini"},
 }
 
@@ -61,6 +69,25 @@ def _get_allowed_models_for_provider_name(provider: str | None = None) -> set[st
         models.add(default_model)
       return models
   return set(get_allowed_models(resolved))
+
+
+def sub_agent_default_model(allowed_models: set[str] | frozenset[str] | None) -> str | None:
+  """Return the operator's default sub-agent model when valid for this provider."""
+  raw_model = os.environ.get("SUB_AGENT_DEFAULT_MODEL", "").strip()
+  if not raw_model:
+    return None
+
+  allowed = set(allowed_models or set())
+  if raw_model in allowed:
+    return raw_model
+
+  if raw_model not in _SUB_AGENT_DEFAULT_MODEL_WARNED:
+    _SUB_AGENT_DEFAULT_MODEL_WARNED.add(raw_model)
+    log.warning(
+      "Ignoring SUB_AGENT_DEFAULT_MODEL=%r because it is not in the resolved provider allowlist",
+      raw_model,
+    )
+  return None
 
 
 def _classify_anthropic_credential(raw: str) -> dict[str, Any]:
@@ -223,8 +250,11 @@ def _resolve_provider(
       provider_instance = CodexProvider()
     elif provider_name == "openai":
       provider_instance = OpenAIProvider()
+    elif provider_name == "fixture":
+      require_fixture_provider_available("fixture provider resolver", error_type=ValueError)
+      provider_instance = FixtureProvider()
     else:
-      raise ValueError(f"Unknown provider: {provider}. Use 'anthropic', 'codex', or 'openai'.")
+      raise ValueError(f"Unknown provider: {provider}. Use 'anthropic', 'codex', 'openai', or dev-only 'fixture'.")
     if model is None:
       model = _get_default_model_for_provider(provider_name)
   elif isinstance(provider, ModelProvider):
@@ -265,6 +295,8 @@ def _resolve_provider(
       provider="codex",
       auth_config=auth_config,
     )
+  elif isinstance(provider_instance, FixtureProvider):
+    resolved_auth_config = dict(auth_config or {})
   else:
     resolved_auth_config = dict(auth_config)
 
@@ -289,6 +321,8 @@ def _allowed_models_for_provider(
     if model:
       allowed_models.add(model)
     return allowed_models
+  if isinstance(provider, FixtureProvider):
+    return {model or FIXTURE_MODEL_ID}
   return set()
 
 

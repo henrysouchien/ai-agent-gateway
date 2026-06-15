@@ -16,6 +16,8 @@ class SkillMetadataResponse(BaseModel):
   agent_description: str | None
   version: str
   scope: str
+  requires_portfolio_context: bool
+  required_context: list[str]
   agent_callable: bool
   resumable: bool
   max_turns: int | None

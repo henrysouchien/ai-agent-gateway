@@ -11,17 +11,18 @@ import logging
 import math
 import os
 import re
+import secrets
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from starlette.background import BackgroundTask
 
 from ._provider_utils import _get_allowed_models_for_provider_name
@@ -55,6 +56,8 @@ from .approval_resolver import resolve_policy
 from .approval_store import SQLiteApprovalStore, expire_pending_loop
 from .audit_resolver import resolve_audit_writer
 from .agent_session_log import _atomic_write_sidecar
+from .event_adapter import adapt_event
+from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, event_to_dict
 from .mcp_client import McpClientManager
 from .package_info import package_health
 from .product_config import gateway_product_id
@@ -62,7 +65,8 @@ from .providers.agent_sdk import AgentSDKConfig
 from .providers import AnthropicProvider, ModelProvider, StreamEvent
 from .runner import AgentRunner
 from .sdk_runner import AgentSDKRunner
-from .session import AuthManager, GatewaySession, SessionStore
+from .session import AuthManager, GatewaySession, SessionStore, SessionStream, StreamSubscriber
+from .session_recap import compute_recap, emit_recap_then_terminal
 from .tool_dispatcher import ApprovalDecision, ApprovalRequest
 from .tool_redaction import (
   get_audit_hmac_key_id,
@@ -75,7 +79,7 @@ SystemPrompt = str | List[Tuple[str, bool]]
 ExecutionLocationResolver = Callable[[str], Optional[str]]
 BuildChatRuntime = Callable[[GatewaySession, "ChatRequest", Optional[str], AuthManager], Awaitable["ChatRuntime"]]
 RequestApproval = Callable[[ApprovalRequest], Awaitable[Optional[ApprovalDecision]]]
-BuildRunner = Callable[[EventLog, str], AgentRunner | AgentSDKRunner]
+BuildRunner = Callable[..., AgentRunner | AgentSDKRunner]
 
 _AGENT_API_CLAIM_AUDIENCE = "agent_api_v1"
 _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS = 60
@@ -93,14 +97,19 @@ _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT = 600
 _ARTIFACT_DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _DEFAULT_CHAT_PROFILE = "analyst"
 _CHAT_PROFILE_ALIASES = {"hank": "analyst"}
+_ACTIVE_TURN_GRACE_SECONDS = 60.0
+_STREAM_SUBSCRIBER_QUEUE_MAX = 256
+_STREAM_SUBSCRIBER_KEEPALIVE_SECONDS = 15.0
 _SIDECAR_SLUG_RE = re.compile(r"[^a-z0-9-]+")
 log = logging.getLogger("agent_gateway.server")
+_STREAM_SUBSCRIBER_DONE = object()
 
 
 class ChatInitRequest(BaseModel):
   """Request body for `POST /chat/init`."""
 
   api_key: str = Field(..., min_length=1)
+  schema_version: int | None = None
   user_id: str | None = None
   user_email: str | None = None
   context: Dict[str, Any] = Field(default_factory=dict)
@@ -113,6 +122,7 @@ class ModelCatalog(BaseModel):
   default_model: str
   allowed_models: List[str]
   display_names: Dict[str, str]
+  providers: Dict[str, str] | None = None
 
 
 class ChatInitResponse(BaseModel):
@@ -122,6 +132,7 @@ class ChatInitResponse(BaseModel):
   session_token: str
   session_id: str
   expires_at: int
+  schema_version: int
   model_catalog: Optional[ModelCatalog] = None
 
 
@@ -146,6 +157,19 @@ class ChatRequest(BaseModel):
   context: Dict[str, Any] = Field(default_factory=dict)
   metadata: Dict[str, Any] = Field(default_factory=dict)
   model: Optional[str] = None
+
+
+class ChatRecapRequest(BaseModel):
+  """Request body for `POST /chat/recap`."""
+
+  session_id: str = Field(..., min_length=1)
+  scope: str = "active_turn"
+
+
+class ChatCancelRequest(BaseModel):
+  """Request body for `POST /chat/cancel`."""
+
+  session_id: str = Field(..., min_length=1)
 
 
 def _resolve_chat_profile_name(context: Mapping[str, Any] | None) -> str:
@@ -201,6 +225,16 @@ class ToolApprovalRequest(BaseModel):
   nonce: str
   approved: bool
   allow_tool_type: bool = False
+  denied_by: Optional[str] = None
+
+  @model_validator(mode="after")
+  def _validate_denied_by(self) -> "ToolApprovalRequest":
+    if self.approved:
+      self.denied_by = None
+      return self
+    if self.denied_by not in (None, "relay_policy"):
+      raise ValueError("denied_by must be omitted or 'relay_policy'")
+    return self
 
 
 @dataclass
@@ -209,13 +243,15 @@ class ChatRuntime:
 
   Attributes:
     system_prompt: Prompt string or cached prompt blocks for the request.
-    build_runner: Factory that receives `(event_log, session_id)` and returns an
-      `AgentRunner` or `AgentSDKRunner`.
+    build_runner: Factory that receives `(event_log, session_id, started_at)`
+      and returns an `AgentRunner` or `AgentSDKRunner`. Two-argument factories
+      are still accepted for compatibility with older tests/custom runtimes.
     get_tool_definitions: Callback returning the tool schemas visible to the
       model for this request.
     build_dispatcher: Reserved callback slot for custom dispatcher builders.
     provider: Provider handling the request, typically Anthropic or OpenAI.
     model_override: Request-scoped model override.
+    resolved_provider_name: Provider resolved for this request, when known.
     excluded_tools: Optional tool names hidden from the runtime.
     execution_location: Optional resolver used to annotate tool events with
       metadata such as `backend`, `client`, or a channel-specific location.
@@ -236,6 +272,7 @@ class ChatRuntime:
   build_dispatcher: Callable[["RequestContext"], Any] | None = None
   provider: ModelProvider | None = None
   model_override: Optional[str] = None
+  resolved_provider_name: Optional[str] = None
   excluded_tools: Optional[Set[str]] = None
   execution_location: Optional[ExecutionLocationResolver] = None
   on_usage: Optional[Callable[..., Any]] = None
@@ -260,6 +297,59 @@ class ChatRuntime:
         await result
     except Exception as exc:
       logging.getLogger("agent_gateway.server").warning("ChatRuntime.on_disconnect failed: %s", exc)
+
+
+def _build_runner_with_started_at(
+  build_runner: BuildRunner,
+  event_log: EventLog,
+  session_id: str,
+  started_at: float,
+) -> AgentRunner | AgentSDKRunner:
+  try:
+    signature = inspect.signature(build_runner)
+  except (TypeError, ValueError):
+    return build_runner(event_log, session_id, started_at)
+
+  positional_params = [
+    param
+    for param in signature.parameters.values()
+    if param.kind in {param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD}
+  ]
+  accepts_varargs = any(param.kind == param.VAR_POSITIONAL for param in signature.parameters.values())
+  if accepts_varargs or len(positional_params) >= 3:
+    return build_runner(event_log, session_id, started_at)
+  return build_runner(event_log, session_id)
+
+
+async def _call_build_chat_runtime(
+  build_chat_runtime: BuildChatRuntime,
+  *,
+  session: GatewaySession,
+  request: "ChatRequest",
+  channel: str | None,
+  auth_manager: AuthManager | None,
+) -> "ChatRuntime":
+  kwargs = {
+    "session": session,
+    "request": request,
+    "channel": channel,
+    "auth_manager": auth_manager,
+  }
+  try:
+    signature = inspect.signature(build_chat_runtime)
+  except (TypeError, ValueError):
+    return await build_chat_runtime(session, request, channel, auth_manager)  # type: ignore[misc]
+
+  params = signature.parameters
+  accepts_kwargs = any(param.kind == param.VAR_KEYWORD for param in params.values())
+  accepts_named_kwargs = all(
+    name in params
+    and params[name].kind in {params[name].POSITIONAL_OR_KEYWORD, params[name].KEYWORD_ONLY}
+    for name in kwargs
+  )
+  if accepts_kwargs or accepts_named_kwargs:
+    return await build_chat_runtime(**kwargs)
+  return await build_chat_runtime(session, request, channel, auth_manager)  # type: ignore[misc]
 
 
 @dataclass
@@ -311,6 +401,7 @@ class GatewayServerConfig:
     on_shutdown: Optional shutdown callback.
     transcript_dir: Optional directory where request and event transcripts are
       written as JSONL files.
+    transcript_retention_days: Number of days to retain chat transcript files.
     control_skills_dir: Optional directory backing control-plane skill list/read
       endpoints. When omitted, the package uses `AGENT_GATEWAY_SKILLS_DIR` if
       set, otherwise an empty package-local directory.
@@ -327,7 +418,7 @@ class GatewayServerConfig:
 
   auth_manager: Optional[AuthManager] = None
   default_provider: ModelProvider | None = None
-  jwt_secret: str = "dev-secret-change-me"
+  jwt_secret: str = field(default_factory=lambda: secrets.token_hex(32))
   session_ttl: int = 3600
   valid_api_keys: Set[str] = field(default_factory=set)
   cors_origins: List[str] = field(default_factory=lambda: ["http://localhost:3002"])
@@ -359,6 +450,7 @@ class GatewayServerConfig:
   on_startup: Optional[Callable[..., Any]] = None
   on_shutdown: Optional[Callable[..., Any]] = None
   transcript_dir: Optional[Path] = None
+  transcript_retention_days: int = 7
   control_skills_dir: Optional[Path] = None
   audit_hmac_secret_resolver: Callable[[], bytes] = get_audit_hmac_secret
   audit_hmac_key_id_resolver: Callable[[], str] = get_audit_hmac_key_id
@@ -475,6 +567,9 @@ def _artifact_auth_dependency(request: Request) -> str:
     if auth_manager is None:
       raise HTTPException(status_code=503, detail="Gateway auth manager unavailable")
     session, _claims = auth_manager.verify_token_with_payload(token)
+    risk_user_id = int(getattr(session, "risk_user_id", 0) or 0)
+    if risk_user_id > 0:
+      return str(risk_user_id)
     return session.user_id
 
   claim = _verify_signed_user_claim(request)
@@ -547,6 +642,49 @@ def _artifact_json_response(artifact: ArtifactPath) -> JSONResponse:
   with path.open("r", encoding="utf-8") as handle:
     payload = json_mod.load(handle)
   return JSONResponse(content=payload, headers=_file_cache_headers(path))
+
+
+def _artifact_index_identity_fields(artifact: ArtifactPath | None) -> dict[str, Any]:
+  fields: dict[str, Any] = {
+    "research_file_id": None,
+    "control_run_id": None,
+    "has_research_file": False,
+  }
+  if artifact is None:
+    return fields
+  path = _assert_artifact_path_still_safe(artifact)
+  if not path.is_file():
+    return fields
+  try:
+    with path.open("r", encoding="utf-8") as handle:
+      payload = json_mod.load(handle)
+  except (OSError, ValueError):
+    return fields
+  if not isinstance(payload, dict):
+    return fields
+  research_file_id = _int_or_none(payload.get("research_file_id"))
+  fields["research_file_id"] = research_file_id
+  fields["control_run_id"] = str(payload.get("control_run_id") or "").strip() or None
+  fields["has_research_file"] = research_file_id is not None
+  return fields
+
+
+def _int_or_none(value: Any) -> int | None:
+  if isinstance(value, bool):
+    return None
+  if isinstance(value, int):
+    return value
+  return None
+
+
+def _query_int_or_none(request: Request, name: str) -> int | None:
+  raw = request.query_params.get(name)
+  if raw is None or str(raw).strip() == "":
+    return None
+  try:
+    return int(str(raw).strip())
+  except ValueError as exc:
+    raise HTTPException(status_code=422, detail=f"{name} must be an integer") from exc
 
 
 def _assert_artifact_path_still_safe(artifact: ArtifactPath) -> Path:
@@ -682,6 +820,11 @@ def _maybe_write_chat_log_meta(
 ) -> None:
   meta_path = transcript_dir / f"{session_id}.meta.json"
   if meta_path.exists():
+    try:
+      now = time.time()
+      os.utime(meta_path, (now, now))
+    except OSError:
+      pass
     return
   _atomic_write_sidecar(
     meta_path,
@@ -721,6 +864,65 @@ def _write_transcript(
       handle.write(json_mod.dumps(payload, default=str) + "\n")
   except Exception:
     pass
+  try:
+    meta_path = transcript_dir / f"{session_id}.meta.json"
+    if meta_path.exists():
+      transcript_mtime = path.stat().st_mtime
+      os.utime(meta_path, (transcript_mtime, transcript_mtime))
+  except OSError:
+    pass
+
+
+def _cleanup_old_transcripts(
+  transcript_dir: Optional[Path],
+  retention_days: int,
+  *,
+  now: float | None = None,
+) -> int:
+  if transcript_dir is None or retention_days <= 0 or not transcript_dir.exists():
+    return 0
+
+  cutoff = (time.time() if now is None else now) - (retention_days * 86400)
+  removed = 0
+  transcript_freshness: dict[str, float] = {}
+  for transcript in transcript_dir.glob("*.jsonl"):
+    try:
+      transcript_freshness[transcript.name.removesuffix(".jsonl")] = transcript.stat().st_mtime
+    except OSError:
+      continue
+
+  for path in transcript_dir.iterdir():
+    if not path.is_file():
+      continue
+    if path.suffix != ".jsonl" and not path.name.endswith(".meta.json"):
+      continue
+    try:
+      effective_mtime = path.stat().st_mtime
+      if path.name.endswith(".meta.json"):
+        session_key = path.name.removesuffix(".meta.json")
+        effective_mtime = max(effective_mtime, transcript_freshness.get(session_key, 0.0))
+      if effective_mtime <= cutoff:
+        path.unlink()
+        removed += 1
+    except OSError:
+      continue
+  return removed
+
+
+def _compute_session_recap_payload(
+  session: GatewaySession,
+  active_turn: SessionStream,
+  *,
+  trigger: str,
+) -> Dict[str, Any]:
+  recap = compute_recap(
+    active_turn.event_log,
+    session_id=session.session_id,
+    started_at=float(session.created_at),
+    trigger=trigger,  # type: ignore[arg-type]
+    usage=getattr(session, "cached_usage", None),
+  )
+  return event_to_dict(recap)
 
 
 def _redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
@@ -734,10 +936,19 @@ def _redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> 
     return dict(tool_input)
 
 
-async def _cleanup_sessions_loop(session_store: SessionStore) -> None:
+async def _cleanup_sessions_loop(
+  session_store: SessionStore,
+  *,
+  transcript_dir: Optional[Path] = None,
+  transcript_retention_days: int = 7,
+) -> None:
   while True:
     await asyncio.sleep(300)
     await session_store.cleanup_expired_async()
+    try:
+      _cleanup_old_transcripts(transcript_dir, transcript_retention_days)
+    except Exception:
+      log.warning("Transcript retention cleanup failed", exc_info=True)
 
 
 async def _maybe_await(callback: Optional[Callable[..., Any]]) -> None:
@@ -746,6 +957,237 @@ async def _maybe_await(callback: Optional[Callable[..., Any]]) -> None:
   result = callback()
   if inspect.isawaitable(result):
     await result
+
+
+def _cancel_active_turn_cleanup_handle(active_turn: SessionStream) -> None:
+  cleanup_handle = active_turn.cleanup_handle
+  if cleanup_handle is None:
+    return
+  cleanup_handle.cancel()
+  active_turn.cleanup_handle = None
+
+
+def _clear_active_turn(session: GatewaySession, active_turn: SessionStream) -> None:
+  if session.active_turn is not active_turn:
+    return
+  _cancel_active_turn_cleanup_handle(active_turn)
+  for subscriber in active_turn.subscribers.values():
+    pump_task = subscriber.pump_task
+    if pump_task is not None and not pump_task.done():
+      pump_task.cancel()
+  active_turn.subscribers.clear()
+  session.active_turn = None
+  session.stream_active = False
+
+
+def _active_turn_is_running(active_turn: SessionStream | None) -> bool:
+  return active_turn is not None and active_turn.is_running
+
+
+def _schedule_active_turn_clear(session: GatewaySession, active_turn: SessionStream) -> None:
+  if session.active_turn is not active_turn:
+    return
+  _cancel_active_turn_cleanup_handle(active_turn)
+  loop = asyncio.get_running_loop()
+  active_turn.cleanup_handle = loop.call_later(_ACTIVE_TURN_GRACE_SECONDS, _clear_active_turn, session, active_turn)
+
+
+async def _cancel_active_turn_runner(active_turn: SessionStream) -> None:
+  _cancel_active_turn_cleanup_handle(active_turn)
+  task = active_turn.runner_task
+  if task is not None and not task.done():
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _cleanup_active_turn_on_expiry(session: GatewaySession) -> None:
+  active_turn = session.active_turn
+  if active_turn is None:
+    return
+  await _cancel_active_turn_runner(active_turn)
+  _clear_active_turn(session, active_turn)
+
+
+def _event_for_wire(entry: Any, event_log: EventLog) -> Dict[str, Any]:
+  event = dict(entry.event)
+  pid = gateway_product_id()
+  if pid is not None:
+    event["product_id"] = pid
+  if event.get("type") in {"tool_call_start", "tool_call_complete"}:
+    tool_name = event.get("tool_name")
+    execution_location_resolver = getattr(event_log, "_gateway_execution_location", None)
+    if isinstance(tool_name, str) and execution_location_resolver is not None:
+      execution_location = execution_location_resolver(tool_name)
+      if execution_location is not None:
+        event["execution_location"] = execution_location
+  return event
+
+
+def _resolve_schema_version(schema_version: int | None) -> int:
+  resolved = DEFAULT_SCHEMA_VERSION if schema_version is None else int(schema_version)
+  if resolved not in SUPPORTED_SCHEMA_VERSIONS:
+    supported = ", ".join(str(version) for version in sorted(SUPPORTED_SCHEMA_VERSIONS))
+    raise HTTPException(
+      status_code=400,
+      detail=f"Unsupported schema_version {resolved}; supported: [{supported}]",
+    )
+  return resolved
+
+
+def _stream_envelope(*, entry: Any, session_id: str, schema_version: int, event: Dict[str, Any]) -> Dict[str, Any]:
+  return {
+    "seq": entry.seq,
+    "session_id": session_id,
+    "schema_version": schema_version,
+    "event": event,
+  }
+
+
+def _disconnect_stream_subscriber_for_backpressure(subscriber: StreamSubscriber) -> None:
+  subscriber.disconnect_reason = "backpressure"
+  while True:
+    try:
+      subscriber.queue.get_nowait()
+    except asyncio.QueueEmpty:
+      break
+  try:
+    subscriber.queue.put_nowait(_STREAM_SUBSCRIBER_DONE)
+  except asyncio.QueueFull:
+    pass
+
+
+async def _pump_stream_subscriber(active_turn: SessionStream, subscriber: StreamSubscriber, after_seq: int) -> None:
+  try:
+    async for entry in active_turn.event_log.iter_from(after_seq):
+      try:
+        subscriber.queue.put_nowait(entry)
+      except asyncio.QueueFull:
+        _disconnect_stream_subscriber_for_backpressure(subscriber)
+        return
+  except asyncio.CancelledError:
+    raise
+  else:
+    try:
+      subscriber.queue.put_nowait(_STREAM_SUBSCRIBER_DONE)
+    except asyncio.QueueFull:
+      _disconnect_stream_subscriber_for_backpressure(subscriber)
+
+
+def _register_stream_subscriber(
+  active_turn: SessionStream,
+  *,
+  after_seq: int,
+  client_label: str | None,
+) -> StreamSubscriber:
+  subscriber = StreamSubscriber(
+    subscriber_id=f"sub:{uuid.uuid4().hex}",
+    connected_at=time.time(),
+    last_sent_seq=max(int(after_seq), 0),
+    queue=asyncio.Queue(maxsize=_STREAM_SUBSCRIBER_QUEUE_MAX),
+    client_label=client_label,
+  )
+  active_turn.subscribers[subscriber.subscriber_id] = subscriber
+  subscriber.pump_task = asyncio.create_task(_pump_stream_subscriber(active_turn, subscriber, subscriber.last_sent_seq))
+  return subscriber
+
+
+async def _cleanup_stream_subscriber(active_turn: SessionStream, subscriber_id: str) -> None:
+  subscriber = active_turn.subscribers.pop(subscriber_id, None)
+  if subscriber is None:
+    return
+  pump_task = subscriber.pump_task
+  if pump_task is not None and not pump_task.done():
+    pump_task.cancel()
+    await asyncio.gather(pump_task, return_exceptions=True)
+
+
+async def _stream_subscriber_sse(
+  *,
+  session: GatewaySession,
+  active_turn: SessionStream,
+  subscriber: StreamSubscriber,
+  transcript_dir: Path | None,
+  channel: str | None,
+  write_transcript: bool,
+  log: logging.Logger,
+) -> AsyncIterator[bytes]:
+  event_log = active_turn.event_log
+  try:
+    while True:
+      try:
+        item = await asyncio.wait_for(
+          subscriber.queue.get(),
+          timeout=_STREAM_SUBSCRIBER_KEEPALIVE_SECONDS,
+        )
+      except asyncio.TimeoutError:
+        pump_task = subscriber.pump_task
+        if pump_task is not None and pump_task.done() and subscriber.disconnect_reason:
+          return
+        yield b":keepalive\n\n"
+        continue
+
+      if item is _STREAM_SUBSCRIBER_DONE:
+        return
+
+      entry = item
+      subscriber.last_sent_seq = int(entry.seq)
+      event = _event_for_wire(entry, event_log)
+      entry_seq = int(entry.seq)
+      if write_transcript and entry_seq not in active_turn.transcript_written_seqs:
+        active_turn.transcript_written_seqs.add(entry_seq)
+        _write_transcript(
+          transcript_dir=transcript_dir,
+          session_id=session.session_id,
+          entry=event,
+          user_id=session.user_id,
+          channel=channel,
+        )
+
+      try:
+        adapted_event = adapt_event(event, session.schema_version)
+      except ValueError as adapter_exc:
+        log.error(
+          "SSE adapter failed for session=%s schema_version=%s event_type=%s: %s",
+          session.session_id,
+          session.schema_version,
+          event.get("type"),
+          adapter_exc,
+          exc_info=True,
+        )
+        error_event = {"type": "stream_error", "error": str(adapter_exc)}
+        adapted_event = adapt_event(error_event, DEFAULT_SCHEMA_VERSION)
+      if adapted_event is None:
+        continue
+
+      envelope = _stream_envelope(
+        entry=entry,
+        session_id=session.session_id,
+        schema_version=session.schema_version,
+        event=adapted_event,
+      )
+      try:
+        yield f"data: {_json_dumps(envelope)}\n\n".encode("utf-8")
+      except Exception as ser_exc:
+        log.error(
+          "SSE serialization failed for event type=%s: %s",
+          event.get("type"),
+          ser_exc,
+          exc_info=True,
+        )
+        try:
+          error_event = {"type": "stream_error", "error": f"SSE serialization failed: {ser_exc}"}
+          error_envelope = {
+            "seq": subscriber.last_sent_seq,
+            "session_id": session.session_id,
+            "schema_version": session.schema_version,
+            "event": adapt_event(error_event, session.schema_version) or error_event,
+          }
+          yield f"data: {_json_dumps(error_envelope)}\n\n".encode("utf-8")
+        except Exception:
+          pass
+        return
+  finally:
+    await _cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
 
 
 def _legacy_request_approval(session: GatewaySession, event_log: EventLog) -> RequestApproval:
@@ -782,6 +1224,7 @@ def _legacy_request_approval(session: GatewaySession, event_log: EventLog) -> Re
     return ApprovalDecision(
       approved=bool(approval.get("approved")),
       allow_tool_type=bool(approval.get("allow_tool_type")),
+      denied_by=None if approval.get("approved") else approval.get("denied_by"),
     )
 
   return request_approval
@@ -814,6 +1257,29 @@ def _chat_turn_state_from_events(events: list[dict[str, Any]]) -> str:
   return "completed" if events else "starting"
 
 
+def _chat_run_state_event(session_id: str, state: str) -> dict[str, Any]:
+  return {
+    "type": "run_state_changed",
+    "run_id": session_id,
+    "control_run_id": session_id,
+    "state": state,
+    "ts": int(time.time()),
+  }
+
+
+def _latest_chat_run_state(session: GatewaySession, session_id: str) -> str | None:
+  for event in reversed(session.event_history.snapshot()):
+    if event.get("type") != "run_state_changed":
+      continue
+    event_run_id = event.get("run_id") or event.get("control_run_id")
+    if event_run_id is not None and event_run_id != session_id:
+      continue
+    state = event.get("state")
+    if state in {"starting", "running", "approval_pending", "completed", "failed", "cancelled"}:
+      return str(state)
+  return None
+
+
 async def _dispatch_chat_turn(
   session: GatewaySession,
   inputs: ChatTurnInputs,
@@ -823,15 +1289,25 @@ async def _dispatch_chat_turn(
   build_chat_runtime: BuildChatRuntime,
   credentials_resolver: CredentialsResolver | None,
   transcript_dir: Path | None,
+  publish_lifecycle_events: bool = False,
 ) -> ChatTurnResult:
   """Run one chat turn outside the ASGI response lifecycle."""
   if session.kind != "chat":
     raise HTTPException(status_code=400, detail="control sessions cannot dispatch chat turns")
+  if _active_turn_is_running(session.active_turn):
+    raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
+  if session.active_turn is not None:
+    _clear_active_turn(session, session.active_turn)
   if session.stream_active:
-    raise HTTPException(status_code=409, detail="A chat stream is already active for this session")
+    raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
 
   session.stream_active = True
   sid = session.session_id
+  active_turn = SessionStream(
+    event_log=event_log,
+    runner_task=asyncio.current_task(),
+  )
+  session.active_turn = active_turn
   request_id = inputs.request_id.strip() if isinstance(inputs.request_id, str) else inputs.request_id
   request_id = request_id or str(uuid.uuid4())
   context = dict(inputs.context or {})
@@ -886,11 +1362,12 @@ async def _dispatch_chat_turn(
   setattr(event_log, "_on_event", _record_event)
   setattr(event_log, "_session_id", sid)
   fanout_task = asyncio.create_task(_fanout_worker())
+  if publish_lifecycle_events:
+    _record_event(_chat_run_state_event(sid, "running"), sid)
 
   runtime: ChatRuntime | None = None
   runner: Any | None = None
   runner_task: asyncio.Task[Any] | None = None
-  heartbeat_task: asyncio.Task[Any] | None = None
 
   async def _credential_refresher(failure: ProviderCredentialFailure) -> Dict[str, Any] | None:
     resolver = credentials_resolver
@@ -953,6 +1430,16 @@ async def _dispatch_chat_turn(
     except Exception as exc:
       log.warning("on_disconnect failed for %s: %s", sid, exc)
 
+  started_at = float(session.created_at)
+
+  def _emit_terminal(event: Dict[str, Any]) -> None:
+    emit_recap_then_terminal(
+      event_log,
+      event,
+      session_id=sid,
+      started_at=started_at,
+    )
+
   try:
     messages = [_model_to_dict(message) for message in inputs.messages]
     last_user = next((message["content"] for message in reversed(messages) if message.get("role") == "user"), "")
@@ -971,7 +1458,8 @@ async def _dispatch_chat_turn(
       channel=channel,
     )
 
-    runtime = await build_chat_runtime(
+    runtime = await _call_build_chat_runtime(
+      build_chat_runtime,
       session=session,
       request=request,
       channel=channel,
@@ -980,9 +1468,14 @@ async def _dispatch_chat_turn(
     session_auth_config = session.auth_config or config_auth_config
     resolved_model = runtime.model_override or request.model or str(session_auth_config.get("model", "")).strip() or None
     if resolved_model:
-      if allowed_models and resolved_model not in allowed_models:
+      resolved_provider_name = str(getattr(runtime, "resolved_provider_name", "") or "").strip().lower()
+      if resolved_provider_name:
+        provider_allowed_models = _get_allowed_models_for_provider_name(resolved_provider_name)
+        if provider_allowed_models and resolved_model not in provider_allowed_models:
+          raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
+      elif allowed_models and resolved_model not in allowed_models:
         raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
-    runner = runtime.build_runner(event_log, sid)
+    runner = _build_runner_with_started_at(runtime.build_runner, event_log, sid, started_at)
     setattr(event_log, "_gateway_execution_location", runtime.execution_location)
     set_credential_refresher = getattr(runner, "set_credential_refresher", None)
     if callable(set_credential_refresher) and credentials_resolver is not None:
@@ -1003,19 +1496,12 @@ async def _dispatch_chat_turn(
       except asyncio.CancelledError:
         raise
       except Exception as exc:
-        event_log.append({"type": "error", "error": str(exc)})
+        _emit_terminal({"type": "error", "error": str(exc)})
       finally:
-        event_log.close()
-
-    async def heartbeat() -> None:
-      while True:
-        await asyncio.sleep(15)
-        if event_log.closed:
-          return
-        event_log.append({"type": "heartbeat", "timestamp": int(time.time())})
+        if not event_log.closed:
+          _emit_terminal({"type": "error", "error": "stream closed"})
 
     runner_task = asyncio.create_task(run_agent())
-    heartbeat_task = asyncio.create_task(heartbeat())
     # shield: a client-disconnect cancel of the enclosing dispatch_task must NOT
     # auto-propagate into runner_task here. The `except asyncio.CancelledError` block
     # below fires the cooperative disconnect (sets the tool abort_event and yields)
@@ -1024,23 +1510,32 @@ async def _dispatch_chat_turn(
     # that handshake — the PR4 (47b91a31) regression this restores.
     await asyncio.shield(runner_task)
     session.stream_active = False
+    if publish_lifecycle_events:
+      events = [dict(entry.event) for entry in event_log.entries]
+      if _latest_chat_run_state(session, sid) != "cancelled":
+        _record_event(_chat_run_state_event(sid, _chat_turn_state_from_events(events)), sid)
   except asyncio.CancelledError:
     await _safe_fire_disconnect()
     if runner_task is not None:
       runner_task.cancel()
-    if heartbeat_task is not None:
-      heartbeat_task.cancel()
     await asyncio.gather(
-      *(task for task in (runner_task, heartbeat_task) if task is not None),
+      *(task for task in (runner_task,) if task is not None),
       return_exceptions=True,
     )
-    event_log.close("stream closed")
+    if publish_lifecycle_events and _latest_chat_run_state(session, sid) != "cancelled":
+      _record_event(_chat_run_state_event(sid, "cancelled"), sid)
+    _emit_terminal({"type": "error", "error": "stream closed"})
+    raise
+  except Exception as exc:
+    session.stream_active = False
+    if publish_lifecycle_events:
+      _emit_terminal({"type": "error", "error": str(exc)})
+      _record_event(_chat_run_state_event(sid, "failed"), sid)
+    _emit_terminal({"type": "error", "error": "stream failed"})
     raise
   finally:
-    if heartbeat_task is not None:
-      heartbeat_task.cancel()
-      await asyncio.gather(heartbeat_task, return_exceptions=True)
-    event_log.close()
+    if not event_log.closed:
+      _emit_terminal({"type": "error", "error": "stream closed"})
     await _stop_fanout_worker()
     setattr(event_log, "_on_event", previous_on_event)
     setattr(event_log, "_session_id", previous_session_id)
@@ -1048,6 +1543,8 @@ async def _dispatch_chat_turn(
     session.approval_queues.clear()
     _drain_result_queue(session.result_queue)
     session.stream_active = False
+    if session.active_turn is active_turn:
+      _schedule_active_turn_clear(session, active_turn)
 
   events = [dict(entry.event) for entry in event_log.entries]
   return ChatTurnResult(
@@ -1088,12 +1585,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   - `GET  {prefix}/control/runs`
   - `GET  {prefix}/control/runs/{run_id}`
   - `GET  {prefix}/control/runs/{run_id}/logs`
+  - `POST {prefix}/control/runs/{run_id}/resume`
   - `GET  {prefix}/control/schedules`
   - `GET  {prefix}/control/schedules/{name}`
   - `GET  {prefix}/control/schedules/{name}/logs`
   - `POST {prefix}/control/schedules`
   - `PUT  {prefix}/control/schedules/{name}/enabled`
   - `DELETE {prefix}/control/schedules/{name}`
+  - `GET  {prefix}/control/profiles`
   - `GET  {prefix}/control/skills`
   - `GET  {prefix}/control/skills/{name}`
   - `GET  {prefix}/health`
@@ -1121,15 +1620,46 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     valid_keys=config.valid_api_keys,
     session_store=SessionStore(ttl=config.session_ttl),
   )
+  from .control_plane.runs import cleanup_control_chat_tasks
+
   transcript_dir = Path(config.transcript_dir) if config.transcript_dir is not None else None
   if transcript_dir is not None:
     transcript_dir.mkdir(parents=True, exist_ok=True)
+
+  async def _write_session_gc_recap_on_expiry(session: GatewaySession) -> None:
+    active_turn = session.active_turn
+    if active_turn is None:
+      return
+    try:
+      await _cancel_active_turn_runner(active_turn)
+      if not active_turn.event_log.entries:
+        return
+      recap_payload = _compute_session_recap_payload(session, active_turn, trigger="session_gc")
+      _write_transcript(
+        transcript_dir,
+        session.session_id,
+        recap_payload,
+        user_id=session.user_id,
+        channel=session.channel,
+      )
+    except Exception:
+      log.warning("session_recap GC write failed for %s", session.session_id, exc_info=True)
+
+  auth.session_store.add_on_expiry(_write_session_gc_recap_on_expiry)
+  auth.session_store.add_on_expiry(_cleanup_active_turn_on_expiry)
+  auth.session_store.add_on_expiry(cleanup_control_chat_tasks)
   log = logging.getLogger(config.log_name)
   route_prefix = _normalize_prefix(config.prefix)
 
   @asynccontextmanager
   async def lifespan(app: FastAPI):
-    cleanup_task = asyncio.create_task(_cleanup_sessions_loop(auth.session_store))
+    cleanup_task = asyncio.create_task(
+      _cleanup_sessions_loop(
+        auth.session_store,
+        transcript_dir=transcript_dir,
+        transcript_retention_days=config.transcript_retention_days,
+      )
+    )
     approval_expire_task = asyncio.create_task(expire_pending_loop(app.state.gateway_approval_store))
     startup_complete = False
     try:
@@ -1161,7 +1691,8 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     auth_manager: AuthManager | None,
   ) -> ChatRuntime:
     _ = auth_manager
-    return await config.build_chat_runtime(
+    return await _call_build_chat_runtime(
+      config.build_chat_runtime,
       session=session,
       request=request,
       channel=channel,
@@ -1175,13 +1706,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   setattr(_build_chat_runtime_for_dispatch, "_gateway_resolver_timeout_seconds", config.resolver_timeout_seconds)
   app.state.gateway_build_chat_runtime = _build_chat_runtime_for_dispatch
   app.state.user_event_bus = UserEventBus()
+  _init_approval_subsystem(app, config)
   app.state.subprocess_registry = AutonomousRegistry(
     api_dir=_default_autonomous_api_dir(),
     python_executable=os.getenv("AGENT_GATEWAY_AUTONOMOUS_PYTHON", "").strip() or sys.executable,
     log_dir=_default_autonomous_log_dir(),
     max_running=int(os.getenv("AGENT_GATEWAY_AUTONOMOUS_MAX_RUNNING", "2") or "2"),
+    approval_db_path=getattr(app.state.gateway_approval_store, "path", None),
   )
-  _init_approval_subsystem(app, config)
   control_prefix = _route_path(route_prefix, "/control")
   add_control_plane_version_header_middleware(
     app,
@@ -1201,6 +1733,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   @router.post("/chat/init", response_model=ChatInitResponse)
   async def chat_init(payload: ChatInitRequest) -> ChatInitResponse:
     auth.validate_api_key(payload.api_key)
+    try:
+      schema_version = _resolve_schema_version(payload.schema_version)
+    except HTTPException as exc:
+      return JSONResponse({"error": "unsupported_schema_version", "message": str(exc.detail)}, status_code=exc.status_code)
     resolver = config.credentials_resolver
     try:
       resolved_user_id = _normalize_request_user_id(payload.user_id)
@@ -1298,6 +1834,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       role=resolved_role,  # type: ignore[arg-type]
       kind="chat",
       auth_config=resolved_auth_config,
+      schema_version=schema_version,
     )
     session.channel = resolved_channel
     session.is_public = resolved_channel == "public"
@@ -1316,6 +1853,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       session_token=token,
       session_id=session.session_id,
       expires_at=session.expires_at,
+      schema_version=session.schema_version,
       model_catalog=config.model_catalog,
     )
 
@@ -1377,6 +1915,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
     async def _on_chat_event(event: StreamEvent) -> None:
       event_dict = dict(event)  # type: ignore[arg-type]
+      event_dict.setdefault("run_id", sid)
       try:
         await user_event_bus.publish(
           user_id=session.user_id,
@@ -1408,6 +1947,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         build_chat_runtime=app.state.gateway_build_chat_runtime,
         credentials_resolver=config.credentials_refresh_resolver,  # type: ignore[arg-type]
         transcript_dir=transcript_dir,
+        publish_lifecycle_events=True,
       )
     )
     await asyncio.sleep(0)
@@ -1415,52 +1955,167 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       exc = dispatch_task.exception()
       if exc is not None:
         raise exc
+    active_turn = session.active_turn
+    subscriber: StreamSubscriber | None = None
+    if active_turn is not None and active_turn.event_log is event_log:
+      subscriber = _register_stream_subscriber(
+        active_turn,
+        after_seq=0,
+        client_label="post",
+      )
+
+    async def finalize_dispatch_task() -> None:
+      try:
+        await dispatch_task
+      except asyncio.CancelledError:
+        pass
+      except Exception as exc:
+        log.warning("chat turn dispatch failed for %s: %s", sid, exc)
+      finally:
+        await user_event_bus.cleanup_run(session.user_id, sid)
+
+    asyncio.create_task(finalize_dispatch_task())
+
+    cleanup_complete = False
+    cleanup_lock = asyncio.Lock()
 
     async def response_cleanup() -> None:
-      dispatch_task.cancel()
-      await asyncio.gather(dispatch_task, return_exceptions=True)
-      await user_event_bus.cleanup_run(session.user_id, sid)
+      nonlocal cleanup_complete
+      async with cleanup_lock:
+        if cleanup_complete:
+          return
+        active_turn = session.active_turn
+        if active_turn is not None and active_turn.event_log is event_log and subscriber is not None:
+          await _cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
+        cleanup_complete = True
 
     async def event_generator():
-      async for entry in event_log.iter_from(0):
-        event = dict(entry.event)
-        pid = gateway_product_id()
-        if pid is not None:
-          event["product_id"] = pid
-        if event.get("type") in {"tool_call_start", "tool_call_complete"}:
-          tool_name = event.get("tool_name")
-          execution_location_resolver = getattr(event_log, "_gateway_execution_location", None)
-          if isinstance(tool_name, str) and execution_location_resolver is not None:
-            execution_location = execution_location_resolver(tool_name)
-            if execution_location is not None:
-              event["execution_location"] = execution_location
-
-        if event.get("type") != "heartbeat":
-          _write_transcript(
-            transcript_dir=transcript_dir,
-            session_id=sid,
-            entry=event,
-            user_id=session.user_id,
-            channel=channel,
-          )
-
-        try:
-          yield f"data: {_json_dumps(event)}\n\n".encode("utf-8")
-        except Exception as ser_exc:
-          log.error(
-            "SSE serialization failed for event type=%s: %s",
-            event.get("type"),
-            ser_exc,
-            exc_info=True,
-          )
-          try:
-            error_event = {"type": "stream_error", "error": f"SSE serialization failed: {ser_exc}"}
-            yield f"data: {_json_dumps(error_event)}\n\n".encode("utf-8")
-          except Exception:
-            pass
-          break
+      try:
+        if active_turn is None or subscriber is None:
+          return
+        async for chunk in _stream_subscriber_sse(
+          session=session,
+          active_turn=active_turn,
+          subscriber=subscriber,
+          transcript_dir=transcript_dir,
+          channel=channel,
+          write_transcript=True,
+          log=log,
+        ):
+          yield chunk
+      finally:
+        await response_cleanup()
 
     return StreamingResponse(event_generator(), headers=headers, background=BackgroundTask(response_cleanup))
+
+  @router.get("/chat/subscribe")
+  async def chat_subscribe(request: Request) -> StreamingResponse:
+    token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
+    session = auth.verify_token(token)
+    if "schema_version" in request.query_params:
+      raise HTTPException(
+        status_code=400,
+        detail="schema_version is set at session init via POST /chat/init; create a new session to change versions",
+      )
+    requested_session_id = request.query_params.get("session_id") or session.session_id
+    if requested_session_id != session.session_id:
+      raise HTTPException(status_code=403, detail="Cannot subscribe to a different session")
+
+    raw_after_seq = request.query_params.get("after_seq", "0")
+    try:
+      after_seq = max(int(raw_after_seq), 0)
+    except (TypeError, ValueError):
+      raise HTTPException(status_code=400, detail="after_seq must be an integer")
+
+    active_turn = session.active_turn
+    if active_turn is None:
+      raise HTTPException(status_code=404, detail="No active turn for this session")
+
+    subscriber = _register_stream_subscriber(
+      active_turn,
+      after_seq=after_seq,
+      client_label=request.query_params.get("client_label") or "subscriber",
+    )
+    headers = {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "X-Accel-Buffering": "no",
+      "Connection": "keep-alive",
+    }
+
+    async def cleanup() -> None:
+      await _cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
+
+    async def event_generator():
+      try:
+        async for chunk in _stream_subscriber_sse(
+          session=session,
+          active_turn=active_turn,
+          subscriber=subscriber,
+          transcript_dir=transcript_dir,
+          channel=session.channel,
+          write_transcript=True,
+          log=log,
+        ):
+          yield chunk
+      finally:
+        await cleanup()
+
+    return StreamingResponse(event_generator(), headers=headers, background=BackgroundTask(cleanup))
+
+  @router.post("/chat/cancel")
+  async def chat_cancel(request: Request, body: ChatCancelRequest = Body(...)) -> JSONResponse:
+    token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
+    session = auth.verify_token(token)
+    if body.session_id != session.session_id:
+      raise HTTPException(status_code=403, detail="Cannot cancel a different session")
+
+    active_turn = session.active_turn
+    if active_turn is None:
+      raise HTTPException(status_code=404, detail="No active turn for this session")
+
+    await _cancel_active_turn_runner(active_turn)
+    _clear_active_turn(session, active_turn)
+    return JSONResponse(content={"status": "cancelled", "session_id": session.session_id})
+
+  @router.post("/chat/recap")
+  async def chat_recap(request: Request, body: ChatRecapRequest = Body(...)) -> JSONResponse:
+    token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
+    session = auth.verify_token(token)
+    if body.session_id != session.session_id:
+      raise HTTPException(status_code=403, detail="Cannot recap a different session")
+
+    scope = str(body.scope or "active_turn").strip().lower()
+    if scope == "session_cumulative":
+      raise HTTPException(status_code=501, detail="session_cumulative recap is not implemented")
+    if scope != "active_turn":
+      raise HTTPException(status_code=400, detail="scope must be active_turn or session_cumulative")
+
+    active_turn = session.active_turn
+    if active_turn is None:
+      raise HTTPException(status_code=404, detail="No active turn for this session")
+
+    recap_payload = _compute_session_recap_payload(session, active_turn, trigger="explicit")
+    if active_turn.event_log.closed:
+      _write_transcript(
+        transcript_dir,
+        session.session_id,
+        recap_payload,
+        user_id=session.user_id,
+        channel=session.channel,
+      )
+    else:
+      appended = active_turn.event_log.append(recap_payload)
+      if appended is None:
+        _write_transcript(
+          transcript_dir,
+          session.session_id,
+          recap_payload,
+          user_id=session.user_id,
+          channel=session.channel,
+        )
+
+    return JSONResponse(content=recap_payload)
 
   @router.get("/artifacts/{ticker}/{skill}/latest")
   async def artifact_latest(request: Request, ticker: str, skill: str) -> JSONResponse:
@@ -1499,11 +2154,38 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   @router.get("/artifacts/{ticker}")
   async def artifact_index(request: Request, ticker: str) -> JSONResponse:
     user_id = _artifact_auth_dependency(request)
+    research_file_id = _query_int_or_none(request, "research_file_id")
     try:
       index = ticker_artifact_index_for_request(user_id, ticker=ticker)
     except ArtifactPathError as exc:
       raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-    return JSONResponse(content=index)
+    decorated: list[dict[str, Any]] = []
+    for entry in index:
+      next_entry = dict(entry)
+      skill = str(next_entry.get("skill") or "").strip()
+      artifact_id = str(next_entry.get("latest_artifact_id") or "").strip()
+      artifact: ArtifactPath | None = None
+      if skill and artifact_id:
+        try:
+          artifact = artifact_json_path_for_request(
+            user_id,
+            ticker=ticker,
+            skill=skill,
+            artifact_id=artifact_id,
+          )
+        except ArtifactPathError:
+          artifact = None
+      next_entry.update(_artifact_index_identity_fields(artifact))
+      decorated.append(next_entry)
+    if research_file_id is not None:
+      # V1 filters the existing latest-per-skill index; older artifacts for the
+      # same skill are not scanned here.
+      decorated = [
+        entry
+        for entry in decorated
+        if entry.get("research_file_id") == research_file_id
+      ]
+    return JSONResponse(content=decorated)
 
   @router.get("/letters/{ticker}/{artifact_id}")
   async def letter_by_id(request: Request, ticker: str, artifact_id: str) -> FileResponse:
@@ -1599,6 +2281,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         allow_tool_type=payload.allow_tool_type,
         reason=None,
         app_state=request.app.state,
+        denied_by=payload.denied_by,
       )
     except ApprovalActionError as exc:
       return JSONResponse(exc.payload, status_code=exc.status_code)
@@ -1608,6 +2291,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   async def health() -> JSONResponse:
     return JSONResponse({"status": "ok", "package": package_health()})
 
+  from .control_plane.dashboard_artifacts import build_dashboard_artifacts_router
+  from .control_plane.html_artifacts import build_html_artifacts_router
+
+  router.include_router(build_dashboard_artifacts_router(artifact_auth_dependency=_artifact_auth_dependency))
+  router.include_router(build_html_artifacts_router(artifact_auth_dependency=_artifact_auth_dependency))
   app.include_router(router)
   app.include_router(
     create_control_plane_router(

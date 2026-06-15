@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote
 
 
@@ -36,6 +37,7 @@ _SHARE_CLASS_SUFFIXES = (".A", ".B")
 _TICKER_RE = re.compile(r"^[A-Z]{1,6}$")
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+_ARTIFACT_INDEX_RECENT_LIMIT = 5
 
 
 class ArtifactPathError(ValueError):
@@ -108,14 +110,14 @@ def latest_artifact_json_path_for_request(
   )
 
 
-def ticker_artifact_index_for_request(user_id: str, *, ticker: str) -> list[dict[str, str]]:
+def ticker_artifact_index_for_request(user_id: str, *, ticker: str) -> list[dict[str, Any]]:
   normalized_ticker = _validate_ticker(ticker)
   workspace_root = user_workspace_root(user_id)
   ticker_dir = _resolve_under_workspace(workspace_root, "artifacts", normalized_ticker)
   if not ticker_dir.is_dir():
     return []
 
-  index: list[dict[str, str]] = []
+  index: list[dict[str, Any]] = []
   for skill_dir in sorted(ticker_dir.iterdir(), key=lambda path: path.name):
     if not skill_dir.is_dir():
       continue
@@ -127,7 +129,13 @@ def ticker_artifact_index_for_request(user_id: str, *, ticker: str) -> list[dict
     artifacts = _safe_json_children(safe_skill_dir, workspace_root)
     if not artifacts:
       continue
-    index.append({"skill": normalized_skill, "latest_artifact_id": artifacts[-1].stem})
+    artifact_ids = [path.stem for path in artifacts]
+    index.append({
+      "skill": normalized_skill,
+      "latest_artifact_id": artifact_ids[-1],
+      "artifact_count": len(artifact_ids),
+      "recent_artifact_ids": list(reversed(artifact_ids[-_ARTIFACT_INDEX_RECENT_LIMIT:])),
+    })
   return index
 
 

@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from agent.skills.loader import _SKILL_NAME_RE, SkillMetadata, load_skill_metadata
 from agent_gateway.control_plane.middleware import CONTROL_PLANE_VERSION_HEADER
+from agent_gateway.skills import parse_skill_file
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -63,17 +64,31 @@ def test_control_skills_lists_catalog_metadata(
     "name": "comparative-analysis",
     "description": next(entry.description for entry in expected if entry.name == "comparative-analysis"),
     "agent_description": next(entry.agent_description for entry in expected if entry.name == "comparative-analysis"),
-    "version": "1.0",
+    "version": "1.1",
     "scope": "ticker",
+    "requires_portfolio_context": False,
+    "required_context": [],
     "agent_callable": True,
     "resumable": True,
     "max_turns": 20,
     "max_budget_usd": 4.0,
-    "persist_state": True,
+    "persist_state": False,
     "typed_contract": None,
     "catalog": True,
     "path": "api/memory/workspace/notes/skills/comparative-analysis.md",
   }
+  performance_review = next(entry for entry in skills if entry["name"] == "performance-review")
+  assert performance_review["scope"] == "portfolio"
+  assert performance_review["requires_portfolio_context"] is True
+  assert performance_review["required_context"] == ["portfolio"]
+  strategy_executor = next(entry for entry in skills if entry["name"] == "strategy-executor")
+  assert strategy_executor["scope"] == "portfolio"
+  assert strategy_executor["requires_portfolio_context"] is True
+  assert strategy_executor["required_context"] == ["portfolio"]
+  macro_review = next(entry for entry in skills if entry["name"] == "macro-review")
+  assert macro_review["scope"] == "portfolio"
+  assert macro_review["requires_portfolio_context"] is False
+  assert macro_review["required_context"] == []
 
 
 def test_control_skill_detail_returns_metadata_and_resolved_body(
@@ -125,6 +140,53 @@ def test_control_skill_detail_404s_for_unknown_and_catalog_false(
   assert hidden.json()["detail"] == "Skill not found"
 
 
+def test_fixture_html_artifact_is_hidden_but_resumable_for_live_qa(monkeypatch) -> None:
+  monkeypatch.setenv("APP_ENV", "development")
+  for name in ("ENVIRONMENT", "AGENT_GATEWAY_ENV", "NODE_ENV"):
+    monkeypatch.delenv(name, raising=False)
+
+  for skill_name in ("fixture-html-artifact", "fixture-dashboard-artifact", "fixture-approval-html-artifact"):
+    metadata = load_skill_metadata(skill_name, SKILLS_DIR, include_catalog_false=True)
+    profile = parse_skill_file(SKILLS_DIR / f"{skill_name}.md")
+
+    assert load_skill_metadata(skill_name, SKILLS_DIR) is None
+    assert metadata is not None
+    assert metadata.catalog is False
+    assert metadata.agent_callable is False
+    assert metadata.resumable is True
+    assert profile.state_class == "advisor-with-decision-log"
+
+
+def test_fixture_html_artifact_stays_hidden_from_control_skill_routes(
+  client: TestClient,
+  test_control_session: dict,
+  monkeypatch,
+) -> None:
+  monkeypatch.setenv("APP_ENV", "development")
+  for name in ("ENVIRONMENT", "AGENT_GATEWAY_ENV", "NODE_ENV"):
+    monkeypatch.delenv(name, raising=False)
+
+  headers = _auth_headers(test_control_session)
+  list_response = client.get("/api/control/skills", headers=headers)
+  detail_response = client.get("/api/control/skills/fixture-html-artifact", headers=headers)
+  dashboard_detail_response = client.get("/api/control/skills/fixture-dashboard-artifact", headers=headers)
+  approval_detail_response = client.get("/api/control/skills/fixture-approval-html-artifact", headers=headers)
+
+  assert list_response.status_code == 200
+  assert "fixture-html-artifact" not in {
+    entry["name"] for entry in list_response.json()["skills"]
+  }
+  assert "fixture-dashboard-artifact" not in {
+    entry["name"] for entry in list_response.json()["skills"]
+  }
+  assert "fixture-approval-html-artifact" not in {
+    entry["name"] for entry in list_response.json()["skills"]
+  }
+  assert detail_response.status_code == 404
+  assert dashboard_detail_response.status_code == 404
+  assert approval_detail_response.status_code == 404
+
+
 def test_load_skill_metadata_is_frontmatter_only(tmp_path: Path) -> None:
   skills_dir = tmp_path / "skills"
   skills_dir.mkdir()
@@ -157,6 +219,8 @@ typed_contract: DemoContract
     agent_description=None,
     version="1.0",
     scope="global",
+    requires_portfolio_context=False,
+    required_context=[],
     agent_callable=True,
     resumable=False,
     max_turns=3,
@@ -166,6 +230,60 @@ typed_contract: DemoContract
     catalog=True,
     path=(skills_dir / "frontmatter-only.md").as_posix(),
   )
+
+
+def test_load_skill_metadata_respects_top_level_required_context_override(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  (skills_dir / "portfolio-optional.md").write_text(
+    """---
+name: portfolio-optional
+description: Portfolio scoped but optional.
+version: '1.0'
+scope: portfolio
+agent_callable: true
+required_context: []
+---
+
+# Portfolio Optional
+""",
+    encoding="utf-8",
+  )
+
+  metadata = load_skill_metadata("portfolio-optional", skills_dir)
+
+  assert metadata is not None
+  assert metadata.scope == "portfolio"
+  assert metadata.requires_portfolio_context is False
+  assert metadata.required_context == []
+
+
+def test_load_skill_metadata_respects_nested_required_context_override(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  (skills_dir / "portfolio-name-required.md").write_text(
+    """---
+name: portfolio-name-required
+description: Portfolio context by nested metadata.
+version: '1.0'
+scope: global
+agent_callable: true
+metadata:
+  required_context:
+    - portfolio_name
+---
+
+# Portfolio Name Required
+""",
+    encoding="utf-8",
+  )
+
+  metadata = load_skill_metadata("portfolio-name-required", skills_dir)
+
+  assert metadata is not None
+  assert metadata.scope == "global"
+  assert metadata.requires_portfolio_context is True
+  assert metadata.required_context == ["portfolio_name"]
 
 
 def test_load_skill_metadata_catalog_scan_under_100ms() -> None:

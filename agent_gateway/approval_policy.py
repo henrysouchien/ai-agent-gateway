@@ -142,6 +142,7 @@ class RunContext:
   decider_role: str | None = None
   tenant_id: str | None = None
   parent_approval_id: str | None = None
+  delegation: DelegationGrant | None = None
   model_id: str | None = None
   model_version: str | None = None
   system_prompt_hash: str | None = None
@@ -156,6 +157,7 @@ class ApprovalRequest:
   tool_call_id: str
   parent_approval_id: str | None
   approval_chain_id: str
+  delegation_id: str | None = None
   request_id: str
   session_id: str | None
   run_id: str | None
@@ -243,6 +245,27 @@ class PersistentGrant:
   policy_id: str
 
 
+@dataclass(frozen=True, kw_only=True)
+class DelegationGrant:
+  delegation_id: str
+  delegator_user_id: str
+  delegator_run_id: str | None
+  delegator_session_id: str | None
+  delegator_profile: str
+  delegator_channel: str
+  bound_excel_session_id: str
+  bound_relay_request_id: str
+  bound_workbook: str | None
+  tool_class_ceiling: frozenset[ToolClass]
+  args_predicate: dict[str, Any] | None
+  window_seconds: int
+  exclude_external_write_bypass: bool = True
+  created_at: datetime
+  expires_at: datetime | None = None
+  revoked_at: datetime | None = None
+  consumed_at: datetime | None = None
+
+
 class ApprovalPolicy(Protocol):
   async def decide(
     self,
@@ -277,6 +300,7 @@ def build_approval_request(
     tool_call_id=tool_call_id,
     parent_approval_id=parent_id,
     approval_chain_id=parent_id or approval_id,
+    delegation_id=run_context.delegation.delegation_id if run_context.delegation is not None else None,
     request_id=run_context.request_id,
     session_id=run_context.session_id,
     run_id=run_context.run_id,

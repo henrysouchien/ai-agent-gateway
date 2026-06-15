@@ -1,6 +1,7 @@
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -9,7 +10,13 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway import SessionStore
+from agent_gateway.approval_policy import ApprovalDecision as PolicyApprovalDecision, ApprovalRequest, ApprovalRequestPayload, RunContext
+from agent_gateway.approval_policy import DelegationGrant, utc_now
+from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.approvals import _record_vote_and_unblock
 from agent_gateway.event_log import EventLog
+from agent_gateway.single_user_policy import DelegationApprovalPolicy
 from agent_gateway.tool_dispatcher import ApprovalDecision, InterceptDecision, ToolDispatcher
 
 
@@ -26,6 +33,68 @@ class _NullMcpClient:
 
 async def _ok_handler(_tool_input: dict[str, Any], **_kwargs: Any):
   return {"ok": True}, None
+
+
+class _ClassifiedToolDispatcher(ToolDispatcher):
+  def __init__(self, *args: Any, tool_class: str, **kwargs: Any) -> None:
+    super().__init__(*args, **kwargs)
+    self._test_tool_class = tool_class
+
+  def _resolve_tool_class(self, tool_name: str) -> str:
+    _ = tool_name
+    return self._test_tool_class
+
+
+class _ManualApprovalBasePolicy:
+  policy_bundle_hash = "manual-test-policy"
+  policy_version = "1"
+
+  async def decide(
+    self,
+    *,
+    payload: ApprovalRequestPayload,
+    request: ApprovalRequest,
+    run_context: RunContext,
+  ):
+    _ = payload, request, run_context
+    return PolicyApprovalDecision(
+      outcome="request_user_approval",
+      reason="Tool requires approval",
+      route_target_type="pending_tools",
+      expiry_seconds=600,
+      allow_persistent_grant=False,
+    )
+
+  async def on_resolve(self, *, request: ApprovalRequest) -> None:
+    _ = request
+
+  async def revoke_persistent_grant(self, *, grant_id: str, reason: str) -> None:
+    _ = grant_id, reason
+
+  def role_authorized_for_class(self, *, decider_role: str | None, tool_class: str) -> bool:
+    _ = decider_role, tool_class
+    return True
+
+
+def _delegation_grant(*, ceiling: frozenset[str] = frozenset({"state_write"})) -> DelegationGrant:
+  now = utc_now()
+  return DelegationGrant(
+    delegation_id="delegation-1",
+    delegator_user_id="alice",
+    delegator_run_id=None,
+    delegator_session_id="orchestrator-session-1",
+    delegator_profile="relay_qa_operator",
+    delegator_channel="excel",
+    bound_excel_session_id="excel-session-1",
+    bound_relay_request_id="request-1",
+    bound_workbook="Budget.xlsx",
+    tool_class_ceiling=ceiling,
+    args_predicate=None,
+    window_seconds=600,
+    exclude_external_write_bypass=True,
+    created_at=now,
+    expires_at=None,
+  )
 
 
 def _decision_events(event_log: EventLog) -> list[dict[str, Any]]:
@@ -162,6 +231,261 @@ def test_approval_timeout_emits_decided_event() -> None:
   asyncio.run(_run())
 
 
+def test_lifecycle_approval_request_times_out_without_user_response(monkeypatch, tmp_path: Path) -> None:
+  async def _run() -> None:
+    from agent_gateway import approval_settings
+
+    monkeypatch.setattr(approval_settings, "approval_wait_seconds", lambda: 0.01)
+
+    class _Policy:
+      policy_bundle_hash = "test-policy"
+
+      async def decide(
+        self,
+        *,
+        payload: ApprovalRequestPayload,
+        request: ApprovalRequest,
+        run_context: RunContext,
+      ):
+        _ = payload, request, run_context
+        return PolicyApprovalDecision(
+          outcome="request_user_approval",
+          reason="Tool requires approval",
+          route_target_type="pending_tools",
+          expiry_seconds=600,
+          allow_persistent_grant=True,
+        )
+
+      async def on_resolve(self, *, request: ApprovalRequest) -> None:
+        _ = request
+
+      async def revoke_persistent_grant(self, *, grant_id: str, reason: str) -> None:
+        _ = grant_id, reason
+
+      def role_authorized_for_class(self, *, decider_role: str | None, tool_class: str) -> bool:
+        _ = decider_role, tool_class
+        return True
+
+    event_log = EventLog()
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    dispatcher = ToolDispatcher(
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"write_file": _ok_handler},
+      needs_approval=lambda _name, _tool_input, _qualifier: True,
+      event_log=event_log,
+      session=session,
+      store=store,
+      policy=_Policy(),
+      run_context=RunContext(
+        user_id="alice",
+        request_id="request-1",
+        session_id=session.session_id,
+        channel="web",
+      ),
+    )
+
+    result, error = await dispatcher.dispatch("tool-1", "write_file", {"path": "x"})
+
+    assert result is None
+    assert error == {"code": "approval_timeout", "message": "User did not respond within timeout"}
+    approval_events = [
+      entry.event for entry in event_log.entries if entry.event.get("type") == "tool_approval_request"
+    ]
+    assert len(approval_events) == 1
+    stored = await store.get(approval_events[0]["approval_id"])
+    assert stored is not None
+    assert stored.state == "expired"
+    events = _decision_events(event_log)
+    assert len(events) == 1
+    assert events[0]["decision_source"] == "approval_timeout"
+    assert events[0]["outcome"] == "timeout"
+
+  asyncio.run(_run())
+
+
+def test_lifecycle_relay_policy_denial_emits_provenance_and_error(tmp_path: Path) -> None:
+  async def _run() -> None:
+    class _Policy:
+      policy_bundle_hash = "test-policy"
+
+      async def decide(
+        self,
+        *,
+        payload: ApprovalRequestPayload,
+        request: ApprovalRequest,
+        run_context: RunContext,
+      ):
+        _ = payload, request, run_context
+        return PolicyApprovalDecision(
+          outcome="request_user_approval",
+          reason="Tool requires approval",
+          route_target_type="pending_tools",
+          expiry_seconds=600,
+          allow_persistent_grant=True,
+        )
+
+      async def on_resolve(self, *, request: ApprovalRequest) -> None:
+        _ = request
+
+      async def revoke_persistent_grant(self, *, grant_id: str, reason: str) -> None:
+        _ = grant_id, reason
+
+      def role_authorized_for_class(self, *, decider_role: str | None, tool_class: str) -> bool:
+        _ = decider_role, tool_class
+        return True
+
+    event_log = EventLog()
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    policy = _Policy()
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    dispatcher = ToolDispatcher(
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"write_file": _ok_handler},
+      needs_approval=lambda _name, _tool_input, _qualifier: True,
+      event_log=event_log,
+      session=session,
+      store=store,
+      policy=policy,
+      run_context=RunContext(
+        user_id="alice",
+        request_id="request-1",
+        session_id=session.session_id,
+        channel="web",
+      ),
+    )
+
+    dispatch_task = asyncio.create_task(dispatcher.dispatch("tool-1", "write_file", {"path": "x"}))
+    for _ in range(100):
+      pending = session.pending_tools.get("tool-1")
+      if pending is not None:
+        break
+      await asyncio.sleep(0.001)
+    else:
+      raise AssertionError("approval request was not queued")
+
+    approval_id = str(pending["approval_id"])
+    await _record_vote_and_unblock(
+      target_session=session,
+      pending_entry=pending,
+      tool_call_id="tool-1",
+      nonce=pending["nonce"],
+      decider_id="alice",
+      decider_role="owner",
+      approved=False,
+      allow_tool_type=False,
+      reason=None,
+      app_state=SimpleNamespace(gateway_approval_store=store, gateway_approval_policy=policy),
+      denied_by="relay_policy",
+    )
+    result, error = await dispatch_task
+
+    assert result is None
+    assert error is not None
+    assert error["code"] == "user_denied"
+    assert error["sub_code"] == "relay_policy_denied"
+    assert "relay chat policy" in error["message"]
+    assert "taskpane composer" in error["message"]
+    stored = await store.get(approval_id)
+    assert stored is not None
+    assert stored.state == "denied"
+    assert stored.decision_reason == "Auto-denied by relay chat policy"
+    events = _decision_events(event_log)
+    assert len(events) == 1
+    assert events[0]["decision_source"] == "relay_policy_denied"
+    assert events[0]["outcome"] == "denied"
+    assert events[0]["allow_tool_type_applied"] is False
+
+  asyncio.run(_run())
+
+
+def test_delegated_lifecycle_auto_approval_emits_delegated_source(tmp_path: Path) -> None:
+  async def _run() -> None:
+    event_log = EventLog()
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    policy = DelegationApprovalPolicy(base=_ManualApprovalBasePolicy())
+    dispatcher = _ClassifiedToolDispatcher(
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"write_file": _ok_handler},
+      needs_approval=lambda _name, _tool_input, _qualifier: True,
+      event_log=event_log,
+      session=session,
+      store=store,
+      policy=policy,
+      run_context=RunContext(
+        user_id="alice",
+        request_id="request-1",
+        session_id="excel-session-1",
+        channel="excel",
+        delegation=_delegation_grant(),
+        policy_bundle_hash=policy.policy_bundle_hash,
+      ),
+      tool_class="state_write",
+    )
+
+    result, error = await dispatcher.dispatch("tool-1", "write_file", {"path": "x"})
+
+    assert result == {"ok": True}
+    assert error is None
+    stored = await store.get_by_tool_call_id("tool-1")
+    assert stored is not None
+    assert stored.state == "auto_approved"
+    assert stored.delegation_id == "delegation-1"
+    events = _decision_events(event_log)
+    assert len(events) == 1
+    assert events[0]["decision_source"] == "delegated_auto_approved"
+    assert events[0]["outcome"] == "approved"
+
+  asyncio.run(_run())
+
+
+def test_delegated_lifecycle_external_write_escalates_without_auto_approval(monkeypatch, tmp_path: Path) -> None:
+  async def _run() -> None:
+    from agent_gateway import approval_settings
+
+    monkeypatch.setattr(approval_settings, "approval_wait_seconds", lambda: 0.01)
+
+    event_log = EventLog()
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    policy = DelegationApprovalPolicy(base=_ManualApprovalBasePolicy())
+    dispatcher = _ClassifiedToolDispatcher(
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"write_file": _ok_handler},
+      needs_approval=lambda _name, _tool_input, _qualifier: True,
+      event_log=event_log,
+      session=session,
+      store=store,
+      policy=policy,
+      run_context=RunContext(
+        user_id="alice",
+        request_id="request-1",
+        session_id="excel-session-1",
+        channel="excel",
+        delegation=_delegation_grant(ceiling=frozenset({"read", "state_write"})),
+        policy_bundle_hash=policy.policy_bundle_hash,
+      ),
+      tool_class="external_write",
+    )
+
+    result, error = await dispatcher.dispatch("tool-1", "write_file", {"path": "x"})
+
+    assert result is None
+    assert error == {"code": "approval_timeout", "message": "User did not respond within timeout"}
+    request_events = [entry.event for entry in event_log.entries if entry.event.get("type") == "tool_approval_request"]
+    assert len(request_events) == 1
+    stored = await store.get_by_tool_call_id("tool-1")
+    assert stored is not None
+    assert stored.state == "expired"
+    events = _decision_events(event_log)
+    assert len(events) == 1
+    assert events[0]["decision_source"] == "approval_timeout"
+    assert all(event["decision_source"] != "delegated_auto_approved" for event in events)
+
+  asyncio.run(_run())
+
+
 def test_headless_static_auto_deny_emits_legacy_and_decided_events() -> None:
   async def _run() -> None:
     event_log = EventLog()
@@ -263,6 +587,9 @@ def test_all_package_decision_sources_have_decided_event_coverage() -> None:
     async def deny(_request):
       return ApprovalDecision(approved=False)
 
+    async def deny_by_relay_policy(_request):
+      return ApprovalDecision(approved=False, denied_by="relay_policy")
+
     async def timeout(_request):
       return None
 
@@ -272,6 +599,7 @@ def test_all_package_decision_sources_have_decided_event_coverage() -> None:
     scenarios = [
       _dispatcher(EventLog(), needs_approval=lambda *_args: True, request_approval=approve),
       _dispatcher(EventLog(), needs_approval=lambda *_args: True, request_approval=deny),
+      _dispatcher(EventLog(), needs_approval=lambda *_args: True, request_approval=deny_by_relay_policy),
       _dispatcher(EventLog(), needs_approval=lambda *_args: True, request_approval=timeout),
       _dispatcher(
         EventLog(),
@@ -300,6 +628,7 @@ def test_all_package_decision_sources_have_decided_event_coverage() -> None:
     assert sources == {
       "user_approved",
       "user_denied",
+      "relay_policy_denied",
       "approval_timeout",
       "headless_auto_deny",
       "headless_hook_approved",

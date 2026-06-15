@@ -6,10 +6,12 @@ import json
 import logging
 import os
 import re
-from typing import Any, AsyncIterator, Dict, List
+from dataclasses import replace
+from typing import Any, AsyncIterator, Dict
 
+from ..rate_limit import get_global_token_bucket
 from ..rates import RateTable, UnknownModelError, load_rate_table
-from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel
+from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
 
 
 log = logging.getLogger("agent_gateway.providers.anthropic")
@@ -35,6 +37,36 @@ _SENSITIVE_ERROR_VALUE_RES = (
 
 _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
   (
+    ("claude-fable-5",),
+    ModelInfo(
+      id="claude-fable-5",
+      provider="anthropic",
+      context_window=1_000_000,
+      max_output_tokens=32_000,
+      supports_thinking=True,
+      thinking_mode="adaptive",
+      input_cost_per_mtok=10.00,
+      output_cost_per_mtok=50.00,
+      cache_read_cost_per_mtok=1.00,
+      cache_write_cost_per_mtok=12.50,
+    ),
+  ),
+  (
+    ("claude-opus-4-8",),
+    ModelInfo(
+      id="claude-opus-4-8",
+      provider="anthropic",
+      context_window=1_000_000,
+      max_output_tokens=32_000,
+      supports_thinking=True,
+      thinking_mode="adaptive",
+      input_cost_per_mtok=5.00,
+      output_cost_per_mtok=25.00,
+      cache_read_cost_per_mtok=0.50,
+      cache_write_cost_per_mtok=6.25,
+    ),
+  ),
+  (
     ("claude-opus-4-7",),
     ModelInfo(
       id="claude-opus-4-7",
@@ -42,6 +74,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       context_window=1_000_000,
       max_output_tokens=32_000,
       supports_thinking=True,
+      thinking_mode="adaptive",
       input_cost_per_mtok=5.00,
       output_cost_per_mtok=25.00,
       cache_read_cost_per_mtok=0.50,
@@ -53,7 +86,9 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
     ModelInfo(
       id="claude-sonnet-4-6",
       provider="anthropic",
+      max_output_tokens=64_000,
       supports_thinking=True,
+      thinking_mode="adaptive",
       input_cost_per_mtok=3.00,
       output_cost_per_mtok=15.00,
       cache_read_cost_per_mtok=0.30,
@@ -66,6 +101,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       id="claude-opus-4-6",
       provider="anthropic",
       supports_thinking=True,
+      thinking_mode="adaptive",
       input_cost_per_mtok=3.00,
       output_cost_per_mtok=15.00,
       cache_read_cost_per_mtok=0.30,
@@ -77,7 +113,35 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
     ModelInfo(
       id="claude-sonnet-4-5",
       provider="anthropic",
+      max_output_tokens=64_000,
       supports_thinking=True,
+      thinking_mode="budget",
+      input_cost_per_mtok=3.00,
+      output_cost_per_mtok=15.00,
+      cache_read_cost_per_mtok=0.30,
+      cache_write_cost_per_mtok=3.75,
+    ),
+  ),
+  (
+    ("claude-haiku-4-5",),
+    ModelInfo(
+      id="claude-haiku-4-5",
+      provider="anthropic",
+      supports_thinking=False,
+      thinking_mode="none",
+      input_cost_per_mtok=1.00,
+      output_cost_per_mtok=5.00,
+      cache_read_cost_per_mtok=0.10,
+      cache_write_cost_per_mtok=1.25,
+    ),
+  ),
+  (
+    ("claude-3",),
+    ModelInfo(
+      id="claude-3",
+      provider="anthropic",
+      supports_thinking=False,
+      thinking_mode="none",
       input_cost_per_mtok=3.00,
       output_cost_per_mtok=15.00,
       cache_read_cost_per_mtok=0.30,
@@ -87,11 +151,31 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
 ]
 
 
-def _thinking_param(model: str, max_tokens: int) -> dict[str, Any] | None:
-  if any(tag in model for tag in ("sonnet-4-6", "opus-4-6", "opus-4-7")):
+def _model_matches_tag(model_id: str, tag: str) -> bool:
+  return model_id == tag or tag in model_id or model_id.startswith(f"{tag}-")
+
+
+def _model_info_for_model(model_id: str) -> ModelInfo:
+  for tags, info in _MODEL_INFO_BY_TAG:
+    if any(_model_matches_tag(model_id, tag) for tag in tags):
+      return replace(info, id=model_id)
+  return ModelInfo(
+    id=model_id,
+    provider="anthropic",
+    supports_thinking=True,
+    thinking_mode="adaptive",
+    input_cost_per_mtok=3.00,
+    output_cost_per_mtok=15.00,
+    cache_read_cost_per_mtok=0.30,
+    cache_write_cost_per_mtok=3.75,
+  )
+
+
+def _thinking_param(model_info: ModelInfo, max_tokens: int) -> dict[str, Any] | None:
+  if model_info.thinking_mode == "adaptive":
     return {"type": "adaptive"}
 
-  if any(tag in model for tag in ("sonnet-4-5", "opus-4-5", "sonnet-4")):
+  if model_info.thinking_mode == "budget":
     budget_tokens = min(10000, max_tokens - 1024)
     if budget_tokens >= 1024:
       return {"type": "enabled", "budget_tokens": budget_tokens}
@@ -314,7 +398,10 @@ class AnthropicProvider(ModelProvider):
 
   @staticmethod
   def thinking_param(model: str, max_tokens: int) -> dict[str, Any] | None:
-    return _thinking_param(model, max_tokens)
+    model_id = str(model or "").strip()
+    if not model_id.startswith("claude"):
+      return None
+    return _thinking_param(_model_info_for_model(model_id), max_tokens)
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     if str(config.get("auth_mode", "api")).strip().lower() == "oauth":
@@ -382,24 +469,15 @@ class AnthropicProvider(ModelProvider):
       raise ValueError("Model is required")
     if not model_id.startswith("claude"):
       raise ValueError(f"AnthropicProvider does not recognize model: {model_id}")
+    model_info = _model_info_for_model(model_id)
     try:
       rates = self._rate_table.lookup(self.name, model_id)
     except UnknownModelError:
-      return ModelInfo(
-        id=model_id,
-        provider=self.name,
-        supports_thinking=_thinking_param(model_id, 4096) is not None,
-        input_cost_per_mtok=3.00,
-        output_cost_per_mtok=15.00,
-        cache_read_cost_per_mtok=0.30,
-        cache_write_cost_per_mtok=3.75,
-      )
-    return ModelInfo(
-      id=model_id,
-      provider=self.name,
+      return model_info
+    return replace(
+      model_info,
       context_window=rates.context_window or 200_000,
       max_output_tokens=rates.max_tokens or 16_384,
-      supports_thinking=_thinking_param(model_id, rates.max_tokens or 4096) is not None,
       input_cost_per_mtok=rates.input_cost_per_mtok,
       output_cost_per_mtok=rates.output_cost_per_mtok,
       cache_read_cost_per_mtok=rates.cache_read_cost_per_mtok,
@@ -421,6 +499,7 @@ class AnthropicProvider(ModelProvider):
     system_blocks: list[dict[str, Any]] | None = None
     if auth_mode == "oauth":
       system_blocks = [{"type": "text", "text": _OAUTH_IDENTITY}]
+    model_info = self.get_model_info(model)
 
     if system_prompt:
       if isinstance(system_prompt, list):
@@ -453,7 +532,7 @@ class AnthropicProvider(ModelProvider):
       params["system"] = system_blocks
 
     if thinking_level != ThinkingLevel.NONE and max_tokens >= 2048:
-      thinking_param = _thinking_param(model, max_tokens)
+      thinking_param = _thinking_param(model_info, max_tokens)
       if thinking_param is not None:
         params["thinking"] = thinking_param
 
@@ -647,9 +726,13 @@ class AnthropicProvider(ModelProvider):
       if missing:
         result.append({"role": "user", "content": missing})
 
-    return result
+    return truncate_to_last_compaction(result)
 
   async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
+    bucket = get_global_token_bucket()
+    if bucket is not None:
+      await bucket.acquire(estimated_tokens=int(params.get("max_tokens") or 0))
+
     stream_params = dict(params)
     auth_mode = str(stream_params.pop("_provider_auth_mode", "api")).strip().lower()
     use_compaction = "context_management" in stream_params
@@ -715,7 +798,7 @@ class AnthropicProvider(ModelProvider):
               current_block_type = "thinking"
               current_thinking = ""
               current_signature = ""
-              yield StreamEvent(type="heartbeat")
+              yield StreamEvent(type="stream_progress")
             elif block_type == "text":
               current_block_type = "text"
               current_text = ""
@@ -746,10 +829,10 @@ class AnthropicProvider(ModelProvider):
               signature = getattr(delta, "signature", "")
               if signature:
                 current_signature += signature
-                yield StreamEvent(type="heartbeat")
+                yield StreamEvent(type="stream_progress")
             elif delta_type == "compaction_delta":
               current_compaction = getattr(delta, "content", None)
-              yield StreamEvent(type="heartbeat")
+              yield StreamEvent(type="stream_progress")
             continue
 
           if event_type == "content_block_stop":

@@ -414,7 +414,11 @@ def test_run_drains_message_inbox_and_injects_parent_messages_between_turns() ->
     assert len(seen_messages) == 2
     assert seen_messages[1][-1] == {
       "role": "user",
-      "content": "[Parent message id=msg-1]: Focus on regressions\n[Parent message id=msg-2]: Skip polish",
+      "content": (
+        "Operator update for this task:\n"
+        "- id=msg-1: Focus on regressions\n"
+        "- id=msg-2: Skip polish"
+      ),
     }
     assert seen_messages[1][1]["role"] == "assistant"
     assert inbox.empty()
@@ -519,7 +523,10 @@ def test_send_message_persists_event_and_child_sees_parent_message_envelope(tmp_
 
     assert seen_messages[0][-1] == {
       "role": "user",
-      "content": "[Parent message id=msg-live]: Focus on regressions",
+      "content": (
+        "Operator update for this task:\n"
+        "- id=msg-live: Focus on regressions"
+      ),
     }
 
   _run(_case())

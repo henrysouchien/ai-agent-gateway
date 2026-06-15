@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,9 +14,11 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway.skills import SkillLoader
 from agent_gateway import EventLog
+from agent_gateway.html_artifact_store import read_html_artifact_content, read_html_artifact_sidecar
 from agent_gateway.session import GatewaySession
 from agent_gateway.sub_agent import (
   _DEFAULT_EXCLUDED_TOOLS,
+  DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
   _DEFAULT_SYSTEM_PROMPT_TEMPLATE,
   _SKILL_SYSTEM_PROMPT_TEMPLATE,
   make_get_background_result_handler,
@@ -24,6 +27,8 @@ from agent_gateway.sub_agent import (
   make_run_agent_tool_def,
 )
 from agent_gateway.tool_dispatcher import ToolExecutionContext
+
+_UNRESOLVED_BLOCK_RE = re.compile(r"\{\{[A-Z][A-Z0-9_]*\}\}")
 
 
 def _run(coro):
@@ -74,6 +79,239 @@ def _callable_skill(frontmatter: str = "", body: str = "Use multiple sources.") 
   return "\n".join(lines)
 
 
+def test_make_run_agent_handler_installs_emit_html_artifact_for_named_skill(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import memory
+
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "data"))
+  memory.set_memory_store_factory(None)
+  try:
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir, "html-research", _callable_skill("scope: ticker", body="Research."))
+    parent_session = GatewaySession(
+      session_id="sess_parent",
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="alice",
+      user_email="alice@example.com",
+      auth_config={"provider": "anthropic", "billing_mode": "byok", "api_key": "key"},
+    )
+    runner = _StubRunner()
+    parent_log = EventLog()
+    handler = make_run_agent_handler(
+      [runner],
+      parent_session=parent_session,
+      skill_loader=SkillLoader(skills_dir),
+      mcp_client=_StubMcpClient(),
+      local_tool_handlers={},
+      excluded_tools={"emit_html_artifact"},
+      default_model="claude-sonnet-4-6",
+      allowed_models={"claude-sonnet-4-6"},
+    )
+
+    result, error = _run(
+      handler(
+        {"agent": "html-research", "task": "Analyze PCTY with rich visuals"},
+        tool_ctx=ToolExecutionContext(
+          tool_call_id="tool_run_agent_1",
+          tool_name="run_agent",
+          event_log=parent_log,
+        ),
+      )
+    )
+    assert error is None
+    assert result == {"response": "ok"}
+    dispatcher = runner.calls[0]["dispatcher"]
+    assert "emit_html_artifact" not in runner.calls[0]["excluded_tools"]
+
+    emit_result, emit_error = _run(
+      dispatcher.dispatch(
+        "tool_html_1",
+        "emit_html_artifact",
+        {
+          "title": "PCTY Historical Coincidences",
+          "purpose": "exploration",
+          "summary": "Timeline of PCTY coincidences.",
+          "html": "<section><h1>PCTY</h1></section>",
+          "copy_as_prompt": "Analyze PCTY",
+          "copy_as_markdown": "## PCTY",
+          "copy_as_json": {"ticker": "PCTY"},
+          "sources": [],
+        },
+      )
+    )
+
+    assert emit_error is None
+    assert emit_result is not None
+    artifact_id = emit_result["artifact_id"]
+    workspace_dir = memory.get_workspace_dir("alice")
+    sidecar = read_html_artifact_sidecar(workspace_dir, artifact_id)
+    assert sidecar is not None
+    assert sidecar.title == "PCTY Historical Coincidences"
+    assert sidecar.ticker == "PCTY"
+    assert sidecar.source_skill == "html-research"
+    assert sidecar.exports.copy_as_json == {"ticker": "PCTY"}
+    assert read_html_artifact_content(workspace_dir, artifact_id) == "<section><h1>PCTY</h1></section>"
+
+    events = [entry.event for entry in parent_log.entries]
+    assert [event["type"] for event in events] == [
+      "skill_run_started",
+      "skill_result_captured",
+      "artifact_ready",
+    ]
+    assert events[1]["skill"] == "html-research"
+    assert events[1]["artifact_refs"] == []
+    ready = events[-1]
+    assert ready["artifact_id"] == artifact_id
+    assert ready["ticker"] == "PCTY"
+    assert ready["skill"] == "_html"
+    assert ready["artifact_path"] == f"artifacts/_html/{artifact_id}.json"
+    assert ready["binary_artifact_path"] == f"artifacts/_html/{artifact_id}.html"
+    assert ready["contract_name"] == "HtmlArtifact"
+  finally:
+    memory.set_memory_store_factory(None)
+
+
+def test_emit_html_artifact_failure_emits_tool_write_failed(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import memory
+
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "data"))
+  memory.set_memory_store_factory(None)
+  try:
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir, "portfolio-report", _callable_skill("scope: portfolio", body="Report."))
+    parent_session = GatewaySession(
+      session_id="sess_parent",
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="alice",
+      user_email="alice@example.com",
+      auth_config={"provider": "anthropic", "billing_mode": "byok", "api_key": "key"},
+    )
+    runner = _StubRunner()
+    parent_log = EventLog()
+    handler = make_run_agent_handler(
+      [runner],
+      parent_session=parent_session,
+      skill_loader=SkillLoader(skills_dir),
+      mcp_client=_StubMcpClient(),
+      local_tool_handlers={},
+      default_model="claude-sonnet-4-6",
+      allowed_models={"claude-sonnet-4-6"},
+    )
+
+    _run(
+      handler(
+        {"agent": "portfolio-report", "task": "Analyze portfolio"},
+        tool_ctx=ToolExecutionContext(
+          tool_call_id="tool_run_agent_1",
+          tool_name="run_agent",
+          event_log=parent_log,
+        ),
+      )
+    )
+    dispatcher = runner.calls[0]["dispatcher"]
+
+    emit_result, emit_error = _run(
+      dispatcher.dispatch(
+        "tool_html_bad",
+        "emit_html_artifact",
+        {
+          "title": "Broken report",
+          "purpose": "report",
+          "summary": "Empty html field.",
+          "html": "",
+          "sources": [],
+        },
+      )
+    )
+
+    assert emit_result is None
+    assert emit_error is not None
+    assert emit_error["code"] == "internal_error"
+    assert "non-empty string" in emit_error["message"]
+    events = [entry.event for entry in parent_log.entries]
+    assert [event["type"] for event in events] == [
+      "skill_run_started",
+      "skill_result_captured",
+      "artifact_failed",
+    ]
+    assert events[0]["ticker"] is None
+    assert events[0]["scope"] == "portfolio"
+    failed = events[-1]
+    assert failed["ticker"] is None
+    assert failed["skill"] == "_html"
+    assert failed["error_code"] == "tool_write_failed"
+    assert failed["source_path"] is None
+    assert failed["tool_call_id"] == "tool_html_bad"
+    assert not (memory.get_workspace_dir("alice") / "artifacts" / "_html").exists()
+  finally:
+    memory.set_memory_store_factory(None)
+
+
+def test_emit_html_artifact_uses_risk_user_storage_workspace(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import memory
+
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "data"))
+  memory.set_memory_store_factory(None)
+  try:
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir, "html-research", _callable_skill("scope: ticker", body="Research."))
+    parent_session = GatewaySession(
+      session_id="sess_parent",
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="alice-slug",
+      user_email="alice@example.com",
+      risk_user_id=42,
+      auth_config={"provider": "anthropic", "billing_mode": "byok", "api_key": "key"},
+    )
+    runner = _StubRunner()
+    handler = make_run_agent_handler(
+      [runner],
+      parent_session=parent_session,
+      skill_loader=SkillLoader(skills_dir),
+      mcp_client=_StubMcpClient(),
+      local_tool_handlers={},
+      default_model="claude-sonnet-4-6",
+      allowed_models={"claude-sonnet-4-6"},
+    )
+
+    _run(handler({"agent": "html-research", "task": "Analyze PCTY"}))
+    dispatcher = runner.calls[0]["dispatcher"]
+    emit_result, emit_error = _run(
+      dispatcher.dispatch(
+        "tool_html_1",
+        "emit_html_artifact",
+        {
+          "title": "PCTY View",
+          "purpose": "exploration",
+          "summary": "PCTY visual analysis.",
+          "html": "<section><h1>PCTY</h1></section>",
+          "sources": [],
+        },
+      )
+    )
+
+    assert emit_error is None
+    artifact_id = emit_result["artifact_id"]
+    assert read_html_artifact_sidecar(memory.get_workspace_dir("42"), artifact_id) is not None
+    assert read_html_artifact_sidecar(memory.get_workspace_dir("alice-slug"), artifact_id) is None
+  finally:
+    memory.set_memory_store_factory(None)
+
+
 def test_make_run_agent_handler_loads_skill_profile_and_filters_tools(tmp_path: Path) -> None:
   skills_dir = tmp_path / "skills"
   _write_skill(
@@ -116,14 +354,54 @@ def test_make_run_agent_handler_loads_skill_profile_and_filters_tools(tmp_path: 
   assert call["max_turns"] == 7
   assert call["timeout"] == 12.5
   assert call["client_timeout"] == 90
-  assert call["max_tokens"] == 32000
+  assert call["max_tokens"] == 64000
   assert call["call_index"] == 3
-  assert dispatcher._local == {"keep_tool": keep_tool}
+  assert dispatcher._local["keep_tool"] is keep_tool
+  assert "drop_tool" not in dispatcher._local
+  assert "run_agent" not in dispatcher._local
+  assert "emit_html_artifact" in dispatcher._local
   assert dispatcher._needs_approval("keep_tool", {}, "") is False
   assert dispatcher._session_id == runner._full_session_id
 
 
-def test_make_run_agent_handler_uses_anonymous_defaults_for_blank_agent(tmp_path: Path) -> None:
+def test_make_run_agent_handler_resolves_skill_blocks_before_spawn(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  blocks_dir = skills_dir / "_blocks"
+  blocks_dir.mkdir(parents=True)
+  (blocks_dir / "citation-contract.md").write_text(
+    "Resolved citation contract.\nSecond line stays verbatim.\n",
+    encoding="utf-8",
+  )
+  _write_skill(
+    skills_dir,
+    "blocked-research",
+    _callable_skill(body="Use sources.\n{{CITATION_CONTRACT}}\nReport findings."),
+  )
+  assert "{{CITATION_CONTRACT}}" in SkillLoader(skills_dir).load("blocked-research").system_prompt
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+    default_model="claude-sonnet-4-6",
+    allowed_models={"claude-sonnet-4-6"},
+  )
+
+  result, error = _run(handler({"agent": "blocked-research", "task": "Analyze filings"}))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  prompt = runner.calls[0]["system_prompt"]
+  assert "Resolved citation contract.\nSecond line stays verbatim.\n" in prompt
+  assert not _UNRESOLVED_BLOCK_RE.search(prompt)
+
+
+def test_make_run_agent_handler_uses_anonymous_defaults_for_blank_agent(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.delenv("SUB_AGENT_DEFAULT_MODEL", raising=False)
   runner = _StubRunner()
   handler = make_run_agent_handler(
     [runner],
@@ -148,7 +426,55 @@ def test_make_run_agent_handler_uses_anonymous_defaults_for_blank_agent(tmp_path
   assert call["timeout"] == 42.0
 
 
-def test_make_run_agent_handler_default_timeout_is_none() -> None:
+def test_make_run_agent_handler_uses_sub_agent_default_model_knob(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  runner = _StubRunner()
+  monkeypatch.setenv("SUB_AGENT_DEFAULT_MODEL", "claude-opus-4-8")
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(tmp_path / "skills"),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+    default_model="claude-sonnet-4-6",
+    allowed_models={"claude-sonnet-4-6", "claude-opus-4-8"},
+  )
+
+  result, error = _run(handler({"task": "Quick question"}))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  assert runner.calls[0]["model"] == "claude-opus-4-8"
+
+
+def test_make_run_agent_handler_skill_pin_beats_sub_agent_default_model_knob(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  skills_dir = tmp_path / "skills"
+  _write_skill(skills_dir, "deep-research", _callable_skill("model: claude-opus-4-6"))
+  runner = _StubRunner()
+  monkeypatch.setenv("SUB_AGENT_DEFAULT_MODEL", "claude-opus-4-8")
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+    default_model="claude-sonnet-4-6",
+    allowed_models={"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-8"},
+  )
+
+  result, error = _run(handler({"agent": "deep-research", "task": "Analyze filings"}))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  assert runner.calls[0]["model"] == "claude-opus-4-6"
+
+
+def test_make_run_agent_handler_default_timeout_is_finite() -> None:
+  # ACUI-1: timeout=None let a wedged sub-agent hold the parent turn open
+  # forever; the default must be a finite bound (profiles still override).
   runner = _StubRunner()
   handler = make_run_agent_handler(
     [runner],
@@ -161,7 +487,7 @@ def test_make_run_agent_handler_default_timeout_is_none() -> None:
 
   assert error is None
   assert result == {"response": "ok"}
-  assert runner.calls[0]["timeout"] is None
+  assert runner.calls[0]["timeout"] == DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
 
 
 def test_make_run_agent_handler_forwards_needs_approval_to_child_dispatcher() -> None:
@@ -512,6 +838,7 @@ def test_make_run_agent_handler_background_propagates_resumable_skill_flag(tmp_p
   skills_dir = tmp_path / "skills"
   _write_skill(skills_dir, "research", _callable_skill("resumable: true", body="Research."))
   runner = _StubRunner()
+  parent_log = EventLog()
   handler = make_run_agent_handler(
     [runner],
     skill_loader=SkillLoader(skills_dir),
@@ -519,11 +846,30 @@ def test_make_run_agent_handler_background_propagates_resumable_skill_flag(tmp_p
     local_tool_handlers={},
   )
 
-  result, error = _run(handler({"agent": "research", "task": "Collect", "background": True}))
+  result, error = _run(
+    handler(
+      {"agent": "research", "task": "Collect", "background": True},
+      tool_ctx=ToolExecutionContext(
+        tool_call_id="tool_run_agent_1",
+        tool_name="run_agent",
+        event_log=parent_log,
+      ),
+    )
+  )
 
   assert error is None
   assert result == {"task_id": "bg_0", "status": "running"}
   assert runner.background_calls[0]["tool_input"]["resumable"] is True
+  on_complete = runner.background_calls[0]["on_complete"]
+  assert callable(on_complete)
+
+  bg_task = type("BgTask", (), {"result": {"response": "done"}, "error": None})()
+  _run(on_complete(bg_task))
+
+  events = [entry.event for entry in parent_log.entries]
+  assert [event["type"] for event in events] == ["skill_run_started", "skill_result_captured"]
+  assert events[-1]["skill"] == "research"
+  assert events[-1]["status"] == "success"
 
 
 def test_make_run_agent_handler_background_propagates_non_resumable_skill_flag(tmp_path: Path) -> None:

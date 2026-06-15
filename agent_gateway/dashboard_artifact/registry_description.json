@@ -1,0 +1,111 @@
+{
+  "kind": "hank_dashboard.v1",
+  "modules": [
+    {
+      "chart_minimums": {
+        "min_items": 2
+      },
+      "description": "Ranked metric bar chart data for Recharts.",
+      "material_keys": [
+        "items[].value"
+      ],
+      "name": "bar_chart",
+      "required_keys": [
+        "items"
+      ]
+    },
+    {
+      "chart_minimums": {},
+      "description": "Decision stance and concise evidence-backed summary.",
+      "material_keys": [
+        "summary"
+      ],
+      "name": "decision_box",
+      "required_keys": [
+        "stance",
+        "summary"
+      ]
+    },
+    {
+      "chart_minimums": {},
+      "description": "Grid of labeled metric values with optional detail and status.",
+      "material_keys": [
+        "items[].value",
+        "items[].detail"
+      ],
+      "name": "metric_tiles",
+      "required_keys": [
+        "items"
+      ]
+    },
+    {
+      "chart_minimums": {},
+      "description": "Explicit notice listing evidence gaps; citation-gap exempt.",
+      "material_keys": [],
+      "name": "missing_evidence",
+      "required_keys": [
+        "items"
+      ]
+    },
+    {
+      "chart_minimums": {},
+      "description": "Bull/base/bear or case cards with sourced bodies and bullets.",
+      "material_keys": [
+        "cases[].body",
+        "cases[].bullets[]"
+      ],
+      "name": "scenario_map",
+      "required_keys": [
+        "cases"
+      ]
+    },
+    {
+      "chart_minimums": {},
+      "description": "Audit table with columns and row values.",
+      "material_keys": [
+        "rows[]"
+      ],
+      "name": "table",
+      "required_keys": [
+        "columns",
+        "rows"
+      ]
+    },
+    {
+      "chart_minimums": {},
+      "description": "Narrative prose block with optional bullets.",
+      "material_keys": [
+        "body",
+        "bullets[]"
+      ],
+      "name": "text_block",
+      "required_keys": [
+        "body"
+      ]
+    },
+    {
+      "chart_minimums": {},
+      "description": "Catalyst or watch-item timeline.",
+      "material_keys": [
+        "events[].detail"
+      ],
+      "name": "timeline",
+      "required_keys": [
+        "events"
+      ]
+    },
+    {
+      "chart_minimums": {
+        "min_complete_periods": 2
+      },
+      "description": "Period-indexed numeric series data for Recharts.",
+      "material_keys": [
+        "periods[].series_values"
+      ],
+      "name": "trend_chart",
+      "required_keys": [
+        "periods"
+      ]
+    }
+  ]
+}

@@ -100,8 +100,14 @@ def test_artifact_by_id_returns_specific_json_sidecar(artifact_api: ArtifactApiF
   assert response.json() == payload
 
 
-def test_artifact_index_returns_latest_per_skill_and_empty_list(artifact_api: ArtifactApiFixture) -> None:
+def test_artifact_index_returns_latest_and_recent_history_per_skill(
+  artifact_api: ArtifactApiFixture,
+) -> None:
+  _write_artifact(artifact_api.data_dir, USER_ID, "PCTY", "earnings-scenarios", "2026-05-20T100000.000-run-z")
+  _write_artifact(artifact_api.data_dir, USER_ID, "PCTY", "earnings-scenarios", "2026-05-20T110000.000-run-y")
+  _write_artifact(artifact_api.data_dir, USER_ID, "PCTY", "earnings-scenarios", "2026-05-20T115000.000-run-x")
   _write_artifact(artifact_api.data_dir, USER_ID, "PCTY", "earnings-scenarios", "2026-05-20T120000.000-run-a")
+  _write_artifact(artifact_api.data_dir, USER_ID, "PCTY", "earnings-scenarios", "2026-05-20T125000.000-run-d")
   _write_artifact(artifact_api.data_dir, USER_ID, "PCTY", "earnings-scenarios", "2026-05-20T130000.000-run-b")
   _write_artifact(artifact_api.data_dir, USER_ID, "PCTY", "critical-factors", "2026-05-20T121500.000-run-c")
 
@@ -111,11 +117,57 @@ def test_artifact_index_returns_latest_per_skill_and_empty_list(artifact_api: Ar
 
   assert response.status_code == 200
   assert response.json() == [
-    {"skill": "critical-factors", "latest_artifact_id": "2026-05-20T121500.000-run-c"},
-    {"skill": "earnings-scenarios", "latest_artifact_id": "2026-05-20T130000.000-run-b"},
+    {
+      "skill": "critical-factors",
+      "latest_artifact_id": "2026-05-20T121500.000-run-c",
+      "artifact_count": 1,
+      "recent_artifact_ids": ["2026-05-20T121500.000-run-c"],
+    },
+    {
+      "skill": "earnings-scenarios",
+      "latest_artifact_id": "2026-05-20T130000.000-run-b",
+      "artifact_count": 6,
+      "recent_artifact_ids": [
+        "2026-05-20T130000.000-run-b",
+        "2026-05-20T125000.000-run-d",
+        "2026-05-20T120000.000-run-a",
+        "2026-05-20T115000.000-run-x",
+        "2026-05-20T110000.000-run-y",
+      ],
+    },
   ]
   assert empty_response.status_code == 200
   assert empty_response.json() == []
+
+
+def test_bearer_artifact_auth_uses_risk_user_id_when_present(
+  artifact_api: ArtifactApiFixture,
+) -> None:
+  artifact_id = "2026-06-01T133109.040-run-a"
+  payload = _write_artifact(
+    artifact_api.data_dir,
+    "1",
+    "MSFT",
+    "identifying-risk",
+    artifact_id,
+    payload={"artifact_id": artifact_id, "ticker": "MSFT", "skill": "identifying-risk"},
+  )
+
+  session = artifact_api.app.state.auth.session_store.create_session(
+    api_key_hash="hash-test",
+    user_id="henry",
+    risk_user_id=1,
+  )
+  token = artifact_api.app.state.auth.issue_token(session)
+
+  with TestClient(artifact_api.app) as client:
+    response = client.get(
+      "/api/artifacts/MSFT/identifying-risk/latest",
+      headers={"Authorization": f"Bearer {token}"},
+    )
+
+  assert response.status_code == 200
+  assert response.json() == payload
 
 
 def test_letter_endpoint_returns_docx_blob(artifact_api: ArtifactApiFixture) -> None:

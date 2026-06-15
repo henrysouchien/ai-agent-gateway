@@ -29,6 +29,7 @@ class UsageEvent:
   rate_table_version: str
   billing_mode: Literal["byok", "metered"]
   channel: str | None
+  provider: str | None = None
   product_id: str | None = None
   event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
@@ -57,6 +58,8 @@ class SessionUsageSummary:
   drain_complete: bool = True
   in_flight_task_count: int = 0
   product_id: str | None = None
+  model: str | None = None
+  provider: str | None = None
 
 
 @dataclass
@@ -125,6 +128,8 @@ class _UsageAggregator:
     self._cache_creation_tokens = 0
     self._cost = 0.0
     self._turns = 0
+    self._last_model: str | None = None
+    self._last_provider: str | None = None
     self._closed = False
 
   async def record(self, event: UsageEvent) -> bool:
@@ -137,6 +142,8 @@ class _UsageAggregator:
       self._cache_creation_tokens += int(event.cache_creation_tokens or 0)
       self._cost += float(event.cost_usd or 0.0)
       self._turns += 1
+      self._last_model = event.model
+      self._last_provider = event.provider
       return True
 
   async def close(self) -> None:
@@ -170,6 +177,8 @@ class _UsageAggregator:
         ended_at=ended_at if ended_at is not None else time.time(),
         drain_complete=drain_complete,
         in_flight_task_count=in_flight_task_count,
+        model=self._last_model,
+        provider=self._last_provider,
       )
 
 
@@ -184,6 +193,7 @@ class UsageLedger(Protocol):
     until: float | None = None,
     billing_mode: Literal["byok", "metered"] | None = None,
     model: str | None = None,
+    provider: str | None = None,
   ) -> UsageTotal: ...
 
 
@@ -221,6 +231,7 @@ class SqliteUsageLedger:
         parent_turn_id TEXT,
         timestamp REAL NOT NULL,
         model TEXT NOT NULL,
+        provider TEXT,
         input_tokens INTEGER NOT NULL,
         output_tokens INTEGER NOT NULL,
         cache_read_tokens INTEGER NOT NULL,
@@ -232,6 +243,9 @@ class SqliteUsageLedger:
       )
       """
     )
+    columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(usage_events)").fetchall()}
+    if "provider" not in columns:
+      conn.execute("ALTER TABLE usage_events ADD COLUMN provider TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_events(user_id, timestamp DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_user_mode ON usage_events(user_id, billing_mode, timestamp DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_request ON usage_events(request_id)")
@@ -253,6 +267,7 @@ class SqliteUsageLedger:
           parent_turn_id,
           timestamp,
           model,
+          provider,
           input_tokens,
           output_tokens,
           cache_read_tokens,
@@ -261,7 +276,7 @@ class SqliteUsageLedger:
           rate_table_version,
           billing_mode,
           channel
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
           event.user_id,
@@ -270,6 +285,7 @@ class SqliteUsageLedger:
           event.parent_turn_id,
           event.timestamp,
           event.model,
+          event.provider,
           event.input_tokens,
           event.output_tokens,
           event.cache_read_tokens,
@@ -292,6 +308,7 @@ class SqliteUsageLedger:
     until: float | None,
     billing_mode: Literal["byok", "metered"] | None,
     model: str | None,
+    provider: str | None,
   ) -> UsageTotal:
     self._assert_open()
     where = ["user_id = ?"]
@@ -308,6 +325,9 @@ class SqliteUsageLedger:
     if model is not None:
       where.append("model = ?")
       params.append(model)
+    if provider is not None:
+      where.append("provider = ?")
+      params.append(provider)
 
     query = f"""
       SELECT
@@ -343,6 +363,7 @@ class SqliteUsageLedger:
     until: float | None = None,
     billing_mode: Literal["byok", "metered"] | None = None,
     model: str | None = None,
+    provider: str | None = None,
   ) -> UsageTotal:
     return await asyncio.to_thread(
       self._get_total_sync,
@@ -351,6 +372,7 @@ class SqliteUsageLedger:
       until=until,
       billing_mode=billing_mode,
       model=model,
+      provider=provider,
     )
 
   def close(self) -> None:

@@ -34,6 +34,7 @@ def _event(
   billing_mode: str = "metered",
   channel: str | None = "web",
   parent_turn_id: str | None = None,
+  provider: str | None = "anthropic",
 ) -> UsageEvent:
   return UsageEvent(
     user_id=user_id,
@@ -50,6 +51,7 @@ def _event(
     rate_table_version="2026-04-08",
     billing_mode=billing_mode,  # type: ignore[arg-type]
     channel=channel,
+    provider=provider,
   )
 
 
@@ -63,6 +65,7 @@ def test_sqlite_usage_ledger_record_inserts_all_fields(tmp_path: Path) -> None:
     row = conn.execute(
       """
       SELECT user_id, session_id, request_id, parent_turn_id, timestamp, model,
+             provider,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cost_usd, rate_table_version, billing_mode, channel
       FROM usage_events
@@ -76,6 +79,7 @@ def test_sqlite_usage_ledger_record_inserts_all_fields(tmp_path: Path) -> None:
     "tool-1",
     100.0,
     "claude-sonnet-4-6",
+    "anthropic",
     100,
     50,
     10,
@@ -106,6 +110,7 @@ def test_sqlite_usage_ledger_get_total_filters_and_sums(tmp_path: Path) -> None:
       rate_table_version="2026-04-08",
       billing_mode="byok",
       channel="cli",
+      provider="codex",
     ),
     UsageEvent(
       user_id="bob",
@@ -149,6 +154,11 @@ def test_sqlite_usage_ledger_get_total_filters_and_sums(tmp_path: Path) -> None:
   assert model_filtered.input_tokens == 40
   assert model_filtered.output_tokens == 20
   assert model_filtered.event_count == 1
+
+  provider_filtered = _run(ledger.get_total("alice", provider="codex"))
+  assert provider_filtered.input_tokens == 40
+  assert provider_filtered.output_tokens == 20
+  assert provider_filtered.event_count == 1
 
 
 def test_sqlite_usage_ledger_get_total_returns_zeros_when_empty(tmp_path: Path) -> None:
@@ -229,6 +239,38 @@ def test_dlq_spool_survives_as_file_on_disk(tmp_path: Path) -> None:
 
 def test_sqlite_usage_ledger_schema_migration_is_idempotent(tmp_path: Path) -> None:
   db_path = tmp_path / "usage.db"
+  with sqlite3.connect(db_path) as conn:
+    conn.execute(
+      """
+      CREATE TABLE usage_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        parent_turn_id TEXT,
+        timestamp REAL NOT NULL,
+        model TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL,
+        output_tokens INTEGER NOT NULL,
+        cache_read_tokens INTEGER NOT NULL,
+        cache_creation_tokens INTEGER NOT NULL,
+        cost_usd REAL NOT NULL,
+        rate_table_version TEXT NOT NULL,
+        billing_mode TEXT NOT NULL CHECK (billing_mode IN ('byok', 'metered')),
+        channel TEXT
+      )
+      """
+    )
+    conn.execute(
+      """
+      INSERT INTO usage_events (
+        user_id, session_id, request_id, parent_turn_id, timestamp, model,
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+        cost_usd, rate_table_version, billing_mode, channel
+      ) VALUES ('legacy', 'sess-old', 'req-old', NULL, 1.0, 'claude-sonnet-4-6', 1, 1, 0, 0, 0.01, 'v1', 'byok', 'cli')
+      """
+    )
+    conn.commit()
 
   ledger_one = SqliteUsageLedger(db_path)
   ledger_one.close()
@@ -238,19 +280,27 @@ def test_sqlite_usage_ledger_schema_migration_is_idempotent(tmp_path: Path) -> N
 
   with sqlite3.connect(db_path) as conn:
     count = conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0]
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(usage_events)").fetchall()}
+    legacy_provider = conn.execute("SELECT provider FROM usage_events WHERE request_id = 'req-old'").fetchone()[0]
+    new_provider = conn.execute("SELECT provider FROM usage_events WHERE request_id = 'req-1'").fetchone()[0]
     journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
 
-  assert count == 1
+  assert count == 2
+  assert "provider" in columns
+  assert legacy_provider is None
+  assert new_provider == "anthropic"
   assert str(journal_mode).lower() == "wal"
 
 
 def test_usage_event_event_id_default_supports_old_dlq_payload() -> None:
   payload = _event().__dict__.copy()
   payload.pop("event_id", None)
+  payload.pop("provider", None)
 
   event = UsageEvent(**payload)
 
   assert event.event_id
+  assert event.provider is None
   assert event.request_id == "req-1"
 
 
@@ -277,7 +327,8 @@ def test_usage_aggregator_accumulates_and_snapshots() -> None:
         request_id="req",
         parent_turn_id="tool-1",
         timestamp=3.0,
-        model="claude-sonnet-4-6",
+        model="gpt-5.5",
+        provider="codex",
         input_tokens=10,
         output_tokens=5,
         cache_read_tokens=1,
@@ -300,6 +351,8 @@ def test_usage_aggregator_accumulates_and_snapshots() -> None:
     assert summary.ended_at == 4.0
     assert summary.drain_complete is False
     assert summary.in_flight_task_count == 1
+    assert summary.model == "gpt-5.5"
+    assert summary.provider == "codex"
 
   _run(case())
 

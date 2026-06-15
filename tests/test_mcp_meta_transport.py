@@ -82,6 +82,78 @@ def test_tool_dispatcher_injects_user_id_into_mcp_meta(server_name: str) -> None
   ]
 
 
+def test_tool_dispatcher_injects_run_context_into_mcp_meta_when_present() -> None:
+  mcp = _FakeMcpClient()
+  dispatcher = ToolDispatcher(
+    mcp_client=mcp,
+    local_tool_handlers={},
+    session_id="sess-1",
+    risk_user_id=42,
+    channel="excel",
+    role="invite",
+    mcp_meta_inject_servers=frozenset({"portfolio-mcp"}),
+  )
+
+  result, error = _run(
+    dispatcher.dispatch(
+      "call-1",
+      "portfolio_tool",
+      {"ticker": "AAPL"},
+      skill_run_id="skill-run-123",
+      workspace_dir="/tmp/workspace",
+    )
+  )
+
+  assert error is None
+  assert result == {"ok": True}
+  assert mcp.calls == [
+    {
+      "name": "portfolio_tool",
+      "tool_input": {"ticker": "AAPL"},
+      "meta": {
+        "session_id": "sess-1",
+        "user_id": "42",
+        "channel": "excel",
+        "role": "invite",
+        "skill_run_id": "skill-run-123",
+        "workspace_dir": "/tmp/workspace",
+      },
+    }
+  ]
+
+
+def test_tool_dispatcher_omits_run_context_from_mcp_meta_when_absent() -> None:
+  mcp = _FakeMcpClient()
+  dispatcher = ToolDispatcher(
+    mcp_client=mcp,
+    local_tool_handlers={},
+    session_id="sess-1",
+    risk_user_id=42,
+    channel="excel",
+    role="invite",
+    mcp_meta_inject_servers=frozenset({"portfolio-mcp"}),
+  )
+
+  result, error = _run(
+    dispatcher.dispatch(
+      "call-1",
+      "portfolio_tool",
+      {"ticker": "AAPL"},
+    )
+  )
+
+  assert error is None
+  assert result == {"ok": True}
+  assert mcp.calls[0]["meta"] == {
+    "session_id": "sess-1",
+    "user_id": "42",
+    "channel": "excel",
+    "role": "invite",
+  }
+  assert "skill_run_id" not in mcp.calls[0]["meta"]
+  assert "workspace_dir" not in mcp.calls[0]["meta"]
+
+
 def test_tool_dispatcher_session_param_injection_still_works() -> None:
   mcp = _FakeMcpClient(server_name="session-param-server")
   dispatcher = ToolDispatcher(
@@ -137,3 +209,33 @@ def test_mcp_client_call_tool_forwards_meta_to_underlying_session() -> None:
   assert error is None
   assert result == {"ok": True}
   assert session.calls[0]["meta"] == {"session_id": "sess-1", "user_id": "42", "channel": "excel", "role": "invite"}
+
+
+def test_mcp_client_call_tool_uses_per_tool_timeout_before_server_timeout() -> None:
+  manager = McpClientManager(
+    config_path=None,
+    timeout_overrides={"portfolio-mcp": 120},
+    tool_timeout_overrides={"portfolio-mcp.build_model": 300},
+  )
+  session = _FakeSession()
+  manager._tool_to_server = {
+    "build_model": "portfolio-mcp",
+    "portfolio_summary": "portfolio-mcp",
+  }
+  manager._prefixed_to_original = {
+    "build_model": "build_model",
+    "portfolio_summary": "portfolio_summary",
+  }
+  manager._servers = {
+    "portfolio-mcp": SimpleNamespace(session=session),
+  }
+
+  result, error = _run(manager.call_tool("build_model", {"research_file_id": 1}))
+  assert error is None
+  assert result == {"ok": True}
+  assert session.calls[-1]["read_timeout_seconds"].total_seconds() == 300
+
+  result, error = _run(manager.call_tool("portfolio_summary", {}))
+  assert error is None
+  assert result == {"ok": True}
+  assert session.calls[-1]["read_timeout_seconds"].total_seconds() == 120

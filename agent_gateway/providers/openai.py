@@ -8,7 +8,7 @@ import re
 from dataclasses import replace
 from typing import Any, AsyncIterator, Dict
 
-from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel
+from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
 
 
 log = logging.getLogger("agent_gateway.providers.openai")
@@ -752,7 +752,7 @@ class OpenAIProvider(ModelProvider):
       if missing:
         result.append({"role": "user", "content": missing})
 
-    return result
+    return truncate_to_last_compaction(result, compaction_as_text=True)
 
   async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
     stream = await client.chat.completions.create(**params)

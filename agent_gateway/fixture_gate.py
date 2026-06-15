@@ -9,11 +9,15 @@ FIXTURE_PROVIDER_NAME = "fixture"
 FIXTURE_PROFILE_NAME = "_fixture"
 FIXTURE_SLEEP_SKILL_NAME = "fixture-sleep"
 FIXTURE_HTML_ARTIFACT_SKILL_NAME = "fixture-html-artifact"
+FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME = "fixture-dashboard-artifact"
 FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME = "fixture-approval-html-artifact"
+FIXTURE_TERMINAL_FAILURE_SKILL_NAME = "fixture-terminal-failure"
 FIXTURE_SKILL_NAMES = frozenset({
   FIXTURE_SLEEP_SKILL_NAME,
   FIXTURE_HTML_ARTIFACT_SKILL_NAME,
+  FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME,
   FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME,
+  FIXTURE_TERMINAL_FAILURE_SKILL_NAME,
 })
 FIXTURE_APPROVAL_TOOL_NAME = "fixture_approval_gate"
 FIXTURE_MODEL_ID = "fixture-scripted"
@@ -35,10 +39,18 @@ def _normalized_env_values(names: Iterable[str] = _ENV_NAMES) -> dict[str, str]:
 
 
 def fixture_production_detected() -> bool:
+  """Return True when an environment variable positively identifies production."""
   return any(value in _PRODUCTION_VALUES for value in _normalized_env_values().values())
 
 
 def fixture_provider_available() -> bool:
+  """Fail-closed availability check for the deterministic fixture surface.
+
+  The existing Python-side production convention is ``APP_ENV=production``.
+  To avoid stale dev flags exposing the fixture, any known production value in
+  common environment selectors wins. If no explicit dev/test environment is
+  present, the fixture stays unavailable.
+  """
   values = _normalized_env_values()
   if any(value in _PRODUCTION_VALUES for value in values.values()):
     return False
@@ -69,3 +81,23 @@ def is_fixture_skill_name(name: str | None) -> bool:
 
 def is_fixture_profile_name(name: str | None) -> bool:
   return str(name or "").strip() == FIXTURE_PROFILE_NAME
+
+
+__all__ = [
+  "FIXTURE_APPROVAL_TOOL_NAME",
+  "FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME",
+  "FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME",
+  "FIXTURE_HTML_ARTIFACT_SKILL_NAME",
+  "FIXTURE_MODEL_ID",
+  "FIXTURE_PROFILE_NAME",
+  "FIXTURE_PROVIDER_NAME",
+  "FIXTURE_SLEEP_SKILL_NAME",
+  "FIXTURE_SKILL_NAMES",
+  "FIXTURE_TERMINAL_FAILURE_SKILL_NAME",
+  "fixture_production_detected",
+  "fixture_provider_available",
+  "fixture_unavailable_message",
+  "is_fixture_profile_name",
+  "is_fixture_skill_name",
+  "require_fixture_provider_available",
+]

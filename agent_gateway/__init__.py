@@ -1,3 +1,6 @@
+import importlib
+from typing import Any
+
 from .autonomous import (
   DeliveryConfig,
   RunOutput,
@@ -7,6 +10,7 @@ from .autonomous import (
   extract_state_update,
   format_run_summary,
   load_state,
+  mark_post_run_guard_failure,
   run_autonomous,
   run_autonomous_sync,
   run_output_exit_code,
@@ -15,7 +19,7 @@ from .autonomous import (
   save_state,
   send_telegram,
 )
-from ._provider_utils import resolve_auth_config
+from ._provider_utils import resolve_auth_config, sub_agent_default_model
 from .agent_session_log import AgentSessionLog, AgentSessionRef, LogEntry, QueryCursor, resolve_agent_session_id
 from .auth import (
   AuthConfig,
@@ -54,54 +58,56 @@ from .events import (
   ApprovalOutcome,
   ArtifactFailedEvent,
   ArtifactReadyEvent,
+  ArtifactUpdatedEvent,
   ArtifactUnavailableEvent,
+  DEFAULT_SCHEMA_VERSION,
+  RecapApproval,
+  RecapArtifact,
+  RecapFailure,
+  RecapVerdict,
+  SessionRecapEvent,
+  SkillResultCapturedEvent,
   SkillRunStartedEvent,
+  SUPPORTED_SCHEMA_VERSIONS,
+  ToolCallsSummary,
   ToolApprovalDecidedEvent,
   ToolApprovalRequestEvent,
   TypedRecommendationsExtractedEvent,
-  VerdictEmittedEvent,
   event_from_dict,
   event_to_dict,
 )
 from .event_log import EventLog, LogEntry as EventLogEntry
 from .heartbeat import HeartbeatConfig, HeartbeatLoop, TickResult, strip_heartbeat_ok
-from .easy import create_agent
-from .memory import EmbeddingProvider, MarkdownSyncManager, MemoryStore
-from .mcp_client import McpClientManager
-from .multi_user.billing import SqliteUsageLedger, SessionUsageSummary, UsageEvent, UsageLedger, UsageTotal, normalize_identity
-from .package_info import (
-  CONTRACTS,
-  CONTRACT_CREDENTIAL_REFRESH_V1,
-  PACKAGE_NAME,
-  SOURCE_COMMIT,
-  __version__,
-  package_health,
-)
 from .providers import (
   AgentSDKConfig,
   AnthropicProvider,
   CodexProvider,
   CostEstimate,
+  FixtureProvider,
   ModelInfo,
   ModelProvider,
   OpenAIProvider,
   StreamEvent,
   ThinkingLevel,
 )
+from .memory import EmbeddingProvider, MarkdownSyncManager, MemoryStore
+from .mcp_client import McpClientManager
+from .multi_user.billing import SqliteUsageLedger, SessionUsageSummary, UsageEvent, UsageLedger, UsageTotal, normalize_identity
+from .package_info import (
+  CONTRACTS,
+  CONTRACT_AUTONOMOUS_OPERATOR_MESSAGES_V1,
+  CONTRACT_CONTROL_CHAT_CONTINUATION_V1,
+  CONTRACT_CREDENTIAL_REFRESH_V1,
+  PACKAGE_NAME,
+  SOURCE_COMMIT,
+  __version__,
+  package_health,
+)
 from .rates import ModelRates, RateTable, UnknownModelError, load_rate_table
 from .retry import RetryConfig, classify_outcome, run_autonomous_with_retry
 from .runner import AgentRunner, SubAgentConfig, ToolResultContext, _derive_sub_agent_id
 from .send_prompt import send_prompt, send_prompt_sync
 from .sdk_runner import AgentSDKRunner
-from .server import (
-  ChatRuntime,
-  ChatTurnInputs,
-  ChatTurnResult,
-  GatewayServerConfig,
-  ModelCatalog,
-  RequestContext,
-  create_gateway_app,
-)
 from .session import AuthManager, GatewaySession, SessionStore
 from .session_event_history import SessionEventHistory
 from .skills import SkillLoader, SkillProfile, SkillStateStore, parse_skill_file
@@ -136,12 +142,15 @@ from .tool_dispatcher import (
   InterceptContext,
   InterceptDecision,
   InterceptResult,
+  RELAY_POLICY_DENIED_MESSAGE,
+  RELAY_POLICY_DENIED_SUB_CODE,
   ToolDispatcher,
   ToolExecutionContext,
   ToolInterceptor,
   ToolResult,
   TransportApprovalRequest,
   TransportApprovalResult,
+  resolve_denied_provenance,
 )
 from .approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
@@ -152,6 +161,28 @@ from .approval_policy import (
   PersistentGrant,
   RunContext,
 )
+
+_LAZY_EXPORTS = {
+  "ChatRuntime": ("agent_gateway.server", "ChatRuntime"),
+  "ChatTurnInputs": ("agent_gateway.server", "ChatTurnInputs"),
+  "ChatTurnResult": ("agent_gateway.server", "ChatTurnResult"),
+  "GatewayServerConfig": ("agent_gateway.server", "GatewayServerConfig"),
+  "ModelCatalog": ("agent_gateway.server", "ModelCatalog"),
+  "RequestContext": ("agent_gateway.server", "RequestContext"),
+  "create_agent": ("agent_gateway.easy", "create_agent"),
+  "create_gateway_app": ("agent_gateway.server", "create_gateway_app"),
+}
+
+
+def __getattr__(name: str) -> Any:
+  try:
+    module_name, attr_name = _LAZY_EXPORTS[name]
+  except KeyError as exc:
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+  value = getattr(importlib.import_module(module_name), attr_name)
+  globals()[name] = value
+  return value
+
 
 __all__ = [
   "AgentSDKConfig",
@@ -171,6 +202,7 @@ __all__ = [
   "AnthropicProvider",
   "ArtifactFailedEvent",
   "ArtifactReadyEvent",
+  "ArtifactUpdatedEvent",
   "ArtifactUnavailableEvent",
   "AuthConfig",
   "AuthManager",
@@ -178,6 +210,8 @@ __all__ = [
   "ChannelMismatchError",
   "BackgroundTask",
   "CONTRACTS",
+  "CONTRACT_AUTONOMOUS_OPERATOR_MESSAGES_V1",
+  "CONTRACT_CONTROL_CHAT_CONTINUATION_V1",
   "CONTRACT_CREDENTIAL_REFRESH_V1",
   "CodexProvider",
   "COORDINATOR_DEFAULT_PREAMBLE",
@@ -196,9 +230,11 @@ __all__ = [
   "CodeExecutionConfig",
   "Message",
   "DeliveryConfig",
+  "DEFAULT_SCHEMA_VERSION",
   "DockerBackend",
   "EventLog",
   "EventLogEntry",
+  "FixtureProvider",
   "GatewaySession",
   "GatewayServerConfig",
   "HeartbeatConfig",
@@ -223,6 +259,12 @@ __all__ = [
   "ProviderCredentialFailure",
   "ProviderResolver",
   "QueryCursor",
+  "RELAY_POLICY_DENIED_MESSAGE",
+  "RELAY_POLICY_DENIED_SUB_CODE",
+  "RecapApproval",
+  "RecapArtifact",
+  "RecapFailure",
+  "RecapVerdict",
   "RateTable",
   "RequestContext",
   "PersistentGrant",
@@ -230,6 +272,7 @@ __all__ = [
   "PolicyApprovalRequest",
   "ResolverResult",
   "SOURCE_COMMIT",
+  "sub_agent_default_model",
   "ResolvedProvider",
   "RetryConfig",
   "RunOutput",
@@ -237,6 +280,7 @@ __all__ = [
   "resolve_auth_config",
   "send_prompt",
   "send_prompt_sync",
+  "SessionRecapEvent",
   "SessionUsageSummary",
   "SessionContextBuilder",
   "SessionEventHistory",
@@ -246,6 +290,7 @@ __all__ = [
   "SkillStateStore",
   "SkillRunStartedEvent",
   "StreamEvent",
+  "SUPPORTED_SCHEMA_VERSIONS",
   "SubAgentConfig",
   "SubprocessBackend",
   "SummaryFn",
@@ -261,6 +306,7 @@ __all__ = [
   "TaskRegistry",
   "TaskState",
   "ToolDispatcher",
+  "ToolCallsSummary",
   "ToolApprovalDecidedEvent",
   "ToolApprovalRequestEvent",
   "ToolExecutionContext",
@@ -269,12 +315,12 @@ __all__ = [
   "TypedRecommendationsExtractedEvent",
   "TransportApprovalRequest",
   "TransportApprovalResult",
+  "resolve_denied_provenance",
   "RunContext",
   "ToolResultContext",
   "UsageEvent",
   "UsageLedger",
   "UsageTotal",
-  "VerdictEmittedEvent",
   "__version__",
   "normalize_identity",
   "UnknownModelError",
@@ -294,6 +340,7 @@ __all__ = [
   "generate_and_append_summary",
   "load_state",
   "load_rate_table",
+  "mark_post_run_guard_failure",
   "package_health",
   "make_code_execute_status_tool_def",
   "make_code_execute_tool_def",

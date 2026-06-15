@@ -93,6 +93,34 @@ def test_lookup_exact_match_returns_model_rates() -> None:
   assert rates.output_cost_per_mtok == 15.0
 
 
+def test_lookup_fable_returns_bundled_model_rates() -> None:
+  table = load_rate_table(None)
+
+  rates = table.lookup("anthropic", "claude-fable-5")
+
+  assert rates.display_name == "Claude Fable 5"
+  assert rates.input_cost_per_mtok == 10.0
+  assert rates.output_cost_per_mtok == 50.0
+  assert rates.cache_read_cost_per_mtok == 1.0
+  assert rates.cache_write_cost_per_mtok == 12.5
+  assert rates.max_tokens == 32_000
+  assert rates.context_window == 1_000_000
+
+
+def test_lookup_opus48_returns_bundled_model_rates() -> None:
+  table = load_rate_table(None)
+
+  rates = table.lookup("anthropic", "claude-opus-4-8")
+
+  assert rates.display_name == "Claude Opus 4.8"
+  assert rates.input_cost_per_mtok == 5.0
+  assert rates.output_cost_per_mtok == 25.0
+  assert rates.cache_read_cost_per_mtok == 0.5
+  assert rates.cache_write_cost_per_mtok == 6.25
+  assert rates.max_tokens == 32_000
+  assert rates.context_window == 1_000_000
+
+
 def test_lookup_tag_match_returns_shorter_tag_entry(tmp_path: Path) -> None:
   path = _write_rate_table(
     tmp_path,

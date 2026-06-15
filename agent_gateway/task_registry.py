@@ -36,6 +36,20 @@ class ParentMessage:
   sent_at: float
 
 
+def format_parent_messages_for_model(parent_messages: list[ParentMessage]) -> str:
+  # Neutral framing on purpose: a user-turn message that self-asserts elevated
+  # authority ("authenticated... controlling parent session... follow as user
+  # intent") pattern-matches prompt injection and newer models refuse to honor
+  # it (ACUI-3). The user-turn channel of an autonomous run is already the
+  # operator channel; label provenance, don't claim trust.
+  lines = ["Operator update for this task:"]
+  lines.extend(
+    f"- id={message.message_id}: {message.text}"
+    for message in parent_messages
+  )
+  return "\n".join(lines)
+
+
 @dataclass
 class TaskEntry:
   task_id: str

@@ -90,6 +90,17 @@ def test_openai_gpt55_uses_gpt5_family_metadata() -> None:
   assert model_info.supports_vision is True
 
 
+def test_openai_gpt55_cost_estimation_is_non_zero() -> None:
+  provider = OpenAIProvider()
+
+  estimate = provider.estimate_cost("gpt-5.5", 1_000, 500, cache_read_tokens=100)
+
+  assert estimate.total > 0
+  assert estimate.input_cost > 0
+  assert estimate.output_cost > 0
+  assert estimate.cache_read_cost > 0
+
+
 def test_openai_create_client_api_mode_uses_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
   class _FakeAsyncOpenAI:
     def __init__(self, **kwargs):
@@ -121,3 +132,31 @@ def test_openai_create_client_oauth_ignores_env_key(monkeypatch: pytest.MonkeyPa
   client = provider.create_client({"auth_mode": "oauth", "auth_token": "my-bearer"})
 
   assert client.kwargs["api_key"] == "my-bearer"
+
+
+def test_normalize_messages_converts_compaction_to_text_and_truncates() -> None:
+  provider = OpenAIProvider()
+  model_info = provider.get_model_info("gpt-5.2")
+  messages = [
+    {"role": "user", "content": "old history"},
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "compaction", "content": "summary"},
+        {"type": "text", "text": "answer"},
+      ],
+    },
+    {"role": "user", "content": "next"},
+  ]
+
+  normalized = provider.normalize_messages(messages, model_info)
+
+  assert len(normalized) == 2
+  first_block = normalized[0]["content"][0]
+  assert first_block["type"] == "text"
+  assert "summary" in first_block["text"]
+  assert not any(
+    isinstance(b, dict) and b.get("type") == "compaction"
+    for m in normalized
+    for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+  )

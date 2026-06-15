@@ -2,6 +2,34 @@
 
 ## Unreleased (post-0.15.0)
 
+### Added — Tool-result spill to code-execution work dir (2026-06-03)
+
+When a model-bound tool result exceeds the truncation cap
+(`AGENT_GATEWAY_MAX_MODEL_TOOL_RESULT_CHARS`, default 60K), the full payload is now
+written verbatim to the session's code-execution work dir (bind-mounted into the
+sandbox) and the model receives a bare filename to read inside `code_execute` — so
+large MCP/data-tool pulls skip the context round-trip. Automatic and universal
+(every tool), complementing the per-tool opt-in `output="file"` mode.
+
+- `AgentRunner` — new `code_execution_spill_dir_provider` constructor param.
+  `_compact_model_tool_result_entry` now returns `(live_entry, durable_entry)`: the
+  spill pointer lives only in the live in-memory entry, so the durable event-log
+  copy stays pointer-free (no dangling reads on resume). Spill filename is a
+  full-sanitized `{tool_name}_{tool_use_id}.{json|txt}`, written exclusive-create
+  with a uuid retry; spill is best-effort (never breaks a turn) and skipped for
+  error results.
+- `code_execution.CodeExecutionBundle.ensure_work_dir` — exposed and lock-guarded
+  so spill and `code_execute` share one work dir; sub-agents inherit the parent
+  provider (with `approval_key_qualifier` propagated so their `code_execute`
+  resolves a backend).
+- `easy.py` runner construction passes the provider; app-layer consumers (e.g. the
+  interactive runtime) do the same.
+- Env kill-switch `AGENT_GATEWAY_SPILL_TRUNCATED_TOOL_RESULTS` (default on).
+
+Spec: `docs/design/completed/tool-result-spill-to-code-exec-task.md` (Codex review PASS).
+Live-verified: real model + gateway + FMP — a 232 KB `fmp_fetch` result spilled to
+`fmp_fetch_<id>.json` and was read back in `code_execute` over the full 1,254 rows.
+
 ### Added — Agent Control Plane v1 (10 PRs + 1 fix, 2026-05-20 → 2026-05-28)
 
 Channel-agnostic HTTP control surface under `/control/...` for skill discovery, run dispatch (chat + autonomous), monitoring, schedule management, approval handling, and artifact browsing. The TUI (and future Telegram + Excel add-in tab) consume this surface; agents-mcp's autonomous tools (`agent_run_start/status/wait/logs/cancel`) become HTTP relays to the same endpoints (Claude's behavior unchanged).
@@ -32,7 +60,7 @@ Channel-agnostic HTTP control surface under `/control/...` for skill discovery, 
 - `agents-mcp` autonomous tools (`agent_run_start/status/wait/logs/cancel`) — internal cutover to HTTP relays against the control plane. Claude-facing behavior unchanged (`agent_run_start` still returns `task_id` etc.).
 - `mcp_servers/agents_mcp/subprocess_runner.py` — DELETED (logic relocated to `packages/agent-gateway/agent_gateway/autonomous_runner.py`).
 - `/chat/tool-approval` handler refactored to call the shared `_record_vote_and_unblock` helper; role-class precheck added (strictly more restrictive on approvals; unchanged on denials).
-- `tui` channel added to `GATEWAY_USER_KEYS` v2 channel taxonomy. Wired through channel registry, credential resolver, `WEB_TOOL_CHANNELS`, agents-mcp validator, and chat_costs attribution. **Note:** the actual SSM key entry (`sk_henry_tui_<token>`) was not added in this round — open follow-up; e2e currently uses `cli` channel for testing.
+- `tui` channel added to `GATEWAY_USER_KEYS` v2 channel taxonomy. Wired through channel registry, credential resolver, `WEB_TOOL_CHANNELS`, agents-mcp validator, and chat_costs attribution. The follow-up `sk_henry_tui_<token>` SSM entries were provisioned for dev and prod on 2026-05-30.
 
 ### Fixed
 
@@ -50,11 +78,11 @@ Channel-agnostic HTTP control surface under `/control/...` for skill discovery, 
 ### Added
 
 - **Typed event contract for skill-framework runs.** New module
-  `agent_gateway.events` exports `SkillRunStartedEvent`, `VerdictEmittedEvent`,
-  `ArtifactReadyEvent`, `AggregateReadyEvent`, `ArtifactFailedEvent`, and
-  `ArtifactUnavailableEvent`. All carry `run_id` correlation except
-  `ArtifactUnavailableEvent` (renderer-side only, no skill run). Re-exported
-  from `agent_gateway` top-level. Spec:
+  `agent_gateway.events` exports `SkillRunStartedEvent`, `ArtifactReadyEvent`,
+  `AggregateReadyEvent`, `ArtifactFailedEvent`, and `ArtifactUnavailableEvent`;
+  structured skill results flow as `skill_result_captured` wire events. All carry
+  `run_id` correlation except `ArtifactUnavailableEvent` (renderer-side only, no
+  skill run). Re-exported from `agent_gateway` top-level. Spec:
   `docs/design/demo-surface-spec.md` §2.3.
 - **Artifact read API.** Four new GET endpoints serving artifact JSON sidecars
   and `.docx` binaries from per-user workspace storage:

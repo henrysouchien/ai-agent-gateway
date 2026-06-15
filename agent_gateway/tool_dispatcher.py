@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set
 
 from pydantic import ValidationError
 
+from . import approval_settings
 from .event_log import EventLog
 from .approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
@@ -32,11 +33,22 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("agent_gateway.dispatcher")
 
+RELAY_POLICY_DENIED_SUB_CODE = "relay_policy_denied"
+RELAY_POLICY_DENIED_MESSAGE = (
+  "Denied automatically by relay chat policy — the user did not see or decline this request. "
+  "Do not tell the user they denied it. To run this tool, the user must send the request from "
+  "the Excel taskpane composer, where they can approve it interactively."
+)
+
 
 ToolResult = Tuple[Optional[Any], Optional[Dict[str, Any]]]
 NeedsApprovalCallback = Callable[[str, Dict[str, Any], str], bool]
 ApprovalKeyQualifier = Callable[[str, Dict[str, Any]], str]
 ToolResult.__doc__ = "Standard tool return type: `(result, error)`."
+
+
+def _approval_queue_timeout_seconds(expiry_seconds: float | int | None) -> float:
+  return min(float(expiry_seconds or 600), approval_settings.approval_wait_seconds())
 
 
 @dataclass
@@ -59,16 +71,28 @@ class TransportApprovalResult:
 
   approved: bool
   allow_tool_type: bool = False
+  denied_by: str | None = None
 
 
 ApprovalCallback = Callable[[TransportApprovalRequest], Awaitable[Optional[TransportApprovalResult]]]
 LocalToolHandler = Callable[..., Awaitable[ToolResult]]
 
-# Backward-compatible import aliases for existing callback-based integrations.
+# Transport-layer aliases for callback-based integrations.
 ApprovalRequest = TransportApprovalRequest
 ApprovalDecision = TransportApprovalResult
-LegacyApprovalRequest = TransportApprovalRequest
-LegacyApprovalDecision = TransportApprovalResult
+
+
+def resolve_denied_provenance(denied_by: str | None) -> tuple[str, dict[str, Any]]:
+  if denied_by == "relay_policy":
+    return (
+      RELAY_POLICY_DENIED_SUB_CODE,
+      {
+        "code": "user_denied",
+        "sub_code": RELAY_POLICY_DENIED_SUB_CODE,
+        "message": RELAY_POLICY_DENIED_MESSAGE,
+      },
+    )
+  return "user_denied", {"code": "user_denied", "message": "User denied execution"}
 
 
 @dataclass
@@ -134,6 +158,8 @@ class ToolExecutionContext:
   event_log: EventLog
   resolved_qualifier: str = ""
   abort_event: asyncio.Event | None = None
+  skill_run_id: str | None = None
+  workspace_dir: str | None = None
 
   def emit(self, event: Dict[str, Any]) -> None:
     """Append a custom event to the active event log."""
@@ -322,6 +348,8 @@ class ToolDispatcher:
     *,
     call_index: int = 0,
     abort_event: asyncio.Event | None = None,
+    skill_run_id: str | None = None,
+    workspace_dir: str | None = None,
   ) -> ToolResult:
     """Execute one tool call and return `(result, error)`.
 
@@ -480,14 +508,15 @@ class ToolDispatcher:
             )
             return None, {"code": "approval_timeout", "message": "User did not respond within timeout"}
           if not lifecycle.get("approved"):
+            decision_source, error_dict = resolve_denied_provenance(lifecycle.get("denied_by"))
             self._emit_approval_decided(
               tool_call_id,
               tool_name,
               outcome="denied",
-              decision_source="user_denied",
+              decision_source=decision_source,
               allow_tool_type_applied=False,
             )
-            return None, {"code": "user_denied", "message": "User denied execution"}
+            return None, error_dict
           final_tool_input = lifecycle.get("tool_input") or tool_input
           will_install = (
             bool(lifecycle.get("allow_tool_type"))
@@ -498,7 +527,11 @@ class ToolDispatcher:
             tool_call_id,
             tool_name,
             outcome="approved",
-            decision_source="user_approved",
+            decision_source=(
+              "delegated_auto_approved"
+              if getattr(approval_request_record, "state", None) == "auto_approved"
+              else "user_approved"
+            ),
             allow_tool_type_applied=will_install,
           )
           if will_install:
@@ -541,11 +574,11 @@ class ToolDispatcher:
             tool_call_id,
             tool_name,
             outcome="approved" if decision.approved else "denied",
-            decision_source="user_approved" if decision.approved else "user_denied",
+            decision_source="user_approved" if decision.approved else resolve_denied_provenance(decision.denied_by)[0],
             allow_tool_type_applied=will_install,
           )
           if not decision.approved:
-            return None, {"code": "user_denied", "message": "User denied execution"}
+            return None, resolve_denied_provenance(decision.denied_by)[1]
           if will_install:
             self._approved_tool_types.add(self._qualified_key(tool_name, qualifier))
 
@@ -560,6 +593,8 @@ class ToolDispatcher:
           event_log=self._event_log,
           resolved_qualifier=qualifier,
           abort_event=abort_event,
+          skill_run_id=skill_run_id,
+          workspace_dir=workspace_dir,
         )
       result, error = await self._local[tool_name](final_tool_input, call_index=call_index, tool_ctx=tool_ctx)
     elif self._mcp.is_mcp_tool(tool_name):
@@ -576,6 +611,10 @@ class ToolDispatcher:
           "channel": self._channel,
           "role": self._role,
         }
+        if skill_run_id is not None:
+          meta["skill_run_id"] = skill_run_id
+        if workspace_dir is not None:
+          meta["workspace_dir"] = workspace_dir
         result, error = await self._call_mcp_tool(tool_name, final_tool_input, meta=meta, abort_event=abort_event)
       elif server and server in self._mcp_session_inject_servers:
         final_tool_input = {**final_tool_input, "_session_id": self._session_id}
@@ -703,6 +742,7 @@ class ToolDispatcher:
       nonce=nonce,
       resolved_qualifier=qualifier,
       allow_persistent=allow_persistent,
+      timeout_seconds=_approval_queue_timeout_seconds(decision.expiry_seconds),
     )
     if approval is None:
       return {"approved": False, "allow_tool_type": False, "request": request, "timeout": True}
@@ -712,6 +752,7 @@ class ToolDispatcher:
     return {
       "approved": bool(approval.get("approved")),
       "allow_tool_type": bool(approval.get("allow_tool_type")),
+      "denied_by": approval.get("denied_by"),
       "request": request,
       "tool_input": final_tool_input,
     }
@@ -724,6 +765,7 @@ class ToolDispatcher:
     nonce: str,
     resolved_qualifier: str,
     allow_persistent: bool,
+    timeout_seconds: float,
   ) -> dict[str, Any] | None:
     session = self._session
     if session is None:
@@ -761,7 +803,22 @@ class ToolDispatcher:
         log.warning("Failed to persist approval request event for %s", request.tool_call_id, exc_info=True)
 
     try:
-      return await approval_queue.get()
+      return await asyncio.wait_for(approval_queue.get(), timeout=max(0.1, timeout_seconds))
+    except asyncio.TimeoutError:
+      store = self._approval_store
+      if store is not None:
+        try:
+          latest = await store.get(request.approval_id)
+          if latest is not None and latest.state == "pending_user":
+            await store.transition_state(
+              latest.approval_id,
+              "expired",
+              expected_state_version=latest.state_version,
+              decision_reason="Timed out waiting for user approval",
+            )
+        except Exception:
+          log.warning("Failed to expire timed-out approval request %s", request.approval_id, exc_info=True)
+      return None
     finally:
       session.pending_tools.pop(request.tool_call_id, None)
       session.approval_queues.pop(request.tool_call_id, None)
@@ -873,6 +930,8 @@ class ToolDispatcher:
       from schema.source_pack import SourcePack
 
       planner_result = self._planner_result_payload(result)
+      if planner_result is None:
+        return
       pack = SourcePack.from_planner_result(
         planner_result,
         ticker=tool_input.get("ticker"),
@@ -883,15 +942,38 @@ class ToolDispatcher:
     except (ValidationError, TypeError, AttributeError, ValueError) as exc:
       log.warning("get_filing_evidence result didn't adapt to SourcePack: %s", exc)
 
+  @classmethod
+  def _planner_result_payload(cls, result: Any) -> Any | None:
+    for candidate in cls._planner_result_candidates(result):
+      if cls._looks_like_source_pack_payload(candidate):
+        return cls._coerce_planner_result_payload(candidate)
+    return None
+
+  @classmethod
+  def _planner_result_candidates(cls, result: Any) -> list[Any]:
+    candidates: list[Any] = []
+    for key in ("source_pack", "planner_result", "planner_trace", "result"):
+      if isinstance(result, dict):
+        candidates.append(result.get(key))
+      else:
+        candidates.append(getattr(result, key, None))
+    candidates.append(result)
+    return candidates
+
   @staticmethod
-  def _planner_result_payload(result: Any) -> Any:
-    if isinstance(result, dict):
-      for key in ("planner_result", "source_pack", "result"):
-        nested = result.get(key)
-        if isinstance(nested, dict) and "matched_intent" in nested:
-          return SimpleNamespace(**nested)
-      return SimpleNamespace(**result)
-    return result
+  def _coerce_planner_result_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+      return SimpleNamespace(**payload)
+    return payload
+
+  @staticmethod
+  def _looks_like_source_pack_payload(payload: Any) -> bool:
+    required = ("matched_intent", "source_pack_sha256", "required_reads", "rationale")
+    if isinstance(payload, dict):
+      return all(key in payload for key in required)
+    if payload is None:
+      return False
+    return all(hasattr(payload, key) for key in required)
 
   @staticmethod
   def _payload_get(payload: Any, key: str) -> Any:

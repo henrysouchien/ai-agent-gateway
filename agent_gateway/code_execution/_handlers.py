@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -30,6 +31,7 @@ class CodeExecutionBundle:
   approval_qualifier: ApprovalKeyQualifier
   needs_approval: Callable[[str, Dict[str, Any] | None, str], bool]
   sanitize_hook: Callable[[ToolResultContext], None]
+  ensure_work_dir: Callable[[], str]
 
 
 def build_code_execution(
@@ -65,12 +67,17 @@ def build_code_execution(
   def _get_registered_backend_names() -> list[str]:
     return list(backends.keys())
 
+  work_dir_lock = threading.Lock()
+
   def _ensure_code_execution_work_dir() -> str:
-    if not session.code_execution_work_dir:
-      session.code_execution_work_dir = tempfile.mkdtemp(
-        prefix=cfg.work_dir_prefix,
-        dir=cfg.work_dir_root,
-      )
+    if session.code_execution_work_dir:
+      return session.code_execution_work_dir
+    with work_dir_lock:
+      if not session.code_execution_work_dir:
+        session.code_execution_work_dir = tempfile.mkdtemp(
+          prefix=cfg.work_dir_prefix,
+          dir=cfg.work_dir_root,
+        )
     return session.code_execution_work_dir
 
   def _handle_has_exited(handle: Any) -> bool:
@@ -246,4 +253,5 @@ def build_code_execution(
     approval_qualifier=_approval_qualifier,
     needs_approval=_needs_approval,
     sanitize_hook=strip_code_execute_base64_hook,
+    ensure_work_dir=_ensure_code_execution_work_dir,
   )

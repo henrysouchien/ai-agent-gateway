@@ -300,6 +300,7 @@ def create_agent(
         default_model=model,
         allowed_models=allowed_models,
         coordinator_config=coordinator,
+        approval_key_qualifier=ce_bundle.approval_qualifier if ce_bundle else None,
       )
       if "get_background_result" not in local_handlers:
         local_handlers["get_background_result"] = make_get_background_result_handler(runner_ref)
@@ -367,13 +368,14 @@ def create_agent(
           log.warning("on_usage observer failed after ledger record (non-fatal): %s", exc)
 
     async def _combined_on_session_summary(summary: SessionUsageSummary) -> None:
-      if on_session_summary is None:
-        return
-      result = on_session_summary(summary)
-      if inspect.isawaitable(result):
-        await result
+      session.cached_usage = summary
+      if on_session_summary is not None:
+        result = on_session_summary(summary)
+        if inspect.isawaitable(result):
+          await result
 
-    def _build_runner(event_log, session_id: str) -> AgentRunner:
+    def _build_runner(event_log, session_id: str, started_at: float | None = None) -> AgentRunner:
+      resolved_started_at = float(started_at if started_at is not None else session.created_at)
       dispatcher = ToolDispatcher(
         mcp_client=mcp_client or _NullMcpClient(),
         local_tool_handlers=local_handlers,
@@ -390,6 +392,7 @@ def create_agent(
         event_log=event_log,
         dispatcher=dispatcher,
         session_id=session_id,
+        started_at=resolved_started_at,
         provider=provider_instance,
         auth_config=session.auth_config or auth_config,
         mcp_client=mcp_client,
@@ -397,7 +400,7 @@ def create_agent(
         per_turn_timeout=per_turn_timeout,
         on_tool_result=_combined_on_tool_result,
         on_usage=_combined_on_usage if usage_ledger is not None or on_usage is not None else None,
-        on_session_summary=_combined_on_session_summary if on_session_summary is not None else None,
+        on_session_summary=_combined_on_session_summary,
         on_tool_timing=on_tool_timing,
         user_id=session.user_id,
         request_id=request.request_id,
@@ -407,6 +410,7 @@ def create_agent(
         usage_ledger_dlq_path=resolved_usage_dlq_path,
         max_budget_usd=max_budget_usd,
         coordinator=coordinator,
+        code_execution_spill_dir_provider=ce_bundle.ensure_work_dir if ce_bundle else None,
       )
       runner_ref[0] = runner
       return runner
@@ -470,26 +474,12 @@ def create_agent(
     from .code_execution import cleanup_code_execution
 
     session_store = app.state.auth.session_store
-    code_execution_expiry = session_store._on_expiry
-
-    async def _on_expiry_with_cleanup(session: GatewaySession) -> None:
-      if code_execution_expiry is not None:
-        result = code_execution_expiry(session)
-        if inspect.isawaitable(result):
-          await result
-      await cleanup_code_execution(session)
-
-    session_store.set_on_expiry(_on_expiry_with_cleanup)
+    session_store.add_on_expiry(cleanup_code_execution)
 
   if mcp_session_inject_servers and mcp_client is not None:
     session_store = app.state.auth.session_store
-    mcp_session_expiry = session_store._on_expiry
 
     async def _on_expiry_with_mcp_session_cleanup(session: GatewaySession) -> None:
-      if mcp_session_expiry is not None:
-        result = mcp_session_expiry(session)
-        if inspect.isawaitable(result):
-          await result
       for server_name in mcp_session_inject_servers:
         close_tool = mcp_client.resolve_tool_name(server_name, f"{server_name}_close_session")
         if close_tool:
@@ -504,7 +494,7 @@ def create_agent(
         else:
           log.debug("No close_session tool for %s; session cleanup skipped", server_name)
 
-    session_store.set_on_expiry(_on_expiry_with_mcp_session_cleanup)
+    session_store.add_on_expiry(_on_expiry_with_mcp_session_cleanup)
 
   return app
 

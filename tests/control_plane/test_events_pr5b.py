@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from agent_gateway.event_log import EventLog
+from agent_gateway.control_plane.events import _shielded_aclose
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 
 
@@ -93,6 +94,49 @@ def _decode_sse_chunk(chunk: bytes) -> dict[str, Any]:
   return json.loads(line.removeprefix("data: "))
 
 
+def test_control_events_cancelled_aclose_does_not_leave_pending_close_task() -> None:
+  class _SlowClose:
+    def __init__(self) -> None:
+      self.started = asyncio.Event()
+      self.cancelled = asyncio.Event()
+
+    async def aclose(self) -> None:
+      self.started.set()
+      try:
+        await asyncio.Event().wait()
+      except asyncio.CancelledError:
+        self.cancelled.set()
+        raise
+
+  async def case() -> None:
+    iterator = _SlowClose()
+    before = set(asyncio.all_tasks())
+    close_task = asyncio.create_task(_shielded_aclose(iterator))
+    await asyncio.wait_for(iterator.started.wait(), timeout=0.5)
+
+    close_task.cancel()
+    try:
+      await close_task
+    except asyncio.CancelledError:
+      pass
+
+    leaked = [
+      task
+      for task in asyncio.all_tasks() - before
+      if task is not asyncio.current_task() and not task.done()
+    ]
+    try:
+      assert leaked == []
+      assert iterator.cancelled.is_set()
+    finally:
+      for task in leaked:
+        task.cancel()
+      if leaked:
+        await asyncio.gather(*leaked, return_exceptions=True)
+
+  asyncio.run(case())
+
+
 async def _collect_control_events(app, token: str, *, control_run_id: str, count: int) -> list[dict[str, Any]]:
   route = next(route for route in app.routes if getattr(route, "path", None) == "/api/control/events")
   request = Request(
@@ -124,7 +168,12 @@ async def _collect_control_events(app, token: str, *, control_run_id: str, count
 def test_control_events_replays_autonomous_jsonl_bridge_events(monkeypatch, tmp_path: Path) -> None:
   typed_events = [
     {"type": "skill_run_started", "skill_run_id": "skill-1", "skill": "earnings-review"},
-    {"type": "verdict_emitted", "skill_run_id": "skill-1", "verdict_token": "BUY", "one_line_summary": "ok"},
+    {
+      "type": "skill_result_captured",
+      "skill_run_id": "skill-1",
+      "skill": "earnings-review",
+      "verdict_echo": {"verdict_token": "BUY", "one_line_summary": "ok"},
+    },
     {"type": "artifact_ready", "skill_run_id": "skill-1", "artifact_id": "artifact-1"},
     {"type": "artifact_failed", "skill_run_id": "skill-1", "artifact_id": "artifact-2"},
   ]
@@ -153,7 +202,7 @@ def test_control_events_replays_autonomous_jsonl_bridge_events(monkeypatch, tmp_
     )
 
     received_types = [event["type"] for event in received]
-    for expected in ["skill_run_started", "verdict_emitted", "artifact_ready", "artifact_failed"]:
+    for expected in ["skill_run_started", "skill_result_captured", "artifact_ready", "artifact_failed"]:
       assert expected in received_types
     assert "run_state_changed" in received_types
     assert all(event["control_run_id"] == run_id for event in received)

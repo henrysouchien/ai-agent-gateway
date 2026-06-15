@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -71,10 +72,13 @@ def _make_app(turns: list[list[dict[str, Any]]] | None = None):
   )
 
 
-def _control_session(client: TestClient, user_id: str) -> dict[str, Any]:
+def _control_session(client: TestClient, user_id: str, *, channel: str | None = "tui") -> dict[str, Any]:
+  payload: dict[str, Any] = {"api_key": API_KEY, "user_id": user_id, "context": {}}
+  if channel is not None:
+    payload["context"]["channel"] = channel
   response = client.post(
     "/api/control/session",
-    json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": "tui"}},
+    json=payload,
   )
   assert response.status_code == 200, response.text
   return response.json()
@@ -108,6 +112,19 @@ async def _collect_available_user_events(app: Any, user_id: str, control_run_id:
     if callable(close):
       await close()
   return events
+
+
+def test_messages_openapi_keeps_typed_request_union() -> None:
+  app = _make_app()
+
+  schema = app.openapi()
+  request_schema = schema["paths"]["/api/control/runs/{control_run_id}/messages"]["post"]["requestBody"]["content"][
+    "application/json"
+  ]["schema"]
+
+  encoded = json.dumps(request_schema)
+  assert "ChatContinuationRequest" in encoded
+  assert "AutonomousRunMessageRequest" in encoded
 
 
 def test_chat_messages_continue_with_chat_session_token_and_full_transcript() -> None:
@@ -172,7 +189,7 @@ def test_chat_messages_continue_with_chat_session_token_and_full_transcript() ->
     ]
 
     logs = client.get(
-      f"/api/control/runs/{dispatched['chat_session_id']}/logs?tail=20",
+      f"/api/control/runs/{dispatched['chat_session_id']}/logs?tail=40",
       headers=_headers(control),
     )
     assert logs.status_code == 200, logs.text
@@ -212,7 +229,7 @@ def test_chat_messages_continue_with_chat_session_token_and_full_transcript() ->
     ] == parent_events
 
 
-def test_chat_messages_reject_wrong_or_control_session_token() -> None:
+def test_chat_messages_accept_matching_control_session_and_reject_wrong_tokens() -> None:
   app = _make_app()
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -224,17 +241,151 @@ def test_chat_messages_reject_wrong_or_control_session_token() -> None:
       headers={"Authorization": f"Bearer {second['chat_session_token']}"},
       json={"messages": [{"role": "user", "content": "bad"}]},
     )
-    control_token = client.post(
+    matching_control_token = client.post(
       f"/api/control/runs/{first['chat_session_id']}/messages",
       headers=_headers(control),
-      json={"messages": [{"role": "user", "content": "bad"}]},
+      json={"messages": [{"role": "user", "content": "second via control"}]},
+    )
+    wrong_user_control = _control_session(client, "bob")
+    wrong_user_response = client.post(
+      f"/api/control/runs/{first['chat_session_id']}/messages",
+      headers=_headers(wrong_user_control),
+      json={"messages": [{"role": "user", "content": "bad user"}]},
+    )
+    wrong_channel_control = _control_session(client, "alice", channel="excel")
+    wrong_channel_response = client.post(
+      f"/api/control/runs/{first['chat_session_id']}/messages",
+      headers=_headers(wrong_channel_control),
+      json={"messages": [{"role": "user", "content": "bad channel"}]},
     )
 
     assert wrong_chat_token.status_code == 401
-    assert control_token.status_code == 401
+    assert matching_control_token.status_code == 200
+    assert matching_control_token.json()["run"]["state"] == "completed"
+    assert wrong_user_response.status_code == 401
+    assert wrong_channel_response.status_code == 404
 
 
-def test_chat_messages_reject_autonomous_runs_with_409(monkeypatch, tmp_path: Path) -> None:
+def test_autonomous_messages_deliver_to_operator_inbox(monkeypatch, tmp_path: Path) -> None:
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+  monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(tmp_path / "logs"))
+  app = _make_app()
+
+  async def fake_exec(*args, **kwargs):
+    _ = args, kwargs
+    return _FakeAutonomousProcess()
+
+  from agent_gateway import autonomous_runner
+
+  monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
+
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    start = client.post(
+      "/api/control/runs",
+      headers=_headers(control),
+      json={"kind": "autonomous", "profile": "analyst", "mode": "task", "task": "summarize"},
+    )
+    assert start.status_code == 200, start.text
+    assert start.json()["run"]["messageable"] is True
+
+    response = client.post(
+      f"/api/control/runs/{start.json()['run_id']}/messages",
+      headers=_headers(control),
+      json={"message": "Focus on AWS exposure next.", "message_id": "msg-1"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["message_id"] == "msg-1"
+    assert body["delivery_status"] == "delivered"
+    assert body["run"]["kind"] == "autonomous"
+    assert body["run"]["messageable"] is True
+
+    record = app.state.subprocess_registry._tasks[start.json()["task_id"]]
+    assert record.operator_inbox_path is not None
+    inbox_lines = record.operator_inbox_path.read_text(encoding="utf-8").splitlines()
+    assert len(inbox_lines) == 1
+    inbox_record = json.loads(inbox_lines[0])
+    assert inbox_record["message_id"] == "msg-1"
+    assert inbox_record["text"] == "Focus on AWS exposure next."
+    assert inbox_record["sender"]["user_id"] == "alice"
+
+    event = next(event for event in record.event_lines if event["type"] == "parent_message_sent")
+    assert event["message_id"] == "msg-1"
+    assert event["task_id"] == start.json()["task_id"]
+    assert event["task_type"] == "autonomous"
+    assert record.events_path is not None
+    persisted_events = [
+      json.loads(line)
+      for line in record.events_path.read_text(encoding="utf-8").splitlines()
+      if line.strip()
+    ]
+    persisted_parent_events = [
+      event for event in persisted_events if event["type"] == "parent_message_sent"
+    ]
+    assert len(persisted_parent_events) == 1
+    assert persisted_parent_events[0]["message_id"] == "msg-1"
+    assert persisted_parent_events[0]["run_id"] == start.json()["run_id"]
+    assert persisted_parent_events[0]["control_run_id"] == start.json()["run_id"]
+    record.event_lines = [
+      event for event in record.event_lines if event.get("type") != "parent_message_sent"
+    ]
+    record.events_path.write_text("", encoding="utf-8")
+
+    duplicate = client.post(
+      f"/api/control/runs/{start.json()['run_id']}/messages",
+      headers=_headers(control),
+      json={"message": "Different duplicate text should not replace inbox text.", "message_id": "msg-1"},
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["delivery_status"] == "duplicate"
+    assert len(record.operator_inbox_path.read_text(encoding="utf-8").splitlines()) == 1
+    persisted_events_after_duplicate = [
+      json.loads(line)
+      for line in record.events_path.read_text(encoding="utf-8").splitlines()
+      if line.strip()
+    ]
+    parent_events_after_duplicate = [
+      event for event in persisted_events_after_duplicate if event["type"] == "parent_message_sent"
+    ]
+    assert len(parent_events_after_duplicate) == 1
+    assert parent_events_after_duplicate[0]["message"] == "Focus on AWS exposure next."
+
+    other_control = _control_session(client, "bob")
+    wrong_user = client.post(
+      f"/api/control/runs/{start.json()['run_id']}/messages",
+      headers=_headers(other_control),
+      json={"message": "take over", "message_id": "msg-2"},
+    )
+    assert wrong_user.status_code == 404
+
+    wrong_channel = _control_session(client, "alice", channel="excel")
+    wrong_channel_response = client.post(
+      f"/api/control/runs/{start.json()['run_id']}/messages",
+      headers=_headers(wrong_channel),
+      json={"message": "wrong channel", "message_id": "msg-3"},
+    )
+    assert wrong_channel_response.status_code == 404
+
+    no_channel = _control_session(client, "alice", channel=None)
+    no_channel_response = client.post(
+      f"/api/control/runs/{start.json()['run_id']}/messages",
+      headers=_headers(no_channel),
+      json={"message": "missing channel", "message_id": "msg-4"},
+    )
+    assert no_channel_response.status_code == 404
+
+    chat = _dispatch_chat(client, control, "hello")
+    chat_token_response = client.post(
+      f"/api/control/runs/{start.json()['run_id']}/messages",
+      headers={"Authorization": f"Bearer {chat['chat_session_token']}"},
+      json={"message": "chat token", "message_id": "msg-5"},
+    )
+    assert chat_token_response.status_code == 401
+
+
+def test_autonomous_messages_reject_terminal_run_with_409(monkeypatch, tmp_path: Path) -> None:
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(tmp_path / "logs"))
   app = _make_app()
@@ -256,10 +407,21 @@ def test_chat_messages_reject_autonomous_runs_with_409(monkeypatch, tmp_path: Pa
     )
     assert start.status_code == 200, start.text
 
+    record = app.state.subprocess_registry._tasks[start.json()["task_id"]]
+    record.state = "completed"
+    record.completed_at = time.time()
+
+    run = client.get(
+      f"/api/control/runs/{start.json()['run_id']}",
+      headers=_headers(control),
+    )
+    assert run.status_code == 200, run.text
+    assert run.json()["messageable"] is False
+
     response = client.post(
       f"/api/control/runs/{start.json()['run_id']}/messages",
       headers=_headers(control),
-      json={"messages": [{"role": "user", "content": "bad"}]},
+      json={"message": "too late", "message_id": "msg-terminal"},
     )
 
     assert response.status_code == 409

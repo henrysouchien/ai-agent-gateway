@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import types
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -21,6 +22,7 @@ from agent_gateway.providers.base import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.runner import AgentRunner
 from agent_gateway.sdk_runner import AgentSDKRunner
 from agent_gateway.server import ChatRuntime
+from agent_gateway.session import SessionStream
 from agent_gateway.tool_dispatcher import ToolDispatcher
 from starlette.requests import ClientDisconnect
 
@@ -166,7 +168,7 @@ async def _init_session(client: httpx.AsyncClient) -> dict[str, Any]:
 async def _read_sse_event(response: httpx.Response) -> dict[str, Any]:
   async for line in response.aiter_lines():
     if line.startswith("data: "):
-      return json.loads(line[6:])
+      return _unwrap_sse_payload(json.loads(line[6:]))
   raise AssertionError("Expected at least one SSE event")
 
 
@@ -174,15 +176,29 @@ async def _collect_sse_events(response: httpx.Response) -> list[dict[str, Any]]:
   events: list[dict[str, Any]] = []
   async for line in response.aiter_lines():
     if line.startswith("data: "):
-      events.append(json.loads(line[6:]))
+      events.append(_unwrap_sse_payload(json.loads(line[6:])))
   return events
+
+
+async def _read_sse_payload(response: httpx.Response) -> dict[str, Any]:
+  async for line in response.aiter_lines():
+    if line.startswith("data: "):
+      return json.loads(line[6:])
+  raise AssertionError("Expected at least one SSE payload")
+
+
+def _unwrap_sse_payload(payload: dict[str, Any]) -> dict[str, Any]:
+  candidate = payload.get("event")
+  if isinstance(payload.get("seq"), int) and isinstance(candidate, dict) and isinstance(candidate.get("type"), str):
+    return candidate
+  return payload
 
 
 async def _read_until_event_type(response: httpx.Response, event_type: str) -> dict[str, Any]:
   async for line in response.aiter_lines():
     if not line.startswith("data: "):
       continue
-    event = json.loads(line[6:])
+    event = _unwrap_sse_payload(json.loads(line[6:]))
     if event.get("type") == event_type:
       return event
   raise AssertionError(f"Expected SSE event type {event_type!r}")
@@ -197,6 +213,11 @@ async def _wait_for(predicate, timeout: float, interval: float = 0.05) -> float:
     if elapsed >= timeout:
       raise AssertionError(f"Condition not met within {timeout:.2f}s")
     await asyncio.sleep(interval)
+
+
+async def _expire_session_and_shutdown_bus(app, session_id: str) -> None:
+  await app.state.auth.session_store.expire_session_async(session_id)
+  await app.state.user_event_bus.shutdown()
 
 
 def _find_free_port() -> int:
@@ -386,6 +407,23 @@ class _CompletingProvider(ModelProvider):
     _ = client, params
     yield StreamEvent(type="message_start", input_tokens=1)
     yield StreamEvent(type="text_delta", text=self.text)
+    yield StreamEvent(type="text_end", raw_block={"type": "text", "text": self.text})
+    yield StreamEvent(type="usage_update", output_tokens=1)
+    yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+
+class _ReleaseCompletingProvider(_CompletingProvider):
+  name = "release-complete"
+
+  def __init__(self, *, text: str = "done") -> None:
+    super().__init__(text=text)
+    self.release = asyncio.Event()
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    _ = client, params
+    yield StreamEvent(type="message_start", input_tokens=1)
+    yield StreamEvent(type="text_delta", text=self.text)
+    await self.release.wait()
     yield StreamEvent(type="text_end", raw_block={"type": "text", "text": self.text})
     yield StreamEvent(type="usage_update", output_tokens=1)
     yield StreamEvent(type="message_end", stop_reason="end_turn")
@@ -601,7 +639,7 @@ def test_close_client_handles_real_openai_contract() -> None:
   _run(case())
 
 
-def test_disconnect_cleanup_fires_fast(make_test_app) -> None:
+def test_disconnect_cleanup_removes_subscriber_without_cancelling_turn(make_test_app) -> None:
   async def case() -> None:
     provider = _HangingProvider()
     app = make_test_app(provider=provider, runner_class=_ObservedAgentRunner)
@@ -622,14 +660,69 @@ def test_disconnect_cleanup_fires_fast(make_test_app) -> None:
         assert first_event["type"] == "text_delta"
 
       elapsed = await _wait_for(
-        lambda: app.state.test_state.disconnect_hook_calls == 1
-        and getattr(app.state.test_state.runner, "cancelled_calls", 0) == 1
-        and provider.close_calls >= 1
-        and session.stream_active is False,
+        lambda: session.active_turn is not None
+        and session.active_turn.subscribers == {}
+        and session.active_turn.is_running,
         timeout=1.0,
       )
 
       assert elapsed < 1.0
+      assert session.stream_active is True
+      assert app.state.test_state.disconnect_hook_calls == 0
+      assert getattr(app.state.test_state.runner, "cancelled_calls", 0) == 0
+      assert provider.close_calls == 0
+
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
+      assert app.state.test_state.disconnect_hook_calls == 1
+      assert getattr(app.state.test_state.runner, "cancelled_calls", 0) == 1
+      assert provider.close_calls >= 1
+      assert session.stream_active is False
+      assert session.active_turn is None
+
+  _run(case())
+
+
+def test_chat_cancel_endpoint_cancels_backend_turn(make_test_app) -> None:
+  async def case() -> None:
+    provider = _HangingProvider()
+    app = make_test_app(provider=provider, runner_class=_ObservedAgentRunner)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      ) as response:
+        assert response.status_code == 200
+        first_event = await _read_sse_event(response)
+        assert first_event["type"] == "text_delta"
+
+      await _wait_for(
+        lambda: session.active_turn is not None
+        and session.active_turn.subscribers == {}
+        and session.active_turn.is_running,
+        timeout=1.0,
+      )
+
+      cancel_response = await client.post(
+        "/api/chat/cancel",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json={"session_id": session_info["session_id"]},
+      )
+
+      assert cancel_response.status_code == 200
+      assert cancel_response.json() == {"status": "cancelled", "session_id": session_info["session_id"]}
+      assert session.active_turn is None
+      assert session.stream_active is False
+      assert app.state.test_state.disconnect_hook_calls == 1
+      assert getattr(app.state.test_state.runner, "cancelled_calls", 0) == 1
+      assert provider.close_calls >= 1
+      await app.state.user_event_bus.shutdown()
 
   _run(case())
 
@@ -650,7 +743,10 @@ def test_no_double_disconnect_firing(make_test_app) -> None:
         assert response.status_code == 200
         await _read_sse_event(response)
 
-      await _wait_for(lambda: app.state.test_state.disconnect_hook_calls == 1, timeout=1.0)
+      assert app.state.test_state.disconnect_hook_calls == 0
+
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
+      assert app.state.test_state.disconnect_hook_calls == 1
       await app.state.test_state.runtime.on_disconnect()
 
       assert app.state.test_state.disconnect_hook_calls == 1
@@ -747,7 +843,7 @@ def test_on_disconnect_idempotent() -> None:
   assert calls == ["disconnect"]
 
 
-def test_client_disconnect_releases_lock_fast(make_test_app) -> None:
+def test_client_disconnect_keeps_turn_running_and_rejects_new_post(make_test_app) -> None:
   async def case() -> None:
     provider = _HangingProvider()
     app = make_test_app(provider=provider)
@@ -766,9 +862,22 @@ def test_client_disconnect_releases_lock_fast(make_test_app) -> None:
         assert response.status_code == 200
         await _read_sse_event(response)
 
-      elapsed = await _wait_for(lambda: session.stream_active is False, timeout=2.0)
+      elapsed = await _wait_for(
+        lambda: session.active_turn is not None and session.active_turn.is_running and not session.active_turn.subscribers,
+        timeout=2.0,
+      )
 
       assert elapsed < 2.0
+      assert session.stream_active is True
+
+      conflict = await client.post(
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      )
+      assert conflict.status_code == 409
+
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
 
   _run(case())
 
@@ -800,24 +909,30 @@ def test_disconnect_works_with_externally_built_runtime_no_handler(make_test_app
         assert callable(runtime.disconnect_handler)
 
       elapsed = await _wait_for(
-        lambda: session.stream_active is False
-        and provider.close_calls >= 1
-        and getattr(app.state.test_state.runner, "cancelled_calls", 0) == 1
-        and getattr(app.state.test_state.runner, "_disconnected", False) is True,
+        lambda: session.active_turn is not None and session.active_turn.is_running and not session.active_turn.subscribers,
         timeout=2.0,
       )
 
       assert elapsed < 2.0
+      assert session.stream_active is True
+      assert provider.close_calls == 0
+      assert getattr(app.state.test_state.runner, "cancelled_calls", 0) == 0
+      assert getattr(app.state.test_state.runner, "_disconnected", False) is False
       assert app.state.test_state.disconnect_hook_calls == 0
+
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
+      assert provider.close_calls >= 1
+      assert getattr(app.state.test_state.runner, "cancelled_calls", 0) == 1
+      assert getattr(app.state.test_state.runner, "_disconnected", False) is True
 
   _run(case())
 
 
-def test_disconnect_releases_lock_with_real_uvicorn(make_test_app) -> None:
+def test_completed_grace_allows_new_post_with_real_uvicorn(make_test_app) -> None:
   async def case() -> None:
     uvicorn = pytest.importorskip("uvicorn")
     app = make_test_app(
-      provider=_HangingProvider(),
+      provider=_CompletingProvider(),
       runner_class=_ObservedAgentRunner,
       attach_disconnect_handler=False,
     )
@@ -850,7 +965,8 @@ def test_disconnect_releases_lock_with_real_uvicorn(make_test_app) -> None:
           json=_chat_payload(),
         ) as response:
           assert response.status_code == 200
-          await _read_sse_event(response)
+          events = await _collect_sse_events(response)
+          assert any(event.get("type") == "stream_complete" for event in events)
 
         started = time.perf_counter()
         while True:
@@ -885,7 +1001,7 @@ def test_disconnect_releases_lock_with_real_uvicorn(make_test_app) -> None:
   _run(case())
 
 
-def test_second_request_succeeds_after_disconnect(make_test_app) -> None:
+def test_second_request_after_subscriber_disconnect_gets_409(make_test_app) -> None:
   async def case() -> None:
     app = make_test_app(provider=_HangingProvider())
 
@@ -903,7 +1019,10 @@ def test_second_request_succeeds_after_disconnect(make_test_app) -> None:
         assert response.status_code == 200
         await _read_sse_event(response)
 
-      await _wait_for(lambda: session.stream_active is False, timeout=2.0)
+      await _wait_for(
+        lambda: session.active_turn is not None and session.active_turn.is_running and not session.active_turn.subscribers,
+        timeout=2.0,
+      )
 
       started = time.perf_counter()
       async with client.stream(
@@ -912,8 +1031,9 @@ def test_second_request_succeeds_after_disconnect(make_test_app) -> None:
         headers={"Authorization": f"Bearer {session_info['session_token']}"},
         json=_chat_payload(),
       ) as response:
-        assert response.status_code == 200
+        assert response.status_code == 409
       assert time.perf_counter() - started < 3.0
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
 
   _run(case())
 
@@ -946,7 +1066,11 @@ def test_concurrent_request_still_gets_409(make_test_app) -> None:
         )
         assert conflict.status_code == 409
 
-      await _wait_for(lambda: session.stream_active is False, timeout=2.0)
+      await _wait_for(
+        lambda: session.active_turn is not None and session.active_turn.is_running and not session.active_turn.subscribers,
+        timeout=2.0,
+      )
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
 
   _run(case())
 
@@ -969,10 +1093,14 @@ def test_disconnect_does_not_emit_stream_retry(make_test_app) -> None:
         assert response.status_code == 200
         await _read_sse_event(response)
 
-      await _wait_for(lambda: session.stream_active is False, timeout=2.0)
+      await _wait_for(
+        lambda: session.active_turn is not None and session.active_turn.is_running and not session.active_turn.subscribers,
+        timeout=2.0,
+      )
 
       event_types = [entry.event.get("type") for entry in app.state.test_state.event_log.entries]
       assert "stream_retry" not in event_types
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
 
   _run(case())
 
@@ -998,6 +1126,279 @@ def test_normal_stream_completion_unchanged(make_test_app) -> None:
       assert texts == "done"
       assert "stream_complete" in event_types
       assert "stream_retry" not in event_types
+
+  _run(case())
+
+
+def test_chat_stream_emits_wire_envelope(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_CompletingProvider(text="done"))
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      ) as response:
+        assert response.status_code == 200
+        payload = await _read_sse_payload(response)
+
+      assert payload["seq"] == 1
+      assert payload["session_id"] == session_info["session_id"]
+      assert payload["schema_version"] == 1
+      assert payload["event"]["type"] == "text_delta"
+      assert payload["event"]["text"] == "done"
+
+  _run(case())
+
+
+def test_subscribe_replays_active_turn_events(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_HangingProvider())
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      ) as response:
+        assert response.status_code == 200
+        first_payload = await _read_sse_payload(response)
+        assert first_payload["seq"] == 1
+        assert first_payload["event"]["type"] == "text_delta"
+
+      async with client.stream(
+        "GET",
+        f"/api/chat/subscribe?session_id={session_info['session_id']}&after_seq=0",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+      ) as subscriber_response:
+        assert subscriber_response.status_code == 200
+        replayed_payload = await _read_sse_payload(subscriber_response)
+
+      assert replayed_payload["seq"] == 1
+      assert replayed_payload["session_id"] == session_info["session_id"]
+      assert replayed_payload["schema_version"] == 1
+      assert replayed_payload["event"]["type"] == "text_delta"
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
+
+  _run(case())
+
+
+def test_subscribe_live_fanout_keeps_post_and_subscriber_connected(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_HangingProvider())
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      ) as response:
+        assert response.status_code == 200
+        post_payload = await _read_sse_payload(response)
+        assert post_payload["seq"] == 1
+
+        async with client.stream(
+          "GET",
+          f"/api/chat/subscribe?session_id={session_info['session_id']}&after_seq=0",
+          headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        ) as subscriber_response:
+          assert subscriber_response.status_code == 200
+          await _wait_for(
+            lambda: session.active_turn is not None and len(session.active_turn.subscribers) == 2,
+            timeout=1.0,
+          )
+          subscriber_payload = await _read_sse_payload(subscriber_response)
+
+      assert subscriber_payload["seq"] == post_payload["seq"]
+      assert subscriber_payload["event"]["type"] == post_payload["event"]["type"]
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
+
+  _run(case())
+
+
+def test_slow_subscriber_disconnects_on_backpressure(monkeypatch: pytest.MonkeyPatch) -> None:
+  async def case() -> None:
+    monkeypatch.setattr(gateway_server, "_STREAM_SUBSCRIBER_QUEUE_MAX", 1)
+    event_log = EventLog(session_id="sess-slow")
+    event_log.append({"type": "text_delta", "text": "one"})
+    event_log.append({"type": "text_delta", "text": "two"})
+    active_turn = SessionStream(event_log=event_log, runner_task=None)
+
+    subscriber = gateway_server._register_stream_subscriber(
+      active_turn,
+      after_seq=0,
+      client_label="slow",
+    )
+
+    await _wait_for(lambda: subscriber.disconnect_reason == "backpressure", timeout=1.0)
+    assert subscriber.queue.get_nowait() is gateway_server._STREAM_SUBSCRIBER_DONE
+    await gateway_server._cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
+
+  _run(case())
+
+
+def test_subscribe_resume_cursor_replays_tail_through_terminal(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_CompletingProvider(text="done"))
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      ) as response:
+        assert response.status_code == 200
+        payloads = []
+        async for line in response.aiter_lines():
+          if line.startswith("data: "):
+            payloads.append(json.loads(line[6:]))
+
+      assert payloads[0]["seq"] == 1
+      async with client.stream(
+        "GET",
+        f"/api/chat/subscribe?session_id={session_info['session_id']}&after_seq=1",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+      ) as subscriber_response:
+        assert subscriber_response.status_code == 200
+        replayed = []
+        async for line in subscriber_response.aiter_lines():
+          if line.startswith("data: "):
+            replayed.append(json.loads(line[6:]))
+
+      assert replayed
+      assert all(payload["seq"] > 1 for payload in replayed)
+      assert replayed[-1]["event"]["type"] in {"stream_complete", "error"}
+
+  _run(case())
+
+
+def test_subscribe_persists_reconnected_tail_to_transcript(make_test_app, tmp_path: Path) -> None:
+  async def case() -> None:
+    provider = _ReleaseCompletingProvider(text="tail")
+    app = make_test_app(provider=provider, transcript_dir=tmp_path)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      ) as response:
+        assert response.status_code == 200
+        first_payload = await _read_sse_payload(response)
+
+      assert first_payload["event"]["type"] == "text_delta"
+      await _wait_for(
+        lambda: session.active_turn is not None
+        and session.active_turn.is_running
+        and session.active_turn.subscribers == {},
+        timeout=1.0,
+      )
+
+      provider.release.set()
+      async with client.stream(
+        "GET",
+        f"/api/chat/subscribe?session_id={session_info['session_id']}&after_seq={first_payload['seq']}",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+      ) as subscriber_response:
+        assert subscriber_response.status_code == 200
+        replayed = await _collect_sse_events(subscriber_response)
+
+      assert replayed[-1]["type"] in {"stream_complete", "error"}
+      transcript_path = tmp_path / f"{session_info['session_id']}.jsonl"
+      transcript_events = [json.loads(line) for line in transcript_path.read_text(encoding="utf-8").splitlines()]
+      event_types = [event.get("type") for event in transcript_events]
+      assert event_types.count("text_delta") == 1
+      assert "turn_complete" in event_types
+      assert "stream_complete" in event_types
+
+  _run(case())
+
+
+def test_subscribe_auth_and_no_active_turn_errors(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_CompletingProvider())
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      alice = await _init_session(client)
+      bob_response = await client.post("/api/chat/init", json={"api_key": "gateway-key", "user_id": "bob"})
+      assert bob_response.status_code == 200
+      bob = bob_response.json()
+
+      missing_auth = await client.get(f"/api/chat/subscribe?session_id={alice['session_id']}")
+      assert missing_auth.status_code == 401
+
+      wrong_user = await client.get(
+        f"/api/chat/subscribe?session_id={alice['session_id']}",
+        headers={"Authorization": f"Bearer {bob['session_token']}"},
+      )
+      assert wrong_user.status_code == 403
+
+      no_active = await client.get(
+        f"/api/chat/subscribe?session_id={alice['session_id']}",
+        headers={"Authorization": f"Bearer {alice['session_token']}"},
+      )
+      assert no_active.status_code == 404
+
+  _run(case())
+
+
+def test_subscribe_uses_sse_comment_keepalive_without_event_log_heartbeat(make_test_app, monkeypatch: pytest.MonkeyPatch) -> None:
+  async def case() -> None:
+    monkeypatch.setattr(gateway_server, "_STREAM_SUBSCRIBER_KEEPALIVE_SECONDS", 0.01)
+    app = make_test_app(provider=_HangingProvider())
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      ) as response:
+        assert response.status_code == 200
+        first_payload = await _read_sse_payload(response)
+        assert first_payload["seq"] == 1
+
+      async with client.stream(
+        "GET",
+        f"/api/chat/subscribe?session_id={session_info['session_id']}&after_seq=1",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+      ) as subscriber_response:
+        assert subscriber_response.status_code == 200
+        async for line in subscriber_response.aiter_lines():
+          if line == ":keepalive":
+            break
+        else:
+          raise AssertionError("Expected keepalive comment")
+
+      event_types = [entry.event.get("type") for entry in app.state.test_state.event_log.entries]
+      assert "heartbeat" not in event_types
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
 
   _run(case())
 
@@ -1082,7 +1483,7 @@ def test_normal_completion_creates_no_pending_disconnect_task(make_test_app, mon
   _run(case())
 
 
-def test_sdk_runner_client_disconnect_releases_lock_fast(make_test_app, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sdk_runner_client_disconnect_keeps_turn_running(make_test_app, monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     iterators: list[_HangingQueryIterator] = []
 
@@ -1119,15 +1520,22 @@ def test_sdk_runner_client_disconnect_releases_lock_fast(make_test_app, monkeypa
         event = await _read_sse_event(response)
         assert event["type"] == "text_delta"
 
-      elapsed = await _wait_for(lambda: session.stream_active is False, timeout=2.0)
+      elapsed = await _wait_for(
+        lambda: session.active_turn is not None and session.active_turn.is_running and not session.active_turn.subscribers,
+        timeout=2.0,
+      )
 
       assert elapsed < 2.0
+      assert session.stream_active is True
+      assert iterators and iterators[0].close_calls == 0
+
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
       assert iterators and iterators[0].close_calls >= 1
 
   _run(case())
 
 
-def test_sdk_runner_second_request_succeeds_after_disconnect(make_test_app, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sdk_runner_second_request_after_disconnect_gets_409(make_test_app, monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     def _iterator_factory(_prompt: str, _options: Any):
       return _HangingQueryIterator()
@@ -1159,7 +1567,10 @@ def test_sdk_runner_second_request_succeeds_after_disconnect(make_test_app, monk
         assert response.status_code == 200
         await _read_sse_event(response)
 
-      await _wait_for(lambda: session.stream_active is False, timeout=2.0)
+      await _wait_for(
+        lambda: session.active_turn is not None and session.active_turn.is_running and not session.active_turn.subscribers,
+        timeout=2.0,
+      )
 
       started = time.perf_counter()
       async with client.stream(
@@ -1168,13 +1579,14 @@ def test_sdk_runner_second_request_succeeds_after_disconnect(make_test_app, monk
         headers={"Authorization": f"Bearer {session_info['session_token']}"},
         json=_chat_payload(),
       ) as response:
-        assert response.status_code == 200
+        assert response.status_code == 409
       assert time.perf_counter() - started < 3.0
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
 
   _run(case())
 
 
-def test_tool_call_in_flight_disconnect_releases_lock_fast(make_test_app) -> None:
+def test_tool_call_in_flight_disconnect_preserves_running_turn(make_test_app) -> None:
   async def case() -> None:
     dispatcher = _HangingDispatcher(cancel_delay=2.0)
     app = make_test_app(
@@ -1210,9 +1622,12 @@ def test_tool_call_in_flight_disconnect_releases_lock_fast(make_test_app) -> Non
       await stream.__aexit__(None, None, None)
       elapsed = time.perf_counter() - disconnect_started
 
-      assert dispatcher.cancelled_calls == 1
       assert elapsed < 1.0
-      assert session.stream_active is False
+      assert dispatcher.cancelled_calls == 0
+      assert session.stream_active is True
+      assert session.active_turn is not None
+      assert session.active_turn.is_running
+      assert session.active_turn.subscribers == {}
 
       async with client.stream(
         "POST",
@@ -1220,6 +1635,11 @@ def test_tool_call_in_flight_disconnect_releases_lock_fast(make_test_app) -> Non
         headers={"Authorization": f"Bearer {session_info['session_token']}"},
         json=_chat_payload(),
       ) as retry_response:
-        assert retry_response.status_code == 200
+        assert retry_response.status_code == 409
+
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
+      assert dispatcher.cancelled_calls == 1
+      assert session.stream_active is False
+      assert session.active_turn is None
 
   _run(case())

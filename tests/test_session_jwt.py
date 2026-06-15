@@ -10,10 +10,12 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway.session import AuthManager, JWT_ALGORITHM, SessionStore
 
+_JWT_SECRET = "jwt-secret-with-at-least-32-bytes"
+
 
 def test_session_channel_fields_and_jwt_round_trip_new_claims() -> None:
   store = SessionStore(ttl=3600)
-  auth = AuthManager(secret="jwt-secret", valid_keys={"gateway-key"}, session_store=store)
+  auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
   session = store.create_session(
     api_key_hash="hash",
     user_id="alice",
@@ -46,9 +48,20 @@ def test_session_channel_fields_and_jwt_round_trip_new_claims() -> None:
   assert session.is_public is True
 
 
+def test_auth_manager_rejects_short_hs256_secret() -> None:
+  store = SessionStore(ttl=3600)
+
+  try:
+    AuthManager(secret="too-short", valid_keys={"gateway-key"}, session_store=store)
+  except ValueError as exc:
+    assert "at least 32 bytes" in str(exc)
+  else:
+    raise AssertionError("AuthManager accepted a short JWT signing secret")
+
+
 def test_session_store_ttl_override_and_kind_are_store_only() -> None:
   store = SessionStore(ttl=3600)
-  auth = AuthManager(secret="jwt-secret", valid_keys={"gateway-key"}, session_store=store)
+  auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
   session = store.create_session(
     api_key_hash="hash",
     user_id="alice",
@@ -57,7 +70,7 @@ def test_session_store_ttl_override_and_kind_are_store_only() -> None:
   )
 
   token = auth.issue_token(session)
-  claims = jwt.decode(token, "jwt-secret", algorithms=[JWT_ALGORITHM])
+  claims = jwt.decode(token, _JWT_SECRET, algorithms=[JWT_ALGORITHM])
 
   assert session.kind == "control"
   assert session.expires_at == session.created_at + 900
@@ -66,7 +79,7 @@ def test_session_store_ttl_override_and_kind_are_store_only() -> None:
 
 def test_old_jwt_without_channel_claims_still_validates_with_defaults() -> None:
   store = SessionStore(ttl=3600)
-  auth = AuthManager(secret="jwt-secret", valid_keys={"gateway-key"}, session_store=store)
+  auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
   session = store.create_session(api_key_hash="hash", user_id="alice")
   session.channel = "excel"
   session.is_public = True
@@ -78,7 +91,7 @@ def test_old_jwt_without_channel_claims_still_validates_with_defaults() -> None:
     "user_id": session.user_id,
     "user_email": session.user_email,
   }
-  token = jwt.encode(old_payload, "jwt-secret", algorithm=JWT_ALGORITHM)
+  token = jwt.encode(old_payload, _JWT_SECRET, algorithm=JWT_ALGORITHM)
 
   verified_session, claims = auth.verify_token_with_payload(token)
 

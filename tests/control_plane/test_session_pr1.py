@@ -30,6 +30,7 @@ def test_control_session_lifecycle_create_use_expire_recreate(
   payload = first.json()
   assert payload["kind"] == "control"
   assert payload["user_id"] == test_user_id
+  assert payload["channel"] == test_channel
   assert payload["expires_at"] == fake_now[0] + CONTROL_SESSION_TTL_SECONDS
 
   session = control_plane_app.state.auth.session_store.get_session(payload["session_id"])
@@ -57,6 +58,7 @@ def test_control_session_lifecycle_create_use_expire_recreate(
   )
   assert second.status_code == 200
   assert second.json()["session_id"] != payload["session_id"]
+  assert second.json()["channel"] == test_channel
   assert second.json()["expires_at"] == fake_now[0] + CONTROL_SESSION_TTL_SECONDS
 
 

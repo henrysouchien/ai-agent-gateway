@@ -19,7 +19,30 @@ from agent_gateway.skills import (
   SkillLoader,
   SkillProfile,
   parse_skill_file,
+  resolve_blocks,
 )
+from agent.skills.loader import resolve_blocks as api_resolve_blocks
+from agent.shared.tool_handlers import _skill_memory_write_allowed_files
+
+SKILLS_DIR = ROOT / "api" / "memory" / "workspace" / "notes" / "skills"
+COMPACT_ROLLOUT_SKILLS = [
+  "fundamental-research",
+  "business-quality-assessment",
+  "competitive-position",
+  "critical-factors",
+  "forecast-assumptions",
+  "earnings-scenarios",
+  "dcf-relative-valuation",
+  "identifying-risk",
+  "quantifying-risk",
+  "managing-risk",
+  "thesis-articulation",
+  "thesis-review",
+  "valuation-inputs",
+  "financial-red-flags",
+  "scenario-multiple-pricing",
+  "expected-value-decision",
+]
 
 
 def _write_skill(tmp_path: Path, frontmatter: str | None, *, body: str = "# Skill\n\nPrompt") -> Path:
@@ -39,6 +62,23 @@ def _write_named_skill(skills_dir: Path, name: str, frontmatter: str | None, *, 
   else:
     text = f"---\n{textwrap.dedent(frontmatter).strip()}\n---\n\n{body}\n"
   (skills_dir / f"{name}.md").write_text(text, encoding="utf-8")
+
+
+def test_package_resolve_blocks_matches_api_resolver(tmp_path: Path) -> None:
+  blocks_dir = tmp_path / "_blocks"
+  blocks_dir.mkdir()
+  (blocks_dir / "citation-contract.md").write_text("Citation content.\n", encoding="utf-8")
+  (blocks_dir / "nested.md").write_text("Nested {{CITATION_CONTRACT}} marker.\n", encoding="utf-8")
+  content = "Start {{CITATION_CONTRACT}} escaped \\{{ESCAPED}} nested {{NESTED}} end"
+
+  package_resolved = resolve_blocks(content, blocks_dir)
+  api_resolved = api_resolve_blocks(content, blocks_dir)
+
+  assert package_resolved == api_resolved
+  assert package_resolved == (
+    "Start Citation content.\n escaped {{ESCAPED}} nested "
+    "Nested {{CITATION_CONTRACT}} marker.\n end"
+  )
 
 
 def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
@@ -519,3 +559,44 @@ def test_invalid_mcp_tools_shape_rejected(tmp_path: Path) -> None:
 
   with pytest.raises(ValueError, match="mcp_tools"):
     parse_skill_file(skill_path)
+
+
+def test_fundamental_research_typed_contract_scopes_memory_write_to_standard_artifact() -> None:
+  profile = SkillLoader(SKILLS_DIR).load("fundamental-research")
+
+  assert profile.metadata is not None
+  assert profile.metadata.get("typed_outputs_contract") == {}
+  assert _skill_memory_write_allowed_files(
+    profile,
+    "skills/fundamental-research/2026-06-11T120000.000Z-run123-MSFT.md",
+  ) == {"skills/fundamental-research/2026-06-11T120000.000Z-run123-MSFT.md"}
+
+
+def _compact_rollout_model_writer_skills() -> list[str]:
+  loader = SkillLoader(SKILLS_DIR)
+  return [
+    skill_name
+    for skill_name in COMPACT_ROLLOUT_SKILLS
+    if loader.load(skill_name).mutation_mode == "model_writer"
+  ]
+
+
+@pytest.mark.parametrize("skill_name", _compact_rollout_model_writer_skills())
+def test_model_writer_rollout_skills_are_not_resumable(skill_name: str) -> None:
+  profile = SkillLoader(SKILLS_DIR).load(skill_name)
+
+  assert profile.mutation_mode == "model_writer"
+  assert profile.resumable is False
+
+
+@pytest.mark.parametrize(
+  ("skill_name", "expected_timeout"),
+  [
+    ("fundamental-research", 1800.0),
+    ("valuation-inputs", 1200.0),
+  ],
+)
+def test_compact_rollout_skill_timeout_frontmatter(skill_name: str, expected_timeout: float) -> None:
+  profile = SkillLoader(SKILLS_DIR).load(skill_name)
+
+  assert profile.timeout == expected_timeout

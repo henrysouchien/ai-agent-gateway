@@ -296,16 +296,16 @@ Key details:
 
 ### Typed Event Contract (0.15.0+)
 
-Skill-framework sub-agent runs emit six typed events onto the parent `EventLog`, where they flow through the standard SSE channel alongside `text_delta` / `tool_call_complete` / etc. The contract is opt-in — events only fire when both `skill_run_id` and `SkillProfile` are wired into the sub-agent dispatch.
+Skill-framework sub-agent runs emit typed lifecycle and result events onto the parent `EventLog`, where they flow through the standard SSE channel alongside `text_delta` / `tool_call_complete` / etc. The contract is opt-in — events only fire when both `skill_run_id` and `SkillProfile` are wired into the sub-agent dispatch.
 
 The six events split into two scopes:
 
-- **Run-scoped** (carry `skill_run_id` for correlation): `SkillRunStartedEvent`, `VerdictEmittedEvent`, `ArtifactReadyEvent`, `AggregateReadyEvent`, `ArtifactFailedEvent`.
+- **Run-scoped** (carry `skill_run_id` for correlation): `SkillRunStartedEvent`, `skill_result_captured`, `ArtifactReadyEvent`, `AggregateReadyEvent`, `ArtifactFailedEvent`.
 - **Renderer-only** (no skill run): `ArtifactUnavailableEvent`, surfaced when a UI lookup for `(ticker, skill)` finds nothing.
 
-Why typed: renderers (Excel taskpane, web demo surface, etc.) need a stable shape to react to skill state transitions without parsing free-form `tool_call_complete` blocks. The dataclasses are frozen, the `type` discriminator is fixed at construction, and `event_to_dict` / `event_from_dict` round-trip the wire format. Renderers can drive UI state machines off `skill_run_started` → `verdict_emitted` → `artifact_ready` without doing tool-call introspection.
+Why typed: renderers (Excel taskpane, web demo surface, etc.) need a stable shape to react to skill state transitions without parsing free-form `tool_call_complete` blocks. The dataclasses are frozen where event classes exist, the `type` discriminator is fixed, and `event_to_dict` / `event_from_dict` round-trip the dataclass wire format. Renderers can drive UI state machines off `skill_run_started` → `skill_result_captured` → `artifact_ready` without doing tool-call introspection.
 
-Verdict extraction is non-obvious: `VerdictEmittedEvent` is constructed by walking `tool_call_complete.final_tool_result_blocks` in reverse to find the most recent `memory_write` carrying a verdict YAML. Reverse-walk handles post-verdict decision-log writes (e.g., the `earnings-scenarios` pattern that writes the verdict then writes its decision log).
+Verdict display data comes from `skill_result_captured.verdict_echo` or structured FMS artifact events. Runtime code does not parse final markdown, fenced YAML, or `memory_write` payloads to infer verdict state.
 
 See `agent_gateway.events` for the dataclasses, `docs/api-reference.md` for the public surface, and `docs/http-api.md` → "Skill Framework Events" for wire format.
 

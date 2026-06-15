@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import re
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 from ..auth import ProviderCredentialFailure
 
@@ -41,6 +41,9 @@ class ThinkingLevel(str, Enum):
   MAX = "max"
 
 
+ThinkingMode = Literal["adaptive", "budget", "none"]
+
+
 @dataclass
 class ModelInfo:
   """Static or semi-static metadata about a model identifier."""
@@ -56,7 +59,14 @@ class ModelInfo:
   output_cost_per_mtok: float = 0.0
   cache_read_cost_per_mtok: float = 0.0
   cache_write_cost_per_mtok: float = 0.0
+  thinking_mode: ThinkingMode | None = None
   compat: dict[str, Any] | None = None
+
+  def __post_init__(self) -> None:
+    if self.thinking_mode is None:
+      self.thinking_mode = "adaptive" if self.supports_thinking else "none"
+    if self.thinking_mode != "none":
+      self.supports_thinking = True
 
 
 @dataclass
@@ -181,6 +191,87 @@ def _classify_provider_credential_failure(
     )
 
   return None
+
+
+def truncate_to_last_compaction(
+  messages: list[dict[str, Any]],
+  *,
+  compaction_as_text: bool = False,
+) -> list[dict[str, Any]]:
+  """Drop history already covered by the most recent server-side compaction block.
+
+  Compaction blocks are produced by Anthropic's `compact_20260112` context
+  management: the block's `content` is a model-generated summary that replaces
+  everything before it. The compaction trigger evaluates raw submitted input
+  tokens, not the post-replacement rendered context — resending the full
+  pre-compaction history keeps every request above the trigger and the API
+  re-summarizes from scratch on every turn. Submitting from the last compaction
+  block onward (the documented "manually drop" client strategy) is what makes
+  compaction actually reduce the next request's size.
+
+  Providers whose APIs don't understand compaction blocks (anything
+  non-Anthropic replaying an Anthropic-originated transcript) pass
+  `compaction_as_text=True` to convert the anchor block into a plain text
+  summary block instead of forwarding an unknown block type.
+  """
+  last_message_idx: int | None = None
+  last_block_idx = 0
+  for message_idx, message in enumerate(messages):
+    if message.get("role") != "assistant":
+      continue
+    content = message.get("content")
+    if not isinstance(content, list):
+      continue
+    for block_idx, block in enumerate(content):
+      if isinstance(block, dict) and block.get("type") == "compaction":
+        last_message_idx = message_idx
+        last_block_idx = block_idx
+
+  if last_message_idx is None:
+    return messages
+
+  anchor = dict(messages[last_message_idx])
+  full_anchor_content = list(anchor.get("content") or [])
+  anchor_content = full_anchor_content[last_block_idx:]
+  if compaction_as_text:
+    summary = str(anchor_content[0].get("content") or "")
+    # Trailing separator: some providers concatenate adjacent text blocks with
+    # no delimiter when building their request payload.
+    anchor_content[0] = {
+      "type": "text",
+      "text": f"[Summary of the earlier conversation]\n{summary}\n\n",
+    }
+  anchor["content"] = anchor_content
+  truncated = [anchor, *messages[last_message_idx + 1 :]]
+
+  # If the anchor's dropped prefix contained tool_use blocks, their results in
+  # the following user message would now be orphaned — drop those tool_results.
+  dropped_tool_ids = {
+    str(block.get("id", ""))
+    for block in full_anchor_content[:last_block_idx]
+    if isinstance(block, dict) and block.get("type") == "tool_use"
+  }
+  if dropped_tool_ids and len(truncated) > 1:
+    follower = truncated[1]
+    follower_content = follower.get("content")
+    if follower.get("role") == "user" and isinstance(follower_content, list):
+      kept_blocks = [
+        block
+        for block in follower_content
+        if not (
+          isinstance(block, dict)
+          and block.get("type") == "tool_result"
+          and str(block.get("tool_use_id", "")) in dropped_tool_ids
+        )
+      ]
+      if kept_blocks:
+        next_follower = dict(follower)
+        next_follower["content"] = kept_blocks
+        truncated[1] = next_follower
+      else:
+        truncated = [truncated[0], *truncated[2:]]
+
+  return truncated
 
 
 class ModelProvider:

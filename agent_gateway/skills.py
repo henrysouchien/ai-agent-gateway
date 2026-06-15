@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
+from .fixture_gate import fixture_provider_available, is_fixture_skill_name, require_fixture_provider_available
 from ._io import _atomic_write_json, _read_json_object
 
 log = logging.getLogger("agent_gateway.skills")
 _FRONTMATTER_DELIMITER = "---"
+_BLOCK_REF_RE = re.compile(r"(?<!\\)\{\{([A-Z][A-Z0-9_]*)\}\}")
+_ESCAPE_SENTINEL = "\x00BLOCK_ESC\x00"
 AGENT_DESCRIPTION_MAX_CHARS = 240
 AGENT_DESCRIPTION_PLACEHOLDER = "(no description)"
 SKILL_STATE_CLASSES = frozenset({
@@ -19,6 +23,7 @@ SKILL_STATE_CLASSES = frozenset({
   "advisor-no-state",
   "deprecated",
 })
+Mode = Literal["read_only", "preview", "apply", "model_writer"]
 
 
 @dataclass
@@ -59,6 +64,7 @@ class SkillProfile:
   tool_packs_enabled: bool = True
   provider: str | None = None
   state_class: str | None = None
+  mutation_mode: Mode | str | None = None
 
 
 def _clean_string(value: Any) -> str | None:
@@ -264,6 +270,22 @@ def _split_frontmatter(text: str, *, path: Path) -> tuple[dict[str, Any], str]:
   return {}, text
 
 
+def _read_block(block_name: str, blocks_dir: Path) -> str:
+  block_path = blocks_dir / f"{block_name.lower().replace('_', '-')}.md"
+  if not block_path.exists():
+    raise FileNotFoundError(
+      f"Block '{block_name}' not found: expected {block_path}"
+    )
+  return block_path.read_text(encoding="utf-8")
+
+
+def resolve_blocks(content: str, blocks_dir: Path) -> str:
+  """Resolve {{BLOCK_NAME}} references in skill content from block files."""
+  working = content.replace("\\{{", _ESCAPE_SENTINEL)
+  working = _BLOCK_REF_RE.sub(lambda match: _read_block(match.group(1), blocks_dir), working)
+  return working.replace(_ESCAPE_SENTINEL, "{{")
+
+
 def parse_skill_file(path: Path) -> SkillProfile:
   """Parse a markdown skill file into a `SkillProfile`.
 
@@ -289,6 +311,7 @@ def parse_skill_file(path: Path) -> SkillProfile:
   raw_resume_mcp_session_reset_ok = frontmatter.pop("resume_mcp_session_reset_ok", None)
   raw_mode = frontmatter.pop("mode", None)
   raw_state_class = frontmatter.pop("state_class", None)
+  raw_mutation_mode = frontmatter.pop("mutation_mode", None)
   raw_extra_excluded_tools = frontmatter.pop("extra_excluded_tools", None)
   raw_tool_packs_enabled = frontmatter.pop("tool_packs_enabled", None)
   raw_metadata = frontmatter.pop("metadata", None)
@@ -436,6 +459,7 @@ def parse_skill_file(path: Path) -> SkillProfile:
     tool_packs_enabled=coerced_tool_packs_enabled,
     provider=_clean_string(raw_provider),
     state_class=coerced_state_class,
+    mutation_mode=_clean_string(raw_mutation_mode),
   )
 
 
@@ -486,6 +510,8 @@ class SkillLoader:
     return path
 
   def load(self, name: str) -> SkillProfile:
+    if is_fixture_skill_name(name):
+      require_fixture_provider_available("fixture skill", error_type=ValueError)
     path = self._skill_path(name)
     if not path.exists():
       available = self.list_skills()
@@ -498,7 +524,10 @@ class SkillLoader:
   def list_skills(self) -> list[str]:
     if not self.skills_dir.exists():
       return []
-    return sorted(path.stem for path in self.skills_dir.glob("*.md") if path.is_file())
+    names = [path.stem for path in self.skills_dir.glob("*.md") if path.is_file()]
+    if not fixture_provider_available():
+      names = [name for name in names if not is_fixture_skill_name(name)]
+    return sorted(names)
 
   def list_callable_skills_with_descriptions(self) -> list[tuple[str, str]]:
     entries: list[tuple[str, str]] = []
@@ -553,8 +582,10 @@ class SkillStateStore:
 __all__ = [
   "AGENT_DESCRIPTION_MAX_CHARS",
   "AGENT_DESCRIPTION_PLACEHOLDER",
+  "Mode",
   "SkillLoader",
   "SkillProfile",
   "SkillStateStore",
   "parse_skill_file",
+  "resolve_blocks",
 ]

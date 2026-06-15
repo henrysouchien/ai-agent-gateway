@@ -4,8 +4,10 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 import secrets
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +17,9 @@ import httpx
 
 from ._io import _atomic_write_json, _read_json_object
 from ._provider_utils import _allowed_models_for_provider, _get_default_model_for_provider, _resolve_provider
+from .autonomous_excel_dispatch import make_autonomous_message_excel_agent_handler
 from .event_log import EventLog
+from .excel_dispatch import make_message_excel_agent_tool_def
 from .mcp_client import McpClientManager
 from .multi_user.billing import SessionUsageSummary, UsageEvent
 from .providers import ModelProvider
@@ -59,6 +63,9 @@ class RunOutput:
   budget_exceeded: bool = False
   max_turns_reached: bool = False
   operator_paused: bool = False
+  max_tokens_reached: bool = False
+  exit_reason: str | None = None
+  post_run_guard: dict[str, Any] | None = None
 
 
 @dataclass
@@ -70,6 +77,69 @@ class DeliveryConfig:
   briefing_file: Path | str | None = None
   webhook_url: str | None = None
   format_message: Callable[[RunOutput, dict[str, Any] | None], str] | None = None
+
+
+def _is_env_placeholder(value: str) -> bool:
+  stripped = value.strip()
+  return stripped.startswith("${") and stripped.endswith("}")
+
+
+def _resolve_autonomous_mcp_gateway_api_key(user_id: str, user_email: str | None) -> str:
+  try:
+    from api.agent.autonomous.mcp_config import _resolve_gateway_api_key
+
+    return str(_resolve_gateway_api_key(user_id, user_email)).strip()
+  except ModuleNotFoundError:
+    api_dir = Path(__file__).resolve().parents[3] / "api"
+    if not api_dir.exists():
+      raise
+    api_dir_text = str(api_dir)
+    if api_dir_text not in sys.path:
+      sys.path.insert(0, api_dir_text)
+    from agent.autonomous.mcp_config import _resolve_gateway_api_key
+
+    return str(_resolve_gateway_api_key(user_id, user_email)).strip()
+
+
+def _resolve_message_excel_agent_gateway_config(user_id: str) -> tuple[str, str]:
+  gateway_url = os.getenv("GATEWAY_URL", "").strip()
+  if not gateway_url or _is_env_placeholder(gateway_url):
+    gateway_url = "https://localhost:8000"
+
+  env_key = os.getenv("GATEWAY_API_KEY", "").strip()
+  if env_key and not _is_env_placeholder(env_key):
+    return gateway_url, env_key
+
+  resolved_user_id = str(user_id or "").strip()
+  user_email = os.getenv("RISK_MODULE_USER_EMAIL", "").strip() or None
+  if not resolved_user_id:
+    raise RuntimeError(
+      "message_excel_agent registration requires GATEWAY_API_KEY or a user_id "
+      "for api/agent/autonomous/mcp_config._resolve_gateway_api_key"
+    )
+
+  try:
+    gateway_api_key = _resolve_autonomous_mcp_gateway_api_key(resolved_user_id, user_email)
+  except SystemExit as exc:
+    detail = str(exc) or "gateway API key resolver exited without a message"
+    raise RuntimeError(
+      "message_excel_agent registration requires GATEWAY_API_KEY or "
+      "GATEWAY_USER_KEYS channel='mcp' entry for "
+      f"user_id={resolved_user_id!r}, user_email={user_email!r}: {detail}"
+    ) from exc
+  except Exception as exc:
+    raise RuntimeError(
+      "message_excel_agent registration requires GATEWAY_API_KEY or "
+      "api/agent/autonomous/mcp_config._resolve_gateway_api_key; "
+      f"resolver failed for user_id={resolved_user_id!r}, user_email={user_email!r}: {exc}"
+    ) from exc
+
+  if not gateway_api_key:
+    raise RuntimeError(
+      "message_excel_agent registration requires a non-empty gateway API key from "
+      "GATEWAY_API_KEY or api/agent/autonomous/mcp_config._resolve_gateway_api_key"
+    )
+  return gateway_url, gateway_api_key
 
 
 def _extract_summary(text: str, limit: int = 1500) -> str:
@@ -100,6 +170,7 @@ def collect_run_output(event_log: EventLog, timed_out: bool) -> RunOutput:
   budget_exceeded = False
   max_turns_reached = False
   operator_paused = False
+  max_tokens_reached = False
 
   for entry in event_log.entries:
     event = entry.event
@@ -119,6 +190,10 @@ def collect_run_output(event_log: EventLog, timed_out: bool) -> RunOutput:
       budget_exceeded = True
     elif event_type == "max_turns_reached":
       max_turns_reached = True
+    elif event_type == "max_tokens_reached":
+      max_tokens_reached = True
+    elif event_type == "assistant_message" and event.get("stop_reason") == "max_tokens":
+      max_tokens_reached = True
     elif event_type == "operator_pause":
       operator_paused = True
     elif event_type == "interrupted" and event.get("reason") == "operator_pause":
@@ -135,6 +210,7 @@ def collect_run_output(event_log: EventLog, timed_out: bool) -> RunOutput:
     budget_exceeded=budget_exceeded,
     max_turns_reached=max_turns_reached,
     operator_paused=operator_paused,
+    max_tokens_reached=max_tokens_reached,
   )
 
 
@@ -177,27 +253,53 @@ async def run_session(
 def run_output_exit_code(run_output: RunOutput) -> int:
   if run_output.timed_out:
     return 124
+  if run_output.exit_reason == "post_run_guard_failed":
+    return 1
   if run_output.error:
     return 1
   if run_output.budget_exceeded:
     return 2
   if run_output.max_turns_reached:
     return 3
+  if run_output.max_tokens_reached:
+    return 4
   return 0
 
 
 def run_output_outcome(run_output: RunOutput) -> str:
   if run_output.timed_out:
     return "timeout"
+  if run_output.exit_reason:
+    return run_output.exit_reason
   if run_output.error:
     return "error"
   if run_output.budget_exceeded:
     return "budget_exceeded"
   if run_output.max_turns_reached:
     return "max_turns"
+  if run_output.max_tokens_reached:
+    return "max_tokens"
   if run_output.operator_paused:
     return "operator_pause"
   return "success"
+
+
+def mark_post_run_guard_failure(
+  run_output: RunOutput,
+  *,
+  guard: str,
+  message: str,
+  details: dict[str, Any] | None = None,
+) -> None:
+  payload = {
+    "guard": guard,
+    "message": message,
+  }
+  if details:
+    payload.update(details)
+  run_output.error = message
+  run_output.exit_reason = "post_run_guard_failed"
+  run_output.post_run_guard = payload
 
 
 def load_state(
@@ -262,6 +364,7 @@ def build_state_payload(
   state["timed_out"] = run_output.timed_out
   state["budget_exceeded"] = run_output.budget_exceeded
   state["max_turns_reached"] = run_output.max_turns_reached
+  state["max_tokens_reached"] = run_output.max_tokens_reached
   state["operator_paused"] = run_output.operator_paused
   state["connected_servers"] = connected_server_names
   state["active_servers"] = active_server_names
@@ -291,12 +394,16 @@ def format_run_summary(
   format_state_fn: Callable[[dict[str, Any]], str] | None = None,
 ) -> str:
   status = "timed out" if run_output.timed_out else "completed"
-  if run_output.error and not run_output.timed_out:
+  if run_output.exit_reason == "post_run_guard_failed" and not run_output.timed_out:
+    status = "post-run guard failed"
+  elif run_output.error and not run_output.timed_out:
     status = "failed"
   elif run_output.budget_exceeded:
     status = "budget exceeded"
   elif run_output.max_turns_reached:
     status = "max turns reached"
+  elif run_output.max_tokens_reached:
+    status = "max tokens reached"
   elif run_output.operator_paused:
     status = "operator paused"
 
@@ -328,6 +435,12 @@ def format_run_summary(
   summary = _extract_summary(run_output.response, limit=1200)
   if summary:
     lines.extend(["", "Summary:", summary])
+  if run_output.exit_reason:
+    lines.extend(["", f"Exit reason: {run_output.exit_reason}"])
+  if run_output.post_run_guard:
+    guard_name = run_output.post_run_guard.get("guard")
+    if guard_name:
+      lines.append(f"Post-run guard: {guard_name}")
   if run_output.error:
     lines.extend(["", f"Error: {run_output.error}"])
 
@@ -480,7 +593,11 @@ async def run_autonomous(
   max_turns: int = 80,
   timeout_seconds: float | None = None,
   max_budget_usd: float | None = None,
-  per_turn_timeout: float | None = 300.0,
+  # None by default: thinking-turn duration is unpredictable, so a wall-clock
+  # per-turn cap races the runner's event-gap stall guard (which retries) and
+  # terminally kills slow-first-token turns (ACUI-25). Liveness = stall guard;
+  # runaway bounds = max_turns / max_budget_usd / timeout_seconds.
+  per_turn_timeout: float | None = None,
   client_timeout: float = 90.0,
   max_concurrent_sub_agents: int | None = None,
   compaction_instructions: str | None = None,
@@ -519,12 +636,24 @@ async def run_autonomous(
   allowed_models = _allowed_models_for_provider(provider_instance, resolved_model)
   sid = str(session_id or f"autonomous-{secrets.token_hex(8)}")
   skill_loader = SkillLoader(skills_dir) if skills_dir else None
+  excel_dispatch_config: tuple[str, str] | None = None
+  excel_dispatch_enabled = os.getenv("EXCEL_ORCHESTRATION_DEV", "").strip() == "1"
+  if excel_dispatch_enabled and "message_excel_agent" not in (tool_handlers or {}):
+    # Non-fatal: a globally-set dev flag must not crash a non-Excel autonomous run.
+    # If the gateway URL/key can't be resolved, log and skip registering the tool.
+    try:
+      excel_dispatch_config = _resolve_message_excel_agent_gateway_config(user_id)
+    except Exception as exc:
+      log.warning("message_excel_agent registration skipped (gateway config unresolved): %s", exc)
+      excel_dispatch_config = None
 
   mcp_client: McpClientManager | None = None
   connected_servers: set[str] = set()
   active_servers: set[str] = set()
   if mcp_servers or mcp_config_path:
     builtin_names = set((tool_handlers or {}).keys())
+    if excel_dispatch_config is not None:
+      builtin_names.add("message_excel_agent")
     if skills_dir and "run_agent" not in builtin_names:
       builtin_names |= {"run_agent", "get_background_result", "send_message"}
     mcp_client = McpClientManager(
@@ -543,6 +672,15 @@ async def run_autonomous(
     local_handlers = dict(tool_handlers or {})
     extra_tool_defs = list(tool_definitions or [])
     runner_ref: list[Any] = [None]
+
+    if excel_dispatch_config is not None and "message_excel_agent" not in local_handlers:
+      gateway_url, gateway_api_key = excel_dispatch_config
+      local_handlers["message_excel_agent"] = make_autonomous_message_excel_agent_handler(
+        gateway_url=gateway_url,
+        gateway_api_key=gateway_api_key,
+      )
+      if not any(definition.get("name") == "message_excel_agent" for definition in extra_tool_defs):
+        extra_tool_defs.append(make_message_excel_agent_tool_def())
 
     if skill_loader is not None and "run_agent" not in local_handlers:
       local_handlers["run_agent"] = make_run_agent_handler(
@@ -681,6 +819,7 @@ __all__ = [
   "extract_state_update",
   "format_run_summary",
   "load_state",
+  "mark_post_run_guard_failure",
   "run_autonomous",
   "run_autonomous_sync",
   "run_output_exit_code",

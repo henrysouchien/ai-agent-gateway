@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from agent_gateway import (
   parse_skill_file,
 )
 from agent_gateway.providers import StreamEvent
+import agent_gateway._provider_utils as provider_utils
 
 
 def _run(coro):
@@ -312,6 +314,51 @@ def test_make_run_agent_handler_uses_skill_provider_and_resolved_default_model(t
   assert runner.calls[0]["provider"] is resolved_provider
   assert runner.calls[0]["auth_config"] == {"api_key": "openai-key"}
   assert runner.calls[0]["model"] == "gpt-4o-mini"
+
+
+def test_make_run_agent_handler_ignores_invalid_knob_for_resolved_provider(
+  tmp_path: Path,
+  monkeypatch,
+  caplog,
+) -> None:
+  skills_dir = tmp_path / "skills"
+  _write_skill(
+    skills_dir,
+    "openai-worker",
+    "---\nagent_callable: true\nagent_description: Uses the OpenAI worker.\nprovider: openai\n---\nUse the OpenAI worker.",
+  )
+  runner = _StubRunner()
+  resolved_provider = _RecordingProvider("openai")
+  provider_utils._SUB_AGENT_DEFAULT_MODEL_WARNED.clear()
+  monkeypatch.setenv("SUB_AGENT_DEFAULT_MODEL", "claude-opus-4-8")
+
+  def _resolve_provider(name: str) -> ResolvedProvider:
+    assert name == "openai"
+    return ResolvedProvider(
+      provider=resolved_provider,
+      auth_config={"api_key": "openai-key"},
+      allowed_models={"gpt-4o-mini"},
+      default_model="gpt-4o-mini",
+    )
+
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={},
+    default_model="claude-sonnet-4-6",
+    allowed_models={"claude-sonnet-4-6", "claude-opus-4-8"},
+    provider_resolver=_resolve_provider,
+  )
+
+  caplog.set_level(logging.WARNING, logger="agent_gateway.provider_utils")
+  result, error = _run(handler({"agent": "openai-worker", "task": "Collect"}))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  assert runner.calls[0]["provider"] is resolved_provider
+  assert runner.calls[0]["model"] == "gpt-4o-mini"
+  assert "Ignoring SUB_AGENT_DEFAULT_MODEL='claude-opus-4-8'" in caplog.text
 
 
 def test_make_run_agent_tool_def_includes_provider_field() -> None:

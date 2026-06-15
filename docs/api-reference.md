@@ -412,7 +412,7 @@ Factory for the `get_background_result` tool schema. The tool accepts `task_id` 
 
 ## Typed Events
 
-Added in 0.15.0. Frozen dataclasses for the six skill-framework events emitted on the `/api/chat` SSE stream when the host wires up a `SkillProfile` and a `skill_run_id`. The six event classes plus `event_to_dict` are re-exported from `agent_gateway` top-level; the rest live in `agent_gateway.events`. Wire format (JSON shape on the SSE stream) is documented in `http-api.md` → "Skill Framework Events".
+Added in 0.15.0 and extended by later result-capture work. Frozen dataclasses cover the run/artifact lifecycle events emitted on the `/api/chat` SSE stream when the host wires up a `SkillProfile` and a `skill_run_id`; structured skill results are emitted as `skill_result_captured` wire events. The dataclass event classes plus `event_to_dict` are re-exported from `agent_gateway` top-level; the rest live in `agent_gateway.events`. Wire format (JSON shape on the SSE stream) is documented in `http-api.md` → "Skill Framework Events".
 
 ### `SkillRunStartedEvent`
 
@@ -420,15 +420,15 @@ Emitted once at the start of a skill-framework sub-agent run.
 
 Fields: `skill_run_id`, `skill`, `ticker`, `ts`. `type` is fixed to `"skill_run_started"`.
 
-### `VerdictEmittedEvent`
+### `SkillResultCapturedEvent`
 
-Emitted when the skill writes a verdict YAML through `memory_write` (extracted in reverse order from `tool_call_complete.final_tool_result_blocks`).
+Emitted when a skill run completes with a structured runtime result. This is the display/control-plane source for status, gate code, artifact refs, proposal ids, FMS result envelopes, and verdict echo data.
 
-Fields: `skill_run_id`, `skill`, `ticker`, `verdict_token`, `confidence` (`"HIGH" | "MEDIUM" | "LOW" | None`), `materiality_cushion` (`float | None`), `one_line_summary`, `ts`.
+Fields: `skill_run_id`, `skill`, `ticker`, `exit_code`, `outcome`, `status`, `gate_code`, `artifact_refs`, `proposal_ids`, `verdict_echo`, `fms_results`, `artifact_events`, `output_memory_file`, `cost_usd`, `duration_s`, `error`, `warnings`.
 
 ### `ArtifactReadyEvent`
 
-Emitted when the materializer writes a JSON sidecar (and optionally a `.docx` letter) to per-user workspace storage. Pairs with the artifact read endpoints documented in `http-api.md`.
+Emitted when a structured report door or artifact-producing tool writes a JSON sidecar (and optionally a binary artifact such as a `.docx` letter) to per-user workspace storage. Pairs with the artifact read endpoints documented in `http-api.md`.
 
 Fields: `skill_run_id`, `ticker`, `skill`, `artifact_id`, `artifact_path`, `binary_artifact_path` (`str | None`), `contract_name`, `data_source` (`"live" | "fixture"`), `ts`.
 
@@ -440,9 +440,9 @@ Fields: `skill_run_id`, `ticker`, `view_model_id`, `trigger` (`AggregateReadyTri
 
 ### `ArtifactFailedEvent`
 
-Emitted when the materializer fails to produce an artifact.
+Emitted when a structured report door or artifact-producing tool fails to produce an artifact.
 
-Fields: `skill_run_id`, `ticker`, `skill`, `error_code` (`"yaml_parse" | "validation" | "missing_contract" | "schema_drift" | "other"`), `error_detail`, `source_path`, `ts`.
+Fields: `skill_run_id`, `ticker`, `skill`, `error_code` (`"validation" | "missing_contract" | "schema_drift" | "tool_write_failed" | "other"`), `error_detail`, `source_path`, `ts`.
 
 ### `ArtifactUnavailableEvent`
 

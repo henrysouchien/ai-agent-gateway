@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+from datetime import timedelta
 from typing import Any
 
 from .approval_policy import (
@@ -10,6 +11,8 @@ from .approval_policy import (
   ApprovalRequest,
   ApprovalRequestPayload,
   RunContext,
+  ToolClass,
+  utc_now,
 )
 
 
@@ -140,5 +143,87 @@ class SingleUserApprovalPolicy:
     return True
 
 
+class DelegationApprovalPolicy:
+  """Approval policy wrapper for server-authoritative delegated Excel turns."""
+
+  policy_id = "delegation"
+
+  def __init__(self, *, base: ApprovalPolicy) -> None:
+    self._base = base
+    try:
+      source = inspect.getsource(type(self))
+    except Exception:
+      source = type(self).__name__
+    base_hash = getattr(base, "policy_bundle_hash", "unknown")
+    self._policy_bundle_hash = hashlib.sha256((source + base_hash).encode("utf-8")).hexdigest()
+
+  @property
+  def policy_version(self) -> str:
+    return getattr(self._base, "policy_version", "1")
+
+  @property
+  def policy_bundle_hash(self) -> str:
+    return self._policy_bundle_hash
+
+  async def decide(
+    self,
+    *,
+    payload: ApprovalRequestPayload,
+    request: ApprovalRequest,
+    run_context: RunContext,
+  ) -> ApprovalDecision:
+    grant = run_context.delegation
+    if grant is None:
+      return await self._base.decide(payload=payload, request=request, run_context=run_context)
+
+    if request.tool_class in {"portfolio_config", "irreversible"}:
+      return self._request_user(f"{request.tool_class} tool requires explicit user approval")
+
+    if request.tool_class == "external_write":
+      return self._request_user("external_write tool requires explicit user approval under delegation")
+
+    if (
+      request.tool_class in grant.tool_class_ceiling
+      and utc_now() <= grant.created_at + timedelta(seconds=grant.window_seconds)
+      and self._predicate_matches(payload=payload, predicate=grant.args_predicate)
+    ):
+      return ApprovalDecision(
+        outcome="auto_approve",
+        reason="delegation grant matched",
+        policy_id=self.policy_id,
+        policy_version=self.policy_version,
+      )
+
+    return self._request_user("Tool requires user approval under delegation")
+
+  async def on_resolve(self, *, request: ApprovalRequest) -> None:
+    await self._base.on_resolve(request=request)
+
+  async def revoke_persistent_grant(self, *, grant_id: str, reason: str) -> None:
+    await self._base.revoke_persistent_grant(grant_id=grant_id, reason=reason)
+
+  def role_authorized_for_class(self, *, decider_role: str | None, tool_class: ToolClass) -> bool:
+    return self._base.role_authorized_for_class(decider_role=decider_role, tool_class=tool_class)
+
+  def _request_user(self, reason: str) -> ApprovalDecision:
+    return ApprovalDecision(
+      outcome="request_user_approval",
+      reason=reason,
+      route_target_type="pending_tools",
+      required_decider_count=1,
+      eligible_decider_count=1,
+      expiry_seconds=600,
+      allow_persistent_grant=False,
+      policy_id=self.policy_id,
+      policy_version=self.policy_version,
+    )
+
+  @staticmethod
+  def _predicate_matches(*, payload: ApprovalRequestPayload, predicate: dict[str, Any] | None) -> bool:
+    if predicate is None:
+      return True
+    return all(payload.tool_args.get(key) == value for key, value in predicate.items())
+
+
 def make_default_policy(*, store: Any | None = None) -> ApprovalPolicy:
-  return SingleUserApprovalPolicy(store=store)
+  return DelegationApprovalPolicy(base=SingleUserApprovalPolicy(store=store))

@@ -4,14 +4,18 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
+import re
 import secrets
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .fixture_gate import is_fixture_profile_name, is_fixture_skill_name, require_fixture_provider_available
 
 _AGENT_API_CLAIM_AUDIENCE = "agent_api_v1"
 _AGENT_API_CLAIM_TTL_SECONDS_DEFAULT = 300
@@ -26,8 +30,72 @@ _AGENT_API_CLAIM_ENV_VARS = {
 }
 _STATUS_TAIL_LINES = 40
 _SPAWN_CLEANUP_GRACE_SEC = 1.0
-AUTONOMOUS_ALLOWED_PROFILES = frozenset({"analyst", "advisor", "research_producer", "tutor"})
-_AUTONOMOUS_ALLOWED_PROFILE_DISPLAY = "analyst, advisor, research_producer, or tutor"
+_AUTONOMOUS_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_AUTONOMOUS_RUN_FILE_RE = re.compile(r"^bg_(\d+)\..+")
+_AUTONOMOUS_MANIFEST_FILE_RE = re.compile(r"^bg_(\d+)\.task\.json$")
+_ACTIVE_AUTONOMOUS_PROCESS_STATES = {"running", "approval_pending"}
+_REHYDRATED_ACTIVE_STATES = {"running", "approval_pending", "queued", "waiting"}
+_TERMINAL_AUTONOMOUS_STATES = {"completed", "failed", "killed", "interrupted"}
+_REHYDRATION_INTERRUPTED_ERROR = "gateway restarted while run was active"
+_REHYDRATE_EVENTS_SIZE_CAP_BYTES = 5 * 1024 * 1024
+_REHYDRATE_EVENTS_TAIL_LINES = 2000
+_TASK_MANIFEST_VERSION = 1
+_LOGGER = logging.getLogger(__name__)
+
+
+class _ManifestTrackedList(list[str]):
+  def __init__(self, values: list[str], on_change) -> None:
+    super().__init__(values)
+    self._on_change = on_change
+
+  def _changed(self) -> None:
+    self._on_change()
+
+  def append(self, item: str) -> None:
+    super().append(item)
+    self._changed()
+
+  def extend(self, values) -> None:
+    super().extend(values)
+    self._changed()
+
+  def insert(self, index: int, item: str) -> None:
+    super().insert(index, item)
+    self._changed()
+
+  def remove(self, item: str) -> None:
+    super().remove(item)
+    self._changed()
+
+  def pop(self, index: int = -1) -> str:
+    item = super().pop(index)
+    self._changed()
+    return item
+
+  def clear(self) -> None:
+    super().clear()
+    self._changed()
+
+  def sort(self, *args, **kwargs) -> None:
+    super().sort(*args, **kwargs)
+    self._changed()
+
+  def reverse(self) -> None:
+    super().reverse()
+    self._changed()
+
+  def __setitem__(self, index, value) -> None:
+    super().__setitem__(index, value)
+    self._changed()
+
+  def __delitem__(self, index) -> None:
+    super().__delitem__(index)
+    self._changed()
+
+  def __iadd__(self, values):
+    result = super().__iadd__(values)
+    self._changed()
+    return result
 
 
 def get_agent_api_claim_ttl_seconds() -> int:
@@ -71,6 +139,17 @@ def sign_user_claim(
   }
 
 
+def normalize_autonomous_profile(profile: str) -> str:
+  normalized_profile = str(profile or "").strip().lower()
+  if not normalized_profile:
+    raise ValueError("profile is required")
+  if is_fixture_profile_name(normalized_profile):
+    return normalized_profile
+  if not _AUTONOMOUS_PROFILE_NAME_RE.fullmatch(normalized_profile):
+    raise ValueError("profile must be a Python module-safe name using letters, numbers, and underscores")
+  return normalized_profile
+
+
 @dataclass
 class AutonomousTask:
   task_id: str
@@ -88,6 +167,8 @@ class AutonomousTask:
   cmd: list[str]
   log_path: Path
   events_path: Path | None
+  operator_inbox_path: Path | None
+  approval_decisions_path: Path | None
   started_at: float
   state: str = "running"
   exit_code: int | None = None
@@ -99,6 +180,11 @@ class AutonomousTask:
   log_handle: Any | None = None
   slot_reserved: bool = False
   event_lines: list[dict[str, Any]] | None = None
+  delivered_messages: set[str] = field(default_factory=set)
+  operator_message_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+  resume_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+  resumed_from: str | None = None
+  resumed_as: list[str] = field(default_factory=list)
 
   @property
   def elapsed_sec(self) -> int:
@@ -115,19 +201,339 @@ class AutonomousRegistry:
     log_dir: Path | None = None,
     max_running: int = 2,
     user_event_bus: Any | None = None,
+    approval_db_path: Path | str | None = None,
   ) -> None:
     self._api_dir = Path(api_dir)
     self._python = python_executable or sys.executable
     self._log_dir = (log_dir or Path("~/.cache/agent-gateway/autonomous").expanduser()).expanduser()
     self._max_running = max_running
     self._user_event_bus = user_event_bus
+    self._approval_db_path = (
+      Path(approval_db_path).expanduser().resolve() if approval_db_path is not None else None
+    )
     self._tasks: dict[str, AutonomousTask] = {}
-    self._seq = 0
+    self._seq = self._initial_task_seq()
     self._slot_lock = asyncio.Lock()
     self._reserved_slots = 0
+    self.rehydrate()
 
   def set_user_event_bus(self, user_event_bus: Any | None) -> None:
     self._user_event_bus = user_event_bus
+
+  def _initial_task_seq(self) -> int:
+    if not self._log_dir.exists():
+      return 0
+    max_existing = -1
+    try:
+      for path in self._log_dir.iterdir():
+        if not path.is_file():
+          continue
+        match = _AUTONOMOUS_RUN_FILE_RE.match(path.name)
+        if match is None:
+          continue
+        max_existing = max(max_existing, int(match.group(1)))
+    except OSError:
+      _LOGGER.warning(
+        "Failed to scan autonomous log directory for existing run ids: %s",
+        self._log_dir,
+        exc_info=True,
+      )
+      return 0
+    return max_existing + 1
+
+  def _manifest_path(self, task_id: str) -> Path:
+    return self._log_dir / f"{task_id}.task.json"
+
+  def _manifest_payload(self, record: AutonomousTask) -> dict[str, Any]:
+    return {
+      "manifest_version": _TASK_MANIFEST_VERSION,
+      "task_id": record.task_id,
+      "control_run_id": record.control_run_id,
+      "user_id": record.user_id,
+      "user_email": record.user_email,
+      "profile": record.profile,
+      "mode": record.mode,
+      "task": record.task,
+      "skill": record.skill,
+      "context": record.context,
+      "ticker": record.ticker,
+      "channel": record.channel,
+      "dev_mode": record.dev_mode,
+      "cmd": list(record.cmd),
+      "log_path": str(record.log_path),
+      "events_path": str(record.events_path) if record.events_path is not None else None,
+      "operator_inbox_path": (
+        str(record.operator_inbox_path) if record.operator_inbox_path is not None else None
+      ),
+      "approval_decisions_path": (
+        str(record.approval_decisions_path) if record.approval_decisions_path is not None else None
+      ),
+      "started_at": record.started_at,
+      "state": record.state,
+      "exit_code": record.exit_code,
+      "error": record.error,
+      "completed_at": record.completed_at,
+      "resumed_from": record.resumed_from,
+      "resumed_as": list(record.resumed_as),
+    }
+
+  def _attach_manifest_tracking(self, record: AutonomousTask) -> None:
+    if isinstance(record.resumed_as, _ManifestTrackedList):
+      return
+    record.resumed_as = _ManifestTrackedList(
+      list(record.resumed_as),
+      lambda: self._write_task_manifest(record),
+    )
+
+  def _write_task_manifest(self, record: AutonomousTask) -> None:
+    manifest_path = self._manifest_path(record.task_id)
+    tmp_path = manifest_path.with_name(f"{manifest_path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+      manifest_path.parent.mkdir(parents=True, exist_ok=True)
+      tmp_path.write_text(
+        json.dumps(self._manifest_payload(record), sort_keys=True) + "\n",
+        encoding="utf-8",
+      )
+      os.replace(tmp_path, manifest_path)
+    except Exception:
+      try:
+        tmp_path.unlink()
+      except OSError:
+        pass
+      _LOGGER.warning(
+        "Failed to write autonomous task manifest for %s",
+        record.task_id,
+        exc_info=True,
+      )
+
+  def _delete_task_manifest(self, task_id: str) -> None:
+    try:
+      self._manifest_path(task_id).unlink()
+    except FileNotFoundError:
+      pass
+    except OSError:
+      _LOGGER.warning(
+        "Failed to delete autonomous task manifest for uncommitted run %s",
+        task_id,
+        exc_info=True,
+      )
+
+  def _manifest_paths(self) -> list[Path]:
+    if not self._log_dir.exists():
+      return []
+    try:
+      return sorted(
+        (
+          path
+          for path in self._log_dir.iterdir()
+          if path.is_file() and _AUTONOMOUS_MANIFEST_FILE_RE.match(path.name)
+        ),
+        key=lambda path: path.name,
+      )
+    except OSError:
+      _LOGGER.warning(
+        "Failed to scan autonomous log directory for manifests: %s",
+        self._log_dir,
+        exc_info=True,
+      )
+      return []
+
+  def _path_from_manifest(
+    self,
+    manifest: dict[str, Any],
+    field_name: str,
+    *,
+    fallback: Path | None = None,
+  ) -> Path | None:
+    raw = manifest.get(field_name)
+    if isinstance(raw, str) and raw.strip():
+      return Path(raw).expanduser()
+    return fallback
+
+  def _event_timestamp(self, event: dict[str, Any]) -> float | None:
+    for key in ("ts", "sent_at", "decided_at", "timestamp", "created_at"):
+      raw = event.get(key)
+      if isinstance(raw, (int, float)):
+        return float(raw)
+      if isinstance(raw, str):
+        try:
+          return float(raw)
+        except ValueError:
+          continue
+    return None
+
+  def _last_event_timestamp(self, events: list[dict[str, Any]]) -> float | None:
+    for event in reversed(events):
+      ts = self._event_timestamp(event)
+      if ts is not None:
+        return ts
+    return None
+
+  def _parse_event_lines(self, lines: list[str], *, path: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in lines:
+      stripped = line.strip()
+      if not stripped:
+        continue
+      try:
+        event = json.loads(stripped)
+      except json.JSONDecodeError:
+        _LOGGER.warning("Skipping malformed autonomous event line while rehydrating %s", path)
+        continue
+      if isinstance(event, dict):
+        events.append(event)
+    return events
+
+  def _load_rehydrated_events(self, events_path: Path | None) -> list[dict[str, Any]]:
+    if events_path is None:
+      return []
+    try:
+      stat = events_path.stat()
+    except FileNotFoundError:
+      return []
+    except OSError:
+      _LOGGER.warning("Failed to stat autonomous events file for rehydration: %s", events_path, exc_info=True)
+      return []
+
+    try:
+      if stat.st_size <= _REHYDRATE_EVENTS_SIZE_CAP_BYTES:
+        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+          return self._parse_event_lines(handle.readlines(), path=events_path)
+
+      _LOGGER.warning(
+        "Autonomous events file exceeds rehydrate cap; loading tail only: %s",
+        events_path,
+      )
+      recent = deque(maxlen=_REHYDRATE_EVENTS_TAIL_LINES)
+      with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+          recent.append(line)
+      return self._parse_event_lines(list(recent), path=events_path)
+    except OSError:
+      _LOGGER.warning("Failed to load autonomous events for rehydration: %s", events_path, exc_info=True)
+      return []
+
+  def _coerce_manifest_str(self, manifest: dict[str, Any], field_name: str) -> str | None:
+    value = manifest.get(field_name)
+    return value if isinstance(value, str) else None
+
+  def _task_from_manifest(
+    self,
+    manifest: dict[str, Any],
+    *,
+    manifest_path: Path,
+    rehydrate_time: float,
+  ) -> AutonomousTask | None:
+    if manifest.get("manifest_version") != _TASK_MANIFEST_VERSION:
+      _LOGGER.warning("Skipping autonomous manifest with unsupported version: %s", manifest_path)
+      return None
+
+    task_id = self._coerce_manifest_str(manifest, "task_id")
+    control_run_id = self._coerce_manifest_str(manifest, "control_run_id")
+    user_id = self._coerce_manifest_str(manifest, "user_id")
+    profile = self._coerce_manifest_str(manifest, "profile")
+    mode = self._coerce_manifest_str(manifest, "mode")
+    if not task_id or not control_run_id or not user_id or not profile or not mode:
+      _LOGGER.warning("Skipping autonomous manifest missing required fields: %s", manifest_path)
+      return None
+
+    events_path = self._path_from_manifest(
+      manifest,
+      "events_path",
+      fallback=manifest_path.with_name(f"{task_id}.events.jsonl"),
+    )
+    events = self._load_rehydrated_events(events_path)
+
+    raw_state = self._coerce_manifest_str(manifest, "state") or "running"
+    was_interrupted = False
+    completed_at = manifest.get("completed_at")
+    completed_at = float(completed_at) if isinstance(completed_at, (int, float)) else None
+    error = self._coerce_manifest_str(manifest, "error")
+    if raw_state in _REHYDRATED_ACTIVE_STATES or raw_state not in _TERMINAL_AUTONOMOUS_STATES:
+      raw_state = "interrupted"
+      was_interrupted = True
+      completed_at = self._last_event_timestamp(events) or rehydrate_time
+      error = _REHYDRATION_INTERRUPTED_ERROR
+
+    cmd = manifest.get("cmd")
+    resumed_as = manifest.get("resumed_as")
+    user_email = manifest.get("user_email")
+    exit_code = manifest.get("exit_code")
+    started_at = manifest.get("started_at")
+
+    record = AutonomousTask(
+      task_id=task_id,
+      control_run_id=control_run_id,
+      user_id=user_id,
+      user_email=user_email if isinstance(user_email, str) else None,
+      profile=profile,
+      mode=mode,
+      task=self._coerce_manifest_str(manifest, "task"),
+      skill=self._coerce_manifest_str(manifest, "skill"),
+      context=self._coerce_manifest_str(manifest, "context"),
+      ticker=self._coerce_manifest_str(manifest, "ticker"),
+      channel=self._coerce_manifest_str(manifest, "channel"),
+      dev_mode=bool(manifest.get("dev_mode", False)),
+      cmd=[str(part) for part in cmd] if isinstance(cmd, list) else [],
+      log_path=self._path_from_manifest(
+        manifest,
+        "log_path",
+        fallback=manifest_path.with_name(f"{task_id}.log"),
+      )
+      or manifest_path.with_name(f"{task_id}.log"),
+      events_path=events_path,
+      operator_inbox_path=self._path_from_manifest(
+        manifest,
+        "operator_inbox_path",
+        fallback=manifest_path.with_name(f"{task_id}.operator-messages.jsonl"),
+      ),
+      approval_decisions_path=self._path_from_manifest(
+        manifest,
+        "approval_decisions_path",
+        fallback=manifest_path.with_name(f"{task_id}.approval-decisions.jsonl"),
+      ),
+      started_at=float(started_at) if isinstance(started_at, (int, float)) else rehydrate_time,
+      state=raw_state,
+      exit_code=int(exit_code) if isinstance(exit_code, int) else None,
+      error=error,
+      proc=None,
+      reaper_task=None,
+      events_tail_task=None,
+      completed_at=completed_at,
+      log_handle=None,
+      slot_reserved=False,
+      event_lines=events,
+      resumed_from=self._coerce_manifest_str(manifest, "resumed_from"),
+      resumed_as=[str(item) for item in resumed_as] if isinstance(resumed_as, list) else [],
+    )
+    self._attach_manifest_tracking(record)
+    if was_interrupted:
+      self._write_task_manifest(record)
+    return record
+
+  def rehydrate(self) -> None:
+    rehydrate_time = time.time()
+    for manifest_path in self._manifest_paths():
+      try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+      except (OSError, json.JSONDecodeError):
+        _LOGGER.warning("Skipping unreadable autonomous task manifest: %s", manifest_path, exc_info=True)
+        continue
+      if not isinstance(manifest, dict):
+        _LOGGER.warning("Skipping malformed autonomous task manifest: %s", manifest_path)
+        continue
+
+      record = self._task_from_manifest(
+        manifest,
+        manifest_path=manifest_path,
+        rehydrate_time=rehydrate_time,
+      )
+      if record is None:
+        continue
+      if record.task_id in self._tasks:
+        _LOGGER.warning("Skipping duplicate autonomous task manifest for %s", record.task_id)
+        continue
+      self._tasks[record.task_id] = record
 
   def _next_task_id(self) -> str:
     task_id = f"bg_{self._seq}"
@@ -142,11 +548,12 @@ class AutonomousRegistry:
     task: str | None,
     skill: str | None,
     context: str | None,
+    ticker: str | None = None,
     dev_mode: bool = False,
   ) -> list[str]:
-    normalized_profile = profile.strip().lower()
-    if normalized_profile not in AUTONOMOUS_ALLOWED_PROFILES:
-      raise ValueError(f"profile must be {_AUTONOMOUS_ALLOWED_PROFILE_DISPLAY}")
+    normalized_profile = normalize_autonomous_profile(profile)
+    if is_fixture_profile_name(normalized_profile):
+      require_fixture_provider_available("fixture profile dispatch", error_type=ValueError)
 
     normalized_mode = mode.strip().lower()
     if normalized_mode not in {"once", "task", "skill"}:
@@ -176,9 +583,13 @@ class AutonomousRegistry:
 
     if not skill or not skill.strip():
       raise ValueError("skill is required when mode='skill'")
+    if is_fixture_skill_name(skill):
+      require_fixture_provider_available("fixture skill dispatch", error_type=ValueError)
     if task:
       raise ValueError("mode='skill' does not accept task")
     cmd.extend(["--skill", skill.strip()])
+    if ticker and ticker.strip():
+      cmd.extend(["--ticker", ticker.strip().upper()])
     if context and context.strip():
       cmd.extend(["--context", context.strip()])
     return cmd
@@ -198,8 +609,134 @@ class AutonomousRegistry:
     event_copy.setdefault("control_run_id", record.control_run_id)
     return event_copy
 
+  def _event_duplicate_key(self, event: dict[str, Any]) -> tuple[str, str] | None:
+    if event.get("type") != "parent_message_sent":
+      return None
+    message_id = event.get("message_id")
+    if not isinstance(message_id, str) or not message_id.strip():
+      return None
+    scope = "|".join(
+      str(event.get(key) or "")
+      for key in ("task_type", "task_id", "run_id", "control_run_id")
+    )
+    return ("parent_message_sent", f"{scope}|{message_id.strip()}")
+
+  def _event_already_recorded(self, record: AutonomousTask, event: dict[str, Any]) -> bool:
+    duplicate_key = self._event_duplicate_key(event)
+    if duplicate_key is None:
+      return False
+    for existing in record.event_lines or ():
+      if self._event_duplicate_key(existing) == duplicate_key:
+        return True
+    return False
+
+  def _event_file_already_recorded(self, record: AutonomousTask, event: dict[str, Any]) -> bool:
+    duplicate_key = self._event_duplicate_key(event)
+    if duplicate_key is None or record.events_path is None:
+      return False
+    try:
+      with record.events_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+          try:
+            existing = json.loads(line)
+          except json.JSONDecodeError:
+            continue
+          if isinstance(existing, dict) and self._event_duplicate_key(existing) == duplicate_key:
+            return True
+    except FileNotFoundError:
+      return False
+    return False
+
+  def _append_event_to_events_file(self, record: AutonomousTask, event: dict[str, Any]) -> None:
+    if record.events_path is None:
+      return
+    if self._event_file_already_recorded(record, event):
+      return
+    record.events_path.parent.mkdir(parents=True, exist_ok=True)
+    with record.events_path.open("a", encoding="utf-8", buffering=1) as handle:
+      handle.write(json.dumps(event, default=str) + "\n")
+
+  def _operator_inbox_record_for_message_id(
+    self,
+    record: AutonomousTask,
+    message_id: str,
+  ) -> dict[str, Any] | None:
+    if record.operator_inbox_path is None:
+      return None
+    try:
+      with record.operator_inbox_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+          try:
+            payload = json.loads(line)
+          except json.JSONDecodeError:
+            continue
+          if isinstance(payload, dict) and payload.get("message_id") == message_id:
+            return payload
+    except FileNotFoundError:
+      return None
+    return None
+
+  def _parent_message_event(
+    self,
+    record: AutonomousTask,
+    *,
+    message_id: str,
+    text: str,
+    user_id: str,
+    sent_at: float,
+  ) -> dict[str, Any]:
+    inbox_record = self._operator_inbox_record_for_message_id(record, message_id)
+    event_text = text
+    event_sent_at: float | str = sent_at
+    sender: dict[str, Any] = {"user_id": user_id}
+    if inbox_record is not None:
+      inbox_text = inbox_record.get("message") or inbox_record.get("text")
+      if isinstance(inbox_text, str) and inbox_text:
+        event_text = inbox_text
+      inbox_sent_at = inbox_record.get("sent_at")
+      if isinstance(inbox_sent_at, (int, float, str)):
+        event_sent_at = inbox_sent_at
+      inbox_sender = inbox_record.get("sender")
+      if isinstance(inbox_sender, dict):
+        sender = dict(inbox_sender)
+    return self._event_for_record(
+      record,
+      {
+        "type": "parent_message_sent",
+        "task_id": record.task_id,
+        "task_type": "autonomous",
+        "profile": record.profile,
+        "mode": record.mode,
+        "message_id": message_id,
+        "sender": sender,
+        "sent_at": event_sent_at,
+        "message": event_text,
+      },
+    )
+
+  async def _persist_and_publish_parent_message_event(
+    self,
+    record: AutonomousTask,
+    *,
+    message_id: str,
+    text: str,
+    user_id: str,
+    sent_at: float,
+  ) -> None:
+    event = self._parent_message_event(
+      record,
+      message_id=message_id,
+      text=text,
+      user_id=user_id,
+      sent_at=sent_at,
+    )
+    self._append_event_to_events_file(record, event)
+    await self._record_and_publish_event(record, event)
+
   async def _record_and_publish_event(self, record: AutonomousTask, event: dict[str, Any]) -> None:
     event_copy = self._event_for_record(record, event)
+    if self._event_already_recorded(record, event_copy):
+      return
     if record.event_lines is None:
       record.event_lines = []
     record.event_lines.append(event_copy)
@@ -243,6 +780,9 @@ class AutonomousRegistry:
       return "failed"
     return "running"
 
+  def _is_active_process_state(self, record: AutonomousTask) -> bool:
+    return record.state in _ACTIVE_AUTONOMOUS_PROCESS_STATES
+
   def _has_terminal_run_state(self, record: AutonomousTask, state: str) -> bool:
     for event in record.event_lines or ():
       if event.get("type") == "run_state_changed" and event.get("state") == state:
@@ -285,6 +825,15 @@ class AutonomousRegistry:
     if record is None:
       raise ValueError(f"Unknown task_id: {task_id}")
     return record
+
+  def _find_by_control_run_id(self, control_run_id: str) -> AutonomousTask | None:
+    record = self._tasks.get(control_run_id)
+    if record is not None:
+      return record
+    return next(
+      (task for task in self._tasks.values() if task.control_run_id == control_run_id),
+      None,
+    )
 
   def live_process_count(self) -> int:
     return sum(
@@ -342,6 +891,7 @@ class AutonomousRegistry:
     log_handle: Any | None,
   ) -> None:
     self._tasks.pop(task_id, None)
+    self._delete_task_manifest(task_id)
     await self._terminate_unowned_process(record)
     if log_handle is not None:
       log_handle.close()
@@ -368,41 +918,60 @@ class AutonomousRegistry:
     ticker: str | None = None,
     channel: str | None = None,
     dev_mode: bool = False,
+    resumed_from: str | None = None,
   ) -> dict[str, Any]:
-    cmd = self._build_cmd(profile=profile, mode=mode, task=task, skill=skill, context=context, dev_mode=dev_mode)
     await self._reserve_slot()
     task_id = self._next_task_id()
     control_run_id = control_run_id or task_id
-    log_path = self._log_dir / f"{task_id}.log"
-    events_path = self._log_dir / f"{task_id}.events.jsonl"
     log_handle = None
     record: AutonomousTask | None = None
     ownership_transferred = False
     try:
+      cmd = self._build_cmd(
+        profile=profile,
+        mode=mode,
+        task=task,
+        skill=skill,
+        context=context,
+        ticker=ticker,
+        dev_mode=dev_mode,
+      )
+      normalized_mode = mode.strip().lower()
+      effective_dev_mode = bool(dev_mode or normalized_mode == "task")
+      log_path = self._log_dir / f"{task_id}.log"
+      events_path = self._log_dir / f"{task_id}.events.jsonl"
+      operator_inbox_path = self._log_dir / f"{task_id}.operator-messages.jsonl"
+      approval_decisions_path = self._log_dir / f"{task_id}.approval-decisions.jsonl"
       self._log_dir.mkdir(parents=True, exist_ok=True)
-      events_path.touch(exist_ok=True)
-      log_handle = log_path.open("ab")
+      events_path.write_text("", encoding="utf-8")
+      operator_inbox_path.write_text("", encoding="utf-8")
+      approval_decisions_path.write_text("", encoding="utf-8")
+      log_handle = log_path.open("wb")
       record = AutonomousTask(
         task_id=task_id,
         control_run_id=control_run_id,
         user_id=user_id,
         user_email=user_email,
-        profile=profile.strip().lower(),
+        profile=normalize_autonomous_profile(profile),
         mode=mode.strip().lower(),
         task=task.strip() if isinstance(task, str) and task.strip() else None,
         skill=skill.strip() if isinstance(skill, str) and skill.strip() else None,
         context=context.strip() if isinstance(context, str) and context.strip() else None,
         ticker=ticker.strip().upper() if isinstance(ticker, str) and ticker.strip() else None,
         channel=channel.strip().lower() if isinstance(channel, str) and channel.strip() else None,
-        dev_mode=bool(dev_mode),
+        dev_mode=effective_dev_mode,
         cmd=cmd,
         log_path=log_path,
         events_path=events_path,
+        operator_inbox_path=operator_inbox_path,
+        approval_decisions_path=approval_decisions_path,
         started_at=time.time(),
         log_handle=log_handle,
         slot_reserved=True,
         event_lines=[],
+        resumed_from=resumed_from.strip() if isinstance(resumed_from, str) and resumed_from.strip() else None,
       )
+      self._attach_manifest_tracking(record)
       self._tasks[task_id] = record
       record.events_tail_task = asyncio.create_task(self._tail_events_file(task_id))
 
@@ -424,6 +993,17 @@ class AutonomousRegistry:
       env["AUTONOMOUS_USER_ID"] = user_id
       env["AUTONOMOUS_USER_EMAIL"] = user_email or ""
       env["AGENT_AUTONOMOUS_EVENTS_PATH"] = str(events_path)
+      env["AGENT_AUTONOMOUS_OPERATOR_INBOX_PATH"] = str(operator_inbox_path)
+      env["AGENT_AUTONOMOUS_APPROVAL_DECISIONS_PATH"] = str(approval_decisions_path)
+      env["AGENT_AUTONOMOUS_GATEWAY_SESSION_ID"] = (
+        f"agent-control:{control_run_id}:{int(record.started_at)}"
+      )
+      env["AGENT_AUTONOMOUS_CONTROL_RUN_ID"] = control_run_id
+      env["AGENT_AUTONOMOUS_CONTROL_CHANNEL"] = record.channel or ""
+      if record.dev_mode:
+        env[f"{record.profile.upper().replace('-', '_')}_DEV_MODE"] = "true"
+      if self._approval_db_path is not None:
+        env["AGENT_AUTONOMOUS_APPROVALS_DB_PATH"] = str(self._approval_db_path)
       record.proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(self._api_dir),
@@ -437,6 +1017,7 @@ class AutonomousRegistry:
       record.reaper_task = asyncio.create_task(self._reap(task_id))
       await self._publish_run_state(record, "running")
       ownership_transferred = True
+      self._write_task_manifest(record)
       return self._start_payload(record)
     except OSError as exc:
       raise RuntimeError(f"spawn failed: {exc}") from exc
@@ -498,10 +1079,11 @@ class AutonomousRegistry:
     try:
       exit_code = await record.proc.wait()
     except Exception as exc:
-      if record.state == "running":
+      if self._is_active_process_state(record):
         record.state = "failed"
         record.error = f"reaper failed: {exc}"
       record.completed_at = time.time()
+      self._write_task_manifest(record)
       if record.log_handle is not None:
         record.log_handle.close()
         record.log_handle = None
@@ -515,7 +1097,7 @@ class AutonomousRegistry:
       return
 
     record.exit_code = exit_code
-    if record.state == "running":
+    if self._is_active_process_state(record):
       if exit_code == 0:
         record.state = "completed"
       else:
@@ -524,6 +1106,7 @@ class AutonomousRegistry:
       record.completed_at = time.time()
     else:
       record.completed_at = record.completed_at or time.time()
+    self._write_task_manifest(record)
 
     if record.log_handle is not None:
       record.log_handle.close()
@@ -542,7 +1125,7 @@ class AutonomousRegistry:
 
   async def wait(self, task_id: str, *, timeout_sec: int = 600) -> dict[str, Any]:
     record = self._get(task_id)
-    if record.state == "running" and record.reaper_task is not None:
+    if self._is_active_process_state(record) and record.reaper_task is not None:
       try:
         await asyncio.wait_for(asyncio.shield(record.reaper_task), timeout=float(timeout_sec))
       except asyncio.TimeoutError:
@@ -559,9 +1142,181 @@ class AutonomousRegistry:
       "total_lines": total_lines,
     }
 
+  async def send_operator_message(
+    self,
+    control_run_id: str,
+    *,
+    user_id: str,
+    channel: str | None = None,
+    message: str,
+    message_id: str | None = None,
+  ) -> dict[str, Any]:
+    record = self._find_by_control_run_id(control_run_id)
+    if record is None:
+      raise ValueError(f"Unknown control_run_id: {control_run_id}")
+    if record.user_id != user_id:
+      raise PermissionError("Run not found")
+
+    normalized_channel = channel.strip().lower() if isinstance(channel, str) and channel.strip() else None
+    if record.channel is not None and normalized_channel != record.channel:
+      raise PermissionError("Run not found")
+
+    if record.state not in {"running", "waiting", "approval_pending"} or (
+      record.proc is not None and record.proc.returncode is not None
+    ):
+      raise RuntimeError("Autonomous run is not accepting messages")
+    if record.event_lines is not None and any(
+      event.get("type") == "stream_complete"
+      for event in record.event_lines
+    ):
+      raise RuntimeError("Autonomous run is no longer accepting messages")
+
+    text = message.strip() if isinstance(message, str) else ""
+    if not text:
+      raise ValueError("message is required")
+
+    if record.operator_inbox_path is None:
+      raise RuntimeError("Autonomous operator inbox unavailable")
+
+    async with record.operator_message_lock:
+      resolved_message_id = message_id.strip() if isinstance(message_id, str) and message_id.strip() else None
+      resolved_message_id = resolved_message_id or f"op_{secrets.token_hex(8)}"
+      if resolved_message_id in record.delivered_messages:
+        await self._persist_and_publish_parent_message_event(
+          record,
+          message_id=resolved_message_id,
+          text=text,
+          user_id=user_id,
+          sent_at=time.time(),
+        )
+        return {
+          "task_id": record.task_id,
+          "run_id": record.control_run_id,
+          "message_id": resolved_message_id,
+          "delivery_status": "duplicate",
+        }
+
+      existing_inbox_record = self._operator_inbox_record_for_message_id(record, resolved_message_id)
+      if existing_inbox_record is not None:
+        await self._persist_and_publish_parent_message_event(
+          record,
+          message_id=resolved_message_id,
+          text=text,
+          user_id=user_id,
+          sent_at=time.time(),
+        )
+        record.delivered_messages.add(resolved_message_id)
+        return {
+          "task_id": record.task_id,
+          "run_id": record.control_run_id,
+          "message_id": resolved_message_id,
+          "delivery_status": "duplicate",
+        }
+
+      sent_at = time.time()
+      inbox_record = {
+        "message_id": resolved_message_id,
+        "text": text,
+        "message": text,
+        "sent_at": sent_at,
+        "sender": {
+          "user_id": user_id,
+        },
+        "channel": normalized_channel,
+      }
+      record.operator_inbox_path.parent.mkdir(parents=True, exist_ok=True)
+      with record.operator_inbox_path.open("a", encoding="utf-8", buffering=1) as handle:
+        handle.write(json.dumps(inbox_record, default=str) + "\n")
+
+      await self._persist_and_publish_parent_message_event(
+        record,
+        message_id=resolved_message_id,
+        text=text,
+        user_id=user_id,
+        sent_at=sent_at,
+      )
+      record.delivered_messages.add(resolved_message_id)
+      return {
+        "task_id": record.task_id,
+        "run_id": record.control_run_id,
+        "message_id": resolved_message_id,
+        "delivery_status": "delivered",
+      }
+
+  async def send_approval_decision(
+    self,
+    control_run_id: str,
+    *,
+    user_id: str,
+    channel: str | None = None,
+    approval_id: str,
+    tool_call_id: str,
+    nonce: str,
+    approved: bool,
+    allow_tool_type: bool = False,
+    reason: str | None = None,
+  ) -> dict[str, Any]:
+    record = self._find_by_control_run_id(control_run_id)
+    if record is None:
+      raise ValueError(f"Unknown control_run_id: {control_run_id}")
+    if record.user_id != user_id:
+      raise PermissionError("Run not found")
+
+    normalized_channel = channel.strip().lower() if isinstance(channel, str) and channel.strip() else None
+    if record.channel is not None and normalized_channel != record.channel:
+      raise PermissionError("Run not found")
+
+    if not self._is_active_process_state(record) or (
+      record.proc is not None and record.proc.returncode is not None
+    ):
+      raise RuntimeError("Autonomous run is not running")
+    if record.approval_decisions_path is None:
+      raise RuntimeError("Autonomous approval inbox unavailable")
+
+    decision_record = {
+      "approval_id": approval_id,
+      "tool_call_id": tool_call_id,
+      "nonce": nonce,
+      "approved": bool(approved),
+      "allow_tool_type": bool(allow_tool_type),
+      "reason": reason,
+      "decider": {
+        "user_id": user_id,
+      },
+      "channel": normalized_channel,
+      "decided_at": time.time(),
+    }
+    record.approval_decisions_path.parent.mkdir(parents=True, exist_ok=True)
+    with record.approval_decisions_path.open("a", encoding="utf-8", buffering=1) as handle:
+      handle.write(json.dumps(decision_record, default=str) + "\n")
+
+    await self._record_and_publish_event(
+      record,
+      {
+        "type": "approval_decision_sent",
+        "task_id": record.task_id,
+        "run_id": record.control_run_id,
+        "control_run_id": record.control_run_id,
+        "approval_id": approval_id,
+        "tool_call_id": tool_call_id,
+        "approved": bool(approved),
+        "allow_tool_type": bool(allow_tool_type),
+        "decider": {
+          "user_id": user_id,
+        },
+        "sent_at": decision_record["decided_at"],
+      },
+    )
+    return {
+      "task_id": record.task_id,
+      "run_id": record.control_run_id,
+      "approval_id": approval_id,
+      "tool_call_id": tool_call_id,
+    }
+
   async def cancel(self, task_id: str) -> dict[str, Any]:
     record = self._get(task_id)
-    if record.state == "running":
+    if self._is_active_process_state(record):
       if record.proc is not None and record.proc.returncode is None:
         try:
           record.proc.terminate()
@@ -570,6 +1325,7 @@ class AutonomousRegistry:
       record.state = "killed"
       record.completed_at = time.time()
       record.error = record.error or "Process terminated by user"
+      self._write_task_manifest(record)
       await self._publish_run_state(record, "cancelled")
       await self._cleanup_run_buffer(record)
     return self._status_payload(record)
@@ -582,10 +1338,11 @@ class AutonomousRegistry:
     ]
 
     for record in live_records:
-      if record.state == "running":
+      if self._is_active_process_state(record):
         record.state = "killed"
         record.completed_at = time.time()
         record.error = record.error or "Process terminated during gateway shutdown"
+        self._write_task_manifest(record)
       try:
         record.proc.terminate()
       except ProcessLookupError:
@@ -614,4 +1371,4 @@ class AutonomousRegistry:
         await asyncio.gather(record.events_tail_task, return_exceptions=True)
 
 
-__all__ = ["AUTONOMOUS_ALLOWED_PROFILES", "AutonomousRegistry", "AutonomousTask"]
+__all__ = ["AutonomousRegistry", "AutonomousTask", "normalize_autonomous_profile"]

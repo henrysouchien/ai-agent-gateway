@@ -5,7 +5,7 @@ from typing import Any
 
 from .agent_session_log import AgentSessionLog, LogEntry
 from .context_builder import Message
-from .task_registry import ParentMessage
+from .task_registry import ParentMessage, format_parent_messages_for_model
 
 ToolResultBlock = dict[str, Any]
 
@@ -201,10 +201,7 @@ async def reconstruct_parent_messages(log: AgentSessionLog, task_id: str, before
 
 
 def _parent_context_message(parent_messages: list[ParentMessage], additional_context: str | None) -> Message | None:
-  lines = [
-    f"[Parent message id={message.message_id}]: {message.text}"
-    for message in parent_messages
-  ]
+  lines = [format_parent_messages_for_model(parent_messages)] if parent_messages else []
   if additional_context is not None and additional_context.strip():
     lines.append(f"[Operator continuation note]: {additional_context.strip()}")
   if not lines:

@@ -229,10 +229,14 @@ def test_chat_delete_denies_pending_approval_unblocks_loop_and_expires_session(t
     assert run_payload["run"]["state"] == "approval_pending"
     assert run_payload["run"]["pending_approval"] is not None
     assert approval_ids
+    session = app.state.auth.session_store.get_session(run_payload["chat_session_id"])
+    assert session is not None
 
     deleted = client.delete(f"/api/control/runs/{run_payload['chat_session_id']}", headers=_headers(control))
     assert deleted.status_code == 200, deleted.text
     assert deleted.json()["state"] == "cancelled"
+    retained_states = [event.get("state") for event in session.event_history.snapshot() if event.get("type") == "run_state_changed"]
+    assert retained_states == ["running", "cancelled"]
 
     request_record = _run(store.get(approval_ids[0]))
     assert request_record is not None

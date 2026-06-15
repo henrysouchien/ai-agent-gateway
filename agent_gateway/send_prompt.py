@@ -101,6 +101,7 @@ async def send_prompt(
         parent_turn_id=None,
         timestamp=time.time(),
         model=model,
+        provider=provider.name,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,

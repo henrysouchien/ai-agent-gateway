@@ -154,6 +154,35 @@ def _text_turn(text: str) -> list[StreamEvent]:
   ]
 
 
+def _mixed_text_tool_turn(
+  *,
+  text: str = "scratch text before tool",
+  tool_id: str = "tool-1",
+  tool_name: str = "lookup",
+  tool_input: dict[str, Any] | None = None,
+) -> list[StreamEvent]:
+  payload = tool_input or {"query": "AAPL"}
+  return [
+    StreamEvent(type="message_start", input_tokens=10),
+    StreamEvent(type="text_delta", text=text),
+    StreamEvent(type="text_end", raw_block={"type": "text", "text": text}),
+    StreamEvent(
+      type="tool_use_end",
+      tool_id=tool_id,
+      tool_name=tool_name,
+      tool_input=payload,
+      raw_block={
+        "type": "tool_use",
+        "id": tool_id,
+        "name": tool_name,
+        "input": payload,
+      },
+    ),
+    StreamEvent(type="usage_update", output_tokens=3),
+    StreamEvent(type="message_end", stop_reason="tool_use"),
+  ]
+
+
 async def _lookup_tool(tool_input: dict[str, Any], **kwargs: Any):
   _ = kwargs
   return {"echo": tool_input}, None
@@ -175,6 +204,20 @@ async def _semantic_error_tool(tool_input: dict[str, Any], **kwargs: Any):
   return {
     "status": "error",
     "error": {"code": "not_found", "message": f"{tool_input.get('query', 'ticker')} not found"},
+  }, None
+
+
+async def _decision_log_validation_error_tool(tool_input: dict[str, Any], **kwargs: Any):
+  _ = tool_input, kwargs
+  return {
+    "status": "error",
+    "error": "decisions-log entry is invalid",
+    "error_code": "invalid_decisions_log_entry",
+    "validation_error": True,
+    "validation_errors": [
+      {"type": "missing", "loc": ["date"], "msg": "Field required"},
+    ],
+    "required_fields": ["date", "skill", "decision", "rationale"],
   }, None
 
 
@@ -216,6 +259,54 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
   assert entries[3].event["parent_assistant_message_seq"] == entries[2].seq
   assert "final_tool_result_blocks" in entries[4].event
   assert entries[6].event["reason"] == "completed"
+
+
+def test_runner_suppresses_text_from_tool_only_turns(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "tool-only.jsonl")
+  provider = _ScriptedProvider([
+    _mixed_text_tool_turn(text="scratch before tool"),
+    _text_turn("done"),
+  ])
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _lookup_tool}),
+    session_id="sess-parent",
+    provider=provider,
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(
+    runner.run(
+      messages=[
+        {
+          "role": "user",
+          "content": (
+            "Tool-call messages are tool-only. Every assistant message that contains any tool call "
+            "must contain zero visible text. Run lookup."
+          ),
+        }
+      ],
+    )
+  )
+
+  entries, _ = _run(log.query(order="asc"))
+  tool_turn = next(entry.event for entry in entries if entry.event.get("stop_reason") == "tool_use")
+  assert tool_turn["content_blocks"] == [
+    {
+      "type": "tool_use",
+      "id": "tool-1",
+      "name": "lookup",
+      "input": {"query": "AAPL"},
+    }
+  ]
+  assert "scratch before tool" not in json.dumps([entry.event for entry in entries])
+  text_events = [entry for entry in event_log.entries if entry.event.get("type") == "text_delta"]
+  assert [event.event["text"] for event in text_events] == ["done"]
 
 
 def test_semantic_tool_error_is_visible_in_trace_and_timing(tmp_path: Path) -> None:
@@ -263,6 +354,44 @@ def test_semantic_tool_error_is_visible_in_trace_and_timing(tmp_path: Path) -> N
   assert durable_entries[0].event["semantic_error"]["message"] == "X not found"
 
 
+def test_native_runner_semantic_error_includes_validation_details(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "semantic-validation-error.jsonl")
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(
+      event_log=event_log,
+      local_tool_handlers={"thesis_append_decisions_log": _decision_log_validation_error_tool},
+    ),
+    session_id="sess-parent",
+    provider=_ScriptedProvider([
+      _tool_turn(tool_name="thesis_append_decisions_log", tool_input={"research_file_id": 1, "entry": {}}),
+      _text_turn("handled"),
+    ]),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "Run invalid decision log"}]))
+
+  complete_events = [
+    entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"
+  ]
+  assert len(complete_events) == 1
+  complete = complete_events[0]
+  assert complete["error"] is None
+  assert complete["is_error"] is True
+  assert complete["semantic_error"]["sub_code"] == "invalid_decisions_log_entry"
+  assert "decisions-log entry is invalid" in complete["semantic_error"]["message"]
+  assert "date: Field required" in complete["semantic_error"]["message"]
+  assert "required_fields: date, skill, decision, rationale" in complete["semantic_error"]["message"]
+  final_content = json.loads(complete["final_tool_result_blocks"][0]["content"])
+  assert final_content["validation_errors"][0]["loc"] == ["date"]
+
+
 def test_operator_pause_before_turn_emits_clean_interruption(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "operator-pause-before-turn.jsonl")
   event_log = EventLog()
@@ -289,7 +418,11 @@ def test_operator_pause_before_turn_emits_clean_interruption(tmp_path: Path) -> 
   assert entries[2].event["reason"] == "operator_pause"
   assert entries[2].event["safe_boundary"] == "before_turn"
   assert entries[3].event["reason"] == "operator_pause"
-  assert [entry.event["type"] for entry in event_log.entries] == ["operator_pause", "stream_complete"]
+  assert [entry.event["type"] for entry in event_log.entries] == [
+    "operator_pause",
+    "session_recap",
+    "stream_complete",
+  ]
 
 
 def test_operator_pause_after_turn_stops_before_tool_dispatch(tmp_path: Path) -> None:

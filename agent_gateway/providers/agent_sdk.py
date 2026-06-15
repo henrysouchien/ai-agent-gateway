@@ -54,6 +54,8 @@ class AgentSDKConfig:
   """Configuration for the optional Anthropic agent SDK runner."""
 
   api_key: str
+  auth_mode: str | None = None
+  auth_token: str | None = None
   model: str | None = None
   max_budget_usd: float | None = None
   cwd: str | Path | None = None
@@ -102,6 +104,15 @@ def build_disallowed_tools(
     allowed |= SDK_WEB_BUILTINS
 
   blocked = set(SDK_KNOWN_BUILTINS) - allowed
+  # NOTE (deferred-tier limitation, agent-sdk only): the SDK fixes its MCP server
+  # set at session start and has no mid-session `load_tools`, so deferred-tier
+  # servers are hard-blocked here and never started by load_mcp_config_for_sdk
+  # (always-only, below). A server placed in a channel's `defer` set (e.g.
+  # fred-mcp, macro-mcp) is therefore unreachable under AGENT_PROVIDER=agent-sdk.
+  # The `anthropic` provider does NOT have this limitation — it honors load_tools,
+  # so `defer` works there. To make a deferred server usable under agent-sdk,
+  # promote it to the channel's `always` tier in CHANNEL_TIERS, or add
+  # deferred-loading support to this provider.
   for server_name in tier.get("defer", set()):
     blocked.add(f"mcp__{server_name}__*")
   if extra_blocked:
@@ -148,6 +159,8 @@ def load_mcp_config_for_sdk(
     return {}
 
   tier = _resolve_channel_tier(channel, channel_tiers)
+  # always-only: the SDK has no mid-session load_tools, so deferred-tier servers
+  # are not started here (and are blocked in build_disallowed_tools — see note there).
   allowed_servers = tier.get("always", set())
   sdk_configs: Dict[str, Dict[str, Any]] = {}
 

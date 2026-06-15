@@ -54,6 +54,8 @@ def test_sdk_runner_usage_event_threads_identity() -> None:
   assert event.rate_table_version == "v1"
   assert event.billing_mode == "metered"
   assert event.request_id == "req-sdk"
+  assert event.model == "claude-sonnet-4-6"
+  assert event.provider == "agent-sdk"
   assert event.input_tokens == 10
   assert event.cost_usd == pytest.approx(0.03)
 
@@ -98,3 +100,5 @@ def test_sdk_runner_explicit_identity_summary() -> None:
   assert summaries[0].request_id
   assert summaries[0].input_tokens == 3
   assert summaries[0].turns == 1
+  assert summaries[0].model == "claude-sonnet-4-6"
+  assert summaries[0].provider == "agent-sdk"
