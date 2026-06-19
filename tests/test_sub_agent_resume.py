@@ -541,7 +541,16 @@ def test_resume_handler_installs_emit_html_artifact_for_resumable_named_skill(
   try:
     async def _case() -> None:
       skills_dir = tmp_path / "skills"
-      _write_skill(skills_dir, "html-research", "scope: ticker")
+      _write_skill(
+        skills_dir,
+        "html-research",
+        """
+scope: ticker
+extra_excluded_tools:
+  - memory_write
+  - file_write
+""",
+      )
       runner = _runner(tmp_path)
       await _append_interrupted_skill_task(
         runner,
@@ -592,6 +601,8 @@ def test_resume_handler_installs_emit_html_artifact_for_resumable_named_skill(
 
       dispatcher = captured["dispatcher"]
       assert "emit_html_artifact" not in captured["excluded_tools"]
+      assert "memory_write" in captured["excluded_tools"]
+      assert "file_write" in captured["excluded_tools"]
       assert dispatcher._local["emit_html_artifact"] is not _stub_emit_html_artifact
       emit_result, emit_error = await dispatcher.dispatch(
         "tool_html_resume",

@@ -116,6 +116,44 @@ class RaisingFakeProcess:
     self.returncode = -9
 
 
+class RecordingEventBus:
+  def __init__(self) -> None:
+    self.calls: list[tuple[str, dict]] = []
+
+  async def seed_replay_buffer(
+    self,
+    user_id: str,
+    control_run_id: str,
+    events: list[dict],
+    *,
+    terminated: bool = False,
+  ) -> int:
+    self.calls.append(
+      (
+        "seed",
+        {
+          "user_id": user_id,
+          "control_run_id": control_run_id,
+          "events": list(events),
+          "terminated": terminated,
+        },
+      )
+    )
+    return len(events)
+
+  async def publish(self, user_id: str, control_run_id: str, event: dict) -> None:
+    self.calls.append(
+      (
+        "publish",
+        {
+          "user_id": user_id,
+          "control_run_id": control_run_id,
+          "event": dict(event),
+        },
+      )
+    )
+
+
 def _registry(tmp_path: Path):
   from agent_gateway.autonomous_runner import AutonomousRegistry
 
@@ -166,6 +204,15 @@ def _write_manifest(tmp_path: Path, task_id: str = "bg_0", **overrides) -> dict:
   manifest.update(overrides)
   _manifest_path(tmp_path, task_id).write_text(json.dumps(manifest) + "\n", encoding="utf-8")
   return manifest
+
+
+def _write_run_files(tmp_path: Path, task_id: str) -> None:
+  for suffix in (".log", ".events.jsonl", ".operator-messages.jsonl", ".approval-decisions.jsonl"):
+    (tmp_path / f"{task_id}{suffix}").write_text(f"{task_id}{suffix}\n", encoding="utf-8")
+
+
+def _run_files_exist(tmp_path: Path, task_id: str) -> bool:
+  return any(tmp_path.glob(f"{task_id}.*"))
 
 
 def _claim_headers_from_env(env: dict[str, str]) -> dict[str, str]:
@@ -427,6 +474,33 @@ def test_autonomous_registry_rehydrates_manifest_with_event_history(tmp_path) ->
   assert _read_manifest(tmp_path, "bg_3")["resumed_as"] == ["run-4", "run-5"]
 
 
+def test_autonomous_registry_rehydrates_budget_exceeded_as_budget_limited(tmp_path) -> None:
+  _write_manifest(
+    tmp_path,
+    "bg_7",
+    control_run_id="run-budget",
+    state="completed",
+    exit_code=2,
+    error="Process exited with code 2",
+    completed_at=200.0,
+  )
+  (tmp_path / "bg_7.events.jsonl").write_text(
+    '{"type":"budget_exceeded","total_cost":1.25,"budget":1.0,"ts":199}\n',
+    encoding="utf-8",
+  )
+
+  registry = _registry(tmp_path)
+
+  record = registry._tasks["bg_7"]
+  assert record.state == "budget_limited"
+  assert record.error is None
+  assert record.event_lines == [{"type": "budget_exceeded", "total_cost": 1.25, "budget": 1.0, "ts": 199}]
+  assert registry._terminal_state_for_record(record) == "budget_limited"
+  manifest = _read_manifest(tmp_path, "bg_7")
+  assert manifest["state"] == "budget_limited"
+  assert manifest["error"] is None
+
+
 @pytest.mark.parametrize("state", ["running", "approval_pending", "queued", "waiting"])
 def test_autonomous_registry_rehydrates_active_states_as_interrupted(tmp_path, state) -> None:
   _write_manifest(
@@ -525,6 +599,152 @@ def test_autonomous_registry_skips_corrupt_unknown_and_legacy_runs(tmp_path, cap
   assert registry._seq == 3
   assert "Skipping unreadable autonomous task manifest" in caplog.text
   assert "Skipping autonomous manifest with unsupported version" in caplog.text
+
+
+def test_autonomous_run_retention_prunes_only_old_completed_unlinked_run_groups(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner
+
+  now = 1_000_000.0
+  old = now - (8 * 86400)
+  recent = now - (2 * 86400)
+  monkeypatch.setenv("AGENT_AUTONOMOUS_RUN_RETENTION_DAYS", "7")
+  monkeypatch.setattr(autonomous_runner.time, "time", lambda: now)
+
+  _write_manifest(tmp_path, "bg_1", state="completed", completed_at=old)
+  _write_manifest(tmp_path, "bg_2", state="completed", completed_at=recent)
+  _write_manifest(tmp_path, "bg_3", state="failed", completed_at=old)
+  _write_manifest(tmp_path, "bg_4", state="running", completed_at=None, started_at=old)
+  _write_manifest(tmp_path, "bg_5", state="completed", completed_at=old, resumed_as=["bg_6"])
+  _write_manifest(tmp_path, "bg_99", state="completed", completed_at=old)
+  for task_id in ("bg_1", "bg_2", "bg_3", "bg_4", "bg_5", "bg_99"):
+    _write_run_files(tmp_path, task_id)
+
+  registry = _registry(tmp_path)
+
+  assert not _run_files_exist(tmp_path, "bg_1")
+  assert not _run_files_exist(tmp_path, "bg_99")
+  for task_id in ("bg_2", "bg_3", "bg_4", "bg_5"):
+    assert _run_files_exist(tmp_path, task_id)
+  assert set(registry._tasks) == {"bg_2", "bg_3", "bg_4", "bg_5"}
+  assert registry._tasks["bg_4"].state == "interrupted"
+  assert registry._seq == 100
+  cursor = json.loads((tmp_path / ".autonomous-sequence.json").read_text(encoding="utf-8"))
+  assert cursor == {"next_seq": 100}
+
+
+def test_autonomous_run_retention_sequence_cursor_prevents_reuse_after_prune(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner
+
+  now = 1_000_000.0
+  old = now - (8 * 86400)
+  monkeypatch.setenv("AGENT_AUTONOMOUS_RUN_RETENTION_DAYS", "7")
+  monkeypatch.setattr(autonomous_runner.time, "time", lambda: now)
+  _write_manifest(tmp_path, "bg_42", state="completed", completed_at=old)
+  _write_run_files(tmp_path, "bg_42")
+
+  first = _registry(tmp_path)
+  assert first._seq == 43
+  assert not _run_files_exist(tmp_path, "bg_42")
+
+  second = _registry(tmp_path)
+  assert second._seq == 43
+
+
+def test_autonomous_run_retention_skips_prune_when_sequence_cursor_cannot_persist(
+  monkeypatch,
+  tmp_path,
+  caplog,
+) -> None:
+  from agent_gateway import autonomous_runner
+
+  now = 1_000_000.0
+  old = now - (8 * 86400)
+  monkeypatch.setenv("AGENT_AUTONOMOUS_RUN_RETENTION_DAYS", "7")
+  monkeypatch.setattr(autonomous_runner.time, "time", lambda: now)
+
+  def fail_replace(src, dst):
+    _ = src, dst
+    raise OSError("readonly-ish")
+
+  _write_manifest(tmp_path, "bg_7", state="completed", completed_at=old)
+  _write_run_files(tmp_path, "bg_7")
+  monkeypatch.setattr(autonomous_runner.os, "replace", fail_replace)
+
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.autonomous_runner"):
+    registry = _registry(tmp_path)
+
+  assert _run_files_exist(tmp_path, "bg_7")
+  assert set(registry._tasks) == {"bg_7"}
+  assert registry._seq == 8
+  assert "Failed to write autonomous run sequence cursor" in caplog.text
+
+
+def test_autonomous_run_retention_ignores_malformed_manifest_task_id(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner
+
+  now = 1_000_000.0
+  old = now - (8 * 86400)
+  monkeypatch.setenv("AGENT_AUTONOMOUS_RUN_RETENTION_DAYS", "7")
+  monkeypatch.setattr(autonomous_runner.time, "time", lambda: now)
+  manifest = _write_manifest(tmp_path, "bg_8", state="completed", completed_at=old)
+  manifest["task_id"] = "*"
+  _manifest_path(tmp_path, "bg_8").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+  _write_run_files(tmp_path, "bg_8")
+
+  registry = _registry(tmp_path)
+
+  assert _run_files_exist(tmp_path, "bg_8")
+  assert registry._tasks == {}
+  assert registry._seq == 9
+
+
+def test_record_and_publish_seeds_rehydrated_events_before_new_publish(tmp_path) -> None:
+  from agent_gateway.autonomous_runner import AutonomousRegistry
+
+  _write_manifest(tmp_path, "bg_11", control_run_id="run-11", state="interrupted")
+  (tmp_path / "bg_11.events.jsonl").write_text(
+    json.dumps({"type": "text_delta", "text": "old"}) + "\n",
+    encoding="utf-8",
+  )
+  bus = RecordingEventBus()
+  registry = AutonomousRegistry(api_dir=tmp_path, log_dir=tmp_path, user_event_bus=bus)
+  record = registry._tasks["bg_11"]
+
+  asyncio.run(
+    registry._record_and_publish_event(
+      record,
+      {"type": "run_resumed", "resumed_run_id": "run-12"},
+    )
+  )
+
+  assert [name for name, _payload in bus.calls] == ["seed", "publish"]
+  seed_payload = bus.calls[0][1]
+  assert seed_payload["user_id"] == USER_ID
+  assert seed_payload["control_run_id"] == "run-11"
+  assert seed_payload["terminated"] is True
+  assert seed_payload["events"] == [
+    {
+      "type": "text_delta",
+      "text": "old",
+      "run_id": "run-11",
+      "control_run_id": "run-11",
+    }
+  ]
+  assert bus.calls[1][1]["event"] == {
+    "type": "run_resumed",
+    "resumed_run_id": "run-12",
+    "run_id": "run-11",
+    "control_run_id": "run-11",
+  }
 
 
 def test_autonomous_manifest_written_post_spawn_with_full_field_set(monkeypatch, tmp_path) -> None:

@@ -4,7 +4,7 @@ import asyncio
 import json
 from contextlib import suppress
 from types import SimpleNamespace
-from typing import Any, AsyncIterator
+from typing import Any
 
 import pytest
 from starlette.requests import Request
@@ -72,11 +72,12 @@ async def _open_events(
   control_run_id: str | None = "run-1",
   schema_version: str | None = None,
   after_seq: int = 0,
+  tasks: dict[str, Any] | None = None,
 ):
   app = SimpleNamespace(
     state=SimpleNamespace(
       user_event_bus=bus,
-      subprocess_registry=SimpleNamespace(_tasks={}),
+      subprocess_registry=SimpleNamespace(_tasks=dict(tasks or {})),
     )
   )
   response = await _route(auth).endpoint(
@@ -301,6 +302,79 @@ def test_projected_stream_seq_resume_and_truncation_marker() -> None:
     )
     assert await _read_data(other_run, 1) == [
       {"run_id": "run-2", "seq": 1, "event": {"type": "text_delta", "text": "other", "run_id": "run-2"}}
+    ]
+
+    await bus.shutdown()
+
+  _run(case())
+
+
+def test_projected_stream_replays_rehydrated_autonomous_events_after_restart() -> None:
+  async def case() -> None:
+    auth = _FakeAuth({"control-token": _session()})
+    bus = UserEventBus()
+    rehydrated = SimpleNamespace(
+      task_id="bg_7",
+      control_run_id="run-1",
+      user_id="alice",
+      channel="tui",
+      state="completed",
+      proc=None,
+      event_lines=[
+        {"type": "text_delta", "text": "restored"},
+        {"type": "turn_complete", "turn": 1},
+      ],
+    )
+
+    by_task_id = await _open_events(
+      bus=bus,
+      auth=auth,
+      control_run_id="bg_7",
+      schema_version="v1",
+      tasks={"bg_7": rehydrated},
+    )
+    assert await _read_data(by_task_id, 2) == [
+      {
+        "run_id": "run-1",
+        "seq": 1,
+        "event": {
+          "type": "text_delta",
+          "text": "restored",
+          "run_id": "run-1",
+          "control_run_id": "run-1",
+        },
+      },
+      {
+        "run_id": "run-1",
+        "seq": 2,
+        "event": {
+          "type": "turn_complete",
+          "turn": 1,
+          "run_id": "run-1",
+          "control_run_id": "run-1",
+        },
+      },
+    ]
+
+    resumed = await _open_events(
+      bus=bus,
+      auth=auth,
+      control_run_id="run-1",
+      schema_version="v1",
+      after_seq=1,
+      tasks={"bg_7": rehydrated},
+    )
+    assert await _read_data(resumed, 1) == [
+      {
+        "run_id": "run-1",
+        "seq": 2,
+        "event": {
+          "type": "turn_complete",
+          "turn": 1,
+          "run_id": "run-1",
+          "control_run_id": "run-1",
+        },
+      }
     ]
 
     await bus.shutdown()

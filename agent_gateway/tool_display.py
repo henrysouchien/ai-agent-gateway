@@ -78,6 +78,7 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   "fms_report_business_quality_assessment": _spec("Writing business-quality report", "ticker"),
   "fms_report_idea_to_thesis": _spec("Writing idea-to-thesis report", "ticker"),
   "fms_report_thesis_consultation": _spec("Writing thesis-consultation report", "ticker"),
+  "fms_report_metric_trend_dashboard": _spec("Writing metric trend dashboard", "metric_name"),
   "fms_report_risk_review": _spec("Writing risk review", "ticker"),
   "fms_link_thesis": _spec("Linking thesis records", "ticker", "name"),
 }

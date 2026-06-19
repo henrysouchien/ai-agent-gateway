@@ -207,6 +207,120 @@ def test_event_only_blocks_are_filtered_from_batched_run_agent_next_turn() -> No
   assert all(block.get("type") != "source_envelope" for block in model_content)
 
 
+def test_event_only_blocks_are_filtered_from_mixed_run_agent_and_normal_tools() -> None:
+  event_log = EventLog()
+  tool_calls: list[tuple[str, int]] = []
+  provider = _RecordingProvider([
+    _tool_use_turn([
+      ("tool_1", "run_agent", {"task": "a"}),
+      ("tool_2", "run_agent", {"task": "b"}),
+      ("tool_3", "lookup", {}),
+    ]),
+    _end_turn(),
+  ])
+
+  async def run_agent_handler(_tool_input: dict[str, Any], *, call_index: int = 0, tool_ctx: Any = None):
+    _ = tool_ctx
+    tool_calls.append(("run_agent", call_index))
+    return {"status": "success"}, None
+
+  async def lookup_handler(_tool_input: dict[str, Any], *, call_index: int = 0, tool_ctx: Any = None):
+    _ = tool_ctx
+    tool_calls.append(("lookup", call_index))
+    return {"status": "success"}, None
+
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_dispatcher(event_log, {"run_agent": run_agent_handler, "lookup": lookup_handler}),
+    session_id="sess-event-only",
+    provider=provider,
+    auth_config={"api_key": "k", "model": "stub-model"},
+    get_tool_definitions=lambda: [_tool_def("run_agent"), _tool_def("lookup")],
+    on_tool_result=_mixed_extra_blocks,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x", max_turns=2))
+
+  complete_events = [entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"]
+  assert len(complete_events) == 3
+  assert sorted(tool_calls) == [("lookup", 0), ("run_agent", 0), ("run_agent", 1)]
+  assert all(
+    any(block.get("type") == "source_envelope" for block in event["final_tool_result_blocks"])
+    for event in complete_events
+  )
+
+  model_content = _model_bound_tool_result_content(provider)
+  assert [block["type"] for block in model_content] == [
+    "tool_result",
+    "tool_result",
+    "tool_result",
+    "text",
+    "text",
+    "text",
+  ]
+  assert [block["tool_use_id"] for block in model_content[:3]] == ["tool_1", "tool_2", "tool_3"]
+  assert all(block.get("type") != "source_envelope" for block in model_content)
+
+
+def test_run_agent_call_index_continues_across_separated_batches() -> None:
+  event_log = EventLog()
+  tool_calls: list[tuple[str, str, int]] = []
+  provider = _RecordingProvider([
+    _tool_use_turn([
+      ("tool_1", "run_agent", {"task": "a"}),
+      ("tool_2", "lookup", {}),
+      ("tool_3", "run_agent", {"task": "b"}),
+    ]),
+    _end_turn(),
+  ])
+
+  async def run_agent_handler(tool_input: dict[str, Any], *, call_index: int = 0, tool_ctx: Any = None):
+    _ = tool_ctx
+    tool_calls.append(("run_agent", str(tool_input["task"]), call_index))
+    return {"status": "success"}, None
+
+  async def lookup_handler(_tool_input: dict[str, Any], *, call_index: int = 0, tool_ctx: Any = None):
+    _ = tool_ctx
+    tool_calls.append(("lookup", "", call_index))
+    return {"status": "success"}, None
+
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_dispatcher(event_log, {"run_agent": run_agent_handler, "lookup": lookup_handler}),
+    session_id="sess-event-only",
+    provider=provider,
+    auth_config={"api_key": "k", "model": "stub-model"},
+    get_tool_definitions=lambda: [_tool_def("run_agent"), _tool_def("lookup")],
+    on_tool_result=_mixed_extra_blocks,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x", max_turns=2))
+
+  assert sorted(tool_calls) == [
+    ("lookup", "", 0),
+    ("run_agent", "a", 0),
+    ("run_agent", "b", 1),
+  ]
+
+  model_content = _model_bound_tool_result_content(provider)
+  assert [block["type"] for block in model_content] == [
+    "tool_result",
+    "tool_result",
+    "tool_result",
+    "text",
+    "text",
+    "text",
+  ]
+  assert [block["tool_use_id"] for block in model_content[:3]] == ["tool_1", "tool_2", "tool_3"]
+  assert all(block.get("type") != "source_envelope" for block in model_content)
+
+
 def test_event_only_blocks_are_filtered_from_transcript_replay() -> None:
   blocks = _tool_result_blocks_from_event(
     {

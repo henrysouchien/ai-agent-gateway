@@ -40,6 +40,8 @@ from .tool_dispatcher import LocalToolHandler, ToolDispatcher, ToolInterceptor
 log = logging.getLogger("agent_gateway.autonomous")
 _STATE_JSON_MARKER = "## STATE_UPDATE_JSON"
 _JSON_FENCE_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
+_RUN_SESSION_FORCE_CLOSE_SECONDS = 2.0
+_RUN_SESSION_CANCEL_DRAIN_SECONDS = 5.0
 
 
 class _NullMcpClient:
@@ -214,6 +216,59 @@ def collect_run_output(event_log: EventLog, timed_out: bool) -> RunOutput:
   )
 
 
+async def _force_close_runner(runner: Any, *, timeout: float) -> None:
+  force_close = getattr(runner, "force_close", None)
+  if not callable(force_close):
+    return
+  try:
+    signature = inspect.signature(force_close)
+  except (TypeError, ValueError):
+    accepts_timeout = True
+  else:
+    accepts_timeout = (
+      "timeout" in signature.parameters
+      or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
+    )
+  if accepts_timeout:
+    close_result = force_close(timeout=timeout)
+  else:
+    close_result = force_close()
+  if inspect.isawaitable(close_result):
+    await asyncio.wait_for(close_result, timeout=max(0.1, timeout + 0.5))
+
+
+async def _drain_cancelled_run_task(task: asyncio.Task[None], *, timeout: float) -> bool:
+  if task.done():
+    try:
+      await task
+    except asyncio.CancelledError:
+      return True
+    except Exception as exc:
+      log.warning("Autonomous run raised while draining after timeout: %s", exc)
+      return True
+    return True
+
+  done, _pending = await asyncio.wait({task}, timeout=timeout)
+  if task not in done:
+    return False
+  try:
+    await task
+  except asyncio.CancelledError:
+    return True
+  except Exception as exc:
+    log.warning("Autonomous run raised while draining after timeout: %s", exc)
+  return True
+
+
+def _consume_late_run_task_result(task: asyncio.Task[None]) -> None:
+  try:
+    task.result()
+  except asyncio.CancelledError:
+    return
+  except Exception as exc:
+    log.warning("Autonomous run raised after timeout return: %s", exc)
+
+
 async def run_session(
   runner: AgentRunner,
   event_log: EventLog,
@@ -232,14 +287,41 @@ async def run_session(
     model_override=model,
     max_turns=max_turns,
   )
+  run_task: asyncio.Task[None] | None = None
   try:
     if timeout_seconds is not None and timeout_seconds > 0:
-      await asyncio.wait_for(coro, timeout=timeout_seconds)
+      run_task = asyncio.create_task(coro)
+      done, _pending = await asyncio.wait({run_task}, timeout=timeout_seconds)
+      if run_task in done:
+        await run_task
+      else:
+        timed_out = True
+        log.warning("Autonomous run timed out after %ss", timeout_seconds)
+        run_task.cancel()
+        try:
+          await _force_close_runner(runner, timeout=_RUN_SESSION_FORCE_CLOSE_SECONDS)
+        except Exception as exc:
+          log.warning("Autonomous runner force-close after timeout failed: %s", exc)
+        drained = await _drain_cancelled_run_task(run_task, timeout=_RUN_SESSION_CANCEL_DRAIN_SECONDS)
+        if not drained:
+          log.warning(
+            "Autonomous run cancellation did not drain within %ss after timeout",
+            _RUN_SESSION_CANCEL_DRAIN_SECONDS,
+          )
+          run_task.add_done_callback(_consume_late_run_task_result)
     else:
       await coro
-  except asyncio.TimeoutError:
-    timed_out = True
-    log.warning("Autonomous run timed out after %ss", timeout_seconds)
+  except asyncio.CancelledError:
+    if run_task is not None and not run_task.done():
+      run_task.cancel()
+      try:
+        await _force_close_runner(runner, timeout=_RUN_SESSION_FORCE_CLOSE_SECONDS)
+      except Exception as exc:
+        log.warning("Autonomous runner force-close after cancellation failed: %s", exc)
+      drained = await _drain_cancelled_run_task(run_task, timeout=_RUN_SESSION_CANCEL_DRAIN_SECONDS)
+      if not drained:
+        run_task.add_done_callback(_consume_late_run_task_result)
+    raise
   except Exception as exc:
     error_msg = f"{type(exc).__name__}: {exc}"
     log.error("Autonomous run failed: %s", error_msg, exc_info=True)

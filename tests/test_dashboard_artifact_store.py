@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -11,6 +14,8 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+import agent_gateway.dashboard_artifact_store as dashboard_store
+from agent_gateway.artifact_sidecar_index import get_artifact_sidecar_index_row
 from agent_gateway.dashboard_artifact_store import (
   list_dashboard_artifacts,
   read_dashboard_artifact_payload,
@@ -32,6 +37,94 @@ def test_dashboard_artifact_store_round_trips_sidecar_and_payload(tmp_path: Path
 
   assert read_dashboard_artifact_sidecar(tmp_path, "dashboard-artifact-1") == artifact
   assert read_dashboard_artifact_payload(tmp_path, "dashboard-artifact-1") == payload
+
+
+def test_dashboard_artifact_store_registers_sidecar_index_row(tmp_path: Path) -> None:
+  workspace = tmp_path / "users" / "alice" / "workspace"
+  artifact = _artifact("dashboard-artifact-1", ticker="PCTY")
+  payload = _payload("PCTY Dashboard")
+
+  write_dashboard_artifact(
+    workspace_dir=workspace,
+    artifact=artifact,
+    payload_json=payload,
+  )
+
+  row = get_artifact_sidecar_index_row(
+    workspace_dir=workspace,
+    artifact_kind="dashboard",
+    artifact_id="dashboard-artifact-1",
+    user_id="alice",
+  )
+  assert row is not None
+  assert row["artifact_ref"] == "artifacts/_dashboards/dashboard-artifact-1.json"
+  assert row["payload_ref"] == "artifacts/_dashboards/dashboard-artifact-1.payload.json"
+  assert row["scope"] == "ticker"
+  assert row["scope_label"] is None
+  assert row["ticker"] == "PCTY"
+  assert row["skill"] == "fixture-dashboard-artifact"
+  assert row["contract_name"] == "DashboardArtifact"
+  assert row["classification_source"] == "legacy_default"
+  assert row["index_version"] == 1
+  assert row["last_seen_ts"]
+  assert row["stale_ts"] is None
+  assert row["last_error"] is None
+  assert row["content_hash"]
+  assert get_artifact_sidecar_index_row(
+    workspace_dir=workspace,
+    artifact_kind="dashboard",
+    artifact_id="dashboard-artifact-1",
+  ) == row
+
+
+def test_dashboard_artifact_store_keeps_sidecar_when_index_registration_fails(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  artifact = _artifact("index-failure", ticker="PCTY")
+  payload = _payload("PCTY Dashboard")
+
+  def _raise(*args, **kwargs):
+    raise RuntimeError("index unavailable")
+
+  monkeypatch.setattr(dashboard_store, "register_dashboard_artifact_sidecar", _raise)
+
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.dashboard_artifact_store"):
+    write_dashboard_artifact(
+      workspace_dir=tmp_path,
+      artifact=artifact,
+      payload_json=payload,
+    )
+
+  assert read_dashboard_artifact_sidecar(tmp_path, "index-failure") == artifact
+  assert read_dashboard_artifact_payload(tmp_path, "index-failure") == payload
+  assert "artifact_index_failure" in caplog.messages
+
+
+def test_dashboard_artifact_store_rejects_mismatched_index_user_without_failing_sidecar(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  workspace = tmp_path / "users" / "alice" / "workspace"
+  artifact = _artifact("wrong-user", ticker="PCTY")
+  payload = _payload("PCTY Dashboard")
+
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.dashboard_artifact_store"):
+    write_dashboard_artifact(
+      workspace_dir=workspace,
+      artifact=artifact,
+      payload_json=payload,
+      user_id="bob",
+    )
+
+  assert read_dashboard_artifact_sidecar(workspace, "wrong-user") == artifact
+  assert get_artifact_sidecar_index_row(
+    workspace_dir=workspace,
+    artifact_kind="dashboard",
+    artifact_id="wrong-user",
+  ) is None
+  assert "artifact_index_failure" in caplog.messages
 
 
 def test_dashboard_artifact_store_lists_newest_first_with_filters(tmp_path: Path) -> None:

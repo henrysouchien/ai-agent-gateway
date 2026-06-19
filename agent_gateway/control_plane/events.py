@@ -201,6 +201,58 @@ def _autonomous_record_for_run(app_state: Any, run_id: str) -> Any | None:
   return next((task for task in tasks.values() if getattr(task, "control_run_id", None) == run_id), None)
 
 
+def _autonomous_replay_events_for_record(record: Any) -> list[dict[str, Any]]:
+  control_run_id = getattr(record, "control_run_id", None)
+  events: list[dict[str, Any]] = []
+  for raw_event in getattr(record, "event_lines", None) or []:
+    if not isinstance(raw_event, dict):
+      continue
+    event = dict(raw_event)
+    if isinstance(control_run_id, str) and control_run_id:
+      event.setdefault("run_id", control_run_id)
+      event.setdefault("control_run_id", control_run_id)
+    events.append(event)
+  return events
+
+
+def _autonomous_record_is_terminated(record: Any) -> bool:
+  state = str(getattr(record, "state", "") or "").strip().lower()
+  if state in {"completed", "finished", "failed", "killed", "cancelled", "interrupted"}:
+    return True
+  proc = getattr(record, "proc", None)
+  if proc is not None and getattr(proc, "returncode", None) is None:
+    return False
+  return state not in {"starting", "queued", "waiting", "running", "approval_pending"}
+
+
+async def _seed_autonomous_replay_buffer(
+  *,
+  user_event_bus: Any,
+  app_state: Any,
+  run_id: str | None,
+) -> str | None:
+  if run_id is None:
+    return None
+  record = _autonomous_record_for_run(app_state, run_id)
+  if record is None:
+    return None
+  control_run_id = getattr(record, "control_run_id", None)
+  if not isinstance(control_run_id, str) or not control_run_id:
+    return None
+  seed = getattr(user_event_bus, "seed_replay_buffer", None)
+  if not callable(seed):
+    return control_run_id
+  events = _autonomous_replay_events_for_record(record)
+  if events:
+    await seed(
+      getattr(record, "user_id", ""),
+      control_run_id,
+      events,
+      terminated=_autonomous_record_is_terminated(record),
+    )
+  return control_run_id
+
+
 def _run_visible_to_session(
   *,
   auth: AuthManager,
@@ -287,6 +339,12 @@ def build_events_router(*, auth: AuthManager) -> APIRouter:
     user_event_bus = getattr(request.app.state, "user_event_bus", None)
     if user_event_bus is None:
       raise HTTPException(status_code=503, detail="User event bus unavailable")
+    if authenticated.kind != "chat":
+      scoped_run_id = await _seed_autonomous_replay_buffer(
+        user_event_bus=user_event_bus,
+        app_state=request.app.state,
+        run_id=scoped_run_id,
+      ) or scoped_run_id
 
     if projected_schema_version is None:
       subscription: AsyncIterator[Any] = user_event_bus.subscribe(

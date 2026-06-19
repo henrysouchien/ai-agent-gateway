@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import sys
 import types
 from pathlib import Path
@@ -9,12 +11,39 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+import agent_gateway.providers.openai as openai_provider_module
+import agent_gateway.providers.openai_helpers as openai_helpers
 from agent_gateway.providers import OpenAIProvider
 
 
 @pytest.fixture(autouse=True)
 def _clear_openai_env(monkeypatch: pytest.MonkeyPatch):
   monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
+def test_openai_provider_helper_exports_are_parent_aliases() -> None:
+  helper_names = (
+    "_MAX_TOOL_ID_LEN",
+    "_MODEL_INFO_BY_TAG",
+    "_TOOL_ID_RE",
+    "_base_compat",
+    "_contains_tool_history",
+    "_detect_compat",
+    "_field",
+    "_image_part",
+    "_is_tool_result_message",
+    "_map_reasoning_effort",
+    "_model_matches_tag",
+    "_normalize_tool_call_id",
+    "_same_model_message",
+    "_stringify_tool_result_content",
+    "_synthetic_tool_result",
+    "_system_prompt_text",
+    "_to_plain_dict",
+  )
+
+  for name in helper_names:
+    assert getattr(openai_provider_module, name) is getattr(openai_helpers, name)
 
 
 def test_openai_has_active_credential_oauth_mode() -> None:

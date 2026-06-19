@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import asyncio
 import datetime
 import re
@@ -16,6 +18,8 @@ from agent_gateway.skills import SkillLoader
 from agent_gateway import EventLog
 from agent_gateway.html_artifact_store import read_html_artifact_content, read_html_artifact_sidecar
 from agent_gateway.session import GatewaySession
+import agent_gateway.sub_agent as sub_agent_module
+import agent_gateway.sub_agent_helpers as sub_agent_helpers
 from agent_gateway.sub_agent import (
   _DEFAULT_EXCLUDED_TOOLS,
   DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
@@ -29,6 +33,47 @@ from agent_gateway.sub_agent import (
 from agent_gateway.tool_dispatcher import ToolExecutionContext
 
 _UNRESOLVED_BLOCK_RE = re.compile(r"\{\{[A-Z][A-Z0-9_]*\}\}")
+
+
+def test_sub_agent_helper_exports_are_parent_aliases() -> None:
+  helper_names = (
+    "_DEFAULT_EXCLUDED_TOOLS",
+    "DEFAULT_SUB_AGENT_TIMEOUT_SECONDS",
+    "_ARTIFACT_EMIT_TOOLS",
+    "_RESEARCH_FILE_ID_RE",
+    "ExcludedToolsResolver",
+    "NeedsApprovalResolver",
+    "MutationModeExclusionsApplier",
+    "_SKILL_SYSTEM_PROMPT_TEMPLATE",
+    "_DEFAULT_SYSTEM_PROMPT_TEMPLATE",
+    "_RUN_AGENT_DESCRIPTION",
+    "_RESUME_AGENT_DESCRIPTION",
+    "_entry_child_budget_usd",
+    "_CONTEXT_TICKER_RE",
+    "_TICKER_STOPWORDS",
+    "_artifact_storage_user_id",
+    "_render_agent_param_description",
+    "_extract_ticker_from_task",
+    "_extract_research_file_id_from_task",
+    "_optional_research_file_id",
+    "_message_content_text",
+    "_extract_ticker_from_resume_messages",
+    "_extract_research_file_id_from_resume_messages",
+    "_html_artifact_ticker",
+    "_html_artifact_scope",
+    "_dashboard_artifact_ticker",
+    "_dashboard_artifact_scope",
+    "_skill_html_excluded_tools",
+    "_install_emit_html_artifact_handler",
+    "_install_emit_dashboard_artifact_handler",
+    "make_run_agent_tool_def",
+    "make_get_background_result_tool_def",
+    "make_resume_tool_def",
+    "make_send_message_tool_def",
+  )
+
+  for name in helper_names:
+    assert getattr(sub_agent_module, name) is getattr(sub_agent_helpers, name)
 
 
 def _run(coro):
@@ -317,7 +362,7 @@ def test_make_run_agent_handler_loads_skill_profile_and_filters_tools(tmp_path: 
   _write_skill(
     skills_dir,
     "deep-research",
-    _callable_skill("model: claude-opus-4-6\nmax_turns: 7\ntimeout: 12.5"),
+    _callable_skill("model: claude-opus-4-6\nmax_turns: 7\ntimeout: 12.5\nmax_tokens: 12000"),
   )
   runner = _StubRunner()
   keep_tool = _dummy_tool
@@ -354,7 +399,7 @@ def test_make_run_agent_handler_loads_skill_profile_and_filters_tools(tmp_path: 
   assert call["max_turns"] == 7
   assert call["timeout"] == 12.5
   assert call["client_timeout"] == 90
-  assert call["max_tokens"] == 64000
+  assert call["max_tokens"] == 12000
   assert call["call_index"] == 3
   assert dispatcher._local["keep_tool"] is keep_tool
   assert "drop_tool" not in dispatcher._local

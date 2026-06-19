@@ -11,7 +11,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import (
+from agent_gateway import (  # noqa: E402
   AgentRunner,
   EventLog,
   NotificationQueue,
@@ -20,7 +20,12 @@ from agent_gateway import (
   TaskState,
   ToolDispatcher,
 )
-import agent_gateway.runner as gateway_runner
+import agent_gateway.runner as gateway_runner  # noqa: E402
+from agent_gateway.runner_notifications import (  # noqa: E402
+  build_notification_reminder,
+  consume_notifications,
+  inject_system_prompt_reminder,
+)
 
 
 class _NullMcpClient:
@@ -112,6 +117,39 @@ def test_notification_queue_drain_respects_max_count_and_order() -> None:
   assert [item.task_id for item in drained] == ["bg_0", "bg_1"]
   assert queue.pending_count == 1
   assert [item.task_id for item in queue.peek()] == ["bg_2"]
+
+
+def test_notification_reminder_helper_peeks_with_pending_suffix() -> None:
+  queue = NotificationQueue()
+  for index in range(3):
+    queue.push(_notification(f"bg_{index}", summary=f"done {index}"))
+
+  reminder = build_notification_reminder(queue, max_count=2)
+
+  assert reminder.count("<task-notification") == 2
+  assert "bg_0" in reminder
+  assert "bg_1" in reminder
+  assert "bg_2" not in reminder
+  assert "[1 more task notification(s) pending]" in reminder
+  assert queue.pending_count == 3
+
+
+def test_consume_notifications_helper_drains_requested_count() -> None:
+  queue = NotificationQueue()
+  queue.push(_notification("bg_0"))
+  queue.push(_notification("bg_1"))
+  queue.push(_notification("bg_2"))
+
+  assert consume_notifications(queue, max_count=2) == 2
+  assert [item.task_id for item in queue.peek()] == ["bg_2"]
+
+
+def test_inject_system_prompt_reminder_helper_matches_runner_delegate() -> None:
+  assert inject_system_prompt_reminder(None, "") is None
+  assert inject_system_prompt_reminder("", "reminder") == "reminder"
+  assert inject_system_prompt_reminder("base", "reminder") == "base\n\nreminder"
+  assert inject_system_prompt_reminder([("base", True)], "reminder") == [("base", True), ("reminder", False)]
+  assert AgentRunner._inject_system_prompt_reminder("base", "reminder") == "base\n\nreminder"
 
 
 def test_notification_queue_honors_max_pending_cap() -> None:

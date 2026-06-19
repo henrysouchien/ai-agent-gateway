@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import types
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -15,13 +16,13 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog, SessionStore
-from agent_gateway.approval_policy import ApprovalDecision as PolicyApprovalDecision, ApprovalRequest, ApprovalRequestPayload, RunContext
-from agent_gateway.approval_store import SQLiteApprovalStore
-from agent_gateway.approvals import _record_vote_and_unblock
-from agent_gateway.providers.agent_sdk import SDK_PINNED_VERSION
-from agent_gateway.runner import _ACTIVE_SKILL_DENY_RESULT_KEY, _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY
-from agent_gateway.skill_context import clear_current_skill, current_skill, set_current_skill
+from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog, SessionStore  # noqa: E402
+from agent_gateway.approval_policy import ApprovalDecision as PolicyApprovalDecision, ApprovalRequest, ApprovalRequestPayload, RunContext  # noqa: E402
+from agent_gateway.approval_store import SQLiteApprovalStore  # noqa: E402
+from agent_gateway.approvals import _record_vote_and_unblock  # noqa: E402
+from agent_gateway.providers.agent_sdk import SDK_PINNED_VERSION  # noqa: E402
+from agent_gateway.runner import _ACTIVE_SKILL_DENY_RESULT_KEY, _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY  # noqa: E402
+from agent_gateway.skill_context import clear_current_skill, current_skill, set_current_skill  # noqa: E402
 
 
 def _run(coro):
@@ -248,6 +249,137 @@ def test_sdk_runner_relay_policy_denial_uses_machine_readable_message(
     assert denied.message.startswith("[relay_policy_denied]")
     assert "relay chat policy" in denied.message
     assert "taskpane composer" in denied.message
+
+  _run(_case())
+
+
+def test_sdk_runner_trade_approval_record_includes_preview_summary(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  preview_expires_at = datetime.now(UTC) + timedelta(seconds=120)
+
+  class _Policy:
+    policy_bundle_hash = "test-policy"
+
+    async def decide(
+      self,
+      *,
+      payload: ApprovalRequestPayload,
+      request: ApprovalRequest,
+      run_context: RunContext,
+    ):
+      _ = payload, request, run_context
+      return PolicyApprovalDecision(
+        outcome="request_user_approval",
+        reason="Tool requires approval",
+        route_target_type="pending_tools",
+        expiry_seconds=600,
+        allow_persistent_grant=True,
+      )
+
+    async def on_resolve(self, *, request: ApprovalRequest) -> None:
+      _ = request
+
+    async def revoke_persistent_grant(self, *, grant_id: str, reason: str) -> None:
+      _ = grant_id, reason
+
+    def role_authorized_for_class(self, *, decider_role: str | None, tool_class: str) -> bool:
+      _ = decider_role, tool_class
+      return True
+
+  event_log = EventLog()
+  event_log.append(
+    {
+      "type": "tool_call_complete",
+      "tool_call_id": "preview-1",
+      "tool_name": "mcp__portfolio-mcp__preview_trade",
+      "result": {
+        "status": "success",
+        "metadata": {
+          "account_id": "acct-1",
+          "expires_at": preview_expires_at.isoformat(),
+          "broker_provider": "ibkr",
+        },
+        "data": {
+          "preview_id": "p1",
+          "ticker": "SGOV",
+          "side": "BUY",
+          "quantity": 10,
+          "order_type": "Market",
+          "time_in_force": "Day",
+          "estimated_price": 100.25,
+          "estimated_total": 1002.5,
+          "estimated_commission": 0.0,
+          "validation": {"is_valid": True, "warnings": []},
+        },
+      },
+      "error": None,
+    }
+  )
+
+  async def _case() -> None:
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    policy = _Policy()
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    runner = AgentSDKRunner(
+      event_log=event_log,
+      session_id=session.session_id,
+      sdk_config=AgentSDKConfig(
+        api_key="k",
+        model="claude-sonnet-4-6",
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      ),
+      system_prompt="test",
+      session=session,
+      store=store,
+      policy=policy,
+      run_context=RunContext(
+        user_id="alice",
+        request_id="request-1",
+        session_id=session.session_id,
+        channel="web",
+      ),
+    )
+
+    callback_task = asyncio.create_task(
+      runner._can_use_tool_callback("mcp__portfolio-mcp__execute_trade", {"preview_id": "p1"}, None)
+    )
+    for _ in range(100):
+      if session.pending_tools:
+        break
+      await asyncio.sleep(0.001)
+    else:
+      raise AssertionError("approval request was not queued")
+
+    tool_call_id, pending = next(iter(session.pending_tools.items()))
+    request = await store.get(str(pending["approval_id"]))
+    assert request is not None
+    assert request.tool_args_redacted["preview_id"] == "p1"
+    assert request.tool_args_redacted["approval_summary"]["ticker"] == "SGOV"
+    assert request.tool_args_redacted["approval_summary"]["quantity"] == 10
+    assert request.tool_args_redacted["approval_summary"]["estimated_total"] == 1002.5
+    assert request.expires_at is not None
+    approval_window = (request.expires_at - request.requested_at).total_seconds()
+    assert 85 <= approval_window <= 91
+
+    await _record_vote_and_unblock(
+      target_session=session,
+      pending_entry=pending,
+      tool_call_id=tool_call_id,
+      nonce=pending["nonce"],
+      decider_id="alice",
+      decider_role="owner",
+      approved=False,
+      allow_tool_type=False,
+      reason="test",
+      app_state=SimpleNamespace(gateway_approval_store=store, gateway_approval_policy=policy),
+    )
+    denied = await callback_task
+    assert denied.behavior == "deny"
 
   _run(_case())
 

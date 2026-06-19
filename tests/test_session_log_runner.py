@@ -11,7 +11,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import (
+from agent_gateway import (  # noqa: E402
   AgentRunner,
   AgentSessionLog,
   EventLog,
@@ -23,8 +23,8 @@ from agent_gateway import (
   TaskState,
   ToolDispatcher,
 )
-from agent_gateway.providers import StreamEvent
-import agent_gateway.runner as gateway_runner
+from agent_gateway.providers import StreamEvent  # noqa: E402
+import agent_gateway.runner as gateway_runner  # noqa: E402
 
 
 def _run(coro):
@@ -460,6 +460,50 @@ def test_operator_pause_after_turn_stops_before_tool_dispatch(tmp_path: Path) ->
   assert entries[4].event["reason"] == "operator_pause"
   assert "tool_call_start" not in event_types
   assert "tool_call_interrupted" not in event_types
+
+
+def test_sub_agent_cancelled_run_emits_sub_agent_interrupted_reason(tmp_path: Path) -> None:
+  stream_started = asyncio.Event()
+
+  class _BlockingProvider(_ScriptedProvider):
+    async def stream(self, client: Any, params: dict[str, Any]):
+      _ = client, params
+      stream_started.set()
+      while True:
+        await asyncio.sleep(60)
+      yield  # pragma: no cover
+
+  log = AgentSessionLog(path=tmp_path / "sessions" / "sub-agent-cancelled.jsonl")
+  runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sub-worker:parent",
+    provider=_BlockingProvider([]),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+    shutdown_signal_provider=lambda: {"signal_name": "SIGTERM"},
+  )
+
+  async def _cancel_runner() -> None:
+    task = asyncio.create_task(
+      runner.run(messages=[{"role": "user", "content": "Cancel"}])
+    )
+    await asyncio.wait_for(stream_started.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+
+  _run(_cancel_runner())
+
+  entries, _ = _run(log.query(order="asc"))
+  interrupted = next(entry.event for entry in entries if entry.event["type"] == "interrupted")
+  detach = next(entry.event for entry in entries if entry.event["type"] == "detach")
+  assert interrupted["reason"] == "sub_agent_cancelled"
+  assert "shutdown" not in interrupted
+  assert detach["reason"] == "cancelled"
 
 
 def test_runner_without_context_builder_does_not_inject_prior_durable_history(tmp_path: Path) -> None:

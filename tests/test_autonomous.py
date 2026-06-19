@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +143,52 @@ def test_run_session_timeout() -> None:
   assert output.timed_out is True
   assert output.response == ""
   assert output.error is None
+
+
+def test_run_session_timeout_does_not_wait_for_slow_cancellation(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  event_log = EventLog()
+  monkeypatch.setattr(autonomous, "_RUN_SESSION_CANCEL_DRAIN_SECONDS", 0.01)
+  monkeypatch.setattr(autonomous, "_RUN_SESSION_FORCE_CLOSE_SECONDS", 0.01)
+
+  class _SlowCancellationRunner:
+    force_closed = False
+    cancel_seen = False
+
+    async def run(self, **kwargs: Any) -> None:
+      _ = kwargs
+      try:
+        await asyncio.Event().wait()
+      except asyncio.CancelledError:
+        self.cancel_seen = True
+        await asyncio.sleep(1.0)
+
+    async def force_close(self, timeout: float = 2.0) -> None:
+      _ = timeout
+      self.force_closed = True
+
+  async def _exercise() -> tuple[autonomous.RunOutput, float, _SlowCancellationRunner]:
+    runner = _SlowCancellationRunner()
+    started = time.monotonic()
+    output = await autonomous.run_session(
+      runner,  # type: ignore[arg-type]
+      event_log,
+      model="claude-sonnet-4-6",
+      max_turns=3,
+      timeout_seconds=0.01,
+      initial_message="hello",
+      system_prompt="You are helpful.",
+    )
+    return output, time.monotonic() - started, runner
+
+  output, elapsed, runner = _run(_exercise())
+
+  assert output.timed_out is True
+  assert output.error is None
+  assert runner.cancel_seen is True
+  assert runner.force_closed is True
+  assert elapsed < 0.2
 
 
 @pytest.mark.parametrize("timeout_seconds", [0, None, -1])

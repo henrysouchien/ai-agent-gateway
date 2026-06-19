@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 from agent_gateway.dashboard_artifact.generate_description import render_description
 from agent_gateway.dashboard_artifact.qa import build_dashboard_artifact, validate_dashboard_payload
@@ -20,6 +22,27 @@ REGISTRY_DESCRIPTION = (
   / "dashboard_artifact"
   / "registry_description.json"
 )
+
+
+def test_dashboard_artifact_package_import_defers_qa_module() -> None:
+  script = """
+import sys
+from agent_gateway import dashboard_artifact
+
+assert "agent_gateway.dashboard_artifact.qa" not in sys.modules
+assert "validate_dashboard_payload" in dashboard_artifact.__all__
+assert "decision_box" in dashboard_artifact.MODULE_REGISTRY
+_ = dashboard_artifact.validate_dashboard_payload
+assert "agent_gateway.dashboard_artifact.qa" in sys.modules
+"""
+  result = subprocess.run(
+    [sys.executable, "-c", script],
+    cwd=ROOT,
+    capture_output=True,
+    text=True,
+  )
+
+  assert result.returncode == 0, result.stderr
 
 
 def test_registry_is_pinned_to_literal_expectations() -> None:

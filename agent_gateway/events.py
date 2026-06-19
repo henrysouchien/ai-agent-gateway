@@ -557,6 +557,7 @@ def _session_usage_summary(value: Any) -> SessionUsageSummary | None:
     product_id=_optional_str(value.get("product_id")),
     model=_optional_str(value.get("model")),
     provider=_optional_str(value.get("provider")),
+    context_surfaces=_mapping_list(value.get("context_surfaces", []), "session_recap.usage.context_surfaces"),
   )
 
 

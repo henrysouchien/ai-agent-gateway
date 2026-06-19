@@ -2,1573 +2,166 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
-import hashlib
-import hmac
-import inspect
-import json as json_mod
 import logging
-import math
 import os
-import re
-import secrets
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, model_validator
 from starlette.background import BackgroundTask
 
 from ._provider_utils import _get_allowed_models_for_provider_name
 from .artifact_paths import (
   ArtifactPath,
   ArtifactPathError,
+  artifact_json_paths_for_request,
   artifact_json_path_for_request,
-  latest_artifact_json_path_for_request,
   letter_docx_path_for_request,
   reject_unsafe_path,
-  ticker_artifact_index_for_request,
+  ticker_artifact_paths_for_request,
 )
 from .auth import (
   ChannelMismatchError,
-  CredentialRefreshRequest,
-  CredentialsResolver,
-  CredentialsRefreshResolver,
   CredentialsTimeoutError,
   CrossUserReuseError,
   MissingUserIdError,
-  NoCredentialError,
-  ProviderCredentialFailure,
 )
 from .autonomous_runner import AutonomousRegistry
 from .control_plane import create_control_plane_router
 from .control_plane.middleware import add_control_plane_version_header_middleware
 from .event_log import EventLog, UserEventBus
-from .approval_audit import ApprovalAuditEmitter
 from .approvals import ApprovalActionError, _record_vote_and_unblock
-from .approval_resolver import resolve_policy
-from .approval_store import SQLiteApprovalStore, expire_pending_loop
-from .audit_resolver import resolve_audit_writer
-from .agent_session_log import _atomic_write_sidecar
-from .event_adapter import adapt_event
-from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, event_to_dict
-from .mcp_client import McpClientManager
+from .approval_resolver import resolve_policy  # noqa: F401 - compatibility alias
+from .approval_store import SQLiteApprovalStore, expire_pending_loop  # noqa: F401
 from .package_info import package_health
-from .product_config import gateway_product_id
-from .providers.agent_sdk import AgentSDKConfig
-from .providers import AnthropicProvider, ModelProvider, StreamEvent
-from .runner import AgentRunner
-from .sdk_runner import AgentSDKRunner
-from .session import AuthManager, GatewaySession, SessionStore, SessionStream, StreamSubscriber
-from .session_recap import compute_recap, emit_recap_then_terminal
-from .tool_dispatcher import ApprovalDecision, ApprovalRequest
-from .tool_redaction import (
-  get_audit_hmac_key_id,
-  get_audit_hmac_secret,
-  redact_tool_input as default_redact_tool_input,
+from .providers import StreamEvent
+from .session import AuthManager, GatewaySession, SessionStore, StreamSubscriber
+
+from . import server_chat_helpers as _server_chat_helpers  # noqa: F401 - dynamic streaming deps alias
+from . import server_streaming as _server_streaming
+from .server_models import (  # noqa: F401
+  SystemPrompt,
+  ExecutionLocationResolver,
+  BuildChatRuntime,
+  RequestApproval,
+  BuildRunner,
+  _AGENT_API_CLAIM_AUDIENCE,
+  _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS,
+  _AGENT_API_CLAIM_NONCE_HEX_LENGTH,
+  _AGENT_API_CLAIM_HEADERS,
+  _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT,
+  _ARTIFACT_DOCX_MEDIA_TYPE,
+  _ARTIFACT_ORIGIN_VALUES,
+  _ARTIFACT_ORIGIN_FILTER_VALUES,
+  _ARTIFACT_VISIBILITY_VALUES,
+  _ARTIFACT_VISIBILITY_FILTER_VALUES,
+  _ARTIFACT_INDEX_RECENT_LIMIT,
+  _DEFAULT_CHAT_PROFILE,
+  _CHAT_PROFILE_ALIASES,
+  _ACTIVE_TURN_GRACE_SECONDS,
+  _STREAM_SUBSCRIBER_QUEUE_MAX,
+  _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS,
+  _SIDECAR_SLUG_RE,
+  _STREAM_SUBSCRIBER_DONE,
+  ChatInitRequest,
+  ModelCatalog,
+  ChatInitResponse,
+  ChatMessage,
+  ChatRequest,
+  ChatRecapRequest,
+  ChatCancelRequest,
+  _resolve_chat_profile_name,
+  ChatTurnInputs,
+  ChatTurnResult,
+  ToolResultRequest,
+  ToolApprovalRequest,
+  ChatRuntime,
+  _build_runner_with_started_at,
+  _call_build_chat_runtime,
+  RequestContext,
+  GatewayServerConfig,
+)
+from .server_artifact_helpers import (  # noqa: F401
+  _model_to_dict,
+  _normalize_prefix,
+  _route_path,
+  _default_control_skills_dir,
+  _default_autonomous_api_dir,
+  _default_autonomous_log_dir,
+  _resolve_compaction_trigger,
+  _sanitize_for_json,
+  _json_dumps,
+  _claim_ttl_ceiling_seconds,
+  _verify_signed_user_claim,
+  _artifact_auth_dependency,
+  _extract_agent_claim_headers,
+  _verify_agent_claim_headers,
+  _artifact_json_response,
+  _artifact_payload_from_path,
+  _decorate_artifact_payload,
+  _artifact_effective_fields,
+  _artifact_research_file_classification,
+  _artifact_sidecar_classification,
+  _artifact_origin_kind,
+  _artifact_origin_kind_filter,
+  _artifact_visibility,
+  _artifact_visibility_filter,
+  _artifact_origin_ref,
+  _artifact_request_filters,
+  _artifact_payload_matches_filters,
+  _int_or_none,
+  _artifact_research_file_id_token_present,
+  _query_int_or_none,
+  _query_str_or_none,
+  _assert_artifact_path_still_safe,
+  _file_cache_headers,
+  _letter_filename,
+  _normalize_request_user_id,
+  _resolver_contract_payload,
+  _error_payload,
+)
+from .server_chat_helpers import (  # noqa: F401
+  _drain_result_queue,
+  _now_iso,
+  _sidecar_slug,
+  _maybe_write_chat_log_meta,
+  _write_transcript,
+  _cleanup_old_transcripts,
+  _compute_session_recap_payload,
+  _redact_tool_input_for_event,
+  _cleanup_sessions_loop,
+  _maybe_await,
+  _cancel_active_turn_cleanup_handle,
+  _clear_active_turn,
+  _active_turn_is_running,
+  _schedule_active_turn_clear,
+  _cancel_active_turn_runner,
+  _cleanup_active_turn_on_expiry,
+  _event_for_wire,
+  _resolve_schema_version,
+  _stream_envelope,
+  _legacy_request_approval,
+  _make_request_approval,
+  _chat_turn_state_from_events,
+  _chat_run_state_event,
+  _latest_chat_run_state,
+  _dispatch_chat_turn,
+  _init_approval_subsystem,
 )
 
 
-SystemPrompt = str | List[Tuple[str, bool]]
-ExecutionLocationResolver = Callable[[str], Optional[str]]
-BuildChatRuntime = Callable[[GatewaySession, "ChatRequest", Optional[str], AuthManager], Awaitable["ChatRuntime"]]
-RequestApproval = Callable[[ApprovalRequest], Awaitable[Optional[ApprovalDecision]]]
-BuildRunner = Callable[..., AgentRunner | AgentSDKRunner]
-
-_AGENT_API_CLAIM_AUDIENCE = "agent_api_v1"
-_AGENT_API_CLAIM_CLOCK_SKEW_SECONDS = 60
-_AGENT_API_CLAIM_NONCE_HEX_LENGTH = 32
-_AGENT_API_CLAIM_HEADERS = {
-  "audience": "X-Agent-Claim-Audience",
-  "issued_at": "X-Agent-Claim-Issued-At",
-  "expiry": "X-Agent-Claim-Expiry",
-  "user_id": "X-Agent-Claim-User-Id",
-  "user_email": "X-Agent-Claim-User-Email",
-  "nonce": "X-Agent-Claim-Nonce",
-  "signature": "X-Agent-Claim-Signature",
-}
-_AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT = 600
-_ARTIFACT_DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-_DEFAULT_CHAT_PROFILE = "analyst"
-_CHAT_PROFILE_ALIASES = {"hank": "analyst"}
-_ACTIVE_TURN_GRACE_SECONDS = 60.0
-_STREAM_SUBSCRIBER_QUEUE_MAX = 256
-_STREAM_SUBSCRIBER_KEEPALIVE_SECONDS = 15.0
-_SIDECAR_SLUG_RE = re.compile(r"[^a-z0-9-]+")
-log = logging.getLogger("agent_gateway.server")
-_STREAM_SUBSCRIBER_DONE = object()
-
-
-class ChatInitRequest(BaseModel):
-  """Request body for `POST /chat/init`."""
-
-  api_key: str = Field(..., min_length=1)
-  schema_version: int | None = None
-  user_id: str | None = None
-  user_email: str | None = None
-  context: Dict[str, Any] = Field(default_factory=dict)
-  anthropic_auth_mode: Optional[str] = None
-  anthropic_api_key: Optional[str] = None
-  anthropic_auth_token: Optional[str] = None
-
-
-class ModelCatalog(BaseModel):
-  default_model: str
-  allowed_models: List[str]
-  display_names: Dict[str, str]
-  providers: Dict[str, str] | None = None
-
-
-class ChatInitResponse(BaseModel):
-  """Response body returned after a session token is issued."""
-
-  user_id: str
-  session_token: str
-  session_id: str
-  expires_at: int
-  schema_version: int
-  model_catalog: Optional[ModelCatalog] = None
-
-
-class ChatMessage(BaseModel):
-  """Single plain-text chat message sent to the gateway."""
-
-  role: str
-  content: str
-
-
-class ChatRequest(BaseModel):
-  """Request body for `POST /chat`.
-
-  `messages` is the full message list for the current turn. `context` is
-  intentionally free-form; `context["channel"]` is the most common field used
-  to shape runtime behavior per frontend.
-  """
-
-  messages: List[ChatMessage]
-  user_id: str | None = None
-  request_id: str | None = None
-  context: Dict[str, Any] = Field(default_factory=dict)
-  metadata: Dict[str, Any] = Field(default_factory=dict)
-  model: Optional[str] = None
-
-
-class ChatRecapRequest(BaseModel):
-  """Request body for `POST /chat/recap`."""
-
-  session_id: str = Field(..., min_length=1)
-  scope: str = "active_turn"
-
-
-class ChatCancelRequest(BaseModel):
-  """Request body for `POST /chat/cancel`."""
-
-  session_id: str = Field(..., min_length=1)
-
-
-def _resolve_chat_profile_name(context: Mapping[str, Any] | None) -> str:
-  raw_profile = None
-  for key in ("profile", "profile_name", "agent_id", "agent", "system_prompt_key"):
-    raw_profile = (context or {}).get(key)
-    if raw_profile is not None:
-      break
-  if raw_profile is None:
-    return _DEFAULT_CHAT_PROFILE
-  if not isinstance(raw_profile, str):
-    raise HTTPException(status_code=400, detail="context.profile must be a string when provided")
-  profile_name = raw_profile.strip().lower()
-  if not profile_name:
-    return _DEFAULT_CHAT_PROFILE
-  return _CHAT_PROFILE_ALIASES.get(profile_name, profile_name)
-
-
-@dataclass
-class ChatTurnInputs:
-  messages: list[ChatMessage]
-  request_id: str | None
-  context: dict[str, Any] | None
-  metadata: dict[str, Any] | None
-  model: str | None
-
-
-@dataclass
-class ChatTurnResult:
-  session_id: str
-  request_id: str | None
-  state: str
-  events: list[dict[str, Any]]
-
-
-class ToolResultRequest(BaseModel):
-  """Submit the result of a client-executed tool call.
-
-  The built-in backend tools do not normally use this path, but the endpoint is
-  available for custom runtimes that stage tool execution on the client side.
-  """
-
-  tool_call_id: str
-  nonce: str
-  result: Optional[Dict[str, Any]] = None
-  error: Optional[Dict[str, Any]] = None
-
-
-class ToolApprovalRequest(BaseModel):
-  """Approve or deny a pending tool call."""
-
-  tool_call_id: str
-  nonce: str
-  approved: bool
-  allow_tool_type: bool = False
-  denied_by: Optional[str] = None
-
-  @model_validator(mode="after")
-  def _validate_denied_by(self) -> "ToolApprovalRequest":
-    if self.approved:
-      self.denied_by = None
-      return self
-    if self.denied_by not in (None, "relay_policy"):
-      raise ValueError("denied_by must be omitted or 'relay_policy'")
-    return self
-
-
-@dataclass
-class ChatRuntime:
-  """Per-request runtime wiring returned by `build_chat_runtime`.
-
-  Attributes:
-    system_prompt: Prompt string or cached prompt blocks for the request.
-    build_runner: Factory that receives `(event_log, session_id, started_at)`
-      and returns an `AgentRunner` or `AgentSDKRunner`. Two-argument factories
-      are still accepted for compatibility with older tests/custom runtimes.
-    get_tool_definitions: Callback returning the tool schemas visible to the
-      model for this request.
-    build_dispatcher: Reserved callback slot for custom dispatcher builders.
-    provider: Provider handling the request, typically Anthropic or OpenAI.
-    model_override: Request-scoped model override.
-    resolved_provider_name: Provider resolved for this request, when known.
-    excluded_tools: Optional tool names hidden from the runtime.
-    execution_location: Optional resolver used to annotate tool events with
-      metadata such as `backend`, `client`, or a channel-specific location.
-    on_usage: Optional request-scoped usage hook.
-    on_tool_result: Optional request-scoped tool result hook.
-    on_tool_timing: Optional request-scoped tool timing hook.
-    disconnect_handler: Optional request-scoped disconnect hook invoked when the
-      client connection is closed mid-stream.
-    post_runner_init: Optional callback invoked after runner construction.
-    max_turns: Optional cap on loop iterations for this request.
-    compaction_trigger: Optional token threshold for provider-side compaction.
-    compaction_instructions: Optional provider-specific compaction instructions.
-  """
-
-  system_prompt: SystemPrompt
-  build_runner: BuildRunner
-  get_tool_definitions: Callable[[], List[Dict[str, Any]]] = field(default_factory=lambda: [])
-  build_dispatcher: Callable[["RequestContext"], Any] | None = None
-  provider: ModelProvider | None = None
-  model_override: Optional[str] = None
-  resolved_provider_name: Optional[str] = None
-  excluded_tools: Optional[Set[str]] = None
-  execution_location: Optional[ExecutionLocationResolver] = None
-  on_usage: Optional[Callable[..., Any]] = None
-  on_tool_result: Optional[Callable[..., Any]] = None
-  on_tool_timing: Optional[Callable[..., Any]] = None
-  disconnect_handler: Optional[Callable[[], Awaitable[None] | None]] = None
-  post_runner_init: Optional[Callable[[Any], None]] = None
-  max_turns: Optional[int] = None
-  compaction_trigger: int | None = None
-  compaction_instructions: str | None = None
-  _disconnect_called: bool = field(default=False, init=False, repr=False)
-
-  async def on_disconnect(self) -> None:
-    if self._disconnect_called:
-      return
-    self._disconnect_called = True
-    if self.disconnect_handler is None:
-      return
-    try:
-      result = self.disconnect_handler()
-      if inspect.isawaitable(result):
-        await result
-    except Exception as exc:
-      logging.getLogger("agent_gateway.server").warning("ChatRuntime.on_disconnect failed: %s", exc)
-
-
-def _build_runner_with_started_at(
-  build_runner: BuildRunner,
-  event_log: EventLog,
-  session_id: str,
-  started_at: float,
-) -> AgentRunner | AgentSDKRunner:
-  try:
-    signature = inspect.signature(build_runner)
-  except (TypeError, ValueError):
-    return build_runner(event_log, session_id, started_at)
-
-  positional_params = [
-    param
-    for param in signature.parameters.values()
-    if param.kind in {param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD}
-  ]
-  accepts_varargs = any(param.kind == param.VAR_POSITIONAL for param in signature.parameters.values())
-  if accepts_varargs or len(positional_params) >= 3:
-    return build_runner(event_log, session_id, started_at)
-  return build_runner(event_log, session_id)
-
-
-async def _call_build_chat_runtime(
-  build_chat_runtime: BuildChatRuntime,
-  *,
-  session: GatewaySession,
-  request: "ChatRequest",
-  channel: str | None,
-  auth_manager: AuthManager | None,
-) -> "ChatRuntime":
-  kwargs = {
-    "session": session,
-    "request": request,
-    "channel": channel,
-    "auth_manager": auth_manager,
-  }
-  try:
-    signature = inspect.signature(build_chat_runtime)
-  except (TypeError, ValueError):
-    return await build_chat_runtime(session, request, channel, auth_manager)  # type: ignore[misc]
-
-  params = signature.parameters
-  accepts_kwargs = any(param.kind == param.VAR_KEYWORD for param in params.values())
-  accepts_named_kwargs = all(
-    name in params
-    and params[name].kind in {params[name].POSITIONAL_OR_KEYWORD, params[name].KEYWORD_ONLY}
-    for name in kwargs
-  )
-  if accepts_kwargs or accepts_named_kwargs:
-    return await build_chat_runtime(**kwargs)
-  return await build_chat_runtime(session, request, channel, auth_manager)  # type: ignore[misc]
-
-
-@dataclass
-class RequestContext:
-  """Mutable request-scoped objects shared across dispatch layers."""
-
-  session: GatewaySession
-  event_log: EventLog
-  request_approval: RequestApproval
-  result_queue: asyncio.Queue
-  mcp_client: Optional[McpClientManager]
-
-
-@dataclass
-class GatewayServerConfig:
-  """Configuration for `create_gateway_app()`.
-
-  Attributes:
-    auth_manager: Optional pre-built `AuthManager`. When omitted, the server
-      creates one from `jwt_secret`, `valid_api_keys`, and `session_ttl`.
-    default_provider: Informational default provider for the app.
-    jwt_secret: JWT signing secret used when `auth_manager` is omitted.
-    session_ttl: Session lifetime in seconds.
-    valid_api_keys: API keys accepted by `POST /chat/init`.
-    cors_origins: Allowed CORS origins.
-    cors_allow_headers: Allowed CORS headers.
-    cors_allow_methods: Allowed CORS methods.
-    auth_config: Default provider auth/model config used by convenience flows and
-      by request validation when no runtime override is present.
-    credentials_resolver: Optional init-time resolver for per-user credentials.
-    credentials_refresh_resolver: Optional stream-time resolver used to rotate
-      credentials after provider rate-limit, billing, or auth failures.
-    mcp_client: Optional shared `McpClientManager`.
-    sdk_config: Optional `AgentSDKConfig` when using `AgentSDKRunner`.
-    per_turn_timeout: Default per-turn timeout in seconds.
-    compaction_trigger: Default compaction threshold.
-    compaction_instructions: Default compaction instructions.
-    allowed_models: Model allowlist enforced at request time.
-    model_catalog: Optional model discovery metadata returned by `POST /chat/init`.
-    build_chat_runtime: Required async callback that returns a `ChatRuntime`.
-    on_event: Optional event observer invoked for every appended `EventLog`
-      entry.
-    on_tool_result: Optional app-level tool result hook.
-    on_usage: Optional app-level usage hook.
-    on_tool_timing: Optional app-level tool timing hook.
-    on_session_created: Optional app-level hook invoked after session creation
-      and before the init response is issued.
-    on_startup: Optional startup callback.
-    on_shutdown: Optional shutdown callback.
-    transcript_dir: Optional directory where request and event transcripts are
-      written as JSONL files.
-    transcript_retention_days: Number of days to retain chat transcript files.
-    control_skills_dir: Optional directory backing control-plane skill list/read
-      endpoints. When omitted, the package uses `AGENT_GATEWAY_SKILLS_DIR` if
-      set, otherwise an empty package-local directory.
-    audit_hmac_secret_resolver: Callback returning the approval-audit HMAC
-      secret bytes. Defaults to agent_gateway's environment-backed resolver.
-    audit_hmac_key_id_resolver: Callback returning the approval-audit HMAC key
-      id. Defaults to agent_gateway's environment-backed resolver.
-    tool_input_redactor: Optional app-specific redactor used before approval
-      audit persistence. Package consumers can omit this; arguments are copied
-      without redaction when no app policy is provided.
-    log_name: Logger name for the server.
-    prefix: Route prefix, usually `/api`.
-  """
-
-  auth_manager: Optional[AuthManager] = None
-  default_provider: ModelProvider | None = None
-  jwt_secret: str = field(default_factory=lambda: secrets.token_hex(32))
-  session_ttl: int = 3600
-  valid_api_keys: Set[str] = field(default_factory=set)
-  cors_origins: List[str] = field(default_factory=lambda: ["http://localhost:3002"])
-  cors_allow_headers: List[str] = field(
-    default_factory=lambda: [
-      "Authorization",
-      "Content-Type",
-      *_AGENT_API_CLAIM_HEADERS.values(),
-    ]
-  )
-  cors_allow_methods: List[str] = field(default_factory=lambda: ["GET", "POST", "OPTIONS"])
-  auth_config: Dict[str, Any] = field(default_factory=dict)
-  credentials_resolver: CredentialsResolver | None = None
-  credentials_refresh_resolver: CredentialsRefreshResolver | None = None
-  resolver_timeout_seconds: float = 5.0
-  mcp_client: Optional[McpClientManager] = None
-  sdk_config: AgentSDKConfig | None = None
-  per_turn_timeout: int = 300
-  compaction_trigger: int | None = None
-  compaction_instructions: str | None = None
-  allowed_models: Set[str] | None = None
-  model_catalog: Optional[ModelCatalog] = None
-  build_chat_runtime: Optional[BuildChatRuntime] = None
-  on_event: Optional[Callable[..., Any]] = None
-  on_tool_result: Optional[Callable[..., Any]] = None
-  on_usage: Optional[Callable[..., Any]] = None
-  on_tool_timing: Optional[Callable[..., Any]] = None
-  on_session_created: Optional[Callable[[GatewaySession, str, ChatInitRequest], None]] = None
-  on_startup: Optional[Callable[..., Any]] = None
-  on_shutdown: Optional[Callable[..., Any]] = None
-  transcript_dir: Optional[Path] = None
-  transcript_retention_days: int = 7
-  control_skills_dir: Optional[Path] = None
-  audit_hmac_secret_resolver: Callable[[], bytes] = get_audit_hmac_secret
-  audit_hmac_key_id_resolver: Callable[[], str] = get_audit_hmac_key_id
-  tool_input_redactor: Optional[Callable[..., dict[str, Any]]] = None
-  log_name: str = "gateway"
-  prefix: str = "/api"
-
-
-def _model_to_dict(model: Any) -> Dict[str, Any]:
-  if hasattr(model, "model_dump"):
-    return model.model_dump()
-  return model.dict()
-
-
-def _normalize_prefix(prefix: str) -> str:
-  cleaned = (prefix or "").strip()
-  if not cleaned or cleaned == "/":
-    return ""
-  return "/" + cleaned.strip("/")
-
-
-def _route_path(prefix: str, suffix: str) -> str:
-  normalized = _normalize_prefix(prefix)
-  return f"{normalized}{suffix}" if normalized else suffix
-
-
-def _default_control_skills_dir() -> Path:
-  configured = os.getenv("AGENT_GATEWAY_SKILLS_DIR", "").strip()
-  if configured:
-    return Path(configured).expanduser()
-  return Path(__file__).resolve().parent / "_no_control_skills"
-
-
-def _default_autonomous_api_dir() -> Path:
-  return Path(__file__).resolve().parents[3] / "api"
-
-
-def _default_autonomous_log_dir() -> Path | None:
-  explicit = os.getenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", "").strip()
-  if explicit:
-    return Path(explicit).expanduser()
-  gateway_log_dir = os.getenv("GATEWAY_LOG_DIR", "").strip()
-  if gateway_log_dir:
-    return Path(gateway_log_dir).expanduser() / "autonomous"
-  legacy_agents_log_dir = os.getenv("AGENTS_MCP_LOG_DIR", "").strip()
-  if legacy_agents_log_dir:
-    return Path(legacy_agents_log_dir).expanduser()
-  return None
-
-
-def _resolve_compaction_trigger(runtime_val: int | None, config_val: int | None) -> int | None:
-  """Resolve compaction trigger: runtime overrides config. 0 or negative = explicitly disable."""
-  raw = runtime_val if runtime_val is not None else config_val
-  if raw is None or raw <= 0:
-    return None
-  return raw
-
-
-def _sanitize_for_json(obj: Any) -> Any:
-  if isinstance(obj, float) and not math.isfinite(obj):
-    return None
-  if isinstance(obj, dict):
-    return {key: _sanitize_for_json(value) for key, value in obj.items()}
-  if isinstance(obj, (list, tuple)):
-    return [_sanitize_for_json(value) for value in obj]
-  if isinstance(obj, (set, frozenset)):
-    return [_sanitize_for_json(value) for value in obj]
-  return obj
-
-
-def _json_dumps(payload: Dict[str, Any]) -> str:
-  sanitized = _sanitize_for_json(payload)
-  return JSONResponse(content=sanitized).body.decode("utf-8")
-
-
-def _claim_ttl_ceiling_seconds() -> int:
-  raw = os.getenv("AGENT_API_CLAIM_MAX_TTL_SECONDS", "").strip()
-  if not raw:
-    return _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT
-  try:
-    value = int(raw)
-  except ValueError:
-    return _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT
-  return value if value > 0 else _AGENT_API_CLAIM_MAX_TTL_SECONDS_DEFAULT
-
-
-def _verify_signed_user_claim(request: Request) -> dict[str, Any]:
-  claim_headers = _extract_agent_claim_headers(request.headers)
-  if claim_headers is None:
-    raise HTTPException(status_code=401, detail="Signed user claim required")
-
-  hmac_key = os.getenv("AGENT_API_USER_CLAIM_HMAC_KEY", "").strip()
-  if not hmac_key:
-    raise HTTPException(
-      status_code=503,
-      detail="Agent API signed claim verifier not configured (AGENT_API_USER_CLAIM_HMAC_KEY not set)",
-    )
-
-  verified = _verify_agent_claim_headers(
-    hmac_key,
-    claim_headers,
-    ttl_ceiling=_claim_ttl_ceiling_seconds(),
-  )
-  if verified is None:
-    raise HTTPException(status_code=401, detail="Invalid signed user claim")
-  return verified
-
-
-def _artifact_auth_dependency(request: Request) -> str:
-  authorization = request.headers.get("Authorization")
-  if authorization is not None:
-    token = AuthManager.get_bearer_token(authorization)
-    auth_manager = getattr(request.app.state, "auth", None)
-    if auth_manager is None:
-      raise HTTPException(status_code=503, detail="Gateway auth manager unavailable")
-    session, _claims = auth_manager.verify_token_with_payload(token)
-    risk_user_id = int(getattr(session, "risk_user_id", 0) or 0)
-    if risk_user_id > 0:
-      return str(risk_user_id)
-    return session.user_id
-
-  claim = _verify_signed_user_claim(request)
-  return str(claim["user_id"])
-
-
-def _extract_agent_claim_headers(headers: Mapping[str, Any]) -> dict[str, str] | None:
-  claim_headers: dict[str, str] = {}
-  for field_name, header_name in _AGENT_API_CLAIM_HEADERS.items():
-    value = headers.get(header_name)
-    if value is None:
-      return None
-    claim_headers[field_name] = str(value)
-  return claim_headers
-
-
-def _verify_agent_claim_headers(
-  hmac_key: str,
-  claim_headers: Mapping[str, str],
-  *,
-  ttl_ceiling: int,
-  now: int | None = None,
-) -> dict[str, Any] | None:
-  if claim_headers.get("audience") != _AGENT_API_CLAIM_AUDIENCE:
-    return None
-  try:
-    issued_at = int(claim_headers.get("issued_at", ""))
-    expiry = int(claim_headers.get("expiry", ""))
-  except (TypeError, ValueError):
-    return None
-
-  current_time = int(time.time()) if now is None else int(now)
-  if issued_at > current_time + _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS:
-    return None
-  if current_time > expiry:
-    return None
-  if expiry - issued_at > ttl_ceiling:
-    return None
-
-  user_id = str(claim_headers.get("user_id") or "")
-  user_email = str(claim_headers.get("user_email") or "")
-  nonce = str(claim_headers.get("nonce") or "")
-  signature = str(claim_headers.get("signature") or "")
-  if not user_id or not user_email:
-    return None
-  if len(nonce) != _AGENT_API_CLAIM_NONCE_HEX_LENGTH:
-    return None
-  try:
-    bytes.fromhex(nonce)
-  except ValueError:
-    return None
-
-  canonical = f"{_AGENT_API_CLAIM_AUDIENCE}\n{issued_at}\n{expiry}\n{user_id}\n{user_email}\n{nonce}".encode("utf-8")
-  expected = hmac.new(hmac_key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
-  if not hmac.compare_digest(expected, signature):
-    return None
-  return {
-    **dict(claim_headers),
-    "issued_at": issued_at,
-    "expiry": expiry,
-    "user_id": user_id,
-    "user_email": user_email,
-  }
-
-
-def _artifact_json_response(artifact: ArtifactPath) -> JSONResponse:
-  path = _assert_artifact_path_still_safe(artifact)
-  if not path.is_file():
-    raise HTTPException(status_code=404, detail="Artifact not found")
-  with path.open("r", encoding="utf-8") as handle:
-    payload = json_mod.load(handle)
-  return JSONResponse(content=payload, headers=_file_cache_headers(path))
-
-
-def _artifact_index_identity_fields(artifact: ArtifactPath | None) -> dict[str, Any]:
-  fields: dict[str, Any] = {
-    "research_file_id": None,
-    "control_run_id": None,
-    "has_research_file": False,
-  }
-  if artifact is None:
-    return fields
-  path = _assert_artifact_path_still_safe(artifact)
-  if not path.is_file():
-    return fields
-  try:
-    with path.open("r", encoding="utf-8") as handle:
-      payload = json_mod.load(handle)
-  except (OSError, ValueError):
-    return fields
-  if not isinstance(payload, dict):
-    return fields
-  research_file_id = _int_or_none(payload.get("research_file_id"))
-  fields["research_file_id"] = research_file_id
-  fields["control_run_id"] = str(payload.get("control_run_id") or "").strip() or None
-  fields["has_research_file"] = research_file_id is not None
-  return fields
-
-
-def _int_or_none(value: Any) -> int | None:
-  if isinstance(value, bool):
-    return None
-  if isinstance(value, int):
-    return value
-  return None
-
-
-def _query_int_or_none(request: Request, name: str) -> int | None:
-  raw = request.query_params.get(name)
-  if raw is None or str(raw).strip() == "":
-    return None
-  try:
-    return int(str(raw).strip())
-  except ValueError as exc:
-    raise HTTPException(status_code=422, detail=f"{name} must be an integer") from exc
-
-
-def _assert_artifact_path_still_safe(artifact: ArtifactPath) -> Path:
-  try:
-    resolved = artifact.path.resolve()
-    resolved.relative_to(artifact.workspace_root.resolve())
-  except ValueError as exc:
-    raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-  return resolved
-
-
-def _file_cache_headers(path: Path) -> dict[str, str]:
-  stat = path.stat()
-  return {
-    "Cache-Control": "private, max-age=0",
-    "ETag": f'W/"{stat.st_mtime_ns:x}-{stat.st_size:x}"',
-  }
-
-
-def _letter_filename(ticker: str, artifact_id: str) -> str:
-  date = artifact_id[:10] if len(artifact_id) >= 10 else artifact_id
-  return f"LP-letter-{ticker}-{date}.docx"
-
-
-def _normalize_request_user_id(user_id: str | None) -> str | None:
-  normalized = user_id.strip() if isinstance(user_id, str) else user_id
-  if normalized == "":
-    return None
-  if normalized == "_default":
-    raise MissingUserIdError("user_id '_default' is reserved; supply a stable end-user id.")
-  return normalized
-
-
-def _resolver_contract_payload(message: str, *, user_id: str | None = None) -> tuple[int, Dict[str, Any]]:
-  payload: Dict[str, Any] = {"error": "credential_resolver_invalid", "message": message}
-  if user_id is not None:
-    payload["user_id"] = user_id
-  return 400, payload
-
-
-def _error_payload(
-  exc: Exception,
-  *,
-  user_id: str | None = None,
-  session_id: str | None = None,
-  request_user: str | None = None,
-  session_user: str | None = None,
-  timeout_seconds: float | None = None,
-) -> tuple[int, Dict[str, Any]]:
-  if isinstance(exc, CredentialsTimeoutError):
-    payload: Dict[str, Any] = {
-      "error": "credentials_timeout",
-      "message": str(exc),
-    }
-    if user_id is not None:
-      payload["user_id"] = user_id
-    if timeout_seconds is not None:
-      payload["timeout_seconds"] = timeout_seconds
-    return 504, payload
-
-  if isinstance(exc, MissingUserIdError):
-    payload = {"error": "missing_user_id", "message": str(exc)}
-    if user_id is not None:
-      payload["user_id"] = user_id
-    if session_id is not None:
-      payload["session_id"] = session_id
-    return 400, payload
-
-  if isinstance(exc, CrossUserReuseError):
-    payload = {"error": "cross_user_reuse", "message": str(exc)}
-    if session_id is not None:
-      payload["session_id"] = session_id
-    if session_user is not None:
-      payload["session_user"] = session_user
-    if request_user is not None:
-      payload["request_user"] = request_user
-    return 401, payload
-
-  if isinstance(exc, NoCredentialError):
-    payload = {"error": "credentials_unavailable", "message": str(exc), "reason": str(exc)}
-    if user_id is not None:
-      payload["user_id"] = user_id
-    return 401, payload
-
-  if isinstance(exc, ChannelMismatchError):
-    payload = {"error": "channel_mismatch", "message": str(exc)}
-    if user_id is not None:
-      payload["user_id"] = user_id
-    return 400, payload
-
-  if isinstance(exc, HTTPException):
-    payload = {
-      "error": "auth_failed",
-      "message": str(exc.detail) if exc.detail is not None else "Authentication failed",
-    }
-    if user_id is not None:
-      payload["user_id"] = user_id
-    return exc.status_code, payload
-
-  payload = {"error": "credentials_unavailable", "message": str(exc), "reason": str(exc)}
-  if user_id is not None:
-    payload["user_id"] = user_id
-  return 500, payload
-
-
-def _drain_result_queue(queue: Optional[asyncio.Queue]) -> None:
-  if queue is None:
-    return
-  while True:
-    try:
-      queue.get_nowait()
-    except asyncio.QueueEmpty:
-      break
-
-
-def _now_iso() -> str:
-  return datetime.now(UTC).isoformat()
-
-
-def _sidecar_slug(value: str | None) -> str | None:
-  if value is None:
-    return None
-  slug = _SIDECAR_SLUG_RE.sub("-", str(value).strip().lower().replace("_", "-")).strip("-")[:64]
-  return slug or None
-
-
-def _maybe_write_chat_log_meta(
-  transcript_dir: Path,
-  session_id: str,
-  *,
-  user_id: str | None,
-  channel: str | None,
-) -> None:
-  meta_path = transcript_dir / f"{session_id}.meta.json"
-  if meta_path.exists():
-    try:
-      now = time.time()
-      os.utime(meta_path, (now, now))
-    except OSError:
-      pass
-    return
-  _atomic_write_sidecar(
-    meta_path,
-    {
-      "schema_version": 1,
-      "agent_session_id": session_id,
-      "agent_id": None,
-      "user_id": user_id,
-      "product_id": gateway_product_id() or None,
-      "file_kind": None,
-      "channel": _sidecar_slug(channel),
-      "profile": None,
-      "created_at": _now_iso(),
-    },
-  )
-
-
-def _write_transcript(
-  transcript_dir: Optional[Path],
-  session_id: str,
-  entry: Dict[str, Any],
-  *,
-  user_id: str | None = None,
-  channel: str | None = None,
-) -> None:
-  if transcript_dir is None:
-    return
-  try:
-    _maybe_write_chat_log_meta(transcript_dir, session_id, user_id=user_id, channel=channel)
-  except Exception:
-    log.warning("Chat log sidecar write failed for %s (telemetry-only)", session_id, exc_info=True)
-  payload = dict(entry)
-  payload["ts"] = time.time()
-  path = transcript_dir / f"{session_id}.jsonl"
-  try:
-    with open(path, "a", encoding="utf-8") as handle:
-      handle.write(json_mod.dumps(payload, default=str) + "\n")
-  except Exception:
-    pass
-  try:
-    meta_path = transcript_dir / f"{session_id}.meta.json"
-    if meta_path.exists():
-      transcript_mtime = path.stat().st_mtime
-      os.utime(meta_path, (transcript_mtime, transcript_mtime))
-  except OSError:
-    pass
-
-
-def _cleanup_old_transcripts(
-  transcript_dir: Optional[Path],
-  retention_days: int,
-  *,
-  now: float | None = None,
-) -> int:
-  if transcript_dir is None or retention_days <= 0 or not transcript_dir.exists():
-    return 0
-
-  cutoff = (time.time() if now is None else now) - (retention_days * 86400)
-  removed = 0
-  transcript_freshness: dict[str, float] = {}
-  for transcript in transcript_dir.glob("*.jsonl"):
-    try:
-      transcript_freshness[transcript.name.removesuffix(".jsonl")] = transcript.stat().st_mtime
-    except OSError:
-      continue
-
-  for path in transcript_dir.iterdir():
-    if not path.is_file():
-      continue
-    if path.suffix != ".jsonl" and not path.name.endswith(".meta.json"):
-      continue
-    try:
-      effective_mtime = path.stat().st_mtime
-      if path.name.endswith(".meta.json"):
-        session_key = path.name.removesuffix(".meta.json")
-        effective_mtime = max(effective_mtime, transcript_freshness.get(session_key, 0.0))
-      if effective_mtime <= cutoff:
-        path.unlink()
-        removed += 1
-    except OSError:
-      continue
-  return removed
-
-
-def _compute_session_recap_payload(
-  session: GatewaySession,
-  active_turn: SessionStream,
-  *,
-  trigger: str,
-) -> Dict[str, Any]:
-  recap = compute_recap(
-    active_turn.event_log,
-    session_id=session.session_id,
-    started_at=float(session.created_at),
-    trigger=trigger,  # type: ignore[arg-type]
-    usage=getattr(session, "cached_usage", None),
-  )
-  return event_to_dict(recap)
-
-
-def _redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
-  try:
-    return default_redact_tool_input(
-      tool_name,
-      tool_input,
-      deployment_secret=get_audit_hmac_secret(),
-    )
-  except Exception:
-    return dict(tool_input)
-
-
-async def _cleanup_sessions_loop(
-  session_store: SessionStore,
-  *,
-  transcript_dir: Optional[Path] = None,
-  transcript_retention_days: int = 7,
-) -> None:
-  while True:
-    await asyncio.sleep(300)
-    await session_store.cleanup_expired_async()
-    try:
-      _cleanup_old_transcripts(transcript_dir, transcript_retention_days)
-    except Exception:
-      log.warning("Transcript retention cleanup failed", exc_info=True)
-
-
-async def _maybe_await(callback: Optional[Callable[..., Any]]) -> None:
-  if callback is None:
-    return
-  result = callback()
-  if inspect.isawaitable(result):
-    await result
-
-
-def _cancel_active_turn_cleanup_handle(active_turn: SessionStream) -> None:
-  cleanup_handle = active_turn.cleanup_handle
-  if cleanup_handle is None:
-    return
-  cleanup_handle.cancel()
-  active_turn.cleanup_handle = None
-
-
-def _clear_active_turn(session: GatewaySession, active_turn: SessionStream) -> None:
-  if session.active_turn is not active_turn:
-    return
-  _cancel_active_turn_cleanup_handle(active_turn)
-  for subscriber in active_turn.subscribers.values():
-    pump_task = subscriber.pump_task
-    if pump_task is not None and not pump_task.done():
-      pump_task.cancel()
-  active_turn.subscribers.clear()
-  session.active_turn = None
-  session.stream_active = False
-
-
-def _active_turn_is_running(active_turn: SessionStream | None) -> bool:
-  return active_turn is not None and active_turn.is_running
-
-
-def _schedule_active_turn_clear(session: GatewaySession, active_turn: SessionStream) -> None:
-  if session.active_turn is not active_turn:
-    return
-  _cancel_active_turn_cleanup_handle(active_turn)
-  loop = asyncio.get_running_loop()
-  active_turn.cleanup_handle = loop.call_later(_ACTIVE_TURN_GRACE_SECONDS, _clear_active_turn, session, active_turn)
-
-
-async def _cancel_active_turn_runner(active_turn: SessionStream) -> None:
-  _cancel_active_turn_cleanup_handle(active_turn)
-  task = active_turn.runner_task
-  if task is not None and not task.done():
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
-
-async def _cleanup_active_turn_on_expiry(session: GatewaySession) -> None:
-  active_turn = session.active_turn
-  if active_turn is None:
-    return
-  await _cancel_active_turn_runner(active_turn)
-  _clear_active_turn(session, active_turn)
-
-
-def _event_for_wire(entry: Any, event_log: EventLog) -> Dict[str, Any]:
-  event = dict(entry.event)
-  pid = gateway_product_id()
-  if pid is not None:
-    event["product_id"] = pid
-  if event.get("type") in {"tool_call_start", "tool_call_complete"}:
-    tool_name = event.get("tool_name")
-    execution_location_resolver = getattr(event_log, "_gateway_execution_location", None)
-    if isinstance(tool_name, str) and execution_location_resolver is not None:
-      execution_location = execution_location_resolver(tool_name)
-      if execution_location is not None:
-        event["execution_location"] = execution_location
-  return event
-
-
-def _resolve_schema_version(schema_version: int | None) -> int:
-  resolved = DEFAULT_SCHEMA_VERSION if schema_version is None else int(schema_version)
-  if resolved not in SUPPORTED_SCHEMA_VERSIONS:
-    supported = ", ".join(str(version) for version in sorted(SUPPORTED_SCHEMA_VERSIONS))
-    raise HTTPException(
-      status_code=400,
-      detail=f"Unsupported schema_version {resolved}; supported: [{supported}]",
-    )
-  return resolved
-
-
-def _stream_envelope(*, entry: Any, session_id: str, schema_version: int, event: Dict[str, Any]) -> Dict[str, Any]:
-  return {
-    "seq": entry.seq,
-    "session_id": session_id,
-    "schema_version": schema_version,
-    "event": event,
-  }
-
-
-def _disconnect_stream_subscriber_for_backpressure(subscriber: StreamSubscriber) -> None:
-  subscriber.disconnect_reason = "backpressure"
-  while True:
-    try:
-      subscriber.queue.get_nowait()
-    except asyncio.QueueEmpty:
-      break
-  try:
-    subscriber.queue.put_nowait(_STREAM_SUBSCRIBER_DONE)
-  except asyncio.QueueFull:
-    pass
-
-
-async def _pump_stream_subscriber(active_turn: SessionStream, subscriber: StreamSubscriber, after_seq: int) -> None:
-  try:
-    async for entry in active_turn.event_log.iter_from(after_seq):
-      try:
-        subscriber.queue.put_nowait(entry)
-      except asyncio.QueueFull:
-        _disconnect_stream_subscriber_for_backpressure(subscriber)
-        return
-  except asyncio.CancelledError:
-    raise
-  else:
-    try:
-      subscriber.queue.put_nowait(_STREAM_SUBSCRIBER_DONE)
-    except asyncio.QueueFull:
-      _disconnect_stream_subscriber_for_backpressure(subscriber)
-
-
-def _register_stream_subscriber(
-  active_turn: SessionStream,
-  *,
-  after_seq: int,
-  client_label: str | None,
-) -> StreamSubscriber:
-  subscriber = StreamSubscriber(
-    subscriber_id=f"sub:{uuid.uuid4().hex}",
-    connected_at=time.time(),
-    last_sent_seq=max(int(after_seq), 0),
-    queue=asyncio.Queue(maxsize=_STREAM_SUBSCRIBER_QUEUE_MAX),
-    client_label=client_label,
-  )
-  active_turn.subscribers[subscriber.subscriber_id] = subscriber
-  subscriber.pump_task = asyncio.create_task(_pump_stream_subscriber(active_turn, subscriber, subscriber.last_sent_seq))
-  return subscriber
-
-
-async def _cleanup_stream_subscriber(active_turn: SessionStream, subscriber_id: str) -> None:
-  subscriber = active_turn.subscribers.pop(subscriber_id, None)
-  if subscriber is None:
-    return
-  pump_task = subscriber.pump_task
-  if pump_task is not None and not pump_task.done():
-    pump_task.cancel()
-    await asyncio.gather(pump_task, return_exceptions=True)
-
-
-async def _stream_subscriber_sse(
-  *,
-  session: GatewaySession,
-  active_turn: SessionStream,
-  subscriber: StreamSubscriber,
-  transcript_dir: Path | None,
-  channel: str | None,
-  write_transcript: bool,
-  log: logging.Logger,
-) -> AsyncIterator[bytes]:
-  event_log = active_turn.event_log
-  try:
-    while True:
-      try:
-        item = await asyncio.wait_for(
-          subscriber.queue.get(),
-          timeout=_STREAM_SUBSCRIBER_KEEPALIVE_SECONDS,
-        )
-      except asyncio.TimeoutError:
-        pump_task = subscriber.pump_task
-        if pump_task is not None and pump_task.done() and subscriber.disconnect_reason:
-          return
-        yield b":keepalive\n\n"
-        continue
-
-      if item is _STREAM_SUBSCRIBER_DONE:
-        return
-
-      entry = item
-      subscriber.last_sent_seq = int(entry.seq)
-      event = _event_for_wire(entry, event_log)
-      entry_seq = int(entry.seq)
-      if write_transcript and entry_seq not in active_turn.transcript_written_seqs:
-        active_turn.transcript_written_seqs.add(entry_seq)
-        _write_transcript(
-          transcript_dir=transcript_dir,
-          session_id=session.session_id,
-          entry=event,
-          user_id=session.user_id,
-          channel=channel,
-        )
-
-      try:
-        adapted_event = adapt_event(event, session.schema_version)
-      except ValueError as adapter_exc:
-        log.error(
-          "SSE adapter failed for session=%s schema_version=%s event_type=%s: %s",
-          session.session_id,
-          session.schema_version,
-          event.get("type"),
-          adapter_exc,
-          exc_info=True,
-        )
-        error_event = {"type": "stream_error", "error": str(adapter_exc)}
-        adapted_event = adapt_event(error_event, DEFAULT_SCHEMA_VERSION)
-      if adapted_event is None:
-        continue
-
-      envelope = _stream_envelope(
-        entry=entry,
-        session_id=session.session_id,
-        schema_version=session.schema_version,
-        event=adapted_event,
-      )
-      try:
-        yield f"data: {_json_dumps(envelope)}\n\n".encode("utf-8")
-      except Exception as ser_exc:
-        log.error(
-          "SSE serialization failed for event type=%s: %s",
-          event.get("type"),
-          ser_exc,
-          exc_info=True,
-        )
-        try:
-          error_event = {"type": "stream_error", "error": f"SSE serialization failed: {ser_exc}"}
-          error_envelope = {
-            "seq": subscriber.last_sent_seq,
-            "session_id": session.session_id,
-            "schema_version": session.schema_version,
-            "event": adapt_event(error_event, session.schema_version) or error_event,
-          }
-          yield f"data: {_json_dumps(error_envelope)}\n\n".encode("utf-8")
-        except Exception:
-          pass
-        return
-  finally:
-    await _cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
-
-
-def _legacy_request_approval(session: GatewaySession, event_log: EventLog) -> RequestApproval:
-  async def request_approval(payload: ApprovalRequest) -> Optional[ApprovalDecision]:
-    approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
-    session.pending_tools[payload.tool_call_id] = {
-      "nonce": payload.nonce,
-      "requested_at": int(time.time()),
-      "status": "approval_pending",
-      "tool_name": payload.tool_name,
-      "resolved_qualifier": payload.resolved_qualifier,
-    }
-    session.approval_queues[payload.tool_call_id] = approval_queue
-
-    event_log.append(
-      {
-        "type": "tool_approval_request",
-        "tool_call_id": payload.tool_call_id,
-        "nonce": payload.nonce,
-        "tool_name": payload.tool_name,
-        "tool_input": _redact_tool_input_for_event(payload.tool_name, payload.tool_input),
-        "resolved_qualifier": payload.resolved_qualifier,
-        "reason": payload.reason,
-        "allow_persistent_approval": payload.allow_persistent_approval,
-      }
-    )
-
-    try:
-      approval = await approval_queue.get()
-    finally:
-      session.pending_tools.pop(payload.tool_call_id, None)
-      session.approval_queues.pop(payload.tool_call_id, None)
-
-    return ApprovalDecision(
-      approved=bool(approval.get("approved")),
-      allow_tool_type=bool(approval.get("allow_tool_type")),
-      denied_by=None if approval.get("approved") else approval.get("denied_by"),
-    )
-
-  return request_approval
-
-
-def _make_request_approval(
-  session: GatewaySession,
-  event_log: EventLog,
-  *,
-  store: Any | None = None,
-  policy: Any | None = None,
-) -> RequestApproval:
-  resolved_store = store or getattr(session, "approval_store", None)
-  resolved_policy = policy or getattr(session, "approval_policy", None)
-  if resolved_store is None or resolved_policy is None:
-    return _legacy_request_approval(session, event_log)
-  # Dispatcher-owned lifecycle is used when ToolDispatcher receives the same
-  # store/policy bundle. Keep this callback as the legacy pending-tools
-  # transport for older callers that have not been constructor-injected yet.
-  return _legacy_request_approval(session, event_log)
-
-
-def _chat_turn_state_from_events(events: list[dict[str, Any]]) -> str:
-  for event in reversed(events):
-    event_type = event.get("type")
-    if event_type == "error":
-      return "failed"
-    if event_type == "stream_complete":
-      return "completed"
-  return "completed" if events else "starting"
-
-
-def _chat_run_state_event(session_id: str, state: str) -> dict[str, Any]:
-  return {
-    "type": "run_state_changed",
-    "run_id": session_id,
-    "control_run_id": session_id,
-    "state": state,
-    "ts": int(time.time()),
-  }
-
-
-def _latest_chat_run_state(session: GatewaySession, session_id: str) -> str | None:
-  for event in reversed(session.event_history.snapshot()):
-    if event.get("type") != "run_state_changed":
-      continue
-    event_run_id = event.get("run_id") or event.get("control_run_id")
-    if event_run_id is not None and event_run_id != session_id:
-      continue
-    state = event.get("state")
-    if state in {"starting", "running", "approval_pending", "completed", "failed", "cancelled"}:
-      return str(state)
-  return None
-
-
-async def _dispatch_chat_turn(
-  session: GatewaySession,
-  inputs: ChatTurnInputs,
-  *,
-  event_log: EventLog,
-  on_event: Callable[[StreamEvent], Awaitable[None]],
-  build_chat_runtime: BuildChatRuntime,
-  credentials_resolver: CredentialsResolver | None,
-  transcript_dir: Path | None,
-  publish_lifecycle_events: bool = False,
-) -> ChatTurnResult:
-  """Run one chat turn outside the ASGI response lifecycle."""
-  if session.kind != "chat":
-    raise HTTPException(status_code=400, detail="control sessions cannot dispatch chat turns")
-  if _active_turn_is_running(session.active_turn):
-    raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
-  if session.active_turn is not None:
-    _clear_active_turn(session, session.active_turn)
-  if session.stream_active:
-    raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
-
-  session.stream_active = True
-  sid = session.session_id
-  active_turn = SessionStream(
-    event_log=event_log,
-    runner_task=asyncio.current_task(),
-  )
-  session.active_turn = active_turn
-  request_id = inputs.request_id.strip() if isinstance(inputs.request_id, str) else inputs.request_id
-  request_id = request_id or str(uuid.uuid4())
-  context = dict(inputs.context or {})
-  context["profile"] = _resolve_chat_profile_name(context)
-  request = ChatRequest(
-    messages=list(inputs.messages),
-    user_id=session.user_id,
-    request_id=request_id,
-    context=context,
-    metadata=dict(inputs.metadata or {}),
-    model=inputs.model,
-  )
-
-  raw_channel = context.get("channel")
-  claimed_channel = raw_channel.strip().lower() if isinstance(raw_channel, str) else None
-  channel = session.channel or claimed_channel
-  log = getattr(build_chat_runtime, "_gateway_log", logging.getLogger("agent_gateway.server"))
-  resolver_timeout_seconds = float(getattr(build_chat_runtime, "_gateway_resolver_timeout_seconds", 5.0))
-  config_auth_config = getattr(build_chat_runtime, "_gateway_auth_config", {})
-  allowed_models = getattr(build_chat_runtime, "_gateway_allowed_models", None)
-  auth_manager = getattr(build_chat_runtime, "_gateway_auth_manager", None)
-
-  previous_on_event = getattr(event_log, "_on_event", None)
-  previous_session_id = getattr(event_log, "_session_id", "")
-  fanout_stop = object()
-  fanout_queue: asyncio.Queue[Any] = asyncio.Queue()
-
-  async def _fanout_worker() -> None:
-    while True:
-      event = await fanout_queue.get()
-      if event is fanout_stop:
-        return
-      try:
-        await on_event(dict(event))
-      except Exception as exc:
-        log.warning("chat turn event fan-out failed for %s: %s", sid, exc)
-
-  def _record_event(event: Dict[str, Any], event_session_id: str) -> None:
-    event_copy = dict(event)
-    session.event_history.append(event_copy)
-    fanout_queue.put_nowait(event_copy)
-    if previous_on_event is not None:
-      try:
-        previous_on_event(event, event_session_id)
-      except Exception:
-        pass
-
-  async def _stop_fanout_worker() -> None:
-    fanout_queue.put_nowait(fanout_stop)
-    await asyncio.gather(fanout_task, return_exceptions=True)
-
-  setattr(event_log, "_on_event", _record_event)
-  setattr(event_log, "_session_id", sid)
-  fanout_task = asyncio.create_task(_fanout_worker())
-  if publish_lifecycle_events:
-    _record_event(_chat_run_state_event(sid, "running"), sid)
-
-  runtime: ChatRuntime | None = None
-  runner: Any | None = None
-  runner_task: asyncio.Task[Any] | None = None
-
-  async def _credential_refresher(failure: ProviderCredentialFailure) -> Dict[str, Any] | None:
-    resolver = credentials_resolver
-    if resolver is None:
-      return None
-    session_auth_config = session.auth_config or config_auth_config
-    refresh_request = CredentialRefreshRequest(
-      user_id=session.user_id,
-      user_email=session.user_email,
-      session_id=session.session_id,
-      api_key_hash=session.api_key_hash,
-      channel=channel,
-      provider=failure.provider,
-      billing_mode=str(session_auth_config.get("billing_mode", "") or "") or None,
-      model=str(session_auth_config.get("model", "") or "") or None,
-      auth_mode=str(session_auth_config.get("auth_mode", "") or "") or None,
-      request_id=request_id,
-      failure=failure,
-    )
-    try:
-      auth_config = await asyncio.wait_for(
-        resolver(refresh_request),  # type: ignore[arg-type]
-        timeout=resolver_timeout_seconds,
-      )
-    except Exception as exc:
-      log.warning(
-        "Credential refresh failed | session=%s user=%s provider=%s kind=%s detail=%s",
-        session.session_id,
-        session.user_id,
-        failure.provider,
-        failure.kind,
-        exc,
-      )
-      return None
-    if auth_config is None:
-      log.info(
-        "Credential refresh unavailable | session=%s user=%s provider=%s kind=%s",
-        session.session_id,
-        session.user_id,
-        failure.provider,
-        failure.kind,
-      )
-      return None
-    if auth_config.provider != failure.provider:
-      log.warning(
-        "Credential refresh returned provider=%s for provider=%s; ignoring",
-        auth_config.provider,
-        failure.provider,
-      )
-      return None
-    refreshed_auth_config = auth_config.to_dict()
-    session.auth_config = refreshed_auth_config
-    return dict(refreshed_auth_config)
-
-  async def _safe_fire_disconnect() -> None:
-    if runtime is None:
-      return
-    try:
-      await runtime.on_disconnect()
-    except Exception as exc:
-      log.warning("on_disconnect failed for %s: %s", sid, exc)
-
-  started_at = float(session.created_at)
-
-  def _emit_terminal(event: Dict[str, Any]) -> None:
-    emit_recap_then_terminal(
-      event_log,
-      event,
-      session_id=sid,
-      started_at=started_at,
-    )
-
-  try:
-    messages = [_model_to_dict(message) for message in inputs.messages]
-    last_user = next((message["content"] for message in reversed(messages) if message.get("role") == "user"), "")
-    if not session.initial_message and last_user:
-      session.initial_message = str(last_user)
-    log.info("Chat request | session=%s | msgs=%d | user=%s", sid, len(messages), last_user[:200])
-    event = {"type": "chat_request", "messages": messages, "context": context}
-    pid = gateway_product_id()
-    if pid is not None:
-      event["product_id"] = pid
-    _write_transcript(
-      transcript_dir=transcript_dir,
-      session_id=sid,
-      entry=event,
-      user_id=session.user_id,
-      channel=channel,
-    )
-
-    runtime = await _call_build_chat_runtime(
-      build_chat_runtime,
-      session=session,
-      request=request,
-      channel=channel,
-      auth_manager=auth_manager,
-    )
-    session_auth_config = session.auth_config or config_auth_config
-    resolved_model = runtime.model_override or request.model or str(session_auth_config.get("model", "")).strip() or None
-    if resolved_model:
-      resolved_provider_name = str(getattr(runtime, "resolved_provider_name", "") or "").strip().lower()
-      if resolved_provider_name:
-        provider_allowed_models = _get_allowed_models_for_provider_name(resolved_provider_name)
-        if provider_allowed_models and resolved_model not in provider_allowed_models:
-          raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
-      elif allowed_models and resolved_model not in allowed_models:
-        raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
-    runner = _build_runner_with_started_at(runtime.build_runner, event_log, sid, started_at)
-    setattr(event_log, "_gateway_execution_location", runtime.execution_location)
-    set_credential_refresher = getattr(runner, "set_credential_refresher", None)
-    if callable(set_credential_refresher) and credentials_resolver is not None:
-      set_credential_refresher(_credential_refresher)
-    if runtime.disconnect_handler is None:
-      runner_on_disconnect = getattr(runner, "on_disconnect", None)
-      if callable(runner_on_disconnect):
-        runtime.disconnect_handler = runner_on_disconnect
-
-    async def run_agent() -> None:
-      try:
-        await runner.run(
-          messages=messages,
-          system_prompt=runtime.system_prompt,
-          model_override=runtime.model_override,
-          max_turns=runtime.max_turns,
-        )
-      except asyncio.CancelledError:
-        raise
-      except Exception as exc:
-        _emit_terminal({"type": "error", "error": str(exc)})
-      finally:
-        if not event_log.closed:
-          _emit_terminal({"type": "error", "error": "stream closed"})
-
-    runner_task = asyncio.create_task(run_agent())
-    # shield: a client-disconnect cancel of the enclosing dispatch_task must NOT
-    # auto-propagate into runner_task here. The `except asyncio.CancelledError` block
-    # below fires the cooperative disconnect (sets the tool abort_event and yields)
-    # BEFORE cancelling runner_task, so an in-flight tool call gets the cooperative
-    # abort handshake. Plain `await runner_task` cancels runner_task first, pre-empting
-    # that handshake — the PR4 (47b91a31) regression this restores.
-    await asyncio.shield(runner_task)
-    session.stream_active = False
-    if publish_lifecycle_events:
-      events = [dict(entry.event) for entry in event_log.entries]
-      if _latest_chat_run_state(session, sid) != "cancelled":
-        _record_event(_chat_run_state_event(sid, _chat_turn_state_from_events(events)), sid)
-  except asyncio.CancelledError:
-    await _safe_fire_disconnect()
-    if runner_task is not None:
-      runner_task.cancel()
-    await asyncio.gather(
-      *(task for task in (runner_task,) if task is not None),
-      return_exceptions=True,
-    )
-    if publish_lifecycle_events and _latest_chat_run_state(session, sid) != "cancelled":
-      _record_event(_chat_run_state_event(sid, "cancelled"), sid)
-    _emit_terminal({"type": "error", "error": "stream closed"})
-    raise
-  except Exception as exc:
-    session.stream_active = False
-    if publish_lifecycle_events:
-      _emit_terminal({"type": "error", "error": str(exc)})
-      _record_event(_chat_run_state_event(sid, "failed"), sid)
-    _emit_terminal({"type": "error", "error": "stream failed"})
-    raise
-  finally:
-    if not event_log.closed:
-      _emit_terminal({"type": "error", "error": "stream closed"})
-    await _stop_fanout_worker()
-    setattr(event_log, "_on_event", previous_on_event)
-    setattr(event_log, "_session_id", previous_session_id)
-    session.pending_tools.clear()
-    session.approval_queues.clear()
-    _drain_result_queue(session.result_queue)
-    session.stream_active = False
-    if session.active_turn is active_turn:
-      _schedule_active_turn_clear(session, active_turn)
-
-  events = [dict(entry.event) for entry in event_log.entries]
-  return ChatTurnResult(
-    session_id=sid,
-    request_id=request_id,
-    state=_chat_turn_state_from_events(events),
-    events=events,
-  )
-
-
-def _init_approval_subsystem(app: FastAPI, config: GatewayServerConfig) -> None:
-  audit_writer = resolve_audit_writer()
-  audit_emitter = ApprovalAuditEmitter(
-    writer=audit_writer,
-    deployment_secret=config.audit_hmac_secret_resolver(),
-    key_id=config.audit_hmac_key_id_resolver(),
-    tool_input_redactor=config.tool_input_redactor,
-  )
-  store = SQLiteApprovalStore(audit_emitter=audit_emitter)
-  policy = resolve_policy(store=store)
-  app.state.gateway_approval_audit_writer = audit_writer
-  app.state.gateway_approval_audit_emitter = audit_emitter
-  app.state.gateway_approval_store = store
-  app.state.gateway_approval_policy = policy
+(
+  _disconnect_stream_subscriber_for_backpressure,
+  _pump_stream_subscriber,
+  _register_stream_subscriber,
+  _cleanup_stream_subscriber,
+  _stream_subscriber_sse,
+) = _server_streaming.bind_streaming_helpers(lambda: globals())
 
 
 def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
@@ -1621,6 +214,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     session_store=SessionStore(ttl=config.session_ttl),
   )
   from .control_plane.runs import cleanup_control_chat_tasks
+  from .control_plane.batches import BatchTaskRegistry
 
   transcript_dir = Path(config.transcript_dir) if config.transcript_dir is not None else None
   if transcript_dir is not None:
@@ -1672,6 +266,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       subprocess_registry = getattr(app.state, "subprocess_registry", None)
       if subprocess_registry is not None:
         await subprocess_registry.shutdown()
+      batch_task_registry = getattr(app.state, "batch_task_registry", None)
+      if batch_task_registry is not None:
+        await batch_task_registry.shutdown()
       user_event_bus = getattr(app.state, "user_event_bus", None)
       if user_event_bus is not None:
         await user_event_bus.shutdown()
@@ -1714,6 +311,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     max_running=int(os.getenv("AGENT_GATEWAY_AUTONOMOUS_MAX_RUNNING", "2") or "2"),
     approval_db_path=getattr(app.state.gateway_approval_store, "path", None),
   )
+  app.state.batch_task_registry = BatchTaskRegistry()
   control_prefix = _route_path(route_prefix, "/control")
   add_control_plane_version_header_middleware(
     app,
@@ -1759,7 +357,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           resolver(payload.api_key, payload),
           timeout=config.resolver_timeout_seconds,
         )
-      except asyncio.TimeoutError as exc:
+      except asyncio.TimeoutError:
         status, error_payload = _error_payload(
           CredentialsTimeoutError(
             f"Credential resolution for user '{resolved_user_id or 'unresolved'}' timed out after "
@@ -2120,17 +718,18 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   @router.get("/artifacts/{ticker}/{skill}/latest")
   async def artifact_latest(request: Request, ticker: str, skill: str) -> JSONResponse:
     user_id = _artifact_auth_dependency(request)
+    filters = _artifact_request_filters(request)
     try:
-      artifact = latest_artifact_json_path_for_request(
-        user_id,
-        ticker=ticker,
-        skill=skill,
-      )
+      artifacts = artifact_json_paths_for_request(user_id, ticker=ticker, skill=skill)
     except ArtifactPathError as exc:
       raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-    if artifact is None:
-      raise HTTPException(status_code=404, detail="Artifact not found")
-    return _artifact_json_response(artifact)
+    for artifact in reversed(artifacts):
+      try:
+        return _artifact_json_response(artifact, user_id=user_id, filters=filters)
+      except HTTPException as exc:
+        if exc.status_code != 404:
+          raise
+    raise HTTPException(status_code=404, detail="Artifact not found")
 
   @router.get("/artifacts/{ticker}/{skill}/{artifact_id}")
   async def artifact_by_id(
@@ -2140,6 +739,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     artifact_id: str,
   ) -> JSONResponse:
     user_id = _artifact_auth_dependency(request)
+    filters = _artifact_request_filters(request)
     try:
       artifact = artifact_json_path_for_request(
         user_id,
@@ -2149,42 +749,47 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       )
     except ArtifactPathError as exc:
       raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-    return _artifact_json_response(artifact)
+    return _artifact_json_response(artifact, user_id=user_id, filters=filters)
 
   @router.get("/artifacts/{ticker}")
   async def artifact_index(request: Request, ticker: str) -> JSONResponse:
     user_id = _artifact_auth_dependency(request)
-    research_file_id = _query_int_or_none(request, "research_file_id")
+    filters = _artifact_request_filters(request)
     try:
-      index = ticker_artifact_index_for_request(user_id, ticker=ticker)
+      artifacts_by_skill = ticker_artifact_paths_for_request(user_id, ticker=ticker)
     except ArtifactPathError as exc:
       raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
     decorated: list[dict[str, Any]] = []
-    for entry in index:
-      next_entry = dict(entry)
-      skill = str(next_entry.get("skill") or "").strip()
-      artifact_id = str(next_entry.get("latest_artifact_id") or "").strip()
-      artifact: ArtifactPath | None = None
-      if skill and artifact_id:
-        try:
-          artifact = artifact_json_path_for_request(
-            user_id,
-            ticker=ticker,
-            skill=skill,
-            artifact_id=artifact_id,
-          )
-        except ArtifactPathError:
-          artifact = None
-      next_entry.update(_artifact_index_identity_fields(artifact))
-      decorated.append(next_entry)
-    if research_file_id is not None:
-      # V1 filters the existing latest-per-skill index; older artifacts for the
-      # same skill are not scanned here.
-      decorated = [
-        entry
-        for entry in decorated
-        if entry.get("research_file_id") == research_file_id
+    for skill, artifacts in sorted(artifacts_by_skill.items(), key=lambda item: item[0]):
+      matching: list[tuple[ArtifactPath, dict[str, Any]]] = []
+      for artifact in artifacts:
+        path = _assert_artifact_path_still_safe(artifact)
+        if not path.is_file():
+          continue
+        payload = _decorate_artifact_payload(_artifact_payload_from_path(path), user_id=user_id)
+        if _artifact_payload_matches_filters(payload, filters=filters):
+          matching.append((artifact, payload))
+      if not matching:
+        continue
+      latest_artifact, latest_payload = matching[-1]
+      recent_artifact_ids = [
+        str(artifact.artifact_id)
+        for artifact, _payload in reversed(matching[-_ARTIFACT_INDEX_RECENT_LIMIT:])
+        if artifact.artifact_id is not None
       ]
+      decorated.append({
+        "skill": skill,
+        "latest_artifact_id": latest_artifact.artifact_id,
+        "artifact_count": len(matching),
+        "recent_artifact_ids": recent_artifact_ids,
+        "research_file_id": latest_payload.get("research_file_id"),
+        "control_run_id": latest_payload.get("control_run_id"),
+        "has_research_file": latest_payload.get("has_research_file") is True,
+        "origin_kind": latest_payload.get("origin_kind"),
+        "visibility": latest_payload.get("visibility"),
+        "origin_ref": latest_payload.get("origin_ref"),
+        "classification_source": latest_payload.get("classification_source"),
+      })
     return JSONResponse(content=decorated)
 
   @router.get("/letters/{ticker}/{artifact_id}")

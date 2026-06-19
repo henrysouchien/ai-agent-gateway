@@ -34,6 +34,14 @@ def _fallback_classify_addin_dispatch_error(error: BaseException | str) -> str:
     return "no_taskpane_registered"
   if "taskpane disconnected" in message or "targeted workbook is disconnected" in message:
     return "taskpane_disconnected"
+  if "chat_relay_disabled" in message or "chat relay is disabled" in message:
+    return "chat_relay_disabled"
+  if "focus_lost" in message or (
+    "lost focus" in message and ("workbook" in message or "multiple workbooks" in message)
+  ):
+    return "focus_lost"
+  if "taskpane_tool_timeout" in message:
+    return "taskpane_tool_timeout"
   if "401" in message or "unauthorized" in message or "forbidden" in message or "403" in message:
     return "auth_failed"
   if "connection refused" in message or "couldn't connect" in message or "connecterror" in message:
@@ -90,7 +98,8 @@ def _classified_error(
   state: str | None = None,
   payload: Any = None,
 ) -> dict[str, Any]:
-  reason = _classify_addin_dispatch_error(message)
+  classification_source = message if payload is None else f"{message} {payload}"
+  reason = _classify_addin_dispatch_error(classification_source)
   details: dict[str, Any] = {"reason": reason}
   if status_code is not None:
     details["status_code"] = status_code

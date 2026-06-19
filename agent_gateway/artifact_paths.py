@@ -110,6 +110,67 @@ def latest_artifact_json_path_for_request(
   )
 
 
+def artifact_json_paths_for_request(
+  user_id: str,
+  *,
+  ticker: str,
+  skill: str,
+) -> list[ArtifactPath]:
+  normalized_ticker = _validate_ticker(ticker)
+  normalized_skill = _validate_skill(skill)
+  workspace_root = user_workspace_root(user_id)
+  directory = _resolve_under_workspace(
+    workspace_root,
+    "artifacts",
+    normalized_ticker,
+    normalized_skill,
+  )
+  if not directory.is_dir():
+    return []
+  return [
+    ArtifactPath(
+      workspace_root=workspace_root,
+      path=path,
+      ticker=normalized_ticker,
+      skill=normalized_skill,
+      artifact_id=path.stem,
+    )
+    for path in _safe_json_children(directory, workspace_root)
+  ]
+
+
+def ticker_artifact_paths_for_request(user_id: str, *, ticker: str) -> dict[str, list[ArtifactPath]]:
+  normalized_ticker = _validate_ticker(ticker)
+  workspace_root = user_workspace_root(user_id)
+  ticker_dir = _resolve_under_workspace(workspace_root, "artifacts", normalized_ticker)
+  if not ticker_dir.is_dir():
+    return {}
+
+  by_skill: dict[str, list[ArtifactPath]] = {}
+  for skill_dir in sorted(ticker_dir.iterdir(), key=lambda path: path.name):
+    if not skill_dir.is_dir():
+      continue
+    try:
+      normalized_skill = _validate_skill(skill_dir.name)
+    except ArtifactPathError:
+      continue
+    safe_skill_dir = _ensure_under_workspace(skill_dir, workspace_root)
+    artifacts = _safe_json_children(safe_skill_dir, workspace_root)
+    if not artifacts:
+      continue
+    by_skill[normalized_skill] = [
+      ArtifactPath(
+        workspace_root=workspace_root,
+        path=path,
+        ticker=normalized_ticker,
+        skill=normalized_skill,
+        artifact_id=path.stem,
+      )
+      for path in artifacts
+    ]
+  return by_skill
+
+
 def ticker_artifact_index_for_request(user_id: str, *, ticker: str) -> list[dict[str, Any]]:
   normalized_ticker = _validate_ticker(ticker)
   workspace_root = user_workspace_root(user_id)
@@ -295,11 +356,13 @@ def _normalize_ticker(raw: str) -> str:
 __all__ = [
   "ArtifactPath",
   "ArtifactPathError",
+  "artifact_json_paths_for_request",
   "artifact_json_path_for_request",
   "latest_artifact_json_path_for_request",
   "letter_docx_path_for_request",
   "reject_unsafe_path",
   "ticker_artifact_index_for_request",
+  "ticker_artifact_paths_for_request",
   "user_data_dir",
   "user_workspace_root",
 ]

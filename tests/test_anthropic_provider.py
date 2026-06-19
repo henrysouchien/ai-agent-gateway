@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import asyncio
 import logging
 import sys
@@ -13,6 +15,8 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AnthropicProvider, ModelInfo, ThinkingLevel
+import agent_gateway.providers.anthropic as anthropic_provider_module
+import agent_gateway.providers.anthropic_helpers as anthropic_helpers
 from agent_gateway.providers.anthropic import _MODEL_INFO_BY_TAG, _format_anthropic_rejection_detail
 
 
@@ -29,6 +33,40 @@ def _make_anthropic_api_status_error(status_code: int, message: str):
     response=response,
     body={"error": {"message": message}},
   )
+
+
+def test_anthropic_provider_helper_exports_are_parent_aliases() -> None:
+  helper_names = (
+    "_COMMON_BETA_SLUGS",
+    "_COMPACTION_BETA_SLUG",
+    "_ERROR_REDACTION",
+    "_MAX_ERROR_DETAIL_LEN",
+    "_MAX_TOOL_ID_LEN",
+    "_MODEL_INFO_BY_TAG",
+    "_OAUTH_BETA_SLUGS",
+    "_OAUTH_IDENTITY",
+    "_SENSITIVE_ERROR_KEY_RE",
+    "_SENSITIVE_ERROR_VALUE_RES",
+    "_TOOL_ID_RE",
+    "_exception_body",
+    "_exception_status_code",
+    "_format_anthropic_rejection_detail",
+    "_has_tool_result_block",
+    "_model_info_for_model",
+    "_model_matches_tag",
+    "_normalize_tool_call_id",
+    "_redact_error_body",
+    "_response_header",
+    "_same_model_message",
+    "_stream_request_context",
+    "_synthetic_tool_result",
+    "_thinking_param",
+    "_to_plain_dict",
+    "_truncate_error_detail",
+  )
+
+  for name in helper_names:
+    assert getattr(anthropic_provider_module, name) is getattr(anthropic_helpers, name)
 
 
 def test_model_info_defaults_derive_thinking_mode_from_supports_thinking() -> None:

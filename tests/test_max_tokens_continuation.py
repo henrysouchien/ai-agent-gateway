@@ -3,6 +3,7 @@ silently end the run — the runner nudges and continues (bounded), and request
 max_tokens is clamped to the model's max_output_tokens."""
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -12,14 +13,14 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import (
+from agent_gateway import (  # noqa: E402
   AgentRunner,
   CostEstimate,
   EventLog,
   ModelInfo,
   ToolDispatcher,
 )
-from agent_gateway.runner import _MAX_TOKENS_CONTINUATIONS, _MAX_TOKENS_NUDGE, StreamTurnResult
+from agent_gateway.runner import _MAX_TOKENS_CONTINUATIONS, _MAX_TOKENS_NUDGE, StreamTurnResult  # noqa: E402
 
 
 def _run(coro):
@@ -109,6 +110,9 @@ def test_max_tokens_turn_with_no_tool_use_continues_with_nudge() -> None:
     assert len(seen_messages) == 2, "run must continue past the truncated turn"
     follow_up = seen_messages[1]
     assert follow_up[-1] == {"role": "user", "content": _MAX_TOKENS_NUDGE}
+    assert "tool-first response" in _MAX_TOKENS_NUDGE
+    assert "smallest valid JSON payload" in _MAX_TOKENS_NUDGE
+    assert "Do not spend another turn on hidden analysis" in _MAX_TOKENS_NUDGE
     # the truncated partial tool_use must NOT be replayed to the model
     replayed_assistant = follow_up[-2]
     assert replayed_assistant["role"] == "assistant"
@@ -117,7 +121,7 @@ def test_max_tokens_turn_with_no_tool_use_continues_with_nudge() -> None:
   _run(_case())
 
 
-def test_max_tokens_continuation_is_bounded() -> None:
+def test_max_tokens_continuation_is_bounded(caplog) -> None:
   async def _case() -> None:
     runner = _make_runner(_StubProvider())
     calls = {"n": 0}
@@ -131,10 +135,14 @@ def test_max_tokens_continuation_is_bounded() -> None:
       )
 
     runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    caplog.set_level(logging.WARNING, logger="agent_gateway.runner")
     await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
 
     # initial turn + bounded continuations, then the run ends instead of looping
     assert calls["n"] == 1 + _MAX_TOKENS_CONTINUATIONS
+    assert f"continuing with truncation nudge (1/{_MAX_TOKENS_CONTINUATIONS})" in caplog.text
+    assert f"continuing with truncation nudge ({_MAX_TOKENS_CONTINUATIONS}/{_MAX_TOKENS_CONTINUATIONS})" in caplog.text
+    assert f"after {_MAX_TOKENS_CONTINUATIONS} continuation attempts" in caplog.text
 
   _run(_case())
 

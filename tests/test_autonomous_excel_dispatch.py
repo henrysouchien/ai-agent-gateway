@@ -262,6 +262,138 @@ def test_handler_returns_classified_error_on_submit_http_error(monkeypatch) -> N
   assert [request["method"] for request in transport.requests] == ["POST", "POST"]
 
 
+def test_handler_classifies_focus_lost_status_error(monkeypatch) -> None:
+  base = "https://gateway.example"
+  transport = _FakeGatewayHttp(
+    [
+      _response("POST", f"{base}/api/chat/init", 200, {"session_token": "jwt-token"}),
+      _response(
+        "POST",
+        f"{base}/api/orchestration/excel-dispatch",
+        200,
+        {"request_id": "request-1", "delegation_id": "delegation-1"},
+      ),
+      _response(
+        "GET",
+        f"{base}/api/orchestration/excel-dispatch/request-1",
+        200,
+        {
+          "state": "failed",
+          "error": {
+            "code": "focus_lost",
+            "message": "Bring the workbook to the front and retry.",
+          },
+        },
+      ),
+    ]
+  )
+  monkeypatch.setattr(dispatch, "_get_session_token", None)
+  monkeypatch.setattr(dispatch.httpx, "AsyncClient", transport.client_factory)
+
+  handler = dispatch.make_autonomous_message_excel_agent_handler(
+    gateway_url=base,
+    gateway_api_key="api-key-1",
+    poll_interval_seconds=0.001,
+    tls_verify=False,
+  )
+  result, error = _run(handler({"text": "Update the model"}))
+
+  assert result is None
+  assert error is not None
+  assert error["code"] == "excel_agent_failed"
+  assert error["reason"] == "focus_lost"
+  assert error["state"] == "failed"
+  assert error["payload"]["error"]["code"] == "focus_lost"
+
+
+def test_handler_classifies_taskpane_tool_timeout_status_error(monkeypatch) -> None:
+  base = "https://gateway.example"
+  transport = _FakeGatewayHttp(
+    [
+      _response("POST", f"{base}/api/chat/init", 200, {"session_token": "jwt-token"}),
+      _response(
+        "POST",
+        f"{base}/api/orchestration/excel-dispatch",
+        200,
+        {"request_id": "request-1", "delegation_id": "delegation-1"},
+      ),
+      _response(
+        "GET",
+        f"{base}/api/orchestration/excel-dispatch/request-1",
+        200,
+        {
+          "state": "failed",
+          "error": {
+            "code": "taskpane_tool_timeout",
+            "message": "Check workbook state before retrying.",
+          },
+        },
+      ),
+    ]
+  )
+  monkeypatch.setattr(dispatch, "_get_session_token", None)
+  monkeypatch.setattr(dispatch.httpx, "AsyncClient", transport.client_factory)
+
+  handler = dispatch.make_autonomous_message_excel_agent_handler(
+    gateway_url=base,
+    gateway_api_key="api-key-1",
+    poll_interval_seconds=0.001,
+    tls_verify=False,
+  )
+  result, error = _run(handler({"text": "Update the model"}))
+
+  assert result is None
+  assert error is not None
+  assert error["code"] == "excel_agent_failed"
+  assert error["reason"] == "taskpane_tool_timeout"
+  assert error["state"] == "failed"
+  assert error["payload"]["error"]["code"] == "taskpane_tool_timeout"
+
+
+def test_handler_classifies_chat_relay_disabled_status_error(monkeypatch) -> None:
+  base = "https://gateway.example"
+  transport = _FakeGatewayHttp(
+    [
+      _response("POST", f"{base}/api/chat/init", 200, {"session_token": "jwt-token"}),
+      _response(
+        "POST",
+        f"{base}/api/orchestration/excel-dispatch",
+        200,
+        {"request_id": "request-1", "delegation_id": "delegation-1"},
+      ),
+      _response(
+        "GET",
+        f"{base}/api/orchestration/excel-dispatch/request-1",
+        200,
+        {
+          "state": "failed",
+          "error": {
+            "code": "chat_relay_disabled",
+            "message": "Excel chat relay is disabled in this taskpane bundle.",
+          },
+        },
+      ),
+    ]
+  )
+  monkeypatch.setattr(dispatch, "_get_session_token", None)
+  monkeypatch.setattr(dispatch.httpx, "AsyncClient", transport.client_factory)
+
+  handler = dispatch.make_autonomous_message_excel_agent_handler(
+    gateway_url=base,
+    gateway_api_key="api-key-1",
+    poll_interval_seconds=0.001,
+    tls_verify=False,
+  )
+  result, error = _run(handler({"text": "Update the model"}))
+
+  assert result is None
+  assert error is not None
+  assert error["code"] == "excel_agent_failed"
+  assert error["reason"] == "chat_relay_disabled"
+  assert error["state"] == "failed"
+  assert error["payload"]["error"]["code"] == "chat_relay_disabled"
+
+
 def test_handler_returns_timeout_when_status_never_done(monkeypatch) -> None:
   base = "https://gateway.example"
   pending = _response(

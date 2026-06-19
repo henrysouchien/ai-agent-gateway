@@ -411,6 +411,7 @@ def test_get_run_returns_chat_run_shape_and_404s_unknown_or_cross_user() -> None
         "type": "skill_result_captured",
         "skill_run_id": "skill-1",
         "skill": "model-review",
+        "cost_usd": 0.09,
         "verdict_echo": {
           "verdict_token": "PRICE_TARGET_SET",
           "confidence": "HIGH",
@@ -433,7 +434,7 @@ def test_get_run_returns_chat_run_shape_and_404s_unknown_or_cross_user() -> None
       "state": "starting",
       "started_at": payload["started_at"],
       "ended_at": None,
-      "cost_usd": None,
+      "cost_usd": 0.09,
       "initial_message": "first",
       "skill_run_ids": ["skill-1"],
       "current_verdict": {
@@ -450,6 +451,59 @@ def test_get_run_returns_chat_run_shape_and_404s_unknown_or_cross_user() -> None
 
     assert unknown.status_code == 404
     assert cross_user.status_code == 404
+
+
+def test_chat_run_cost_accumulates_completed_turns_and_live_partial() -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    alice_control = _control_session(client, "alice")
+    alice_chat = _chat_session(client, "alice")
+
+    session = app.state.auth.session_store.get_session(alice_chat["session_id"])
+    assert session is not None
+    session.channel = "tui"
+    session.initial_message = "first"
+    session.event_history.append({"type": "stream_complete", "usage": {"estimated_cost": 0.10}})
+    session.event_history.append({"type": "stream_complete", "usage": {"estimated_cost": 0.20}})
+    session.stream_active = True
+    session.event_history.append({"type": "turn_complete", "turn": 1, "usage": {"estimated_cost": 0.03}})
+
+    response = client.get(f"/api/control/runs/{alice_chat['session_id']}", headers=_headers(alice_control))
+
+  assert response.status_code == 200, response.text
+  payload = response.json()
+  assert payload["state"] == "running"
+  assert payload["cost_usd"] == 0.33
+
+
+def test_chat_run_cost_accumulates_child_and_parent_stream_totals() -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    alice_control = _control_session(client, "alice")
+    alice_chat = _chat_session(client, "alice")
+
+    session = app.state.auth.session_store.get_session(alice_chat["session_id"])
+    assert session is not None
+    session.channel = "tui"
+    session.initial_message = "parent with sub-agent"
+    session.event_history.append(
+      {
+        "type": "stream_complete",
+        "sub_agent_id": "sub0:child",
+        "usage": {"estimated_cost": 0.20},
+      }
+    )
+    session.event_history.append(
+      {
+        "type": "stream_complete",
+        "usage": {"estimated_cost": 0.03},
+      }
+    )
+
+    response = client.get(f"/api/control/runs/{alice_chat['session_id']}", headers=_headers(alice_control))
+
+  assert response.status_code == 200, response.text
+  assert response.json()["cost_usd"] == 0.23
 
 
 def test_get_run_logs_reads_session_event_history_tail_and_enforces_user_scope() -> None:

@@ -5,13 +5,18 @@ import copy
 import json
 import logging
 import os
-import re
+import random
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Set, SupportsFloat, Tuple
+from typing import Any, Dict, List, Sequence, Set, Tuple
+
+from . import mcp_client_catalog as _catalog_helpers
+from . import mcp_client_config as _config_helpers
+from . import mcp_client_errors as _error_helpers
+from . import mcp_client_oauth_storage as _oauth_storage
+from . import mcp_client_runtime as _runtime_helpers
 
 try:
   from mcp.client.session import ClientSession
@@ -49,115 +54,109 @@ except Exception as exc:
 
 
 log = logging.getLogger("agent_gateway.mcp_client")
-_UNSET = object()
-_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-_STREAMABLE_HTTP_TYPES = {"streamable-http", "streamable_http", "http", "streamable"}
-_SUPPORTED_SERVER_TYPES = {"stdio"} | _STREAMABLE_HTTP_TYPES
-# Default-deny: MCP subprocesses inherit only a small set of safe env vars.
-_DEFAULT_ENV_ALLOWLIST = {
-  "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "USER",
-  "PYTHONPATH", "NODE_PATH", "VIRTUAL_ENV",
-}
-_MCP_STDIO_TERMINATION_LOGGER = "mcp.os.posix.utilities"
-_MCP_STDIO_PG_FALLBACK_PREFIX = "Process group termination failed for PID "
-_MCP_STDIO_PG_FALLBACK_MARKER = "falling back to simple terminate"
+_UNSET = _config_helpers.UNSET
+_ENV_REF_RE = _config_helpers.ENV_REF_RE
+_STREAMABLE_HTTP_TYPES = _config_helpers.STREAMABLE_HTTP_TYPES
+_SUPPORTED_SERVER_TYPES = _config_helpers.SUPPORTED_SERVER_TYPES
+_DEFAULT_ENV_ALLOWLIST = _config_helpers.DEFAULT_ENV_ALLOWLIST
 _MCP_CLOSE_TIMEOUT_SECONDS = 5.0
+_MCP_TOOL_CANCEL_GRACE_SECONDS = 1.0
+_MCP_STDIO_CONNECT_RETRIES_ENV = _config_helpers.MCP_STDIO_CONNECT_RETRIES_ENV
+_MCP_STDIO_CONNECT_BACKOFF_ENV = _config_helpers.MCP_STDIO_CONNECT_BACKOFF_ENV
+_MCP_STDIO_CONNECT_STABILIZE_ENV = _config_helpers.MCP_STDIO_CONNECT_STABILIZE_ENV
+_MCP_STARTUP_CONCURRENCY_ENV = _config_helpers.MCP_STARTUP_CONCURRENCY_ENV
+_MCP_STDIO_CONNECT_RETRIES_DEFAULT = _config_helpers.MCP_STDIO_CONNECT_RETRIES_DEFAULT
+_MCP_STDIO_CONNECT_BACKOFF_DEFAULT = _config_helpers.MCP_STDIO_CONNECT_BACKOFF_DEFAULT
+_MCP_STDIO_CONNECT_STABILIZE_DEFAULT = _config_helpers.MCP_STDIO_CONNECT_STABILIZE_DEFAULT
+_MCP_STDIO_RETRYABLE_EXCEPTION_NAMES = _config_helpers.MCP_STDIO_RETRYABLE_EXCEPTION_NAMES
+_MCP_STDIO_RETRYABLE_MESSAGE_MARKERS = _config_helpers.MCP_STDIO_RETRYABLE_MESSAGE_MARKERS
 
 
 def _resolve_mcp_config_path(config_path: Path | str | None | object = _UNSET) -> Path | None:
-  if config_path is _UNSET:
-    env_path = os.getenv("MCP_CONFIG_PATH", "").strip()
-    return Path(env_path).expanduser() if env_path else Path.home() / ".claude.json"
-  if config_path is None:
-    return None
-  return Path(config_path).expanduser()
+  return _config_helpers.resolve_mcp_config_path(
+    config_path,
+    unset=_UNSET,
+    environ=os.environ,
+    home_factory=Path.home,
+  )
 
 
-class _McpStdioTerminationFallbackFilter(logging.Filter):
-  def filter(self, record: logging.LogRecord) -> bool:
-    if record.name != _MCP_STDIO_TERMINATION_LOGGER:
-      return True
-    message = record.getMessage()
-    return not (
-      message.startswith(_MCP_STDIO_PG_FALLBACK_PREFIX)
-      and _MCP_STDIO_PG_FALLBACK_MARKER in message
-    )
+_McpStdioTerminationFallbackFilter = _runtime_helpers.McpStdioTerminationFallbackFilter
 
 
-@contextmanager
 def _suppress_mcp_stdio_termination_fallback_warnings():
-  """Suppress the MCP SDK's expected process-group fallback warning during close."""
-  upstream_logger = logging.getLogger(_MCP_STDIO_TERMINATION_LOGGER)
-  log_filter = _McpStdioTerminationFallbackFilter()
-  upstream_logger.addFilter(log_filter)
-  try:
-    yield
-  finally:
-    upstream_logger.removeFilter(log_filter)
+  return _runtime_helpers.suppress_mcp_stdio_termination_fallback_warnings(logging.getLogger, _McpStdioTerminationFallbackFilter)
 
 
 def _build_mcp_env(server_env: Dict[str, Any] | None) -> Dict[str, str]:
-  env = {k: v for k, v in os.environ.items() if k in _DEFAULT_ENV_ALLOWLIST}
-  if not isinstance(server_env, dict):
-    return env
-
-  for key, value in server_env.items():
-    if value is None:
-      continue
-    env[str(key)] = _expand_env_refs(value)
-  return env
+  return _config_helpers.build_mcp_env(
+    server_env if isinstance(server_env, dict) else None,
+    environ=os.environ,
+  )
 
 
 def _expand_env_refs(value: Any) -> str:
-  raw = str(value)
-  return _ENV_REF_RE.sub(lambda match: os.environ.get(match.group(1), ""), raw)
+  return _config_helpers.expand_env_refs(value, environ=os.environ)
 
 
 def _build_http_headers(headers: Dict[str, Any] | None) -> Dict[str, str]:
-  if not isinstance(headers, dict):
-    return {}
-  return {
-    str(key): _expand_env_refs(value)
-    for key, value in headers.items()
-    if value is not None
-  }
+  return _config_helpers.build_http_headers(
+    headers if isinstance(headers, dict) else None,
+    environ=os.environ,
+  )
+
+
+def _env_nonnegative_int(name: str, default: int) -> int:
+  return _config_helpers.env_nonnegative_int(name, default, environ=os.environ, logger=log)
+
+
+def _env_nonnegative_float(name: str, default: float) -> float:
+  return _config_helpers.env_nonnegative_float(name, default, environ=os.environ, logger=log)
+
+
+def _stdio_connect_retries() -> int:
+  return _config_helpers.stdio_connect_retries(environ=os.environ, logger=log)
+
+
+def _stdio_connect_retry_delay(attempt: int) -> float:
+  return _config_helpers.stdio_connect_retry_delay(
+    attempt,
+    environ=os.environ,
+    logger=log,
+    jitter_fn=random.uniform,
+  )
+
+
+def _stdio_connect_stabilize_delay() -> float:
+  return _config_helpers.stdio_connect_stabilize_delay(environ=os.environ, logger=log)
+
+
+def _startup_concurrency_limit() -> int:
+  return _config_helpers.startup_concurrency_limit(environ=os.environ, logger=log)
+
+
+def _iter_exception_tree(exc: BaseException):
+  yield from _config_helpers.iter_exception_tree(exc)
+
+
+def _is_retryable_stdio_connect_error(exc: BaseException) -> bool:
+  return _config_helpers.is_retryable_stdio_connect_error(exc)
+
+
+def _consume_mcp_tool_call_result(task: asyncio.Task[Any]) -> None:
+  _runtime_helpers.consume_mcp_tool_call_result(task, logger=log)
 
 
 def _safe_cache_name(name: str) -> str:
-  return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "server"
+  return _config_helpers.safe_cache_name(name)
 
 
-class _JsonFileKeyValue:
-  """Minimal AsyncKeyValue-compatible JSON store for FastMCP OAuth tokens."""
+class _JsonFileKeyValue(_oauth_storage.JsonFileKeyValue):
+  def _replace_file(self, tmp_path: Path, path: Path) -> None:
+    os.replace(tmp_path, path)
 
-  def __init__(self, path: Path | str, *, default_collection: str = "default") -> None:
-    self._path = Path(path).expanduser()
-    self._default_collection = default_collection
-
-  def _collection(self, collection: str | None) -> str:
-    return str(collection or self._default_collection)
-
-  def _load(self) -> dict[str, dict[str, dict[str, Any]]]:
-    try:
-      data = json.loads(self._path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-      return {}
-    except (OSError, json.JSONDecodeError):
-      return {}
-    return data if isinstance(data, dict) else {}
-
-  def _save(self, data: dict[str, dict[str, dict[str, Any]]]) -> None:
-    self._path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = self._path.with_suffix(f"{self._path.suffix}.tmp")
-    tmp_path.write_text(
-      json.dumps(data, indent=2, sort_keys=True) + "\n",
-      encoding="utf-8",
-    )
-    try:
-      tmp_path.chmod(0o600)
-    except OSError:
-      pass
-    os.replace(tmp_path, self._path)
+  def _time(self) -> float:
+    return time.time()
 
   @staticmethod
   def _active_value(entry: Any) -> dict[str, Any] | None:
@@ -173,116 +172,20 @@ class _JsonFileKeyValue:
     value = entry.get("value")
     return dict(value) if isinstance(value, dict) else None
 
-  async def get(self, key: str, *, collection: str | None = None) -> dict[str, Any] | None:
-    data = self._load()
-    coll = self._collection(collection)
-    value = self._active_value(data.get(coll, {}).get(str(key)))
-    if value is None and str(key) in data.get(coll, {}):
-      await self.delete(str(key), collection=coll)
-    return value
-
-  async def ttl(
-    self,
-    key: str,
-    *,
-    collection: str | None = None,
-  ) -> tuple[dict[str, Any] | None, float | None]:
-    data = self._load()
-    coll = self._collection(collection)
-    entry = data.get(coll, {}).get(str(key))
-    value = self._active_value(entry)
-    if value is None:
-      if str(key) in data.get(coll, {}):
-        await self.delete(str(key), collection=coll)
-      return None, None
-    expires_at = entry.get("expires_at") if isinstance(entry, dict) else None
-    ttl_seconds = None if expires_at is None else max(float(expires_at) - time.time(), 0.0)
-    return value, ttl_seconds
-
-  async def put(
-    self,
-    key: str,
-    value: Mapping[str, Any],
-    *,
-    collection: str | None = None,
-    ttl: SupportsFloat | None = None,
-  ) -> None:
-    data = self._load()
-    coll = self._collection(collection)
-    expires_at = None if ttl is None else time.time() + float(ttl)
-    data.setdefault(coll, {})[str(key)] = {
-      "value": dict(value),
-      "expires_at": expires_at,
-    }
-    self._save(data)
-
-  async def delete(self, key: str, *, collection: str | None = None) -> bool:
-    data = self._load()
-    coll = self._collection(collection)
-    bucket = data.get(coll, {})
-    existed = str(key) in bucket
-    if existed:
-      bucket.pop(str(key), None)
-      if not bucket:
-        data.pop(coll, None)
-      self._save(data)
-    return existed
-
-  async def get_many(
-    self,
-    keys: Sequence[str],
-    *,
-    collection: str | None = None,
-  ) -> list[dict[str, Any] | None]:
-    return [await self.get(str(key), collection=collection) for key in keys]
-
-  async def ttl_many(
-    self,
-    keys: Sequence[str],
-    *,
-    collection: str | None = None,
-  ) -> list[tuple[dict[str, Any] | None, float | None]]:
-    return [await self.ttl(str(key), collection=collection) for key in keys]
-
-  async def put_many(
-    self,
-    keys: Sequence[str],
-    values: Sequence[Mapping[str, Any]],
-    *,
-    collection: str | None = None,
-    ttl: SupportsFloat | None = None,
-  ) -> None:
-    if len(keys) != len(values):
-      raise ValueError("keys and values must have the same length")
-    for key, value in zip(keys, values):
-      await self.put(str(key), value, collection=collection, ttl=ttl)
-
-  async def delete_many(self, keys: Sequence[str], *, collection: str | None = None) -> int:
-    deleted = 0
-    for key in keys:
-      if await self.delete(str(key), collection=collection):
-        deleted += 1
-    return deleted
-
 
 def _classify_exception(exc: Exception, msg: str) -> str:
-  lower = msg.lower()
-  if isinstance(exc, asyncio.TimeoutError) or "timeout" in lower or "timed out" in lower:
-    return "timeout"
-  if "connection" in lower or "refused" in lower:
-    return "connection_error"
-  return "unknown"
+  return _error_helpers.classify_exception(exc, msg)
 
 
 def _classify_mcp_error(message: str) -> str:
-  lower = message.lower()
-  if "not found" in lower or "no filing" in lower or "no data" in lower:
-    return "not_found"
-  if "parse" in lower or "invalid" in lower or "malformed" in lower:
-    return "parse_error"
-  if "timeout" in lower or "timed out" in lower:
-    return "timeout"
-  return "unknown"
+  return _error_helpers.classify_mcp_error(message)
+
+
+def _startup_failure_from_exception(exc: BaseException) -> Dict[str, Any]:
+  return _error_helpers.startup_failure_from_exception(
+    exc,
+    is_retryable_stdio_connect_error=_is_retryable_stdio_connect_error,
+  )
 
 
 @dataclass
@@ -293,6 +196,7 @@ class _ServerState:
   tool_definitions: List[Dict[str, Any]]
   tool_names: Set[str]
   tool_prefix: str = ""
+  config: Dict[str, Any] | None = None
 
 
 class McpClientManager:
@@ -327,6 +231,7 @@ class McpClientManager:
     self._tool_to_server: Dict[str, str] = {}
     self._prefixed_to_original: Dict[str, str] = {}
     self._mcp_tool_names: Set[str] = set()
+    self._startup_diagnostics: Dict[str, Dict[str, Any]] = {}
     self._server_aliases = dict(server_aliases or {})
     self._allowed_servers = self._canonical_server_names(allowed_servers) if allowed_servers is not None else None
     self._builtin_tool_names = set(builtin_tool_names or set())
@@ -355,6 +260,26 @@ class McpClientManager:
       return tool_name
     server_name, original_name = tool_name.split(".", 1)
     return f"{self._canonical_server_name(server_name)}.{original_name}"
+
+  def _set_startup_diagnostic(
+    self,
+    server_name: str,
+    *,
+    category: str,
+    message: str,
+    retryable: bool,
+    error_type: str | None = None,
+  ) -> None:
+    canonical_name = self._canonical_server_name(server_name)
+    payload: Dict[str, Any] = {
+      "server": canonical_name,
+      "category": category,
+      "retryable": bool(retryable),
+      "message": message,
+    }
+    if error_type:
+      payload["error_type"] = error_type
+    self._startup_diagnostics[canonical_name] = payload
 
   def _timeout_for_tool(self, server_name: str, exposed_name: str, original_name: str) -> int:
     for key in (
@@ -406,8 +331,23 @@ class McpClientManager:
       if self._started:
         return
 
+      self._startup_diagnostics = {}
+      requested_servers = (
+        self._canonical_server_names(set(allowed_servers))
+        if allowed_servers is not None
+        else None
+      )
+
       if MCP_IMPORT_ERROR is not None:
         log.warning("MCP runtime unavailable; skipping startup: %s", MCP_IMPORT_ERROR)
+        for server_name in sorted(requested_servers or set()):
+          self._set_startup_diagnostic(
+            server_name,
+            category="runtime_unavailable",
+            message=f"MCP runtime unavailable: {MCP_IMPORT_ERROR}",
+            retryable=False,
+            error_type=type(MCP_IMPORT_ERROR).__name__,
+          )
         self._started = True
         return
 
@@ -417,47 +357,125 @@ class McpClientManager:
         mcp_servers = {}
       mcp_servers = dict(mcp_servers)
       mcp_servers.update(self._inline_servers)
+
+      effective_allowed_servers = self._allowed_servers
+      if requested_servers is not None:
+        if effective_allowed_servers is None:
+          effective_allowed_servers = requested_servers
+        else:
+          not_allowed = requested_servers - effective_allowed_servers
+          for server_name in sorted(not_allowed):
+            self._set_startup_diagnostic(
+              server_name,
+              category="not_allowed",
+              message="server requested for startup but absent from the MCP allowlist",
+              retryable=False,
+            )
+          effective_allowed_servers = set(effective_allowed_servers) & requested_servers
+
       if not mcp_servers:
+        missing_config_targets = effective_allowed_servers if requested_servers is not None else set()
+        for server_name in sorted(missing_config_targets or set()):
+          self._set_startup_diagnostic(
+            server_name,
+            category="config_missing",
+            message="server requested for startup but absent from the MCP config",
+            retryable=False,
+          )
         self._started = True
         return
       mcp_servers = self._canonicalize_server_configs(mcp_servers)
 
-      effective_allowed_servers = self._allowed_servers
-      if allowed_servers is not None:
-        requested_servers = self._canonical_server_names(set(allowed_servers))
-        if effective_allowed_servers is None:
-          effective_allowed_servers = requested_servers
-        else:
-          effective_allowed_servers = set(effective_allowed_servers) & requested_servers
+      if requested_servers is not None and effective_allowed_servers is not None:
+        for server_name in sorted(effective_allowed_servers - set(mcp_servers)):
+          self._set_startup_diagnostic(
+            server_name,
+            category="config_missing",
+            message="server requested for startup but absent from the MCP config",
+            retryable=False,
+          )
 
-      connect_tasks = []
+      connect_jobs: list[tuple[str, Dict[str, Any]]] = []
       for server_name, server_config in mcp_servers.items():
         if effective_allowed_servers is not None and server_name not in effective_allowed_servers:
           continue
         if not isinstance(server_config, dict):
           log.warning("Skipping MCP server %s: invalid config", server_name)
+          self._set_startup_diagnostic(
+            server_name,
+            category="invalid_config",
+            message="invalid MCP server config",
+            retryable=False,
+          )
           continue
 
         server_type = str(server_config.get("type", "stdio")).strip().lower()
         if server_type not in _SUPPORTED_SERVER_TYPES:
           log.info("Skipping MCP server %s: unsupported type %s", server_name, server_type)
+          self._set_startup_diagnostic(
+            server_name,
+            category="unsupported_type",
+            message=f"unsupported MCP server type: {server_type}",
+            retryable=False,
+          )
           continue
 
-        connect_tasks.append(self._connect_or_warn(server_name, server_config))
+        connect_jobs.append((server_name, server_config))
 
-      if connect_tasks:
-        for state in await asyncio.gather(*connect_tasks):
+      if connect_jobs:
+        for state in await self._connect_startup_servers(connect_jobs):
           if state is not None:
             self._servers[state.name] = state
 
       self._apply_collision_filtering()
       self._started = True
 
+  async def _connect_startup_servers(
+    self,
+    connect_jobs: Sequence[tuple[str, Dict[str, Any]]],
+  ) -> list[_ServerState | None]:
+    concurrency = _startup_concurrency_limit()
+    if concurrency <= 0 or concurrency >= len(connect_jobs):
+      return await asyncio.gather(
+        *(
+          self._connect_or_warn(server_name, server_config)
+          for server_name, server_config in connect_jobs
+        )
+      )
+
+    log.info(
+      "MCP startup concurrency limited to %d for %d server(s)",
+      concurrency,
+      len(connect_jobs),
+    )
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _connect_limited(
+      server_name: str,
+      server_config: Dict[str, Any],
+    ) -> _ServerState | None:
+      async with semaphore:
+        return await self._connect_or_warn(server_name, server_config)
+
+    return await asyncio.gather(
+      *(_connect_limited(server_name, server_config) for server_name, server_config in connect_jobs)
+    )
+
   async def _connect_or_warn(self, name: str, config: Dict[str, Any]) -> _ServerState | None:
     try:
-      return await self._connect(name, config)
+      state = await self._connect(name, config)
+      self._startup_diagnostics.pop(self._canonical_server_name(name), None)
+      return state
     except Exception as exc:
       message = str(exc).strip() or type(exc).__name__
+      diagnostic = _startup_failure_from_exception(exc)
+      self._set_startup_diagnostic(
+        name,
+        category=str(diagnostic["category"]),
+        message=str(diagnostic["message"]),
+        retryable=bool(diagnostic["retryable"]),
+        error_type=str(diagnostic["error_type"]) if diagnostic.get("error_type") else None,
+      )
       log.warning("MCP server %s failed to connect: %s", name, message)
       return None
 
@@ -466,8 +484,31 @@ class McpClientManager:
     if server_type in _STREAMABLE_HTTP_TYPES:
       return await self._connect_streamable_http(name, config)
     if server_type == "stdio":
-      return await self._connect_stdio(name, config)
+      return await self._connect_stdio_with_retries(name, config)
     raise ValueError(f"unsupported type {server_type}")
+
+  async def _connect_stdio_with_retries(self, name: str, config: Dict[str, Any]) -> _ServerState:
+    total_attempts = 1 + _stdio_connect_retries()
+    for attempt in range(1, total_attempts + 1):
+      try:
+        return await self._connect_stdio(name, config)
+      except Exception as exc:
+        if attempt >= total_attempts or not _is_retryable_stdio_connect_error(exc):
+          raise
+        delay = _stdio_connect_retry_delay(attempt)
+        message = str(exc).strip() or type(exc).__name__
+        log.warning(
+          "MCP stdio server %s connect attempt %d/%d failed with transient transport error; "
+          "retrying in %.2fs: %s",
+          name,
+          attempt,
+          total_attempts,
+          delay,
+          message,
+        )
+        if delay > 0:
+          await asyncio.sleep(delay)
+    raise RuntimeError("unreachable stdio connect retry state")
 
   async def _connect_stdio(self, name: str, config: Dict[str, Any]) -> _ServerState:
     exit_contexts: List[Any] = []
@@ -507,6 +548,8 @@ class McpClientManager:
         exit_contexts=exit_contexts,
         tool_prefix=tool_prefix,
       )
+      await self._verify_stdio_session_stable(session)
+      state.config = dict(config)
       success = True
       return state
     finally:
@@ -644,6 +687,15 @@ class McpClientManager:
       tool_prefix=tool_prefix,
     )
 
+  async def _verify_stdio_session_stable(self, session: ClientSession) -> None:
+    delay = _stdio_connect_stabilize_delay()
+    if delay > 0:
+      await asyncio.sleep(delay)
+    await asyncio.wait_for(
+      session.list_tools(cursor=None),
+      timeout=self._startup_timeout,
+    )
+
   def get_tool_definitions(self) -> List[Dict[str, Any]]:
     return copy.deepcopy(self._tool_definitions)
 
@@ -667,6 +719,9 @@ class McpClientManager:
         "tools": tool_names,
       }
     return catalog
+
+  def get_startup_diagnostics(self) -> Dict[str, Dict[str, Any]]:
+    return copy.deepcopy(self._startup_diagnostics)
 
   def is_mcp_tool(self, name: str) -> bool:
     return name in self._mcp_tool_names
@@ -702,43 +757,44 @@ class McpClientManager:
     timeout_seconds = self._timeout_for_tool(server_name, name, original_name)
 
     try:
-      if abort_event is not None and abort_event.is_set():
-        raise asyncio.CancelledError()
-      call_kwargs = {
-        "read_timeout_seconds": timedelta(seconds=timeout_seconds),
-      }
-      if meta is not None:
-        call_kwargs["meta"] = meta
-      call_task = asyncio.create_task(server.session.call_tool(
-        original_name,
-        tool_input,
-        **call_kwargs,
-      ))
-      abort_task: asyncio.Task[Any] | None = None
-      try:
-        if abort_event is None:
-          result = await call_task
-        else:
-          abort_task = asyncio.create_task(abort_event.wait())
-          done, _pending = await asyncio.wait(
-            {call_task, abort_task},
-            return_when=asyncio.FIRST_COMPLETED,
-          )
-          if abort_task in done and abort_event.is_set():
-            call_task.cancel()
-            await asyncio.gather(call_task, return_exceptions=True)
-            raise asyncio.CancelledError()
-          result = await call_task
-      finally:
-        if abort_task is not None:
-          abort_task.cancel()
+      result = await self._call_tool_once(
+        server=server,
+        original_name=original_name,
+        tool_input=tool_input,
+        meta=meta,
+        abort_event=abort_event,
+        timeout_seconds=timeout_seconds,
+      )
     except Exception as exc:
-      msg = str(exc)
-      return None, {
-        "code": "tool_error",
-        "sub_code": _classify_exception(exc, msg),
-        "message": msg,
-      }
+      try:
+        retry_result = await self._retry_stdio_tool_call_after_reconnect(
+          server_name=server_name,
+          server=server,
+          original_name=original_name,
+          tool_input=tool_input,
+          meta=meta,
+          abort_event=abort_event,
+          timeout_seconds=timeout_seconds,
+          cause=exc,
+        )
+      except Exception as retry_exc:
+        msg = str(retry_exc)
+        return None, {
+          "code": "tool_error",
+          "sub_code": _classify_exception(retry_exc, msg),
+          "message": msg,
+        }
+      if retry_result is not None:
+        result = retry_result
+      else:
+        msg = str(exc)
+        return None, {
+          "code": "tool_error",
+          "sub_code": _classify_exception(exc, msg),
+          "message": msg,
+        }
+    except asyncio.CancelledError:
+      raise
 
     if result.isError:
       message = self._extract_text(result.content)
@@ -762,6 +818,137 @@ class McpClientManager:
 
     return {}, None
 
+  async def _call_tool_once(
+    self,
+    *,
+    server: _ServerState,
+    original_name: str,
+    tool_input: Dict[str, Any],
+    meta: Dict[str, Any] | None,
+    abort_event: asyncio.Event | None,
+    timeout_seconds: int,
+  ) -> Any:
+    if abort_event is not None and abort_event.is_set():
+      raise asyncio.CancelledError()
+    call_kwargs = {
+      "read_timeout_seconds": timedelta(seconds=timeout_seconds),
+    }
+    if meta is not None:
+      call_kwargs["meta"] = meta
+    call_task = asyncio.create_task(server.session.call_tool(
+      original_name,
+      tool_input,
+      **call_kwargs,
+    ))
+    abort_task: asyncio.Task[Any] | None = None
+    try:
+      wait_tasks: set[asyncio.Task[Any]] = {call_task}
+      if abort_event is not None:
+        abort_task = asyncio.create_task(abort_event.wait())
+        wait_tasks.add(abort_task)
+      timeout = max(0.0, float(timeout_seconds))
+      done, _pending = await asyncio.wait(
+        wait_tasks,
+        timeout=timeout,
+        return_when=asyncio.FIRST_COMPLETED,
+      )
+      if abort_task in done and abort_event is not None and abort_event.is_set():
+        await self._cancel_mcp_tool_call(
+          call_task,
+          tool_name=original_name,
+          reason="abort",
+        )
+        raise asyncio.CancelledError()
+      if call_task in done:
+        return await call_task
+      await self._cancel_mcp_tool_call(
+        call_task,
+        tool_name=original_name,
+        reason="timeout",
+      )
+      raise asyncio.TimeoutError(
+        f"MCP tool {original_name} timed out after {timeout:g}s"
+      )
+    except asyncio.CancelledError:
+      await self._cancel_mcp_tool_call(
+        call_task,
+        tool_name=original_name,
+        reason="caller_cancelled",
+      )
+      raise
+    finally:
+      if abort_task is not None:
+        abort_task.cancel()
+
+  @staticmethod
+  async def _cancel_mcp_tool_call(
+    task: asyncio.Task[Any],
+    *,
+    tool_name: str,
+    reason: str,
+  ) -> None:
+    await _runtime_helpers.cancel_mcp_tool_call(
+      task,
+      tool_name=tool_name,
+      reason=reason,
+      grace_seconds=_MCP_TOOL_CANCEL_GRACE_SECONDS,
+      consume_result=_consume_mcp_tool_call_result,
+      current_task=asyncio.current_task,
+      logger=log,
+      shield=asyncio.shield,
+      wait_for=asyncio.wait_for,
+    )
+
+  async def _retry_stdio_tool_call_after_reconnect(
+    self,
+    *,
+    server_name: str,
+    server: _ServerState,
+    original_name: str,
+    tool_input: Dict[str, Any],
+    meta: Dict[str, Any] | None,
+    abort_event: asyncio.Event | None,
+    timeout_seconds: int,
+    cause: Exception,
+  ) -> Any | None:
+    config = server.config
+    if not config:
+      return None
+    server_type = str(config.get("type", "stdio")).strip().lower()
+    if server_type != "stdio" or not _is_retryable_stdio_connect_error(cause):
+      return None
+    message = str(cause).strip() or type(cause).__name__
+    log.warning(
+      "MCP stdio server %s tool call %s failed with transient transport error; "
+      "reconnecting once: %s",
+      server_name,
+      original_name,
+      message,
+    )
+    try:
+      await self._close_contexts(server.exit_contexts)
+      replacement = await self._connect_stdio_with_retries(server_name, config)
+    except Exception as reconnect_exc:
+      reconnect_message = str(reconnect_exc).strip() or type(reconnect_exc).__name__
+      log.warning(
+        "MCP stdio server %s failed to reconnect after tool transport error: %s",
+        server_name,
+        reconnect_message,
+      )
+      return None
+
+    server.session = replacement.session
+    server.exit_contexts = replacement.exit_contexts
+    server.config = replacement.config
+    return await self._call_tool_once(
+      server=server,
+      original_name=original_name,
+      tool_input=tool_input,
+      meta=meta,
+      abort_event=abort_event,
+      timeout_seconds=timeout_seconds,
+    )
+
   async def shutdown(self) -> None:
     async with self._lock:
       if not self._started and not self._servers:
@@ -775,91 +962,24 @@ class McpClientManager:
       self._tool_to_server = {}
       self._prefixed_to_original = {}
       self._mcp_tool_names = set()
+      self._startup_diagnostics = {}
       self._started = False
 
   def _apply_collision_filtering(self) -> None:
-    existing_names = set(self._builtin_tool_names)
-    seen_mcp_names: Dict[str, str] = {}
-    merged: List[Dict[str, Any]] = []
-
-    self._tool_to_server = {}
-    self._prefixed_to_original = {}
-
-    for server_name, state in self._servers.items():
-      prefix = state.tool_prefix
-      filtered: List[Dict[str, Any]] = []
-      filtered_names: Set[str] = set()
-
-      for tool in state.tool_definitions:
-        original_name = tool["name"]
-        tool_name = f"{prefix}{original_name}" if prefix else original_name
-        if tool_name in existing_names:
-          log.warning(
-            "Skipping MCP tool %s from %s: collides with built-in tool. "
-            "Fix: add \"tool_prefix\" to the \"%s\" server config to namespace its tools.",
-            tool_name,
-            server_name,
-            server_name,
-          )
-          continue
-
-        first_server = seen_mcp_names.get(tool_name)
-        if first_server:
-          log.warning(
-            "Skipping MCP tool %s from %s: collides with MCP tool from %s. "
-            "Fix: add \"tool_prefix\" to the \"%s\" server config to namespace its tools.",
-            tool_name,
-            server_name,
-            first_server,
-            server_name,
-          )
-          continue
-
-        seen_mcp_names[tool_name] = server_name
-        self._tool_to_server[tool_name] = server_name
-        if prefix:
-          self._prefixed_to_original[tool_name] = original_name
-          tool = {**tool, "name": tool_name}
-        filtered.append(tool)
-        filtered_names.add(tool_name)
-
-      state.tool_definitions = filtered
-      state.tool_names = filtered_names
-      merged.extend(filtered)
-
-      log.info(
-        "MCP server %s connected | %d tools: %s",
-        server_name,
-        len(filtered_names),
-        sorted(filtered_names),
-      )
-
-    self._tool_definitions = merged
-    if self._strip_input_fields:
-      for tool_def in self._tool_definitions:
-        schema = tool_def.get("input_schema", {})
-        props = schema.get("properties", {})
-        required = schema.get("required", [])
-        for field in self._strip_input_fields:
-          props.pop(field, None)
-          if field in required:
-            required.remove(field)
-    self._mcp_tool_names = set(self._tool_to_server.keys())
+    result = _catalog_helpers.apply_collision_filtering(
+      servers=self._servers,
+      builtin_tool_names=self._builtin_tool_names,
+      strip_input_fields=self._strip_input_fields,
+      logger=log,
+    )
+    self._tool_definitions = result.tool_definitions
+    self._tool_to_server = result.tool_to_server
+    self._prefixed_to_original = result.prefixed_to_original
+    self._mcp_tool_names = result.mcp_tool_names
 
   @staticmethod
   def _extract_text(content: Any) -> str:
-    if not content:
-      return ""
-
-    chunks: List[str] = []
-    for item in content:
-      if isinstance(item, dict):
-        text = item.get("text")
-      else:
-        text = getattr(item, "text", None)
-      if isinstance(text, str) and text.strip():
-        chunks.append(text)
-    return "\n".join(chunks).strip()
+    return _runtime_helpers.extract_text(content)
 
   @staticmethod
   async def _close_contexts(
@@ -867,31 +987,13 @@ class McpClientManager:
     *,
     close_timeout_seconds: float = _MCP_CLOSE_TIMEOUT_SECONDS,
   ) -> None:
-    while contexts:
-      ctx = contexts.pop()
-      try:
-        with _suppress_mcp_stdio_termination_fallback_warnings():
-          await asyncio.wait_for(
-            ctx.__aexit__(None, None, None),
-            timeout=close_timeout_seconds,
-          )
-      except asyncio.TimeoutError:
-        log.warning(
-          "MCP context close timed out after %.1fs; continuing shutdown",
-          close_timeout_seconds,
-        )
-      except Exception as exc:
-        log.debug("MCP context close failed: %s", exc)
+    await _runtime_helpers.close_contexts(
+      contexts,
+      close_timeout_seconds=close_timeout_seconds,
+      logger=log,
+      suppress_warnings=_suppress_mcp_stdio_termination_fallback_warnings,
+      wait_for=asyncio.wait_for,
+    )
 
   def _read_claude_config(self) -> Dict[str, Any]:
-    if self._config_path is None or not self._config_path.exists():
-      return {}
-
-    try:
-      with open(self._config_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    except Exception as exc:
-      log.warning("Failed to read %s: %s", self._config_path, exc)
-      return {}
-
-    return data if isinstance(data, dict) else {}
+    return _runtime_helpers.read_claude_config(self._config_path, json_load=json.load, logger=log)

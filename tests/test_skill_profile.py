@@ -103,6 +103,7 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
         slack: 45
       state_dir: daily-scan
       max_budget_usd: "0.75"
+      thinking: false
       max_retries: 2
       initial_message: Run the workflow.
       delivery_label: Daily Scan
@@ -120,6 +121,7 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
   assert profile.timeout_overrides == {"gmail": 30, "slack": 45}
   assert profile.state_dir == "daily-scan"
   assert profile.max_budget_usd == 0.75
+  assert profile.thinking is False
   assert profile.max_retries == 2
   assert profile.initial_message == "Run the workflow."
   assert profile.delivery_label == "Daily Scan"
@@ -133,6 +135,7 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
     "timeout_overrides": {"gmail": 30, "slack": 45},
     "state_dir": "daily-scan",
     "max_budget_usd": 0.75,
+    "thinking": False,
     "max_retries": 2,
     "initial_message": "Run the workflow.",
     "delivery_label": "Daily Scan",
@@ -201,6 +204,7 @@ def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:
       github: "90"
     state_dir: top-level-state
     max_budget_usd: 1.25
+    thinking: "off"
     max_retries: 3
     initial_message: Run from top level.
     delivery_label: Top Level
@@ -214,6 +218,7 @@ def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:
   assert profile.timeout_overrides == {"github": 90}
   assert profile.state_dir == "top-level-state"
   assert profile.max_budget_usd == 1.25
+  assert profile.thinking is False
   assert profile.max_retries == 3
   assert profile.initial_message == "Run from top level."
   assert profile.delivery_label == "Top Level"
@@ -223,6 +228,7 @@ def test_parse_lifts_top_level_keys(tmp_path: Path) -> None:
     "timeout_overrides": {"github": 90},
     "state_dir": "top-level-state",
     "max_budget_usd": 1.25,
+    "thinking": False,
     "max_retries": 3,
     "initial_message": "Run from top level.",
     "delivery_label": "Top Level",

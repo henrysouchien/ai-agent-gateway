@@ -1,21 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
-import functools
+import fcntl  # noqa: F401 - compatibility alias for runner session lifecycle monkeypatches
 import inspect
-import json
+import json  # noqa: F401 - compatibility alias for runner tool execution monkeypatches
 import logging
-import os
-import re
-import socket
+import socket  # noqa: F401 - compatibility alias for runner session lifecycle monkeypatches
 import time
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
-from ._provider_utils import _get_default_model_for_provider
+from ._provider_utils import _get_default_model_for_provider  # noqa: F401 - compatibility alias
 from .agent_session_log import AgentSessionLog
 from .auth import ProviderCredentialFailure
 from .context_builder import SessionContextBuilder
@@ -27,13 +23,187 @@ from .multi_user.billing import (
   UsageEvent,
   _UsageAggregator,
   normalize_identity,
-  write_dlq,
 )
-from .product_config import gateway_product_id
-from .providers import ModelInfo, ModelProvider, ThinkingLevel, truncate_to_last_compaction
+from .product_config import gateway_product_id  # noqa: F401 - compatibility alias
+from .providers import ModelInfo, ModelProvider, ThinkingLevel  # noqa: F401 - compatibility aliases
+from .runner_introspection import (
+  derive_sub_agent_id as _derive_sub_agent_id,  # noqa: F401 - compatibility alias
+  detect_keyword_param as _detect_keyword_param,
+  detect_user_id_param as _detect_user_id_param,
+  format_exc as _format_exc,  # noqa: F401 - compatibility alias
+)
+from .runner_limits import (
+  COMPACTION_TRIGGER_PCT as COMPACTION_TRIGGER_PCT,
+  CONTEXT_WARNING_PCT as CONTEXT_WARNING_PCT,
+  MODEL_CONTEXT_LIMIT as MODEL_CONTEXT_LIMIT,
+  effective_compaction_trigger as _effective_compaction_trigger,  # noqa: F401 - compatibility alias
+  estimate_tokens as _estimate_tokens,  # noqa: F401 - compatibility alias
+  model_context_window as _model_context_window,  # noqa: F401 - compatibility alias
+  system_prompt_estimate_text as _system_prompt_estimate_text,  # noqa: F401 - compatibility alias
+  token_breakdown_snapshot as _token_breakdown_snapshot,  # noqa: F401 - compatibility alias
+  token_estimate_snapshot as _token_estimate_snapshot,  # noqa: F401 - compatibility alias
+)
+from .runner_prompt_rules import (
+  last_user_message as _last_user_message,
+  message_content_text as _message_content_text,  # noqa: F401 - compatibility alias
+  messages_require_tool_only_turns as _messages_require_tool_only_turns,  # noqa: F401 - compatibility alias
+  prepend_system_prompt_preamble as _prepend_system_prompt_preamble,  # noqa: F401 - compatibility alias
+  system_prompt_requires_tool_only_turns as _system_prompt_requires_tool_only_turns,  # noqa: F401 - compatibility alias
+  system_prompt_text as _system_prompt_text,  # noqa: F401 - compatibility alias
+)
+from .runner_background_lifecycle import RunnerBackgroundLifecycleMixin
+from .runner_hooks_lifecycle import RunnerHooksLifecycleMixin
+from .runner_auth import (
+  call_credential_refresher as _call_credential_refresher,  # noqa: F401 - compatibility alias
+  merge_refreshed_auth_config as _merge_refreshed_auth_config,  # noqa: F401 - compatibility alias
+)
+from .runner_background_tasks import (
+  background_asyncio_tasks as _background_asyncio_tasks,  # noqa: F401 - compatibility alias
+  background_task_call_index as _background_task_call_index,  # noqa: F401 - compatibility alias
+  background_elapsed_seconds as _background_elapsed_seconds,  # noqa: F401 - compatibility alias
+  background_task_model as _background_task_model,  # noqa: F401 - compatibility alias
+  background_task_payload as _background_task_payload,  # noqa: F401 - compatibility alias
+  background_task_provider_name as _background_task_provider_name,  # noqa: F401 - compatibility alias
+  background_task_ids as _background_task_ids,  # noqa: F401 - compatibility alias
+  background_task_ids_for_asyncio_tasks as _background_task_ids_for_asyncio_tasks,  # noqa: F401 - compatibility alias
+  background_task_limit_error as _background_task_limit_error,  # noqa: F401 - compatibility alias
+  background_task_registration_metadata as _background_task_registration_metadata,  # noqa: F401 - compatibility alias
+  background_task_reminder_text as _background_task_reminder_text,  # noqa: F401 - compatibility alias
+  background_result_task as _background_result_task,  # noqa: F401 - compatibility alias
+  background_result_tasks as _background_result_tasks,  # noqa: F401 - compatibility alias
+  background_task_started_result as _background_task_started_result,  # noqa: F401 - compatibility alias
+  background_timeout_value as _background_timeout_value,  # noqa: F401 - compatibility alias
+  background_wait_tasks as _background_wait_tasks,  # noqa: F401 - compatibility alias
+  call_before_background_task_start_hook as _call_before_background_task_start_hook,  # noqa: F401 - compatibility alias
+  drain_cancelled_background_tasks as _drain_cancelled_background_tasks,  # noqa: F401 - compatibility alias
+  drain_still_pending_background_tasks as _drain_still_pending_background_tasks,  # noqa: F401 - compatibility alias
+  entry_aware_background_handler as _entry_aware_background_handler,  # noqa: F401 - compatibility alias
+  ensure_sub_agent_semaphore as _ensure_sub_agent_semaphore,  # noqa: F401 - compatibility alias
+  kill_background_tasks as _kill_background_tasks,  # noqa: F401 - compatibility alias
+  kill_background_tasks_for_asyncio_tasks as _kill_background_tasks_for_asyncio_tasks,
+  parse_background_result_request as _parse_background_result_request,  # noqa: F401 - compatibility alias
+  parse_child_budget_usd as _parse_child_budget_usd,  # noqa: F401 - compatibility alias
+  prepare_background_task_registration as _prepare_background_task_registration,  # noqa: F401 - compatibility alias
+  resume_chain_depth as _resume_chain_depth,  # noqa: F401 - compatibility alias
+  resume_root_task_id as _resume_root_task_id,  # noqa: F401 - compatibility alias
+  resume_root_task_id_from_registry as _resume_root_task_id_from_registry,  # noqa: F401 - compatibility alias
+  resume_task_id_override as _resume_task_id_override,  # noqa: F401 - compatibility alias
+  resumed_task_ids as _resumed_task_ids,  # noqa: F401 - compatibility alias
+  resumed_task_ids_from_registry as _resumed_task_ids_from_registry,  # noqa: F401 - compatibility alias
+  sub_agent_result_from_log_entries as _sub_agent_result_from_log_entries,  # noqa: F401 - compatibility alias
+  task_completed_event_payload as _task_completed_event_payload,  # noqa: F401 - compatibility alias
+  task_correlation_payload as _task_correlation_payload,  # noqa: F401 - compatibility alias
+  task_registered_event_payload as _task_registered_event_payload,  # noqa: F401 - compatibility alias
+  wait_for_background_tasks as _wait_for_background_tasks,  # noqa: F401 - compatibility alias
+)
+from .runner_callbacks import (
+  call_before_stream_complete_hook as _call_before_stream_complete_hook,  # noqa: F401 - compatibility alias
+  call_metric_hook as _call_metric_hook,  # noqa: F401 - compatibility alias
+  call_tool_timing_hook as _call_tool_timing_hook,  # noqa: F401 - compatibility alias
+  call_tool_result_hook as _call_tool_result_hook,  # noqa: F401 - compatibility alias
+)
+from .runner_notifications import (
+  build_notification_reminder as _build_notification_reminder,  # noqa: F401 - compatibility alias
+  consume_notifications as _consume_notifications,  # noqa: F401 - compatibility alias
+  inject_system_prompt_reminder as _inject_system_prompt_reminder,  # noqa: F401 - compatibility alias
+)
+from .runner_session_lifecycle import RunnerSessionLifecycleMixin
+from .runner_sub_agents import RunnerSubAgentMixin
+from .runner_stream_turn import RunnerStreamTurnMixin
+from .runner_run_loop import RunnerRunLoopMixin
+from .runner_tool_execution import RunnerToolExecutionMixin
+from .runner_session_events import (
+  build_assistant_message_event as _build_assistant_message_event,  # noqa: F401 - compatibility alias
+  build_attach_event as _build_attach_event,  # noqa: F401 - compatibility alias
+  build_budget_exceeded_event as _build_budget_exceeded_event,  # noqa: F401 - compatibility alias
+  build_budget_exceeded_text_event as _build_budget_exceeded_text_event,  # noqa: F401 - compatibility alias
+  build_chat_done_log_data as _build_chat_done_log_data,  # noqa: F401 - compatibility alias
+  build_context_warning_log_data as _build_context_warning_log_data,  # noqa: F401 - compatibility alias
+  build_detach_event as _build_detach_event,  # noqa: F401 - compatibility alias
+  build_error_event as _build_error_event,  # noqa: F401 - compatibility alias
+  build_interrupted_event as _build_interrupted_event,  # noqa: F401 - compatibility alias
+  build_max_turns_reached_event as _build_max_turns_reached_event,  # noqa: F401 - compatibility alias
+  build_max_turns_text_event as _build_max_turns_text_event,  # noqa: F401 - compatibility alias
+  build_orphan_tool_call_interrupted_events as _build_orphan_tool_call_interrupted_events,  # noqa: F401 - compatibility alias
+  build_operator_pause_event as _build_operator_pause_event,  # noqa: F401 - compatibility alias
+  build_run_error_event as _build_run_error_event,  # noqa: F401 - compatibility alias
+  build_runtime_guard_event as _build_runtime_guard_event,  # noqa: F401 - compatibility alias
+  build_stream_complete_event as _build_stream_complete_event,  # noqa: F401 - compatibility alias
+  build_stream_retry_event as _build_stream_retry_event,  # noqa: F401 - compatibility alias
+  build_stub_response_events as _build_stub_response_events,
+  build_tool_call_complete_event as _build_tool_call_complete_event,  # noqa: F401 - compatibility alias
+  build_tool_call_start_event as _build_tool_call_start_event,  # noqa: F401 - compatibility alias
+  build_turn_complete_log_data as _build_turn_complete_log_data,  # noqa: F401 - compatibility alias
+  build_token_estimate_log_data as _build_token_estimate_log_data,  # noqa: F401 - compatibility alias
+  build_turn_complete_event as _build_turn_complete_event,  # noqa: F401 - compatibility alias
+  build_user_message_event as _build_user_message_event,  # noqa: F401 - compatibility alias
+  durable_event_payload as _durable_event_payload,  # noqa: F401 - compatibility alias
+  release_write_lease as _release_write_lease,  # noqa: F401 - compatibility alias
+  run_detach_reason as _run_detach_reason,  # noqa: F401 - compatibility alias
+  run_interrupted_reason as _run_interrupted_reason,  # noqa: F401 - compatibility alias
+  shutdown_interrupted_reason as _shutdown_interrupted_reason,  # noqa: F401 - compatibility alias
+  write_lease_metadata as _write_lease_metadata,  # noqa: F401 - compatibility alias
+)
+from .runner_skill_gate import (
+  default_tool_definitions as _default_tool_definitions,
+  effective_excluded_tools as _effective_excluded_tools,
+  filter_excluded_tool_definitions as _filter_excluded_tool_definitions,
+  is_report_door_clear_event as _is_report_door_clear_event,
+  normalize_skill_deny as _normalize_skill_deny,
+  normalize_skill_report_doors as _normalize_skill_report_doors,
+)
+from .runner_state import (
+  BackgroundTask,
+  ChildCostAccumulator,  # noqa: F401 - compatibility alias
+  CostAccumulator,
+  StreamTurnResult,  # noqa: F401 - compatibility alias
+  SubAgentConfig,
+  ToolResultContext,
+  assistant_turn_message as _assistant_turn_message,  # noqa: F401 - compatibility alias
+  background_tasks_completed_user_message as _background_tasks_completed_user_message,  # noqa: F401 - compatibility alias
+  budget_cost_progress as _budget_cost_progress,  # noqa: F401 - compatibility alias
+  budget_exceeded_state as _budget_exceeded_state,  # noqa: F401 - compatibility alias
+  budget_reason_suffix as _budget_reason_suffix,  # noqa: F401 - compatibility alias
+  execute_tool_use_loop as _execute_tool_use_loop,  # noqa: F401 - compatibility alias
+  model_visible_extra_blocks as _model_visible_extra_blocks,  # noqa: F401 - compatibility alias
+  no_tool_use_turn_outcome as _no_tool_use_turn_outcome,  # noqa: F401 - compatibility alias
+  normalized_run_config as _normalized_run_config,  # noqa: F401 - compatibility alias
+  select_run_max_tokens as _select_run_max_tokens,  # noqa: F401 - compatibility alias
+  session_drain_state as _session_drain_state,  # noqa: F401 - compatibility alias
+  stream_turn_log_summary as _stream_turn_log_summary,  # noqa: F401 - compatibility alias
+  sub_agent_batch_error as _sub_agent_batch_error,  # noqa: F401 - compatibility alias
+  turn_reminder_state as _turn_reminder_state,  # noqa: F401 - compatibility alias
+  usage_cache_status as _usage_cache_status,  # noqa: F401 - compatibility alias
+  user_turn_message as _user_turn_message,  # noqa: F401 - compatibility alias
+)
+from .runner_streaming import (
+  STREAM_STALL_TIMEOUT as STREAM_STALL_TIMEOUT,
+  STREAM_THINKING_STALL_TIMEOUT as STREAM_THINKING_STALL_TIMEOUT,
+  classify_guard_outcome,  # noqa: F401 - compatibility alias
+  effective_stream_stall_timeout,  # noqa: F401 - compatibility alias
+  thinking_level,  # noqa: F401 - compatibility alias
+)
+from .runner_tool_audit import (
+  get_tool_risk_value as _get_tool_risk_value,  # noqa: F401 - compatibility alias
+  redact_tool_input_for_event as _redact_tool_input_for_event,  # noqa: F401 - compatibility alias
+)
+from .runner_usage import (
+  apply_message_start_usage as _apply_message_start_usage,  # noqa: F401 - compatibility alias
+  apply_usage_update as _apply_usage_update,  # noqa: F401 - compatibility alias
+  build_usage_event as _build_usage_event,  # noqa: F401 - compatibility alias
+  call_late_usage_event_hook as _call_late_usage_event_hook,  # noqa: F401 - compatibility alias
+  call_session_summary_hook as _call_session_summary_hook,  # noqa: F401 - compatibility alias
+  call_usage_event_hook as _call_usage_event_hook,  # noqa: F401 - compatibility alias
+  empty_usage_totals as _empty_usage_totals,  # noqa: F401 - compatibility alias
+  estimate_usage_cost as _estimate_usage_cost,  # noqa: F401 - compatibility alias
+  turn_usage_payload as _turn_usage_payload,  # noqa: F401 - compatibility alias
+  usage_delta as _usage_delta,  # noqa: F401 - compatibility alias
+  usage_delta_state as _usage_delta_state,  # noqa: F401 - compatibility alias
+  usage_has_tokens as _usage_has_tokens,  # noqa: F401 - compatibility alias
+)
 from .session_recap import emit_recap_then_terminal
 from .task_registry import (
-  COORDINATOR_DEFAULT_PREAMBLE,
+  COORDINATOR_DEFAULT_PREAMBLE,  # noqa: F401 - compatibility alias
   CoordinatorConfig,
   NotificationQueue,
   ParentMessage,
@@ -41,29 +211,36 @@ from .task_registry import (
   TaskNotification,
   TaskRegistry,
   TaskState,
-  format_parent_messages_for_model,
-  make_progress_tracker,
+  format_parent_messages_for_model,  # noqa: F401 - compatibility alias
+  make_progress_tracker,  # noqa: F401 - compatibility alias
 )
 from .tool_dispatcher import ToolDispatcher
-from .tool_display import resolve_display
-from .tool_result_semantics import classify_semantic_tool_error
+from .tool_display import resolve_display  # noqa: F401 - compatibility alias
+from .tool_result_compaction import (
+  MODEL_TOOL_RESULT_MAX_CHARS as MODEL_TOOL_RESULT_MAX_CHARS,
+  MODEL_TOOL_RESULT_MAX_CHARS_ENV as MODEL_TOOL_RESULT_MAX_CHARS_ENV,
+  MODEL_TOOL_RESULT_MIN_CHARS as MODEL_TOOL_RESULT_MIN_CHARS,
+  SPILL_TRUNCATED_TOOL_RESULTS_ENV as SPILL_TRUNCATED_TOOL_RESULTS_ENV,
+  annotate_result,
+  compact_model_tool_result_entry as _compact_model_tool_result_entry,
+  is_error_tool_result_entry,
+  make_error_result,
+  model_tool_result_max_chars as _model_tool_result_max_chars,  # noqa: F401 - compatibility alias
+  scalar_preview_fields as _scalar_preview_fields,  # noqa: F401 - compatibility alias
+  spill_truncated_tool_results_enabled as _spill_truncated_tool_results_enabled,  # noqa: F401 - compatibility alias
+  truncate_model_tool_result_content as _truncate_model_tool_result_content,  # noqa: F401 - compatibility alias
+  write_tool_result_spill,
+)
+from .tool_result_semantics import (
+  classify_semantic_tool_error,  # noqa: F401 - compatibility alias
+  is_semantic_tool_error as _is_soft_error,
+)
 
+
+kill_background_tasks = _kill_background_tasks
+kill_background_tasks_for_asyncio_tasks = _kill_background_tasks_for_asyncio_tasks
 
 log = logging.getLogger("agent_gateway.runner")
-MODEL_CONTEXT_LIMIT = 200_000
-CONTEXT_WARNING_PCT = 80
-# Server-side compaction fires when submitted input crosses the trigger. A fixed
-# trigger calibrated to the old 200k-window era fires on every turn once the
-# static system+tool surface alone exceeds it on a large-window model (e.g. 1M),
-# so the API re-compacts each request for no benefit. Scale the trigger and the
-# context-usage warning to the model's real window instead.
-COMPACTION_TRIGGER_PCT = 80
-MODEL_TOOL_RESULT_MAX_CHARS = 60_000
-MODEL_TOOL_RESULT_MAX_CHARS_ENV = "AGENT_GATEWAY_MAX_MODEL_TOOL_RESULT_CHARS"
-MODEL_TOOL_RESULT_MIN_CHARS = 4_000
-SPILL_TRUNCATED_TOOL_RESULTS_ENV = "AGENT_GATEWAY_SPILL_TRUNCATED_TOOL_RESULTS"
-STREAM_STALL_TIMEOUT = 60  # max seconds between stream progress events before watchdog cancels
-STREAM_THINKING_STALL_TIMEOUT = 300  # extended-thinking turns can be quiet before first visible output
 STREAM_GUARD_POLL_INTERVAL = 2.0
 # Liveness is guarded by event-gap stall detection (retryable), NOT wall clock:
 # thinking-turn duration is unpredictable, so per_turn_timeout should be None on
@@ -83,12 +260,14 @@ _RUN_AGENT_DISPATCH_TIMEOUT_SECONDS = 2100.0
 # A turn that exhausts max_tokens with no usable tool call (e.g. long interleaved
 # thinking + a very large tool-call JSON truncated mid-stream) must not silently
 # end the run (ACUI-27): nudge and continue, bounded to avoid loops.
-_MAX_TOKENS_CONTINUATIONS = 2
+_MAX_TOKENS_CONTINUATIONS = 3
 _MAX_TOKENS_NUDGE = (
   "[System: Your previous response hit the output-token limit and was truncated; "
-  "any partial tool call was discarded. Continue the task now. If you were emitting "
-  "a large tool call, re-issue it more concisely (trim verbose narrative fields) or "
-  "split the submission into smaller steps. Do not restate prior reasoning.]"
+  "any partial tool call was discarded. Continue the task now with a tool-first "
+  "response: if a required tool/report/persist door is available, call it now with "
+  "the smallest valid JSON payload. Trim verbose rationale fields, omit optional "
+  "narrative, and split only when the tool contract requires it. Do not spend "
+  "another turn on hidden analysis or restate prior reasoning.]"
 )
 _ACTIVE_SKILL_DENY_RESULT_KEY = "_active_skill_deny"
 _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
@@ -99,391 +278,6 @@ FinalAnswerGuard = Callable[
   [List[Dict[str, Any]], str, List[str], List[Dict[str, Any]], int],
   str | None,
 ]
-
-
-def _derive_sub_agent_id(parent_session: Any, call_index: int) -> str:
-  parent_sid = str(getattr(parent_session, "session_id", parent_session) or "")
-  return f"sub{int(call_index)}:{parent_sid}"
-
-
-def _estimate_tokens(text: str) -> int:
-  """Rough token estimate: ~4 chars per token for English text + JSON overhead."""
-  return max(1, len(text) // 4)
-
-
-def _model_context_window(model_info: Any) -> int:
-  window = getattr(model_info, "context_window", None)
-  return int(window) if window else MODEL_CONTEXT_LIMIT
-
-
-def _effective_compaction_trigger(compaction_trigger: int | None, model_info: Any) -> int | None:
-  """Scale a fixed compaction trigger up to the model's real context window.
-
-  Keeps the configured value as a floor (never compacts later than legacy on a
-  small window) but raises it to ``COMPACTION_TRIGGER_PCT`` of a larger window so
-  it only fires near genuine capacity instead of on every turn once the static
-  system+tool surface alone already exceeds the legacy trigger.
-  """
-  if compaction_trigger is None:
-    return None
-  window_trigger = int(_model_context_window(model_info) * COMPACTION_TRIGGER_PCT / 100)
-  return max(window_trigger, int(compaction_trigger))
-
-
-def _format_exc(exc: BaseException) -> str:
-  parts = [f"{type(exc).__name__}: {repr(exc)}"]
-  seen = {id(exc)}
-  cause = exc.__cause__
-  while cause is not None and id(cause) not in seen:
-    parts.append(f"caused by {type(cause).__name__}: {repr(cause)}")
-    seen.add(id(cause))
-    cause = cause.__cause__
-  return " | ".join(parts)
-
-
-def _detect_user_id_param(fn) -> bool:
-  """True iff fn accepts user_id as a keyword argument.
-
-  Returns True for POSITIONAL_OR_KEYWORD, KEYWORD_ONLY, and **kwargs.
-  Returns False for None, positional-only params, and uninspectable callables.
-  """
-  if fn is None:
-    return False
-  if isinstance(fn, functools.partial):
-    return False
-  try:
-    sig = inspect.signature(fn)
-  except (TypeError, ValueError):
-    return False
-  for name, param in sig.parameters.items():
-    if param.kind is inspect.Parameter.VAR_KEYWORD:
-      return True
-    if name == "user_id" and param.kind in (
-      inspect.Parameter.POSITIONAL_OR_KEYWORD,
-      inspect.Parameter.KEYWORD_ONLY,
-    ):
-      return True
-  return False
-
-
-def _model_tool_result_max_chars() -> int:
-  raw = os.getenv(MODEL_TOOL_RESULT_MAX_CHARS_ENV)
-  if raw is None or not raw.strip():
-    return MODEL_TOOL_RESULT_MAX_CHARS
-  try:
-    value = int(raw)
-  except ValueError:
-    return MODEL_TOOL_RESULT_MAX_CHARS
-  if value <= 0:
-    return 0
-  return max(MODEL_TOOL_RESULT_MIN_CHARS, value)
-
-
-def _spill_truncated_tool_results_enabled() -> bool:
-  raw = os.getenv(SPILL_TRUNCATED_TOOL_RESULTS_ENV)
-  if raw is None:
-    return True
-  return raw.strip().lower() not in {"0", "false", "no"}
-
-
-def _scalar_preview_fields(value: Any) -> Dict[str, Any]:
-  if not isinstance(value, dict):
-    return {}
-  preview: Dict[str, Any] = {}
-  for key, item in value.items():
-    if isinstance(item, str):
-      preview[str(key)] = item if len(item) <= 500 else f"{item[:500]}... <truncated chars={len(item)}>"
-    elif isinstance(item, (int, float, bool)) or item is None:
-      preview[str(key)] = item
-    if len(preview) >= 24:
-      break
-  return preview
-
-
-def _truncate_model_tool_result_content(
-  content: str,
-  *,
-  tool_name: str,
-  max_chars: int,
-  spill_filename: str | None = None,
-  spill_abspath: str | None = None,
-) -> tuple[str, bool]:
-  if max_chars <= 0 or len(content) <= max_chars:
-    return content, False
-
-  parsed: Any | None = None
-  try:
-    parsed = json.loads(content)
-  except Exception:
-    parsed = None
-
-  payload: Dict[str, Any] = {
-    "_runner_truncated": True,
-    "tool_name": tool_name,
-    "original_chars": len(content),
-    "message": (
-      "The full tool result was retained in the gateway event log, but this "
-      "model-bound preview was truncated to stay within the provider context "
-      "window. Narrow the tool query (filters, pagination, fewer fields) if you "
-      "need more detail. If a spill file is listed below, read it for the full result."
-    ),
-  }
-  if spill_filename is not None:
-    payload["spill_file"] = spill_filename
-    payload["spill_abspath"] = spill_abspath
-    payload["spill_hint"] = (
-      "The FULL, untruncated result was written to this file in your code_execute "
-      "working directory. Read it there instead of relying on this preview - e.g. "
-      f"in code_execute: `import pandas as pd; df = pd.read_json('{spill_filename}')` "
-      f"(or `json.load(open('{spill_filename}'))`). In run_bash/file_read, use the "
-      "absolute path (spill_abspath) instead of the bare name."
-    )
-  if isinstance(parsed, dict):
-    payload["top_level_keys"] = list(parsed.keys())[:50]
-    scalar_fields = _scalar_preview_fields(parsed)
-    if scalar_fields:
-      payload["scalar_fields"] = scalar_fields
-  elif isinstance(parsed, list):
-    payload["top_level_type"] = "list"
-    payload["top_level_items"] = len(parsed)
-
-  prefix_budget = max(0, max_chars - len(json.dumps(payload, default=str)) - 200)
-  payload["content_prefix"] = content[:prefix_budget]
-  payload["retained_prefix_chars"] = len(payload["content_prefix"])
-
-  truncated = json.dumps(payload, default=str)
-  while len(truncated) > max_chars and prefix_budget > 0:
-    prefix_budget = max(0, prefix_budget - (len(truncated) - max_chars) - 100)
-    payload["content_prefix"] = content[:prefix_budget]
-    payload["retained_prefix_chars"] = len(payload["content_prefix"])
-    truncated = json.dumps(payload, default=str)
-  if len(truncated) <= max_chars:
-    return truncated, True
-
-  fallback_payload = {
-    "_runner_truncated": True,
-    "tool_name": tool_name,
-    "original_chars": len(content),
-    "message": "Tool result omitted from model context because it exceeded the configured payload limit.",
-  }
-  if spill_filename is not None:
-    fallback_payload["spill_file"] = spill_filename
-    fallback_payload["spill_abspath"] = spill_abspath
-    fallback_payload["spill_hint"] = (
-      "The FULL, untruncated result was written to this file in your code_execute working directory."
-    )
-  return json.dumps(fallback_payload, default=str), True
-
-
-def _get_tool_risk_value(tool_name: str) -> str:
-  normalized = str(tool_name or "").strip()
-  try:
-    from api.agent.shared.tool_risk import get_tool_risk
-  except Exception:
-    if normalized in {"file_read", "memory_read", "memory_recall", "web_search", "web_fetch"}:
-      return "read_only"
-    if normalized.startswith(
-      (
-        "analyze_",
-        "check_",
-        "compare_",
-        "describe_",
-        "fetch_",
-        "file_read",
-        "get_",
-        "list_",
-        "preview_",
-        "query_",
-        "read_",
-        "recall_",
-        "screen_",
-        "search_",
-        "view_",
-      )
-    ):
-      return "read_only"
-    if normalized.startswith(("memory_", "set_", "sync_", "upsert_")):
-      return "idempotent_write"
-    return "side_effecting"
-  try:
-    return get_tool_risk(normalized).value
-  except Exception:
-    return "side_effecting"
-
-
-def _redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
-  try:
-    from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
-
-    return redact_tool_input(tool_name, tool_input, deployment_secret=get_audit_hmac_secret())
-  except Exception:
-    return dict(tool_input)
-
-
-@dataclass
-class ToolResultContext:
-  """Context passed to `on_tool_result` hooks.
-
-  Hooks can inspect the original tool input, the normalized tool result, the
-  emitted result entry, and timing metadata before the runner forwards the tool
-  result back into the model conversation.
-  """
-
-  tool_name: str
-  tool_input: Dict[str, Any]
-  result: Any | None
-  error: Dict[str, Any] | None
-  duration_ms: int
-  tool_call_id: str
-  session_id: str
-  server: str | None
-  result_entry: Dict[str, Any] | None
-  skill_run_id: str | None = None
-  workspace_dir: str | None = None
-
-
-@dataclass
-class SubAgentConfig:
-  """Default settings applied to spawned sub-agents."""
-
-  excluded_tools: Set[str]
-  system_prompt: str | None = None
-  max_turns: int = 15
-  model: str | None = None
-
-
-@dataclass
-class StreamTurnResult:
-  full_text: str = ""
-  tool_uses: List[Tuple[str, str, Dict[str, Any]]] = field(default_factory=list)
-  stop_reason: str | None = None
-  first_token_t: float | None = None
-  content_blocks: List[Dict[str, Any]] = field(default_factory=list)
-
-
-def _system_prompt_text(system_prompt: Optional[Union[str, List[Tuple[str, bool]]]]) -> str:
-  if isinstance(system_prompt, str):
-    return system_prompt
-  if isinstance(system_prompt, list):
-    return "\n".join(str(part[0]) for part in system_prompt if part)
-  return ""
-
-
-def _system_prompt_requires_tool_only_turns(system_prompt: Optional[Union[str, List[Tuple[str, bool]]]]) -> bool:
-  text = _system_prompt_text(system_prompt).lower()
-  return (
-    "tool-call messages are tool-only" in text
-    or "every assistant message that contains any tool call must contain zero visible text" in text
-  )
-
-
-def _message_content_text(content: Any) -> str:
-  if isinstance(content, str):
-    return content
-  if isinstance(content, list):
-    parts: list[str] = []
-    for block in content:
-      if isinstance(block, dict):
-        text = block.get("text")
-        if isinstance(text, str):
-          parts.append(text)
-      elif isinstance(block, str):
-        parts.append(block)
-    return "\n".join(parts)
-  return ""
-
-
-def _messages_require_tool_only_turns(messages: List[Dict[str, Any]]) -> bool:
-  for message in messages:
-    if not isinstance(message, dict):
-      continue
-    text = _message_content_text(message.get("content")).lower()
-    if (
-      "tool-call messages are tool-only" in text
-      or "every assistant message that contains any tool call must contain zero visible text" in text
-    ):
-      return True
-  return False
-
-
-@dataclass
-class BackgroundTask:
-  task_id: str
-  agent_name: str | None
-  asyncio_task: asyncio.Task[Any] | None
-  started_at: float
-  result: Dict[str, Any] | None = None
-  error: Dict[str, Any] | None = None
-  completed: bool = False
-  completed_at: float | None = None
-
-
-class CostAccumulator:
-  """Running cost tracker shared across parent and sub-agent runners."""
-
-  def __init__(self, budget: float) -> None:
-    self.budget = budget
-    self._total = 0.0
-
-  def add(self, cost: float) -> None:
-    self._total += cost
-
-  @property
-  def total(self) -> float:
-    return self._total
-
-  @property
-  def exceeded(self) -> bool:
-    return self._total >= self.budget
-
-
-class ChildCostAccumulator(CostAccumulator):
-  """Child-local budget tracker that forwards spend to the parent."""
-
-  def __init__(self, parent: CostAccumulator | None, budget: float) -> None:
-    super().__init__(budget)
-    self._parent = parent
-
-  def add(self, cost: float) -> None:
-    super().add(cost)
-    if self._parent is not None:
-      self._parent.add(cost)
-
-  @property
-  def _local_exceeded(self) -> bool:
-    return self.total >= self.budget
-
-  @property
-  def exceeded(self) -> bool:
-    return self._local_exceeded or bool(self._parent is not None and self._parent.exceeded)
-
-  @property
-  def exceeded_reason(self) -> str | None:
-    if self._local_exceeded:
-      return "child_budget"
-    if self._parent is not None and self._parent.exceeded:
-      return "parent_budget"
-    return None
-
-  @property
-  def effective_total(self) -> float:
-    if not self._local_exceeded and self._parent is not None and self._parent.exceeded:
-      return self._parent.total
-    return self.total
-
-  @property
-  def effective_budget(self) -> float:
-    if not self._local_exceeded and self._parent is not None and self._parent.exceeded:
-      return self._parent.budget
-    return self.budget
-
-
-def _budget_reason_suffix(reason: Any) -> str:
-  if reason == "child_budget":
-    return " (child budget)"
-  if reason == "parent_budget":
-    return " (parent budget)"
-  return ""
 
 
 OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | None]]
@@ -499,7 +293,15 @@ OnCredentialRefresh = Callable[[ProviderCredentialFailure], Awaitable[Dict[str, 
 ShutdownSignalProvider = Callable[[], Dict[str, Any] | None]
 
 
-class AgentRunner:
+class AgentRunner(
+  RunnerSessionLifecycleMixin,
+  RunnerBackgroundLifecycleMixin,
+  RunnerHooksLifecycleMixin,
+  RunnerSubAgentMixin,
+  RunnerToolExecutionMixin,
+  RunnerStreamTurnMixin,
+  RunnerRunLoopMixin,
+):
   """Run the model/tool loop for one gateway conversation.
 
   `AgentRunner` is responsible for streaming provider output, executing tool
@@ -571,6 +373,7 @@ class AgentRunner:
     code_execution_spill_dir_provider: Callable[[], str] | None = None,
     skill_run_id: str | None = None,
     workspace_dir: str | Path | None = None,
+    context_surfaces: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
   ) -> None:
     if max_budget_usd is not None and max_budget_usd <= 0:
       raise ValueError("max_budget_usd must be positive when provided")
@@ -607,6 +410,9 @@ class AgentRunner:
     self._on_before_stream_complete = on_before_stream_complete
     self._on_tool_timing = on_tool_timing
     self._on_tool_timing_accepts_user_id = _detect_user_id_param(on_tool_timing)
+    self._on_tool_timing_accepts_context_surfaces = _detect_keyword_param(on_tool_timing, "context_surfaces")
+    self._context_surfaces_provider = context_surfaces if callable(context_surfaces) else None
+    self._context_surfaces_static = self._normalize_context_surfaces(None if callable(context_surfaces) else context_surfaces)
     self._request_id = str(request_id or uuid.uuid4())
     self._parent_turn_id = parent_turn_id
     self._usage_user_id, self._rate_table_version, self._billing_mode, self._channel = normalize_identity(
@@ -621,6 +427,8 @@ class AgentRunner:
       session_id=self._full_session_id,
       request_id=self._request_id,
       channel=self._channel,
+      rate_table_version=self._rate_table_version,
+      billing_mode=self._billing_mode,
     )
     self._summary_emitted = False
     self._usage_ledger_dlq_path = (
@@ -723,6 +531,23 @@ class AgentRunner:
   def _background_tasks(self) -> Dict[str, TaskEntry]:
     return self._task_registry._tasks
 
+  @staticmethod
+  def _normalize_context_surfaces(surfaces: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    return [
+      dict(surface)
+      for surface in (surfaces or [])
+      if isinstance(surface, dict)
+    ]
+
+  def _context_surface_records(self) -> list[dict[str, Any]]:
+    if self._context_surfaces_provider is None:
+      return self._normalize_context_surfaces(self._context_surfaces_static)
+    try:
+      return self._normalize_context_surfaces(self._context_surfaces_provider())
+    except Exception as exc:
+      log.warning("[%s] context surface provider failed (non-fatal): %s", self._sid, exc)
+      return self._normalize_context_surfaces(self._context_surfaces_static)
+
   def _append(self, event: Dict[str, Any]) -> None:
     if event.get("type") in {"stream_complete", "error"}:
       emit_recap_then_terminal(
@@ -747,341 +572,12 @@ class AgentRunner:
     self._on_credential_failure = callback
 
   def _extract_last_user_message(self, request_messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    for msg in reversed(request_messages):
-      if msg.get("role") == "user":
-        return dict(msg)
-    return None
+    return _last_user_message(request_messages)
 
-  async def _append_durable_event(self, event: Dict[str, Any]) -> Any | None:
-    if self._agent_session_log is None or self._runner_id is None:
-      return None
-    payload = dict(event)
-    payload.setdefault("runner_id", self._runner_id)
-    payload.setdefault("role", self._role)
-    if self._sub_agent_id is not None:
-      payload.setdefault("sub_agent_id", self._sub_agent_id)
-    pid = gateway_product_id()
-    if pid is not None:
-      payload["product_id"] = pid
-    entry = await self._agent_session_log.append(payload)
-    self._last_durable_seq = entry.seq
-    return entry
-
-  async def _rebuild_task_registry_from_log(self) -> None:
-    if self._task_registry_rebuilt:
-      return
-    async with self._task_registry_rebuild_lock:
-      if self._task_registry_rebuilt:
-        return
-      if self._agent_session_log is None:
-        self._task_registry_rebuilt = True
-        return
-
-      entries, _ = await self._agent_session_log.query(
-        event_types={"task_registered", "task_completed", "parent_message_sent"},
-        order="desc",
-      )
-      events: list[dict[str, Any]] = []
-      registered_task_ids: set[str] = set()
-      max_retained = max(0, getattr(self._task_registry, "_max_retained", 50))
-      for entry in entries:
-        event = entry.event
-        task_id = str(event.get("task_id") or "")
-        if not task_id:
-          continue
-        events.append(dict(event))
-        if event.get("type") == "task_registered":
-          registered_task_ids.add(task_id)
-          if len(registered_task_ids) >= max_retained:
-            break
-      self._task_registry.load_from_events(events)
-      self._task_registry_rebuilt = True
-
-  async def _lookup_task_in_log(self, task_id: str) -> TaskEntry | None:
-    if self._agent_session_log is None:
-      return None
-    entries, _ = await self._agent_session_log.query(
-      event_types={"task_registered", "task_completed", "parent_message_sent"},
-      order="desc",
-    )
-    events: list[dict[str, Any]] = []
-    found_registration = False
-    for entry in entries:
-      event = entry.event
-      if event.get("task_id") != task_id:
-        continue
-      events.append(dict(event))
-      if event.get("type") == "task_registered":
-        found_registration = True
-        break
-    if not found_registration:
-      return None
-    registry = TaskRegistry(max_retained=max(1, getattr(self._task_registry, "_max_retained", 50)))
-    registry.load_from_events(events)
-    return registry.get(task_id)
-
-  async def _emit_attach_event(self) -> None:
-    entry = await self._append_durable_event(
-      {
-        "type": "attach",
-        "gateway_session_id": self._gateway_session_id,
-        "started_at": time.time(),
-        "client_kind": self._client_kind,
-        "hostname": socket.gethostname(),
-      }
-    )
-    self._durable_attach_emitted = entry is not None
-
-  async def _append_user_message_event(self, message: Dict[str, Any]) -> None:
-    await self._append_durable_event(
-      {
-        "type": "user_message",
-        "content": message.get("content"),
-        "client_kind": self._client_kind,
-        "received_at": time.time(),
-      }
-    )
-
-  async def _append_assistant_message_event(
-    self,
-    *,
-    content_blocks: List[Dict[str, Any]],
-    stop_reason: str | None,
-    model: str,
-    usage: Dict[str, int],
-  ) -> None:
-    entry = await self._append_durable_event(
-      {
-        "type": "assistant_message",
-        "content_blocks": list(content_blocks),
-        "stop_reason": stop_reason,
-        "model": model,
-        "provider": getattr(self._provider, "name", None),
-        "usage": dict(usage),
-      }
-    )
-    if entry is not None:
-      self._last_assistant_message_seq = entry.seq
-
-  async def _emit_stream_retry_event(self, *, attempt: int, error: str) -> None:
-    event = {"type": "stream_retry", "attempt": attempt, "error": error}
-    await self._append_durable_event(event)
-    self._append(event)
-
-  async def _emit_error_event(self, error: str) -> None:
-    event = {"type": "error", "error": error}
-    await self._call_on_before_stream_complete(event)
-    await self._append_durable_event(event)
-    self._append(event)
-
-  async def _emit_run_error_event(self, exc: BaseException, *, phase: str = "run") -> None:
-    await self._append_durable_event(
-      {
-        "type": "run_error",
-        "phase": phase,
-        "error_type": type(exc).__name__,
-        "error": _format_exc(exc),
-      }
-    )
-
-  async def _emit_interrupted_event(
-    self,
-    reason: str,
-    *,
-    runner_id: str | None = None,
-    role: str | None = None,
-    last_completed_seq: int | None = None,
-    recovered_by_runner_id: str | None = None,
-    recovered_at: float | None = None,
-    extra_fields: Dict[str, Any] | None = None,
-  ) -> None:
-    payload: Dict[str, Any] = {
-      "type": "interrupted",
-      "reason": reason,
-      "runner_id": runner_id or self._runner_id,
-      "role": role or self._role,
-      "last_completed_seq": self._last_durable_seq if last_completed_seq is None else last_completed_seq,
-    }
-    if recovered_by_runner_id is not None:
-      payload["recovered_by_runner_id"] = recovered_by_runner_id
-    if recovered_at is not None:
-      payload["recovered_at"] = recovered_at
-    if extra_fields:
-      payload.update(extra_fields)
-    await self._append_durable_event(payload)
-
-  def _shutdown_interrupted_reason(self) -> tuple[str, Dict[str, Any]]:
-    if self._shutdown_signal_provider is None:
-      return "graceful_shutdown", {}
-    try:
-      signal_payload = self._shutdown_signal_provider()
-    except Exception as exc:
-      log.warning("[%s] shutdown signal provider failed (non-fatal): %s", self._sid, exc)
-      return "graceful_shutdown", {}
-    if not isinstance(signal_payload, dict) or not signal_payload:
-      return "graceful_shutdown", {}
-
-    payload = dict(signal_payload)
-    signal_name = str(payload.get("signal_name") or "").strip()
-    signal_number = payload.get("signal")
-    suffix = signal_name
-    if not suffix and signal_number is not None:
-      suffix = f"SIG{signal_number}"
-    if not suffix:
-      suffix = "unknown"
-    return f"signal_{suffix}", {"shutdown": payload}
-
-  async def _emit_detach_event(self, reason: str) -> None:
-    if not self._durable_attach_emitted:
-      return
-    await self._append_durable_event(
-      {
-        "type": "detach",
-        "reason": reason,
-        "ended_at": time.time(),
-      }
-    )
-
-  async def _emit_operator_pause_event(self, safe_boundary: str) -> None:
-    event = {
-      "type": "operator_pause",
-      "reason": "operator_pause",
-      "safe_boundary": safe_boundary,
-    }
-    self._append(event)
-    await self._emit_interrupted_event("operator_pause", extra_fields={"safe_boundary": safe_boundary})
-
-  async def _acquire_writer_lease_and_recover(self) -> None:
-    if self._agent_session_log is None or self._role != "writer":
-      return
-
-    lease_file = self._agent_session_log.write_lease_path.open("a+b")
-    try:
-      fcntl.flock(lease_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-      lease_file.close()
-      raise RuntimeError(f"Writer lease already held for {self._agent_session_log.path}") from exc
-    self._write_lease_file = lease_file
-
-    last_known_safe_seq = 0
-    safe_entries, _ = await self._agent_session_log.query(
-      event_types={"detach", "interrupted"},
-      role="writer",
-      order="desc",
-      limit=1,
-    )
-    if safe_entries:
-      last_known_safe_seq = safe_entries[0].seq
-      self._last_durable_seq = last_known_safe_seq
-
-    prior_writer_runner_id: str | None = None
-    writer_lifecycle, _ = await self._agent_session_log.query(
-      event_types={"attach", "detach", "interrupted"},
-      role="writer",
-      order="desc",
-      limit=1,
-    )
-    if writer_lifecycle and writer_lifecycle[0].event.get("type") == "attach":
-      prior_writer_runner_id = str(writer_lifecycle[0].event.get("runner_id") or "")
-
-    orphan_entries, _ = await self._agent_session_log.query(
-      event_types={"tool_call_start", "tool_call_complete", "tool_call_interrupted"},
-      after_seq=last_known_safe_seq + 1,
-      order="asc",
-    )
-    starts: Dict[str, Dict[str, Any]] = {}
-    resolved_tool_ids: Set[str] = set()
-    for entry in orphan_entries:
-      event = entry.event
-      tool_call_id = str(event.get("tool_call_id") or "")
-      if not tool_call_id:
-        continue
-      event_type = str(event.get("type") or "")
-      if event_type == "tool_call_start":
-        starts.setdefault(tool_call_id, event)
-      elif event_type in {"tool_call_complete", "tool_call_interrupted"}:
-        resolved_tool_ids.add(tool_call_id)
-
-    discovered_at = time.time()
-    for tool_call_id, start_event in starts.items():
-      if tool_call_id in resolved_tool_ids:
-        continue
-      synthetic_event: Dict[str, Any] = {
-        "type": "tool_call_interrupted",
-        "tool_call_id": tool_call_id,
-        "tool_name": start_event.get("tool_name"),
-        "tool_input": start_event.get("tool_input"),
-        "original_started_at": start_event.get("started_at"),
-        "discovered_at": discovered_at,
-        "tool_risk": _get_tool_risk_value(str(start_event.get("tool_name") or "")),
-        "runner_id": start_event.get("runner_id"),
-        "role": start_event.get("role", "writer"),
-      }
-      if start_event.get("sub_agent_id") is not None:
-        synthetic_event["sub_agent_id"] = start_event.get("sub_agent_id")
-      await self._append_durable_event(synthetic_event)
-
-    if prior_writer_runner_id:
-      await self._emit_interrupted_event(
-        "recovered_on_attach",
-        runner_id=prior_writer_runner_id,
-        role="writer",
-        last_completed_seq=last_known_safe_seq,
-        recovered_by_runner_id=self._runner_id,
-        recovered_at=discovered_at,
-      )
-
-  def _write_lease_metadata(self) -> None:
-    if self._agent_session_log is None or self._role != "writer" or self._runner_id is None:
-      return
-    payload = {
-      "runner_id": self._runner_id,
-      "gateway_session_id": self._gateway_session_id,
-      "started_at": time.time(),
-      "hostname": socket.gethostname(),
-    }
-    self._agent_session_log.write_lease_meta_path.write_text(
-      json.dumps(payload, sort_keys=True),
-      encoding="utf-8",
-    )
-
-  def _release_write_lease(self) -> None:
-    if self._write_lease_file is None:
-      return
-    try:
-      self._write_lease_file.close()
-    finally:
-      self._write_lease_file = None
 
   @staticmethod
   def _annotate_result(result: Any, tool_name: str = "") -> Any:
-    """Add _runner_warning to generic results with detectable anomalies."""
-    if not isinstance(result, dict):
-      return result
-
-    warnings: List[str] = []
-    interceptor_warnings = result.pop("_interceptor_warnings", None)
-    if isinstance(interceptor_warnings, list):
-      for w in interceptor_warnings:
-        warnings.append(f"Policy warning: {w}")
-
-    low_match = result.get("low_match_warning")
-    if low_match:
-      warnings.append(f"Low match rate detected: {low_match}")
-
-    if tool_name == "run_agent":
-      sub_warning = result.get("warning")
-      if sub_warning:
-        warnings.append(f"Sub-agent warning: {sub_warning}")
-
-    if not warnings:
-      return result
-
-    enriched = dict(result)
-    enriched["_runner_warning"] = " | ".join(warnings)
-    if low_match:
-      enriched["_runner_warning_detail"] = str(low_match)
-    return enriched
+    return annotate_result(result, tool_name=tool_name)
 
   @staticmethod
   def _make_error_result(
@@ -1089,16 +585,9 @@ class AgentRunner:
     code: str,
     message: str,
     sub_code: str = "",
+    data: Dict[str, Any] | None = None,
   ) -> Dict[str, Any]:
-    error_dict = {"code": code, "message": message}
-    if sub_code:
-      error_dict["sub_code"] = sub_code
-    return {
-      "type": "tool_result",
-      "tool_use_id": tool_use_id,
-      "content": json.dumps({"error": error_dict}),
-      "is_error": True,
-    }
+    return make_error_result(tool_use_id, code, message, sub_code, data)
 
   def _compact_model_tool_result_entry(
     self,
@@ -1106,85 +595,18 @@ class AgentRunner:
     *,
     tool_name: str,
   ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    content = result_entry.get("content")
-    if not isinstance(content, str):
-      return result_entry, result_entry
-
-    max_chars = _model_tool_result_max_chars()
-    plain_compacted_content, was_truncated = _truncate_model_tool_result_content(
-      content,
+    return _compact_model_tool_result_entry(
+      result_entry,
       tool_name=tool_name,
-      max_chars=max_chars,
+      spill_dir_provider=self._spill_dir_provider,
+      log_session_id=self._sid,
+      logger=log,
+      uuid_factory=uuid.uuid4,
     )
-    if not was_truncated:
-      return result_entry, result_entry
-
-    plain_compacted_entry = dict(result_entry)
-    plain_compacted_entry["content"] = plain_compacted_content
-    live_entry = plain_compacted_entry
-    durable_entry = plain_compacted_entry
-    if (
-      self._spill_dir_provider is not None
-      and _spill_truncated_tool_results_enabled()
-      and not self._is_error_tool_result_entry(result_entry, content)
-    ):
-      try:
-        work_dir = self._spill_dir_provider()
-        filename, spill_abspath = self._write_tool_result_spill(
-          work_dir=work_dir,
-          tool_name=tool_name,
-          tool_use_id=result_entry.get("tool_use_id"),
-          content=content,
-        )
-        live_compacted_content, _ = _truncate_model_tool_result_content(
-          content,
-          tool_name=tool_name,
-          max_chars=max_chars,
-          spill_filename=filename,
-          spill_abspath=spill_abspath,
-        )
-        live_entry = dict(result_entry)
-        live_entry["content"] = live_compacted_content
-      except Exception as exc:
-        log.warning(
-          "[%s] Tool %s result spill failed; using compacted preview only: %s",
-          self._sid,
-          tool_name,
-          exc,
-          exc_info=True,
-        )
-    log.info(
-      "[%s] Tool %s result compacted for model context | original_chars=%d compacted_chars=%d limit=%d",
-      self._sid,
-      tool_name,
-      len(content),
-      len(str(live_entry.get("content", ""))),
-      max_chars,
-      extra={
-        "data": {
-          "event": "tool_result_compacted",
-          "session_id": self._sid,
-          "tool": tool_name,
-          "original_chars": len(content),
-          "compacted_chars": len(str(live_entry.get("content", ""))),
-          "limit": max_chars,
-        }
-      },
-    )
-    return live_entry, durable_entry
 
   @staticmethod
   def _is_error_tool_result_entry(result_entry: Dict[str, Any], content: str) -> bool:
-    if result_entry.get("is_error") or "error" in result_entry:
-      return True
-    try:
-      parsed = json.loads(content)
-    except Exception:
-      return False
-    # Only a *truthy* top-level "error" marks a genuine error result. A successful
-    # data payload that merely carries `"error": null` (or empty) must still spill —
-    # the authoritative tool-error signal is the is_error flag checked above.
-    return isinstance(parsed, dict) and bool(parsed.get("error"))
+    return is_error_tool_result_entry(result_entry, content)
 
   @staticmethod
   def _write_tool_result_spill(
@@ -1194,93 +616,52 @@ class AgentRunner:
     tool_use_id: Any,
     content: str,
   ) -> tuple[str, str]:
-    raw = f"{tool_name}_{tool_use_id or uuid.uuid4().hex}"
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw)[:120]
-    try:
-      json.loads(content)
-      ext = "json"
-    except Exception:
-      ext = "txt"
-
-    filename = f"{safe}.{ext}"
-    for attempt in range(2):
-      if attempt:
-        filename = f"{safe}_{uuid.uuid4().hex[:8]}.{ext}"
-      spill_abspath = os.path.join(work_dir, filename)
-      try:
-        with open(spill_abspath, "x", encoding="utf-8") as handle:
-          handle.write(content)
-        return filename, spill_abspath
-      except FileExistsError:
-        if attempt == 0:
-          continue
-        raise
-    raise FileExistsError(filename)
+    return write_tool_result_spill(
+      work_dir=work_dir,
+      tool_name=tool_name,
+      tool_use_id=tool_use_id,
+      content=content,
+      uuid_factory=uuid.uuid4,
+    )
 
   @staticmethod
   def _is_soft_error(result: Any) -> bool:
-    return classify_semantic_tool_error(result) is not None
+    return _is_soft_error(result)
 
   def _default_tool_definitions(self) -> List[Dict[str, Any]]:
-    if self._get_tool_definitions is not None:
-      return list(self._get_tool_definitions())
-    if self._mcp_client is not None:
-      return self._mcp_client.get_tool_definitions()
-    return []
+    return _default_tool_definitions(self._get_tool_definitions, self._mcp_client)
 
   def _effective_excluded_tools(self) -> set[str]:
-    if not self._active_skill_deny:
-      return set(self._excluded_tools)
-    return set(self._excluded_tools) | set(self._active_skill_deny)
+    return _effective_excluded_tools(self._excluded_tools, self._active_skill_deny)
 
   def _filter_excluded_tool_definitions(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    excluded_tools = self._effective_excluded_tools()
-    if not excluded_tools:
-      return list(tools)
-    return [tool for tool in tools if tool["name"] not in excluded_tools]
+    return _filter_excluded_tool_definitions(tools, self._effective_excluded_tools())
 
   def _rebuild_filtered_tool_definitions(self, base_kwargs: Dict[str, Any]) -> None:
     base_kwargs["tools"] = self._filter_excluded_tool_definitions(self._default_tool_definitions())
 
   def _activate_skill_report_doors(self, value: Any) -> None:
-    if isinstance(value, dict):
-      self._active_skill_report_doors = {
-        str(tool_name).strip(): str(skill_name).strip()
-        for tool_name, skill_name in value.items()
-        if str(tool_name).strip() and str(skill_name).strip()
-      }
-      return
-    if value is not None:
-      self._active_skill_report_doors = {}
+    normalized = _normalize_skill_report_doors(value)
+    if normalized is not None:
+      self._active_skill_report_doors = normalized
 
   def _activate_skill_deny(self, tool_names: Any, base_kwargs: Dict[str, Any]) -> None:
-    if isinstance(tool_names, str):
-      candidates = [tool_names]
-    elif isinstance(tool_names, (list, tuple, set, frozenset)):
-      candidates = list(tool_names)
-    else:
+    denied = _normalize_skill_deny(tool_names)
+    if denied is None:
       return
-    denied = {normalized for name in candidates if (normalized := str(name or "").strip())}
     if denied == self._active_skill_deny:
       return
     self._active_skill_deny = denied
     self._rebuild_filtered_tool_definitions(base_kwargs)
 
   def _clear_active_skill_if_report_door_completed(self, event: Dict[str, Any], base_kwargs: Dict[str, Any]) -> bool:
-    if event.get("type") != "tool_call_complete" or event.get("error") is not None:
-      return False
     tool_name = str(event.get("tool_name") or "").strip()
     expected_skill = self._active_skill_report_doors.get(tool_name)
-    if not expected_skill:
-      return False
-    result = event.get("result")
-    if not (
-      isinstance(result, dict)
-      and "subcommand" in result
-      and str(result.get("mutation_mode") or "").strip() == "preview"
+    if not _is_report_door_clear_event(
+      event,
+      expected_skill=expected_skill,
+      success_statuses=_REPORT_DOOR_CLEAR_SUCCESS_STATUSES,
     ):
-      return False
-    if str(result.get("status") or "").strip().lower() not in _REPORT_DOOR_CLEAR_SUCCESS_STATUSES:
       return False
     try:
       from .skill_context import clear_current_skill, current_skill
@@ -1301,13 +682,10 @@ class AgentRunner:
     self._rebuild_filtered_tool_definitions(base_kwargs)
 
   async def _emit_stub_response(self, messages: List[Dict[str, Any]]) -> None:
-    last_user = next((msg for msg in reversed(messages) if msg.get("role") == "user"), {})
-    prompt = last_user.get("content") or "your request"
-    response = f"Stub response (no {self._provider.name.title()} credential configured). You asked: {prompt}"
-    for token in response.split():
-      self._append({"type": "text_delta", "text": token + " "})
-      await asyncio.sleep(0.05)
-    self._append({"type": "stream_complete", "usage": {}})
+    for event in _build_stub_response_events(messages, provider_name=self._provider.name):
+      self._append(event)
+      if event.get("type") == "text_delta":
+        await asyncio.sleep(0.05)
 
   def _set_client(self, client: Any) -> None:
     """Track the active httpx client for cleanup on cancellation."""
@@ -1334,2568 +712,3 @@ class AgentRunner:
       await self.force_close()
     except Exception as exc:
       log.warning("[%s] force_close on disconnect failed (non-fatal): %s", self._sid, exc)
-
-  async def spawn_sub_agent(
-    self,
-    task: str,
-    *,
-    provider: ModelProvider | None = None,
-    auth_config: Dict[str, Any] | None = None,
-    model: str | None = None,
-    system_prompt: str | None = None,
-    dispatcher: ToolDispatcher,
-    sub_session: Any | None = None,
-    excluded_tools: Set[str] | None = None,
-    max_turns: int | None,
-    timeout: float | None,
-    client_timeout: float = 90,
-    per_turn_timeout: float | None = None,
-    max_tokens: int = 64000,
-    call_index: int = 0,
-    parent_turn_id: str | None = None,
-    task_entry: TaskEntry | None = None,
-    max_budget_usd: float | None = None,
-    on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
-  ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
-    """Run a focused sub-agent task and return its summarized result.
-
-    This method is used by the built-in `run_agent` tool. The sub-agent shares
-    the same budget accounting as the parent runner, but it gets a fresh
-    `EventLog`, its own turn budget, and its own dispatcher. By default the
-    sub-agent inherits the parent's provider, but callers may override it with
-    an explicit `provider` + `auth_config` pair.
-    """
-    if self._sub_agent_config is not None:
-      if model is None:
-        model = self._sub_agent_config.model
-      if system_prompt is None:
-        system_prompt = self._sub_agent_config.system_prompt
-      if excluded_tools is None:
-        excluded_tools = set(self._sub_agent_config.excluded_tools)
-
-    effective_provider = provider or self._provider
-    if provider is not None:
-      if auth_config is None:
-        return None, {"code": "invalid_input", "message": "auth_config required when overriding provider"}
-      effective_auth = dict(auth_config)
-    else:
-      effective_auth = getattr(sub_session, "auth_config", None) or self._auth_config
-
-    sub_session_id = str(getattr(sub_session, "session_id", "") or _derive_sub_agent_id(self._full_session_id, call_index))
-    original_on_event = getattr(self._log, "_on_event", None)
-    progress_cb = make_progress_tracker(task_entry) if task_entry else None
-
-    def _composed_on_event(event: Dict[str, Any], session_id: str) -> None:
-      event_copy = dict(event)
-      event_copy.setdefault("sub_agent_id", session_id)
-      if progress_cb is not None:
-        try:
-          progress_cb(event_copy, session_id)
-        except Exception:
-          pass
-      if original_on_event is not None:
-        try:
-          original_on_event(event_copy, session_id)
-        except Exception:
-          pass
-      if on_sub_event is not None:
-        try:
-          on_sub_event(event_copy, session_id)
-        except Exception:
-          pass
-
-    sub_log = EventLog(
-      on_event=_composed_on_event,
-      session_id=sub_session_id,
-    )
-    child_max_budget_usd = self._max_budget_usd
-    child_cost_accumulator = self._cost_accumulator
-    if max_budget_usd is not None:
-      child_max_budget_usd = max_budget_usd
-      child_cost_accumulator = ChildCostAccumulator(self._cost_accumulator, max_budget_usd)
-    sub_runner = AgentRunner(
-      event_log=sub_log,
-      dispatcher=dispatcher,
-      session_id=sub_session_id,
-      provider=effective_provider,
-      auth_config=effective_auth,
-      client_timeout=client_timeout,
-      max_tokens_override=max_tokens,
-      per_turn_timeout=per_turn_timeout if per_turn_timeout is not None else self._per_turn_timeout,
-      stream_stall_timeout=self._stream_stall_timeout,
-      mcp_client=self._mcp_client,
-      loaded_mcp_servers=self._loaded_mcp_servers,
-      excluded_tools=excluded_tools or set(),
-      get_tool_definitions=self._get_tool_definitions,
-      on_tool_result=self._on_tool_result,
-      on_usage=self._on_usage,
-      on_session_summary=None,
-      on_late_usage_event=self._on_late_usage_event,
-      on_tool_timing=self._on_tool_timing,
-      user_id=getattr(sub_session, "user_id", None) or self._usage_user_id,
-      request_id=self._request_id,
-      parent_turn_id=parent_turn_id,
-      billing_mode=self._billing_mode,
-      rate_table_version=self._rate_table_version,
-      channel=self._channel,
-      usage_ledger_dlq_path=self._usage_ledger_dlq_path,
-      on_metric=self._on_metric,
-      sub_agent_config=self._sub_agent_config,
-      compaction_trigger=self._compaction_trigger,
-      compaction_instructions=None,
-      tool_call_timeout=self._tool_call_timeout,
-      on_max_turns=self._on_max_turns,
-      max_budget_usd=child_max_budget_usd,
-      _cost_accumulator=child_cost_accumulator,
-      _parent_aggregator=self._aggregator,
-      max_concurrent_sub_agents=self._max_concurrent_sub_agents,
-      agent_session_log=self._agent_session_log,
-      message_inbox=task_entry.message_inbox if task_entry else None,
-      max_resume_chain_depth=self._max_resume_chain_depth,
-      emit_session_recap=False,
-      code_execution_spill_dir_provider=self._spill_dir_provider,
-      skill_run_id=self._skill_run_id,
-      workspace_dir=self._workspace_dir,
-    )
-
-    timed_out = False
-    coro = sub_runner.run(
-      messages=[{"role": "user", "content": task}],
-      system_prompt=system_prompt,
-      model_override=model,
-      max_turns=max_turns,
-    )
-    try:
-      if timeout is not None and timeout > 0:
-        await asyncio.wait_for(coro, timeout=timeout)
-      else:
-        await coro
-    except asyncio.TimeoutError:
-      timed_out = True
-      sub_log.append({"type": "error", "error": f"Sub-agent timed out after {timeout}s"})
-    except asyncio.CancelledError:
-      log.warning("[%s] Sub-agent cancelled (parent disconnect or shutdown)", sub_session_id)
-      sub_log.append({"type": "error", "error": "Sub-agent cancelled"})
-      raise
-    finally:
-      await sub_runner.force_close(timeout=2.0)
-
-    text_parts: List[str] = []
-    tool_calls_made: List[str] = []
-    usage: Dict[str, Any] = {}
-    error_msg: str | None = None
-    budget_exceeded = False
-    budget_exceeded_reason: str | None = None
-    max_turns_hit = False
-    for entry in sub_log.entries:
-      event = entry.event
-      event_type = event.get("type")
-      if event_type == "stream_retry":
-        text_parts.clear()
-        tool_calls_made.clear()
-      elif event_type == "text_delta":
-        text_parts.append(str(event.get("text", "")))
-      elif event_type == "tool_call_start":
-        tool_calls_made.append(str(event.get("tool_name", "")))
-      elif event_type == "stream_complete":
-        event_usage = event.get("usage")
-        if isinstance(event_usage, dict):
-          usage = event_usage
-      elif event_type == "budget_exceeded":
-        budget_exceeded = True
-        raw_reason = event.get("reason")
-        if isinstance(raw_reason, str) and raw_reason:
-          budget_exceeded_reason = raw_reason
-      elif event_type == "max_turns_reached":
-        max_turns_hit = True
-      elif event_type == "error":
-        error_msg = str(event.get("error", "Sub-agent error"))
-
-    result: Dict[str, Any] = {
-      "response": "".join(text_parts).strip(),
-      "tools_used": tool_calls_made,
-      "usage": usage,
-    }
-    warnings: List[str] = []
-    if timed_out:
-      warnings.append(f"Sub-agent timed out after {timeout}s — partial results returned")
-    elif error_msg:
-      warnings.append(f"Sub-agent error: {error_msg}")
-    if budget_exceeded:
-      budget_exceeded_reason = budget_exceeded_reason or getattr(child_cost_accumulator, "exceeded_reason", None)
-      warnings.append(f"Sub-agent stopped: budget limit reached{_budget_reason_suffix(budget_exceeded_reason)}")
-    if max_turns_hit:
-      warnings.append("Sub-agent stopped: max turns reached — partial results")
-    if warnings:
-      result["warning"] = "; ".join(warnings)
-    return result, None
-
-  async def resume_sub_agent(
-    self,
-    *,
-    original_task_id: str,
-    reconstructed_messages: List[Dict[str, Any]],
-    parent_messages: list[ParentMessage],
-    provider: ModelProvider | None = None,
-    auth_config: Dict[str, Any] | None = None,
-    model: str | None = None,
-    system_prompt: str | None = None,
-    dispatcher: ToolDispatcher,
-    sub_session: Any | None = None,
-    excluded_tools: Set[str] | None = None,
-    max_turns: int | None,
-    timeout: float | None,
-    client_timeout: float = 90,
-    per_turn_timeout: float | None = None,
-    max_tokens: int = 64000,
-    call_index: int = 0,
-    parent_turn_id: str | None = None,
-    task_entry: TaskEntry | None = None,
-    max_budget_usd: float | None = None,
-    on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
-  ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
-    if task_entry is not None:
-      task_entry.delivered_messages.update(message.message_id for message in parent_messages)
-
-    if self._sub_agent_config is not None:
-      if model is None:
-        model = self._sub_agent_config.model
-      if system_prompt is None:
-        system_prompt = self._sub_agent_config.system_prompt
-      if excluded_tools is None:
-        excluded_tools = set(self._sub_agent_config.excluded_tools)
-
-    effective_provider = provider or self._provider
-    if provider is not None:
-      if auth_config is None:
-        return None, {"code": "invalid_input", "message": "auth_config required when overriding provider"}
-      effective_auth = dict(auth_config)
-    else:
-      effective_auth = getattr(sub_session, "auth_config", None) or self._auth_config
-
-    sub_session_id = str(getattr(sub_session, "session_id", "") or _derive_sub_agent_id(self._full_session_id, call_index))
-    original_on_event = getattr(self._log, "_on_event", None)
-    progress_cb = make_progress_tracker(task_entry) if task_entry else None
-
-    def _composed_on_event(event: Dict[str, Any], session_id: str) -> None:
-      event_copy = dict(event)
-      event_copy.setdefault("sub_agent_id", session_id)
-      if progress_cb is not None:
-        try:
-          progress_cb(event_copy, session_id)
-        except Exception:
-          pass
-      if original_on_event is not None:
-        try:
-          original_on_event(event_copy, session_id)
-        except Exception:
-          pass
-      if on_sub_event is not None:
-        try:
-          on_sub_event(event_copy, session_id)
-        except Exception:
-          pass
-
-    sub_log = EventLog(on_event=_composed_on_event, session_id=sub_session_id)
-    child_max_budget_usd = self._max_budget_usd
-    child_cost_accumulator = self._cost_accumulator
-    if max_budget_usd is not None:
-      child_max_budget_usd = max_budget_usd
-      child_cost_accumulator = ChildCostAccumulator(self._cost_accumulator, max_budget_usd)
-    sub_runner = AgentRunner(
-      event_log=sub_log,
-      dispatcher=dispatcher,
-      session_id=sub_session_id,
-      provider=effective_provider,
-      auth_config=effective_auth,
-      client_timeout=client_timeout,
-      max_tokens_override=max_tokens,
-      per_turn_timeout=per_turn_timeout if per_turn_timeout is not None else self._per_turn_timeout,
-      stream_stall_timeout=self._stream_stall_timeout,
-      mcp_client=self._mcp_client,
-      loaded_mcp_servers=self._loaded_mcp_servers,
-      excluded_tools=excluded_tools or set(),
-      get_tool_definitions=self._get_tool_definitions,
-      on_tool_result=self._on_tool_result,
-      on_usage=self._on_usage,
-      on_session_summary=None,
-      on_late_usage_event=self._on_late_usage_event,
-      on_tool_timing=self._on_tool_timing,
-      user_id=getattr(sub_session, "user_id", None) or self._usage_user_id,
-      request_id=self._request_id,
-      parent_turn_id=parent_turn_id,
-      billing_mode=self._billing_mode,
-      rate_table_version=self._rate_table_version,
-      channel=self._channel,
-      usage_ledger_dlq_path=self._usage_ledger_dlq_path,
-      on_metric=self._on_metric,
-      sub_agent_config=self._sub_agent_config,
-      compaction_trigger=self._compaction_trigger,
-      compaction_instructions=None,
-      tool_call_timeout=self._tool_call_timeout,
-      on_max_turns=self._on_max_turns,
-      max_budget_usd=child_max_budget_usd,
-      _cost_accumulator=child_cost_accumulator,
-      _parent_aggregator=self._aggregator,
-      max_concurrent_sub_agents=self._max_concurrent_sub_agents,
-      agent_session_log=self._agent_session_log,
-      message_inbox=task_entry.message_inbox if task_entry else None,
-      max_resume_chain_depth=self._max_resume_chain_depth,
-      emit_session_recap=False,
-      code_execution_spill_dir_provider=self._spill_dir_provider,
-      skill_run_id=self._skill_run_id,
-      workspace_dir=self._workspace_dir,
-    )
-
-    timed_out = False
-    coro = sub_runner.run(
-      messages=reconstructed_messages[-1:] or [{"role": "user", "content": ""}],
-      system_prompt=system_prompt,
-      model_override=model,
-      max_turns=max_turns,
-      resume_initial_messages=reconstructed_messages,
-    )
-    try:
-      if timeout is not None and timeout > 0:
-        await asyncio.wait_for(coro, timeout=timeout)
-      else:
-        await coro
-    except asyncio.TimeoutError:
-      timed_out = True
-      sub_log.append({"type": "error", "error": f"Sub-agent timed out after {timeout}s"})
-    except asyncio.CancelledError:
-      log.warning("[%s] Resumed sub-agent cancelled (parent disconnect or shutdown)", sub_session_id)
-      sub_log.append({"type": "error", "error": "Sub-agent cancelled"})
-      raise
-    finally:
-      await sub_runner.force_close(timeout=2.0)
-
-    text_parts: List[str] = []
-    tool_calls_made: List[str] = []
-    usage: Dict[str, Any] = {}
-    error_msg: str | None = None
-    budget_exceeded = False
-    budget_exceeded_reason: str | None = None
-    max_turns_hit = False
-    for entry in sub_log.entries:
-      event = entry.event
-      event_type = event.get("type")
-      if event_type == "stream_retry":
-        text_parts.clear()
-        tool_calls_made.clear()
-      elif event_type == "text_delta":
-        text_parts.append(str(event.get("text", "")))
-      elif event_type == "tool_call_start":
-        tool_calls_made.append(str(event.get("tool_name", "")))
-      elif event_type == "stream_complete":
-        event_usage = event.get("usage")
-        if isinstance(event_usage, dict):
-          usage = event_usage
-      elif event_type == "budget_exceeded":
-        budget_exceeded = True
-        raw_reason = event.get("reason")
-        if isinstance(raw_reason, str) and raw_reason:
-          budget_exceeded_reason = raw_reason
-      elif event_type == "max_turns_reached":
-        max_turns_hit = True
-      elif event_type == "error":
-        error_msg = str(event.get("error", "Sub-agent error"))
-
-    result: Dict[str, Any] = {
-      "response": "".join(text_parts).strip(),
-      "tools_used": tool_calls_made,
-      "usage": usage,
-      "original_task_id": original_task_id,
-    }
-    warnings: List[str] = []
-    if timed_out:
-      warnings.append(f"Sub-agent timed out after {timeout}s — partial results returned")
-    elif error_msg:
-      warnings.append(f"Sub-agent error: {error_msg}")
-    if budget_exceeded:
-      budget_exceeded_reason = budget_exceeded_reason or getattr(child_cost_accumulator, "exceeded_reason", None)
-      warnings.append(f"Sub-agent stopped: budget limit reached{_budget_reason_suffix(budget_exceeded_reason)}")
-    if max_turns_hit:
-      warnings.append("Sub-agent stopped: max turns reached — partial results")
-    if warnings:
-      result["warning"] = "; ".join(warnings)
-    return result, None
-
-  async def _call_on_tool_result(self, ctx: ToolResultContext) -> List[Dict[str, Any]]:
-    if self._on_tool_result is None:
-      return []
-    try:
-      extra_blocks = await self._on_tool_result(ctx)
-    except Exception as exc:
-      log.warning("[%s] on_tool_result hook failed (non-fatal): %s", self._sid, exc)
-      return []
-    if not extra_blocks:
-      return []
-    if isinstance(extra_blocks, list):
-      return [block for block in extra_blocks if isinstance(block, dict)]
-    return []
-
-  async def _call_on_before_stream_complete(self, terminal_event: Dict[str, Any] | None = None) -> None:
-    if self._on_before_stream_complete is None:
-      return
-    try:
-      params = inspect.signature(self._on_before_stream_complete).parameters
-      accepts_terminal_event = (
-        any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params.values())
-        or "terminal_event" in params
-        or len([
-          param
-          for param in params.values()
-          if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        ]) >= 2
-      )
-      if isinstance(terminal_event, dict) and terminal_event.get("type") != "stream_complete" and not accepts_terminal_event:
-        return
-      if accepts_terminal_event:
-        result = self._on_before_stream_complete(self._log, terminal_event)
-      else:
-        result = self._on_before_stream_complete(self._log)
-      if inspect.isawaitable(result):
-        await result
-    except Exception as exc:
-      log.warning("[%s] on_before_stream_complete hook failed (non-fatal): %s", self._sid, exc)
-
-  def _ensure_sub_agent_semaphore(self) -> asyncio.Semaphore | None:
-    if self._sub_agent_semaphore is None and self._max_concurrent_sub_agents is not None:
-      self._sub_agent_semaphore = asyncio.Semaphore(self._max_concurrent_sub_agents)
-    return self._sub_agent_semaphore
-
-  @staticmethod
-  def _background_timeout_value(raw_timeout: Any) -> float:
-    timeout = 60.0 if raw_timeout is None else float(raw_timeout)
-    return max(0.0, min(timeout, 120.0))
-
-  def _background_elapsed_seconds(self, bg_task: BackgroundTask | TaskEntry) -> int:
-    end_t = bg_task.completed_at if bg_task.completed_at is not None else time.time()
-    return max(0, int(end_t - bg_task.started_at))
-
-  async def _task_entry_for_chain(self, task_id: str) -> TaskEntry | None:
-    entry = self._task_registry.get(task_id)
-    if entry is not None:
-      return entry
-    return await self._lookup_task_in_log(task_id)
-
-  async def _resume_chain_depth(self, task_id: str) -> int:
-    depth = 0
-    seen: set[str] = set()
-    current_id: str | None = task_id
-    while current_id:
-      if current_id in seen:
-        break
-      seen.add(current_id)
-      entry = await self._task_entry_for_chain(current_id)
-      parent_id = entry.original_task_id if entry is not None else None
-      if not parent_id:
-        break
-      depth += 1
-      current_id = parent_id
-    return depth
-
-  async def _resume_root_task_id(self, task_id: str) -> str:
-    seen: set[str] = set()
-    current_id = task_id
-    while current_id not in seen:
-      seen.add(current_id)
-      entry = await self._task_entry_for_chain(current_id)
-      parent_id = entry.original_task_id if entry is not None else None
-      if not parent_id:
-        return current_id
-      current_id = parent_id
-    return task_id
-
-  async def _resumed_task_ids(self, task_id: str) -> list[str]:
-    await self._rebuild_task_registry_from_log()
-    root_id = await self._resume_root_task_id(task_id)
-    resumed: list[str] = []
-    for entry in self._task_registry.list_tasks():
-      if entry.task_id == root_id or entry.original_task_id is None:
-        continue
-      if await self._resume_root_task_id(entry.task_id) == root_id:
-        resumed.append(entry.task_id)
-    return resumed
-
-  def _resume_root_task_id_from_registry(self, task_id: str) -> str:
-    seen: set[str] = set()
-    current_id = task_id
-    while current_id not in seen:
-      seen.add(current_id)
-      entry = self._task_registry.get(current_id)
-      parent_id = entry.original_task_id if entry is not None else None
-      if not parent_id:
-        return current_id
-      current_id = parent_id
-    return task_id
-
-  def _resumed_task_ids_from_registry(self, task_id: str) -> list[str]:
-    root_id = self._resume_root_task_id_from_registry(task_id)
-    resumed: list[str] = []
-    for entry in self._task_registry.list_tasks():
-      if entry.task_id == root_id or entry.original_task_id is None:
-        continue
-      if self._resume_root_task_id_from_registry(entry.task_id) == root_id:
-        resumed.append(entry.task_id)
-    return resumed
-
-  def _background_task_payload(self, bg_task: BackgroundTask | TaskEntry) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-      "task_id": bg_task.task_id,
-      "status": "running",
-    }
-    if bg_task.agent_name:
-      payload["agent"] = bg_task.agent_name
-
-    elapsed = self._background_elapsed_seconds(bg_task)
-    if getattr(bg_task, "state", None) == TaskState.INTERRUPTED:
-      metadata = getattr(bg_task, "metadata", {}) if isinstance(getattr(bg_task, "metadata", None), dict) else {}
-      resumed_as = self._resumed_task_ids_from_registry(bg_task.task_id)
-      payload.update(
-        {
-          "status": "interrupted",
-          "completed": True,
-          "elapsed_seconds": elapsed,
-          "started_at": bg_task.started_at,
-          "owner_runner_id": metadata.get("owner_runner_id"),
-          "owner_role": metadata.get("owner_role"),
-          "sub_agent_id": metadata.get("sub_agent_id"),
-          "parent_turn_id": metadata.get("parent_turn_id"),
-          "call_index": metadata.get("call_index"),
-          "task_type": metadata.get("task_type", getattr(bg_task, "task_type", None)),
-          "provider_name": metadata.get("provider_name", getattr(bg_task, "provider_name", None)),
-          "model": metadata.get("model", getattr(bg_task, "model", None)),
-          "original_task_id": getattr(bg_task, "original_task_id", None),
-          "resumable": bool(metadata.get("resumable", False)),
-          "resumed_as": resumed_as,
-          "latest_resume_task_id": resumed_as[-1] if resumed_as else None,
-          "message": "Background task was interrupted by a gateway restart before completion.",
-        }
-      )
-      return payload
-    if getattr(bg_task, "state", None) == TaskState.KILLED:
-      payload["status"] = "killed"
-      payload["elapsed_seconds"] = elapsed
-      return payload
-    if bg_task.completed:
-      payload["elapsed_seconds"] = elapsed
-      if bg_task.error is not None:
-        payload["status"] = "error"
-        payload["error"] = bg_task.error
-        return payload
-      payload["status"] = "completed"
-      if isinstance(bg_task.result, dict):
-        for key, value in bg_task.result.items():
-          if key not in {"task_id", "status", "agent"}:
-            payload[key] = value
-      elif bg_task.result is not None:
-        payload["result"] = bg_task.result
-      return payload
-
-    payload["elapsed_seconds"] = elapsed
-    progress = getattr(bg_task, "progress", None)
-    if progress is not None and progress.tool_use_count > 0:
-      payload["progress"] = {
-        "tools_used": progress.tool_use_count,
-        "turns": progress.turn_count,
-        "last_tool": progress.last_tool_name,
-        "idle_seconds": int(time.time() - progress.last_activity_at) if progress.last_activity_at else None,
-        "output_tokens": progress.output_tokens,
-      }
-    return payload
-
-  def _background_task_reminder_text(self) -> str:
-    running_tasks = self._task_registry.list_tasks(state=TaskState.RUNNING)
-    if not running_tasks:
-      return ""
-    entries: List[str] = []
-    for bg_task in running_tasks:
-      parts = [f"running, {self._background_elapsed_seconds(bg_task)}s"]
-      if bg_task.progress.tool_use_count > 0:
-        parts.append(f"{bg_task.progress.tool_use_count} tools")
-        if bg_task.progress.last_tool_name:
-          parts.append(f"last: {bg_task.progress.last_tool_name}")
-      status = ", ".join(parts)
-      label = bg_task.task_id
-      if bg_task.agent_name:
-        label += f" ({bg_task.agent_name}, {status})"
-      else:
-        label += f" ({status})"
-      entries.append(label)
-    return "[Background tasks active: " + ", ".join(entries) + "]"
-
-  def _build_notification_reminder(self) -> str:
-    """Peek notifications into system prompt text. Non-destructive."""
-    if self._notification_queue.pending_count == 0:
-      return ""
-    notifications = self._notification_queue.peek(max_count=_MAX_NOTIFICATIONS_PER_TURN)
-    parts = [notification.format_xml() for notification in notifications]
-    remaining = self._notification_queue.pending_count - len(notifications)
-    if remaining > 0:
-      parts.append(f"[{remaining} more task notification(s) pending]")
-    return "\n".join(parts)
-
-  def _consume_notifications(self, max_count: int) -> int:
-    """Drain up to max_count notifications. Returns count consumed."""
-    return len(self._notification_queue.drain(max_count=max_count))
-
-  @staticmethod
-  def _inject_system_prompt_reminder(
-    system_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
-    reminder: str,
-  ) -> Optional[Union[str, List[Tuple[str, bool]]]]:
-    if not reminder:
-      return system_prompt
-    if isinstance(system_prompt, list):
-      return [*system_prompt, (reminder, False)]
-    base = system_prompt or ""
-    if base:
-      return f"{base}\n\n{reminder}"
-    return reminder
-
-  async def _run_background_agent(
-    self,
-    bg_task: TaskEntry,
-    handler: BackgroundTaskHandler,
-    tool_input: Dict[str, Any],
-    call_index: int,
-    on_complete: BackgroundTaskCallback | None = None,
-  ) -> None:
-    try:
-      semaphore = self._ensure_sub_agent_semaphore()
-      if semaphore is not None:
-        async with semaphore:
-          result, error = await handler(tool_input, call_index=call_index)
-      else:
-        result, error = await handler(tool_input, call_index=call_index)
-      bg_task.result = result if isinstance(result, dict) else ({"result": result} if result is not None else None)
-      bg_task.error = error
-      if bg_task.error is not None:
-        await self._append_task_completed_event(bg_task, TaskState.FAILED)
-        self._task_registry.transition(bg_task.task_id, TaskState.FAILED, error=bg_task.error)
-      else:
-        await self._append_task_completed_event(bg_task, TaskState.COMPLETED)
-        self._task_registry.transition(bg_task.task_id, TaskState.COMPLETED, result=bg_task.result)
-    except asyncio.CancelledError:
-      bg_task.error = {"code": "cancelled", "message": "Background task was cancelled"}
-      await self._append_task_completed_event(bg_task, TaskState.FAILED)
-      self._task_registry.transition(bg_task.task_id, TaskState.FAILED, error=bg_task.error)
-    except Exception as exc:
-      bg_task.error = {"code": "background_error", "message": str(exc)}
-      await self._append_task_completed_event(bg_task, TaskState.FAILED)
-      self._task_registry.transition(bg_task.task_id, TaskState.FAILED, error=bg_task.error)
-    finally:
-      if on_complete is not None:
-        try:
-          maybe_awaitable = on_complete(bg_task)
-          if asyncio.iscoroutine(maybe_awaitable):
-            await maybe_awaitable
-        except Exception:
-          pass
-
-  def _task_correlation_payload(self, entry: TaskEntry) -> Dict[str, Any]:
-    metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
-    payload = {
-      "task_id": entry.task_id,
-      "owner_runner_id": metadata.get("owner_runner_id", self._runner_id),
-      "owner_role": metadata.get("owner_role", self._role),
-      "sub_agent_id": metadata.get("sub_agent_id"),
-      "parent_turn_id": metadata.get("parent_turn_id"),
-      "call_index": metadata.get("call_index"),
-      "task_type": metadata.get("task_type", "background"),
-      "provider_name": metadata.get("provider_name", entry.provider_name),
-      "model": metadata.get("model", entry.model),
-    }
-    if entry.original_task_id is not None:
-      payload["original_task_id"] = entry.original_task_id
-    return payload
-
-  async def _append_task_completed_event(self, entry: TaskEntry, final_state: TaskState) -> None:
-    payload = self._task_correlation_payload(entry)
-    payload.update(
-      {
-        "type": "task_completed",
-        "final_state": final_state.value,
-        "completed_at": time.time(),
-        "result": entry.result,
-        "error": entry.error,
-      }
-    )
-    await self._append_durable_event(payload)
-
-  async def _register_background_task(
-    self,
-    *,
-    tool_input: Dict[str, Any],
-    handler: BackgroundTaskHandler,
-    agent_name: str | None = None,
-    parent_turn_id: str | None = None,
-    on_complete: BackgroundTaskCallback | None = None,
-    on_before_start: Callable[[], None] | None = None,
-    original_task_id: str | None = None,
-  ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    if self._task_registry.inflight_count >= self._max_background_tasks:
-      return None, {
-        "code": "max_background_tasks",
-        "message": (
-          f"Background task limit reached ({self._max_background_tasks}). "
-          "Wait for an existing background task to finish before launching another."
-        ),
-      }
-
-    if on_before_start is not None:
-      try:
-        on_before_start()
-      except Exception as exc:
-        log.warning("[%s] on_before_start hook failed (non-fatal): %s", self._sid, exc)
-
-    task_id_override = None
-    if original_task_id:
-      depth = await self._resume_chain_depth(original_task_id)
-      if depth >= self._max_resume_chain_depth:
-        return None, {
-          "code": "max_resume_chain_depth",
-          "message": f"Resume chain depth limit reached ({self._max_resume_chain_depth}) for {original_task_id}",
-        }
-      root_id = await self._resume_root_task_id(original_task_id)
-      task_id_override = f"{root_id}_r{depth + 1}"
-
-    entry = self._task_registry.register(
-      "background_agent",
-      agent_name=agent_name,
-      task_id=task_id_override,
-      original_task_id=original_task_id,
-    )
-    raw_provider_name = tool_input.get("provider_name", tool_input.get("provider"))
-    if isinstance(raw_provider_name, str) and raw_provider_name.strip():
-      entry.provider_name = raw_provider_name.strip()
-    else:
-      entry.provider_name = getattr(self._provider, "name", None)
-    raw_model = tool_input.get("model")
-    if isinstance(raw_model, str) and raw_model.strip():
-      entry.model = raw_model.strip()
-    else:
-      auth_model = self._auth_config.get("model")
-      if isinstance(auth_model, str) and auth_model.strip():
-        entry.model = auth_model.strip()
-    child_budget_usd: float | None = None
-    raw_child_budget = tool_input.get("child_budget_usd")
-    if raw_child_budget is not None and not isinstance(raw_child_budget, bool):
-      try:
-        parsed_child_budget = float(raw_child_budget)
-      except (TypeError, ValueError):
-        parsed_child_budget = 0.0
-      if parsed_child_budget > 0:
-        child_budget_usd = parsed_child_budget
-
-    base_for_call_index = entry.task_id.split("_r", 1)[0]
-    try:
-      call_index = int(base_for_call_index.rsplit("_", 1)[-1])
-    except ValueError:
-      call_index = 0
-    sub_agent_id = _derive_sub_agent_id(self._gateway_session_id, call_index)
-    correlation = {
-      "owner_runner_id": self._runner_id,
-      "owner_role": self._role,
-      "sub_agent_id": sub_agent_id,
-      "parent_turn_id": parent_turn_id if parent_turn_id is not None else self._parent_turn_id,
-      "call_index": call_index,
-      "task_type": "background",
-      "provider_name": entry.provider_name,
-      "model": entry.model,
-    }
-    if child_budget_usd is not None:
-      correlation["child_budget_usd"] = child_budget_usd
-    if original_task_id is not None:
-      correlation["original_task_id"] = original_task_id
-    if "resumable" in tool_input:
-      correlation["resumable"] = bool(tool_input.get("resumable"))
-    entry.metadata.update(correlation)
-    await self._append_durable_event(
-      {
-        "type": "task_registered",
-        **self._task_correlation_payload(entry),
-        "agent_name": agent_name,
-        "parent_session_id": self._gateway_session_id,
-        "metadata": dict(entry.metadata),
-        "started_at": entry.started_at,
-      }
-    )
-
-    async def _entry_aware_handler(ti: Dict[str, Any], **kwargs: Any) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
-      kwargs["task_entry"] = entry
-      return await handler(ti, **kwargs)
-
-    entry.asyncio_task = asyncio.create_task(
-      self._run_background_agent(
-        entry,
-        _entry_aware_handler,
-        dict(tool_input),
-        call_index,
-        on_complete=on_complete,
-      ),
-      name=entry.task_id,
-    )
-    self._task_registry.transition(entry.task_id, TaskState.RUNNING)
-
-    result: Dict[str, Any] = {
-      "task_id": entry.task_id,
-      "status": "running",
-    }
-    if agent_name:
-      result["agent"] = agent_name
-    return result, None
-
-  async def get_background_result(
-    self,
-    tool_input: Dict[str, Any],
-    **_: Any,
-  ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    raw_task_id = tool_input.get("task_id")
-    if not isinstance(raw_task_id, str) or not raw_task_id.strip():
-      return None, {"code": "invalid_input", "message": "task_id is required"}
-    task_id = raw_task_id.strip()
-
-    wait = tool_input.get("wait", False)
-    if not isinstance(wait, bool):
-      return None, {"code": "invalid_input", "message": "wait must be a boolean"}
-
-    raw_timeout = tool_input.get("timeout")
-    if raw_timeout is not None and not isinstance(raw_timeout, (int, float)):
-      return None, {"code": "invalid_input", "message": "timeout must be a number"}
-    timeout = self._background_timeout_value(raw_timeout)
-
-    await self._rebuild_task_registry_from_log()
-
-    if task_id == "*":
-      selected = self._task_registry.list_tasks()
-      if wait:
-        pending = [
-          bg_task.asyncio_task
-          for bg_task in selected
-          if bg_task.asyncio_task is not None and not bg_task.completed
-        ]
-        if pending:
-          await asyncio.wait(pending, timeout=timeout)
-      return {"tasks": [self._background_task_payload(bg_task) for bg_task in selected]}, None
-
-    bg_task = self._task_registry.get(task_id)
-    if bg_task is None:
-      bg_task = await self._lookup_task_in_log(task_id)
-      if bg_task is None:
-        return None, {"code": "not_found", "message": f"Unknown background task: {task_id}"}
-
-    if wait and bg_task.asyncio_task is not None and not bg_task.completed:
-      await asyncio.wait([bg_task.asyncio_task], timeout=timeout)
-    return self._background_task_payload(bg_task), None
-
-  async def _shutdown_background_tasks(self, was_cancelled: bool) -> None:
-    running_entries = self._task_registry.list_tasks(state=TaskState.RUNNING)
-    pending = [
-      bg_task.asyncio_task
-      for bg_task in running_entries
-      if bg_task.asyncio_task is not None
-    ]
-    if not pending:
-      return
-
-    try:
-      if was_cancelled:
-        for bg_task in running_entries:
-          self._task_registry.kill(bg_task.task_id)
-        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5.0)
-        return
-
-      _done, still_pending = await asyncio.wait(pending, timeout=30.0)
-      if not still_pending:
-        return
-      for bg_task in running_entries:
-        if bg_task.asyncio_task in still_pending:
-          self._task_registry.kill(bg_task.task_id)
-      await asyncio.wait_for(asyncio.gather(*still_pending, return_exceptions=True), timeout=5.0)
-    except asyncio.TimeoutError:
-      pass
-
-  def _call_on_tool_timing(
-    self,
-    *,
-    tool_name: str,
-    server: str | None,
-    duration_ms: int,
-    is_error: bool,
-    result_bytes: int,
-  ) -> None:
-    if self._on_tool_timing is None:
-      return
-    try:
-      if self._on_tool_timing_accepts_user_id:
-        self._on_tool_timing(
-          self._full_session_id,
-          tool_name,
-          server,
-          duration_ms,
-          is_error,
-          result_bytes,
-          user_id=self._usage_user_id,
-        )
-      else:
-        self._on_tool_timing(
-          self._full_session_id,
-          tool_name,
-          server,
-          duration_ms,
-          is_error,
-          result_bytes,
-        )
-    except Exception as exc:
-      log.warning("[%s] on_tool_timing hook failed (non-fatal): %s", self._sid, exc)
-
-  def _call_metric(self, name: str, value: int = 1) -> None:
-    if self._on_metric is None:
-      return
-    try:
-      self._on_metric(name, value)
-    except Exception as exc:
-      log.warning("[%s] metric hook failed (non-fatal): %s", self._sid, exc)
-
-  async def _call_credential_refresher(self, failure: ProviderCredentialFailure) -> Dict[str, Any] | None:
-    if self._on_credential_failure is None or not failure.retryable_with_new_credentials:
-      return None
-    try:
-      refreshed = self._on_credential_failure(failure)
-      if inspect.isawaitable(refreshed):
-        refreshed = await refreshed
-    except Exception as exc:
-      log.warning(
-        "[%s] credential refresh failed after provider %s failure (non-fatal): %s",
-        self._sid,
-        failure.kind,
-        exc,
-      )
-      self._call_metric("gateway.credential_refresh_failed", 1)
-      return None
-    if not isinstance(refreshed, dict) or not refreshed:
-      self._call_metric("gateway.credential_refresh_unavailable", 1)
-      return None
-    return dict(refreshed)
-
-  def _apply_refreshed_auth_config(self, config: Dict[str, Any], refreshed: Dict[str, Any]) -> None:
-    # Preserve request-scoped model/runtime controls. The refresh hook rotates
-    # credentials for the already-selected provider; model changes belong to a
-    # new session/init handshake.
-    preserved = {
-      "model": config.get("model"),
-      "max_tokens": config.get("max_tokens"),
-      "thinking": config.get("thinking"),
-    }
-    merged = dict(config)
-    merged.update(refreshed)
-    for key, value in preserved.items():
-      if value is not None:
-        merged[key] = value
-    merged["auth_mode"] = str(merged.get("auth_mode", "api")).strip().lower()
-    merged["api_key"] = str(merged.get("api_key", ""))
-    merged["auth_token"] = str(merged.get("auth_token", ""))
-    merged["model"] = str(merged.get("model") or "")
-    merged["max_tokens"] = int(merged.get("max_tokens", 16000))
-    merged["thinking"] = bool(merged.get("thinking", True))
-    config.clear()
-    config.update(merged)
-    self._auth_config.clear()
-    self._auth_config.update(merged)
-
-  @staticmethod
-  def _usage_has_tokens(usage_totals: Dict[str, int]) -> bool:
-    return any(
-      int(usage_totals.get(key, 0) or 0) > 0
-      for key in (
-        "input_tokens",
-        "output_tokens",
-        "cache_read_input_tokens",
-        "cache_creation_input_tokens",
-      )
-    )
-
-  @staticmethod
-  def _usage_delta(before: Dict[str, int], after: Dict[str, int]) -> Dict[str, int]:
-    return {
-      "input_tokens": max(0, int(after.get("input_tokens", 0) or 0) - int(before.get("input_tokens", 0) or 0)),
-      "output_tokens": max(0, int(after.get("output_tokens", 0) or 0) - int(before.get("output_tokens", 0) or 0)),
-      "cache_read_input_tokens": max(
-        0,
-        int(after.get("cache_read_input_tokens", 0) or 0) - int(before.get("cache_read_input_tokens", 0) or 0),
-      ),
-      "cache_creation_input_tokens": max(
-        0,
-        int(after.get("cache_creation_input_tokens", 0) or 0)
-        - int(before.get("cache_creation_input_tokens", 0) or 0),
-      ),
-    }
-
-  def _build_usage_event(self, *, model: str, usage_totals: Dict[str, int]) -> UsageEvent:
-    cost = self._estimate_usage_cost(model, usage_totals)
-    return UsageEvent(
-      user_id=self._usage_user_id,
-      session_id=self._full_session_id,
-      request_id=self._request_id,
-      parent_turn_id=self._parent_turn_id,
-      timestamp=time.time(),
-      model=model,
-      provider=getattr(self._provider, "name", None),
-      input_tokens=int(usage_totals["input_tokens"]),
-      output_tokens=int(usage_totals["output_tokens"]),
-      cache_read_tokens=int(usage_totals["cache_read_input_tokens"]),
-      cache_creation_tokens=int(usage_totals["cache_creation_input_tokens"]),
-      cost_usd=float(cost.total),
-      rate_table_version=self._rate_table_version,
-      billing_mode=self._billing_mode,
-      channel=self._channel,
-    )
-
-  async def _call_on_usage(self, usage_event: UsageEvent) -> None:
-    recorded = await self._aggregator.record(usage_event)
-    if not recorded or self._summary_emitted:
-      log.warning("[%s] Usage event arrived after session summary emission: %s", self._sid, usage_event.event_id)
-      await self._call_on_late_usage_event(usage_event)
-      return
-    if self._on_usage is None:
-      return
-    try:
-      result = self._on_usage(usage_event)
-      if inspect.isawaitable(result):
-        await result
-    except Exception as exc:
-      log.error("[%s] on_usage hook failed (non-fatal): %s", self._sid, exc)
-      self._call_metric("gateway.usage_event_dropped", 1)
-      if self._usage_ledger_dlq_path is not None:
-        try:
-          write_dlq(usage_event, self._usage_ledger_dlq_path)
-        except Exception as dlq_exc:
-          log.error("[%s] usage DLQ write failed (non-fatal): %s", self._sid, dlq_exc)
-
-  async def _call_on_late_usage_event(self, usage_event: UsageEvent) -> None:
-    if self._on_late_usage_event is None:
-      return
-    try:
-      result = self._on_late_usage_event(usage_event)
-      if inspect.isawaitable(result):
-        await result
-    except Exception as exc:
-      log.error("[%s] on_late_usage_event hook failed (non-fatal): %s", self._sid, exc)
-
-  async def _call_on_session_summary(self, summary: SessionUsageSummary) -> None:
-    if self._on_session_summary is None:
-      return
-    try:
-      result = self._on_session_summary(summary)
-      if inspect.isawaitable(result):
-        await result
-    except Exception as exc:
-      log.error("[%s] on_session_summary hook failed (non-fatal): %s", self._sid, exc)
-
-  def _estimate_usage_cost(self, model: str, usage_totals: Dict[str, int]):
-    uncached_input = max(
-      0,
-      usage_totals["input_tokens"]
-      - usage_totals["cache_read_input_tokens"]
-      - usage_totals["cache_creation_input_tokens"],
-    )
-    return self._provider.estimate_cost(
-      model,
-      uncached_input,
-      usage_totals["output_tokens"],
-      cache_read_tokens=usage_totals["cache_read_input_tokens"],
-      cache_creation_tokens=usage_totals["cache_creation_input_tokens"],
-    )
-
-  @staticmethod
-  def _thinking_level(enabled: bool) -> ThinkingLevel:
-    return ThinkingLevel.HIGH if enabled else ThinkingLevel.NONE
-
-  def _effective_stream_stall_timeout(
-    self,
-    *,
-    config: Dict[str, Any],
-    model_info: ModelInfo,
-    max_tokens: int,
-  ) -> float:
-    if self._stream_stall_timeout is not None:
-      return float(self._stream_stall_timeout)
-    if bool(config.get("thinking", True)) and max_tokens >= 2048 and model_info.supports_thinking:
-      return float(STREAM_THINKING_STALL_TIMEOUT)
-    return float(STREAM_STALL_TIMEOUT)
-
-  @staticmethod
-  def _classify_guard_outcome(
-    guard_reason: tuple[str, str] | None,
-    attempt: int,
-    max_attempts: int,
-  ) -> tuple[str, str, str]:
-    """Classify guard outcome into (action, guard_error, guard_kind)."""
-    if not guard_reason:
-      return ("not_guard", "", "")
-    guard_kind, guard_message = guard_reason
-    guard_error = f"Stream watchdog: {guard_message}"
-    if guard_kind == "stall" and attempt < max_attempts:
-      return ("retry", guard_error, guard_kind)
-    return ("abort", guard_error, guard_kind)
-
-  async def _stream_turn(
-    self,
-    *,
-    client: Any,
-    config: Dict[str, Any],
-    model_info: ModelInfo,
-    system_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
-    current_messages: List[Dict[str, Any]],
-    base_kwargs: Dict[str, Any],
-    max_tokens: int,
-    turn_count: int,
-    turn_t0: float,
-    turn_t0_mono: float,
-    system_chars: int,
-    tools_chars: int,
-    usage_totals: Dict[str, int],
-  ) -> Tuple[Any, StreamTurnResult] | None:
-    last_progress_at = time.monotonic()
-    guard_reason: tuple[str, str] | None = None
-    _effective_stall_timeout = self._effective_stream_stall_timeout(
-      config=config,
-      model_info=model_info,
-      max_tokens=max_tokens,
-    )
-
-    def _make_params() -> Dict[str, Any]:
-      normalized_messages = self._provider.normalize_messages(current_messages, model_info)
-      return self._provider.build_request_params(
-        model=config["model"],
-        messages=normalized_messages,
-        system_prompt=system_prompt,
-        tools=base_kwargs.get("tools") or [],
-        max_tokens=max_tokens,
-        thinking_level=self._thinking_level(bool(config.get("thinking", True))),
-        auth_mode=config["auth_mode"],
-        compaction_trigger=_effective_compaction_trigger(self._compaction_trigger, model_info),
-        compaction_instructions=self._compaction_instructions,
-    )
-
-    suppress_tool_turn_text = (
-      _system_prompt_requires_tool_only_turns(system_prompt)
-      or _messages_require_tool_only_turns(current_messages)
-    )
-
-    async def _consume_stream(params: Dict[str, Any], result: StreamTurnResult) -> None:
-      nonlocal last_progress_at
-      first_turn = turn_count == 1
-      log.debug("[%s] Turn %d stream open", self._sid, turn_count)
-
-      async for event in self._provider.stream(client, params):
-        event_type = event.type
-        if event_type != "heartbeat":
-          last_progress_at = time.monotonic()
-
-        if event_type == "message_start":
-          usage_totals["input_tokens"] += event.input_tokens
-          usage_totals["cache_creation_input_tokens"] += event.cache_creation_tokens
-          usage_totals["cache_read_input_tokens"] += event.cache_read_tokens
-          if first_turn:
-            log.info(
-              "[%s] Cache | read=%d create=%d uncached=%d",
-              self._sid,
-              event.cache_read_tokens,
-              event.cache_creation_tokens,
-              event.input_tokens,
-            )
-            if event.input_tokens > 0:
-              msgs_chars = len(json.dumps(current_messages, default=str))
-              total_chars = system_chars + tools_chars + msgs_chars
-              if total_chars > 0:
-                pct_system = round(system_chars / total_chars * 100)
-                pct_tools = round(tools_chars / total_chars * 100)
-                pct_messages = round(msgs_chars / total_chars * 100)
-                tok_system = round(event.input_tokens * system_chars / total_chars)
-                tok_tools = round(event.input_tokens * tools_chars / total_chars)
-                tok_messages = event.input_tokens - tok_system - tok_tools
-                log.info(
-                  "[%s] Token breakdown | system=%d (%d%%) tools=%d (%d%%) messages=%d (%d%%) | total=%d",
-                  self._sid,
-                  tok_system,
-                  pct_system,
-                  tok_tools,
-                  pct_tools,
-                  tok_messages,
-                  pct_messages,
-                  event.input_tokens,
-                  extra={
-                    "data": {
-                      "event": "token_breakdown",
-                      "session_id": self._sid,
-                      "turn": turn_count,
-                      "input_tokens": event.input_tokens,
-                      "est_system_tokens": tok_system,
-                      "est_tools_tokens": tok_tools,
-                      "est_messages_tokens": tok_messages,
-                      "pct_system": pct_system,
-                      "pct_tools": pct_tools,
-                      "pct_messages": pct_messages,
-                    }
-                  },
-                )
-          continue
-
-        if event_type == "text_delta":
-          if result.first_token_t is None:
-            result.first_token_t = time.time()
-          text = str(event.text or "")
-          if not suppress_tool_turn_text:
-            self._append({"type": "text_delta", "text": text})
-          result.full_text += text
-          continue
-
-        if event_type == "text_end":
-          if isinstance(event.raw_block, dict):
-            result.content_blocks.append(event.raw_block)
-          continue
-
-        if event_type == "thinking_delta":
-          thinking_text = str(event.thinking_text or "")
-          self._append({"type": "thinking_delta", "text": thinking_text})
-          continue
-
-        if event_type == "thinking_end":
-          if isinstance(event.raw_block, dict):
-            result.content_blocks.append(event.raw_block)
-          log.info("[%s] Thinking block complete | %d chars", self._sid, len(str(event.thinking_text or "")))
-          continue
-
-        if event_type == "heartbeat":
-          continue
-
-        if event_type == "stream_progress":
-          continue
-
-        if event_type == "tool_use_start":
-          continue
-
-        if event_type == "tool_use_end":
-          if isinstance(event.raw_block, dict):
-            result.content_blocks.append(event.raw_block)
-          result.tool_uses.append((event.tool_id, event.tool_name or "tool", dict(event.tool_input or {})))
-          continue
-
-        if event_type == "compaction":
-          if isinstance(event.raw_block, dict):
-            result.content_blocks.append(event.raw_block)
-          content = event.raw_block.get("content") if isinstance(event.raw_block, dict) else event.text
-          chars = len(content) if isinstance(content, str) else 0
-          self._append({"type": "compaction", "chars": chars})
-          log.info("[%s] Compaction block | %d chars", self._sid, chars)
-          continue
-
-        if event_type == "usage_update":
-          usage_totals["output_tokens"] += event.output_tokens
-          continue
-
-        if event_type == "message_end":
-          result.stop_reason = event.stop_reason or None
-
-      log.debug("[%s] Turn %d stream end", self._sid, turn_count)
-
-    async def _stream_guard(task: asyncio.Task, turn_start_mono: float) -> None:
-      nonlocal guard_reason
-      while not task.done():
-        await asyncio.sleep(STREAM_GUARD_POLL_INTERVAL)
-        if task.done():
-          return
-        now = time.monotonic()
-        stall = now - last_progress_at
-        if stall > _effective_stall_timeout:
-          guard_reason = ("stall", f"no stream progress for {stall:.0f}s")
-          log.error("[%s] Turn %d watchdog (%s): %s", self._sid, turn_count, guard_reason[0], guard_reason[1])
-          task.cancel()
-          return
-        if self._per_turn_timeout is not None and (now - turn_start_mono) > self._per_turn_timeout:
-          guard_reason = ("timeout", f"turn timeout after {now - turn_start_mono:.0f}s")
-          log.error("[%s] Turn %d watchdog (%s): %s", self._sid, turn_count, guard_reason[0], guard_reason[1])
-          task.cancel()
-          return
-
-    stream_error: Exception | None = None
-
-    def _raise_if_disconnected(exc: Exception | None = None) -> None:
-      if not self._disconnected:
-        return
-      if exc is not None:
-        raise exc
-      if stream_error is not None:
-        raise stream_error
-      raise asyncio.CancelledError()
-
-    credential_refresh_attempted = False
-
-    for attempt in range(1 + STREAM_RETRY_MAX):
-      if attempt > 0:
-        _raise_if_disconnected()
-        await self._close_client(client, timeout=2.0)
-        client = self._provider.create_client(config, timeout=self._client_timeout)
-        self._set_client(client)
-        log.warning(
-          "[%s] Stream retry %d/%d on turn %d after %s",
-          self._sid,
-          attempt,
-          STREAM_RETRY_MAX,
-          turn_count,
-          _format_exc(stream_error) if stream_error is not None else "unknown error",
-        )
-        _raise_if_disconnected()
-        delay = STREAM_RETRY_DELAY * (STREAM_RETRY_BACKOFF ** (attempt - 1))
-        await asyncio.sleep(delay)
-
-      last_progress_at = time.monotonic()
-      params = _make_params()
-      result = StreamTurnResult()
-      tokens_snapshot = dict(usage_totals)
-      guard_reason = None
-      stream_task = asyncio.create_task(_consume_stream(params, result))
-      guard_task = asyncio.create_task(_stream_guard(stream_task, turn_t0_mono))
-      try:
-        done, pending = await asyncio.wait({stream_task, guard_task}, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-          task.cancel()
-        if pending:
-          _, stuck = await asyncio.wait(pending, timeout=5.0)
-          if stuck:
-            log.warning("[%s] Turn %d: cancelled task stuck, force-closing client", self._sid, turn_count)
-            await self._close_client(client, timeout=2.0)
-            await asyncio.wait(stuck, timeout=2.0)
-        if stream_task in done and not stream_task.cancelled():
-          exc = stream_task.exception()
-          if exc is not None:
-            raise exc
-      except asyncio.CancelledError:
-        guard_task.cancel()
-        stream_task.cancel()
-        await self.force_close()
-        raise
-      except Exception as exc:
-        stream_error = exc
-        partial_usage = self._usage_delta(tokens_snapshot, usage_totals)
-        usage_totals.clear()
-        usage_totals.update(tokens_snapshot)
-
-        action, guard_error, guard_kind = self._classify_guard_outcome(
-          guard_reason,
-          attempt,
-          STREAM_RETRY_MAX,
-        )
-        if action != "not_guard":
-          guard_message = guard_reason[1] if guard_reason else ""
-          if action == "retry":
-            stream_error = RuntimeError(guard_error)
-            _raise_if_disconnected(stream_error)
-            log.warning(
-              "[%s] Stream watchdog stall on turn %d after %.1fs (attempt %d/%d), retrying: %s",
-              self._sid,
-              turn_count,
-              time.time() - turn_t0,
-              attempt + 1,
-              1 + STREAM_RETRY_MAX,
-              guard_message,
-            )
-            await self._emit_stream_retry_event(attempt=attempt, error=guard_error)
-            continue
-          log.error(
-            "[%s] Stream watchdog on turn %d after %.1fs (%s): %s | %s",
-            self._sid,
-            turn_count,
-            time.time() - turn_t0,
-            guard_kind,
-            guard_message,
-            _format_exc(exc),
-          )
-          if self._usage_has_tokens(partial_usage):
-            await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=partial_usage))
-          await self._emit_error_event(guard_error)
-          await self._close_client(client, timeout=5.0)
-          return None
-
-        credential_failure: ProviderCredentialFailure | None = None
-        try:
-          credential_failure = self._provider.classify_credential_failure(exc)
-        except Exception as classify_exc:
-          log.warning("[%s] credential failure classification failed (non-fatal): %s", self._sid, classify_exc)
-        if credential_failure is not None and not credential_refresh_attempted:
-          credential_refresh_attempted = True
-          refreshed_config = await self._call_credential_refresher(credential_failure)
-          if refreshed_config is not None:
-            self._apply_refreshed_auth_config(config, refreshed_config)
-            if not self._provider.has_active_credential(config):
-              log.warning("[%s] credential refresh returned inactive credentials; falling back to normal error path", self._sid)
-            else:
-              usage_totals.clear()
-              usage_totals.update(tokens_snapshot)
-              stream_error = RuntimeError(f"credential refreshed after {credential_failure.kind}")
-              self._call_metric("gateway.credential_refresh_success", 1)
-              self._append(
-                {
-                  "type": "credential_refreshed",
-                  "provider": credential_failure.provider,
-                  "kind": credential_failure.kind,
-                  "status_code": credential_failure.status_code,
-                }
-              )
-              await self._emit_stream_retry_event(
-                attempt=attempt,
-                error=f"credential refreshed after provider {credential_failure.kind} failure",
-              )
-              continue
-
-        formatted_exc = _format_exc(exc)
-        if not self._provider.is_retryable_error(exc):
-          log.error(
-            "[%s] Stream error on turn %d after %.1fs (non-retryable): %s",
-            self._sid,
-            turn_count,
-            time.time() - turn_t0,
-            formatted_exc,
-          )
-          if self._usage_has_tokens(partial_usage):
-            await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=partial_usage))
-          await self._emit_error_event(formatted_exc)
-          await self._close_client(client, timeout=5.0)
-          return None
-
-        log.warning(
-          "[%s] Transient stream error on turn %d after %.1fs (attempt %d/%d): %s",
-          self._sid,
-          turn_count,
-          time.time() - turn_t0,
-          attempt + 1,
-          1 + STREAM_RETRY_MAX,
-          formatted_exc,
-        )
-        if attempt < STREAM_RETRY_MAX:
-          _raise_if_disconnected(exc)
-          await self._emit_stream_retry_event(attempt=attempt, error=formatted_exc)
-          continue
-      else:
-        action, guard_error, _ = self._classify_guard_outcome(
-          guard_reason,
-          attempt,
-          STREAM_RETRY_MAX,
-        )
-        if action != "not_guard":
-          guard_message = guard_reason[1] if guard_reason else ""
-          if action == "retry":
-            stream_error = RuntimeError(guard_error)
-            usage_totals.clear()
-            usage_totals.update(tokens_snapshot)
-            _raise_if_disconnected(stream_error)
-            log.warning(
-              "[%s] Stream watchdog stall on turn %d after %.1fs (attempt %d/%d), retrying: %s",
-              self._sid,
-              turn_count,
-              time.time() - turn_t0,
-              attempt + 1,
-              1 + STREAM_RETRY_MAX,
-              guard_message,
-            )
-            await self._emit_stream_retry_event(attempt=attempt, error=guard_error)
-            continue
-          await self._emit_error_event(guard_error)
-          await self._close_client(client, timeout=5.0)
-          return None
-        if suppress_tool_turn_text:
-          if result.tool_uses:
-            if result.full_text:
-              log.info(
-                "[%s] Suppressed %d chars of assistant text from tool-use turn %d",
-                self._sid,
-                len(result.full_text),
-                turn_count,
-              )
-            result.full_text = ""
-            result.content_blocks = [
-              block
-              for block in result.content_blocks
-              if not (isinstance(block, dict) and block.get("type") == "text")
-            ]
-          elif result.full_text:
-            self._append({"type": "text_delta", "text": result.full_text})
-        return client, result
-
-    if stream_error is not None:
-      formatted_exc = _format_exc(stream_error)
-      log.error(
-        "[%s] Stream failed on turn %d after %d retries: %s",
-        self._sid,
-        turn_count,
-        STREAM_RETRY_MAX,
-        formatted_exc,
-      )
-      await self._emit_error_event(formatted_exc)
-      await self._close_client(client, timeout=5.0)
-    return None
-
-  async def _execute_single_tool(
-    self,
-    tool_id: str,
-    tool_name: str,
-    tool_input: Dict[str, Any],
-    base_kwargs: Dict[str, Any],
-    call_index: int = 0,
-  ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
-    redacted_tool_input = _redact_tool_input_for_event(tool_name, tool_input)
-    tool_input_preview = json.dumps(redacted_tool_input, default=str)[:200]
-    log.info(
-      "[%s] Tool call: %s | input=%s",
-      self._sid,
-      tool_name,
-      tool_input_preview,
-      extra={
-        "data": {
-          "event": "tool_call",
-          "session_id": self._sid,
-          "tool": tool_name,
-          "input_preview": tool_input_preview,
-        }
-      },
-    )
-    if tool_name == "emit_html_artifact":
-      html_bytes = len((tool_input.get("html") or "").encode("utf-8"))
-      if html_bytes > 512 * 1024:
-        return (
-          self._make_error_result(
-            tool_id,
-            "invalid_input",
-            f"emit_html_artifact: html payload {html_bytes} bytes exceeds 512KB limit",
-          ),
-          tool_name,
-          [],
-        )
-    if tool_name == "emit_dashboard_artifact":
-      payload_bytes = len(json.dumps(tool_input.get("payload") or {}).encode("utf-8"))
-      if payload_bytes > 256 * 1024:
-        return (
-          self._make_error_result(
-            tool_id,
-            "invalid_input",
-            f"emit_dashboard_artifact: payload {payload_bytes} bytes exceeds 256KB limit",
-          ),
-          tool_name,
-          [],
-        )
-    tool_t0 = time.time()
-    server = self._mcp_client.get_server_for_tool(tool_name) if self._mcp_client is not None else None
-    display = resolve_display(tool_name, redacted_tool_input)
-    tool_start_event = {
-      "type": "tool_call_start",
-      "tool_call_id": tool_id,
-      "tool_name": tool_name,
-      "tool_input": redacted_tool_input,
-      "execution_location": "backend",
-      "call_index": call_index,
-      "server": server,
-      "started_at": tool_t0,
-      "parent_assistant_message_seq": self._last_assistant_message_seq,
-    }
-    if display is not None:
-      tool_start_event["display"] = display
-    await self._append_durable_event(tool_start_event)
-    self._append(tool_start_event)
-    result: Optional[Any] = None
-    error: Optional[Dict[str, Any]] = None
-    semantic_error: Optional[Dict[str, Any]] = None
-    cancelled_exc: Optional[asyncio.CancelledError] = None
-    result_bytes = 0
-    duration_ms = 0
-    load_servers_signal: Optional[List[str]] = None
-
-    try:
-      if tool_name in self._effective_excluded_tools():
-        error = {
-          "code": "tool_excluded",
-          "message": f"Tool '{tool_name}' is not available in this context",
-        }
-      else:
-        dispatch_kwargs: Dict[str, Any] = {"call_index": call_index}
-        if self._dispatcher_accepts_abort_event:
-          dispatch_kwargs["abort_event"] = self._tool_abort_event
-        if self._dispatcher_accepts_skill_run_context:
-          dispatch_kwargs["skill_run_id"] = self._skill_run_id
-          dispatch_kwargs["workspace_dir"] = self._workspace_dir
-        dispatch_coro = self._dispatcher.dispatch(
-          tool_id,
-          tool_name,
-          tool_input,
-          **dispatch_kwargs,
-        )
-        needs_approval = False
-        requires_approval_fn = getattr(self._dispatcher, "requires_approval", None)
-        if requires_approval_fn is not None:
-          try:
-            needs_approval = requires_approval_fn(tool_name, tool_input)
-          except Exception:
-            pass
-        # MCP tools already carry per-server read timeouts in McpClientManager.
-        # Applying the runner's generic cap here would mask longer server policy.
-        has_mcp_server_timeout = server is not None
-        skip_timeout = tool_name == "get_background_result" or needs_approval or has_mcp_server_timeout
-        effective_tool_timeout = self._tool_call_timeout
-        if tool_name == "run_agent":
-          # Sub-agents legitimately outrun the generic tool cap, but skipping the
-          # cap entirely let a wedged run_agent hold the chat turn open forever
-          # (ACUI-1). The inner spawn timeout (DEFAULT_SUB_AGENT_TIMEOUT_SECONDS)
-          # is the primary bound and returns a clean tool error; this widened cap
-          # is the backstop if that inner await never resolves. It applies even
-          # when the generic tool_call_timeout is disabled (None) so inline
-          # run_agent is never unbounded.
-          effective_tool_timeout = max(effective_tool_timeout or 0.0, _RUN_AGENT_DISPATCH_TIMEOUT_SECONDS)
-        if effective_tool_timeout is not None and not skip_timeout:
-          try:
-            result, error = await asyncio.wait_for(dispatch_coro, timeout=effective_tool_timeout)
-          except asyncio.TimeoutError:
-            elapsed = time.time() - tool_t0
-            log.error(
-              "[%s] Tool %s timed out after %.1fs (limit %.0fs)",
-              self._sid,
-              tool_name,
-              elapsed,
-              effective_tool_timeout,
-            )
-            error = {
-              "code": "tool_timeout",
-              "sub_code": "timeout",
-              "message": f"Tool '{tool_name}' timed out after {effective_tool_timeout:.0f}s. The tool call was cancelled. You may retry or skip this tool.",
-            }
-        else:
-          result, error = await dispatch_coro
-
-      # Strip private control fields from result before logging, event capture, and
-      # model-bound tool_result content. _load_servers is a control signal -- capture
-      # it for _refresh_tools (called after finally), then remove from result.
-      if error is None and isinstance(result, dict):
-        popped = result.pop("_load_servers", None)
-        if isinstance(popped, list):
-          load_servers_signal = [str(server_name) for server_name in popped if server_name]
-        self._activate_skill_report_doors(result.pop(_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY, None))
-        self._activate_skill_deny(result.pop(_ACTIVE_SKILL_DENY_RESULT_KEY, None), base_kwargs)
-
-      tool_elapsed = time.time() - tool_t0
-      if error is None:
-        semantic_error = classify_semantic_tool_error(result)
-      result_json = json.dumps(result, default=str) if result is not None else ""
-      result_bytes = len(result_json)
-      result_preview = result_json[:150] if result_json else "null"
-      if error or semantic_error:
-        error_detail = error if error is not None else semantic_error
-        log.warning(
-          "[%s] Tool %s error (%.1fs): %s",
-          self._sid,
-          tool_name,
-          tool_elapsed,
-          error_detail,
-          extra={
-            "data": {
-              "event": "tool_done",
-              "session_id": self._sid,
-              "tool": tool_name,
-              "elapsed_s": round(tool_elapsed, 1),
-              "server": server,
-              "error": True,
-              "semantic_error": semantic_error is not None and error is None,
-              "error_detail": str(error_detail)[:200],
-              "error_sub_code": error_detail.get("sub_code", "") if isinstance(error_detail, dict) else "",
-            }
-          },
-        )
-      else:
-        log.info(
-          "[%s] Tool %s done (%.1fs) | result=%s",
-          self._sid,
-          tool_name,
-          tool_elapsed,
-          result_preview,
-          extra={
-            "data": {
-              "event": "tool_done",
-              "session_id": self._sid,
-              "tool": tool_name,
-              "elapsed_s": round(tool_elapsed, 1),
-              "server": server,
-              "result_bytes": result_bytes,
-              "error": False,
-            }
-          },
-        )
-    except asyncio.CancelledError as exc:
-      cancelled_exc = exc
-      error = {"code": "cancelled", "message": "Task was cancelled"}
-    except Exception as exc:
-      log.error("[%s] Tool %s unhandled error: %s", self._sid, tool_name, exc)
-      error = {"code": "internal_error", "message": str(exc)}
-    finally:
-      duration_ms = int((time.time() - tool_t0) * 1000)
-      tool_complete_event = {
-        "type": "tool_call_complete",
-        "tool_call_id": tool_id,
-        "tool_name": tool_name,
-        "result": dict(result) if isinstance(result, dict) else result,
-        "error": error,
-        "duration_ms": duration_ms,
-        "server": server,
-        "is_error": error is not None or semantic_error is not None,
-      }
-      if semantic_error is not None:
-        tool_complete_event["semantic_error"] = dict(semantic_error)
-      if error is None:
-        self._clear_active_skill_if_report_door_completed(tool_complete_event, base_kwargs)
-      self._call_on_tool_timing(
-        tool_name=tool_name,
-        server=server,
-        duration_ms=duration_ms,
-        is_error=tool_complete_event["is_error"],
-        result_bytes=result_bytes,
-      )
-
-    if cancelled_exc is not None:
-      result_entry = self._make_error_result(
-        tool_id,
-        str(error.get("code", "tool_error")) if isinstance(error, dict) else "tool_error",
-        str(error.get("message", "Tool failed")) if isinstance(error, dict) else "Tool failed",
-        sub_code=str(error.get("sub_code", "")) if isinstance(error, dict) else "",
-      )
-      tool_complete_event["final_tool_result_blocks"] = [dict(result_entry)]
-      await self._append_durable_event(tool_complete_event)
-      self._append(tool_complete_event)
-      raise cancelled_exc
-
-    if load_servers_signal:
-      self._refresh_tools(base_kwargs, load_servers_signal)
-      log.info(
-        "[%s] Loaded MCP servers: %s | total tools now: %d",
-        self._sid,
-        load_servers_signal,
-        len(base_kwargs.get("tools") or []),
-      )
-
-    model_result = result
-    if error is None:
-      model_result = self._annotate_result(result, tool_name=tool_name)
-
-    if error is not None:
-      result_entry = self._make_error_result(
-        tool_id,
-        str(error.get("code", "tool_error")),
-        str(error.get("message", "Tool failed")),
-        sub_code=str(error.get("sub_code", "")),
-      )
-    else:
-      result_entry = {
-        "type": "tool_result",
-        "tool_use_id": tool_id,
-        "content": json.dumps(model_result, default=str),
-      }
-      if semantic_error is not None:
-        result_entry["is_error"] = True
-
-    extra_blocks = await self._call_on_tool_result(
-      ToolResultContext(
-        tool_name=tool_name,
-        tool_input=dict(tool_input),
-        result=result,
-        error=error,
-        duration_ms=duration_ms,
-        tool_call_id=tool_id,
-        session_id=self._full_session_id,
-        server=server,
-        result_entry=result_entry,
-        skill_run_id=self._skill_run_id,
-        workspace_dir=self._workspace_dir,
-      )
-    )
-    live_entry, durable_entry = self._compact_model_tool_result_entry(result_entry, tool_name=tool_name)
-    final_tool_result_blocks = [dict(durable_entry)]
-    final_tool_result_blocks.extend(dict(block) for block in extra_blocks)
-    tool_complete_event["final_tool_result_blocks"] = final_tool_result_blocks
-    await self._append_durable_event(tool_complete_event)
-    self._append(tool_complete_event)
-    return live_entry, tool_name, extra_blocks
-
-  async def run(
-    self,
-    messages: List[Dict[str, Any]],
-    system_prompt: Optional[Union[str, List[Tuple[str, bool]]]] = None,
-    model_override: Optional[str] = None,
-    max_turns: Optional[int] = None,
-    *,
-    resume_initial_messages: List[Dict[str, Any]] | None = None,
-  ) -> None:
-    """Execute the full chat loop and stream events into `EventLog`.
-
-    AgentRunner instances are single-use. Construct a new runner for each
-    subsequent run.
-
-    Args:
-      messages: Conversation history for the current request.
-      system_prompt: Optional prompt string or cached prompt blocks.
-      model_override: Optional per-request model override.
-      max_turns: Optional maximum number of model/tool turns.
-
-    Behavior:
-      - emits `text_delta`, `thinking_delta`, and tool lifecycle events
-      - retries transient stream failures
-      - appends `stream_complete` on success
-      - appends `error` on terminal failure
-      - appends `max_turns_reached` or `budget_exceeded` when limits stop the
-        loop early
-    """
-    if self._summary_emitted:
-      raise RuntimeError("AgentRunner is single-use; construct a new runner for subsequent runs")
-    was_cancelled = False
-    run_error: BaseException | None = None
-    clean_detach_reason = "completed"
-    try:
-      if self._agent_session_log is None:
-        self._runner_id = None
-        self._last_assistant_message_seq = None
-        self._durable_attach_emitted = False
-      if self._agent_session_log is not None:
-        self._runner_id = f"runner_{uuid.uuid4().hex}"
-        self._last_durable_seq = 0
-        self._last_assistant_message_seq = None
-        self._durable_attach_emitted = False
-        if self._role == "writer":
-          await self._acquire_writer_lease_and_recover()
-        await self._emit_attach_event()
-        if self._role == "writer":
-          self._write_lease_metadata()
-        await self._rebuild_task_registry_from_log()
-        if resume_initial_messages is not None:
-          messages = [dict(message) for message in resume_initial_messages]
-        elif self._context_builder is not None:
-          # Autonomous / server-authoritative path: context_builder is the source
-          # of truth; the incoming `messages` carries only the new user turn.
-          prior_messages = await self._context_builder.build()
-          new_user_input = self._extract_last_user_message(messages)
-          if new_user_input is not None:
-            await self._append_user_message_event(new_user_input)
-          messages = prior_messages + ([new_user_input] if new_user_input is not None else [])
-        else:
-          # Durable-log path without a replay policy: preserve caller-provided
-          # messages without injecting prior durable history.
-          new_user_input = self._extract_last_user_message(messages)
-          if new_user_input is not None:
-            await self._append_user_message_event(new_user_input)
-          messages = [dict(message) for message in messages]
-
-      if self._coordinator is not None and self._coordinator.enabled:
-        preamble = self._coordinator.preamble or COORDINATOR_DEFAULT_PREAMBLE
-        if isinstance(system_prompt, list):
-          system_prompt = [(preamble, False)] + list(system_prompt)
-        elif system_prompt:
-          system_prompt = f"{preamble}\n\n{system_prompt}"
-        else:
-          system_prompt = preamble
-
-      default_model = _get_default_model_for_provider(getattr(self._provider, "name", None))
-      config = dict(self._auth_config)
-      config.update({
-        "auth_mode": str(config.get("auth_mode", "api")).strip().lower(),
-        "api_key": str(config.get("api_key", "")),
-        "auth_token": str(config.get("auth_token", "")),
-        "model": str(config.get("model") or default_model),
-        "max_tokens": int(config.get("max_tokens", 16000)),
-        "thinking": bool(config.get("thinking", True)),
-      })
-      if model_override:
-        config["model"] = model_override
-
-      if not self._provider.has_active_credential(config):
-        await self._emit_stub_response(messages)
-        return
-
-      try:
-        client = self._provider.create_client(config, timeout=self._client_timeout)
-        self._set_client(client)
-      except Exception:
-        await self._emit_stub_response(messages)
-        return
-
-      try:
-        model_info = self._provider.get_model_info(config["model"])
-      except Exception as exc:
-        await self._emit_error_event(str(exc))
-        await self._close_client(client, timeout=5.0)
-        return
-
-      cached_tools = self._filter_excluded_tool_definitions(self._default_tool_definitions())
-
-      max_tokens = self._max_tokens_override if self._max_tokens_override is not None else config["max_tokens"]
-      model_max_output = int(getattr(model_info, "max_output_tokens", 0) or 0)
-      if model_max_output > 0 and int(max_tokens) > model_max_output:
-        log.info(
-          "[%s] max_tokens %d clamped to model max_output_tokens %d",
-          self._sid, int(max_tokens), model_max_output,
-        )
-        max_tokens = model_max_output
-
-      base_kwargs: Dict[str, Any] = {
-        "tools": cached_tools,
-      }
-      if config["thinking"] and max_tokens >= 2048 and model_info.supports_thinking:
-        log.info("[%s] Thinking enabled | max_tokens=%d", self._sid, max_tokens)
-      elif not config["thinking"]:
-        log.info("[%s] Thinking disabled | thinking=false", self._sid)
-      elif max_tokens < 2048:
-        log.info("[%s] Thinking disabled | max_tokens=%d too low (need >=2048)", self._sid, max_tokens)
-      else:
-        log.info("[%s] Thinking disabled | model=%s not supported", self._sid, config["model"])
-
-      effective_compaction_trigger = _effective_compaction_trigger(self._compaction_trigger, model_info)
-      if effective_compaction_trigger is not None:
-        log.info("[%s] Compaction enabled | trigger=%d tokens", self._sid, effective_compaction_trigger)
-      context_limit = _model_context_window(model_info)
-
-      log.info("[%s] Chat start | model=%s max_tokens=%d messages=%d", self._sid, config["model"], max_tokens, len(messages))
-
-      chat_t0 = time.time()
-      if isinstance(system_prompt, list):
-        system_text = "\n\n".join(text for text, _should_cache in system_prompt if text)
-      else:
-        system_text = system_prompt or ""
-      messages_text = json.dumps(truncate_to_last_compaction(messages), default=str)
-      tools_text = json.dumps(cached_tools, default=str) if cached_tools else ""
-      system_chars = len(system_text)
-      est_system = _estimate_tokens(system_text)
-      est_messages = _estimate_tokens(messages_text)
-      est_tools = _estimate_tokens(tools_text) if tools_text else 0
-      est_total = est_system + est_messages + est_tools
-      if est_total > context_limit * CONTEXT_WARNING_PCT / 100:
-        log.warning(
-          "[%s] Context usage high | est=%d tokens (%.0f%% of %dk limit)",
-          self._sid,
-          est_total,
-          est_total / context_limit * 100,
-          context_limit // 1000,
-          extra={
-            "data": {
-              "event": "context_warning",
-              "session_id": self._sid,
-              "est_tokens": est_total,
-              "limit": context_limit,
-              "pct": round(est_total / context_limit * 100, 1),
-            }
-          },
-        )
-      log.info(
-        "[%s] Pre-request estimate | system=%d msgs=%d tools=%d total=%d tokens (est)",
-        self._sid,
-        est_system,
-        est_messages,
-        est_tools,
-        est_total,
-        extra={
-          "data": {
-            "event": "token_estimate",
-            "session_id": self._sid,
-            "est_system_tokens": est_system,
-            "est_messages_tokens": est_messages,
-            "est_tools_tokens": est_tools,
-            "est_total_tokens": est_total,
-            "message_count": len(messages),
-            "tool_count": len(cached_tools),
-          }
-        },
-      )
-      tools_chars = len(tools_text)
-      usage_totals = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
-      }
-      self._last_reported_cost = 0.0
-      self._ensure_sub_agent_semaphore()
-      turn_count = 0
-      tools_used: List[str] = []
-      final_answer_guard_fired = False
-      max_tokens_continuations = 0
-      current_messages = list(messages)
-
-      while True:
-        if self._operator_pause_requested():
-          log.info("[%s] Operator pause requested before next turn; stopping at safe boundary", self._sid)
-          clean_detach_reason = "operator_pause"
-          await self._emit_operator_pause_event("before_turn")
-          break
-
-        turn_count += 1
-        if max_turns is not None and turn_count > max_turns:
-          log.warning("[%s] Max turns (%d) reached, stopping", self._sid, max_turns)
-          self._append({"type": "max_turns_reached", "turn_count": turn_count, "max_turns": max_turns})
-          await self._emit_interrupted_event("max_turns_reached")
-          summary_text = None
-          if self._on_max_turns is not None:
-            try:
-              summary_text = await self._on_max_turns(current_messages, turn_count)
-            except Exception as exc:
-              log.warning("[%s] on_max_turns callback failed: %s", self._sid, exc)
-          if summary_text:
-            self._append({"type": "text_delta", "text": f"\n\n[Max turns reached]\n{summary_text}"})
-          else:
-            self._append({"type": "text_delta", "text": "\n\n[Sub-agent reached maximum turn limit]"})
-          break
-        turn_t0 = time.time()
-        turn_t0_mono = time.monotonic()
-
-        if turn_count > 1:
-          turn_messages_text = json.dumps(truncate_to_last_compaction(current_messages), default=str)
-          est_messages_turn = _estimate_tokens(turn_messages_text)
-          current_tools = base_kwargs.get("tools") or []
-          est_tools_turn = _estimate_tokens(json.dumps(current_tools, default=str)) if current_tools else 0
-          est_turn = est_system + est_messages_turn + est_tools_turn
-          if est_turn > context_limit * CONTEXT_WARNING_PCT / 100:
-            log.warning(
-              "[%s] Context usage high | est=%d tokens (%.0f%% of %dk limit)",
-              self._sid,
-              est_turn,
-              est_turn / context_limit * 100,
-              context_limit // 1000,
-              extra={
-                "data": {
-                  "event": "context_warning",
-                  "session_id": self._sid,
-                  "turn": turn_count,
-                  "est_tokens": est_turn,
-                  "limit": context_limit,
-                  "pct": round(est_turn / context_limit * 100, 1),
-                }
-              },
-            )
-          log.info(
-            "[%s] Turn %d pre-request | est=%d tokens",
-            self._sid,
-            turn_count,
-            est_turn,
-            extra={
-              "data": {
-                "event": "token_estimate",
-                "session_id": self._sid,
-                "turn": turn_count,
-                "est_system_tokens": est_system,
-                "est_messages_tokens": est_messages_turn,
-                "est_tools_tokens": est_tools_turn,
-                "est_total_tokens": est_turn,
-                "message_count": len(current_messages),
-                "tool_count": len(current_tools),
-              }
-            },
-          )
-
-        bg_reminder = self._background_task_reminder_text()
-        notif_reminder = self._build_notification_reminder()
-        peeked_notification_count = min(
-          self._notification_queue.pending_count,
-          _MAX_NOTIFICATIONS_PER_TURN,
-        ) if notif_reminder else 0
-        combined_reminder = "\n\n".join(filter(None, [bg_reminder, notif_reminder]))
-        if combined_reminder:
-          turn_system_prompt = self._inject_system_prompt_reminder(system_prompt, combined_reminder)
-        else:
-          turn_system_prompt = system_prompt
-        if self._message_inbox is not None:
-          parent_messages: list[ParentMessage] = []
-          while not self._message_inbox.empty():
-            try:
-              parent_messages.append(self._message_inbox.get_nowait())
-            except asyncio.QueueEmpty:
-              break
-          if parent_messages:
-            current_messages.append({"role": "user", "content": format_parent_messages_for_model(parent_messages)})
-        turn_usage_before = dict(usage_totals)
-        turn_result = await self._stream_turn(
-          client=client,
-          config=config,
-          model_info=model_info,
-          system_prompt=turn_system_prompt,
-          current_messages=current_messages,
-          base_kwargs=base_kwargs,
-          max_tokens=max_tokens,
-          turn_count=turn_count,
-          turn_t0=turn_t0,
-          turn_t0_mono=turn_t0_mono,
-          system_chars=system_chars,
-          tools_chars=tools_chars,
-          usage_totals=usage_totals,
-        )
-        if turn_result is None:
-          return
-        client, turn = turn_result
-        turn_usage = self._usage_delta(turn_usage_before, usage_totals)
-        if self._usage_has_tokens(turn_usage):
-          await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=turn_usage))
-        await self._append_assistant_message_event(
-          content_blocks=turn.content_blocks,
-          stop_reason=turn.stop_reason,
-          model=config["model"],
-          usage=turn_usage,
-        )
-        self._append(
-          {
-            "type": "turn_complete",
-            "turn": turn_count,
-            "usage": dict(turn_usage),
-          }
-        )
-
-        turn_elapsed = time.time() - turn_t0
-        ttft = (turn.first_token_t - turn_t0) if turn.first_token_t else None
-        text_len = len(turn.full_text)
-        tool_names = [tool[1] for tool in turn.tool_uses]
-        text_preview = turn.full_text[:150].replace("\n", " ") if turn.full_text else ""
-
-        log.info(
-          "[%s] Turn %d complete | %.1fs | TTFT=%.2fs | text=%d chars | tools=%s | stop=%s | response=%s",
-          self._sid,
-          turn_count,
-          turn_elapsed,
-          ttft if ttft is not None else -1,
-          text_len,
-          tool_names or "none",
-          turn.stop_reason,
-          text_preview or "(none)",
-          extra={
-            "data": {
-              "event": "turn_complete",
-              "session_id": self._sid,
-              "turn": turn_count,
-              "elapsed_s": round(turn_elapsed, 1),
-              "ttft_s": round(ttft, 2) if ttft is not None else None,
-              "text_chars": text_len,
-              "tools": tool_names,
-              "stop_reason": turn.stop_reason,
-            }
-          },
-        )
-
-        if self._cost_accumulator is not None:
-          running_cost = self._estimate_usage_cost(config["model"], usage_totals)
-          incremental_cost = max(0.0, running_cost.total - self._last_reported_cost)
-          if incremental_cost:
-            self._cost_accumulator.add(incremental_cost)
-          self._last_reported_cost = running_cost.total
-          if self._cost_accumulator.exceeded:
-            effective_total = getattr(self._cost_accumulator, "effective_total", self._cost_accumulator.total)
-            effective_budget = getattr(self._cost_accumulator, "effective_budget", self._cost_accumulator.budget)
-            exceeded_reason = getattr(self._cost_accumulator, "exceeded_reason", None)
-            reason_suffix = _budget_reason_suffix(exceeded_reason)
-            log.warning(
-              "[%s] Budget exceeded: $%.4f >= $%.4f%s — stopping",
-              self._sid,
-              effective_total,
-              effective_budget,
-              reason_suffix,
-            )
-            self._append(
-              {
-                "type": "budget_exceeded",
-                "total_cost": round(effective_total, 4),
-                "budget": effective_budget,
-                "reason": exceeded_reason,
-              }
-            )
-            self._append(
-              {
-                "type": "text_delta",
-                "text": (
-                  "\n\n"
-                  f"[Budget limit reached: ${effective_total:.4f} >= "
-                  f"${effective_budget:.4f}{reason_suffix}]"
-                ),
-              }
-            )
-            await self._emit_interrupted_event("budget_exceeded")
-            break
-
-        if self._operator_pause_requested():
-          log.info("[%s] Operator pause requested after turn; stopping before tool dispatch", self._sid)
-          clean_detach_reason = "operator_pause"
-          await self._emit_operator_pause_event("after_turn_before_tools")
-          break
-
-        if not turn.tool_uses:
-          if not final_answer_guard_fired and self._final_answer_guard is not None:
-            guard_message = self._final_answer_guard(
-              current_messages,
-              turn.full_text,
-              list(tools_used),
-              list(base_kwargs.get("tools") or []),
-              turn_count,
-            )
-            if guard_message:
-              final_answer_guard_fired = True
-              log.info("[%s] Final-answer guard injected follow-up before completing turn", self._sid)
-              self._append(
-                {
-                  "type": "runtime_guard",
-                  "guard": "final_answer",
-                  "message": guard_message,
-                }
-              )
-              assistant_content = list(turn.content_blocks)
-              current_messages.append(
-                {
-                  "role": "assistant",
-                  "content": assistant_content,
-                  "provider": self._provider.name,
-                  "model": config["model"],
-                  "stop_reason": turn.stop_reason,
-                }
-              )
-              current_messages.append({"role": "user", "content": guard_message})
-              continue
-          if turn.stop_reason == "pause_turn":
-            log.info("[%s] Pause turn — continuing", self._sid)
-            assistant_content = list(turn.content_blocks)
-            current_messages.append(
-              {
-                "role": "assistant",
-                "content": assistant_content,
-                "provider": self._provider.name,
-                "model": config["model"],
-                "stop_reason": turn.stop_reason,
-              }
-            )
-            continue
-          if turn.stop_reason == "compaction":
-            log.info("[%s] Compaction pause — continuing", self._sid)
-            assistant_content = list(turn.content_blocks)
-            current_messages.append(
-              {
-                "role": "assistant",
-                "content": assistant_content,
-                "provider": self._provider.name,
-                "model": config["model"],
-                "stop_reason": turn.stop_reason,
-              }
-            )
-            continue
-          if turn.stop_reason == "max_tokens":
-            # No usable tool call and no end_turn: the output budget ran out
-            # (typically mid-tool-call). Ending the run here silently drops the
-            # whole task's deliverable (ACUI-27) — nudge and continue instead.
-            max_tokens_continuations += 1
-            if max_tokens_continuations <= _MAX_TOKENS_CONTINUATIONS:
-              log.warning(
-                "[%s] Turn %d hit max_tokens with no usable tool call; continuing with truncation nudge (%d/%d)",
-                self._sid,
-                turn_count,
-                max_tokens_continuations,
-                _MAX_TOKENS_CONTINUATIONS,
-              )
-              self._append(
-                {
-                  "type": "runtime_guard",
-                  "guard": "max_tokens_truncation",
-                  "message": _MAX_TOKENS_NUDGE,
-                }
-              )
-              # Partial tool_use blocks are unusable (no result will follow) and
-              # would make the request invalid — keep only completed content.
-              assistant_content = [
-                block
-                for block in turn.content_blocks
-                if not (isinstance(block, dict) and block.get("type") == "tool_use")
-              ]
-              if assistant_content:
-                current_messages.append(
-                  {
-                    "role": "assistant",
-                    "content": assistant_content,
-                    "provider": self._provider.name,
-                    "model": config["model"],
-                    "stop_reason": turn.stop_reason,
-                  }
-                )
-              current_messages.append({"role": "user", "content": _MAX_TOKENS_NUDGE})
-              continue
-            log.error(
-              "[%s] Turn %d hit max_tokens with no usable tool call after %d continuation attempts; ending run",
-              self._sid,
-              turn_count,
-              _MAX_TOKENS_CONTINUATIONS,
-            )
-            # Terminal: do NOT fall through to the notification branch, whose
-            # `continue` would bypass the continuation cap.
-            break
-          if self._notification_queue.pending_count > 0:
-            assistant_content = list(turn.content_blocks)
-            current_messages.append(
-              {
-                "role": "assistant",
-                "content": assistant_content,
-                "provider": self._provider.name,
-                "model": config["model"],
-                "stop_reason": turn.stop_reason,
-              }
-            )
-            current_messages.append(
-              {
-                "role": "user",
-                "content": "[System: Background tasks have completed. Check results with get_background_result.]",
-              }
-            )
-            continue
-          break
-
-        assistant_content = list(turn.content_blocks)
-        current_messages.append(
-          {
-            "role": "assistant",
-            "content": assistant_content,
-            "provider": self._provider.name,
-            "model": config["model"],
-            "stop_reason": turn.stop_reason,
-          }
-        )
-
-        tool_results_content: List[Dict[str, Any]] = []
-        deferred_extras: List[Dict[str, Any]] = []
-        i = 0
-        run_agent_seq = 0
-        while i < len(turn.tool_uses):
-          tool_id, tool_name, tool_input = turn.tool_uses[i]
-          effective_excluded_tools = self._effective_excluded_tools()
-          if tool_name == "run_agent" and "run_agent" not in effective_excluded_tools:
-            batch: List[Tuple[int, str, str, Dict[str, Any]]] = []
-            call_indices: List[int] = []
-            while i < len(turn.tool_uses):
-              batch_tool_id, batch_tool_name, batch_tool_input = turn.tool_uses[i]
-              if batch_tool_name != "run_agent" or "run_agent" in self._effective_excluded_tools():
-                break
-              batch.append((i, batch_tool_id, batch_tool_name, batch_tool_input))
-              call_indices.append(run_agent_seq)
-              run_agent_seq += 1
-              i += 1
-
-            async def _throttled(
-              tool_call_id: str,
-              tool_call_name: str,
-              tool_call_input: Dict[str, Any],
-              current_call_index: int,
-            ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
-              if self._sub_agent_semaphore is not None:
-                if not bool(tool_call_input.get("background")):
-                  async with self._sub_agent_semaphore:
-                    return await self._execute_single_tool(
-                      tool_call_id,
-                      tool_call_name,
-                      tool_call_input,
-                      base_kwargs,
-                      call_index=current_call_index,
-                    )
-              if self._sub_agent_semaphore is not None and bool(tool_call_input.get("background")):
-                return await self._execute_single_tool(
-                  tool_call_id,
-                  tool_call_name,
-                  tool_call_input,
-                  base_kwargs,
-                  call_index=current_call_index,
-                )
-              return await self._execute_single_tool(
-                tool_call_id,
-                tool_call_name,
-                tool_call_input,
-                base_kwargs,
-                call_index=current_call_index,
-              )
-
-            results = await asyncio.gather(
-              *[
-                _throttled(
-                  batch_tool_id,
-                  batch_tool_name,
-                  batch_tool_input,
-                  call_index,
-                )
-                for (_, batch_tool_id, batch_tool_name, batch_tool_input), call_index in zip(batch, call_indices)
-              ],
-              return_exceptions=True,
-            )
-
-            for j, result_or_exc in enumerate(results):
-              _, batch_tool_id, batch_tool_name, _ = batch[j]
-              if isinstance(result_or_exc, BaseException):
-                if isinstance(result_or_exc, asyncio.CancelledError):
-                  code = "cancelled"
-                  message = "Sub-agent was cancelled"
-                else:
-                  code = "sub_agent_error"
-                  message = str(result_or_exc) or "Sub-agent failed"
-                log.warning("[%s] run_agent gather exception: %s", self._sid, result_or_exc)
-                tool_results_content.append(self._make_error_result(batch_tool_id, code, message))
-                tools_used.append(batch_tool_name)
-              else:
-                result_entry, used_name, extra_blocks = result_or_exc
-                tool_results_content.append(result_entry)
-                deferred_extras.extend(block for block in extra_blocks if not block.get("_event_only"))
-                tools_used.append(used_name)
-          else:
-            result_entry, used_name, extra_blocks = await self._execute_single_tool(
-              tool_id,
-              tool_name,
-              tool_input,
-              base_kwargs,
-            )
-            tool_results_content.append(result_entry)
-            deferred_extras.extend(block for block in extra_blocks if not block.get("_event_only"))
-            tools_used.append(used_name)
-            i += 1
-
-        tool_results_content.extend(deferred_extras)
-        current_messages.append({"role": "user", "content": tool_results_content})
-        if peeked_notification_count > 0:
-          self._consume_notifications(max_count=peeked_notification_count)
-
-        if turn.stop_reason == "end_turn":
-          if self._notification_queue.pending_count > 0:
-            current_messages.append(
-              {
-                "role": "user",
-                "content": "[System: Background tasks have completed. Check results with get_background_result.]",
-              }
-            )
-            continue
-          break
-
-      total_elapsed = time.time() - chat_t0
-      cache_status = "miss"
-      if usage_totals["cache_read_input_tokens"] > 0:
-        cache_status = f"hit ({usage_totals['cache_read_input_tokens']} tokens cached)"
-      elif usage_totals["cache_creation_input_tokens"] > 0:
-        cache_status = f"write ({usage_totals['cache_creation_input_tokens']} tokens written)"
-
-      cost = self._estimate_usage_cost(config["model"], usage_totals)
-
-      log.info(
-        "[%s] Chat done | %.1fs total | %d turns | tools=%s | tokens in=%d out=%d | cache=%s | cost=$%.4f",
-        self._sid,
-        total_elapsed,
-        turn_count,
-        tools_used or "none",
-        usage_totals["input_tokens"],
-        usage_totals["output_tokens"],
-        cache_status,
-        cost.total,
-        extra={
-          "data": {
-            "event": "chat_done",
-            "session_id": self._sid,
-            "elapsed_s": round(total_elapsed, 1),
-            "turns": turn_count,
-            "tools": tools_used,
-            "tokens_in": usage_totals["input_tokens"],
-            "tokens_out": usage_totals["output_tokens"],
-            "cache_read": usage_totals["cache_read_input_tokens"],
-            "cache_write": usage_totals["cache_creation_input_tokens"],
-            "cost": round(cost.total, 4),
-          }
-        },
-      )
-
-      terminal_event = {
-        "type": "stream_complete",
-        "usage": {
-          "input_tokens": usage_totals["input_tokens"],
-          "output_tokens": usage_totals["output_tokens"],
-          "cache_creation_input_tokens": usage_totals["cache_creation_input_tokens"],
-          "cache_read_input_tokens": usage_totals["cache_read_input_tokens"],
-          "estimated_cost": round(cost.total, 4),
-        },
-      }
-      await self._call_on_before_stream_complete(terminal_event)
-
-      self._append(terminal_event)
-
-      try:
-        await self._close_client(client, timeout=5.0)
-      except Exception as exc:
-        log.warning(
-          "[%s] client close after completed stream failed (non-fatal): %s",
-          self._sid,
-          exc,
-        )
-        await self._emit_run_error_event(exc, phase="client_close_after_stream_complete")
-    except asyncio.CancelledError as exc:
-      was_cancelled = True
-      run_error = exc
-    except BaseException as exc:
-      run_error = exc
-    finally:
-      finalizer_error: BaseException | None = None
-      drain_complete = True
-      in_flight_task_count = 0
-      try:
-        from .skill_context import clear_current_skill
-
-        clear_current_skill()
-      except Exception:
-        pass
-      self._active_skill_deny.clear()
-      self._active_skill_report_doors.clear()
-      try:
-        await self._shutdown_background_tasks(was_cancelled)
-      except BaseException as exc:
-        finalizer_error = exc
-        drain_complete = False
-      finally:
-        running_entries = self._task_registry.list_tasks(state=TaskState.RUNNING)
-        in_flight_task_count = sum(1 for task in running_entries if task.asyncio_task is not None and not task.asyncio_task.done())
-        if in_flight_task_count:
-          drain_complete = False
-        if self._parent_aggregator is None:
-          try:
-            await self._aggregator.close()
-            summary = await self._aggregator.snapshot(
-              ended_at=time.time(),
-              drain_complete=drain_complete,
-              in_flight_task_count=in_flight_task_count,
-            )
-            self._summary_emitted = True
-            await self._call_on_session_summary(summary)
-          except Exception as exc:
-            log.error("[%s] session summary emission failed (non-fatal): %s", self._sid, exc)
-        else:
-          self._summary_emitted = True
-      try:
-        if self._agent_session_log is not None and self._durable_attach_emitted:
-          if run_error is not None:
-            await self._emit_run_error_event(run_error)
-            reason, extra_fields = self._shutdown_interrupted_reason()
-            if isinstance(run_error, asyncio.CancelledError) and self._role == "sub_agent":
-              reason = "sub_agent_cancelled"
-              extra_fields = {}
-            await self._emit_interrupted_event(reason, extra_fields=extra_fields or None)
-          detach_reason = clean_detach_reason
-          if isinstance(run_error, asyncio.CancelledError):
-            detach_reason = "cancelled"
-          elif run_error is not None:
-            detach_reason = "error"
-          await self._emit_detach_event(detach_reason)
-      except BaseException as exc:
-        if finalizer_error is None:
-          finalizer_error = exc
-      finally:
-        try:
-          self._release_write_lease()
-        finally:
-          await self.force_close()
-      if run_error is not None:
-        if finalizer_error is not None:
-          raise finalizer_error from run_error
-        raise run_error
-      if finalizer_error is not None:
-        raise finalizer_error

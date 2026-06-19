@@ -1,3 +1,4 @@
+import agent_gateway.runner as gateway_runner
 from agent_gateway.tool_result_semantics import classify_semantic_tool_error, is_semantic_tool_error
 
 
@@ -102,3 +103,26 @@ def test_warning_only_payload_is_not_semantic_error() -> None:
   assert classify_semantic_tool_error({"status": "success", "warning": "partial data"}) is None
   assert classify_semantic_tool_error({"response": "", "warning": "timed out"}) is None
   assert classify_semantic_tool_error(["status", "error"]) is None
+
+
+def test_runner_soft_error_wrapper_delegates_to_semantic_helper() -> None:
+  error_payload = {"status": "error", "error": "failed"}
+  ok_payload = {"status": "success", "warning": "partial data"}
+
+  assert gateway_runner._is_soft_error is is_semantic_tool_error
+  assert gateway_runner.AgentRunner._is_soft_error(error_payload) is True
+  assert gateway_runner.AgentRunner._is_soft_error(ok_payload) is False
+
+
+def test_runner_soft_error_wrapper_calls_module_alias(monkeypatch) -> None:
+  payload = {"status": "success"}
+  calls = []
+
+  def sentinel(result):
+    calls.append(result)
+    return True
+
+  monkeypatch.setattr(gateway_runner, "_is_soft_error", sentinel)
+
+  assert gateway_runner.AgentRunner._is_soft_error(payload) is True
+  assert calls == [payload]

@@ -1,6 +1,35 @@
 # Changelog
 
-## Unreleased (post-0.15.0)
+## Unreleased (post-0.15.3)
+
+_No unreleased changes recorded yet._
+
+## 0.15.3 (2026-06-19)
+
+### Fixed
+
+- Republished the dashboard artifact runtime registry in the PyPI wheel. The
+  source package metadata already includes `agent_gateway/dashboard_artifact/*.json`;
+  this release makes `dashboard_artifact/registry_description.json` available to
+  installed `ai-agent-gateway` consumers and keeps the publish smoke reading it
+  through `importlib.resources`.
+- Deferred schema-backed dashboard QA imports so standalone wheel imports do not
+  require the monorepo `schema` package unless the QA helpers are explicitly used.
+- Honored skill-specific `max_tokens` budgets and typed excluded FMS writer
+  blockers in the gateway runner path.
+- Preserved rotated agent-session log ranges and hardened autonomous run
+  lifecycle cleanup, rehydrated control-event replay, model-writer autonomous
+  resume blocking, and Excel dispatch handling for non-live workbook sessions.
+- Reported MCP startup diagnostics more clearly and kept `SkillProfile.provider`
+  last to preserve positional-construction compatibility.
+
+### Changed
+
+- Extracted gateway streaming, MCP client config / OAuth storage / error /
+  catalog / runtime, and tool-dispatcher source-pack helpers into smaller
+  modules while preserving the public package surface.
+
+## 0.15.2 (2026-06-15)
 
 ### Added — Tool-result spill to code-execution work dir (2026-06-03)
 

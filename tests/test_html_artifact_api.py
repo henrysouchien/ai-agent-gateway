@@ -78,6 +78,48 @@ def test_html_artifact_sidecar_and_content_endpoints(artifact_api: ArtifactApiFi
   assert content_response.headers["x-content-type-options"] == "nosniff"
 
 
+def test_html_artifact_api_filters_sandbox_artifacts_by_default(
+  artifact_api: ArtifactApiFixture,
+) -> None:
+  product_artifact = _artifact("product-artifact", ticker="PCTY")
+  sandbox_artifact = _artifact(
+    "sandbox-artifact",
+    ticker="PCTY",
+    origin_kind="harness",
+    visibility="sandbox",
+  )
+  _write_html_artifact(artifact_api, product_artifact)
+  _write_html_artifact(artifact_api, sandbox_artifact)
+  _set_sidecar_mtime(artifact_api, product_artifact.artifact_id, 100)
+  _set_sidecar_mtime(artifact_api, sandbox_artifact.artifact_id, 200)
+
+  with TestClient(artifact_api.app) as client:
+    default_list = client.get("/api/html-artifacts", headers=_signed_headers())
+    default_sidecar = client.get("/api/html-artifacts/sandbox-artifact", headers=_signed_headers())
+    default_content = client.get("/api/html-artifacts/sandbox-artifact/content", headers=_signed_headers())
+    sandbox_list = client.get(
+      "/api/html-artifacts?visibility=sandbox&origin_kind=harness",
+      headers=_signed_headers(),
+    )
+    sandbox_sidecar = client.get(
+      "/api/html-artifacts/sandbox-artifact?visibility=sandbox&origin_kind=harness",
+      headers=_signed_headers(),
+    )
+    sandbox_content = client.get(
+      "/api/html-artifacts/sandbox-artifact/content?visibility=sandbox&origin_kind=harness",
+      headers=_signed_headers(),
+    )
+
+  assert default_list.status_code == 200
+  assert [item["artifact_id"] for item in default_list.json()] == ["product-artifact"]
+  assert default_sidecar.status_code == 404
+  assert default_content.status_code == 404
+  assert sandbox_list.status_code == 200
+  assert [item["artifact_id"] for item in sandbox_list.json()] == ["sandbox-artifact"]
+  assert sandbox_sidecar.status_code == 200
+  assert sandbox_content.status_code == 200
+
+
 def test_html_artifact_missing_sidecar_or_content_returns_404(
   artifact_api: ArtifactApiFixture,
 ) -> None:
@@ -132,6 +174,8 @@ def _artifact(
   *,
   ticker: str | None,
   purpose: str = "exploration",
+  origin_kind: str | None = None,
+  visibility: str | None = None,
 ) -> HtmlArtifact:
   return HtmlArtifact(
     artifact_id=artifact_id,
@@ -149,6 +193,8 @@ def _artifact(
       copy_as_json={"artifact_id": artifact_id},
     ),
     ts="2026-06-01T12:00:00+00:00",
+    origin_kind=origin_kind,
+    visibility=visibility,
   )
 
 

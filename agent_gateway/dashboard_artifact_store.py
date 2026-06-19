@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
 
+from .artifact_sidecar_index import artifact_sidecar_index_path, register_dashboard_artifact_sidecar
 from schema.dashboard_artifact import DashboardArtifact
 
 
+log = logging.getLogger(__name__)
 _DASHBOARD_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,128}$")
 
 
@@ -16,6 +19,7 @@ def write_dashboard_artifact(
   workspace_dir: Path,
   artifact: DashboardArtifact,
   payload_json: Any,
+  user_id: str = "",
 ) -> None:
   """Atomic dual-write: payload first, sidecar rename as the commit point."""
   artifact_id = _validate_dashboard_artifact_id(artifact.artifact_id)
@@ -46,6 +50,26 @@ def write_dashboard_artifact(
     _unlink_if_exists(payload_tmp_path)
     _unlink_if_exists(sidecar_tmp_path)
     raise
+  try:
+    register_dashboard_artifact_sidecar(
+      workspace_dir=workspace_dir,
+      artifact=artifact,
+      sidecar_path=sidecar_path,
+      payload_path=payload_path,
+      user_id=user_id,
+    )
+  except Exception:
+    log.warning(
+      "artifact_index_failure",
+      extra={
+        "artifact_kind": "dashboard",
+        "artifact_id": artifact_id,
+        "user_id": user_id,
+        "workspace_dir": str(Path(workspace_dir).resolve()),
+        "index_path": str(artifact_sidecar_index_path(workspace_dir)),
+      },
+      exc_info=True,
+    )
 
 
 def read_dashboard_artifact_sidecar(workspace_dir: Path, artifact_id: str) -> DashboardArtifact | None:

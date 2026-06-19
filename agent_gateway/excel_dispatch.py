@@ -66,6 +66,8 @@ def _connected_workbooks(workbooks: list[dict[str, Any]]) -> list[dict[str, Any]
       continue
     if workbook.get("detached"):
       continue
+    if workbook.get("live") is False:
+      continue
     if _as_non_empty_str(workbook.get("gateway_session_id")) is None:
       continue
     connected.append(workbook)

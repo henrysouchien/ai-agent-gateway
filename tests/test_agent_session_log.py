@@ -13,7 +13,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentSessionLog, AgentSessionRef, QueryCursor, resolve_agent_session_id
-from agent_gateway.agent_session_log import slugify
+from agent_gateway.agent_session_log import agent_session_logical_path_for_jsonl, slugify
 
 
 def _run(coro):
@@ -232,7 +232,58 @@ def test_desc_query_uses_reverse_scan_and_stops_early(tmp_path: Path, monkeypatc
   assert len(entries) == 1
   assert entries[0].seq == 1200
   assert entries[0].event["index"] == 1199
-  assert seen_lines <= 2
+  assert seen_lines <= 3
+
+
+def test_query_past_active_tail_uses_fast_bounds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+  path = tmp_path / "large-active.jsonl"
+  rows = [
+    json.dumps(
+      {
+        "seq": seq,
+        "timestamp": float(seq),
+        "event": {"type": "assistant_message", "index": seq},
+      },
+      separators=(",", ":"),
+    )
+    for seq in range(1, 5001)
+  ]
+  path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+  log = AgentSessionLog(path)
+
+  parsed_entries = 0
+  original_parse_entry = log._parse_entry
+
+  def _counting_parse_entry(raw: bytes, *, is_last_line: bool):
+    nonlocal parsed_entries
+    parsed_entries += 1
+    return original_parse_entry(raw, is_last_line=is_last_line)
+
+  monkeypatch.setattr(log, "_parse_entry", _counting_parse_entry)
+
+  entries, _ = _run(log.query(after_seq=5001, order="asc"))
+
+  assert entries == []
+  assert parsed_entries <= 4
+
+
+def test_active_offset_cache_invalidates_after_external_rotation(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setenv("AGENT_SESSION_LOG_MAX_ACTIVE_BYTES", "1")
+  path = tmp_path / "rotated-by-peer.jsonl"
+  cached_reader = AgentSessionLog(path)
+  rotating_writer = AgentSessionLog(path)
+
+  _run(cached_reader.append({"type": "assistant_message", "text": "first"}))
+  first_entries, _ = _run(cached_reader.query(after_seq=1, order="asc"))
+  assert [entry.seq for entry in first_entries] == [1]
+
+  _run(rotating_writer.append({"type": "assistant_message", "text": "second"}))
+  second_entries, _ = _run(cached_reader.query(after_seq=2, order="asc"))
+
+  assert [entry.seq for entry in second_entries] == [2]
 
 
 def test_truncated_trailing_line_is_skipped_with_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -266,6 +317,155 @@ def test_concurrent_appends_remain_well_formed_jsonl(tmp_path: Path) -> None:
   assert [row["seq"] for row in rows] == list(range(1, 201))
   assert all(row["event"]["event_schema_version"] == 1 for row in rows)
   assert _run(log.latest_seq()) == 200
+
+
+def test_rotation_keeps_query_pagination_iter_and_latest_seq(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+  monkeypatch.setenv("AGENT_SESSION_LOG_MAX_ACTIVE_BYTES", "1")
+  log = AgentSessionLog(tmp_path / "rotating.jsonl")
+
+  for idx in range(5):
+    _run(log.append({"type": "assistant_message", "index": idx, "text": f"event-{idx}"}))
+
+  manifest = json.loads(log.manifest_path.read_text(encoding="utf-8"))
+  assert manifest["latest_seq"] == 5
+  assert len(manifest["segments"]) == 4
+  assert [item["first_seq"] for item in manifest["segments"]] == [1, 2, 3, 4]
+  assert [item["last_seq"] for item in manifest["segments"]] == [1, 2, 3, 4]
+  assert [row["seq"] for row in _load_jsonl(log.path)] == [5]
+
+  asc_entries, _ = _run(log.query(order="asc"))
+  desc_entries, _ = _run(log.query(order="desc"))
+  assert [entry.seq for entry in asc_entries] == [1, 2, 3, 4, 5]
+  assert [entry.seq for entry in desc_entries] == [5, 4, 3, 2, 1]
+
+  desc_page, desc_cursor = _run(log.query(order="desc", limit=2))
+  assert [entry.seq for entry in desc_page] == [5, 4]
+  assert desc_cursor == QueryCursor(after_seq=4, direction="desc")
+  desc_second_page, desc_second_cursor = _run(log.query(order="desc", limit=2, cursor=desc_cursor))
+  assert [entry.seq for entry in desc_second_page] == [3, 2]
+  assert desc_second_cursor == QueryCursor(after_seq=2, direction="desc")
+
+  first_page, cursor = _run(log.query(order="asc", limit=3))
+  assert [entry.seq for entry in first_page] == [1, 2, 3]
+  assert cursor == QueryCursor(after_seq=3, direction="asc")
+  second_page, second_cursor = _run(log.query(order="asc", limit=3, cursor=cursor))
+  assert [entry.seq for entry in second_page] == [4, 5]
+  assert second_cursor is None
+
+  filtered, _ = _run(log.query(contains_text="event-3", order="asc"))
+  assert [entry.seq for entry in filtered] == [4]
+  iterated = list(_run(_collect_async(log.iter_from(after_seq=2))))
+  assert [entry.seq for entry in iterated] == [3, 4, 5]
+  assert _run(log.latest_seq()) == 5
+
+
+def test_rotation_writes_v2_active_and_segment_sidecars(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setenv("AGENT_SESSION_LOG_MAX_ACTIVE_BYTES", "1")
+  ref = AgentSessionRef(
+    user_id="alice",
+    agent_id="analyst",
+    agent_session_id=resolve_agent_session_id("alice", "analyst"),
+  )
+  log = AgentSessionLog(session_ref=ref, base_dir=tmp_path / "sessions")
+
+  _run(log.append({"type": "assistant_message", "text": "first"}))
+  _run(log.append({"type": "assistant_message", "text": "second"}))
+
+  active_meta = json.loads(log.path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+  manifest = json.loads(log.manifest_path.read_text(encoding="utf-8"))
+  segment_path = log.segments_dir / manifest["segments"][0]["path"]
+  segment_meta = json.loads(segment_path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+
+  assert active_meta["schema_version"] == 2
+  assert active_meta["file_role"] == "active"
+  assert active_meta["active_generation"] == 1
+  assert active_meta["agent_session_id"] == ref.agent_session_id
+  assert segment_meta["schema_version"] == 2
+  assert segment_meta["file_role"] == "segment"
+  assert segment_meta["segment_id"] == manifest["segments"][0]["segment_id"]
+  assert segment_meta["first_seq"] == 1
+  assert segment_meta["last_seq"] == 1
+  assert segment_meta["rotated_from_source_id"] == manifest["segments"][0]["rotated_from_source_id"]
+  assert set(segment_meta["rotated_from_file_identity"]) == {"mtime_ns", "size", "st_dev", "st_ino"}
+  assert agent_session_logical_path_for_jsonl(log.path) == log.path.resolve()
+  assert agent_session_logical_path_for_jsonl(segment_path) == log.path.resolve()
+
+  orphan_segment = log.segments_dir / "orphan.jsonl"
+  orphan_segment.write_text("", encoding="utf-8")
+  assert agent_session_logical_path_for_jsonl(orphan_segment) is None
+
+
+def test_repair_rebuilds_missing_manifest_and_segment_sidecar(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setenv("AGENT_SESSION_LOG_MAX_ACTIVE_BYTES", "1")
+  ref = AgentSessionRef(
+    user_id="alice",
+    agent_id="analyst",
+    agent_session_id=resolve_agent_session_id("alice", "analyst"),
+  )
+  log = AgentSessionLog(session_ref=ref, base_dir=tmp_path / "sessions")
+  _run(log.append({"type": "assistant_message", "text": "first"}))
+  _run(log.append({"type": "assistant_message", "text": "second"}))
+  manifest = json.loads(log.manifest_path.read_text(encoding="utf-8"))
+  segment_path = log.segments_dir / manifest["segments"][0]["path"]
+
+  log.manifest_path.unlink()
+  segment_path.with_suffix(".meta.json").unlink()
+
+  repaired = AgentSessionLog(path=log.path)
+  repaired_manifest = json.loads(repaired.manifest_path.read_text(encoding="utf-8"))
+  repaired_segment_meta = json.loads(segment_path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+  entries, _ = _run(repaired.query(order="asc"))
+
+  assert [entry.seq for entry in entries] == [1, 2]
+  assert repaired_manifest["active_generation"] == 1
+  assert repaired_manifest["latest_seq"] == 2
+  assert repaired_manifest["segments"][0]["segment_id"] == "000000000001-000000000001-g000000"
+  assert repaired_segment_meta["schema_version"] == 2
+  assert repaired_segment_meta["file_role"] == "segment"
+  assert repaired_segment_meta["agent_session_id"] == ref.agent_session_id
+  assert repaired_segment_meta["agent_id"] == ref.agent_id
+  assert repaired_segment_meta["user_id"] == ref.user_id
+
+
+def test_repair_rewrites_missing_segment_sidecar_and_recreates_active(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setenv("AGENT_SESSION_LOG_MAX_ACTIVE_BYTES", "1")
+  ref = AgentSessionRef(
+    user_id="alice",
+    agent_id="analyst",
+    agent_session_id=resolve_agent_session_id("alice", "analyst"),
+  )
+  log = AgentSessionLog(session_ref=ref, base_dir=tmp_path / "sessions")
+  _run(log.append({"type": "assistant_message", "text": "first"}))
+  log._rotate_active_if_needed_locked()
+  manifest = json.loads(log.manifest_path.read_text(encoding="utf-8"))
+  segment_path = log.segments_dir / manifest["segments"][0]["path"]
+
+  segment_path.with_suffix(".meta.json").unlink()
+  log.path.unlink()
+  log.path.with_suffix(".meta.json").unlink()
+
+  repaired = AgentSessionLog(path=log.path)
+  assert repaired.path.exists()
+  assert repaired.path.read_text(encoding="utf-8") == ""
+  assert segment_path.with_suffix(".meta.json").exists()
+  active_meta = json.loads(repaired.path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+  assert active_meta["schema_version"] == 2
+  assert active_meta["file_role"] == "active"
+  assert active_meta["active_generation"] == 1
+
+  second = _run(repaired.append({"type": "assistant_message", "text": "second"}))
+  entries, _ = _run(repaired.query(order="asc"))
+  assert second.seq == 2
+  assert [entry.seq for entry in entries] == [1, 2]
 
 
 def test_slugify_normalizes_and_rejects_empty() -> None:

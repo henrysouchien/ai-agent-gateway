@@ -16,13 +16,17 @@ from agent_gateway.artifact_paths import (
   _validate_artifact_id,
   _validate_skill,
   _validate_ticker,
+  artifact_json_paths_for_request,
   artifact_json_path_for_request,
-  latest_artifact_json_path_for_request,
   user_workspace_root,
 )
 
 
 ArtifactAuthDependency = Callable[[Request], str]
+_ORIGIN_VALUES = frozenset({"product", "harness", "import"})
+_ORIGIN_FILTER_VALUES = frozenset({"all", *_ORIGIN_VALUES})
+_VISIBILITY_VALUES = frozenset({"default", "sandbox", "archived"})
+_VISIBILITY_FILTER_VALUES = frozenset({"default", "sandbox", "archived", "all"})
 
 
 class ArtifactResponse(BaseModel):
@@ -224,7 +228,12 @@ def _file_cache_headers(path: Path) -> dict[str, str]:
   }
 
 
-def _artifact_json_response(artifact: ArtifactPath | None) -> JSONResponse:
+def _artifact_json_response(
+  artifact: ArtifactPath | None,
+  *,
+  user_id: str,
+  filters: dict[str, Any],
+) -> JSONResponse:
   if artifact is None:
     raise HTTPException(status_code=404, detail="Artifact not found")
   path = _assert_artifact_path_still_safe(artifact)
@@ -232,17 +241,196 @@ def _artifact_json_response(artifact: ArtifactPath | None) -> JSONResponse:
     raise HTTPException(status_code=404, detail="Artifact not found")
   with path.open("r", encoding="utf-8") as handle:
     payload = json.load(handle)
+  if not isinstance(payload, dict):
+    raise HTTPException(status_code=500, detail="Artifact payload must be a JSON object")
+  payload.update(_effective_artifact_fields(payload, user_id=user_id))
+  if not _payload_matches_artifact_filters(payload, filters=filters):
+    raise HTTPException(status_code=404, detail="Artifact not found")
   return JSONResponse(content=payload, headers=_file_cache_headers(path))
+
+
+def _artifact_filters(
+  *,
+  research_file_id: int | None,
+  control_run_id: str | None,
+  visibility: str | None,
+  origin_kind: str | None,
+) -> dict[str, Any]:
+  return {
+    "research_file_id": research_file_id,
+    "control_run_id": _string_or_none(control_run_id),
+    "visibility": _visibility_filter(visibility),
+    "origin_kind": _origin_filter(origin_kind),
+  }
+
+
+def _origin_filter(value: object | None) -> str:
+  normalized = str(value if value is not None else "all").strip().lower()
+  if normalized not in _ORIGIN_FILTER_VALUES:
+    raise HTTPException(status_code=400, detail="origin_kind filter is invalid")
+  return normalized
+
+
+def _visibility_filter(value: object | None) -> str:
+  normalized = str(value if value is not None else "default").strip().lower()
+  if normalized not in _VISIBILITY_FILTER_VALUES:
+    raise HTTPException(status_code=400, detail="visibility filter is invalid")
+  return normalized
+
+
+def _origin_kind(value: object | None) -> str:
+  normalized = str(value if value is not None else "product").strip().lower()
+  if normalized not in _ORIGIN_VALUES:
+    raise ValueError("invalid origin_kind")
+  return normalized
+
+
+def _visibility(value: object | None) -> str:
+  normalized = str(value if value is not None else "default").strip().lower()
+  if normalized not in _VISIBILITY_VALUES:
+    raise ValueError("invalid visibility")
+  return normalized
+
+
+def _origin_ref(value: object | None) -> dict[str, Any] | None:
+  if value is None:
+    return None
+  if isinstance(value, dict):
+    return value or None
+  if isinstance(value, str):
+    if not value.strip():
+      return None
+    parsed = json.loads(value)
+    if isinstance(parsed, dict):
+      return parsed or None
+  raise ValueError("invalid origin_ref")
+
+
+def _effective_artifact_fields(payload: dict[str, Any], *, user_id: str) -> dict[str, Any]:
+  raw_research_file_id = payload.get("research_file_id")
+  research_file_id = _int_or_none(raw_research_file_id)
+  classification = _research_file_classification(user_id=user_id, research_file_id=research_file_id)
+  if classification is None:
+    classification = _sidecar_classification(
+      payload,
+      unresolved_research_file=_research_file_id_token_present(raw_research_file_id),
+    )
+  return {
+    "research_file_id": research_file_id,
+    "control_run_id": _string_or_none(payload.get("control_run_id")),
+    "has_research_file": research_file_id is not None,
+    **classification,
+  }
+
+
+def _effective_auxiliary_artifact_fields(payload: dict[str, Any], *, user_id: str) -> dict[str, Any]:
+  return _effective_artifact_fields(payload, user_id=user_id)
+
+
+def _research_file_classification(*, user_id: str, research_file_id: int | None) -> dict[str, Any] | None:
+  if research_file_id is None:
+    return None
+  try:
+    from research.repository import get_repository_factory
+
+    row = get_repository_factory().get(user_id).get_file(int(research_file_id))
+  except Exception:
+    return None
+  if not isinstance(row, dict):
+    return None
+  return {
+    "origin_kind": _origin_kind(row.get("origin_kind")),
+    "visibility": _visibility(row.get("visibility")),
+    "origin_ref": _origin_ref(row.get("origin_ref")),
+    "classification_source": "research_file",
+  }
+
+
+def _sidecar_classification(
+  payload: dict[str, Any],
+  *,
+  unresolved_research_file: bool,
+) -> dict[str, Any]:
+  if payload.get("origin_kind") is None and payload.get("visibility") is None and payload.get("origin_ref") is None:
+    if unresolved_research_file:
+      return {
+        "origin_kind": "import",
+        "visibility": "archived",
+        "origin_ref": None,
+        "classification_source": "unresolved_research_file",
+      }
+    return {
+      "origin_kind": "product",
+      "visibility": "default",
+      "origin_ref": None,
+      "classification_source": "legacy_default",
+    }
+  try:
+    return {
+      "origin_kind": _origin_kind(payload.get("origin_kind")),
+      "visibility": _visibility(payload.get("visibility")),
+      "origin_ref": _origin_ref(payload.get("origin_ref")),
+      "classification_source": "sidecar",
+    }
+  except ValueError:
+    return {
+      "origin_kind": "import",
+      "visibility": "archived",
+      "origin_ref": None,
+      "classification_source": "invalid_sidecar",
+    }
+
+
+def _payload_matches_artifact_filters(payload: dict[str, Any], *, filters: dict[str, Any]) -> bool:
+  research_file_id = filters.get("research_file_id")
+  if research_file_id is not None and payload.get("research_file_id") != int(research_file_id):
+    return False
+  control_run_id = filters.get("control_run_id")
+  if control_run_id is not None and payload.get("control_run_id") != control_run_id:
+    return False
+  origin_kind = filters.get("origin_kind")
+  if origin_kind != "all" and payload.get("origin_kind") != origin_kind:
+    return False
+  visibility = filters.get("visibility")
+  if visibility != "all" and payload.get("visibility") != visibility:
+    return False
+  return True
+
+
+def _int_or_none(value: Any) -> int | None:
+  if isinstance(value, bool):
+    return None
+  if isinstance(value, int):
+    return value
+  if isinstance(value, str):
+    text = value.strip()
+    if not text:
+      return None
+    try:
+      return int(text)
+    except ValueError:
+      return None
+  return None
+
+
+def _research_file_id_token_present(value: Any) -> bool:
+  if value is None:
+    return False
+  if isinstance(value, str):
+    return bool(value.strip())
+  return True
 
 
 def _artifact_response_from_sidecar(
   *,
   path: Path,
   workspace_root: Path,
+  user_id: str,
   ticker: str,
   skill: str,
   artifact_id: str,
   run_index: dict[str, dict[str, str]],
+  filters: dict[str, Any],
 ) -> ArtifactResponse | None:
   try:
     with path.open("r", encoding="utf-8") as handle:
@@ -250,6 +438,9 @@ def _artifact_response_from_sidecar(
   except (OSError, json.JSONDecodeError):
     return None
   if not isinstance(payload, dict):
+    return None
+  payload.update(_effective_artifact_fields(payload, user_id=user_id))
+  if not _payload_matches_artifact_filters(payload, filters=filters):
     return None
 
   resolved_artifact_id = _string_or_none(payload.get("artifact_id")) or artifact_id
@@ -334,9 +525,11 @@ def _artifact_sidecars_for_user(
 def _html_artifact_responses_for_user(
   workspace_root: Path,
   *,
+  user_id: str,
   ticker_filter: str | None,
   skill_filter: str | None,
   run_index: dict[str, dict[str, str]],
+  filters: dict[str, Any],
   limit: int,
 ) -> list[tuple[int, str, ArtifactResponse]]:
   try:
@@ -366,6 +559,10 @@ def _html_artifact_responses_for_user(
       mtime_ns = sidecar_path.stat().st_mtime_ns
     except (OSError, ValueError):
       continue
+    payload = artifact.model_dump(mode="json")
+    payload.update(_effective_auxiliary_artifact_fields(payload, user_id=user_id))
+    if not _payload_matches_artifact_filters(payload, filters=filters):
+      continue
     artifact_path = f"artifacts/_html/{artifact_id}.json"
     binary_artifact_path = f"artifacts/_html/{artifact_id}.html"
     run_metadata = _artifact_run_metadata(
@@ -374,7 +571,7 @@ def _html_artifact_responses_for_user(
       artifact_path=artifact_path,
       binary_artifact_path=binary_artifact_path,
     )
-    run_id = run_metadata.get("run_id") or _string_or_none(artifact.session_id)
+    run_id = run_metadata.get("run_id") or _string_or_none(payload.get("control_run_id")) or _string_or_none(artifact.session_id)
     responses.append(
       (
         mtime_ns,
@@ -399,9 +596,11 @@ def _html_artifact_responses_for_user(
 def _dashboard_artifact_responses_for_user(
   workspace_root: Path,
   *,
+  user_id: str,
   ticker_filter: str | None,
   skill_filter: str | None,
   run_index: dict[str, dict[str, str]],
+  filters: dict[str, Any],
   limit: int,
 ) -> list[tuple[int, str, ArtifactResponse]]:
   try:
@@ -431,6 +630,10 @@ def _dashboard_artifact_responses_for_user(
       mtime_ns = sidecar_path.stat().st_mtime_ns
     except (OSError, ValueError):
       continue
+    payload = artifact.model_dump(mode="json")
+    payload.update(_effective_auxiliary_artifact_fields(payload, user_id=user_id))
+    if not _payload_matches_artifact_filters(payload, filters=filters):
+      continue
     artifact_path = f"artifacts/_dashboards/{artifact_id}.json"
     binary_artifact_path = f"artifacts/_dashboards/{artifact_id}.payload.json"
     run_metadata = _artifact_run_metadata(
@@ -453,7 +656,7 @@ def _dashboard_artifact_responses_for_user(
           data_source="live",
           created_at=_string_or_none(artifact.ts) or _created_at_from_mtime(sidecar_path),
           skill_run_id=run_metadata.get("skill_run_id") or artifact_id,
-          run_id=run_metadata.get("run_id"),
+          run_id=run_metadata.get("run_id") or _string_or_none(payload.get("control_run_id")),
         ),
       )
     )
@@ -473,6 +676,10 @@ def build_artifacts_router(
     ticker: str | None = Query(default=None),
     skill: str | None = Query(default=None),
     run_id: str | None = Query(default=None),
+    research_file_id: int | None = Query(default=None),
+    control_run_id: str | None = Query(default=None),
+    visibility: str = Query(default="default"),
+    origin_kind: str = Query(default="all"),
     limit: int = Query(default=50, ge=1),
   ) -> ArtifactsListResponse:
     user_id = artifact_auth_dependency(request)
@@ -480,6 +687,12 @@ def build_artifacts_router(
     skill_filter = _filter_skill(skill)
     run_id_filter = _string_or_none(run_id)
     effective_limit = min(limit, 50)
+    filters = _artifact_filters(
+      research_file_id=research_file_id,
+      control_run_id=control_run_id,
+      visibility=visibility,
+      origin_kind=origin_kind,
+    )
 
     try:
       workspace_root = user_workspace_root(user_id)
@@ -499,10 +712,12 @@ def build_artifacts_router(
       artifact = _artifact_response_from_sidecar(
         path=path,
         workspace_root=workspace_root,
+        user_id=user_id,
         ticker=path_ticker,
         skill=path_skill,
         artifact_id=artifact_id,
         run_index=run_index,
+        filters=filters,
       )
       if artifact is None:
         continue
@@ -517,11 +732,13 @@ def build_artifacts_router(
       artifact_entries.append((_mtime_ns, path.as_posix(), artifact))
 
     for entry in _html_artifact_responses_for_user(
-        workspace_root=workspace_root,
-        ticker_filter=ticker_filter,
-        skill_filter=skill_filter,
-        run_index=run_index,
-        limit=effective_limit,
+      workspace_root=workspace_root,
+      user_id=user_id,
+      ticker_filter=ticker_filter,
+      skill_filter=skill_filter,
+      run_index=run_index,
+      filters=filters,
+      limit=max(effective_limit, 500),
     ):
       if run_id_filter is not None and entry[2].run_id != run_id_filter:
         continue
@@ -534,11 +751,13 @@ def build_artifacts_router(
       artifact_entries.append(entry)
 
     for entry in _dashboard_artifact_responses_for_user(
-        workspace_root=workspace_root,
-        ticker_filter=ticker_filter,
-        skill_filter=skill_filter,
-        run_index=run_index,
-        limit=effective_limit,
+      workspace_root=workspace_root,
+      user_id=user_id,
+      ticker_filter=ticker_filter,
+      skill_filter=skill_filter,
+      run_index=run_index,
+      filters=filters,
+      limit=max(effective_limit, 500),
     ):
       if run_id_filter is not None and entry[2].run_id != run_id_filter:
         continue
@@ -556,17 +775,52 @@ def build_artifacts_router(
     )
 
   @router.get("/{ticker}/{skill}/latest")
-  async def latest_artifact(request: Request, ticker: str, skill: str) -> JSONResponse:
+  async def latest_artifact(
+    request: Request,
+    ticker: str,
+    skill: str,
+    research_file_id: int | None = Query(default=None),
+    control_run_id: str | None = Query(default=None),
+    visibility: str = Query(default="default"),
+    origin_kind: str = Query(default="all"),
+  ) -> JSONResponse:
     user_id = artifact_auth_dependency(request)
+    filters = _artifact_filters(
+      research_file_id=research_file_id,
+      control_run_id=control_run_id,
+      visibility=visibility,
+      origin_kind=origin_kind,
+    )
     try:
-      artifact = latest_artifact_json_path_for_request(user_id, ticker=ticker, skill=skill)
+      artifacts = artifact_json_paths_for_request(user_id, ticker=ticker, skill=skill)
     except ArtifactPathError as exc:
       raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-    return _artifact_json_response(artifact)
+    for artifact in reversed(artifacts):
+      try:
+        return _artifact_json_response(artifact, user_id=user_id, filters=filters)
+      except HTTPException as exc:
+        if exc.status_code != 404:
+          raise
+    raise HTTPException(status_code=404, detail="Artifact not found")
 
   @router.get("/{ticker}/{skill}/{artifact_id}")
-  async def artifact_by_id(request: Request, ticker: str, skill: str, artifact_id: str) -> JSONResponse:
+  async def artifact_by_id(
+    request: Request,
+    ticker: str,
+    skill: str,
+    artifact_id: str,
+    research_file_id: int | None = Query(default=None),
+    control_run_id: str | None = Query(default=None),
+    visibility: str = Query(default="default"),
+    origin_kind: str = Query(default="all"),
+  ) -> JSONResponse:
     user_id = artifact_auth_dependency(request)
+    filters = _artifact_filters(
+      research_file_id=research_file_id,
+      control_run_id=control_run_id,
+      visibility=visibility,
+      origin_kind=origin_kind,
+    )
     try:
       artifact = artifact_json_path_for_request(
         user_id,
@@ -576,7 +830,7 @@ def build_artifacts_router(
       )
     except ArtifactPathError as exc:
       raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-    return _artifact_json_response(artifact)
+    return _artifact_json_response(artifact, user_id=user_id, filters=filters)
 
   return router
 

@@ -81,6 +81,48 @@ def test_dashboard_artifact_sidecar_and_payload_endpoints(artifact_api: Artifact
   assert "content-security-policy" not in payload_response.headers
 
 
+def test_dashboard_artifact_api_filters_sandbox_artifacts_by_default(
+  artifact_api: ArtifactApiFixture,
+) -> None:
+  product_artifact = _artifact("product-artifact", ticker="PCTY")
+  sandbox_artifact = _artifact(
+    "sandbox-artifact",
+    ticker="PCTY",
+    origin_kind="harness",
+    visibility="sandbox",
+  )
+  _write_dashboard_artifact(artifact_api, product_artifact)
+  _write_dashboard_artifact(artifact_api, sandbox_artifact)
+  _set_sidecar_mtime(artifact_api, product_artifact.artifact_id, 100)
+  _set_sidecar_mtime(artifact_api, sandbox_artifact.artifact_id, 200)
+
+  with TestClient(artifact_api.app) as client:
+    default_list = client.get("/api/dashboard-artifacts", headers=_signed_headers())
+    default_sidecar = client.get("/api/dashboard-artifacts/sandbox-artifact", headers=_signed_headers())
+    default_payload = client.get("/api/dashboard-artifacts/sandbox-artifact/payload", headers=_signed_headers())
+    sandbox_list = client.get(
+      "/api/dashboard-artifacts?visibility=sandbox&origin_kind=harness",
+      headers=_signed_headers(),
+    )
+    sandbox_sidecar = client.get(
+      "/api/dashboard-artifacts/sandbox-artifact?visibility=sandbox&origin_kind=harness",
+      headers=_signed_headers(),
+    )
+    sandbox_payload = client.get(
+      "/api/dashboard-artifacts/sandbox-artifact/payload?visibility=sandbox&origin_kind=harness",
+      headers=_signed_headers(),
+    )
+
+  assert default_list.status_code == 200
+  assert [item["artifact_id"] for item in default_list.json()] == ["product-artifact"]
+  assert default_sidecar.status_code == 404
+  assert default_payload.status_code == 404
+  assert sandbox_list.status_code == 200
+  assert [item["artifact_id"] for item in sandbox_list.json()] == ["sandbox-artifact"]
+  assert sandbox_sidecar.status_code == 200
+  assert sandbox_payload.status_code == 200
+
+
 def test_dashboard_artifact_missing_sidecar_or_payload_returns_404(
   artifact_api: ArtifactApiFixture,
 ) -> None:
@@ -134,6 +176,8 @@ def _artifact(
   artifact_id: str,
   *,
   ticker: str | None,
+  origin_kind: str | None = None,
+  visibility: str | None = None,
 ) -> DashboardArtifact:
   return DashboardArtifact(
     artifact_id=artifact_id,
@@ -146,6 +190,8 @@ def _artifact(
     profile="production",
     payload_ref=f"{artifact_id}.payload.json",
     ts="2026-06-01T12:00:00+00:00",
+    origin_kind=origin_kind,
+    visibility=visibility,
   )
 
 

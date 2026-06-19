@@ -227,6 +227,7 @@ typed_contract: DemoContract
     max_budget_usd=1.25,
     persist_state=False,
     typed_contract="DemoContract",
+    mutation_mode=None,
     catalog=True,
     path=(skills_dir / "frontmatter-only.md").as_posix(),
   )

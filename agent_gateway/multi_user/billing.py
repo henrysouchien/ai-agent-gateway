@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 
 DEFAULT_USAGE_DLQ_PATH = Path("~/.gateway/usage_dlq.jsonl").expanduser()
@@ -60,6 +60,9 @@ class SessionUsageSummary:
   product_id: str | None = None
   model: str | None = None
   provider: str | None = None
+  rate_table_version: str | None = None
+  billing_mode: Literal["byok", "metered"] | None = None
+  context_surfaces: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -114,6 +117,8 @@ class _UsageAggregator:
     session_id: str,
     request_id: str,
     channel: str | None,
+    rate_table_version: str | None = None,
+    billing_mode: Literal["byok", "metered"] | None = None,
     started_at: float | None = None,
   ) -> None:
     self._lock = asyncio.Lock()
@@ -121,6 +126,8 @@ class _UsageAggregator:
     self._session_id = session_id
     self._request_id = request_id
     self._channel = channel
+    self._rate_table_version = rate_table_version
+    self._billing_mode = billing_mode
     self._started_at = started_at if started_at is not None else time.time()
     self._input_tokens = 0
     self._output_tokens = 0
@@ -160,6 +167,7 @@ class _UsageAggregator:
     ended_at: float | None = None,
     drain_complete: bool = True,
     in_flight_task_count: int = 0,
+    context_surfaces: list[dict[str, Any]] | None = None,
   ) -> SessionUsageSummary:
     async with self._lock:
       return SessionUsageSummary(
@@ -179,6 +187,13 @@ class _UsageAggregator:
         in_flight_task_count=in_flight_task_count,
         model=self._last_model,
         provider=self._last_provider,
+        rate_table_version=self._rate_table_version,
+        billing_mode=self._billing_mode,
+        context_surfaces=[
+          dict(surface)
+          for surface in (context_surfaces or [])
+          if isinstance(surface, dict)
+        ],
       )
 
 

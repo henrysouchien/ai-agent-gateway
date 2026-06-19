@@ -498,7 +498,7 @@ def test_control_artifacts_read_latest_and_specific_sidecar(artifact_pr8: Artifa
     )
 
   assert latest_response.status_code == 200
-  assert latest_response.json() == latest_payload
+  assert latest_response.json() == _with_default_classification(latest_payload)
   assert latest_response.headers["etag"]
   assert latest_response.headers["cache-control"] == "private, max-age=0"
 
@@ -506,6 +506,202 @@ def test_control_artifacts_read_latest_and_specific_sidecar(artifact_pr8: Artifa
   assert specific_response.json()["artifact_id"] == old_id
 
   assert missing_response.status_code == 404
+
+
+def test_control_artifacts_default_reads_skip_sandbox_sidecars(artifact_pr8: ArtifactPr8Fixture) -> None:
+  product_id = "2026-05-20T120000.000-run-product"
+  sandbox_id = "2026-05-20T130000.000-run-harness"
+  _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    product_id,
+    mtime=1_800_000_001,
+  )
+  _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    sandbox_id,
+    mtime=1_800_000_002,
+    payload_updates={
+      "origin_kind": "harness",
+      "visibility": "sandbox",
+      "origin_ref": {
+        "schema_version": "research_file_origin_ref_v1",
+        "kind": "f131_live_harness",
+        "run_id": "run-control-filter-test",
+      },
+    },
+  )
+
+  with TestClient(artifact_pr8.app) as client:
+    headers = _bearer_headers(client, USER_ID)
+    default_list = client.get("/api/control/artifacts", headers=headers)
+    default_latest = client.get("/api/control/artifacts/PCTY/earnings-scenarios/latest", headers=headers)
+    default_sandbox_exact = client.get(
+      f"/api/control/artifacts/PCTY/earnings-scenarios/{sandbox_id}",
+      headers=headers,
+    )
+    sandbox_list = client.get(
+      "/api/control/artifacts?visibility=sandbox&origin_kind=harness",
+      headers=headers,
+    )
+    sandbox_latest = client.get(
+      "/api/control/artifacts/PCTY/earnings-scenarios/latest?visibility=sandbox&origin_kind=harness",
+      headers=headers,
+    )
+
+  assert default_list.status_code == 200
+  assert [artifact["artifact_id"] for artifact in default_list.json()["artifacts"]] == [product_id]
+  assert default_latest.status_code == 200
+  assert default_latest.json()["artifact_id"] == product_id
+  assert default_sandbox_exact.status_code == 404
+  assert sandbox_list.status_code == 200
+  assert [artifact["artifact_id"] for artifact in sandbox_list.json()["artifacts"]] == [sandbox_id]
+  assert sandbox_latest.status_code == 200
+  assert sandbox_latest.json()["artifact_id"] == sandbox_id
+
+
+def test_control_artifacts_default_reads_skip_sandbox_auxiliary_artifacts(
+  artifact_pr8: ArtifactPr8Fixture,
+) -> None:
+  product_html_id = "20260605T142435-producthtml"
+  sandbox_html_id = "20260605T142436-sandboxhtml"
+  sandbox_dashboard_id = "20260605T142437-sandboxdash"
+  _write_html_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    product_html_id,
+    mtime=1_800_000_001,
+  )
+  _write_html_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    sandbox_html_id,
+    mtime=1_800_000_002,
+    payload_updates={
+      "research_file_id": "42",
+      "origin_kind": "harness",
+      "visibility": "sandbox",
+      "origin_ref": {
+        "schema_version": "research_file_origin_ref_v1",
+        "kind": "f131_live_harness",
+        "run_id": "run-control-aux-filter-test",
+      },
+    },
+  )
+  _write_dashboard_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    sandbox_dashboard_id,
+    mtime=1_800_000_003,
+    payload_updates={
+      "origin_kind": "harness",
+      "visibility": "sandbox",
+      "origin_ref": {
+        "schema_version": "research_file_origin_ref_v1",
+        "kind": "f131_live_harness",
+        "run_id": "run-control-aux-filter-test",
+      },
+    },
+  )
+
+  with TestClient(artifact_pr8.app) as client:
+    headers = _bearer_headers(client, USER_ID)
+    default_list = client.get("/api/control/artifacts", headers=headers)
+    sandbox_list = client.get(
+      "/api/control/artifacts?visibility=sandbox&origin_kind=harness",
+      headers=headers,
+    )
+
+  assert default_list.status_code == 200
+  assert [artifact["artifact_id"] for artifact in default_list.json()["artifacts"]] == [product_html_id]
+  assert sandbox_list.status_code == 200
+  assert [artifact["artifact_id"] for artifact in sandbox_list.json()["artifacts"]] == [
+    sandbox_dashboard_id,
+    sandbox_html_id,
+  ]
+
+
+def test_control_artifacts_numeric_string_research_file_id_fails_closed_when_unresolved(
+  artifact_pr8: ArtifactPr8Fixture,
+) -> None:
+  artifact_id = "2026-05-20T130000.000-run-string-rfid"
+  payload = _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    artifact_id,
+    mtime=1_800_000_002,
+    payload_updates={"research_file_id": "42"},
+  )
+
+  with TestClient(artifact_pr8.app) as client:
+    headers = _bearer_headers(client, USER_ID)
+    default_list = client.get("/api/control/artifacts", headers=headers)
+    default_latest = client.get("/api/control/artifacts/PCTY/earnings-scenarios/latest", headers=headers)
+    archived_latest = client.get(
+      "/api/control/artifacts/PCTY/earnings-scenarios/latest?visibility=archived&origin_kind=import",
+      headers=headers,
+    )
+
+  assert default_list.status_code == 200
+  assert default_list.json()["artifacts"] == []
+  assert default_latest.status_code == 404
+  assert archived_latest.status_code == 200
+  assert archived_latest.json() == {
+    **payload,
+    "research_file_id": 42,
+    "control_run_id": None,
+    "has_research_file": True,
+    "origin_kind": "import",
+    "visibility": "archived",
+    "origin_ref": None,
+    "classification_source": "unresolved_research_file",
+  }
+
+
+def test_control_artifacts_boolean_research_file_id_fails_closed_when_unresolved(
+  artifact_pr8: ArtifactPr8Fixture,
+) -> None:
+  artifact_id = "2026-05-20T130000.000-run-bool-rfid"
+  payload = _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    artifact_id,
+    mtime=1_800_000_002,
+    payload_updates={"research_file_id": True},
+  )
+
+  with TestClient(artifact_pr8.app) as client:
+    headers = _bearer_headers(client, USER_ID)
+    default_list = client.get("/api/control/artifacts", headers=headers)
+    default_latest = client.get("/api/control/artifacts/PCTY/earnings-scenarios/latest", headers=headers)
+    archived_latest = client.get(
+      "/api/control/artifacts/PCTY/earnings-scenarios/latest?visibility=archived&origin_kind=import",
+      headers=headers,
+    )
+
+  assert default_list.status_code == 200
+  assert default_list.json()["artifacts"] == []
+  assert default_latest.status_code == 404
+  assert archived_latest.status_code == 200
+  assert archived_latest.json() == {
+    **payload,
+    "research_file_id": None,
+    "control_run_id": None,
+    "has_research_file": False,
+    "origin_kind": "import",
+    "visibility": "archived",
+    "origin_ref": None,
+    "classification_source": "unresolved_research_file",
+  }
 
 
 @pytest.mark.parametrize("auth_mode", ["bearer", "signed"])
@@ -631,6 +827,7 @@ def _write_artifact(
   mtime: int,
   include_artifact_path: bool = True,
   run_id: str | None = None,
+  payload_updates: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
   payload = {
     "artifact_id": artifact_id,
@@ -646,12 +843,27 @@ def _write_artifact(
     payload["run_id"] = run_id
   if include_artifact_path:
     payload["artifact_path"] = f"artifacts/{ticker}/{skill}/{artifact_id}.json"
+  if payload_updates:
+    payload.update(payload_updates)
 
   path = _workspace(data_dir, user_id) / "artifacts" / ticker / skill / f"{artifact_id}.json"
   path.parent.mkdir(parents=True, exist_ok=True)
   path.write_text(json.dumps(payload), encoding="utf-8")
   os.utime(path, (mtime, mtime))
   return payload
+
+
+def _with_default_classification(payload: dict[str, Any]) -> dict[str, Any]:
+  return {
+    **payload,
+    "research_file_id": None,
+    "control_run_id": None,
+    "has_research_file": False,
+    "origin_kind": "product",
+    "visibility": "default",
+    "origin_ref": None,
+    "classification_source": "legacy_default",
+  }
 
 
 def _write_letter(data_dir: Path, user_id: str, ticker: str, artifact_id: str, content: bytes) -> Path:
@@ -669,30 +881,34 @@ def _write_html_artifact(
   mtime: int,
   session_id: str | None = "fixture-session",
   ts: str = "2026-06-05T14:24:35.683368+00:00",
+  payload_updates: dict[str, Any] | None = None,
 ) -> None:
   path = _workspace(data_dir, user_id) / "artifacts" / "_html" / f"{artifact_id}.json"
   path.parent.mkdir(parents=True, exist_ok=True)
+  payload = {
+    "artifact_id": artifact_id,
+    "title": "Fixture HTML Artifact",
+    "purpose": "report",
+    "content_ref": f"artifacts/_html/{artifact_id}.html",
+    "summary": "Deterministic dev-only HTML artifact fixture for Hank web live QA.",
+    "ticker": "PCTY",
+    "session_id": session_id,
+    "source_skill": "fixture-html-artifact",
+    "sources": [],
+    "exports": {
+      "copy_as_prompt": None,
+      "copy_as_markdown": None,
+      "copy_as_json": None,
+    },
+    "ts": ts,
+    "origin_kind": "product",
+    "visibility": "default",
+    "contract_name": "HtmlArtifact",
+  }
+  if payload_updates:
+    payload.update(payload_updates)
   path.write_text(
-    json.dumps(
-      {
-        "artifact_id": artifact_id,
-        "title": "Fixture HTML Artifact",
-        "purpose": "report",
-        "content_ref": f"artifacts/_html/{artifact_id}.html",
-        "summary": "Deterministic dev-only HTML artifact fixture for Hank web live QA.",
-        "ticker": "PCTY",
-        "session_id": session_id,
-        "source_skill": "fixture-html-artifact",
-        "sources": [],
-        "exports": {
-          "copy_as_prompt": None,
-          "copy_as_markdown": None,
-          "copy_as_json": None,
-        },
-        "ts": ts,
-        "contract_name": "HtmlArtifact",
-      }
-    ),
+    json.dumps(payload),
     encoding="utf-8",
   )
   html_path = path.with_suffix(".html")
@@ -708,25 +924,29 @@ def _write_dashboard_artifact(
   *,
   mtime: int,
   ts: str = "2026-06-05T14:24:35.683368+00:00",
+  payload_updates: dict[str, Any] | None = None,
 ) -> None:
   path = _workspace(data_dir, user_id) / "artifacts" / "_dashboards" / f"{artifact_id}.json"
   path.parent.mkdir(parents=True, exist_ok=True)
+  payload = {
+    "artifact_id": artifact_id,
+    "title": "Fixture Dashboard Artifact",
+    "summary": "Deterministic dev-only DashboardArtifact fixture for Hank web live QA.",
+    "ticker": "PCTY",
+    "scope_label": None,
+    "source_skill": "fixture-dashboard-artifact",
+    "readiness_posture": "decision_ready",
+    "profile": "production",
+    "payload_ref": f"{artifact_id}.payload.json",
+    "ts": ts,
+    "origin_kind": "product",
+    "visibility": "default",
+    "contract_name": "DashboardArtifact",
+  }
+  if payload_updates:
+    payload.update(payload_updates)
   path.write_text(
-    json.dumps(
-      {
-        "artifact_id": artifact_id,
-        "title": "Fixture Dashboard Artifact",
-        "summary": "Deterministic dev-only DashboardArtifact fixture for Hank web live QA.",
-        "ticker": "PCTY",
-        "scope_label": None,
-        "source_skill": "fixture-dashboard-artifact",
-        "readiness_posture": "decision_ready",
-        "profile": "production",
-        "payload_ref": f"{artifact_id}.payload.json",
-        "ts": ts,
-        "contract_name": "DashboardArtifact",
-      }
-    ),
+    json.dumps(payload),
     encoding="utf-8",
   )
   payload_path = path.with_suffix(".payload.json")

@@ -20,6 +20,7 @@ from agent_gateway.providers import AnthropicProvider, OpenAIProvider
 from agent_gateway.providers.agent_sdk import AgentSDKConfig, SDK_PINNED_VERSION
 from agent_gateway.providers.base import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.runner import AgentRunner
+from agent_gateway.runner_auth import merge_refreshed_auth_config
 from agent_gateway.sdk_runner import AgentSDKRunner
 from agent_gateway.server import ChatRuntime
 from agent_gateway.session import SessionStream
@@ -1446,6 +1447,95 @@ def test_credential_refresh_retries_stream_with_new_auth_config(monkeypatch: pyt
     assert any(event.get("type") == "stream_complete" for event in events)
 
   _run(case())
+
+
+def test_merge_refreshed_auth_config_preserves_runtime_controls_and_normalizes() -> None:
+  merged = merge_refreshed_auth_config(
+    {
+      "auth_mode": " api ",
+      "api_key": "old-key",
+      "auth_token": "old-token",
+      "model": "claude-sonnet-4-6",
+      "max_tokens": 256,
+      "thinking": False,
+    },
+    {
+      "auth_mode": " OAUTH ",
+      "api_key": "new-key",
+      "auth_token": 123,
+      "model": "should-not-win",
+      "max_tokens": 999,
+      "thinking": True,
+    },
+  )
+
+  assert merged == {
+    "auth_mode": "oauth",
+    "api_key": "new-key",
+    "auth_token": "123",
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "thinking": False,
+  }
+
+
+def test_runner_apply_refreshed_auth_config_updates_request_and_runner_config() -> None:
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=ToolDispatcher(
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={},
+      event_log=event_log,
+      session_id="sess-refresh",
+    ),
+    session_id="sess-refresh",
+    provider=_CompletingProvider(),
+    auth_config={"api_key": "old-key", "model": "claude-sonnet-4-6", "max_tokens": 256, "thinking": False},
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  request_config = {
+    "api_key": "old-key",
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "thinking": False,
+    "billing_mode": "",
+    "rate_table_version": None,
+  }
+
+  runner._apply_refreshed_auth_config(
+    request_config,
+    {
+      "api_key": "new-key",
+      "model": "ignored-model",
+      "max_tokens": 4096,
+      "thinking": True,
+      "auth_mode": " oauth ",
+      "auth_token": "tok",
+      "billing_mode": "metered",
+      "rate_table_version": "2026-04-08",
+    },
+  )
+
+  expected = {
+    "auth_mode": "oauth",
+    "api_key": "new-key",
+    "auth_token": "tok",
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "thinking": False,
+    "billing_mode": "byok",
+    "rate_table_version": "unknown",
+  }
+  assert request_config == expected
+  assert runner._auth_config == expected
+  assert runner._billing_mode == "byok"
+  assert runner._rate_table_version == "unknown"
+  summary = _run(runner._aggregator.snapshot())
+  assert summary.billing_mode == "byok"
+  assert summary.rate_table_version == "unknown"
 
 
 def test_normal_completion_creates_no_pending_disconnect_task(make_test_app, monkeypatch: pytest.MonkeyPatch) -> None:

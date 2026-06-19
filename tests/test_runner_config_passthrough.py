@@ -8,8 +8,9 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner, EventLog, McpClientManager, ModelInfo, ModelProvider, ToolDispatcher
-from agent_gateway.runner import STREAM_STALL_TIMEOUT, STREAM_THINKING_STALL_TIMEOUT
+from agent_gateway import AgentRunner, EventLog, McpClientManager, ModelInfo, ModelProvider, ToolDispatcher  # noqa: E402
+import agent_gateway.runner as gateway_runner  # noqa: E402
+from agent_gateway.runner import STREAM_STALL_TIMEOUT, STREAM_THINKING_STALL_TIMEOUT  # noqa: E402
 
 
 def _run(coro):
@@ -122,6 +123,23 @@ def test_explicit_stream_stall_timeout_overrides_thinking_default() -> None:
     model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True),
     max_tokens=4096,
   ) == 42
+
+
+def test_runner_stall_timeout_delegate_uses_runner_module_constants(monkeypatch) -> None:
+  runner = _make_runner()
+  monkeypatch.setattr(gateway_runner, "STREAM_STALL_TIMEOUT", 7)
+  monkeypatch.setattr(gateway_runner, "STREAM_THINKING_STALL_TIMEOUT", 11)
+
+  assert runner._effective_stream_stall_timeout(
+    config={"thinking": True},
+    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True),
+    max_tokens=4096,
+  ) == 11
+  assert runner._effective_stream_stall_timeout(
+    config={"thinking": False},
+    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True),
+    max_tokens=4096,
+  ) == 7
 
 
 def test_runner_preserves_extra_auth_config_keys_for_provider_create_client() -> None:

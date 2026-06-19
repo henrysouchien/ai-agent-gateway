@@ -10,12 +10,33 @@ from typing import Any
 import httpx
 from fastapi.testclient import TestClient
 
+from agent_gateway.control_plane import runs as runs_module
+from agent_gateway.control_plane import runs_chat_helpers as chat_helpers_module
+from agent_gateway.control_plane import runs_helpers as helpers_module
+from agent_gateway.control_plane import runs_resume_helpers as resume_helpers_module
+from agent_gateway.control_plane.runs import (
+  _AUTONOMOUS_RESUME_CONTEXT_MAX_CHARS,
+  _AUTONOMOUS_RESUME_TOOL_RESULT_BLOCK_MAX_CHARS,
+  _completed_tool_result_tail,
+  _render_completed_tool_result_tail,
+)
 from agent_gateway.event_log import EventLog
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 
 
 API_KEY = "autonomous-pr5a-key"
 HMAC_KEY = "autonomous-pr5a-hmac"
+
+
+def test_control_plane_runs_parent_aliases_moved_helpers() -> None:
+  assert runs_module.ChatRunResponse is helpers_module.ChatRunResponse
+  assert runs_module.AutonomousRunResponse is helpers_module.AutonomousRunResponse
+  assert runs_module._autonomous_state is helpers_module._autonomous_state
+  assert runs_module._completed_tool_result_tail is resume_helpers_module._completed_tool_result_tail
+  assert runs_module._render_completed_tool_result_tail is resume_helpers_module._render_completed_tool_result_tail
+  assert runs_module._build_autonomous_resume_context is resume_helpers_module._build_autonomous_resume_context
+  assert runs_module.cleanup_control_chat_tasks is chat_helpers_module.cleanup_control_chat_tasks
+  assert runs_module._dispatch_control_chat_turn is chat_helpers_module._dispatch_control_chat_turn
 
 
 class _FakeAutonomousProcess:
@@ -341,6 +362,7 @@ def test_rehydrated_autonomous_run_is_owner_scoped_with_event_derived_fields(mon
         "control_run_id": "run-rehydrated",
         "skill_run_id": "skill-run-1",
         "skill": "monitoring-init",
+        "cost_usd": 0.12,
         "verdict_echo": {
           "verdict_token": "monitor",
           "confidence": "medium",
@@ -365,6 +387,7 @@ def test_rehydrated_autonomous_run_is_owner_scoped_with_event_derived_fields(mon
   runs = listed.json()["runs"]
   assert [run["run_id"] for run in runs] == ["run-rehydrated"]
   assert runs[0]["state"] == "completed"
+  assert runs[0]["cost_usd"] == 0.12
   assert runs[0]["skill_run_ids"] == ["skill-run-1"]
   assert runs[0]["current_verdict"] == {
     "verdict_token": "monitor",
@@ -374,15 +397,135 @@ def test_rehydrated_autonomous_run_is_owner_scoped_with_event_derived_fields(mon
   }
   assert detail.status_code == 200, detail.text
   assert detail.json()["run_id"] == "run-rehydrated"
+  assert detail.json()["cost_usd"] == 0.12
   assert bob_listed.status_code == 200
   assert bob_listed.json()["runs"] == []
   assert bob_detail.status_code == 404
+
+
+def test_run_cost_prefers_terminal_stream_complete_total(monkeypatch, tmp_path) -> None:
+  _write_rehydrate_manifest(
+    tmp_path,
+    "bg_5",
+    control_run_id="run-cost",
+    user_id="alice",
+    state="completed",
+    completed_at=210.0,
+  )
+  _write_rehydrate_events(
+    tmp_path,
+    "bg_5",
+    [
+      {
+        "type": "turn_complete",
+        "run_id": "run-cost",
+        "control_run_id": "run-cost",
+        "turn": 1,
+        "usage": {"input_tokens": 100, "output_tokens": 20, "estimated_cost": 0.03},
+      },
+      {
+        "type": "turn_complete",
+        "run_id": "run-cost",
+        "control_run_id": "run-cost",
+        "turn": 2,
+        "usage": {"input_tokens": 200, "output_tokens": 40, "estimated_cost": 0.04},
+      },
+      {
+        "type": "stream_complete",
+        "run_id": "run-cost",
+        "control_run_id": "run-cost",
+        "usage": {"input_tokens": 300, "output_tokens": 60, "estimated_cost": 0.08},
+      },
+    ],
+  )
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice", email="alice@example.com")
+    detail = client.get("/api/control/runs/run-cost", headers=_headers(alice))
+
+  assert detail.status_code == 200, detail.text
+  assert detail.json()["cost_usd"] == 0.08
+
+
+def test_autonomous_budget_exceeded_event_maps_to_budget_limited_run_state(monkeypatch, tmp_path) -> None:
+  _write_rehydrate_manifest(
+    tmp_path,
+    "bg_8",
+    control_run_id="run-budget",
+    user_id="alice",
+    state="completed",
+    exit_code=2,
+    error="Process exited with code 2",
+    completed_at=210.0,
+  )
+  _write_rehydrate_events(
+    tmp_path,
+    "bg_8",
+    [{"type": "budget_exceeded", "run_id": "run-budget", "control_run_id": "run-budget", "total_cost": 1.25, "budget": 1.0, "ts": 209}],
+  )
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice", email="alice@example.com")
+    detail = client.get("/api/control/runs/run-budget", headers=_headers(alice))
+
+  assert detail.status_code == 200, detail.text
+  payload = detail.json()
+  assert payload["state"] == "budget_limited"
+  assert payload["ended_at"] is not None
+
+
+def test_run_cost_sums_turn_estimates_when_terminal_total_missing(monkeypatch, tmp_path) -> None:
+  _write_rehydrate_manifest(
+    tmp_path,
+    "bg_6",
+    control_run_id="run-live-cost",
+    user_id="alice",
+    state="completed",
+    completed_at=220.0,
+  )
+  _write_rehydrate_events(
+    tmp_path,
+    "bg_6",
+    [
+      {
+        "type": "turn_complete",
+        "run_id": "run-live-cost",
+        "control_run_id": "run-live-cost",
+        "turn": 1,
+        "usage": {"input_tokens": 100, "output_tokens": 20, "estimated_cost": 0.01},
+      },
+      {
+        "type": "turn_complete",
+        "run_id": "run-live-cost",
+        "control_run_id": "run-live-cost",
+        "turn": 2,
+        "usage": {"input_tokens": 200, "output_tokens": 40, "estimated_cost": 0.02},
+      },
+    ],
+  )
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice", email="alice@example.com")
+    detail = client.get("/api/control/runs/run-live-cost", headers=_headers(alice))
+
+  assert detail.status_code == 200, detail.text
+  assert detail.json()["cost_usd"] == 0.03
 
 
 def test_autonomous_state_passes_interrupted_through() -> None:
   from agent_gateway.control_plane.runs import _autonomous_state
 
   assert _autonomous_state("interrupted") == "interrupted"
+
+
+def test_autonomous_state_maps_budget_aliases_to_budget_limited() -> None:
+  from agent_gateway.control_plane.runs import _autonomous_state
+
+  assert _autonomous_state("budget_limited") == "budget_limited"
+  assert _autonomous_state("budget_exceeded") == "budget_limited"
 
 
 def test_rehydrated_interrupted_resumable_skill_uses_existing_resume_flow(monkeypatch, tmp_path) -> None:
@@ -648,6 +791,39 @@ Run the resumable test skill.
     original.exit_code = 1
     original.completed_at = time.time()
     processes[0].returncode = 1
+    original.event_lines = [
+      {
+        "type": "tool_call_start",
+        "tool_call_id": "tool-1",
+        "tool_name": "fmp_fetch",
+        "tool_input": {
+          "endpoint": "income_statement",
+          "symbol": "NVDA",
+          "large": "x" * 2000,
+        },
+      },
+      {
+        "type": "tool_call_complete",
+        "tool_call_id": "tool-1",
+        "tool_name": "fmp_fetch",
+        "result": {
+          "status": "success",
+          "rows": [{"period": "Q1 FY2027", "revenue": 44.06}],
+          "large": "y" * 5000,
+        },
+        "duration_ms": 123,
+        "server": "fmp-mcp",
+        "is_error": False,
+      },
+      {
+        "type": "tool_call_complete",
+        "tool_call_id": "tool-2",
+        "tool_name": "fms_report_earnings_review",
+        "error": {"message": "judgment missing dashboard_headline"},
+        "duration_ms": 42,
+        "is_error": True,
+      },
+    ]
     original.log_path.write_text("prior log line\n", encoding="utf-8")
     original.operator_inbox_path.write_text(
       '{"message_id":"op-1","message":"tighten scope","sent_at":1}\n',
@@ -664,8 +840,200 @@ Run the resumable test skill.
   resumed_context = app.state.subprocess_registry._tasks["bg_1"].context or ""
   assert "resume from the latest safe point" in resumed_context
   assert "tighten scope" in resumed_context
+  assert "Prior completed tool results for recovery" in resumed_context
+  assert "fmp_fetch" in resumed_context
+  assert "income_statement" in resumed_context
+  assert "Q1 FY2027" in resumed_context
+  assert "fms_report_earnings_review" in resumed_context
+  assert "judgment missing dashboard_headline" in resumed_context
   assert "prior log line" in resumed_context
   assert "Do not repeat durable writes" in resumed_context
+
+
+def test_completed_tool_result_recovery_block_keeps_newest_entries_when_saturated() -> None:
+  events: list[dict[str, Any]] = []
+  for index in range(20):
+    tool_call_id = f"tool-{index}"
+    events.extend(
+      [
+        {
+          "type": "tool_call_start",
+          "tool_call_id": tool_call_id,
+          "tool_name": f"saturated_tool_{index:02d}",
+          "tool_input": {
+            "symbol": "NVDA",
+            "query_marker": f"input_marker_{index:02d}",
+            "large": "x" * 5000,
+          },
+        },
+        {
+          "type": "tool_call_complete",
+          "tool_call_id": tool_call_id,
+          "tool_name": f"saturated_tool_{index:02d}",
+          "result": {
+            "result_marker": f"result_marker_{index:02d}",
+            "large": "y" * 5000,
+          },
+          "duration_ms": index,
+          "server": "fixture",
+          "is_error": False,
+        },
+      ]
+    )
+
+  completed_tools = _completed_tool_result_tail(events)
+  assert completed_tools[0]["tool_name"] == "saturated_tool_04"
+  assert completed_tools[-1]["tool_name"] == "saturated_tool_19"
+
+  rendered = _render_completed_tool_result_tail(completed_tools, max_chars=2200)
+  decoded = json.loads(rendered)
+
+  assert len(rendered) <= 2200
+  assert decoded[0]["tool_name"] == "saturated_tool_19"
+  assert decoded[1]["tool_name"] == "saturated_tool_18"
+  assert "result_marker_19" in rendered
+  assert "input_marker_19" in rendered
+  assert "saturated_tool_04" not in rendered
+
+
+def test_completed_tool_result_recovery_block_preserves_wide_object_tail_fields() -> None:
+  long_key_prefix = "zz_late_marker_" + ("x" * 100)
+  events = [
+    {
+      "type": "tool_call_complete",
+      "tool_call_id": "tool-wide",
+      "tool_name": "wide_object_tool",
+      "result": {
+        **{f"early_{index:02d}": f"value_{index:02d}" for index in range(40)},
+        long_key_prefix + "_a": "late-field-survived-a",
+        long_key_prefix + "_b": "late-field-survived-b",
+      },
+      "is_error": False,
+    }
+  ]
+
+  rendered = _render_completed_tool_result_tail(_completed_tool_result_tail(events))
+  decoded = json.loads(rendered)
+
+  assert decoded[0]["tool_name"] == "wide_object_tool"
+  assert "late-field-survived-a" in rendered
+  assert "late-field-survived-b" in rendered
+  assert "...#" in rendered
+  assert "_truncated_keys" in rendered
+
+
+def test_completed_tool_result_recovery_block_renders_single_oversized_summary_as_valid_json() -> None:
+  rendered = _render_completed_tool_result_tail(
+    [
+      {
+        "tool_name": "huge_tool",
+        "tool_call_id": "tool-huge",
+        "result": "z" * (_AUTONOMOUS_RESUME_TOOL_RESULT_BLOCK_MAX_CHARS * 2),
+        "is_error": False,
+      }
+    ],
+    max_chars=300,
+  )
+  decoded = json.loads(rendered)
+
+  assert len(rendered) <= 300
+  assert decoded[0]["tool_name"] == "huge_tool"
+
+
+def test_autonomous_resume_context_reserves_tail_sections_with_saturated_recovery_packet(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  processes, _envs = _install_fake_spawn(monkeypatch)
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  (skills_dir / "resumable-skill.md").write_text(
+    """---
+name: resumable-skill
+description: Resumable test skill
+agent_callable: true
+resumable: true
+---
+Run the resumable test skill.
+""",
+    encoding="utf-8",
+  )
+  app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+    start = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "skill",
+        "skill": "resumable-skill",
+        "context": "ORIGINAL-SATURATED-" + ("x" * 20000),
+      },
+    )
+    assert start.status_code == 200, start.text
+
+    original = app.state.subprocess_registry._tasks["bg_0"]
+    original.state = "failed"
+    original.exit_code = 1
+    original.completed_at = time.time()
+    processes[0].returncode = 1
+    event_lines: list[dict[str, Any]] = []
+    for index in range(20):
+      tool_call_id = f"tool-{index}"
+      event_lines.extend(
+        [
+          {
+            "type": "tool_call_start",
+            "tool_call_id": tool_call_id,
+            "tool_name": f"saturated_tool_{index:02d}",
+            "tool_input": {
+              "symbol": "NVDA",
+              "query_marker": f"input_marker_{index:02d}",
+              "large": "x" * 5000,
+            },
+          },
+          {
+            "type": "tool_call_complete",
+            "tool_call_id": tool_call_id,
+            "tool_name": f"saturated_tool_{index:02d}",
+            "result": {
+              "result_marker": f"result_marker_{index:02d}",
+              "large": "y" * 5000,
+            },
+            "duration_ms": index,
+            "server": "fixture",
+            "is_error": False,
+          },
+        ]
+      )
+    event_lines.extend(
+      {"type": "text_delta", "text": f"recent-event-{index:02d}-" + ("z" * 200)}
+      for index in range(60)
+    )
+    original.event_lines = event_lines
+    original.log_path.write_text(("prior saturated log line\n" * 80), encoding="utf-8")
+
+    resumed = client.post(
+      "/api/control/runs/bg_0/resume",
+      headers=_headers(alice),
+      json={"message": "resume saturated recovery"},
+    )
+    assert resumed.status_code == 200, resumed.text
+
+  resumed_context = app.state.subprocess_registry._tasks["bg_1"].context or ""
+  assert len(resumed_context) <= _AUTONOMOUS_RESUME_CONTEXT_MAX_CHARS
+  assert "Prior completed tool results for recovery" in resumed_context
+  assert "saturated_tool_19" in resumed_context
+  assert "Recent control events" in resumed_context
+  assert "recent-event-59" in resumed_context
+  assert "recent-event-20" not in resumed_context
+  assert "Recent log tail" in resumed_context
+  assert "prior saturated log line" in resumed_context
+  assert "Original context" in resumed_context
+  assert "ORIGINAL-SATURATED" in resumed_context
 
 
 def test_autonomous_resume_rejects_non_resumable_skill(monkeypatch, tmp_path) -> None:
@@ -705,6 +1073,60 @@ Run once.
     original.exit_code = 1
     original.completed_at = time.time()
     processes[0].returncode = 1
+
+    resumed = client.post("/api/control/runs/bg_0/resume", headers=_headers(alice), json={})
+    assert resumed.status_code == 409
+    assert resumed.json()["detail"] == "Autonomous run is not resumable"
+    assert set(app.state.subprocess_registry._tasks) == {"bg_0"}
+
+
+def test_autonomous_resume_rejects_model_writer_skill_even_when_metadata_resumable(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  processes, _envs = _install_fake_spawn(monkeypatch)
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  (skills_dir / "forecast-assumptions.md").write_text(
+    """---
+name: forecast-assumptions
+description: Forecast assumptions writer
+agent_callable: true
+resumable: true
+mutation_mode: model_writer
+catalog: false
+---
+Update forecast assumptions.
+""",
+    encoding="utf-8",
+  )
+  app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+    start = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "skill",
+        "skill": "forecast-assumptions",
+        "context": "Original work packet",
+        "ticker": "MSFT",
+      },
+    )
+    assert start.status_code == 200, start.text
+
+    original = app.state.subprocess_registry._tasks["bg_0"]
+    original.state = "failed"
+    original.exit_code = 1
+    original.completed_at = time.time()
+    processes[0].returncode = 1
+
+    detail = client.get("/api/control/runs/bg_0", headers=_headers(alice))
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["resumable"] is False
 
     resumed = client.post("/api/control/runs/bg_0/resume", headers=_headers(alice), json={})
     assert resumed.status_code == 409

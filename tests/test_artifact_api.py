@@ -74,7 +74,7 @@ def test_latest_artifact_returns_latest_json_sidecar(artifact_api: ArtifactApiFi
     )
 
   assert response.status_code == 200
-  assert response.json() == latest_payload
+  assert response.json() == _with_default_classification(latest_payload)
   assert response.headers["etag"]
 
 
@@ -97,7 +97,7 @@ def test_artifact_by_id_returns_specific_json_sidecar(artifact_api: ArtifactApiF
     )
 
   assert response.status_code == 200
-  assert response.json() == payload
+  assert response.json() == _with_default_classification(payload)
 
 
 def test_artifact_index_returns_latest_and_recent_history_per_skill(
@@ -109,7 +109,22 @@ def test_artifact_index_returns_latest_and_recent_history_per_skill(
   _write_artifact(artifact_api.data_dir, USER_ID, "PCTY", "earnings-scenarios", "2026-05-20T120000.000-run-a")
   _write_artifact(artifact_api.data_dir, USER_ID, "PCTY", "earnings-scenarios", "2026-05-20T125000.000-run-d")
   _write_artifact(artifact_api.data_dir, USER_ID, "PCTY", "earnings-scenarios", "2026-05-20T130000.000-run-b")
-  _write_artifact(artifact_api.data_dir, USER_ID, "PCTY", "critical-factors", "2026-05-20T121500.000-run-c")
+  _write_artifact(
+    artifact_api.data_dir,
+    USER_ID,
+    "PCTY",
+    "critical-factors",
+    "2026-05-20T121500.000-run-c",
+    payload={
+      "artifact_id": "2026-05-20T121500.000-run-c",
+      "ticker": "PCTY",
+      "skill": "critical-factors",
+      "research_file_id": 42,
+      "control_run_id": "bg_critical_factors",
+      "origin_kind": "product",
+      "visibility": "default",
+    },
+  )
 
   with TestClient(artifact_api.app) as client:
     response = client.get("/api/artifacts/PCTY", headers=_signed_headers())
@@ -122,6 +137,13 @@ def test_artifact_index_returns_latest_and_recent_history_per_skill(
       "latest_artifact_id": "2026-05-20T121500.000-run-c",
       "artifact_count": 1,
       "recent_artifact_ids": ["2026-05-20T121500.000-run-c"],
+      "research_file_id": 42,
+      "control_run_id": "bg_critical_factors",
+      "has_research_file": True,
+      "origin_kind": "product",
+      "visibility": "default",
+      "origin_ref": None,
+      "classification_source": "sidecar",
     },
     {
       "skill": "earnings-scenarios",
@@ -134,10 +156,210 @@ def test_artifact_index_returns_latest_and_recent_history_per_skill(
         "2026-05-20T115000.000-run-x",
         "2026-05-20T110000.000-run-y",
       ],
+      "research_file_id": None,
+      "control_run_id": None,
+      "has_research_file": False,
+      "origin_kind": "product",
+      "visibility": "default",
+      "origin_ref": None,
+      "classification_source": "legacy_default",
     },
   ]
   assert empty_response.status_code == 200
   assert empty_response.json() == []
+
+
+def test_default_artifact_reads_skip_newer_sandbox_sidecars(
+  artifact_api: ArtifactApiFixture,
+) -> None:
+  product_id = "2026-05-20T120000.000-run-product"
+  sandbox_id = "2026-05-20T130000.000-run-harness"
+  product_payload = _write_artifact(
+    artifact_api.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    product_id,
+    payload={"artifact_id": product_id, "ticker": "PCTY", "skill": "earnings-scenarios", "value": "product"},
+  )
+  sandbox_payload = _write_artifact(
+    artifact_api.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    sandbox_id,
+    payload={
+      "artifact_id": sandbox_id,
+      "ticker": "PCTY",
+      "skill": "earnings-scenarios",
+      "value": "sandbox",
+      "origin_kind": "harness",
+      "visibility": "sandbox",
+      "origin_ref": {
+        "schema_version": "research_file_origin_ref_v1",
+        "kind": "f131_live_harness",
+        "run_id": "run-artifact-filter-test",
+      },
+    },
+  )
+
+  with TestClient(artifact_api.app) as client:
+    default_latest = client.get(
+      "/api/artifacts/PCTY/earnings-scenarios/latest",
+      headers=_signed_headers(),
+    )
+    default_exact_sandbox = client.get(
+      f"/api/artifacts/PCTY/earnings-scenarios/{sandbox_id}",
+      headers=_signed_headers(),
+    )
+    sandbox_latest = client.get(
+      "/api/artifacts/PCTY/earnings-scenarios/latest",
+      headers=_signed_headers(),
+      params={"visibility": "sandbox", "origin_kind": "harness"},
+    )
+    default_index = client.get("/api/artifacts/PCTY", headers=_signed_headers())
+    sandbox_index = client.get(
+      "/api/artifacts/PCTY",
+      headers=_signed_headers(),
+      params={"visibility": "sandbox", "origin_kind": "harness"},
+    )
+
+  assert default_latest.status_code == 200
+  assert default_latest.json() == _with_default_classification(product_payload)
+  assert default_exact_sandbox.status_code == 404
+  assert sandbox_latest.status_code == 200
+  assert sandbox_latest.json() == {
+    **sandbox_payload,
+    "research_file_id": None,
+    "control_run_id": None,
+    "has_research_file": False,
+    "classification_source": "sidecar",
+  }
+  assert default_index.status_code == 200
+  assert default_index.json() == [
+    {
+      "skill": "earnings-scenarios",
+      "latest_artifact_id": product_id,
+      "artifact_count": 1,
+      "recent_artifact_ids": [product_id],
+      "research_file_id": None,
+      "control_run_id": None,
+      "has_research_file": False,
+      "origin_kind": "product",
+      "visibility": "default",
+      "origin_ref": None,
+      "classification_source": "legacy_default",
+    }
+  ]
+  assert sandbox_index.status_code == 200
+  assert sandbox_index.json() == [
+    {
+      "skill": "earnings-scenarios",
+      "latest_artifact_id": sandbox_id,
+      "artifact_count": 1,
+      "recent_artifact_ids": [sandbox_id],
+      "research_file_id": None,
+      "control_run_id": None,
+      "has_research_file": False,
+      "origin_kind": "harness",
+      "visibility": "sandbox",
+      "origin_ref": {
+        "schema_version": "research_file_origin_ref_v1",
+        "kind": "f131_live_harness",
+        "run_id": "run-artifact-filter-test",
+      },
+      "classification_source": "sidecar",
+    }
+  ]
+
+
+def test_numeric_string_research_file_id_fails_closed_when_unresolved(
+  artifact_api: ArtifactApiFixture,
+) -> None:
+  artifact_id = "2026-05-20T130000.000-run-string-rfid"
+  payload = _write_artifact(
+    artifact_api.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    artifact_id,
+    payload={
+      "artifact_id": artifact_id,
+      "ticker": "PCTY",
+      "skill": "earnings-scenarios",
+      "research_file_id": "42",
+    },
+  )
+
+  with TestClient(artifact_api.app) as client:
+    default_latest = client.get(
+      "/api/artifacts/PCTY/earnings-scenarios/latest",
+      headers=_signed_headers(),
+    )
+    default_index = client.get("/api/artifacts/PCTY", headers=_signed_headers())
+    archived_latest = client.get(
+      "/api/artifacts/PCTY/earnings-scenarios/latest",
+      headers=_signed_headers(),
+      params={"visibility": "archived", "origin_kind": "import"},
+    )
+
+  assert default_latest.status_code == 404
+  assert default_index.status_code == 200
+  assert default_index.json() == []
+  assert archived_latest.status_code == 200
+  assert archived_latest.json() == {
+    **payload,
+    "research_file_id": 42,
+    "control_run_id": None,
+    "has_research_file": True,
+    "origin_kind": "import",
+    "visibility": "archived",
+    "origin_ref": None,
+    "classification_source": "unresolved_research_file",
+  }
+
+
+def test_boolean_research_file_id_fails_closed_when_unresolved(
+  artifact_api: ArtifactApiFixture,
+) -> None:
+  artifact_id = "2026-05-20T130000.000-run-bool-rfid"
+  payload = _write_artifact(
+    artifact_api.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    artifact_id,
+    payload={
+      "artifact_id": artifact_id,
+      "ticker": "PCTY",
+      "skill": "earnings-scenarios",
+      "research_file_id": True,
+    },
+  )
+
+  with TestClient(artifact_api.app) as client:
+    default_latest = client.get(
+      "/api/artifacts/PCTY/earnings-scenarios/latest",
+      headers=_signed_headers(),
+    )
+    archived_latest = client.get(
+      "/api/artifacts/PCTY/earnings-scenarios/latest",
+      headers=_signed_headers(),
+      params={"visibility": "archived", "origin_kind": "import"},
+    )
+
+  assert default_latest.status_code == 404
+  assert archived_latest.status_code == 200
+  assert archived_latest.json() == {
+    **payload,
+    "research_file_id": None,
+    "control_run_id": None,
+    "has_research_file": False,
+    "origin_kind": "import",
+    "visibility": "archived",
+    "origin_ref": None,
+    "classification_source": "unresolved_research_file",
+  }
 
 
 def test_bearer_artifact_auth_uses_risk_user_id_when_present(
@@ -167,7 +389,7 @@ def test_bearer_artifact_auth_uses_risk_user_id_when_present(
     )
 
   assert response.status_code == 200
-  assert response.json() == payload
+  assert response.json() == _with_default_classification(payload)
 
 
 def test_letter_endpoint_returns_docx_blob(artifact_api: ArtifactApiFixture) -> None:
@@ -323,6 +545,19 @@ def _write_artifact(
   path.parent.mkdir(parents=True, exist_ok=True)
   path.write_text(json.dumps(resolved_payload), encoding="utf-8")
   return resolved_payload
+
+
+def _with_default_classification(payload: dict[str, Any]) -> dict[str, Any]:
+  return {
+    **payload,
+    "research_file_id": payload.get("research_file_id"),
+    "control_run_id": payload.get("control_run_id"),
+    "has_research_file": payload.get("research_file_id") is not None,
+    "origin_kind": "product",
+    "visibility": "default",
+    "origin_ref": None,
+    "classification_source": "legacy_default",
+  }
 
 
 def _write_letter(data_dir: Path, user_id: str, ticker: str, artifact_id: str, content: bytes) -> Path:

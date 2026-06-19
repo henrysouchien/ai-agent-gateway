@@ -1,5 +1,8 @@
+# ruff: noqa: E402
+
 import asyncio
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +14,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+import agent_gateway.mcp_client as mcp_client_module
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.tool_dispatcher import ToolDispatcher
 
@@ -239,3 +243,132 @@ def test_mcp_client_call_tool_uses_per_tool_timeout_before_server_timeout() -> N
   assert error is None
   assert result == {"ok": True}
   assert session.calls[-1]["read_timeout_seconds"].total_seconds() == 120
+
+
+def test_mcp_client_call_tool_enforces_hard_timeout_when_sdk_cancel_is_slow(monkeypatch) -> None:
+  monkeypatch.setattr(mcp_client_module, "_MCP_TOOL_CANCEL_GRACE_SECONDS", 0.01)
+  manager = McpClientManager(
+    config_path=None,
+    tool_timeout_overrides={"portfolio-mcp.slow_tool": 0.01},
+  )
+
+  class _SlowCancellationSession:
+    def __init__(self) -> None:
+      self.calls: list[dict[str, Any]] = []
+      self.cancelled = False
+
+    async def call_tool(self, name: str, tool_input: dict[str, Any], *, read_timeout_seconds, meta=None):
+      self.calls.append(
+        {
+          "name": name,
+          "tool_input": tool_input,
+          "read_timeout_seconds": read_timeout_seconds,
+          "meta": meta,
+        }
+      )
+      try:
+        await asyncio.sleep(60)
+      except asyncio.CancelledError:
+        self.cancelled = True
+        await asyncio.sleep(2)
+      return SimpleNamespace(
+        isError=False,
+        structuredContent={"late": True},
+        content=None,
+      )
+
+  session = _SlowCancellationSession()
+  manager._tool_to_server = {"slow_tool": "portfolio-mcp"}
+  manager._prefixed_to_original = {"slow_tool": "slow_tool"}
+  manager._servers = {
+    "portfolio-mcp": SimpleNamespace(session=session, config=None),
+  }
+
+  started = time.monotonic()
+  result, error = _run(manager.call_tool("slow_tool", {"ticker": "MSFT"}))
+
+  assert time.monotonic() - started < 0.5
+  assert result is None
+  assert error is not None
+  assert error["sub_code"] == "timeout"
+  assert "MCP tool slow_tool timed out after 0.01s" in error["message"]
+  assert session.cancelled is True
+  assert session.calls[0]["read_timeout_seconds"].total_seconds() == 0.01
+
+
+def test_mcp_client_call_tool_cancels_sdk_task_when_caller_is_cancelled() -> None:
+  manager = McpClientManager(config_path=None)
+
+  class _CancellableSession:
+    def __init__(self) -> None:
+      self.started = asyncio.Event()
+      self.cancelled = False
+
+    async def call_tool(self, name: str, tool_input: dict[str, Any], *, read_timeout_seconds, meta=None):
+      _ = name, tool_input, read_timeout_seconds, meta
+      self.started.set()
+      try:
+        await asyncio.sleep(60)
+      except asyncio.CancelledError:
+        self.cancelled = True
+        raise
+
+  async def _run_cancel() -> _CancellableSession:
+    session = _CancellableSession()
+    manager._tool_to_server = {"slow_tool": "portfolio-mcp"}
+    manager._prefixed_to_original = {"slow_tool": "slow_tool"}
+    manager._servers = {
+      "portfolio-mcp": SimpleNamespace(session=session, config=None),
+    }
+    task = asyncio.create_task(manager.call_tool("slow_tool", {"ticker": "MSFT"}))
+    await session.started.wait()
+    task.cancel()
+    try:
+      await task
+    except asyncio.CancelledError:
+      pass
+    return session
+
+  session = _run(_run_cancel())
+
+  assert session.cancelled is True
+
+
+def test_mcp_client_call_tool_preserves_caller_cancellation_racing_timeout_cleanup(monkeypatch) -> None:
+  monkeypatch.setattr(mcp_client_module, "_MCP_TOOL_CANCEL_GRACE_SECONDS", 1.0)
+  manager = McpClientManager(
+    config_path=None,
+    tool_timeout_overrides={"portfolio-mcp.slow_tool": 0.01},
+  )
+
+  async def _run_race() -> bool:
+    caller_task = asyncio.current_task()
+    assert caller_task is not None
+
+    class _CallerCancellingSession:
+      def __init__(self) -> None:
+        self.cancelled = False
+
+      async def call_tool(self, name: str, tool_input: dict[str, Any], *, read_timeout_seconds, meta=None):
+        _ = name, tool_input, read_timeout_seconds, meta
+        try:
+          await asyncio.sleep(60)
+        except asyncio.CancelledError:
+          self.cancelled = True
+          caller_task.cancel()
+          raise
+
+    session = _CallerCancellingSession()
+    manager._tool_to_server = {"slow_tool": "portfolio-mcp"}
+    manager._prefixed_to_original = {"slow_tool": "slow_tool"}
+    manager._servers = {
+      "portfolio-mcp": SimpleNamespace(session=session, config=None),
+    }
+
+    try:
+      await manager.call_tool("slow_tool", {"ticker": "MSFT"})
+    except asyncio.CancelledError:
+      return session.cancelled
+    return False
+
+  assert _run(_run_race()) is True

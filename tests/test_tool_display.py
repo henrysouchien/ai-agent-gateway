@@ -171,17 +171,21 @@ def test_absent_display_keeps_existing_projection_shape() -> None:
 
 def test_clean_emission_sites_stamp_display_from_redacted_input() -> None:
   repo_root = Path(__file__).resolve().parents[3]
-  runner = (repo_root / "packages/agent-gateway/agent_gateway/runner.py").read_text(encoding="utf-8")
-  sdk_runner = (repo_root / "packages/agent-gateway/agent_gateway/sdk_runner.py").read_text(encoding="utf-8")
+  runner_tool_execution = (
+    repo_root / "packages/agent-gateway/agent_gateway/runner_tool_execution.py"
+  ).read_text(encoding="utf-8")
+  sdk_runner_stream = (
+    repo_root / "packages/agent-gateway/agent_gateway/sdk_runner_stream.py"
+  ).read_text(encoding="utf-8")
   addin_runtime = (repo_root / "api/agent/interactive/runtime.py").read_text(encoding="utf-8")
 
-  assert "from .tool_display import resolve_display" in runner
-  assert "display = resolve_display(tool_name, redacted_tool_input)" in runner
-  assert 'tool_start_event["display"] = display' in runner
+  assert "from .tool_display import resolve_display" in runner_tool_execution
+  assert '_runner_attr(self, "resolve_display", resolve_display)(tool_name, redacted_tool_input)' in runner_tool_execution
+  assert 'tool_start_event["display"] = display' in runner_tool_execution
 
-  assert "from .tool_display import resolve_display" in sdk_runner
-  assert "display = resolve_display(tool_name, redacted_tool_input)" in sdk_runner
-  assert 'tool_start_event["display"] = display' in sdk_runner
+  assert "from .tool_display import resolve_display" in sdk_runner_stream
+  assert "display = _resolve_display(tool_name, redacted_tool_input)" in sdk_runner_stream
+  assert 'tool_start_event["display"] = display' in sdk_runner_stream
 
   assert "from agent_gateway.tool_display import resolve_display" in addin_runtime
   assert "redacted_tool_input = redact_tool_input(" in addin_runtime

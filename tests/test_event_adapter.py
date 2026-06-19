@@ -15,6 +15,9 @@ def test_v1_wire_projection_covers_every_v1_type() -> None:
   assert V1_WIRE_EVENT_TYPES
   assert set(V1_FIELD_PROJECTION) == set(V1_WIRE_EVENT_TYPES)
   assert all("type" in fields for fields in V1_FIELD_PROJECTION.values())
+  assert "budget_exceeded" in V1_WIRE_EVENT_TYPES
+  assert "budget_limited" not in V1_WIRE_EVENT_TYPES
+  assert "budget_limited" not in V1_FIELD_PROJECTION
 
 
 def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:

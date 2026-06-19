@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from html.parser import HTMLParser
 import json
+import logging
 import re
 from pathlib import Path
 
+from .artifact_sidecar_index import artifact_sidecar_index_path, register_html_artifact_sidecar
 from schema.html_artifact import HtmlArtifact
 
 
+log = logging.getLogger(__name__)
 _HTML_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,128}$")
 _FORBIDDEN_TAGS = frozenset({"script", "style", "link", "meta", "base", "iframe", "object", "embed", "form"})
 _FORBIDDEN_ATTRS = frozenset({"style", "srcdoc"})
@@ -42,6 +45,7 @@ def write_html_artifact(
   workspace_dir: Path,
   artifact: HtmlArtifact,
   html_content: str,
+  user_id: str = "",
 ) -> None:
   """Atomic dual-write: HTML first, sidecar rename as the commit point."""
   artifact_id = _validate_html_artifact_id(artifact.artifact_id)
@@ -68,6 +72,26 @@ def write_html_artifact(
     _unlink_if_exists(html_tmp_path)
     _unlink_if_exists(sidecar_tmp_path)
     raise
+  try:
+    register_html_artifact_sidecar(
+      workspace_dir=workspace_dir,
+      artifact=artifact,
+      sidecar_path=sidecar_path,
+      content_path=html_path,
+      user_id=user_id,
+    )
+  except Exception:
+    log.warning(
+      "artifact_index_failure",
+      extra={
+        "artifact_kind": "html",
+        "artifact_id": artifact_id,
+        "user_id": user_id,
+        "workspace_dir": str(Path(workspace_dir).resolve()),
+        "index_path": str(artifact_sidecar_index_path(workspace_dir)),
+      },
+      exc_info=True,
+    )
 
 
 def read_html_artifact_sidecar(workspace_dir: Path, artifact_id: str) -> HtmlArtifact | None:

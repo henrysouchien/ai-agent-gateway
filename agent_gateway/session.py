@@ -91,6 +91,7 @@ class GatewaySession:
   pending_tools: Dict[str, Dict] = field(default_factory=dict)
   approved_tool_types: Set[str] = field(default_factory=set)
   loaded_mcp_servers: Set[str] = field(default_factory=set)
+  loaded_local_tools: Set[str] = field(default_factory=set)
   approval_queues: Dict[str, asyncio.Queue] = field(default_factory=dict)
   approval_store: Any | None = None
   approval_policy: Any | None = None

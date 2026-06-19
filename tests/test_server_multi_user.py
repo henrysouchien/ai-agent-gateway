@@ -13,7 +13,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import (
+from agent_gateway import (  # noqa: E402
   AgentRunner,
   AgentSessionLog,
   CostEstimate,
@@ -23,8 +23,25 @@ from agent_gateway import (
   StreamEvent,
   ToolDispatcher,
 )
-from agent_gateway.auth import AuthConfig, NoCredentialError, ProviderCredentialFailure, ResolverResult
-from agent_gateway.server import ChatInitRequest, ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.auth import AuthConfig, NoCredentialError, ProviderCredentialFailure, ResolverResult  # noqa: E402
+from agent_gateway import server as server_module  # noqa: E402
+from agent_gateway import server_artifact_helpers as artifact_helpers_module  # noqa: E402
+from agent_gateway import server_chat_helpers as chat_helpers_module  # noqa: E402
+from agent_gateway import server_models as models_module  # noqa: E402
+from agent_gateway.server import ChatInitRequest, ChatRuntime, GatewayServerConfig, create_gateway_app  # noqa: E402
+
+
+def test_server_parent_aliases_moved_helpers() -> None:
+  assert server_module.ChatRuntime is models_module.ChatRuntime
+  assert server_module.GatewayServerConfig is models_module.GatewayServerConfig
+  assert server_module._artifact_json_response is artifact_helpers_module._artifact_json_response
+  assert server_module._error_payload is artifact_helpers_module._error_payload
+  assert server_module._dispatch_chat_turn is chat_helpers_module._dispatch_chat_turn
+  assert callable(server_module._stream_subscriber_sse)
+  assert callable(server_module._register_stream_subscriber)
+  assert server_module._init_approval_subsystem is chat_helpers_module._init_approval_subsystem
+  assert server_module.SQLiteApprovalStore is chat_helpers_module.SQLiteApprovalStore
+  assert server_module.resolve_policy is chat_helpers_module.resolve_policy
 
 
 class _StubRunner:
@@ -390,14 +407,30 @@ def test_chat_refresh_resolver_updates_session_auth_config() -> None:
   refresh_requests: list[Any] = []
 
   async def _resolver(_api_key: str, init_request):
-    return _resolver_result_for(init_request.user_id, channel="web")
+    return ResolverResult(
+      user_id=init_request.user_id,
+      channel="web",
+      auth_config=AuthConfig.from_dict(
+        {
+          "provider": "anthropic",
+          "billing_mode": "byok",
+          "rate_table_version": "unknown",
+          "api_key": "key-alice",
+          "model": "claude-sonnet-4-6",
+          "max_tokens": 16000,
+        }
+      ),
+      risk_user_id=101,
+      role="owner",
+    )
 
   async def _refresh(request):
     refresh_requests.append(request)
     return AuthConfig.from_dict(
       {
         "provider": "anthropic",
-        "billing_mode": "byok",
+        "billing_mode": "metered",
+        "rate_table_version": "2026-04-08",
         "api_key": "key-rotated",
         "model": "claude-sonnet-4-6",
         "max_tokens": 16000,
@@ -419,9 +452,13 @@ def test_chat_refresh_resolver_updates_session_auth_config() -> None:
 
   session = app.state.auth.session_store.get_session(init_response["session_id"])
   assert session.auth_config["api_key"] == "key-rotated"
+  assert session.auth_config["billing_mode"] == "byok"
+  assert session.auth_config["rate_table_version"] == "unknown"
   assert refresh_requests
   assert refresh_requests[0].user_id == "alice"
   assert refresh_requests[0].request_id == "req-refresh"
+  assert refresh_requests[0].billing_mode == "byok"
+  assert refresh_requests[0].rate_table_version == "unknown"
   assert refresh_requests[0].failure.kind == "rate_limit"
 
 

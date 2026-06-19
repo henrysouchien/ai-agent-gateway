@@ -15,11 +15,20 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner, EventLog, ModelInfo, ModelProvider, SessionStore, ToolDispatcher
-from agent_gateway.code_execution import CodeExecutionConfig, DockerBackend, build_code_execution
-from agent_gateway.providers import StreamEvent
-from agent_gateway.sub_agent import make_run_agent_handler
-import agent_gateway.runner as gateway_runner
+from agent_gateway import AgentRunner, EventLog, ModelInfo, ModelProvider, SessionStore, ToolDispatcher  # noqa: E402
+from agent_gateway.code_execution import CodeExecutionConfig, DockerBackend, build_code_execution  # noqa: E402
+from agent_gateway.providers import StreamEvent  # noqa: E402
+from agent_gateway.sub_agent import make_run_agent_handler  # noqa: E402
+from agent_gateway.tool_result_compaction import (  # noqa: E402
+  annotate_result,
+  compact_model_tool_result_entry,
+  is_error_tool_result_entry,
+  make_error_result,
+  truncate_model_tool_result_content,
+  write_tool_result_spill,
+)
+import agent_gateway.tool_result_compaction as tool_result_compaction  # noqa: E402
+import agent_gateway.runner as gateway_runner  # noqa: E402
 
 
 CAP = 4_000
@@ -211,6 +220,18 @@ def _large_content(payload_size: int = PAYLOAD_SIZE) -> str:
   return json.dumps({"status": "success", "payload": "x" * payload_size}, default=str)
 
 
+class _RecordingLogger:
+  def __init__(self) -> None:
+    self.infos: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+    self.warnings: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+  def info(self, message: str, *args: Any, **kwargs: Any) -> None:
+    self.infos.append((message, args, kwargs))
+
+  def warning(self, message: str, *args: Any, **kwargs: Any) -> None:
+    self.warnings.append((message, args, kwargs))
+
+
 def test_emit_html_artifact_oversize_guard_returns_error_before_dispatch() -> None:
   runner = _runner(None)
   html = "x" * ((512 * 1024) + 1)
@@ -268,7 +289,9 @@ async def _dispatch_bundle_tool(bundle: Any, tool_name: str, tool_input: dict[st
 def test_truncate_tool_result_embeds_spill_pointer_only_when_provided() -> None:
   content = _large_content()
 
-  truncated, was_truncated = gateway_runner._truncate_model_tool_result_content(
+  assert gateway_runner._truncate_model_tool_result_content is truncate_model_tool_result_content
+
+  truncated, was_truncated = truncate_model_tool_result_content(
     content,
     tool_name="lookup",
     max_chars=CAP,
@@ -284,7 +307,7 @@ def test_truncate_tool_result_embeds_spill_pointer_only_when_provided() -> None:
   assert "FULL, untruncated result" in payload["spill_hint"]
   assert "pd.read_json('lookup_tool-1.json')" in payload["spill_hint"]
 
-  plain, plain_was_truncated = gateway_runner._truncate_model_tool_result_content(
+  plain, plain_was_truncated = truncate_model_tool_result_content(
     content,
     tool_name="lookup",
     max_chars=CAP,
@@ -295,6 +318,142 @@ def test_truncate_tool_result_embeds_spill_pointer_only_when_provided() -> None:
   assert "spill_file" not in plain_payload
   assert "spill_abspath" not in plain_payload
   assert "spill_hint" not in plain_payload
+
+
+def test_runner_preserves_tool_result_utility_delegates(tmp_path: Path) -> None:
+  assert gateway_runner.AgentRunner._annotate_result({"ok": True}) == annotate_result({"ok": True})
+  assert gateway_runner.AgentRunner._make_error_result("tool-1", "bad", "failed") == make_error_result(
+    "tool-1",
+    "bad",
+    "failed",
+  )
+  assert gateway_runner.AgentRunner._is_error_tool_result_entry({"type": "tool_result"}, '{"error": "bad"}')
+  filename, spill_abspath = gateway_runner.AgentRunner._write_tool_result_spill(
+    work_dir=str(tmp_path),
+    tool_name="lookup",
+    tool_use_id="tool-1",
+    content='{"ok": true}',
+  )
+  assert filename == "lookup_tool-1.json"
+  assert Path(spill_abspath).read_text(encoding="utf-8") == '{"ok": true}'
+
+
+def test_annotate_result_collects_policy_low_match_and_subagent_warnings() -> None:
+  result = {
+    "ok": True,
+    "_interceptor_warnings": ["policy"],
+    "low_match_warning": "2/10",
+    "warning": "partial",
+  }
+
+  annotated = annotate_result(result, tool_name="run_agent")
+
+  assert annotated["_runner_warning"] == (
+    "Policy warning: policy | Low match rate detected: 2/10 | Sub-agent warning: partial"
+  )
+  assert annotated["_runner_warning_detail"] == "2/10"
+  assert "_interceptor_warnings" not in result
+
+
+def test_make_error_result_includes_optional_sub_code() -> None:
+  result = make_error_result("tool-1", "invalid_input", "bad payload", sub_code="too_large")
+
+  payload = json.loads(result["content"])
+  assert result["is_error"] is True
+  assert result["tool_use_id"] == "tool-1"
+  assert payload["error"] == {
+    "code": "invalid_input",
+    "message": "bad payload",
+    "sub_code": "too_large",
+  }
+
+
+def test_make_error_result_includes_optional_data() -> None:
+  result = make_error_result(
+    "tool-1",
+    "tool_excluded",
+    "requires approval",
+    sub_code="requires_interactive_approval",
+    data={"recommended_verdict": "BUILD_BLOCKED"},
+  )
+
+  payload = json.loads(result["content"])
+  assert payload["error"] == {
+    "code": "tool_excluded",
+    "message": "requires approval",
+    "sub_code": "requires_interactive_approval",
+    "data": {"recommended_verdict": "BUILD_BLOCKED"},
+  }
+
+
+def test_is_error_tool_result_entry_treats_only_truthy_payload_error_as_error() -> None:
+  assert is_error_tool_result_entry({"is_error": True}, '{"ok": true}') is True
+  assert is_error_tool_result_entry({"error": {"code": "bad"}}, '{"ok": true}') is True
+  assert is_error_tool_result_entry({"type": "tool_result"}, '{"error": "bad"}') is True
+  assert is_error_tool_result_entry({"type": "tool_result"}, '{"error": null, "rows": []}') is False
+  assert is_error_tool_result_entry({"type": "tool_result"}, "not-json") is False
+
+
+def test_write_tool_result_spill_direct_helper_uses_uuid_factory(tmp_path: Path) -> None:
+  first = SimpleNamespace(hex="a" * 32)
+  second = SimpleNamespace(hex="bcdef1234567890")
+  calls = iter([first, second])
+  (tmp_path / f"lookup_{'a' * 32}.txt").write_text("old", encoding="utf-8")
+
+  filename, spill_abspath = write_tool_result_spill(
+    work_dir=str(tmp_path),
+    tool_name="lookup",
+    tool_use_id=None,
+    content="plain text",
+    uuid_factory=lambda: next(calls),
+  )
+
+  assert filename == f"lookup_{'a' * 32}_bcdef123.txt"
+  assert spill_abspath == str(tmp_path / filename)
+  assert (tmp_path / filename).read_text(encoding="utf-8") == "plain text"
+
+
+def test_write_tool_result_spill_default_uuid_is_resolved_at_call_time(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(tool_result_compaction.uuid, "uuid4", lambda: SimpleNamespace(hex="d" * 32))
+
+  filename, _spill_abspath = write_tool_result_spill(
+    work_dir=str(tmp_path),
+    tool_name="lookup",
+    tool_use_id=None,
+    content='{"ok": true}',
+  )
+
+  assert filename == f"lookup_{'d' * 32}.json"
+
+
+def test_compact_model_tool_result_entry_helper_spills_live_entry_and_logs(tmp_path: Path) -> None:
+  content = _large_content()
+  result_entry = {"type": "tool_result", "tool_use_id": "tool-1", "content": content}
+  logger = _RecordingLogger()
+
+  live_entry, durable_entry = compact_model_tool_result_entry(
+    result_entry,
+    tool_name="lookup",
+    spill_dir_provider=lambda: str(tmp_path),
+    log_session_id="sess-direct",
+    logger=logger,
+    uuid_factory=lambda: SimpleNamespace(hex="e" * 32),
+  )
+
+  spill_files = list(tmp_path.iterdir())
+  assert len(spill_files) == 1
+  assert spill_files[0].read_text(encoding="utf-8") == content
+  live_payload = json.loads(live_entry["content"])
+  durable_payload = json.loads(durable_entry["content"])
+  assert live_payload["spill_file"] == spill_files[0].name
+  assert live_payload["spill_abspath"] == str(spill_files[0])
+  assert "spill_file" not in durable_payload
+  assert logger.warnings == []
+  assert logger.infos[0][2]["extra"]["data"]["event"] == "tool_result_compacted"
+  assert logger.infos[0][2]["extra"]["data"]["session_id"] == "sess-direct"
 
 
 def test_compact_spills_live_entry_and_keeps_durable_pointer_free(tmp_path: Path) -> None:
@@ -667,7 +826,8 @@ def test_interactive_model_provider_runner_threads_spill_provider(monkeypatch: p
       return ModelInfo(id=model, provider="stub")
 
   monkeypatch.setattr(runtime, "AgentRunner", _FakeRunner)
-  spill_provider = lambda: "/tmp/spill"
+  def spill_provider() -> str:
+    return "/tmp/spill"
   runner_ref: list[Any] = [None]
   session = SimpleNamespace(
     result_queue=None,

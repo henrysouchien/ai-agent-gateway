@@ -254,6 +254,39 @@ def test_mint_and_submit_ambiguous_target_returns_error_without_grant_or_submit(
   _run(_case())
 
 
+def test_mint_and_submit_ignores_explicitly_non_live_workbooks(tmp_path: Path) -> None:
+  async def _case() -> None:
+    store = _store(tmp_path)
+    relay = FakeRelay(
+      workbooks=[
+        {
+          "name": "Budget.xlsx",
+          "session": "workbook-session-1",
+          "gateway_session_id": "excel-session-1",
+          "detached": False,
+          "live": False,
+        },
+      ]
+    )
+
+    submitted, error = await mint_and_submit(
+      relay=relay,
+      approval_store=store,
+      user_id="alice",
+      gateway_session_id="orchestrator-session-1",
+      text="Summarize the workbook",
+    )
+
+    assert submitted is None
+    assert error is not None
+    assert error["code"] == "no_excel_session"
+    assert _delegation_count(tmp_path) == 0
+    assert relay.submissions == []
+    assert relay.result_calls == []
+
+  _run(_case())
+
+
 def test_mint_and_submit_not_connected_returns_error_without_grant_or_submit(tmp_path: Path) -> None:
   async def _case() -> None:
     store = _store(tmp_path)

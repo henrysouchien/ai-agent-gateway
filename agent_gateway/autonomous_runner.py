@@ -31,15 +31,19 @@ _AGENT_API_CLAIM_ENV_VARS = {
 _STATUS_TAIL_LINES = 40
 _SPAWN_CLEANUP_GRACE_SEC = 1.0
 _AUTONOMOUS_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_AUTONOMOUS_TASK_ID_RE = re.compile(r"^bg_\d+$")
 _AUTONOMOUS_RUN_FILE_RE = re.compile(r"^bg_(\d+)\..+")
 _AUTONOMOUS_MANIFEST_FILE_RE = re.compile(r"^bg_(\d+)\.task\.json$")
 _ACTIVE_AUTONOMOUS_PROCESS_STATES = {"running", "approval_pending"}
 _REHYDRATED_ACTIVE_STATES = {"running", "approval_pending", "queued", "waiting"}
-_TERMINAL_AUTONOMOUS_STATES = {"completed", "failed", "killed", "interrupted"}
+_TERMINAL_AUTONOMOUS_STATES = {"completed", "failed", "killed", "interrupted", "budget_limited", "budget_exceeded"}
 _REHYDRATION_INTERRUPTED_ERROR = "gateway restarted while run was active"
 _REHYDRATE_EVENTS_SIZE_CAP_BYTES = 5 * 1024 * 1024
 _REHYDRATE_EVENTS_TAIL_LINES = 2000
 _TASK_MANIFEST_VERSION = 1
+_RUN_SEQUENCE_CURSOR_FILE = ".autonomous-sequence.json"
+_RUN_RETENTION_DAYS_ENV = "AGENT_AUTONOMOUS_RUN_RETENTION_DAYS"
+_RUN_RETENTION_SECONDS_PER_DAY = 86400.0
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -215,6 +219,7 @@ class AutonomousRegistry:
     self._seq = self._initial_task_seq()
     self._slot_lock = asyncio.Lock()
     self._reserved_slots = 0
+    self._apply_run_file_retention()
     self.rehydrate()
 
   def set_user_event_bus(self, user_event_bus: Any | None) -> None:
@@ -239,7 +244,147 @@ class AutonomousRegistry:
         exc_info=True,
       )
       return 0
-    return max_existing + 1
+    return max(max_existing + 1, self._read_sequence_cursor())
+
+  def _sequence_cursor_path(self) -> Path:
+    return self._log_dir / _RUN_SEQUENCE_CURSOR_FILE
+
+  def _read_sequence_cursor(self) -> int:
+    path = self._sequence_cursor_path()
+    try:
+      payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+      return 0
+    except (OSError, json.JSONDecodeError):
+      _LOGGER.warning("Failed to read autonomous run sequence cursor: %s", path, exc_info=True)
+      return 0
+    if not isinstance(payload, dict):
+      return 0
+    next_seq = payload.get("next_seq")
+    return int(next_seq) if isinstance(next_seq, int) and next_seq > 0 else 0
+
+  def _write_sequence_cursor(self) -> bool:
+    path = self._sequence_cursor_path()
+    tmp_path = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+      path.parent.mkdir(parents=True, exist_ok=True)
+      tmp_path.write_text(json.dumps({"next_seq": self._seq}, sort_keys=True) + "\n", encoding="utf-8")
+      os.replace(tmp_path, path)
+      return True
+    except Exception:
+      try:
+        tmp_path.unlink()
+      except OSError:
+        pass
+      _LOGGER.warning("Failed to write autonomous run sequence cursor: %s", path, exc_info=True)
+      return False
+
+  def _configured_run_retention_days(self) -> float | None:
+    raw = os.getenv(_RUN_RETENTION_DAYS_ENV, "").strip()
+    if not raw:
+      return None
+    try:
+      days = float(raw)
+    except ValueError:
+      _LOGGER.warning("Ignoring invalid %s=%r; expected positive day count", _RUN_RETENTION_DAYS_ENV, raw)
+      return None
+    return days if days > 0 else None
+
+  def _run_file_group_paths(self, task_id: str, manifest_path: Path, manifest: dict[str, Any]) -> list[Path]:
+    """Return the manifest plus every durable evidence file needed for resume."""
+
+    paths: set[Path] = set()
+    try:
+      paths.update(path for path in self._log_dir.glob(f"{task_id}.*") if path.is_file())
+    except OSError:
+      _LOGGER.warning("Failed to scan autonomous run files for retention: %s", task_id, exc_info=True)
+    paths.add(manifest_path)
+    for field_name in ("log_path", "events_path", "operator_inbox_path", "approval_decisions_path"):
+      path = self._path_from_manifest(manifest, field_name)
+      if path is not None and self._is_log_dir_child(path):
+        paths.add(path)
+    return sorted(paths, key=lambda path: path.name)
+
+  def _is_log_dir_child(self, path: Path) -> bool:
+    try:
+      log_dir = self._log_dir.resolve()
+      resolved = path.expanduser().resolve()
+    except OSError:
+      return False
+    return resolved == log_dir or log_dir in resolved.parents
+
+  def _manifest_retention_timestamp(self, manifest_path: Path, manifest: dict[str, Any]) -> float | None:
+    for field_name in ("completed_at", "started_at"):
+      value = manifest.get(field_name)
+      if isinstance(value, (int, float)):
+        return float(value)
+    try:
+      return manifest_path.stat().st_mtime
+    except OSError:
+      return None
+
+  def _should_prune_run_manifest(
+    self,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    *,
+    cutoff_ts: float,
+  ) -> bool:
+    if manifest.get("manifest_version") != _TASK_MANIFEST_VERSION:
+      return False
+    state = str(manifest.get("state") or "").strip().lower()
+    if state not in {"completed", "finished"}:
+      return False
+    if manifest.get("resumed_from"):
+      return False
+    resumed_as = manifest.get("resumed_as")
+    if isinstance(resumed_as, list) and resumed_as:
+      return False
+    completed_ts = self._manifest_retention_timestamp(manifest_path, manifest)
+    return completed_ts is not None and completed_ts < cutoff_ts
+
+  def _apply_run_file_retention(self) -> None:
+    retention_days = self._configured_run_retention_days()
+    if retention_days is None or not self._log_dir.exists():
+      return
+
+    cutoff_ts = time.time() - (retention_days * _RUN_RETENTION_SECONDS_PER_DAY)
+    pruned_runs = 0
+    pruned_files = 0
+    if not self._write_sequence_cursor():
+      return
+    for manifest_path in self._manifest_paths():
+      try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+      except (OSError, json.JSONDecodeError):
+        continue
+      if not isinstance(manifest, dict):
+        continue
+      if not self._should_prune_run_manifest(manifest_path, manifest, cutoff_ts=cutoff_ts):
+        continue
+      task_id = self._coerce_manifest_str(manifest, "task_id")
+      if not task_id or _AUTONOMOUS_TASK_ID_RE.fullmatch(task_id) is None:
+        continue
+      deleted_any = False
+      for path in self._run_file_group_paths(task_id, manifest_path, manifest):
+        try:
+          path.unlink()
+          pruned_files += 1
+          deleted_any = True
+        except FileNotFoundError:
+          pass
+        except OSError:
+          _LOGGER.warning("Failed to prune autonomous run file: %s", path, exc_info=True)
+      if deleted_any:
+        self._tasks.pop(task_id, None)
+        pruned_runs += 1
+    if pruned_runs:
+      _LOGGER.info(
+        "Pruned %d autonomous run(s), %d file(s), older than %.3g day(s)",
+        pruned_runs,
+        pruned_files,
+        retention_days,
+      )
 
   def _manifest_path(self, task_id: str) -> Path:
     return self._log_dir / f"{task_id}.task.json"
@@ -413,6 +558,34 @@ class AutonomousRegistry:
       _LOGGER.warning("Failed to load autonomous events for rehydration: %s", events_path, exc_info=True)
       return []
 
+  @staticmethod
+  def _events_include_budget_exceeded(events: list[dict[str, Any]] | None) -> bool:
+    return any(
+      isinstance(event, dict) and event.get("type") == "budget_exceeded"
+      for event in events or []
+    )
+
+  def _record_has_budget_exceeded(self, record: AutonomousTask) -> bool:
+    return self._events_include_budget_exceeded(record.event_lines)
+
+  def _canonical_terminal_state(self, state: str, events: list[dict[str, Any]] | None) -> str:
+    if state in {"budget_limited", "budget_exceeded"}:
+      return "budget_limited"
+    if state in {"completed", "finished", "failed"} and self._events_include_budget_exceeded(events):
+      return "budget_limited"
+    return state
+
+  def _apply_budget_limited_terminal_state(self, record: AutonomousTask) -> bool:
+    if record.state not in {"completed", "finished", "failed", "budget_exceeded"}:
+      return False
+    if not self._record_has_budget_exceeded(record):
+      return False
+    previous_state = record.state
+    record.state = "budget_limited"
+    if record.error and record.error.startswith("Process exited with code "):
+      record.error = None
+    return record.state != previous_state
+
   def _coerce_manifest_str(self, manifest: dict[str, Any], field_name: str) -> str | None:
     value = manifest.get(field_name)
     return value if isinstance(value, str) else None
@@ -433,7 +606,14 @@ class AutonomousRegistry:
     user_id = self._coerce_manifest_str(manifest, "user_id")
     profile = self._coerce_manifest_str(manifest, "profile")
     mode = self._coerce_manifest_str(manifest, "mode")
-    if not task_id or not control_run_id or not user_id or not profile or not mode:
+    if (
+      not task_id
+      or _AUTONOMOUS_TASK_ID_RE.fullmatch(task_id) is None
+      or not control_run_id
+      or not user_id
+      or not profile
+      or not mode
+    ):
       _LOGGER.warning("Skipping autonomous manifest missing required fields: %s", manifest_path)
       return None
 
@@ -444,11 +624,14 @@ class AutonomousRegistry:
     )
     events = self._load_rehydrated_events(events_path)
 
-    raw_state = self._coerce_manifest_str(manifest, "state") or "running"
+    raw_manifest_state = self._coerce_manifest_str(manifest, "state") or "running"
+    raw_state = self._canonical_terminal_state(raw_manifest_state, events)
     was_interrupted = False
     completed_at = manifest.get("completed_at")
     completed_at = float(completed_at) if isinstance(completed_at, (int, float)) else None
     error = self._coerce_manifest_str(manifest, "error")
+    if raw_state == "budget_limited" and error and error.startswith("Process exited with code "):
+      error = None
     if raw_state in _REHYDRATED_ACTIVE_STATES or raw_state not in _TERMINAL_AUTONOMOUS_STATES:
       raw_state = "interrupted"
       was_interrupted = True
@@ -507,7 +690,7 @@ class AutonomousRegistry:
       resumed_as=[str(item) for item in resumed_as] if isinstance(resumed_as, list) else [],
     )
     self._attach_manifest_tracking(record)
-    if was_interrupted:
+    if was_interrupted or record.state != raw_manifest_state:
       self._write_task_manifest(record)
     return record
 
@@ -538,6 +721,7 @@ class AutonomousRegistry:
   def _next_task_id(self) -> str:
     task_id = f"bg_{self._seq}"
     self._seq += 1
+    self._write_sequence_cursor()
     return task_id
 
   def _build_cmd(
@@ -608,6 +792,36 @@ class AutonomousRegistry:
     event_copy.setdefault("run_id", record.control_run_id)
     event_copy.setdefault("control_run_id", record.control_run_id)
     return event_copy
+
+  def _replay_seed_events_for_record(self, record: AutonomousTask) -> list[dict[str, Any]]:
+    return [
+      self._event_for_record(record, event)
+      for event in record.event_lines or []
+      if isinstance(event, dict)
+    ]
+
+  def _record_replay_buffer_terminated(self, record: AutonomousTask) -> bool:
+    if record.state in _TERMINAL_AUTONOMOUS_STATES or record.state == "finished":
+      return True
+    if record.proc is not None and record.proc.returncode is None:
+      return False
+    return record.state not in _REHYDRATED_ACTIVE_STATES and record.state != "starting"
+
+  async def _seed_replay_buffer_for_record(self, record: AutonomousTask) -> None:
+    if self._user_event_bus is None:
+      return
+    seed = getattr(self._user_event_bus, "seed_replay_buffer", None)
+    if not callable(seed):
+      return
+    try:
+      await seed(
+        record.user_id,
+        record.control_run_id,
+        self._replay_seed_events_for_record(record),
+        terminated=self._record_replay_buffer_terminated(record),
+      )
+    except Exception:
+      pass
 
   def _event_duplicate_key(self, event: dict[str, Any]) -> tuple[str, str] | None:
     if event.get("type") != "parent_message_sent":
@@ -739,9 +953,11 @@ class AutonomousRegistry:
       return
     if record.event_lines is None:
       record.event_lines = []
-    record.event_lines.append(event_copy)
     if self._user_event_bus is None:
+      record.event_lines.append(event_copy)
       return
+    await self._seed_replay_buffer_for_record(record)
+    record.event_lines.append(event_copy)
     try:
       await self._user_event_bus.publish(
         user_id=record.user_id,
@@ -774,6 +990,8 @@ class AutonomousRegistry:
   def _terminal_state_for_record(self, record: AutonomousTask) -> str:
     if record.state == "killed":
       return "cancelled"
+    if record.state in {"budget_limited", "budget_exceeded"} or self._record_has_budget_exceeded(record):
+      return "budget_limited"
     if record.state in {"completed", "finished"}:
       return "completed"
     if record.state == "failed":
@@ -1059,7 +1277,7 @@ class AutonomousRegistry:
       except FileNotFoundError:
         pass
 
-      if record.completed_at is not None or record.state in {"completed", "finished", "failed", "killed"}:
+      if record.completed_at is not None or record.state == "finished" or record.state in _TERMINAL_AUTONOMOUS_STATES:
         return
       await asyncio.sleep(0.1)
 
@@ -1089,6 +1307,8 @@ class AutonomousRegistry:
         record.log_handle = None
       await self._release_slot(record)
       await self._finish_events_tail(record)
+      if self._apply_budget_limited_terminal_state(record):
+        self._write_task_manifest(record)
       terminal_state = self._terminal_state_for_record(record)
       if terminal_state != "running" and not self._has_terminal_run_state(record, terminal_state):
         await self._publish_run_state(record, terminal_state)
@@ -1114,6 +1334,8 @@ class AutonomousRegistry:
 
     await self._release_slot(record)
     await self._finish_events_tail(record)
+    if self._apply_budget_limited_terminal_state(record):
+      self._write_task_manifest(record)
     terminal_state = self._terminal_state_for_record(record)
     if terminal_state != "running" and not self._has_terminal_run_state(record, terminal_state):
       await self._publish_run_state(record, terminal_state)

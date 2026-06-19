@@ -52,6 +52,7 @@ class SkillProfile:
   state_dir: str | None = None
   max_budget_usd: float | None = None
   max_tokens: int | None = None
+  thinking: bool | None = None
   max_retries: int | None = None
   initial_message: str | None = None
   delivery_label: str | None = None
@@ -62,9 +63,13 @@ class SkillProfile:
   mode: str = "full"
   extra_excluded_tools: set[str] = field(default_factory=set)
   tool_packs_enabled: bool = True
-  provider: str | None = None
   state_class: str | None = None
   mutation_mode: Mode | str | None = None
+  # Append new fields BELOW this line. Positional construction is part of the
+  # contract (test_skill_profile_positional_construction_compat pins the order
+  # through mutation_mode); inserting a field mid-struct shifts later fields and
+  # breaks positional callers.
+  provider: str | None = None
 
 
 def _clean_string(value: Any) -> str | None:
@@ -332,6 +337,7 @@ def parse_skill_file(path: Path) -> SkillProfile:
   raw_state_dir = metadata.pop("state_dir", None)
   raw_max_budget_usd = metadata.pop("max_budget_usd", None)
   raw_max_tokens = metadata.pop("max_tokens", None)
+  raw_thinking = metadata.pop("thinking", None)
   raw_max_retries = metadata.pop("max_retries", None)
   raw_initial_message = metadata.pop("initial_message", None)
   raw_delivery_label = metadata.pop("delivery_label", None)
@@ -367,6 +373,11 @@ def parse_skill_file(path: Path) -> SkillProfile:
     raw_max_tokens,
     field_name="max_tokens",
     path=path,
+  )
+  coerced_thinking = (
+    None
+    if raw_thinking is None
+    else _coerce_optional_bool(raw_thinking, field_name="thinking", path=path)
   )
   coerced_max_retries = _coerce_optional_int(
     raw_max_retries,
@@ -415,6 +426,7 @@ def parse_skill_file(path: Path) -> SkillProfile:
     ("timeout_overrides", coerced_timeout_overrides),
     ("state_dir", coerced_state_dir),
     ("max_budget_usd", coerced_max_budget_usd),
+    ("thinking", coerced_thinking),
     ("max_retries", coerced_max_retries),
     ("initial_message", coerced_initial_message),
     ("delivery_label", coerced_delivery_label),
@@ -447,6 +459,7 @@ def parse_skill_file(path: Path) -> SkillProfile:
     state_dir=coerced_state_dir,
     max_budget_usd=coerced_max_budget_usd,
     max_tokens=coerced_max_tokens,
+    thinking=coerced_thinking,
     max_retries=coerced_max_retries,
     initial_message=coerced_initial_message,
     delivery_label=coerced_delivery_label,

@@ -104,6 +104,7 @@ class CredentialRefreshRequest:
   channel: str | None
   provider: str
   billing_mode: str | None
+  rate_table_version: str | None
   model: str | None
   auth_mode: str | None
   request_id: str | None

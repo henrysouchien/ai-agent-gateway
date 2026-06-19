@@ -114,6 +114,70 @@ def test_user_event_bus_replays_buffer_before_live_tail() -> None:
   asyncio.run(_run())
 
 
+def test_user_event_bus_seeds_replay_buffer_from_durable_events() -> None:
+  async def _run() -> None:
+    bus = UserEventBus(replay_buffer_max=2)
+    seeded = await bus.seed_replay_buffer(
+      "alice",
+      "run-1",
+      [
+        {"type": "message", "value": "one"},
+        {"type": "message", "value": "two"},
+        {"type": "message", "value": "three"},
+      ],
+      terminated=True,
+    )
+    assert seeded == 2
+
+    subscriber = bus.subscribe_entries("alice", control_run_id="run-1", after_seq=0)
+    truncated = await asyncio.wait_for(subscriber.__anext__(), timeout=0.5)
+    assert truncated.seq is None
+    assert truncated.event == {
+      "type": "replay_truncated",
+      "run_id": "run-1",
+      "control_run_id": "run-1",
+      "dropped_before_seq": 2,
+    }
+    replayed = [await asyncio.wait_for(subscriber.__anext__(), timeout=0.5) for _ in range(2)]
+    assert [(entry.seq, entry.event["value"]) for entry in replayed] == [(2, "two"), (3, "three")]
+
+    live_task = asyncio.create_task(subscriber.__anext__())
+    await asyncio.sleep(0)
+    await bus.publish("alice", "run-1", {"type": "message", "value": "four"})
+    live = await asyncio.wait_for(live_task, timeout=0.5)
+    assert live.seq == 4
+    assert live.event == {"type": "message", "value": "four"}
+
+    assert await bus.seed_replay_buffer("alice", "run-1", [{"type": "message", "value": "duplicate"}]) == 0
+    await subscriber.aclose()
+    await bus.shutdown()
+
+  asyncio.run(_run())
+
+
+def test_user_event_bus_seed_existing_buffer_can_mark_terminal_for_cleanup() -> None:
+  async def _run() -> None:
+    bus = UserEventBus()
+    bus._cleanup_delay_seconds = 0.01
+    assert await bus.seed_replay_buffer("alice", "run-1", [{"type": "message", "value": "one"}]) == 1
+    assert await bus.seed_replay_buffer("alice", "run-1", [], terminated=True) == 0
+    await asyncio.sleep(0.05)
+
+    subscriber = bus.subscribe("alice", control_run_id="run-1")
+    next_task = asyncio.create_task(subscriber.__anext__())
+    await asyncio.sleep(0)
+    with pytest.raises(asyncio.TimeoutError):
+      await asyncio.wait_for(asyncio.shield(next_task), timeout=0.05)
+
+    next_task.cancel()
+    with suppress(asyncio.CancelledError):
+      await next_task
+    await subscriber.aclose()
+    await bus.shutdown()
+
+  asyncio.run(_run())
+
+
 def test_user_event_bus_fast_run_race_replays_after_termination_before_cleanup() -> None:
   async def _run() -> None:
     bus = UserEventBus()

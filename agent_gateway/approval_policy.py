@@ -208,7 +208,7 @@ class ApprovalDecision:
   route_target_type: str | None = None
   required_decider_count: int = 1
   eligible_decider_count: int = 1
-  expiry_seconds: int | None = None
+  expiry_seconds: float | int | None = None
   allow_persistent_grant: bool = False
   persistent_grant_scope_hint: str | None = None
   redacted_args_for_audit: dict[str, Any] | None = None

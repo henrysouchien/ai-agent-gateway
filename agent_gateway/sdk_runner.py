@@ -7,9 +7,9 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import timedelta
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Sequence, Tuple
 
 from .approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
@@ -23,6 +23,7 @@ from .approval_policy import (
   utc_now,
 )
 from . import approval_settings
+from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
 from .event_log import EventLog
 from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator, normalize_identity
 from .product_config import gateway_product_id
@@ -34,10 +35,13 @@ from .runner import (
   _REPORT_DOOR_CLEAR_SUCCESS_STATUSES,
   _detect_user_id_param,
 )
+from .runner_introspection import detect_keyword_param as _detect_keyword_param
 from .session_recap import emit_recap_then_terminal
 from .skill_context import clear_current_skill, current_skill
+from . import sdk_runner_helpers as _sdk_runner_helpers
+from .sdk_runner_stream import ToolCallInfo, _ActiveToolUse, _SDKRunnerStreamMixin
 from .tool_dispatcher import RELAY_POLICY_DENIED_MESSAGE, RELAY_POLICY_DENIED_SUB_CODE
-from .tool_display import resolve_display
+from .tool_display import resolve_display  # noqa: F401 - compatibility alias for stream helpers
 from .tool_result_semantics import classify_semantic_tool_error
 
 
@@ -49,24 +53,24 @@ OnSessionSummary = Callable[[SessionUsageSummary], Awaitable[None] | None]
 OnToolTiming = Callable[..., None]
 
 
+_PATCH_OP_RAW_INPUT_TOOLS = _sdk_runner_helpers.PATCH_OP_RAW_INPUT_TOOLS
+_as_dict = _sdk_runner_helpers.as_dict
+_as_plain_dict = _sdk_runner_helpers.as_plain_dict
+_extract_text = _sdk_runner_helpers.extract_text
+_get_attr = _sdk_runner_helpers.get_attr
+_join_system_prompt = _sdk_runner_helpers.join_system_prompt
+_parse_result_payload = _sdk_runner_helpers.parse_result_payload
+_policy_tool_name = _sdk_runner_helpers.policy_tool_name
+_redact_tool_input_for_event = _sdk_runner_helpers.redact_tool_input_for_event
+_server_for_tool = _sdk_runner_helpers.server_for_tool
+_should_escrow_raw_tool_input = _sdk_runner_helpers.should_escrow_raw_tool_input
+_summarize_error_payload = _sdk_runner_helpers.summarize_error_payload
+ToolCallInfo.__module__ = __name__
+_ActiveToolUse.__module__ = __name__
+
+
 def _approval_queue_timeout_seconds(expiry_seconds: float | int | None) -> float:
   return min(float(expiry_seconds or 600), approval_settings.approval_wait_seconds())
-
-
-@dataclass
-class ToolCallInfo:
-  tool_call_id: str
-  tool_name: str
-  tool_input: Dict[str, Any]
-  started_at: float
-
-
-@dataclass
-class _ActiveToolUse:
-  tool_call_id: str
-  tool_name: str
-  input_json: str = ""
-  raw_block: Any = None
 
 
 class _PromptMessages:
@@ -89,149 +93,7 @@ class _PromptMessages:
     }
 
 
-def _as_plain_dict(value: Any) -> Any:
-  if value is None:
-    return None
-  if isinstance(value, dict):
-    return {key: _as_plain_dict(item) for key, item in value.items()}
-  if isinstance(value, list):
-    return [_as_plain_dict(item) for item in value]
-  if hasattr(value, "model_dump"):
-    try:
-      return _as_plain_dict(value.model_dump())
-    except Exception:
-      pass
-  if hasattr(value, "__dict__"):
-    return {
-      key: _as_plain_dict(item)
-      for key, item in vars(value).items()
-      if not key.startswith("_")
-    }
-  return value
-
-
-def _get_attr(value: Any, key: str, default: Any = None) -> Any:
-  if isinstance(value, Mapping):
-    return value.get(key, default)
-  return getattr(value, key, default)
-
-
-def _as_dict(value: Any) -> Dict[str, Any]:
-  plain = _as_plain_dict(value)
-  if isinstance(plain, dict):
-    return plain
-  return {}
-
-
-def _extract_text(value: Any) -> str:
-  if value is None:
-    return ""
-  if isinstance(value, str):
-    return value
-  if isinstance(value, list):
-    chunks: List[str] = []
-    for item in value:
-      if isinstance(item, str):
-        if item:
-          chunks.append(item)
-        continue
-      text = _get_attr(item, "text")
-      if isinstance(text, str) and text:
-        chunks.append(text)
-        continue
-      item_type = _get_attr(item, "type")
-      if item_type == "text":
-        block_text = _get_attr(item, "text")
-        if isinstance(block_text, str) and block_text:
-          chunks.append(block_text)
-    return "\n".join(chunks).strip()
-  return str(value)
-
-
-def _parse_result_payload(value: Any) -> Any:
-  if isinstance(value, (dict, list)):
-    return _as_plain_dict(value)
-  if isinstance(value, str):
-    stripped = value.strip()
-    if not stripped:
-      return ""
-    try:
-      return json.loads(stripped)
-    except json.JSONDecodeError:
-      return value
-  if value is None:
-    return None
-  return _as_plain_dict(value)
-
-
-def _summarize_error_payload(value: Any) -> str:
-  parsed = _parse_result_payload(value)
-  if isinstance(parsed, dict):
-    inner = parsed.get("error")
-    if isinstance(inner, dict):
-      message = inner.get("message")
-      if isinstance(message, str) and message.strip():
-        return message.strip()
-    message = parsed.get("message")
-    if isinstance(message, str) and message.strip():
-      return message.strip()
-    if parsed.get("success") is False:
-      return "success=false"
-    status = parsed.get("status")
-    if isinstance(status, str) and status.strip():
-      return f"status={status.strip()}"
-    return json.dumps(parsed, default=str)
-  if isinstance(parsed, list):
-    return json.dumps(parsed, default=str)
-  return str(parsed or "Tool failed")
-
-
-def _join_system_prompt(system_prompt: str | List[Tuple[str, bool]] | None) -> str:
-  if system_prompt is None:
-    return ""
-  if isinstance(system_prompt, str):
-    return system_prompt
-  return "\n\n".join(text for text, _should_cache in system_prompt if text)
-
-
-def _server_for_tool(tool_name: str) -> str | None:
-  if not tool_name.startswith("mcp__"):
-    return None
-  parts = tool_name.split("__", 2)
-  if len(parts) < 3 or not parts[1]:
-    return None
-  return parts[1]
-
-
-def _redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
-  try:
-    from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
-
-    return redact_tool_input(tool_name, tool_input, deployment_secret=get_audit_hmac_secret())
-  except Exception:
-    return dict(tool_input)
-
-
-def _policy_tool_name(tool_name: str) -> str:
-  if tool_name.startswith("mcp__"):
-    parts = tool_name.split("__", 2)
-    if len(parts) == 3:
-      return parts[2]
-  return tool_name
-
-
-_PATCH_OP_RAW_INPUT_TOOLS = frozenset({
-  "apply_patch_ops",
-  "preview_patch_ops",
-  "publish_price_target",
-})
-
-
-def _should_escrow_raw_tool_input(tool_name: str) -> bool:
-  return _policy_tool_name(tool_name) in _PATCH_OP_RAW_INPUT_TOOLS
-
-
-class AgentSDKRunner:
+class AgentSDKRunner(_SDKRunnerStreamMixin):
   """Run a conversation through the Anthropic agent SDK.
 
   This is an alternative to `AgentRunner` when you want to delegate tool-loop
@@ -262,6 +124,7 @@ class AgentSDKRunner:
     workspace_dir: str | None = None,
     started_at: float | None = None,
     emit_session_recap: bool = True,
+    context_surfaces: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
   ) -> None:
     self._log = event_log
     self._session_id = session_id or "no-session"
@@ -279,6 +142,9 @@ class AgentSDKRunner:
     self._on_tool_result = on_tool_result
     self._on_tool_timing = on_tool_timing
     self._on_tool_timing_accepts_user_id = _detect_user_id_param(on_tool_timing)
+    self._on_tool_timing_accepts_context_surfaces = _detect_keyword_param(on_tool_timing, "context_surfaces")
+    self._context_surfaces_provider = context_surfaces if callable(context_surfaces) else None
+    self._context_surfaces_static = self._normalize_context_surfaces(None if callable(context_surfaces) else context_surfaces)
     self._pending_tool_calls: Dict[str, ToolCallInfo] = {}
     self._active_tool_use: _ActiveToolUse | None = None
     self._active_skill_deny: set[str] = set()
@@ -311,6 +177,8 @@ class AgentSDKRunner:
       session_id=self._session_id,
       request_id=self._request_id,
       channel=self._channel,
+      rate_table_version=self._rate_table_version,
+      billing_mode=self._billing_mode,
     )
     self._summary_emitted = False
     self._session = session
@@ -319,6 +187,23 @@ class AgentSDKRunner:
     self._run_context = run_context
     self._skill_run_id = skill_run_id
     self._workspace_dir = workspace_dir
+
+  @staticmethod
+  def _normalize_context_surfaces(surfaces: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    return [
+      dict(surface)
+      for surface in (surfaces or [])
+      if isinstance(surface, dict)
+    ]
+
+  def _context_surface_records(self) -> list[dict[str, Any]]:
+    if self._context_surfaces_provider is None:
+      return self._normalize_context_surfaces(self._context_surfaces_static)
+    try:
+      return self._normalize_context_surfaces(self._context_surfaces_provider())
+    except Exception as exc:
+      log.warning("[%s] context surface provider failed (non-fatal): %s", self._sid, exc)
+      return self._normalize_context_surfaces(self._context_surfaces_static)
 
   def _append(self, event: Dict[str, Any]) -> None:
     payload = dict(event)
@@ -385,6 +270,9 @@ class AgentSDKRunner:
       return
     try:
       if self._on_tool_timing_accepts_user_id:
+        kwargs: dict[str, Any] = {}
+        if self._on_tool_timing_accepts_context_surfaces:
+          kwargs["context_surfaces"] = self._context_surface_records()
         self._on_tool_timing(
           self._session_id,
           tool_name,
@@ -393,8 +281,12 @@ class AgentSDKRunner:
           is_error,
           result_bytes,
           user_id=self._usage_user_id,
+          **kwargs,
         )
       else:
+        kwargs = {}
+        if self._on_tool_timing_accepts_context_surfaces:
+          kwargs["context_surfaces"] = self._context_surface_records()
         self._on_tool_timing(
           self._session_id,
           tool_name,
@@ -402,6 +294,7 @@ class AgentSDKRunner:
           duration_ms,
           is_error,
           result_bytes,
+          **kwargs,
         )
     except Exception as exc:
       log.warning("[%s] on_tool_timing hook failed (non-fatal): %s", self._sid, exc)
@@ -678,209 +571,6 @@ class AgentSDKRunner:
       hooks["PostToolUseFailure"] = [hook_matcher_cls(hooks=[self._post_tool_use_failure_hook])]
     return hooks
 
-  def _handle_stream_event(self, raw_event: Dict[str, Any]) -> None:
-    event_type = str(raw_event.get("type") or "")
-    if event_type == "content_block_start":
-      block = _as_dict(raw_event.get("content_block"))
-      if str(block.get("type") or "") == "tool_use":
-        self._active_tool_use = _ActiveToolUse(
-          tool_call_id=str(block.get("id") or ""),
-          tool_name=str(block.get("name") or "tool"),
-          raw_block=block,
-        )
-      return
-
-    if event_type == "content_block_delta":
-      delta = _as_dict(raw_event.get("delta"))
-      delta_type = str(delta.get("type") or "")
-      if delta_type == "text_delta":
-        text = str(delta.get("text") or "")
-        if text:
-          self._append({"type": "text_delta", "text": text})
-        return
-      if delta_type == "thinking_delta":
-        thinking_text = str(delta.get("thinking") or "")
-        if thinking_text:
-          self._append({"type": "thinking_delta", "text": thinking_text})
-        return
-      if delta_type == "input_json_delta" and self._active_tool_use is not None:
-        partial_json = str(delta.get("partial_json") or "")
-        if partial_json:
-          self._active_tool_use.input_json += partial_json
-        return
-      return
-
-    if event_type == "content_block_stop" and self._active_tool_use is not None:
-      raw_block = _as_dict(self._active_tool_use.raw_block)
-      tool_input: Dict[str, Any] = {}
-      if self._active_tool_use.input_json:
-        try:
-          parsed = json.loads(self._active_tool_use.input_json)
-          if isinstance(parsed, dict):
-            tool_input = parsed
-        except json.JSONDecodeError:
-          tool_input = {}
-      elif isinstance(raw_block.get("input"), dict):
-        tool_input = dict(raw_block.get("input") or {})
-
-      tool_call_id = self._active_tool_use.tool_call_id
-      tool_name = self._active_tool_use.tool_name
-      self._pending_tool_calls[tool_call_id] = ToolCallInfo(
-        tool_call_id=tool_call_id,
-        tool_name=tool_name,
-        tool_input=tool_input,
-        started_at=time.time(),
-      )
-      if _should_escrow_raw_tool_input(tool_name):
-        record_raw_tool_input = getattr(self._log, "record_raw_tool_input", None)
-        if callable(record_raw_tool_input):
-          record_raw_tool_input(
-            tool_call_id=tool_call_id,
-            tool_name=tool_name,
-            tool_input=tool_input,
-          )
-      redacted_tool_input = _redact_tool_input_for_event(tool_name, tool_input)
-      display = resolve_display(tool_name, redacted_tool_input)
-      tool_start_event = {
-        "type": "tool_call_start",
-        "tool_call_id": tool_call_id,
-        "tool_name": tool_name,
-        "tool_input": redacted_tool_input,
-      }
-      if display is not None:
-        tool_start_event["display"] = display
-      self._append(tool_start_event)
-      self._active_tool_use = None
-
-  def _extract_tool_result_blocks(self, message: Any) -> List[Dict[str, Any]]:
-    content = _get_attr(message, "content")
-    parent_tool_use_id = _get_attr(message, "parent_tool_use_id")
-    tool_use_result = _get_attr(message, "tool_use_result")
-
-    blocks: List[Dict[str, Any]] = []
-    if isinstance(content, list):
-      for raw_block in content:
-        block = _as_dict(raw_block)
-        if str(block.get("type") or "") == "tool_result":
-          blocks.append(block)
-
-    if not blocks and parent_tool_use_id and tool_use_result is not None:
-      blocks.append(
-        {
-          "type": "tool_result",
-          "tool_use_id": str(parent_tool_use_id),
-          "content": tool_use_result,
-        }
-      )
-    return blocks
-
-  def _normalize_tool_result(
-    self,
-    block: Dict[str, Any],
-  ) -> Tuple[Any | None, Dict[str, Any] | None]:
-    parsed = _parse_result_payload(block.get("content"))
-    if bool(block.get("is_error")):
-      if isinstance(parsed, dict):
-        nested = parsed.get("error")
-        if isinstance(nested, dict):
-          return None, nested
-        return None, {
-          "code": str(parsed.get("code") or "tool_error"),
-          "message": _summarize_error_payload(parsed),
-        }
-      return None, {"code": "tool_error", "message": _summarize_error_payload(parsed)}
-    return self._consume_private_tool_result_fields(parsed), None
-
-  def _complete_tool_call(
-    self,
-    tool_call_id: str,
-    *,
-    result: Any | None = None,
-    error: Dict[str, Any] | None = None,
-    synthetic: bool = False,
-    outcome: str | None = None,
-  ) -> None:
-    info = self._pending_tool_calls.pop(tool_call_id, None)
-    if info is None:
-      return
-
-    server = _server_for_tool(info.tool_name)
-    duration_ms = int((time.time() - info.started_at) * 1000)
-    result_bytes = len(json.dumps(result, default=str)) if result is not None else 0
-    semantic_error = classify_semantic_tool_error(result) if error is None else None
-    event = {
-      "type": "tool_call_complete",
-      "tool_call_id": tool_call_id,
-      "tool_name": info.tool_name,
-      "result": result,
-      "error": error,
-      "duration_ms": duration_ms,
-      "server": server,
-      "is_error": error is not None or semantic_error is not None,
-    }
-    if semantic_error is not None:
-      event["semantic_error"] = dict(semantic_error)
-    self._clear_active_skill_if_report_door_completed(
-      tool_name=info.tool_name,
-      result=result,
-      error=error,
-    )
-    if synthetic:
-      log.info("[%s] Synthetic tool completion for %s (%s)", self._sid, info.tool_name, tool_call_id)
-    self._append(event)
-    self._call_on_tool_timing(
-      tool_name=info.tool_name,
-      server=server,
-      duration_ms=duration_ms,
-      is_error=event["is_error"],
-      result_bytes=result_bytes,
-    )
-
-  def _flush_pending_tool_calls(self, *, outcome: str | None = None) -> None:
-    for tool_call_id in list(self._pending_tool_calls.keys()):
-      self._complete_tool_call(tool_call_id, synthetic=True, outcome=outcome)
-
-  def _handle_user_message(self, message: Any) -> None:
-    for block in self._extract_tool_result_blocks(message):
-      tool_call_id = str(block.get("tool_use_id") or "")
-      if not tool_call_id:
-        continue
-      result, error = self._normalize_tool_result(block)
-      self._complete_tool_call(tool_call_id, result=result, error=error)
-
-    # Message boundary flush: keep UI from showing long-lived pending tools when the
-    # SDK consumes tool results internally and omits explicit tool_result blocks.
-    self._flush_pending_tool_calls()
-
-  def _handle_system_message(self, message: Any) -> None:
-    subtype = str(_get_attr(message, "subtype") or "")
-    data = _as_dict(_get_attr(message, "data"))
-    if subtype == "init":
-      statuses = data.get("mcp_servers")
-      log.info("[%s] SDK init | mcp_servers=%s", self._sid, statuses if statuses is not None else data)
-      return
-    log.info("[%s] SDK system message | subtype=%s data=%s", self._sid, subtype or "unknown", data)
-
-  def _handle_assistant_message(self, message: Any) -> None:
-    error = _get_attr(message, "error")
-    if error:
-      log.warning("[%s] SDK assistant message error: %s", self._sid, error)
-
-  def _emit_stream_complete(self) -> None:
-    if self._stream_terminal_emitted:
-      return
-
-    cost_usd = float(self._usage.get("estimated_cost") or 0.0)
-    usage = {
-      "input_tokens": int(self._usage.get("input_tokens") or 0),
-      "output_tokens": int(self._usage.get("output_tokens") or 0),
-      "cache_creation_input_tokens": int(self._usage.get("cache_creation_input_tokens") or 0),
-      "cache_read_input_tokens": int(self._usage.get("cache_read_input_tokens") or 0),
-      "estimated_cost": round(cost_usd, 4),
-    }
-    self._append({"type": "stream_complete", "usage": usage})
-    self._stream_terminal_emitted = True
-
   def _approval_lifecycle_configured(self) -> bool:
     return self._approval_store is not None and self._approval_policy is not None and self._session is not None
 
@@ -1006,6 +696,7 @@ class AgentSDKRunner:
       run_context = replace(run_context, skill=active_skill)
     policy_tool = _policy_tool_name(tool_name)
     redacted, args_hash = self._redact_for_approval_request(tool_name, input_data)
+    redacted = enrich_trade_approval_args(policy_tool, redacted, event_log=self._log)
     request = build_approval_request(
       tool_call_id=f"sdk-{uuid.uuid4().hex}",
       tool_name=policy_tool,
@@ -1021,6 +712,15 @@ class AgentSDKRunner:
     finally:
       raw_args.clear()
       del raw_args
+    expiry_seconds = effective_trade_approval_expiry_seconds(
+      policy_tool,
+      request.tool_args_redacted,
+      requested_expiry_seconds=decision.expiry_seconds,
+      max_wait_seconds=approval_settings.approval_wait_seconds(),
+      now=utc_now(),
+    )
+    if expiry_seconds != decision.expiry_seconds:
+      decision = replace(decision, expiry_seconds=expiry_seconds)
     request = apply_decision_to_request(request, decision)
     await store.update_request(request)
 
@@ -1235,6 +935,7 @@ class AgentSDKRunner:
             ended_at=time.time(),
             drain_complete=True,
             in_flight_task_count=0,
+            context_surfaces=self._context_surface_records(),
           )
           self._summary_emitted = True
           await self._call_on_session_summary(summary)

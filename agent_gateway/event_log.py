@@ -216,6 +216,56 @@ class UserEventBus:
           continue
         self._enqueue_for_subscriber(subscriber, entry)
 
+  async def seed_replay_buffer(
+    self,
+    user_id: str,
+    control_run_id: str,
+    events: list[dict],
+    *,
+    terminated: bool = False,
+  ) -> int:
+    """Backfill one run's replay buffer from a durable event source.
+
+    The bus assigns per-run sequence numbers, so durable events are stored with
+    synthetic seqs that match their position in the persisted stream. Future
+    live publishes then continue at ``len(events) + 1``.
+    """
+    normalized_user_id = str(user_id)
+    normalized_run_id = str(control_run_id)
+    key = (normalized_user_id, normalized_run_id)
+    seed_events = [dict(event) for event in events if isinstance(event, dict)]
+
+    async with self._lock:
+      if self._shutdown:
+        return 0
+      if key in self._replay_buffers or key in self._next_seq_by_run:
+        if terminated:
+          self._terminated_runs.add(key)
+          self._schedule_cleanup_locked(key)
+        return 0
+
+      replay_buffer = deque(maxlen=self._replay_buffer_max)
+      total_events = len(seed_events)
+      tail = seed_events[-self._replay_buffer_max :]
+      first_seq = total_events - len(tail) + 1
+      now = time.time()
+      for index, event in enumerate(tail, start=first_seq):
+        replay_buffer.append(
+          _BusEvent(
+            event=event,
+            timestamp=now,
+            seq=index,
+            control_run_id=normalized_run_id,
+          )
+        )
+
+      self._replay_buffers[key] = replay_buffer
+      self._next_seq_by_run[key] = total_events + 1
+      if terminated:
+        self._terminated_runs.add(key)
+        self._schedule_cleanup_locked(key)
+      return len(replay_buffer)
+
   def subscribe(
     self,
     user_id: str,
