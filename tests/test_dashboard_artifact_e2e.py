@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: F811
+
 import asyncio
 import json
 import sys
@@ -26,7 +28,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
   sys.path.insert(0, str(TESTS_DIR))
 
-from test_artifact_api import ArtifactApiFixture, USER_ID, _signed_headers, artifact_api
+from test_artifact_api import ArtifactApiFixture, USER_ID, _signed_headers, artifact_api  # noqa: F401
 
 
 class _NullMcpClient:

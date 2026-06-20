@@ -34,9 +34,9 @@ _AUTONOMOUS_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _AUTONOMOUS_TASK_ID_RE = re.compile(r"^bg_\d+$")
 _AUTONOMOUS_RUN_FILE_RE = re.compile(r"^bg_(\d+)\..+")
 _AUTONOMOUS_MANIFEST_FILE_RE = re.compile(r"^bg_(\d+)\.task\.json$")
-_ACTIVE_AUTONOMOUS_PROCESS_STATES = {"running", "approval_pending"}
-_REHYDRATED_ACTIVE_STATES = {"running", "approval_pending", "queued", "waiting"}
-_TERMINAL_AUTONOMOUS_STATES = {"completed", "failed", "killed", "interrupted", "budget_limited", "budget_exceeded"}
+_ACTIVE_AUTONOMOUS_PROCESS_STATES = {"running", "approval_pending", "remediating"}
+_REHYDRATED_ACTIVE_STATES = {"running", "approval_pending", "queued", "waiting", "remediating"}
+_TERMINAL_AUTONOMOUS_STATES = {"completed", "failed", "killed", "interrupted", "budget_limited", "budget_exceeded", "blocked"}
 _REHYDRATION_INTERRUPTED_ERROR = "gateway restarted while run was active"
 _REHYDRATE_EVENTS_SIZE_CAP_BYTES = 5 * 1024 * 1024
 _REHYDRATE_EVENTS_TAIL_LINES = 2000
@@ -992,6 +992,8 @@ class AutonomousRegistry:
       return "cancelled"
     if record.state in {"budget_limited", "budget_exceeded"} or self._record_has_budget_exceeded(record):
       return "budget_limited"
+    if record.state == "blocked":
+      return "blocked"
     if record.state in {"completed", "finished"}:
       return "completed"
     if record.state == "failed":

@@ -10,7 +10,6 @@ from typing import Any
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from agent_gateway.event_log import EventLog
 from agent_gateway.control_plane.events import _shielded_aclose
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 

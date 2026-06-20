@@ -688,10 +688,11 @@ def test_create_agent_code_execution_wires_hooks_approval_and_expiry_cleanup(tmp
   }
   assert runner._dispatcher._request_approval is not None
   assert runner._dispatcher._approved_tool_types is session.approved_tool_types
-  assert runner._dispatcher._should_request_approval("code_execute", {"host": "subprocess"}, "subprocess") is True
+  valid_code_execute_input = {"code": "print(1)", "host": "subprocess"}
+  assert runner._dispatcher._should_request_approval("code_execute", valid_code_execute_input, "subprocess") is True
 
   session.approved_tool_types.add("code_execute:subprocess")
-  assert runner._dispatcher._should_request_approval("code_execute", {"host": "subprocess"}, "subprocess") is False
+  assert runner._dispatcher._should_request_approval("code_execute", valid_code_execute_input, "subprocess") is False
 
   ctx = ToolResultContext(
     tool_name="code_execute",

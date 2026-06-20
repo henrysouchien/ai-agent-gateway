@@ -14,7 +14,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.skills import SkillLoader
+from agent_gateway.skills import SkillLoader, SkillProfile
 from agent_gateway import EventLog
 from agent_gateway.html_artifact_store import read_html_artifact_content, read_html_artifact_sidecar
 from agent_gateway.session import GatewaySession
@@ -66,6 +66,7 @@ def test_sub_agent_helper_exports_are_parent_aliases() -> None:
     "_skill_html_excluded_tools",
     "_install_emit_html_artifact_handler",
     "_install_emit_dashboard_artifact_handler",
+    "_skill_extra_excluded_tool_names",
     "make_run_agent_tool_def",
     "make_get_background_result_tool_def",
     "make_resume_tool_def",
@@ -74,6 +75,32 @@ def test_sub_agent_helper_exports_are_parent_aliases() -> None:
 
   for name in helper_names:
     assert getattr(sub_agent_module, name) is getattr(sub_agent_helpers, name)
+
+
+def test_skill_html_excluded_tools_rejects_malformed_extra_exclusions() -> None:
+  profile = SkillProfile(
+    name="bad-extra",
+    system_prompt="",
+    agent_callable=True,
+    agent_description="Bad extra exclusions.",
+  )
+  profile.extra_excluded_tools = "emit_html_artifact"  # type: ignore[assignment]
+
+  with pytest.raises(ValueError, match="extra_excluded_tools must be a list of tool names"):
+    sub_agent_module._skill_html_excluded_tools(set(), skill_profile=profile)
+
+
+def test_skill_html_excluded_tools_rejects_null_extra_exclusions() -> None:
+  profile = SkillProfile(
+    name="bad-extra",
+    system_prompt="",
+    agent_callable=True,
+    agent_description="Bad extra exclusions.",
+  )
+  profile.extra_excluded_tools = ["emit_html_artifact", None]  # type: ignore[list-item]
+
+  with pytest.raises(ValueError, match="extra_excluded_tools entries must be strings"):
+    sub_agent_module._skill_html_excluded_tools(set(), skill_profile=profile)
 
 
 def _run(coro):
@@ -113,6 +140,15 @@ class _StubRunner:
 def _write_skill(skills_dir: Path, name: str, body: str) -> None:
   skills_dir.mkdir(parents=True, exist_ok=True)
   (skills_dir / f"{name}.md").write_text(body, encoding="utf-8")
+
+
+class _StaticSkillLoader:
+  def __init__(self, skills_dir: Path, profile: SkillProfile) -> None:
+    self.skills_dir = skills_dir
+    self._profile = profile
+
+  def load(self, _name: str) -> SkillProfile:
+    return self._profile
 
 
 def _callable_skill(frontmatter: str = "", body: str = "Use multiple sources.") -> str:
@@ -407,6 +443,88 @@ def test_make_run_agent_handler_loads_skill_profile_and_filters_tools(tmp_path: 
   assert "emit_html_artifact" in dispatcher._local
   assert dispatcher._needs_approval("keep_tool", {}, "") is False
   assert dispatcher._session_id == runner._full_session_id
+
+
+def test_make_run_agent_handler_child_dispatcher_validates_local_tool_schema(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  _write_skill(skills_dir, "deep-research", _callable_skill())
+  calls: list[dict[str, Any]] = []
+
+  async def _structured_write(tool_input: dict[str, Any], **_kwargs):
+    calls.append(dict(tool_input))
+    return {"ok": True}, None
+
+  tool_def = {
+    "name": "structured_write",
+    "description": "test",
+    "input_schema": {
+      "type": "object",
+      "properties": {"judgment": {"type": "object"}},
+      "required": ["judgment"],
+      "additionalProperties": False,
+    },
+  }
+
+  class _SchemaGuardRunner(_StubRunner):
+    def _get_tool_definitions(self) -> list[dict[str, Any]]:
+      return [tool_def]
+
+    async def spawn_sub_agent(self, task: str, **kwargs):
+      _ = task
+      result, error = await kwargs["dispatcher"].dispatch(
+        "child-call-1",
+        "structured_write",
+        {},
+      )
+      return {"child_result": result, "child_error": error}, None
+
+  runner = _SchemaGuardRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={"structured_write": _structured_write},
+    default_model="claude-sonnet-4-6",
+    allowed_models={"claude-sonnet-4-6"},
+  )
+
+  result, error = _run(handler({"agent": "deep-research", "task": "Analyze filings"}))
+
+  assert error is None
+  assert result["child_result"] is None
+  assert result["child_error"]["code"] == "invalid_tool_input_schema"
+  assert result["child_error"]["details"]["missing"] == ["judgment"]
+  assert calls == []
+
+
+def test_make_run_agent_handler_rejects_malformed_profile_extra_exclusions(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  profile = SkillProfile(
+    name="bad-extra",
+    system_prompt="Use multiple sources.",
+    agent_callable=True,
+    agent_description="Bad extra exclusions.",
+  )
+  profile.extra_excluded_tools = "drop_tool"  # type: ignore[assignment]
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=_StaticSkillLoader(skills_dir, profile),  # type: ignore[arg-type]
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={"drop_tool": _dummy_tool},
+    default_model="claude-sonnet-4-6",
+    allowed_models={"claude-sonnet-4-6"},
+  )
+
+  result, error = _run(handler({"agent": "bad-extra", "task": "Analyze filings"}))
+
+  assert result is None
+  assert error == {
+    "code": "invalid_skill_config",
+    "message": "Skill 'bad-extra' extra_excluded_tools must be a list of tool names",
+  }
+  assert runner.calls == []
 
 
 def test_make_run_agent_handler_resolves_skill_blocks_before_spawn(tmp_path: Path) -> None:

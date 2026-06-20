@@ -39,6 +39,13 @@ def test_control_plane_runs_parent_aliases_moved_helpers() -> None:
   assert runs_module._dispatch_control_chat_turn is chat_helpers_module._dispatch_control_chat_turn
 
 
+def test_control_plane_run_status_vocab_maps_blocked_and_remediating() -> None:
+  assert helpers_module._autonomous_state("blocked") == "blocked"
+  assert helpers_module._autonomous_state("remediating") == "remediating"
+  assert "blocked" in helpers_module._TERMINAL_RUN_STATES
+  assert "remediating" not in helpers_module._TERMINAL_RUN_STATES
+
+
 class _FakeAutonomousProcess:
   def __init__(self) -> None:
     self.returncode: int | None = None

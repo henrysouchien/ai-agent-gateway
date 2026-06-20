@@ -151,6 +151,41 @@ def test_execute_single_tool_keeps_generic_excluded_tools_bare() -> None:
   }
 
 
+def test_execute_single_tool_stops_after_repeated_generic_excluded_tool() -> None:
+  runner = AgentRunner(
+    event_log=EventLog(session_id="test"),
+    dispatcher=_ExplodingDispatcher(),  # type: ignore[arg-type]
+    session_id="test-repeated-generic-excluded",
+    provider=_Provider(),  # type: ignore[arg-type]
+    excluded_tools={"apply_patch_ops"},
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  first_entry, _tool_name, _extra_blocks = _run(
+    runner._execute_single_tool("tool-1", "apply_patch_ops", {"ops": []}, {"tools": []})
+  )
+  assert json.loads(first_entry["content"])["error"] == {
+    "code": "tool_excluded",
+    "message": "Tool 'apply_patch_ops' is not available in this context",
+  }
+  assert not hasattr(runner, "_stop_after_tool_results_reason")
+
+  second_entry, _tool_name, _extra_blocks = _run(
+    runner._execute_single_tool("tool-2", "apply_patch_ops", {"ops": []}, {"tools": []})
+  )
+
+  error = json.loads(second_entry["content"])["error"]
+  assert error["code"] == "tool_excluded"
+  assert error["sub_code"] == "repeated_tool_excluded"
+  assert error["data"]["blocked_tool"] == "apply_patch_ops"
+  assert error["data"]["exclusion_count"] == 2
+  assert error["data"]["stop_after_tool_results"] is True
+  assert runner._stop_after_tool_results_reason == "repeated_tool_excluded"
+  assert runner._stop_after_tool_results_tool_name == "apply_patch_ops"
+
+
 def test_execute_single_tool_returns_typed_blocker_for_excluded_fms_commit_tool() -> None:
   runner = AgentRunner(
     event_log=EventLog(session_id="test"),

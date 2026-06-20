@@ -290,10 +290,12 @@ def test_batch_task_registry_cancelled_task_finishes_cancelled(tmp_path: Path) -
   asyncio.run(run_case())
 
 
-def test_control_batches_digest_allows_budget_limited(
+@pytest.mark.parametrize("terminal_status", ["budget_limited", "blocked"])
+def test_control_batches_digest_allows_terminal_statuses(
   fake_batch_control: FakeBatchController,
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
+  terminal_status: str,
 ) -> None:
   registry_path = tmp_path / "alice.db"
 
@@ -329,7 +331,7 @@ def test_control_batches_digest_allows_budget_limited(
     error="budget",
   )
   source_registry.add_spent(batch_id, 0.75)
-  source_registry.set_status(batch_id, "budget_limited")
+  source_registry.set_status(batch_id, terminal_status)
   source_registry.close()
 
   app = _make_app()
@@ -340,12 +342,39 @@ def test_control_batches_digest_allows_budget_limited(
 
   assert detail_response.status_code == 200, detail_response.text
   detail = detail_response.json()
-  assert detail["batch"]["status"] == "budget_limited"
+  assert detail["batch"]["status"] == terminal_status
   assert detail["batch"]["error"] is None
   assert detail["batch"]["counts_by_status"] == {"completed": 1, "skipped": 1}
   assert detail["failures"] == [{"ticker": "MSFT", "skill": "business-quality-assessment", "status": "skipped", "error": "budget"}]
   assert list_response.status_code == 200, list_response.text
-  assert list_response.json()["batches"][0]["status"] == "budget_limited"
+  assert list_response.json()["batches"][0]["status"] == terminal_status
+
+
+def test_batch_task_registry_does_not_overwrite_blocked_status(tmp_path: Path) -> None:
+  async def run_case() -> None:
+    registry = BatchRegistry(tmp_path / "blocked-task.db")
+    batch_id = registry.acquire_batch(
+      user_id="alice",
+      host="test-host",
+      spec=_batch_spec(),
+      budget_usd=1.0,
+      pid=None,
+    )
+    registry.set_status(batch_id, "blocked", error="same blocker exhausted")
+
+    async def failed_task() -> None:
+      raise RuntimeError("late failure")
+
+    task = asyncio.create_task(failed_task())
+    task_registry = batches_module.BatchTaskRegistry()
+    await task_registry._consume(batch_id, task, registry)
+
+    digest = registry.get_batch_digest(batch_id)
+    assert digest["status"] == "blocked"
+    assert digest["error"] == "same blocker exhausted"
+    registry.close()
+
+  asyncio.run(run_case())
 
 
 def test_control_batches_retry_failed_uses_failed_tickers_only(

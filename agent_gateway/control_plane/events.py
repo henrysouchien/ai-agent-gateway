@@ -217,12 +217,12 @@ def _autonomous_replay_events_for_record(record: Any) -> list[dict[str, Any]]:
 
 def _autonomous_record_is_terminated(record: Any) -> bool:
   state = str(getattr(record, "state", "") or "").strip().lower()
-  if state in {"completed", "finished", "failed", "killed", "cancelled", "interrupted"}:
+  if state in {"completed", "finished", "failed", "killed", "cancelled", "interrupted", "budget_limited", "blocked"}:
     return True
   proc = getattr(record, "proc", None)
   if proc is not None and getattr(proc, "returncode", None) is None:
     return False
-  return state not in {"starting", "queued", "waiting", "running", "approval_pending"}
+  return state not in {"starting", "queued", "waiting", "running", "approval_pending", "remediating"}
 
 
 async def _seed_autonomous_replay_buffer(

@@ -814,6 +814,7 @@ async def run_autonomous(
       session_id=sid,
       should_avoid_permission_prompts=True,
       mcp_session_inject_servers=mcp_session_inject_servers,
+      get_tool_definitions=_get_tool_defs,
     )
     runner = AgentRunner(
       event_log=event_log,

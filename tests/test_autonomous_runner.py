@@ -501,7 +501,27 @@ def test_autonomous_registry_rehydrates_budget_exceeded_as_budget_limited(tmp_pa
   assert manifest["error"] is None
 
 
-@pytest.mark.parametrize("state", ["running", "approval_pending", "queued", "waiting"])
+def test_autonomous_registry_rehydrates_blocked_as_terminal(tmp_path) -> None:
+  _write_manifest(
+    tmp_path,
+    "bg_8",
+    control_run_id="run-blocked",
+    state="blocked",
+    exit_code=0,
+    error="same blocker exhausted",
+    completed_at=200.0,
+  )
+
+  registry = _registry(tmp_path)
+
+  record = registry._tasks["bg_8"]
+  assert record.state == "blocked"
+  assert record.error == "same blocker exhausted"
+  assert record.completed_at == 200.0
+  assert registry._terminal_state_for_record(record) == "blocked"
+
+
+@pytest.mark.parametrize("state", ["running", "approval_pending", "queued", "waiting", "remediating"])
 def test_autonomous_registry_rehydrates_active_states_as_interrupted(tmp_path, state) -> None:
   _write_manifest(
     tmp_path,

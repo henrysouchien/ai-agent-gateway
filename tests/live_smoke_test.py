@@ -8,15 +8,14 @@ Usage: cd packages/agent-gateway && python3 tests/live_smoke_test.py
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from pathlib import Path
 
 # Ensure the package is importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_gateway.auth import AuthConfig, CredentialsResolver, ResolverResult
-from agent_gateway.rates import RateTable, load_rate_table, UnknownModelError
+from agent_gateway.auth import AuthConfig, ResolverResult
+from agent_gateway.rates import load_rate_table, UnknownModelError
 
 
 def divider(title: str) -> None:
@@ -85,7 +84,7 @@ def test_auth_config() -> None:
   assert rebuilt["api_key"] == "sk-ant-api03-test", "api_key lost in round-trip"
   assert rebuilt["thinking"] is True, "thinking lost in round-trip"
   assert rebuilt["auth_mode"] == "api", "auth_mode lost in round-trip"
-  print(f"  Round-trip preserved: api_key, thinking, auth_mode, base_url")
+  print("  Round-trip preserved: api_key, thinking, auth_mode, base_url")
 
   # Validation
   try:
@@ -236,7 +235,7 @@ def test_gateway_strict_mode() -> None:
   # Will fail at provider level (no real Anthropic key), but that's fine —
   # the important thing is it passes the multi-user validation (not 400/401)
   if resp.status_code not in (400, 401):
-    print(f"  Passed multi-user validation (provider may fail, that's expected) — PASS")
+    print("  Passed multi-user validation (provider may fail, that's expected) — PASS")
   else:
     body = resp.json()
     print(f"  UNEXPECTED auth rejection: {body}")
@@ -413,7 +412,7 @@ def test_on_usage_fires_with_ledger() -> None:
     )
     assert resp.status_code == 200, f"Init failed: {resp.text}"
     token = resp.json()["session_token"]
-    print(f"  Session created for alice_42")
+    print("  Session created for alice_42")
 
     # Send a chat (will fail at Anthropic, but the runner should still attempt on_usage)
     resp = client.post(
@@ -433,17 +432,17 @@ def test_on_usage_fires_with_ledger() -> None:
     total = asyncio.run(ledger.get_total("alice_42"))
     print(f"  Ledger after chat: {total.event_count} events, ${total.cost_usd:.6f}")
     if total.event_count > 0:
-      print(f"  on_usage fired and recorded — PASS")
+      print("  on_usage fired and recorded — PASS")
     else:
-      print(f"  No usage recorded (Anthropic call failed before returning usage — expected with fake key)")
-      print(f"  Wiring confirmed by: no 400/401 from multi-user validation, runner reached provider — PASS")
+      print("  No usage recorded (Anthropic call failed before returning usage — expected with fake key)")
+      print("  Wiring confirmed by: no 400/401 from multi-user validation, runner reached provider — PASS")
 
     # Check DLQ (should be empty if ledger worked, or have events if ledger failed)
     if dlq_path.exists():
       dlq_lines = dlq_path.read_text().strip().split("\n") if dlq_path.read_text().strip() else []
       print(f"  DLQ spool: {len(dlq_lines)} events (expected 0 if ledger healthy)")
     else:
-      print(f"  DLQ spool: not created (ledger healthy) — PASS")
+      print("  DLQ spool: not created (ledger healthy) — PASS")
 
     ledger.close()
 

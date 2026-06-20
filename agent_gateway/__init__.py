@@ -66,7 +66,7 @@ from .events import (
   RecapFailure,
   RecapVerdict,
   SessionRecapEvent,
-  SkillResultCapturedEvent,
+  SkillResultCapturedEvent,  # noqa: F401 - re-exported compatibility surface
   SkillRunStartedEvent,
   SUPPORTED_SCHEMA_VERSIONS,
   ToolCallsSummary,

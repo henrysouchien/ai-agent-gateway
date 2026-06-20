@@ -13,7 +13,7 @@ from ..tool_dispatcher import ApprovalKeyQualifier, LocalToolHandler
 from ._background import BackgroundTask, OutputRingBuffer
 from ._backends import DockerBackend, ExecutionBackend, SubprocessBackend
 from ._config import CodeExecutionConfig
-from ._helpers import _prepare_code_execute_env, code_execute
+from ._helpers import _boolean_input, _prepare_code_execute_env, _string_input, _timeout_ms_input, code_execute
 from ._hooks import strip_code_execute_base64_hook
 from ._tool_defs import make_code_execute_status_tool_def, make_code_execute_tool_def
 
@@ -88,7 +88,10 @@ def build_code_execution(
     return process is not None and getattr(process, "returncode", None) is not None
 
   async def _handle_code_execute(tool_input: Dict[str, Any], **kwargs: Any):
-    host = str(tool_input.get("host") or "auto")
+    host, error = _string_input(tool_input, "host", default="auto")
+    if error is not None:
+      return None, error
+    assert host is not None
     valid_hosts = {"auto"} | set(_get_registered_backend_names())
     if host not in valid_hosts:
       return None, {"code": "invalid_input", "message": f"Unknown host: '{host}'"}
@@ -103,17 +106,24 @@ def build_code_execution(
       return None, {"code": "backend_unavailable", "message": f"Backend '{resolved_host}' unavailable"}
 
     work_dir = _ensure_code_execution_work_dir()
-    background = bool(tool_input.get("background", False))
+    background, error = _boolean_input(tool_input, "background", default=False)
+    if error is not None:
+      return None, error
+    assert background is not None
     if background:
-      code = str(tool_input.get("code") or "")
-      if not code.strip():
-        return None, {"code": "invalid_input", "message": "code is required"}
-      timeout_ms_raw = tool_input.get("timeout_ms", cfg.default_timeout_ms)
-      try:
-        timeout_ms = int(timeout_ms_raw)
-      except (TypeError, ValueError):
-        return None, {"code": "invalid_input", "message": "timeout_ms must be an integer"}
-      timeout_ms = max(1000, min(timeout_ms, cfg.max_timeout_ms))
+      code, error = _string_input(
+        tool_input,
+        "code",
+        required_message="code is required",
+        non_empty=True,
+      )
+      if error is not None:
+        return None, error
+      assert code is not None
+      timeout_ms, error = _timeout_ms_input(tool_input, cfg)
+      if error is not None:
+        return None, error
+      assert timeout_ms is not None
       env = _prepare_code_execute_env(cfg)
       task_id = f"ce_{os.urandom(4).hex()}"
       stdout_buf = OutputRingBuffer()
@@ -173,9 +183,20 @@ def build_code_execution(
     )
 
   async def _handle_code_execute_status(tool_input: Dict[str, Any], **_: Any):
-    task_id = str(tool_input.get("task_id") or "").strip()
-    if not task_id:
-      return None, {"code": "invalid_input", "message": "task_id is required"}
+    task_id, error = _string_input(
+      tool_input,
+      "task_id",
+      required_message="task_id is required",
+      non_empty=True,
+    )
+    if error is not None:
+      return None, error
+    assert task_id is not None
+    task_id = task_id.strip()
+    cancel, error = _boolean_input(tool_input, "cancel", default=False)
+    if error is not None:
+      return None, error
+    assert cancel is not None
     task = session.background_tasks.get(task_id)
     if task is None:
       return None, {"code": "not_found", "message": f"Unknown task_id: {task_id}"}
@@ -189,7 +210,6 @@ def build_code_execution(
       }, None
 
     poll_result = await backend.poll(task.handle)
-    cancel = bool(tool_input.get("cancel", False))
     if cancel:
       if poll_result.get("status") == "completed" or _handle_has_exited(task.handle):
         result = await task.safe_collect(backend)
@@ -219,19 +239,43 @@ def build_code_execution(
   def _approval_qualifier(tool_name: str, tool_input: Dict[str, Any]) -> str:
     if tool_name != "code_execute":
       return ""
-    host = str(tool_input.get("host") or "auto")
+    host, error = _string_input(tool_input, "host", default="auto")
+    if error is not None:
+      return ""
+    assert host is not None
     try:
       return _get_backend(host if host != "auto" else None).name
     except (RuntimeError, ValueError):
       return ""
+
+  def _code_execute_input_will_fail_validation(tool_input: Dict[str, Any] | None) -> bool:
+    if not isinstance(tool_input, dict):
+      return True
+    host, error = _string_input(tool_input, "host", default="auto")
+    if error is not None or host not in {"auto", *set(_get_registered_backend_names())}:
+      return True
+    _, error = _boolean_input(tool_input, "background", default=False)
+    if error is not None:
+      return True
+    _, error = _string_input(
+      tool_input,
+      "code",
+      required_message="code is required",
+      non_empty=True,
+    )
+    if error is not None:
+      return True
+    _, error = _timeout_ms_input(tool_input, cfg)
+    return error is not None
 
   def _needs_approval(
     tool_name: str,
     tool_input: Dict[str, Any] | None = None,
     qualifier: str = "",
   ) -> bool:
-    _ = tool_input
     if tool_name != "code_execute":
+      return False
+    if _code_execute_input_will_fail_validation(tool_input):
       return False
     if qualifier:
       try:

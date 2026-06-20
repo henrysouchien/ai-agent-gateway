@@ -95,7 +95,8 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
           - search_messages
           - search_messages
           - send_message
-        slack: post_message
+        slack:
+          - post_message
       session_inject_servers:
         - gmail
       timeout_overrides:
@@ -259,6 +260,46 @@ def test_parse_agent_fields_from_frontmatter(tmp_path: Path) -> None:
   assert profile.tool_packs_enabled is False
 
 
+def test_scalar_extra_excluded_tools_shape_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    extra_excluded_tools: execute_trade
+    """,
+  )
+
+  with pytest.raises(ValueError, match="'extra_excluded_tools' must be a list of strings"):
+    parse_skill_file(skill_path)
+
+
+def test_invalid_extra_excluded_tools_entry_type_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    extra_excluded_tools:
+      - execute_trade
+      - 7
+    """,
+  )
+
+  with pytest.raises(ValueError, match="'extra_excluded_tools' entries must be strings"):
+    parse_skill_file(skill_path)
+
+
+def test_null_extra_excluded_tools_entry_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    extra_excluded_tools:
+      - execute_trade
+      -
+    """,
+  )
+
+  with pytest.raises(ValueError, match="'extra_excluded_tools' entries must be strings"):
+    parse_skill_file(skill_path)
+
+
 def test_parse_state_class_from_frontmatter(tmp_path: Path) -> None:
   skill_path = _write_skill(
     tmp_path,
@@ -326,6 +367,46 @@ def test_parse_resumable_with_session_injection_and_reset_ack_loads(tmp_path: Pa
   assert profile.resumable is True
   assert profile.resume_mcp_session_reset_ok is True
   assert profile.session_inject_servers == ["browser"]
+
+
+def test_scalar_session_inject_servers_shape_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    session_inject_servers: browser
+    """,
+  )
+
+  with pytest.raises(ValueError, match="'session_inject_servers' must be a list of strings"):
+    parse_skill_file(skill_path)
+
+
+def test_invalid_session_inject_servers_entry_type_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    session_inject_servers:
+      - browser
+      - 7
+    """,
+  )
+
+  with pytest.raises(ValueError, match="'session_inject_servers' entries must be strings"):
+    parse_skill_file(skill_path)
+
+
+def test_null_session_inject_servers_entry_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    session_inject_servers:
+      - browser
+      -
+    """,
+  )
+
+  with pytest.raises(ValueError, match="'session_inject_servers' entries must be strings"):
+    parse_skill_file(skill_path)
 
 
 def test_mixed_known_and_unknown_metadata(tmp_path: Path) -> None:
@@ -539,6 +620,32 @@ def test_empty_mcp_servers_is_none(tmp_path: Path) -> None:
   assert profile.metadata == {"mcp_servers": None}
 
 
+def test_invalid_mcp_server_entry_type_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    mcp_servers:
+      - portfolio-mcp
+      - 7
+    """,
+  )
+
+  with pytest.raises(ValueError, match="'mcp_servers' entries must be strings"):
+    parse_skill_file(skill_path)
+
+
+def test_scalar_mcp_servers_shape_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    mcp_servers: portfolio-mcp
+    """,
+  )
+
+  with pytest.raises(ValueError, match="'mcp_servers' must be a list of strings"):
+    parse_skill_file(skill_path)
+
+
 def test_empty_mcp_tools_is_none(tmp_path: Path) -> None:
   skill_path = _write_skill(
     tmp_path,
@@ -564,6 +671,48 @@ def test_invalid_mcp_tools_shape_rejected(tmp_path: Path) -> None:
   )
 
   with pytest.raises(ValueError, match="mcp_tools"):
+    parse_skill_file(skill_path)
+
+
+def test_invalid_mcp_tools_server_name_type_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    mcp_tools:
+      7:
+        - search
+    """,
+  )
+
+  with pytest.raises(ValueError, match="'mcp_tools' server names must be strings"):
+    parse_skill_file(skill_path)
+
+
+def test_invalid_mcp_tools_tool_name_type_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    mcp_tools:
+      research-corpus-mcp:
+        - search
+        - 7
+    """,
+  )
+
+  with pytest.raises(ValueError, match="'mcp_tools.research-corpus-mcp' entries must be strings"):
+    parse_skill_file(skill_path)
+
+
+def test_scalar_mcp_tool_names_shape_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    mcp_tools:
+      research-corpus-mcp: search
+    """,
+  )
+
+  with pytest.raises(ValueError, match="'mcp_tools.research-corpus-mcp' must be a list of strings"):
     parse_skill_file(skill_path)
 
 

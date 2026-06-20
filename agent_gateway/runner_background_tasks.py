@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Awaitable, Callable, Dict, Iterable
 
 from .runner_state import budget_reason_suffix
@@ -41,8 +42,11 @@ def parse_background_result_request(tool_input: Dict[str, Any]) -> tuple[Backgro
     return None, {"code": "invalid_input", "message": "wait must be a boolean"}
 
   raw_timeout = tool_input.get("timeout")
-  if raw_timeout is not None and not isinstance(raw_timeout, (int, float)):
-    return None, {"code": "invalid_input", "message": "timeout must be a number"}
+  if raw_timeout is not None:
+    if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
+      return None, {"code": "invalid_input", "message": "timeout must be a number"}
+    if not math.isfinite(float(raw_timeout)):
+      return None, {"code": "invalid_input", "message": "timeout must be finite"}
   timeout = background_timeout_value(raw_timeout)
   return BackgroundResultRequest(task_id=task_id, wait=wait, timeout=timeout), None
 

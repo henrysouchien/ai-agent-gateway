@@ -5,9 +5,10 @@ import inspect
 import logging
 import os
 import time
+from collections.abc import Sequence as AbcSequence
 from datetime import timedelta
 from dataclasses import replace
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, TYPE_CHECKING
 
 from . import approval_settings
 from .approval_policy import (
@@ -92,6 +93,7 @@ class ToolDispatcher:
     store: Any | None = None,
     policy: ApprovalPolicy | None = None,
     run_context: RunContext | None = None,
+    get_tool_definitions: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
   ) -> None:
     self._mcp = mcp_client
     self._local = local_tool_handlers or {}
@@ -117,7 +119,200 @@ class ToolDispatcher:
     self._approval_store = store or getattr(session, "approval_store", None)
     self._approval_policy = policy or getattr(session, "approval_policy", None)
     self._run_context = run_context
+    self._get_tool_definitions = get_tool_definitions
     self._mcp_accepts_abort_event = self._callable_accepts_kw(getattr(self._mcp, "call_tool", None), "abort_event")
+
+  def _active_local_tool_schema(
+    self,
+    tool_name: str,
+  ) -> tuple[Mapping[str, Any] | None, Dict[str, Any] | None]:
+    if self._get_tool_definitions is None:
+      return None, None
+    try:
+      tool_definitions = self._get_tool_definitions()
+    except Exception as exc:
+      return None, {
+        "code": "tool_schema_unavailable",
+        "message": f"Could not load active tool schema for local tool '{tool_name}': {exc}",
+        "details": {"tool_name": tool_name},
+        "fix": "Retry after the active tool catalog is available.",
+      }
+
+    for definition in tool_definitions or []:
+      if not isinstance(definition, Mapping):
+        continue
+      if str(definition.get("name") or "") != tool_name:
+        continue
+      schema = definition.get("input_schema") or definition.get("parameters")
+      if isinstance(schema, Mapping):
+        return schema, None
+      return None, None
+
+    return None, {
+      "code": "tool_not_advertised",
+      "message": f"Local tool '{tool_name}' is not advertised in the active tool definitions for this run",
+      "details": {"tool_name": tool_name},
+      "fix": "Call only tools present in the active tool catalog.",
+    }
+
+  @staticmethod
+  def _json_type_name(value: Any) -> str:
+    if value is None:
+      return "null"
+    if isinstance(value, bool):
+      return "boolean"
+    if isinstance(value, dict):
+      return "object"
+    if isinstance(value, list):
+      return "array"
+    if isinstance(value, str):
+      return "string"
+    if isinstance(value, int):
+      return "integer"
+    if isinstance(value, float):
+      return "number"
+    return type(value).__name__
+
+  @classmethod
+  def _matches_json_type(cls, value: Any, expected_type: Any) -> bool:
+    if isinstance(expected_type, AbcSequence) and not isinstance(expected_type, str):
+      return any(cls._matches_json_type(value, item) for item in expected_type)
+    if expected_type == "object":
+      return isinstance(value, dict)
+    if expected_type == "array":
+      return isinstance(value, list)
+    if expected_type == "string":
+      return isinstance(value, str)
+    if expected_type == "boolean":
+      return isinstance(value, bool)
+    if expected_type == "integer":
+      return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+      return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type == "null":
+      return value is None
+    return True
+
+  @classmethod
+  def _format_expected_type(cls, expected_type: Any) -> str:
+    if isinstance(expected_type, AbcSequence) and not isinstance(expected_type, str):
+      return "|".join(str(item) for item in expected_type)
+    return str(expected_type)
+
+  def _tool_input_schema_error(
+    self,
+    tool_name: str,
+    *,
+    message: str,
+    details: Dict[str, Any],
+  ) -> Dict[str, Any]:
+    return {
+      "code": "invalid_tool_input_schema",
+      "message": f"Tool '{tool_name}' input does not match its active input_schema: {message}",
+      "details": {"tool_name": tool_name, **details},
+      "fix": "Call the tool with a JSON object matching its active input_schema, including required fields.",
+    }
+
+  def _validate_against_local_schema(
+    self,
+    tool_name: str,
+    tool_input: Any,
+    schema: Mapping[str, Any],
+  ) -> Dict[str, Any] | None:
+    expects_object = (
+      schema.get("type") == "object"
+      or "properties" in schema
+      or "required" in schema
+      or "additionalProperties" in schema
+    )
+    if expects_object and not isinstance(tool_input, dict):
+      got = self._json_type_name(tool_input)
+      return self._tool_input_schema_error(
+        tool_name,
+        message=f"expected object, got {got}",
+        details={"expected": "object", "got": got},
+      )
+    if not isinstance(tool_input, dict):
+      return None
+
+    required = [
+      str(item)
+      for item in (schema.get("required") or [])
+      if isinstance(item, str) and item
+    ]
+    missing = [name for name in required if name not in tool_input]
+
+    raw_properties = schema.get("properties")
+    properties = raw_properties if isinstance(raw_properties, Mapping) else {}
+    unexpected: list[str] = []
+    if schema.get("additionalProperties") is False:
+      allowed = set(str(key) for key in properties.keys())
+      unexpected = sorted(str(key) for key in tool_input.keys() if str(key) not in allowed)
+
+    type_errors: list[dict[str, str]] = []
+    for field, field_schema in properties.items():
+      field_name = str(field)
+      if field_name not in tool_input or not isinstance(field_schema, Mapping):
+        continue
+      expected_type = field_schema.get("type")
+      if expected_type is None:
+        continue
+      value = tool_input[field_name]
+      if not self._matches_json_type(value, expected_type):
+        type_errors.append({
+          "field": field_name,
+          "expected": self._format_expected_type(expected_type),
+          "got": self._json_type_name(value),
+        })
+
+    if not missing and not unexpected and not type_errors:
+      return None
+
+    parts: list[str] = []
+    if missing:
+      parts.append(f"missing required field(s): {', '.join(missing)}")
+    if unexpected:
+      parts.append(f"unexpected field(s): {', '.join(unexpected)}")
+    if type_errors:
+      first = type_errors[0]
+      parts.append(
+        f"field '{first['field']}' expected {first['expected']}, got {first['got']}"
+      )
+    return self._tool_input_schema_error(
+      tool_name,
+      message="; ".join(parts),
+      details={
+        "missing": missing,
+        "unexpected": unexpected,
+        "type_errors": type_errors,
+      },
+    )
+
+  def _validate_local_tool_input(
+    self,
+    tool_call_id: str,
+    tool_name: str,
+    tool_input: Any,
+  ) -> Dict[str, Any] | None:
+    if tool_name not in self._local or self._get_tool_definitions is None:
+      return None
+
+    schema, schema_error = self._active_local_tool_schema(tool_name)
+    error = schema_error
+    if error is None and schema is not None:
+      error = self._validate_against_local_schema(tool_name, tool_input, schema)
+    if error is not None and self._event_log is not None:
+      self._event_log.append(
+        {
+          "type": "tool_input_validation_failed",
+          "tool_call_id": tool_call_id,
+          "tool_name": tool_name,
+          "code": error.get("code"),
+          "message": error.get("message"),
+          "details": error.get("details"),
+        }
+      )
+    return error
 
   async def _run_interceptors(
     self,
@@ -246,6 +441,10 @@ class ToolDispatcher:
     """
     if abort_event is not None and abort_event.is_set():
       raise asyncio.CancelledError()
+
+    input_schema_error = self._validate_local_tool_input(tool_call_id, tool_name, tool_input)
+    if input_schema_error is not None:
+      return None, input_schema_error
 
     ir = await self._run_interceptors(
       tool_call_id,
@@ -393,7 +592,7 @@ class ToolDispatcher:
               allow_tool_type_applied=False,
             )
             return None, error_dict
-          final_tool_input = lifecycle.get("tool_input") or tool_input
+          final_tool_input = lifecycle["tool_input"] if "tool_input" in lifecycle else tool_input
           will_install = (
             bool(lifecycle.get("allow_tool_type"))
             and allow_persistent
@@ -462,6 +661,10 @@ class ToolDispatcher:
     result: Optional[Any]
     error: Optional[Dict[str, Any]]
     if tool_name in self._local:
+      input_schema_error = self._validate_local_tool_input(tool_call_id, tool_name, final_tool_input)
+      if input_schema_error is not None:
+        return None, input_schema_error
+
       tool_ctx = None
       if self._event_log is not None:
         tool_ctx = ToolExecutionContext(

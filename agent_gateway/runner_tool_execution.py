@@ -22,6 +22,7 @@ log = logging.getLogger("agent_gateway.runner")
 _RUN_AGENT_DISPATCH_TIMEOUT_SECONDS = 2100.0
 _ACTIVE_SKILL_DENY_RESULT_KEY = "_active_skill_deny"
 _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
+_REPEATED_TOOL_EXCLUDED_STOP_AFTER_COUNT = 2
 _FMS_WRITER_TOOL_FALLBACKS = frozenset({
   "fms_link_thesis",
   "fms_persist_business_model",
@@ -70,6 +71,45 @@ _FMS_COMMIT_TOOL_STAGES = {
   "fms_report_thesis_consultation": "diligence",
   "fms_resolve_outcome_contracts": "review",
 }
+
+
+def _record_tool_excluded_attempt(runner: Any, tool_name: str) -> int:
+  counts = getattr(runner, "_tool_excluded_attempt_counts", None)
+  if not isinstance(counts, dict):
+    counts = {}
+    setattr(runner, "_tool_excluded_attempt_counts", counts)
+  count = int(counts.get(tool_name, 0)) + 1
+  counts[tool_name] = count
+  return count
+
+
+def _augment_repeated_tool_excluded_error(
+  error: Dict[str, Any],
+  *,
+  tool_name: str,
+  exclusion_count: int,
+) -> Dict[str, Any]:
+  augmented = dict(error)
+  data = dict(augmented.get("data") or {})
+  resolution = (
+    "Do not retry this excluded tool in the current context. Use an available "
+    "tool path, emit the appropriate blocked/partial verdict, or finish with "
+    "the durable evidence already produced."
+  )
+  data.update({
+    "blocked_tool": tool_name,
+    "exclusion_count": exclusion_count,
+    "repeated_tool_excluded": True,
+    "stop_after_tool_results": True,
+    "resolution": resolution,
+  })
+  augmented["data"] = data
+  augmented["sub_code"] = "repeated_tool_excluded"
+  augmented["message"] = (
+    f"Tool '{tool_name}' is not available in this context and was retried "
+    f"{exclusion_count} times. {resolution}"
+  )
+  return augmented
 
 
 def _fms_commit_tool_names() -> frozenset[str]:
@@ -225,6 +265,15 @@ class RunnerToolExecutionMixin:
           "code": "tool_excluded",
           "message": f"Tool '{tool_name}' is not available in this context",
         }
+        exclusion_count = _record_tool_excluded_attempt(self, tool_name)
+        if exclusion_count >= _REPEATED_TOOL_EXCLUDED_STOP_AFTER_COUNT:
+          error = _augment_repeated_tool_excluded_error(
+            error,
+            tool_name=tool_name,
+            exclusion_count=exclusion_count,
+          )
+          setattr(self, "_stop_after_tool_results_reason", "repeated_tool_excluded")
+          setattr(self, "_stop_after_tool_results_tool_name", tool_name)
       else:
         dispatch_kwargs: Dict[str, Any] = {"call_index": call_index}
         if self._dispatcher_accepts_abort_event:

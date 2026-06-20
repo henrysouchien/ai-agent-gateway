@@ -31,6 +31,8 @@ ChatRunState = Literal[
   "failed",
   "cancelled",
   "budget_limited",
+  "blocked",
+  "remediating",
 ]
 AutonomousRunState = Literal[
   "starting",
@@ -42,8 +44,24 @@ AutonomousRunState = Literal[
   "failed",
   "cancelled",
   "budget_limited",
+  "blocked",
+  "remediating",
   "interrupted",
 ]
+_CHAT_RUN_STATES = {
+  "starting",
+  "queued",
+  "waiting",
+  "running",
+  "approval_pending",
+  "remediating",
+  "completed",
+  "failed",
+  "cancelled",
+  "budget_limited",
+  "blocked",
+}
+_TERMINAL_RUN_STATES = {"completed", "failed", "cancelled", "budget_limited", "blocked"}
 _CONTROL_CHAT_TASK_PREFIX = "control_chat_turn:"
 _AUTONOMOUS_RESUME_EVENT_TAIL = 40
 _AUTONOMOUS_RESUME_EVENT_BLOCK_MAX_CHARS = 1200
@@ -239,7 +257,7 @@ def _state_from_session(session: GatewaySession, events: list[dict[str, Any]]) -
     event_type = event.get("type")
     if event_type == "run_state_changed":
       state = event.get("state")
-      if state in {"starting", "running", "approval_pending", "completed", "failed", "cancelled", "budget_limited"}:
+      if state in _CHAT_RUN_STATES:
         return state  # type: ignore[return-value]
     if raw_terminal_state is None:
       if event_type == "error":
@@ -254,7 +272,7 @@ def _ended_at_from_events(events: list[dict[str, Any]]) -> str | None:
     if event.get("type") != "run_state_changed":
       continue
     state = event.get("state")
-    if state not in {"completed", "failed", "cancelled", "budget_limited"}:
+    if state not in _TERMINAL_RUN_STATES:
       continue
     return _iso_from_unix(event.get("ts"))
   return None
@@ -383,11 +401,13 @@ def _autonomous_state(state: str) -> AutonomousRunState:
     return "cancelled"
   if state in {"budget_limited", "budget_exceeded"}:
     return "budget_limited"
+  if state == "blocked":
+    return "blocked"
   if state in {"finished", "completed"}:
     return "completed"
   if state == "failed":
     return "failed"
-  if state in {"queued", "waiting", "running", "approval_pending", "interrupted"}:
+  if state in {"queued", "waiting", "running", "approval_pending", "remediating", "interrupted"}:
     return state
   if state == "starting":
     return "starting"
@@ -424,7 +444,7 @@ def _chat_run_from_session(session: GatewaySession) -> ChatRunResponse:
     user_id=session.user_id,
     state=state,
     started_at=_iso_from_unix(session.created_at),
-    ended_at=_ended_at_from_events(events) if state in {"completed", "failed", "cancelled", "budget_limited"} else None,
+    ended_at=_ended_at_from_events(events) if state in _TERMINAL_RUN_STATES else None,
     cost_usd=_events_cost_usd(events),
     initial_message=session.initial_message,
     skill_run_ids=_skill_run_ids(events),

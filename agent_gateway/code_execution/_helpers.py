@@ -38,6 +38,7 @@ _SANDBOX_ENV_DENYLIST = frozenset(
     "RISK_API_KEY",
   }
 )
+_MISSING = object()
 
 
 def _error(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Tuple[None, Dict[str, Any]]:
@@ -45,6 +46,74 @@ def _error(code: str, message: str, details: Optional[Dict[str, Any]] = None) ->
   if details is not None:
     payload["details"] = details
   return None, payload
+
+
+def _integer_input(
+  tool_input: Dict[str, Any],
+  key: str,
+  *,
+  default: int,
+  minimum: int | None = None,
+  maximum: int | None = None,
+) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+  raw_value = tool_input[key] if key in tool_input else default
+  if isinstance(raw_value, bool):
+    return None, {"code": "invalid_input", "message": f"{key} must be an integer"}
+  if isinstance(raw_value, float) and raw_value.is_integer():
+    raw_value = int(raw_value)
+  elif not isinstance(raw_value, int):
+    return None, {"code": "invalid_input", "message": f"{key} must be an integer"}
+  if minimum is not None and raw_value < minimum:
+    return None, {"code": "invalid_input", "message": f"{key} must be >= {minimum}"}
+  if maximum is not None and raw_value > maximum:
+    return None, {"code": "invalid_input", "message": f"{key} must be <= {maximum}"}
+  return raw_value, None
+
+
+def _boolean_input(
+  tool_input: Dict[str, Any],
+  key: str,
+  *,
+  default: bool,
+) -> Tuple[Optional[bool], Optional[Dict[str, Any]]]:
+  raw_value = tool_input[key] if key in tool_input else default
+  if not isinstance(raw_value, bool):
+    return None, {"code": "invalid_input", "message": f"{key} must be a boolean"}
+  return raw_value, None
+
+
+def _string_input(
+  tool_input: Dict[str, Any],
+  key: str,
+  *,
+  default: object = _MISSING,
+  required_message: str | None = None,
+  non_empty: bool = False,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+  if key in tool_input:
+    raw_value = tool_input[key]
+  elif default is not _MISSING:
+    raw_value = default
+  else:
+    return None, {"code": "invalid_input", "message": required_message or f"{key} is required"}
+  if not isinstance(raw_value, str):
+    return None, {"code": "invalid_input", "message": f"{key} must be a string"}
+  if non_empty and not raw_value.strip():
+    return None, {"code": "invalid_input", "message": required_message or f"{key} is required"}
+  return raw_value, None
+
+
+def _timeout_ms_input(
+  tool_input: Dict[str, Any],
+  config: CodeExecutionConfig,
+) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+  return _integer_input(
+    tool_input,
+    "timeout_ms",
+    default=config.default_timeout_ms,
+    minimum=1000,
+    maximum=config.max_timeout_ms,
+  )
 
 
 def _truncate_text(text: str, max_bytes: int) -> Tuple[str, bool]:
@@ -368,16 +437,20 @@ async def code_execute(
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
   cfg = config or CodeExecutionConfig()
 
-  code = str(tool_input.get("code") or "")
-  if not code.strip():
-    return _error("invalid_input", "code is required")
+  code, error = _string_input(
+    tool_input,
+    "code",
+    required_message="code is required",
+    non_empty=True,
+  )
+  if error is not None:
+    return None, error
+  assert code is not None
 
-  timeout_ms_raw = tool_input.get("timeout_ms", cfg.default_timeout_ms)
-  try:
-    timeout_ms = int(timeout_ms_raw)
-  except (TypeError, ValueError):
-    return _error("invalid_input", "timeout_ms must be an integer")
-  timeout_ms = max(1000, min(timeout_ms, cfg.max_timeout_ms))
+  timeout_ms, error = _timeout_ms_input(tool_input, cfg)
+  if error is not None:
+    return None, error
+  assert timeout_ms is not None
 
   work_dir_path = Path(session_work_dir or os.getcwd()).expanduser().resolve()
   try:

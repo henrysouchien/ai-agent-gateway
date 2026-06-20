@@ -184,7 +184,7 @@ def _require_batch_owner(registry: Any, batch_id: int, user_id: str) -> dict[str
 def _set_status_if_not_terminal(registry: Any, batch_id: int, status: str, *, error: str | None = None) -> None:
   try:
     current_status = str(registry.get_batch_digest(batch_id).get("status") or "")
-    if current_status not in {"completed", "failed", "cancelled", "budget_limited"}:
+    if current_status not in {"completed", "failed", "cancelled", "budget_limited", "blocked"}:
       registry.set_status(batch_id, status, error=error)
   except Exception:
     return

@@ -17,7 +17,7 @@ from agent_gateway import AgentRunner, AgentSessionLog, EventLog, TaskRegistry, 
 from agent_gateway.html_artifact_store import read_html_artifact_content, read_html_artifact_sidecar
 from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.session import GatewaySession
-from agent_gateway.skills import SkillLoader
+from agent_gateway.skills import SkillLoader, SkillProfile
 from agent_gateway.sub_agent import make_resume_handler, make_resume_tool_def
 from agent_gateway.task_registry import ParentMessage
 from agent_gateway.transcript import (
@@ -145,6 +145,15 @@ def _write_skill(skills_dir: Path, name: str, frontmatter: str = "", *, body: st
     lines.extend(frontmatter.strip().splitlines())
   lines.extend(["---", body])
   (skills_dir / f"{name}.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+class _StaticSkillLoader:
+  def __init__(self, skills_dir: Path, profile: SkillProfile) -> None:
+    self.skills_dir = skills_dir
+    self._profile = profile
+
+  def load(self, _name: str) -> SkillProfile:
+    return self._profile
 
 
 async def _append_interrupted_skill_task(
@@ -366,6 +375,46 @@ def test_resume_handler_rejects_non_resumable_skill(tmp_path: Path) -> None:
 
     assert result is None
     assert error["code"] == "not_resumable"
+
+  _run(_case())
+
+
+def test_resume_handler_rejects_malformed_profile_extra_exclusions(tmp_path: Path) -> None:
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_bad_extra",
+      agent_name="bad-extra",
+      user_message="Resume bad extra exclusions.",
+    )
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    profile = SkillProfile(
+      name="bad-extra",
+      system_prompt="Resume carefully.",
+      agent_callable=True,
+      agent_description="Bad extra exclusions.",
+      resumable=True,
+    )
+    profile.extra_excluded_tools = "drop_tool"  # type: ignore[assignment]
+    runner.resume_sub_agent = pytest.fail  # type: ignore[method-assign]
+    handler = make_resume_handler(
+      [runner],
+      skill_loader=_StaticSkillLoader(skills_dir, profile),  # type: ignore[arg-type]
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+      default_model="claude-sonnet-4-6",
+      allowed_models={"claude-sonnet-4-6"},
+    )
+
+    result, error = await handler({"task_id": "bg_bad_extra"})
+
+    assert result is None
+    assert error == {
+      "code": "invalid_skill_config",
+      "message": "Skill 'bad-extra' extra_excluded_tools must be a list of tool names",
+    }
 
   _run(_case())
 

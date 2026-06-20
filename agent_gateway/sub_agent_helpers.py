@@ -236,13 +236,33 @@ def _dashboard_artifact_scope(profile: SkillProfile, context_ticker: str) -> str
   return "ticker" if _dashboard_artifact_ticker(profile, context_ticker) else "portfolio"
 
 
+def _skill_extra_excluded_tool_names(skill_profile: SkillProfile | None) -> set[str]:
+  raw_tools = getattr(skill_profile, "extra_excluded_tools", None)
+  if raw_tools is None:
+    return set()
+  if isinstance(raw_tools, str) or not isinstance(raw_tools, (list, tuple, set, frozenset)):
+    raise ValueError(
+      f"Skill '{getattr(skill_profile, 'name', '<unknown>')}' extra_excluded_tools must be a list of tool names"
+    )
+  tool_names: set[str] = set()
+  for raw_tool in raw_tools:
+    if not isinstance(raw_tool, str):
+      raise ValueError(
+        f"Skill '{getattr(skill_profile, 'name', '<unknown>')}' extra_excluded_tools entries must be strings"
+      )
+    tool_name = raw_tool.strip()
+    if tool_name:
+      tool_names.add(tool_name)
+  return tool_names
+
+
 def _skill_html_excluded_tools(
   effective_excluded: set[str] | FrozenSet[str],
   *,
   skill_profile: SkillProfile | None = None,
 ) -> set[str]:
   excluded = set(effective_excluded)
-  skill_excluded = set(getattr(skill_profile, "extra_excluded_tools", set()) or set())
+  skill_excluded = _skill_extra_excluded_tool_names(skill_profile)
   if getattr(skill_profile, "mutation_mode", None) is None:
     excluded.difference_update(_ARTIFACT_EMIT_TOOLS - skill_excluded)
   return excluded

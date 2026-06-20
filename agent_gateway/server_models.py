@@ -314,6 +314,7 @@ class RequestContext:
   request_approval: RequestApproval
   result_queue: asyncio.Queue
   mcp_client: Optional[McpClientManager]
+  run_context: Any | None = None
 
 
 @dataclass

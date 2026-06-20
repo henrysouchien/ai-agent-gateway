@@ -387,6 +387,7 @@ def create_agent(
         mcp_session_inject_servers=mcp_session_inject_servers,
         approval_key_qualifier=approval_qualifier,
         session_cache_denied_tools=session_cache_denied_tools,
+        get_tool_definitions=_get_tool_defs,
       )
       runner = AgentRunner(
         event_log=event_log,

@@ -3,12 +3,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import hmac
-import json
 import logging
 import traceback
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Callable, Literal
 
 from .approval_policy import ApprovalRequest, ApprovalVote, PersistentGrant, ToolClass, canonical_json, decision_latency_ms, utc_now

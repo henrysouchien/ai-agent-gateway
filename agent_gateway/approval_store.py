@@ -15,7 +15,6 @@ from .approval_policy import (
   ApprovalVote,
   DelegationGrant,
   PersistentGrant,
-  ToolClass,
   utc_now,
 )
 

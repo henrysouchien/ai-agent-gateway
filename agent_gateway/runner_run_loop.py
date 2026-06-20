@@ -35,6 +35,7 @@ from .runner_state import (
   assistant_turn_message as _assistant_turn_message,
   background_tasks_completed_user_message as _background_tasks_completed_user_message,
   budget_cost_progress as _budget_cost_progress,
+  budget_exceeded_state as _budget_exceeded_state,
   execute_tool_use_loop as _execute_tool_use_loop,
   model_visible_extra_blocks as _model_visible_extra_blocks,
   no_tool_use_turn_outcome as _no_tool_use_turn_outcome,
@@ -162,6 +163,7 @@ class RunnerRunLoopMixin:
       self, "_build_turn_complete_log_data", _build_turn_complete_log_data
     )
     budget_cost_progress = _runner_attr(self, "_budget_cost_progress", _budget_cost_progress)
+    budget_exceeded_state = _runner_attr(self, "_budget_exceeded_state", _budget_exceeded_state)
     build_budget_exceeded_event = _runner_attr(
       self, "_build_budget_exceeded_event", _build_budget_exceeded_event
     )
@@ -351,6 +353,30 @@ class RunnerRunLoopMixin:
       max_tokens_continuations = 0
       current_messages = list(messages)
 
+      async def emit_budget_exceeded_stop(exceeded_state: Any) -> None:
+        logger.warning(
+          "[%s] Budget exceeded: $%.4f >= $%.4f%s — stopping",
+          self._sid,
+          exceeded_state.total_cost,
+          exceeded_state.budget,
+          exceeded_state.reason_suffix,
+        )
+        self._append(
+          build_budget_exceeded_event(
+            total_cost=exceeded_state.total_cost,
+            budget=exceeded_state.budget,
+            reason=exceeded_state.reason,
+          )
+        )
+        self._append(
+          build_budget_exceeded_text_event(
+            total_cost=exceeded_state.total_cost,
+            budget=exceeded_state.budget,
+            reason_suffix=exceeded_state.reason_suffix,
+          )
+        )
+        await self._emit_interrupted_event("budget_exceeded")
+
       while True:
         if self._operator_pause_requested():
           logger.info("[%s] Operator pause requested before next turn; stopping at safe boundary", self._sid)
@@ -510,30 +536,11 @@ class RunnerRunLoopMixin:
           )
           self._last_reported_cost = budget_progress.last_reported_cost
           exceeded_state = budget_progress.exceeded_state
-          if exceeded_state is not None:
-            logger.warning(
-              "[%s] Budget exceeded: $%.4f >= $%.4f%s — stopping",
-              self._sid,
-              exceeded_state.total_cost,
-              exceeded_state.budget,
-              exceeded_state.reason_suffix,
-            )
-            self._append(
-              build_budget_exceeded_event(
-                total_cost=exceeded_state.total_cost,
-                budget=exceeded_state.budget,
-                reason=exceeded_state.reason,
-              )
-            )
-            self._append(
-              build_budget_exceeded_text_event(
-                total_cost=exceeded_state.total_cost,
-                budget=exceeded_state.budget,
-                reason_suffix=exceeded_state.reason_suffix,
-              )
-            )
-            await self._emit_interrupted_event("budget_exceeded")
+          if exceeded_state is not None and not turn.tool_uses:
+            await emit_budget_exceeded_stop(exceeded_state)
             break
+        else:
+          exceeded_state = None
 
         if self._operator_pause_requested():
           logger.info("[%s] Operator pause requested after turn; stopping before tool dispatch", self._sid)
@@ -629,6 +636,23 @@ class RunnerRunLoopMixin:
         current_messages.append(user_turn_message(tool_loop.tool_results_content))
         if peeked_notification_count > 0:
           self._consume_notifications(max_count=peeked_notification_count)
+
+        if self._cost_accumulator is not None:
+          exceeded_state = budget_exceeded_state(self._cost_accumulator) or exceeded_state
+        if exceeded_state is not None:
+          await emit_budget_exceeded_stop(exceeded_state)
+          break
+
+        stop_after_tool_results_reason = getattr(self, "_stop_after_tool_results_reason", None)
+        if stop_after_tool_results_reason:
+          stop_after_tool_results_tool_name = getattr(self, "_stop_after_tool_results_tool_name", None)
+          logger.info(
+            "[%s] Stop-after-tool-results requested after %s (%s); ending run without follow-up model turn",
+            self._sid,
+            stop_after_tool_results_tool_name or "tool result",
+            stop_after_tool_results_reason,
+          )
+          break
 
         if turn.stop_reason == "end_turn":
           if self._notification_queue.pending_count > 0:

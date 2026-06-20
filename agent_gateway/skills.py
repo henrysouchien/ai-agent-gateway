@@ -129,11 +129,20 @@ def _coerce_optional_bool(value: Any, *, field_name: str, path: Path) -> bool:
   raise ValueError(f"{path}: '{field_name}' must be a boolean")
 
 
-def _coerce_optional_string_list(value: Any, *, field_name: str, path: Path) -> list[str] | None:
+def _coerce_optional_string_list(
+  value: Any,
+  *,
+  field_name: str,
+  path: Path,
+  strict_shape: bool = False,
+  strict_items: bool = False,
+) -> list[str] | None:
   if value is None:
     return None
   raw_items: list[Any]
   if isinstance(value, str):
+    if strict_shape:
+      raise ValueError(f"{path}: '{field_name}' must be a list of strings")
     raw_items = [value]
   elif isinstance(value, (list, tuple, set)):
     raw_items = list(value)
@@ -142,17 +151,28 @@ def _coerce_optional_string_list(value: Any, *, field_name: str, path: Path) -> 
 
   items: list[str] = []
   for item in raw_items:
+    if strict_items and not isinstance(item, str):
+      raise ValueError(f"{path}: '{field_name}' entries must be strings")
     text = _clean_string(item)
     if text:
       items.append(text)
   return items or None
 
 
-def _coerce_optional_string_set(value: Any, *, field_name: str, path: Path) -> set[str]:
+def _coerce_optional_string_set(
+  value: Any,
+  *,
+  field_name: str,
+  path: Path,
+  strict_shape: bool = False,
+  strict_items: bool = False,
+) -> set[str]:
   if value is None:
     return set()
   raw_items: list[Any]
   if isinstance(value, str):
+    if strict_shape:
+      raise ValueError(f"{path}: '{field_name}' must be a list of strings")
     raw_items = [value]
   elif isinstance(value, (list, tuple, set)):
     raw_items = list(value)
@@ -161,6 +181,8 @@ def _coerce_optional_string_set(value: Any, *, field_name: str, path: Path) -> s
 
   items: set[str] = set()
   for item in raw_items:
+    if strict_items and not isinstance(item, str):
+      raise ValueError(f"{path}: '{field_name}' entries must be strings")
     text = _clean_string(item)
     if text:
       items.add(text)
@@ -180,6 +202,8 @@ def _coerce_optional_mcp_tools(
 
   declared: dict[str, list[str]] = {}
   for raw_server, raw_tools in value.items():
+    if raw_server is not None and not isinstance(raw_server, str):
+      raise ValueError(f"{path}: '{field_name}' server names must be strings")
     server_name = _clean_string(raw_server)
     if server_name is None:
       continue
@@ -187,6 +211,8 @@ def _coerce_optional_mcp_tools(
       raw_tools,
       field_name=f"{field_name}.{server_name}",
       path=path,
+      strict_shape=True,
+      strict_items=True,
     )
     if not tools:
       continue
@@ -347,6 +373,8 @@ def parse_skill_file(path: Path) -> SkillProfile:
     raw_mcp_servers,
     field_name="mcp_servers",
     path=path,
+    strict_shape=True,
+    strict_items=True,
   )
   coerced_mcp_tools = _coerce_optional_mcp_tools(
     raw_mcp_tools,
@@ -357,6 +385,8 @@ def parse_skill_file(path: Path) -> SkillProfile:
     raw_session_inject_servers,
     field_name="session_inject_servers",
     path=path,
+    strict_shape=True,
+    strict_items=True,
   )
   coerced_timeout_overrides = _coerce_optional_timeout_overrides(
     raw_timeout_overrides,
@@ -408,6 +438,8 @@ def parse_skill_file(path: Path) -> SkillProfile:
     raw_extra_excluded_tools,
     field_name="extra_excluded_tools",
     path=path,
+    strict_shape=True,
+    strict_items=True,
   )
   coerced_tool_packs_enabled = (
     True

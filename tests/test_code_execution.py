@@ -99,6 +99,253 @@ def test_code_execute_basic_execution_and_work_dir_persistence() -> None:
   asyncio.run(_run_test())
 
 
+def test_code_execute_accepts_schema_timeout_bounds() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(register_docker=False, default_timeout_ms=1000, max_timeout_ms=2000),
+    )
+
+    result, error = await _dispatch_bundle_tool(
+      session,
+      bundle,
+      "code_execute",
+      {"code": "print('ok')", "timeout_ms": 1000.0},
+    )
+
+    assert error is None
+    assert result is not None
+    assert result["stdout"] == "ok\n"
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_rejects_invalid_timeout_ms() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(register_docker=False, default_timeout_ms=1000, max_timeout_ms=2000),
+    )
+
+    cases = [
+      ("1000", "timeout_ms must be an integer"),
+      (1.9, "timeout_ms must be an integer"),
+      (True, "timeout_ms must be an integer"),
+      (None, "timeout_ms must be an integer"),
+      (999, "timeout_ms must be >= 1000"),
+      (2001, "timeout_ms must be <= 2000"),
+    ]
+    for timeout_ms, expected_message in cases:
+      result, error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute",
+        {"code": "print('should-not-run')", "timeout_ms": timeout_ms},
+      )
+      assert result is None
+      assert error == {"code": "invalid_input", "message": expected_message}
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_rejects_invalid_code_input() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+
+    for code, expected_message in (
+      (123, "code must be a string"),
+      (True, "code must be a string"),
+      (None, "code must be a string"),
+      ("", "code is required"),
+    ):
+      result, error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute",
+        {"code": code},
+      )
+      assert result is None
+      assert error == {"code": "invalid_input", "message": expected_message}
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_rejects_invalid_host_input() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+
+    for host in (123, True, None):
+      result, error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute",
+        {"code": "print('should-not-run')", "host": host},
+      )
+      assert result is None
+      assert error == {"code": "invalid_input", "message": "host must be a string"}
+
+    result, error = await _dispatch_bundle_tool(
+      session,
+      bundle,
+      "code_execute",
+      {"code": "print('should-not-run')", "host": ""},
+    )
+
+    assert result is None
+    assert error == {"code": "invalid_input", "message": "Unknown host: ''"}
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_invalid_input_bypasses_approval_for_validation() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(register_docker=False, default_timeout_ms=1000, max_timeout_ms=2000),
+    )
+
+    cases = [
+      ({"code": 123}, "code must be a string"),
+      ({"code": "print('should-not-run')", "host": None}, "host must be a string"),
+      ({"code": "print('should-not-run')", "host": "missing"}, "Unknown host: 'missing'"),
+      ({"code": "print('should-not-run')", "background": "true"}, "background must be a boolean"),
+      ({"code": "print('should-not-run')", "timeout_ms": "1000"}, "timeout_ms must be an integer"),
+    ]
+    for tool_input, expected_message in cases:
+      result, error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute",
+        tool_input,
+        needs_approval=bundle.needs_approval,
+      )
+      assert result is None
+      assert error == {"code": "invalid_input", "message": expected_message}
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_valid_subprocess_input_still_requires_approval() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+
+    result, error = await _dispatch_bundle_tool(
+      session,
+      bundle,
+      "code_execute",
+      {"code": "print('needs approval')"},
+      needs_approval=bundle.needs_approval,
+    )
+
+    assert result is None
+    assert error is not None
+    assert error["code"] == "approval_required"
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_rejects_invalid_background_flag() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+
+    for background in ("true", 1, None):
+      result, error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute",
+        {"code": "print('should-not-run')", "background": background},
+      )
+      assert result is None
+      assert error == {"code": "invalid_input", "message": "background must be a boolean"}
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_background_rejects_invalid_code_input() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+
+    for code, expected_message in (
+      (123, "code must be a string"),
+      (None, "code must be a string"),
+      ("", "code is required"),
+    ):
+      result, error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute",
+        {"code": code, "background": True},
+      )
+      assert result is None
+      assert error == {"code": "invalid_input", "message": expected_message}
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_background_rejects_invalid_timeout_ms() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(register_docker=False, default_timeout_ms=1000, max_timeout_ms=2000),
+    )
+
+    for timeout_ms, expected_message in (
+      ("1000", "timeout_ms must be an integer"),
+      (1.9, "timeout_ms must be an integer"),
+      (True, "timeout_ms must be an integer"),
+      (999, "timeout_ms must be >= 1000"),
+      (2001, "timeout_ms must be <= 2000"),
+    ):
+      result, error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute",
+        {"code": "print('should-not-run')", "background": True, "timeout_ms": timeout_ms},
+      )
+      assert result is None
+      assert error == {"code": "invalid_input", "message": expected_message}
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_background_accepts_integral_float_timeout_ms() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(register_docker=False, default_timeout_ms=1000, max_timeout_ms=2000),
+    )
+
+    try:
+      result, error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute",
+        {
+          "code": "import time\nprint('started', flush=True)\ntime.sleep(0.2)",
+          "background": True,
+          "timeout_ms": 1000.0,
+        },
+      )
+
+      assert error is None
+      assert result is not None
+      assert result["status"] == "running"
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run_test())
+
+
 def test_code_execute_preamble_defers_matplotlib_import() -> None:
   async def _run_test() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
@@ -301,6 +548,52 @@ def test_code_execute_background_status_and_cancel_flow() -> None:
       assert task.handle._backend_data["process"].returncode is not None
     finally:
       await cleanup_code_execution(session)
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_status_rejects_invalid_cancel_flag_before_task_lookup() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+
+    for cancel in ("true", 1, None):
+      result, error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute_status",
+        {"task_id": "missing-task", "cancel": cancel},
+      )
+      assert result is None
+      assert error == {"code": "invalid_input", "message": "cancel must be a boolean"}
+
+  asyncio.run(_run_test())
+
+
+def test_code_execute_status_rejects_invalid_task_id_type() -> None:
+  async def _run_test() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+
+    for task_id in (123, True, None):
+      result, error = await _dispatch_bundle_tool(
+        session,
+        bundle,
+        "code_execute_status",
+        {"task_id": task_id},
+      )
+      assert result is None
+      assert error == {"code": "invalid_input", "message": "task_id must be a string"}
+
+    result, error = await _dispatch_bundle_tool(
+      session,
+      bundle,
+      "code_execute_status",
+      {"task_id": ""},
+    )
+
+    assert result is None
+    assert error == {"code": "invalid_input", "message": "task_id is required"}
 
   asyncio.run(_run_test())
 

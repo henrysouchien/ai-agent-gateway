@@ -1,4 +1,5 @@
 import asyncio
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -294,6 +295,22 @@ def test_parse_background_result_request_preserves_legacy_errors() -> None:
   assert parse_background_result_request({"task_id": "bg_1", "timeout": "5"}) == (
     None,
     {"code": "invalid_input", "message": "timeout must be a number"},
+  )
+  assert parse_background_result_request({"task_id": "bg_1", "timeout": True}) == (
+    None,
+    {"code": "invalid_input", "message": "timeout must be a number"},
+  )
+  assert parse_background_result_request({"task_id": "bg_1", "timeout": math.inf}) == (
+    None,
+    {"code": "invalid_input", "message": "timeout must be finite"},
+  )
+  assert parse_background_result_request({"task_id": "bg_1", "timeout": -math.inf}) == (
+    None,
+    {"code": "invalid_input", "message": "timeout must be finite"},
+  )
+  assert parse_background_result_request({"task_id": "bg_1", "timeout": math.nan}) == (
+    None,
+    {"code": "invalid_input", "message": "timeout must be finite"},
   )
 
 

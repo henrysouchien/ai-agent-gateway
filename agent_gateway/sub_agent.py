@@ -43,6 +43,7 @@ from .sub_agent_helpers import (
   _message_content_text as _message_content_text,
   _optional_research_file_id as _optional_research_file_id,
   _render_agent_param_description as _render_agent_param_description,
+  _skill_extra_excluded_tool_names as _skill_extra_excluded_tool_names,
   _skill_html_excluded_tools as _skill_html_excluded_tools,
   make_get_background_result_tool_def as make_get_background_result_tool_def,
   make_resume_tool_def as make_resume_tool_def,
@@ -58,6 +59,37 @@ from .transcript import (
   reconstruct_messages_for_task,
   reconstruct_parent_messages,
 )
+
+
+def _child_tool_definitions_getter(
+  *,
+  runner: Any,
+  mcp_client: Any,
+  excluded_tools: set[str],
+) -> Callable[[], list[dict[str, Any]]] | None:
+  child_excluded_tools = {str(name) for name in excluded_tools}
+  parent_get_tool_definitions = getattr(runner, "_get_tool_definitions", None)
+  mcp_get_tool_definitions = getattr(mcp_client, "get_tool_definitions", None)
+  if not callable(parent_get_tool_definitions) and not callable(mcp_get_tool_definitions):
+    return None
+
+  def _child_tool_definitions() -> list[dict[str, Any]]:
+    if callable(parent_get_tool_definitions):
+      definitions = list(parent_get_tool_definitions())
+    elif callable(mcp_get_tool_definitions):
+      definitions = list(mcp_get_tool_definitions())
+    else:
+      definitions = []
+    if not child_excluded_tools:
+      return definitions
+    return [
+      definition
+      for definition in definitions
+      if str(definition.get("name") or "") not in child_excluded_tools
+    ]
+
+  return _child_tool_definitions
+
 
 def make_run_agent_handler(
   runner_ref: list[Any],
@@ -237,7 +269,13 @@ def make_run_agent_handler(
         effective_excluded,
         local_tool_names=set(local_tool_handlers or {}) | set(_ARTIFACT_EMIT_TOOLS),
       )
-      effective_excluded |= set(getattr(profile, "extra_excluded_tools", set()) or set())
+      try:
+        effective_excluded |= _skill_extra_excluded_tool_names(profile)
+      except ValueError as exc:
+        return None, {
+          "code": "invalid_skill_config",
+          "message": str(exc),
+        }
     sub_local = {
       name: handler
       for name, handler in (local_tool_handlers or {}).items()
@@ -339,6 +377,11 @@ def make_run_agent_handler(
       channel=getattr(parent_session, "channel", None),
       role=getattr(parent_session, "role", None),
       credentials_resolver_active=credentials_resolver_active,
+      get_tool_definitions=_child_tool_definitions_getter(
+        runner=runner,
+        mcp_client=mcp_client,
+        excluded_tools=child_excluded,
+      ),
     )
 
     async def _dispatch_sub_agent(_background_input: dict[str, Any], **background_kwargs: Any):
@@ -620,7 +663,13 @@ def make_resume_handler(
       effective_excluded,
       local_tool_names=set(local_tool_handlers or {}) | set(_ARTIFACT_EMIT_TOOLS),
     )
-    effective_excluded |= set(getattr(profile, "extra_excluded_tools", set()) or set())
+    try:
+      effective_excluded |= _skill_extra_excluded_tool_names(profile)
+    except ValueError as exc:
+      return None, {
+        "code": "invalid_skill_config",
+        "message": str(exc),
+      }
     child_excluded = _skill_html_excluded_tools(effective_excluded, skill_profile=profile)
     sub_local = {
       name: handler
@@ -726,6 +775,11 @@ def make_resume_handler(
       channel=getattr(parent_session, "channel", None),
       role=getattr(parent_session, "role", None),
       credentials_resolver_active=credentials_resolver_active,
+      get_tool_definitions=_child_tool_definitions_getter(
+        runner=runner,
+        mcp_client=mcp_client,
+        excluded_tools=child_excluded,
+      ),
     )
 
     async def _dispatch_resume(_background_input: dict[str, Any], **background_kwargs: Any):
