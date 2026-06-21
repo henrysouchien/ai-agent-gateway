@@ -1,5 +1,8 @@
+# ruff: noqa: E402
+
 import asyncio
 import sys
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 
 import pytest
@@ -14,9 +17,15 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentSessionLog, generate_and_append_summary
-from api.agent.profiles.analyst import BOOTSTRAP_CAP_SECONDS, generate_analyst_session_summary
 import agent_gateway.agent_session_log as agent_session_log_module
+from agent_gateway import AgentSessionLog, generate_and_append_summary
+from agent.profiles import analyst_session_summary
+from api.agent.profiles import analyst as analyst_config
+from api.agent.profiles.analyst import (
+  BOOTSTRAP_CAP_SECONDS,
+  AnalystContextBuilder,
+  generate_analyst_session_summary,
+)
 
 
 def _run(coro):
@@ -32,6 +41,78 @@ def _append_with_timestamp(
 ) -> None:
   monkeypatch.setattr(agent_session_log_module.time, "time", lambda: timestamp)
   _run(log.append(event))
+
+
+def test_analyst_session_summary_helpers_preserve_parent_api() -> None:
+  assert analyst_config.BOOTSTRAP_CAP_SECONDS == analyst_session_summary.BOOTSTRAP_CAP_SECONDS
+  assert analyst_config.SESSION_LOG_SUMMARY_PROMPT is analyst_session_summary.SESSION_LOG_SUMMARY_PROMPT
+  assert analyst_config.SESSION_LOG_SUMMARY_MAX_CHUNKS == analyst_session_summary.SESSION_LOG_SUMMARY_MAX_CHUNKS
+  assert (
+    analyst_config.SESSION_LOG_SUMMARY_PROMPT_CHAR_BUDGET
+    == analyst_session_summary.SESSION_LOG_SUMMARY_PROMPT_CHAR_BUDGET
+  )
+  assert AnalystContextBuilder is analyst_config.AnalystContextBuilder
+  assert issubclass(AnalystContextBuilder, analyst_session_summary.AnalystContextBuilder)
+  assert is_dataclass(AnalystContextBuilder)
+  assert [field.name for field in fields(AnalystContextBuilder)] == [
+    "agent_session_log",
+    "tail_window_seconds",
+    "tail_token_budget",
+  ]
+  assert generate_analyst_session_summary is analyst_config.generate_analyst_session_summary
+  assert AnalystContextBuilder.__module__ == "api.agent.profiles.analyst"
+  assert generate_analyst_session_summary.__module__ == "api.agent.profiles.analyst"
+
+
+def test_generate_analyst_session_summary_forwards_parent_provider_name(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  captured: dict[str, object] = {}
+  expected = object()
+  session_log = object()
+
+  def summarize_fn(_prompt: str) -> str:
+    return "summary"
+
+  async def fake_generate_analyst_session_summary(agent_session_log: object, **kwargs: object) -> object:
+    captured["agent_session_log"] = agent_session_log
+    captured["kwargs"] = kwargs
+    return expected
+
+  monkeypatch.setattr(analyst_config, "PROVIDER", "fixture")
+  monkeypatch.setattr(
+    analyst_config,
+    "_generate_analyst_session_summary",
+    fake_generate_analyst_session_summary,
+  )
+
+  result = _run(
+    analyst_config.generate_analyst_session_summary(
+      session_log,  # type: ignore[arg-type]
+      provider="provider",  # type: ignore[arg-type]
+      auth_config={"api_key": "test"},
+      summarize_fn=summarize_fn,  # type: ignore[arg-type]
+      model="model",
+      prompt="prompt",
+      now=123.0,
+      max_chunks=2,
+      prompt_char_budget=456,
+    )
+  )
+
+  assert result is expected
+  assert captured["agent_session_log"] is session_log
+  kwargs = captured["kwargs"]
+  assert isinstance(kwargs, dict)
+  assert kwargs["provider"] == "provider"
+  assert kwargs["auth_config"] == {"api_key": "test"}
+  assert kwargs["summarize_fn"] is summarize_fn
+  assert kwargs["model"] == "model"
+  assert kwargs["prompt"] == "prompt"
+  assert kwargs["now"] == 123.0
+  assert kwargs["max_chunks"] == 2
+  assert kwargs["prompt_char_budget"] == 456
+  assert kwargs["provider_name"] == "fixture"
 
 
 def test_generate_and_append_summary_round_trips_cumulative_summary(tmp_path: Path) -> None:
