@@ -24,6 +24,8 @@ Key parameters:
 - `provider`: `"anthropic"` (default), `"openai"`, or a `ModelProvider` instance
 - `model`: provider-specific default when omitted for string providers; required for provider instances
 - `provider_config`: merged into the provider auth config last for fields like `base_url` or `compat`
+- `skills_dir`: directory of markdown skill files used by the built-in `run_agent` tool
+- `skill_state_file`: optional JSON file for callable skills with `persist_state: true`; prior state is injected into the skill prompt, and final `## STATE_UPDATE_JSON` updates are merged back into the file
 - `outputs_dir`: directory for named-skill output files; stale same-day outputs are cleaned before background `run_agent` launch
 
 ```python

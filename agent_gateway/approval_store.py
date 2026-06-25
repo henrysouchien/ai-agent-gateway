@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import json
 import os
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 from .approval_policy import (
   ApprovalRequest,
@@ -114,8 +115,17 @@ class SQLiteApprovalStore:
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
+  @contextmanager
+  def _connection(self) -> Iterator[sqlite3.Connection]:
+    conn = self._connect()
+    try:
+      with conn:
+        yield conn
+    finally:
+      conn.close()
+
   def _init_schema(self) -> None:
-    with self._connect() as conn:
+    with self._connection() as conn:
       conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS approval_requests (
@@ -231,7 +241,7 @@ class SQLiteApprovalStore:
 
   async def create(self, request: ApprovalRequest) -> ApprovalRequest:
     async with self._lock:
-      with self._connect() as conn:
+      with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
           """
@@ -266,7 +276,7 @@ class SQLiteApprovalStore:
     return request
 
   async def get(self, approval_id: str) -> ApprovalRequest | None:
-    with self._connect() as conn:
+    with self._connection() as conn:
       row = conn.execute(
         "SELECT * FROM approval_requests WHERE approval_id = ?",
         (approval_id,),
@@ -274,7 +284,7 @@ class SQLiteApprovalStore:
     return self._row_to_request(row) if row is not None else None
 
   async def get_by_tool_call_id(self, tool_call_id: str) -> ApprovalRequest | None:
-    with self._connect() as conn:
+    with self._connection() as conn:
       row = conn.execute(
         "SELECT * FROM approval_requests WHERE tool_call_id = ? ORDER BY requested_at DESC LIMIT 1",
         (tool_call_id,),
@@ -283,7 +293,7 @@ class SQLiteApprovalStore:
 
   async def update_request(self, request: ApprovalRequest) -> ApprovalRequest:
     async with self._lock:
-      with self._connect() as conn:
+      with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
           """
@@ -324,7 +334,7 @@ class SQLiteApprovalStore:
     decision_reason: str | None = None,
   ) -> ApprovalRequest:
     async with self._lock:
-      with self._connect() as conn:
+      with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         current_row = conn.execute(
           "SELECT * FROM approval_requests WHERE approval_id = ?",
@@ -377,7 +387,7 @@ class SQLiteApprovalStore:
     emitted_vote = False
     terminal_event: str | None = None
     async with self._lock:
-      with self._connect() as conn:
+      with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         current_row = conn.execute(
           "SELECT * FROM approval_requests WHERE approval_id = ?",
@@ -473,7 +483,7 @@ class SQLiteApprovalStore:
 
   async def create_persistent_grant(self, grant: PersistentGrant) -> PersistentGrant:
     async with self._lock:
-      with self._connect() as conn:
+      with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
           """
@@ -512,7 +522,7 @@ class SQLiteApprovalStore:
     now: datetime | None = None,
   ) -> PersistentGrant | None:
     now_text = _dt_to_text(now or utc_now())
-    with self._connect() as conn:
+    with self._connection() as conn:
       row = conn.execute(
         """
         SELECT * FROM persistent_grants
@@ -531,7 +541,7 @@ class SQLiteApprovalStore:
   async def revoke_persistent_grant(self, grant_id: str, *, revoked_at: datetime | None = None) -> None:
     when = revoked_at or utc_now()
     async with self._lock:
-      with self._connect() as conn:
+      with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
           "SELECT * FROM persistent_grants WHERE grant_id = ?",
@@ -552,7 +562,7 @@ class SQLiteApprovalStore:
 
   async def create_delegation_grant(self, grant: DelegationGrant) -> DelegationGrant:
     async with self._lock:
-      with self._connect() as conn:
+      with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
           """
@@ -588,7 +598,7 @@ class SQLiteApprovalStore:
     return grant
 
   async def get_delegation_grant(self, delegation_id: str) -> DelegationGrant | None:
-    with self._connect() as conn:
+    with self._connection() as conn:
       row = conn.execute(
         "SELECT * FROM delegation_grants WHERE delegation_id = ?",
         (delegation_id,),
@@ -606,7 +616,7 @@ class SQLiteApprovalStore:
     now_value = now or utc_now()
     now_text = _dt_to_text(now_value)
     async with self._lock:
-      with self._connect() as conn:
+      with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         cursor = conn.execute(
           """
@@ -639,7 +649,7 @@ class SQLiteApprovalStore:
   async def revoke_delegation_grant(self, delegation_id: str, *, revoked_at: datetime | None = None) -> None:
     when = revoked_at or utc_now()
     async with self._lock:
-      with self._connect() as conn:
+      with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
           "UPDATE delegation_grants SET revoked_at = ? WHERE delegation_id = ?",
@@ -651,7 +661,7 @@ class SQLiteApprovalStore:
     now_value = now or utc_now()
     expired: list[ApprovalRequest] = []
     async with self._lock:
-      with self._connect() as conn:
+      with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
           """

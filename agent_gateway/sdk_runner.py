@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
-import json
 import logging
 import os
 import time
 import uuid
 from dataclasses import replace
 from datetime import timedelta
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Sequence, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Sequence
 
 from .approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
@@ -26,6 +24,7 @@ from . import approval_settings
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
 from .event_log import EventLog
 from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator, normalize_identity
+from .policy_imports import resolve_server_policy_tool_class
 from .product_config import gateway_product_id
 from .providers.agent_sdk import AgentSDKConfig, estimate_cost, _validate_sdk_version
 from .runner import (
@@ -38,11 +37,12 @@ from .runner import (
 from .runner_introspection import detect_keyword_param as _detect_keyword_param
 from .session_recap import emit_recap_then_terminal
 from .skill_context import clear_current_skill, current_skill
+from . import sdk_runner_context as _sdk_runner_context
 from . import sdk_runner_helpers as _sdk_runner_helpers
 from .sdk_runner_stream import ToolCallInfo, _ActiveToolUse, _SDKRunnerStreamMixin
 from .tool_dispatcher import RELAY_POLICY_DENIED_MESSAGE, RELAY_POLICY_DENIED_SUB_CODE
 from .tool_display import resolve_display  # noqa: F401 - compatibility alias for stream helpers
-from .tool_result_semantics import classify_semantic_tool_error
+from .tool_result_semantics import classify_semantic_tool_error  # noqa: F401 - compatibility alias for helpers
 
 
 log = logging.getLogger("agent_gateway.sdk_runner")
@@ -60,6 +60,7 @@ _extract_text = _sdk_runner_helpers.extract_text
 _get_attr = _sdk_runner_helpers.get_attr
 _join_system_prompt = _sdk_runner_helpers.join_system_prompt
 _parse_result_payload = _sdk_runner_helpers.parse_result_payload
+_policy_owner_mismatch = _sdk_runner_helpers.policy_owner_mismatch
 _policy_tool_name = _sdk_runner_helpers.policy_tool_name
 _redact_tool_input_for_event = _sdk_runner_helpers.redact_tool_input_for_event
 _server_for_tool = _sdk_runner_helpers.server_for_tool
@@ -109,6 +110,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     system_prompt: str,
     disallowed_tools: list[str] | None = None,
     mcp_server_configs: dict | None = None,
+    allowed_tools: list[str] | None = None,
     max_turns: int | None = None,
     on_usage: Callable[..., Any] | None = None,
     on_session_summary: Callable[..., Any] | None = None,
@@ -122,6 +124,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     run_context: RunContext | None = None,
     skill_run_id: str | None = None,
     workspace_dir: str | None = None,
+    batch_id: int | str | None = None,
     started_at: float | None = None,
     emit_session_recap: bool = True,
     context_surfaces: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
@@ -135,6 +138,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     self._system_prompt = system_prompt
     self._disallowed_tools = list(disallowed_tools or sdk_config.disallowed_tools)
     self._mcp_server_configs = dict(mcp_server_configs or {})
+    self._allowed_tools = list(allowed_tools or [])
     self._max_turns = max_turns
     self._on_usage = on_usage
     self._on_session_summary = on_session_summary
@@ -143,6 +147,8 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     self._on_tool_timing = on_tool_timing
     self._on_tool_timing_accepts_user_id = _detect_user_id_param(on_tool_timing)
     self._on_tool_timing_accepts_context_surfaces = _detect_keyword_param(on_tool_timing, "context_surfaces")
+    self._on_tool_timing_accepts_tool_call_id = _detect_keyword_param(on_tool_timing, "tool_call_id")
+    self._on_tool_timing_accepts_request_id = _detect_keyword_param(on_tool_timing, "request_id")
     self._context_surfaces_provider = context_surfaces if callable(context_surfaces) else None
     self._context_surfaces_static = self._normalize_context_surfaces(None if callable(context_surfaces) else context_surfaces)
     self._pending_tool_calls: Dict[str, ToolCallInfo] = {}
@@ -187,23 +193,14 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     self._run_context = run_context
     self._skill_run_id = skill_run_id
     self._workspace_dir = workspace_dir
+    self._batch_id = str(batch_id).strip() if batch_id is not None and str(batch_id).strip() else None
 
   @staticmethod
   def _normalize_context_surfaces(surfaces: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    return [
-      dict(surface)
-      for surface in (surfaces or [])
-      if isinstance(surface, dict)
-    ]
+    return _sdk_runner_context.normalize_context_surfaces(surfaces)
 
   def _context_surface_records(self) -> list[dict[str, Any]]:
-    if self._context_surfaces_provider is None:
-      return self._normalize_context_surfaces(self._context_surfaces_static)
-    try:
-      return self._normalize_context_surfaces(self._context_surfaces_provider())
-    except Exception as exc:
-      log.warning("[%s] context surface provider failed (non-fatal): %s", self._sid, exc)
-      return self._normalize_context_surfaces(self._context_surfaces_static)
+    return _sdk_runner_context.context_surface_records(self, logger=log)
 
   def _append(self, event: Dict[str, Any]) -> None:
     payload = dict(event)
@@ -222,40 +219,13 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     self._log.append(payload)
 
   async def _call_on_usage(self, usage_event: UsageEvent) -> None:
-    recorded = await self._aggregator.record(usage_event)
-    await self._aggregator.set_turns(self._num_turns)
-    if not recorded or self._summary_emitted:
-      log.warning("[%s] Usage event arrived after session summary emission: %s", self._sid, usage_event.event_id)
-      await self._call_on_late_usage_event(usage_event)
-      return
-    if self._on_usage is None:
-      return
-    try:
-      result = self._on_usage(usage_event)
-      if inspect.isawaitable(result):
-        await result
-    except Exception as exc:
-      log.warning("[%s] on_usage hook failed (non-fatal): %s", self._sid, exc)
+    await _sdk_runner_context.call_on_usage(self, usage_event, logger=log)
 
   async def _call_on_late_usage_event(self, usage_event: UsageEvent) -> None:
-    if self._on_late_usage_event is None:
-      return
-    try:
-      result = self._on_late_usage_event(usage_event)
-      if inspect.isawaitable(result):
-        await result
-    except Exception as exc:
-      log.warning("[%s] on_late_usage_event hook failed (non-fatal): %s", self._sid, exc)
+    await _sdk_runner_context.call_on_late_usage_event(self, usage_event, logger=log)
 
   async def _call_on_session_summary(self, summary: SessionUsageSummary) -> None:
-    if self._on_session_summary is None:
-      return
-    try:
-      result = self._on_session_summary(summary)
-      if inspect.isawaitable(result):
-        await result
-    except Exception as exc:
-      log.warning("[%s] on_session_summary hook failed (non-fatal): %s", self._sid, exc)
+    await _sdk_runner_context.call_on_session_summary(self, summary, logger=log)
 
   def _call_on_tool_timing(
     self,
@@ -265,85 +235,26 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     duration_ms: int,
     is_error: bool,
     result_bytes: int,
+    tool_call_id: str | None = None,
+    request_id: str | None = None,
   ) -> None:
-    if self._on_tool_timing is None:
-      return
-    try:
-      if self._on_tool_timing_accepts_user_id:
-        kwargs: dict[str, Any] = {}
-        if self._on_tool_timing_accepts_context_surfaces:
-          kwargs["context_surfaces"] = self._context_surface_records()
-        self._on_tool_timing(
-          self._session_id,
-          tool_name,
-          server,
-          duration_ms,
-          is_error,
-          result_bytes,
-          user_id=self._usage_user_id,
-          **kwargs,
-        )
-      else:
-        kwargs = {}
-        if self._on_tool_timing_accepts_context_surfaces:
-          kwargs["context_surfaces"] = self._context_surface_records()
-        self._on_tool_timing(
-          self._session_id,
-          tool_name,
-          server,
-          duration_ms,
-          is_error,
-          result_bytes,
-          **kwargs,
-        )
-    except Exception as exc:
-      log.warning("[%s] on_tool_timing hook failed (non-fatal): %s", self._sid, exc)
+    _sdk_runner_context.call_on_tool_timing(
+      self,
+      tool_name=tool_name,
+      server=server,
+      duration_ms=duration_ms,
+      is_error=is_error,
+      result_bytes=result_bytes,
+      tool_call_id=tool_call_id,
+      request_id=request_id,
+      logger=log,
+    )
 
   async def _call_on_tool_result(self, ctx: ToolResultContext) -> List[Dict[str, Any]]:
-    if self._on_tool_result is None:
-      return []
-    try:
-      extra_blocks = await self._on_tool_result(ctx)
-    except Exception as exc:
-      log.warning("[%s] on_tool_result hook failed (non-fatal): %s", self._sid, exc)
-      return []
-    if not extra_blocks:
-      return []
-    if isinstance(extra_blocks, list):
-      return [block for block in extra_blocks if isinstance(block, dict)]
-    return []
+    return await _sdk_runner_context.call_on_tool_result(self, ctx, logger=log)
 
   def _build_prompt(self, messages: List[Dict[str, Any]]) -> str:
-    normalized: List[Tuple[str, str]] = []
-    for message in messages:
-      role = str(message.get("role") or "user").strip().lower() or "user"
-      content = str(message.get("content") or "")
-      if not content:
-        continue
-      normalized.append((role, content))
-
-    if not normalized:
-      return ""
-    if len(normalized) == 1 and normalized[0][0] == "user":
-      return normalized[0][1]
-
-    transcript = "\n\n".join(f"{role.upper()}: {content}" for role, content in normalized[:-1])
-    last_role, last_content = normalized[-1]
-    if last_role == "user":
-      if transcript:
-        return (
-          "You are continuing a stateless conversation. Use the transcript below as prior context.\n\n"
-          f"{transcript}\n\n"
-          "Respond to the latest user message below.\n\n"
-          f"USER: {last_content}"
-        )
-      return last_content
-
-    combined = "\n\n".join(f"{role.upper()}: {content}" for role, content in normalized)
-    return (
-      "You are continuing a stateless conversation. Use the transcript below as prior context and continue appropriately.\n\n"
-      f"{combined}"
-    )
+    return _sdk_runner_context.build_prompt(messages)
 
   def _make_result_entry(
     self,
@@ -351,21 +262,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     result: Any | None,
     error: Dict[str, Any] | None,
   ) -> Dict[str, Any]:
-    if error is not None:
-      return {
-        "type": "tool_result",
-        "tool_use_id": tool_call_id,
-        "content": json.dumps({"error": error}, default=str),
-        "is_error": True,
-      }
-    entry = {
-      "type": "tool_result",
-      "tool_use_id": tool_call_id,
-      "content": json.dumps(result, default=str),
-    }
-    if classify_semantic_tool_error(result) is not None:
-      entry["is_error"] = True
-    return entry
+    return _sdk_runner_context.make_result_entry(tool_call_id, result, error)
 
   def _format_additional_context(
     self,
@@ -374,34 +271,11 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     result_entry: Dict[str, Any],
     extra_blocks: Sequence[Dict[str, Any]],
   ) -> str | None:
-    parts: List[str] = []
-    parsed = _parse_result_payload(result_entry.get("content"))
-    if isinstance(parsed, dict):
-      warning = parsed.get("_runner_warning") or parsed.get("warning")
-      if isinstance(warning, str) and warning.strip():
-        parts.append(f"WARNING: {warning.strip()}")
-
-      if result_entry.get("is_error") is True:
-        summary = _summarize_error_payload(parsed)
-        parts.append(
-          f"ERROR: The previous tool call ({tool_name}) returned a structured error: {summary}. "
-          "Treat this result as a failure."
-        )
-
-    for block in extra_blocks:
-      if block.get("_event_only"):
-        continue
-      block_type = str(block.get("type") or "")
-      if block_type == "text":
-        text = str(block.get("text") or "").strip()
-        if text:
-          parts.append(text)
-        continue
-      parts.append(json.dumps(block, default=str))
-
-    if not parts:
-      return None
-    return "\n\n".join(part for part in parts if part)
+    return _sdk_runner_context.format_additional_context(
+      tool_name=tool_name,
+      result_entry=result_entry,
+      extra_blocks=extra_blocks,
+    )
 
   async def _build_hook_additional_context(
     self,
@@ -412,32 +286,15 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     result: Any | None,
     error: Dict[str, Any] | None,
   ) -> str | None:
-    pending = self._pending_tool_calls.get(tool_call_id)
-    duration_ms = int((time.time() - pending.started_at) * 1000) if pending is not None else 0
-    result_entry = self._make_result_entry(tool_call_id, result, error)
-    extra_blocks = await self._call_on_tool_result(
-      ToolResultContext(
-        tool_name=tool_name,
-        tool_input=dict(tool_input),
-        result=result,
-        error=error,
-        duration_ms=duration_ms,
-        tool_call_id=tool_call_id,
-        session_id=self._session_id,
-        server=_server_for_tool(tool_name),
-        result_entry=result_entry,
-        skill_run_id=self._skill_run_id,
-        workspace_dir=self._workspace_dir,
-      )
-    )
-    additional_context = self._format_additional_context(
+    return await _sdk_runner_context.build_hook_additional_context(
+      self,
+      tool_call_id=tool_call_id,
       tool_name=tool_name,
-      result_entry=result_entry,
-      extra_blocks=extra_blocks,
+      tool_input=tool_input,
+      result=result,
+      error=error,
+      logger=log,
     )
-    if additional_context:
-      log.info("[%s] Injecting additionalContext for %s", self._sid, tool_name)
-    return additional_context
 
   def _effective_disallowed_tools(self) -> set[str]:
     if not self._active_skill_deny:
@@ -590,17 +447,11 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
 
   def _resolve_tool_class(self, tool_name: str) -> str:
     policy_tool = _policy_tool_name(tool_name)
-    try:
-      from agent.shared.server_policies import get_tool_class
-
-      server = _server_for_tool(tool_name)
-      if server:
-        cls = get_tool_class(server, policy_tool)
-        if cls is not None:
-          return cls
-    except Exception:
-      pass
-    return "state_write"
+    return resolve_server_policy_tool_class(
+      tool_name,
+      policy_tool_name=policy_tool,
+      runtime_server=_server_for_tool(tool_name),
+    )
 
   def _redact_for_approval_request(self, tool_name: str, tool_input: Dict[str, Any]) -> tuple[dict[str, Any], str]:
     try:
@@ -685,6 +536,15 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     deny_cls = getattr(claude_agent_sdk, "PermissionResultDeny")
     if tool_name in self._effective_disallowed_tools():
       return deny_cls(message=f"Tool '{tool_name}' is not available in this context")
+    mismatch = _policy_owner_mismatch(tool_name)
+    if mismatch is not None:
+      runtime_server, policy_tool, policy_server = mismatch
+      return deny_cls(
+        message=(
+          f"Tool '{tool_name}' is not available from MCP server "
+          f"'{runtime_server}'; policy owner for '{policy_tool}' is '{policy_server}'"
+        )
+      )
     if not self._approval_lifecycle_configured():
       return allow_cls()
     store = self._approval_store
@@ -859,6 +719,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     options_kwargs: Dict[str, Any] = {
       "system_prompt": effective_system_prompt or None,
       "mcp_servers": dict(self._mcp_server_configs),
+      "allowed_tools": list(self._allowed_tools),
       "continue_conversation": False,
       "max_turns": max_turns if max_turns is not None else self._max_turns,
       "max_budget_usd": self._sdk_config.max_budget_usd,

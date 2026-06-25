@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -26,6 +27,7 @@ from agent_gateway import (  # noqa: E402
 from agent_gateway.auth import AuthConfig, NoCredentialError, ProviderCredentialFailure, ResolverResult  # noqa: E402
 from agent_gateway import server as server_module  # noqa: E402
 from agent_gateway import server_artifact_helpers as artifact_helpers_module  # noqa: E402
+from agent_gateway import server_artifact_routes as artifact_routes_module  # noqa: E402
 from agent_gateway import server_chat_helpers as chat_helpers_module  # noqa: E402
 from agent_gateway import server_models as models_module  # noqa: E402
 from agent_gateway.server import ChatInitRequest, ChatRuntime, GatewayServerConfig, create_gateway_app  # noqa: E402
@@ -36,12 +38,54 @@ def test_server_parent_aliases_moved_helpers() -> None:
   assert server_module.GatewayServerConfig is models_module.GatewayServerConfig
   assert server_module._artifact_json_response is artifact_helpers_module._artifact_json_response
   assert server_module._error_payload is artifact_helpers_module._error_payload
+  assert server_module._server_artifact_routes is artifact_routes_module
   assert server_module._dispatch_chat_turn is chat_helpers_module._dispatch_chat_turn
   assert callable(server_module._stream_subscriber_sse)
   assert callable(server_module._register_stream_subscriber)
   assert server_module._init_approval_subsystem is chat_helpers_module._init_approval_subsystem
   assert server_module.SQLiteApprovalStore is chat_helpers_module.SQLiteApprovalStore
   assert server_module.resolve_policy is chat_helpers_module.resolve_policy
+
+
+def test_server_artifact_routes_use_parent_namespace_helpers(monkeypatch) -> None:
+  calls: dict[str, Any] = {}
+  sentinel_request = object()
+
+  def _auth_dependency(request):
+    calls["request"] = request
+    return "alice"
+
+  def _request_filters(request):
+    calls["filters_request"] = request
+    return {"origin_kind": "product"}
+
+  def _artifact_paths(user_id: str, *, ticker: str, skill: str):
+    calls["paths"] = (user_id, ticker, skill)
+    return ["artifact-a"]
+
+  def _json_response(artifact, *, user_id: str, filters: dict[str, Any]):
+    calls["json"] = (artifact, user_id, filters)
+    return JSONResponse({"ok": True})
+
+  monkeypatch.setattr(server_module, "_artifact_auth_dependency", _auth_dependency)
+  monkeypatch.setattr(server_module, "_artifact_request_filters", _request_filters)
+  monkeypatch.setattr(server_module, "artifact_json_paths_for_request", _artifact_paths)
+  monkeypatch.setattr(server_module, "_artifact_json_response", _json_response)
+
+  response = server_module._server_artifact_routes.artifact_latest_response(
+    server_module.__dict__,
+    sentinel_request,
+    "PCTY",
+    "earnings-scenarios",
+  )
+
+  assert response.status_code == 200
+  assert calls == {
+    "request": sentinel_request,
+    "filters_request": sentinel_request,
+    "paths": ("alice", "PCTY", "earnings-scenarios"),
+    "json": ("artifact-a", "alice", {"origin_kind": "product"}),
+  }
 
 
 class _StubRunner:

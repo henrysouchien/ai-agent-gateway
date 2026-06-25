@@ -11,6 +11,8 @@ from pydantic import BaseModel
 
 from agent_gateway.session import AuthManager
 
+_AGENT_PROFILES_MODULE_NAMES = frozenset({"agent", "agent.profiles"})
+
 
 class ProfileMetadataResponse(BaseModel):
   name: str
@@ -28,7 +30,9 @@ def _profiles_api() -> Any:
     sys.path.insert(0, str(api_dir))
   try:
     return importlib.import_module("agent.profiles")
-  except ModuleNotFoundError:
+  except ModuleNotFoundError as exc:
+    if exc.name not in _AGENT_PROFILES_MODULE_NAMES:
+      raise
     return importlib.import_module("api.agent.profiles")
 
 

@@ -11,7 +11,9 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+import agent_gateway
 import agent_gateway.autonomous as autonomous
+import agent_gateway.autonomous_output as autonomous_output
 from agent_gateway._provider_utils import _get_default_model_for_provider
 from agent_gateway import EventLog
 from agent_gateway.providers import ModelInfo, ModelProvider
@@ -65,6 +67,77 @@ class _StubProvider(ModelProvider):
     _ = client, params
     if False:
       yield
+
+
+def test_autonomous_output_exports_preserve_public_parent_surface() -> None:
+  helper_names = (
+    "RunOutput",
+    "build_state_payload",
+    "collect_run_output",
+    "extract_state_update",
+    "format_run_summary",
+    "load_state",
+    "mark_post_run_guard_failure",
+    "run_output_exit_code",
+    "run_output_outcome",
+    "save_state",
+  )
+
+  assert autonomous.RunOutput is autonomous_output.RunOutput
+  for name in helper_names:
+    assert getattr(agent_gateway, name) is getattr(autonomous, name)
+
+
+def test_autonomous_output_wrappers_preserve_parent_private_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+  class _PatchedRunOutput:
+    def __init__(self, **kwargs: Any) -> None:
+      self.kwargs = kwargs
+
+  monkeypatch.setattr(autonomous, "RunOutput", _PatchedRunOutput)
+  event_log = EventLog()
+  event_log.append({"type": "text_delta", "text": "hello"})
+
+  output = autonomous.collect_run_output(event_log, timed_out=True)
+
+  assert isinstance(output, _PatchedRunOutput)
+  assert output.kwargs["response"] == "hello"
+  assert output.kwargs["timed_out"] is True
+
+  monkeypatch.setattr(autonomous, "_extract_summary", lambda text, limit=1500: f"patched:{limit}:{text}")
+  monkeypatch.setattr(autonomous, "_ensure_string_list", lambda value: [f"patched-list:{value!r}"])
+  payload = autonomous.build_state_payload(
+    previous_state={},
+    model_state={"alerts": ["keep"]},
+    run_output=autonomous_output.RunOutput("body", [], {}, None, False),
+  )
+  assert payload["last_summary"] == "patched:1500:body"
+  assert payload["alerts"] == ["patched-list:['keep']"]
+  assert "patched:1200:body" in autonomous.format_run_summary(
+    autonomous_output.RunOutput("body", [], {}, None, False)
+  )
+
+  monkeypatch.setattr(autonomous, "_STATE_JSON_MARKER", "## CUSTOM_STATE")
+  text = """
+Ignored.
+
+## CUSTOM_STATE
+```json
+{"status": "patched-marker"}
+```
+"""
+  assert autonomous.extract_state_update(text) == {"status": "patched-marker"}
+
+  read_calls: list[Path] = []
+  write_calls: list[tuple[Path, dict[str, Any]]] = []
+  monkeypatch.setattr(autonomous, "_read_json_object", lambda path: read_calls.append(path) or {"loaded": str(path)})
+  monkeypatch.setattr(autonomous, "_atomic_write_json", lambda path, payload: write_calls.append((path, payload)))
+
+  assert autonomous.load_state(Path("/tmp/state-root"), state_file="custom.json") == {
+    "loaded": "/tmp/state-root/custom.json"
+  }
+  autonomous.save_state(Path("/tmp/state-root"), {"saved": True}, state_file="custom.json")
+  assert read_calls == [Path("/tmp/state-root/custom.json")]
+  assert write_calls == [(Path("/tmp/state-root/custom.json"), {"saved": True})]
 
 
 def test_collect_run_output() -> None:

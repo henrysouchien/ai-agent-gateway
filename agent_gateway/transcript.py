@@ -53,6 +53,29 @@ def _message_from_assistant_event(event: dict[str, Any]) -> Message:
   return message
 
 
+def _messages_from_runtime_guard_event(event: dict[str, Any]) -> list[Message]:
+  if event.get("guard") != "final_answer":
+    return []
+  messages: list[Message] = []
+  draft_content_blocks = event.get("draft_content_blocks")
+  if isinstance(draft_content_blocks, list):
+    draft_message: Message = {
+      "role": "assistant",
+      "content": draft_content_blocks,
+    }
+    if event.get("draft_model"):
+      draft_message["model"] = event["draft_model"]
+    if event.get("draft_stop_reason"):
+      draft_message["stop_reason"] = event["draft_stop_reason"]
+    if event.get("draft_provider"):
+      draft_message["provider"] = event["draft_provider"]
+    messages.append(draft_message)
+  guard_message = event.get("message")
+  if isinstance(guard_message, str) and guard_message:
+    messages.append({"role": "user", "content": guard_message})
+  return messages
+
+
 def _tool_result_blocks_from_event(event: dict[str, Any]) -> list[ToolResultBlock]:
   final_blocks = event.get("final_tool_result_blocks")
   if isinstance(final_blocks, list):
@@ -95,7 +118,7 @@ async def reconstruct_messages_for_task(log: AgentSessionLog, task_id: str) -> l
     return []
 
   entries, _ = await log.query(
-    event_types={"user_message", "assistant_message", "tool_call_complete"},
+    event_types={"user_message", "assistant_message", "tool_call_complete", "runtime_guard"},
     sub_agent_id=str(sub_agent_id),
     order="asc",
   )
@@ -119,6 +142,8 @@ async def reconstruct_messages_for_task(log: AgentSessionLog, task_id: str) -> l
       messages.append(_message_from_user_event(event))
     elif event_type == "assistant_message":
       messages.append(_message_from_assistant_event(event))
+    elif event_type == "runtime_guard":
+      messages.extend(_messages_from_runtime_guard_event(event))
   flush_tool_results()
   return messages
 

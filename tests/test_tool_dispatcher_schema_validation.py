@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import asyncio
 import sys
 from pathlib import Path
@@ -17,6 +19,7 @@ from agent_gateway import (
   ToolDispatcher,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
+import agent_gateway.tool_dispatcher_helpers as dispatcher_helpers
 
 
 def _run(coro):
@@ -108,6 +111,120 @@ def test_local_tool_schema_validation_rejects_missing_required_before_handler() 
       "details": error["details"],
     }
   ]
+
+
+def test_local_tool_schema_validation_methods_delegate_to_extracted_helpers() -> None:
+  schema = _tool_defs()[0]["input_schema"]
+  dispatcher = ToolDispatcher(
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={"structured_write": _unexpected_handler},
+    get_tool_definitions=_tool_defs,
+  )
+
+  assert ToolDispatcher._json_type_name(True) == dispatcher_helpers.json_type_name(True)
+  assert ToolDispatcher._matches_json_type({}, ["array", "object"]) is True
+  assert ToolDispatcher._format_expected_type(["string", "null"]) == "string|null"
+  assert dispatcher._active_local_tool_schema("structured_write") == (
+    dispatcher_helpers.active_local_tool_schema(_tool_defs, "structured_write")
+  )
+  assert dispatcher._tool_input_schema_error(
+    "structured_write",
+    message="bad",
+    details={"missing": ["judgment"]},
+  ) == dispatcher_helpers.tool_input_schema_error(
+    "structured_write",
+    message="bad",
+    details={"missing": ["judgment"]},
+  )
+  assert dispatcher._validate_against_local_schema(
+    "structured_write",
+    {},
+    schema,
+  ) == dispatcher_helpers.validate_against_local_schema("structured_write", {}, schema)
+
+
+def test_local_tool_schema_validation_preserves_dispatcher_override_seam() -> None:
+  calls: list[tuple[str, str, Any]] = []
+  handler_calls: list[dict[str, Any]] = []
+
+  async def _handler(tool_input: dict[str, Any], **_kwargs: Any):
+    handler_calls.append(dict(tool_input))
+    return {"ok": True}, None
+
+  class _OverrideDispatcher(ToolDispatcher):
+    def _validate_local_tool_input(
+      self,
+      tool_call_id: str,
+      tool_name: str,
+      tool_input: Any,
+    ) -> dict[str, Any] | None:
+      calls.append((tool_call_id, tool_name, tool_input))
+      return {"code": "custom_schema_gate", "message": "blocked by override"}
+
+  dispatcher = _OverrideDispatcher(
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={"structured_write": _handler},
+    get_tool_definitions=_tool_defs,
+  )
+
+  result, error = _run(
+    dispatcher.dispatch("call-1", "structured_write", {"judgment": {"ticker": "PAYC"}})
+  )
+
+  assert result is None
+  assert error == {"code": "custom_schema_gate", "message": "blocked by override"}
+  assert calls == [("call-1", "structured_write", {"judgment": {"ticker": "PAYC"}})]
+  assert handler_calls == []
+
+
+def test_local_tool_schema_validation_preserves_active_schema_override_seam() -> None:
+  class _ActiveSchemaOverrideDispatcher(ToolDispatcher):
+    def _active_local_tool_schema(
+      self,
+      tool_name: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+      return None, {"code": "custom_active_schema", "message": f"{tool_name} blocked"}
+
+  dispatcher = _ActiveSchemaOverrideDispatcher(
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={"structured_write": _ok_handler},
+    get_tool_definitions=_tool_defs,
+  )
+
+  result, error = _run(
+    dispatcher.dispatch("call-1", "structured_write", {"judgment": {"ticker": "PAYC"}})
+  )
+
+  assert result is None
+  assert error == {"code": "custom_active_schema", "message": "structured_write blocked"}
+
+
+def test_local_tool_schema_validation_preserves_type_match_override_seam() -> None:
+  handler_calls: list[dict[str, Any]] = []
+
+  async def _handler(tool_input: dict[str, Any], **_kwargs: Any):
+    handler_calls.append(dict(tool_input))
+    return {"ok": True}, None
+
+  class _LenientTypeDispatcher(ToolDispatcher):
+    @classmethod
+    def _matches_json_type(cls, value: Any, expected_type: Any) -> bool:
+      _ = value, expected_type
+      return True
+
+  dispatcher = _LenientTypeDispatcher(
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={"structured_write": _handler},
+    get_tool_definitions=_tool_defs,
+  )
+
+  result, error = _run(
+    dispatcher.dispatch("call-1", "structured_write", {"judgment": "accepted by override"})
+  )
+
+  assert error is None
+  assert result == {"ok": True}
+  assert handler_calls == [{"judgment": "accepted by override"}]
 
 
 def test_local_tool_schema_validation_rejects_unknown_top_level_field() -> None:

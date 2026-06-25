@@ -11,6 +11,7 @@ from urllib.parse import quote, urlparse, urlunparse
 import httpx
 
 DEFAULT_TIMEOUT_SECONDS = 300.0
+_ADDIN_DISPATCH_MODULE_NAMES = frozenset({"api", "api.addin_dispatch"})
 
 
 def _fallback_derive_gateway_base_url(backend_url: str) -> str:
@@ -56,7 +57,9 @@ def _load_addin_dispatch_helpers() -> tuple[Callable[[str], str], Callable[[Base
     from api.addin_dispatch import _derive_gateway_base_url, classify_addin_dispatch_error
 
     return _derive_gateway_base_url, classify_addin_dispatch_error
-  except ModuleNotFoundError:
+  except ModuleNotFoundError as exc:
+    if exc.name not in _ADDIN_DISPATCH_MODULE_NAMES:
+      raise
     pass
 
   helper_path = Path(__file__).resolve().parents[3] / "api" / "addin_dispatch.py"

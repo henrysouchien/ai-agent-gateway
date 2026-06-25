@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 import asyncio
 import inspect
 import sys
@@ -19,11 +21,17 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.control_plane import batches as batches_module
+from agent_gateway.control_plane.valuation_ready_tools import make_valuation_ready_skill_tool_bundle
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.skill_context import clear_current_skill, reset_current_skill, set_current_skill
 from api.agent.batch.registry import BatchRegistry
 
 
 API_KEY = "batch-control-key"
+
+
+def _run(coro):
+  return asyncio.run(coro)
 
 
 class FakeActiveBatchError(RuntimeError):
@@ -236,6 +244,67 @@ def test_control_batches_dispatch_list_and_get(fake_batch_control: FakeBatchCont
     assert fake_batch_control.run_calls[0]["identity"] == ("alice", "alice@example.com")
 
 
+def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  async def run_case() -> None:
+    app_state = SimpleNamespace(user_event_bus=None)
+    session = SimpleNamespace(user_id="alice", user_email="alice@example.com")
+    bundle = make_valuation_ready_skill_tool_bundle(app_state=app_state, session=session)
+    dispatch = bundle["handlers"]["valuation_ready_batch_dispatch"]
+    read = bundle["handlers"]["valuation_ready_batch_read"]
+
+    token = set_current_skill("valuation-ready")
+    try:
+      result, error = await dispatch({"ticker": "adi"})
+      assert error is None
+      assert result["status"] == "running"
+      assert result["source"] == "explicit_ticker"
+      assert result["pipeline_template"] == "valuation-ready"
+      assert result["ticker"] == "ADI"
+      assert result["max_concurrency"] == 1
+      batch_id = int(result["batch_id"])
+      task_registry = getattr(app_state, "batch_task_registry")
+      task = task_registry.get(batch_id)
+      assert task is not None
+      await task
+
+      detail, read_error = await read({"batch_id": batch_id})
+      assert read_error is None
+      assert detail["batch"]["status"] == "completed"
+    finally:
+      reset_current_skill(token)
+
+  _run(run_case())
+  assert fake_batch_control.acquire_calls[0]["spec"]["source"] == "explicit_ticker"
+  assert fake_batch_control.acquire_calls[0]["spec"]["pipeline_template"] == "valuation-ready"
+  assert fake_batch_control.acquire_calls[0]["spec"]["universe"] == ["ADI"]
+  assert fake_batch_control.run_calls[0]["spec"] == fake_batch_control.acquire_calls[0]["spec"]
+  assert fake_batch_control.run_calls[0]["identity"] == ("alice", "alice@example.com")
+
+
+def test_gateway_local_valuation_ready_dispatch_refuses_unsupported_runtime(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  async def run_case() -> None:
+    app_state = SimpleNamespace(user_event_bus=None)
+    session = SimpleNamespace(user_id="alice", user_email="alice@example.com")
+    bundle = make_valuation_ready_skill_tool_bundle(app_state=app_state, session=session)
+    dispatch = bundle["handlers"]["valuation_ready_batch_dispatch"]
+    clear_current_skill()
+
+    result, error = await dispatch({"ticker": "ADI"})
+
+    assert result is None
+    assert error["code"] == "unsupported_runtime"
+    assert error["details"]["verdict"] == "INSUFFICIENT_DATA"
+    assert error["details"]["reason"] == "unsupported_runtime"
+
+  _run(run_case())
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
 def test_control_batches_active_batch_conflict_maps_to_409(fake_batch_control: FakeBatchController) -> None:
   fake_batch_control.raise_active = True
   app = _make_app()
@@ -245,6 +314,103 @@ def test_control_batches_active_batch_conflict_maps_to_409(fake_batch_control: F
 
   assert response.status_code == 409
   assert "active batch already exists" in response.json()["detail"]
+
+
+def test_control_batches_workflows_catalog(fake_batch_control: FakeBatchController) -> None:
+  _ = fake_batch_control
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    response = client.get("/api/control/batches/workflows", headers=headers)
+
+  assert response.status_code == 200, response.text
+  workflows = response.json()["workflows"]
+  assert workflows["earnings-review"]["source"] == "estimate_revisions"
+  assert workflows["earnings-review"]["pipeline_template"] == "earnings-review"
+  assert workflows["valuation-ready"]["pipeline_template"] == "valuation-ready"
+  assert workflows["valuation-ready"]["source_pipeline_template"] == "compounder"
+  assert workflows["valuation-ready"]["default_max_concurrency"] == 2
+  assert workflows["full-diligence"]["reservation_budget_usd_per_name"] == 45.0
+  assert workflows["full-diligence"]["suggested_budget_usd_per_name"] == 45.0
+  assert workflows["valuation-ready"]["reservation_budget_usd_per_name"] == 21.0
+  assert (
+    workflows["full-diligence"]["budget_model"]["admission_formula"]
+    == "spent_usd + in_flight_reserved_usd + next_stage_reserved_usd <= budget_usd"
+  )
+  assert workflows["full-diligence"]["budget_model"]["includes_goal_remediation_capacity"] is False
+
+
+def test_fixture_batch_requires_dev_mode(fake_batch_control: FakeBatchController) -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    response = client.post("/api/control/batches/fixture", headers=headers, json={"fixture": "mixed"})
+
+  assert response.status_code == 403
+  assert response.json()["detail"] == "fixture batch seed requires dev_mode=true"
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_fixture_batch_refuses_production_even_with_dev_flags(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("APP_ENV", "production")
+  monkeypatch.setenv("AGENT_GATEWAY_ENV", "development")
+
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    response = client.post("/api/control/batches/fixture", headers=headers, json={"fixture": "mixed", "dev_mode": True})
+
+  assert response.status_code == 403
+  assert "fixture batch seed is dev-only" in response.json()["detail"]
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_fixture_batch_seeds_registry_without_controller(fake_batch_control: FakeBatchController) -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    response = client.post("/api/control/batches/fixture", headers=headers, json={"fixture": "mixed", "dev_mode": True})
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    batch_id = int(payload["batch"]["batch_id"])
+    assert payload["batch"]["status"] == "completed"
+    assert payload["batch"]["cost_usd"] == 0
+    assert payload["batch"]["counts_by_status"] == {
+      "completed": 1,
+      "failed": 1,
+      "rejected": 1,
+    }
+    assert payload["batch"]["counts_by_gate_code"] == {
+      "INSUFFICIENT_DATA": 1,
+      "PROCEED": 1,
+      "STOP": 1,
+    }
+    assert [row["ticker"] for row in payload["verdict_matrix"]] == ["MSFT", "AAPL", "TSLA"]
+    assert payload["candidates"][0]["proposal_id"] == "fixture-proposal-msft"
+    assert payload["failures"] == [
+      {
+        "ticker": "TSLA",
+        "skill": "industry-landscape",
+        "status": "failed",
+        "error": "fixture failure for renderer QA",
+      }
+    ]
+
+    detail_response = client.get(f"/api/control/batches/{batch_id}", headers=headers)
+    list_response = client.get("/api/control/batches", headers=headers)
+
+  assert detail_response.status_code == 200, detail_response.text
+  assert detail_response.json()["batch"]["batch_id"] == batch_id
+  assert list_response.status_code == 200, list_response.text
+  assert [item["batch_id"] for item in list_response.json()["batches"]] == [batch_id]
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
 
 
 def test_control_batches_cancel_sets_cancelling(fake_batch_control: FakeBatchController) -> None:

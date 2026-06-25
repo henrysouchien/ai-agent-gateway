@@ -281,6 +281,8 @@ class RunnerToolExecutionMixin:
         if self._dispatcher_accepts_skill_run_context:
           dispatch_kwargs["skill_run_id"] = self._skill_run_id
           dispatch_kwargs["workspace_dir"] = self._workspace_dir
+          if getattr(self, "_batch_id", None) is not None:
+            dispatch_kwargs["batch_id"] = self._batch_id
         dispatch_coro = self._dispatcher.dispatch(
           tool_id,
           tool_name,
@@ -430,6 +432,8 @@ class RunnerToolExecutionMixin:
         duration_ms=duration_ms,
         is_error=tool_complete_event["is_error"],
         result_bytes=result_bytes,
+        tool_call_id=tool_id,
+        request_id=self._request_id,
       )
 
     if cancelled_exc is not None:
@@ -495,6 +499,7 @@ class RunnerToolExecutionMixin:
         result_entry=result_entry,
         skill_run_id=self._skill_run_id,
         workspace_dir=self._workspace_dir,
+        batch_id=getattr(self, "_batch_id", None),
       )
     )
     live_entry, durable_entry = self._compact_model_tool_result_entry(result_entry, tool_name=tool_name)

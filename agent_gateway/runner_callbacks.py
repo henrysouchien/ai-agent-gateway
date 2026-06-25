@@ -19,6 +19,10 @@ def call_tool_timing_hook(
   is_error: bool,
   result_bytes: int,
   logger: Any,
+  accepts_tool_call_id: bool = False,
+  accepts_request_id: bool = False,
+  tool_call_id: str | None = None,
+  request_id: str | None = None,
 ) -> None:
   if on_tool_timing is None:
     return
@@ -26,6 +30,10 @@ def call_tool_timing_hook(
     kwargs: dict[str, Any] = {}
     if accepts_context_surfaces:
       kwargs["context_surfaces"] = context_surfaces or []
+    if accepts_tool_call_id:
+      kwargs["tool_call_id"] = tool_call_id
+    if accepts_request_id:
+      kwargs["request_id"] = request_id
     if accepts_user_id:
       on_tool_timing(
         session_id,

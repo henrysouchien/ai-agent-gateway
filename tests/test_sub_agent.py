@@ -14,12 +14,13 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.skills import SkillLoader, SkillProfile
+from agent_gateway.skills import SkillLoader, SkillProfile, SkillStateStore
 from agent_gateway import EventLog
 from agent_gateway.html_artifact_store import read_html_artifact_content, read_html_artifact_sidecar
 from agent_gateway.session import GatewaySession
 import agent_gateway.sub_agent as sub_agent_module
 import agent_gateway.sub_agent_helpers as sub_agent_helpers
+import agent_gateway.sub_agent_tool_definitions as sub_agent_tool_definitions
 from agent_gateway.sub_agent import (
   _DEFAULT_EXCLUDED_TOOLS,
   DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
@@ -77,6 +78,49 @@ def test_sub_agent_helper_exports_are_parent_aliases() -> None:
     assert getattr(sub_agent_module, name) is getattr(sub_agent_helpers, name)
 
 
+def test_sub_agent_tool_definition_wrappers_preserve_parent_behavior(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class _RunnerWithCatalog:
+    def _get_tool_definitions(self) -> list[dict[str, Any]]:
+      return [
+        {"name": "keep_tool", "input_schema": {"properties": {"value": {"type": "string"}}}},
+        {"name": "blocked_tool"},
+      ]
+
+  extra_definitions = [
+    {"name": "extra_tool", "input_schema": {"properties": {"items": []}}},
+    {"name": "keep_tool", "description": "duplicate should not be appended"},
+  ]
+  getter = sub_agent_module._child_tool_definitions_getter(
+    runner=_RunnerWithCatalog(),
+    mcp_client=object(),
+    excluded_tools={"blocked_tool"},
+    extra_tool_definitions=extra_definitions,
+  )
+
+  assert getter is not None
+  definitions = getter()
+  assert [definition["name"] for definition in definitions] == ["keep_tool", "extra_tool"]
+  definitions[1]["input_schema"]["properties"]["items"].append("mutated")
+  assert getter()[1]["input_schema"]["properties"]["items"] == []
+
+  monkeypatch.setattr(sub_agent_module, "_ARTIFACT_EMIT_TOOLS", frozenset({"emit_html_artifact"}))
+  wrapper_definitions = sub_agent_module._artifact_emit_tool_definitions(
+    {"emit_dashboard_artifact", "emit_html_artifact"},
+  )
+  direct_definitions = sub_agent_tool_definitions.artifact_emit_tool_definitions(
+    {"emit_html_artifact"},
+    artifact_emit_tools={"emit_html_artifact"},
+  )
+  assert [definition["name"] for definition in wrapper_definitions] == ["emit_html_artifact"]
+  assert wrapper_definitions == direct_definitions
+  wrapper_definitions[0]["name"] = "mutated"
+  assert sub_agent_module._artifact_emit_tool_definitions({"emit_html_artifact"})[0]["name"] == (
+    "emit_html_artifact"
+  )
+
+
 def test_skill_html_excluded_tools_rejects_malformed_extra_exclusions() -> None:
   profile = SkillProfile(
     name="bad-extra",
@@ -117,6 +161,11 @@ class _StubMcpClient:
 
   async def call_tool(self, _name: str, _tool_input: dict):
     raise AssertionError("unexpected MCP tool dispatch")
+
+
+class _CatalogMcpClient(_StubMcpClient):
+  def get_tool_definitions(self) -> list[dict[str, Any]]:
+    return []
 
 
 class _StubRunner:
@@ -207,6 +256,9 @@ def test_make_run_agent_handler_installs_emit_html_artifact_for_named_skill(
     assert result == {"response": "ok"}
     dispatcher = runner.calls[0]["dispatcher"]
     assert "emit_html_artifact" not in runner.calls[0]["excluded_tools"]
+    advertised_tools = {tool["name"] for tool in dispatcher._get_tool_definitions()}
+    assert "emit_html_artifact" in advertised_tools
+    assert "emit_dashboard_artifact" in advertised_tools
 
     emit_result, emit_error = _run(
       dispatcher.dispatch(
@@ -587,6 +639,42 @@ def test_make_run_agent_handler_uses_anonymous_defaults_for_blank_agent(
   )
   assert call["max_turns"] == 9
   assert call["timeout"] == 42.0
+
+
+def test_make_run_agent_handler_does_not_advertise_artifact_stub_for_generic_agent(
+  tmp_path: Path,
+) -> None:
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(tmp_path / "skills"),
+    mcp_client=_CatalogMcpClient(),
+    local_tool_handlers={"emit_html_artifact": _dummy_tool},
+    default_model="claude-opus-4-6",
+  )
+
+  result, error = _run(handler({"agent": "   ", "task": "Quick question"}))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  dispatcher = runner.calls[0]["dispatcher"]
+  assert "emit_html_artifact" in dispatcher._local
+  assert dispatcher._get_tool_definitions() == []
+  emit_result, emit_error = _run(
+    dispatcher.dispatch(
+      "tool_html_generic",
+      "emit_html_artifact",
+      {
+        "title": "Generic",
+        "purpose": "exploration",
+        "summary": "Should not be advertised.",
+        "html": "<main>generic</main>",
+      },
+    )
+  )
+  assert emit_result is None
+  assert emit_error is not None
+  assert emit_error["code"] == "tool_not_advertised"
 
 
 def test_make_run_agent_handler_uses_sub_agent_default_model_knob(
@@ -1266,6 +1354,60 @@ def test_background_cleanup_returns_error_on_oserror(
     "message": f"Failed to clean stale output {stale_path}: boom",
   }
   assert len(runner.background_calls) == 0
+
+
+def test_persistent_named_skill_injects_and_updates_state(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  agent_name = "deep-research"
+  _write_skill(
+    skills_dir,
+    agent_name,
+    _callable_skill(
+      "persist_state: true\nversion: 1.2.3",
+      body="Use prior state when relevant.",
+    ),
+  )
+  store = SkillStateStore(tmp_path / "skill_state.json")
+  store.set(agent_name, {"existing": "keep", "run_count": 2})
+
+  class _StateRunner(_StubRunner):
+    async def spawn_sub_agent(self, task: str, **kwargs):
+      self.calls.append({"task": task, **kwargs})
+      return {
+        "response": (
+          "Done.\n\n"
+          "## STATE_UPDATE_JSON\n"
+          "```json\n"
+          "{\"alerts\":[\"Watch earnings\"]}\n"
+          "```"
+        )
+      }, None
+
+  runner = _StateRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+    default_model="claude-test",
+    allowed_models={"claude-test"},
+    skill_state_store=store,
+  )
+
+  result, error = _run(handler({"agent": agent_name, "task": "Collect"}))
+
+  assert error is None
+  assert result is not None
+  prompt = runner.calls[0]["system_prompt"]
+  assert "## Persisted Skill State" in prompt
+  assert '"existing": "keep"' in prompt
+  state = store.get(agent_name)
+  assert state["existing"] == "keep"
+  assert state["alerts"] == ["Watch earnings"]
+  assert state["model"] == "claude-test"
+  assert state["version"] == "1.2.3"
+  assert state["run_count"] == 3
+  assert "last_run" in state
 
 
 def test_make_get_background_result_handler_proxies_to_runner() -> None:

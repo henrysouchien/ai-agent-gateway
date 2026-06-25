@@ -4,26 +4,34 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway import policy_imports
 import agent_gateway.mcp_client as mcp_client_module
 from agent_gateway.mcp_client import McpClientManager, _ServerState
 from agent_gateway.mcp_client_catalog import apply_collision_filtering
+import api.agent.shared.server_policies as api_server_policies
 
 
 class _CaptureLogger:
   def __init__(self) -> None:
     self.warnings: list[tuple[object, ...]] = []
     self.infos: list[tuple[object, ...]] = []
+    self.errors: list[tuple[object, ...]] = []
 
   def warning(self, message, *args) -> None:
     self.warnings.append((message, *args))
 
   def info(self, message, *args) -> None:
     self.infos.append((message, *args))
+
+  def error(self, message, *args) -> None:
+    self.errors.append((message, *args))
 
 
 def test_apply_collision_filtering_handles_collisions_prefixes_and_hidden_fields() -> None:
@@ -123,3 +131,162 @@ def test_parent_apply_collision_filtering_uses_parent_logger(monkeypatch) -> Non
   assert logger.warnings[0][1:3] == ("builtin_tool", "gateway")
   assert logger.infos[0][1:4] == ("gateway", 1, ["remote_tool"])
   assert logger.infos[1][1:4] == ("prefixed", 1, ["safe_remote_tool"])
+
+
+def test_policy_owner_mismatch_hides_residual_runtime_tool(monkeypatch) -> None:
+  logger = _CaptureLogger()
+  monkeypatch.setattr(mcp_client_module, "log", logger)
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "portfolio-mcp": _ServerState(
+      name="portfolio-mcp",
+      session=object(),
+      exit_contexts=[],
+      tool_definitions=[
+        {"name": "execute_trade", "description": "stale residual", "input_schema": {}},
+        {"name": "preview_trade", "description": "current residual", "input_schema": {}},
+      ],
+      tool_names={"execute_trade", "preview_trade"},
+    ),
+  }
+
+  manager._apply_collision_filtering(
+    policy_server_for_tool=lambda tool_name: (
+      "portfolio-trades-mcp" if tool_name == "execute_trade" else "portfolio-mcp"
+    )
+  )
+
+  assert manager.get_tool_definitions() == [
+    {"name": "preview_trade", "description": "current residual", "input_schema": {}},
+  ]
+  assert manager.is_mcp_tool("execute_trade") is False
+  assert manager.is_mcp_tool("preview_trade") is True
+  assert manager.get_server_for_tool("execute_trade") is None
+  assert manager.get_server_for_tool("preview_trade") == "portfolio-mcp"
+  assert manager._servers["portfolio-mcp"].tool_names == {"preview_trade"}
+  assert manager.get_startup_diagnostics()["portfolio-mcp"]["category"] == "policy_owner_mismatch"
+  assert "execute_trade" in manager.get_startup_diagnostics()["portfolio-mcp"]["message"]
+  assert logger.errors
+
+
+def test_policy_owner_invariant_falls_back_to_api_import(monkeypatch) -> None:
+  logger = _CaptureLogger()
+  monkeypatch.setattr(mcp_client_module, "log", logger)
+
+  def fake_import_module(name: str):
+    if name == "agent.shared.server_policies":
+      raise ModuleNotFoundError("No module named 'agent'", name="agent")
+    if name == "api.agent.shared.server_policies":
+      return api_server_policies
+    raise AssertionError(f"unexpected import: {name}")
+
+  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
+  monkeypatch.setattr(
+    api_server_policies,
+    "get_server_for_policy_tool",
+    lambda tool_name: "portfolio-trades-mcp" if tool_name == "execute_trade" else None,
+  )
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "portfolio-mcp": _ServerState(
+      name="portfolio-mcp",
+      session=object(),
+      exit_contexts=[],
+      tool_definitions=[
+        {"name": "execute_trade", "description": "stale residual", "input_schema": {}},
+      ],
+      tool_names={"execute_trade"},
+    ),
+  }
+
+  manager._apply_collision_filtering()
+
+  assert manager.get_tool_definitions() == []
+  assert manager.is_mcp_tool("execute_trade") is False
+  assert manager.get_startup_diagnostics()["portfolio-mcp"]["category"] == "policy_owner_mismatch"
+
+
+def test_policy_owner_invariant_raises_when_policy_import_dependency_breaks(
+  monkeypatch,
+) -> None:
+  def fake_import_module(_name: str):
+    raise ModuleNotFoundError("No module named 'broken_dependency'", name="broken_dependency")
+
+  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "portfolio-mcp": _ServerState(
+      name="portfolio-mcp",
+      session=object(),
+      exit_contexts=[],
+      tool_definitions=[
+        {"name": "execute_trade", "description": "stale residual", "input_schema": {}},
+      ],
+      tool_names={"execute_trade"},
+    ),
+  }
+
+  with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
+    manager._apply_collision_filtering()
+
+
+def test_policy_owner_invariant_raises_when_api_policy_import_dependency_breaks(
+  monkeypatch,
+) -> None:
+  def fake_import_module(name: str):
+    if name == "agent.shared.server_policies":
+      raise ModuleNotFoundError("No module named 'agent'", name="agent")
+    if name == "api.agent.shared.server_policies":
+      raise ModuleNotFoundError("No module named 'broken_dependency'", name="broken_dependency")
+    raise AssertionError(f"unexpected import: {name}")
+
+  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "portfolio-mcp": _ServerState(
+      name="portfolio-mcp",
+      session=object(),
+      exit_contexts=[],
+      tool_definitions=[
+        {"name": "execute_trade", "description": "stale residual", "input_schema": {}},
+      ],
+      tool_names={"execute_trade"},
+    ),
+  }
+
+  with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
+    manager._apply_collision_filtering()
+
+
+def test_policy_owner_invariant_uses_original_name_for_prefixed_tools(monkeypatch) -> None:
+  logger = _CaptureLogger()
+  monkeypatch.setattr(mcp_client_module, "log", logger)
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "portfolio-trades-mcp": _ServerState(
+      name="portfolio-trades-mcp",
+      session=object(),
+      exit_contexts=[],
+      tool_definitions=[
+        {"name": "execute_trade", "description": "split", "input_schema": {}},
+      ],
+      tool_names={"execute_trade"},
+      tool_prefix="trades_",
+    ),
+  }
+
+  manager._apply_collision_filtering(
+    policy_server_for_tool=lambda tool_name: (
+      "portfolio-trades-mcp" if tool_name == "execute_trade" else None
+    )
+  )
+
+  assert manager.get_tool_definitions() == [
+    {"name": "trades_execute_trade", "description": "split", "input_schema": {}},
+  ]
+  assert manager.get_server_for_tool("trades_execute_trade") == "portfolio-trades-mcp"
+  assert manager.get_original_tool_name("trades_execute_trade") == "execute_trade"
+  assert manager.get_original_tool_name("unknown_tool") == "unknown_tool"
+  assert manager.resolve_tool_name("portfolio-trades-mcp", "execute_trade") == "trades_execute_trade"
+  assert manager.get_startup_diagnostics() == {}
+  assert logger.errors == []

@@ -373,6 +373,7 @@ class AgentRunner(
     code_execution_spill_dir_provider: Callable[[], str] | None = None,
     skill_run_id: str | None = None,
     workspace_dir: str | Path | None = None,
+    batch_id: int | str | None = None,
     context_surfaces: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
   ) -> None:
     if max_budget_usd is not None and max_budget_usd <= 0:
@@ -392,6 +393,7 @@ class AgentRunner(
     self._emit_session_recap = bool(emit_session_recap)
     self._skill_run_id = str(skill_run_id).strip() if skill_run_id else None
     self._workspace_dir = str(workspace_dir) if workspace_dir is not None else None
+    self._batch_id = str(batch_id).strip() if batch_id is not None and str(batch_id).strip() else None
     self._auth_config = dict(auth_config or {})
     self._client_timeout = client_timeout
     self._max_tokens_override = max_tokens_override
@@ -411,6 +413,8 @@ class AgentRunner(
     self._on_tool_timing = on_tool_timing
     self._on_tool_timing_accepts_user_id = _detect_user_id_param(on_tool_timing)
     self._on_tool_timing_accepts_context_surfaces = _detect_keyword_param(on_tool_timing, "context_surfaces")
+    self._on_tool_timing_accepts_tool_call_id = _detect_keyword_param(on_tool_timing, "tool_call_id")
+    self._on_tool_timing_accepts_request_id = _detect_keyword_param(on_tool_timing, "request_id")
     self._context_surfaces_provider = context_surfaces if callable(context_surfaces) else None
     self._context_surfaces_static = self._normalize_context_surfaces(None if callable(context_surfaces) else context_surfaces)
     self._request_id = str(request_id or uuid.uuid4())

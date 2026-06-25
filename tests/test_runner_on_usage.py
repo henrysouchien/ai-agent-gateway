@@ -594,6 +594,74 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
   )
 
 
+def test_runner_tool_timing_forwards_tool_call_and_request_ids() -> None:
+  timing_calls: list[dict[str, Any]] = []
+
+  def on_tool_timing(
+    session_id,
+    tool_name,
+    server,
+    duration_ms,
+    is_error,
+    result_bytes,
+    *,
+    user_id=None,
+    tool_call_id=None,
+    request_id=None,
+  ):
+    timing_calls.append(
+      {
+        "session_id": session_id,
+        "tool_name": tool_name,
+        "server": server,
+        "duration_ms": duration_ms,
+        "is_error": is_error,
+        "result_bytes": result_bytes,
+        "user_id": user_id,
+        "tool_call_id": tool_call_id,
+        "request_id": request_id,
+      }
+    )
+
+  runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sess-parent",
+    provider=_UsageProvider(),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    on_tool_timing=on_tool_timing,
+    user_id="alice",
+    request_id="req-123",
+    billing_mode="metered",
+    rate_table_version="2026-04-08",
+    channel="web",
+  )
+
+  runner._call_on_tool_timing(
+    tool_name="documents_search",
+    server="portfolio-mcp",
+    duration_ms=12,
+    is_error=False,
+    result_bytes=34,
+    tool_call_id="toolu-123",
+    request_id=runner._request_id,
+  )
+
+  assert timing_calls == [
+    {
+      "session_id": "sess-parent",
+      "tool_name": "documents_search",
+      "server": "portfolio-mcp",
+      "duration_ms": 12,
+      "is_error": False,
+      "result_bytes": 34,
+      "user_id": "alice",
+      "tool_call_id": "toolu-123",
+      "request_id": "req-123",
+    }
+  ]
+
+
 def test_runner_build_usage_event_preserves_timestamp_and_cost_delegates(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -630,6 +698,7 @@ def test_runner_build_usage_event_preserves_timestamp_and_cost_delegates(
 def test_final_answer_guard_can_inject_follow_up_turn() -> None:
   event_log = EventLog()
   provider = _TwoTurnTextProvider()
+  durable_events: list[dict[str, Any]] = []
 
   def guard(messages, answer_text, tools_used, tool_definitions, turn_count):
     _ = messages, answer_text, tools_used, tool_definitions
@@ -647,11 +716,131 @@ def test_final_answer_guard_can_inject_follow_up_turn() -> None:
     rate_table_version="unknown",
   )
 
+  async def _append_durable_event(event: dict[str, Any]):
+    durable_events.append(dict(event))
+    return SimpleNamespace(seq=len(durable_events))
+
+  runner._append_durable_event = _append_durable_event  # type: ignore[method-assign]
+
   _run(runner.run(messages=[{"role": "user", "content": "compare margin bps"}]))
 
   assert len(provider.requests) == 2
   assert provider.requests[1][-1] == {"role": "user", "content": "verify with tools before final"}
   assert any(entry.event.get("type") == "runtime_guard" for entry in event_log.entries)
+  assistant_messages = [
+    event
+    for event in durable_events
+    if event.get("type") == "assistant_message"
+  ]
+  runtime_guard_events = [
+    event
+    for event in durable_events
+    if event.get("type") == "runtime_guard"
+  ]
+  assert len(assistant_messages) == 1
+  assert assistant_messages[0]["content_blocks"] == [{"type": "text", "text": "verified 26.1 bps"}]
+  assert len(runtime_guard_events) == 1
+  assert runtime_guard_events[0]["draft_content_blocks"] == [{"type": "text", "text": "rough 25 bps"}]
+  assert runtime_guard_events[0]["draft_usage"] == {
+    "input_tokens": 10,
+    "output_tokens": 5,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+  }
+
+
+def test_final_answer_guard_records_draft_before_budget_stop() -> None:
+  event_log = EventLog()
+  provider = _TwoTurnTextProvider()
+  durable_events: list[dict[str, Any]] = []
+
+  def guard(messages, answer_text, tools_used, tool_definitions, turn_count):
+    _ = messages, answer_text, tools_used, tool_definitions
+    return "verify with tools before final" if turn_count == 1 else None
+
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log),
+    session_id="sess-parent",
+    provider=provider,
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    final_answer_guard=guard,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+    max_budget_usd=0.000001,
+  )
+
+  async def _append_durable_event(event: dict[str, Any]):
+    durable_events.append(dict(event))
+    runner._last_durable_seq = len(durable_events)
+    return SimpleNamespace(seq=len(durable_events))
+
+  runner._append_durable_event = _append_durable_event  # type: ignore[method-assign]
+
+  _run(runner.run(messages=[{"role": "user", "content": "compare margin bps"}]))
+
+  assert len(provider.requests) == 1
+  assert any(entry.event.get("type") == "budget_exceeded" for entry in event_log.entries)
+  assert [
+    event for event in durable_events if event.get("type") == "assistant_message"
+  ] == []
+  runtime_guard_events = [
+    event
+    for event in durable_events
+    if event.get("type") == "runtime_guard"
+  ]
+  assert len(runtime_guard_events) == 1
+  assert runtime_guard_events[0]["draft_content_blocks"] == [{"type": "text", "text": "rough 25 bps"}]
+
+
+def test_final_answer_guard_records_draft_before_operator_pause() -> None:
+  event_log = EventLog()
+  provider = _TwoTurnTextProvider()
+  durable_events: list[dict[str, Any]] = []
+  pause_event = asyncio.Event()
+
+  def guard(messages, answer_text, tools_used, tool_definitions, turn_count):
+    _ = messages, answer_text, tools_used, tool_definitions
+    if turn_count == 1:
+      pause_event.set()
+      return "verify with tools before final"
+    return None
+
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log),
+    session_id="sess-parent",
+    provider=provider,
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    final_answer_guard=guard,
+    operator_pause_event=pause_event,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  async def _append_durable_event(event: dict[str, Any]):
+    durable_events.append(dict(event))
+    runner._last_durable_seq = len(durable_events)
+    return SimpleNamespace(seq=len(durable_events))
+
+  runner._append_durable_event = _append_durable_event  # type: ignore[method-assign]
+
+  _run(runner.run(messages=[{"role": "user", "content": "compare margin bps"}]))
+
+  assert len(provider.requests) == 1
+  assert any(entry.event.get("type") == "operator_pause" for entry in event_log.entries)
+  assert [
+    event for event in durable_events if event.get("type") == "assistant_message"
+  ] == []
+  runtime_guard_events = [
+    event
+    for event in durable_events
+    if event.get("type") == "runtime_guard"
+  ]
+  assert len(runtime_guard_events) == 1
+  assert runtime_guard_events[0]["draft_content_blocks"] == [{"type": "text", "text": "rough 25 bps"}]
 
 
 def test_on_usage_fires_once_per_turn_with_usage_event_fields() -> None:

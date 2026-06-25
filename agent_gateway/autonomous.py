@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import logging
 import os
-import re
 import secrets
 import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -18,6 +15,20 @@ import httpx
 from ._io import _atomic_write_json, _read_json_object
 from ._provider_utils import _allowed_models_for_provider, _get_default_model_for_provider, _resolve_provider
 from .autonomous_excel_dispatch import make_autonomous_message_excel_agent_handler
+from .autonomous_output import (
+  RunOutput as RunOutput,
+  _JSON_FENCE_RE as _JSON_FENCE_RE,
+  _STATE_JSON_MARKER as _STATE_JSON_MARKER,
+  _ensure_string_list as _ensure_string_list,
+  _extract_summary as _extract_summary,
+  build_state_payload as _build_state_payload,
+  collect_run_output as _collect_run_output,
+  extract_state_update as _extract_state_update,
+  format_run_summary as _format_run_summary,
+  mark_post_run_guard_failure as _mark_post_run_guard_failure,
+  run_output_exit_code as _run_output_exit_code,
+  run_output_outcome as _run_output_outcome,
+)
 from .event_log import EventLog
 from .excel_dispatch import make_message_excel_agent_tool_def
 from .mcp_client import McpClientManager
@@ -38,10 +49,11 @@ from .tool_dispatcher import LocalToolHandler, ToolDispatcher, ToolInterceptor
 
 
 log = logging.getLogger("agent_gateway.autonomous")
-_STATE_JSON_MARKER = "## STATE_UPDATE_JSON"
-_JSON_FENCE_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 _RUN_SESSION_FORCE_CLOSE_SECONDS = 2.0
 _RUN_SESSION_CANCEL_DRAIN_SECONDS = 5.0
+_API_AUTONOMOUS_MCP_CONFIG_MODULE_NAMES = frozenset(
+  {"api", "api.agent", "api.agent.autonomous", "api.agent.autonomous.mcp_config"}
+)
 
 
 class _NullMcpClient:
@@ -56,21 +68,6 @@ class _NullMcpClient:
 
 
 @dataclass
-class RunOutput:
-  response: str
-  tools_used: list[str]
-  usage: dict[str, Any]
-  error: str | None
-  timed_out: bool
-  budget_exceeded: bool = False
-  max_turns_reached: bool = False
-  operator_paused: bool = False
-  max_tokens_reached: bool = False
-  exit_reason: str | None = None
-  post_run_guard: dict[str, Any] | None = None
-
-
-@dataclass
 class DeliveryConfig:
   on_complete: Callable[[RunOutput, dict[str, Any] | None], Awaitable[None] | None] | None = None
   telegram_bot_token: str | None = None
@@ -79,6 +76,85 @@ class DeliveryConfig:
   briefing_file: Path | str | None = None
   webhook_url: str | None = None
   format_message: Callable[[RunOutput, dict[str, Any] | None], str] | None = None
+
+
+def collect_run_output(event_log: EventLog, timed_out: bool) -> RunOutput:
+  return _collect_run_output(event_log, timed_out, run_output_cls=RunOutput)
+
+
+def run_output_exit_code(run_output: RunOutput) -> int:
+  return _run_output_exit_code(run_output)
+
+
+def run_output_outcome(run_output: RunOutput) -> str:
+  return _run_output_outcome(run_output)
+
+
+def mark_post_run_guard_failure(
+  run_output: RunOutput,
+  *,
+  guard: str,
+  message: str,
+  details: dict[str, Any] | None = None,
+) -> None:
+  _mark_post_run_guard_failure(run_output, guard=guard, message=message, details=details)
+
+
+def load_state(
+  state_dir: str | Path,
+  state_file: str = "state.json",
+) -> dict[str, Any]:
+  return _read_json_object(Path(state_dir) / state_file)
+
+
+def save_state(
+  state_dir: str | Path,
+  state: dict[str, Any],
+  state_file: str = "state.json",
+) -> None:
+  _atomic_write_json(Path(state_dir) / state_file, dict(state))
+
+
+def extract_state_update(text: str) -> dict[str, Any]:
+  return _extract_state_update(text, state_json_marker=_STATE_JSON_MARKER, json_fence_re=_JSON_FENCE_RE)
+
+
+def build_state_payload(
+  previous_state: dict[str, Any],
+  model_state: dict[str, Any],
+  run_output: RunOutput,
+  model_name: str = "",
+  briefing_file: str = "",
+  connected_servers: Sequence[str] | None = None,
+  active_servers: Sequence[str] | None = None,
+  extract_summary_fn: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
+  return _build_state_payload(
+    previous_state=previous_state,
+    model_state=model_state,
+    run_output=run_output,
+    model_name=model_name,
+    briefing_file=briefing_file,
+    connected_servers=connected_servers,
+    active_servers=active_servers,
+    extract_summary_fn=extract_summary_fn or _extract_summary,
+    ensure_string_list_fn=_ensure_string_list,
+  )
+
+
+def format_run_summary(
+  run_output: RunOutput,
+  label: str | None = None,
+  state: dict[str, Any] | None = None,
+  format_state_fn: Callable[[dict[str, Any]], str] | None = None,
+) -> str:
+  return _format_run_summary(
+    run_output,
+    label=label,
+    state=state,
+    format_state_fn=format_state_fn,
+    extract_summary_fn=_extract_summary,
+  )
 
 
 def _is_env_placeholder(value: str) -> bool:
@@ -91,7 +167,9 @@ def _resolve_autonomous_mcp_gateway_api_key(user_id: str, user_email: str | None
     from api.agent.autonomous.mcp_config import _resolve_gateway_api_key
 
     return str(_resolve_gateway_api_key(user_id, user_email)).strip()
-  except ModuleNotFoundError:
+  except ModuleNotFoundError as exc:
+    if exc.name not in _API_AUTONOMOUS_MCP_CONFIG_MODULE_NAMES:
+      raise
     api_dir = Path(__file__).resolve().parents[3] / "api"
     if not api_dir.exists():
       raise
@@ -142,78 +220,6 @@ def _resolve_message_excel_agent_gateway_config(user_id: str) -> tuple[str, str]
       "GATEWAY_API_KEY or api/agent/autonomous/mcp_config._resolve_gateway_api_key"
     )
   return gateway_url, gateway_api_key
-
-
-def _extract_summary(text: str, limit: int = 1500) -> str:
-  stripped = str(text or "").strip()
-  if len(stripped) <= limit:
-    return stripped
-  return stripped[: limit - 3].rstrip() + "..."
-
-
-def _ensure_string_list(value: Any) -> list[str]:
-  if not isinstance(value, list):
-    return []
-  items: list[str] = []
-  for item in value:
-    if item is None:
-      continue
-    text = str(item).strip()
-    if text:
-      items.append(text)
-  return items
-
-
-def collect_run_output(event_log: EventLog, timed_out: bool) -> RunOutput:
-  text_parts: list[str] = []
-  tool_calls: list[str] = []
-  usage: dict[str, Any] = {}
-  error_msg: str | None = None
-  budget_exceeded = False
-  max_turns_reached = False
-  operator_paused = False
-  max_tokens_reached = False
-
-  for entry in event_log.entries:
-    event = entry.event
-    event_type = event.get("type")
-    if event_type == "stream_retry":
-      text_parts.clear()
-      tool_calls.clear()
-    elif event_type == "text_delta":
-      text_parts.append(str(event.get("text", "")))
-    elif event_type == "tool_call_start":
-      tool_calls.append(str(event.get("tool_name", "")))
-    elif event_type == "stream_complete":
-      event_usage = event.get("usage")
-      if isinstance(event_usage, dict):
-        usage = event_usage
-    elif event_type == "budget_exceeded":
-      budget_exceeded = True
-    elif event_type == "max_turns_reached":
-      max_turns_reached = True
-    elif event_type == "max_tokens_reached":
-      max_tokens_reached = True
-    elif event_type == "assistant_message" and event.get("stop_reason") == "max_tokens":
-      max_tokens_reached = True
-    elif event_type == "operator_pause":
-      operator_paused = True
-    elif event_type == "interrupted" and event.get("reason") == "operator_pause":
-      operator_paused = True
-    elif event_type == "error":
-      error_msg = str(event.get("error", "Autonomous run encountered an error"))
-
-  return RunOutput(
-    response="".join(text_parts).strip(),
-    tools_used=tool_calls,
-    usage=usage,
-    error=error_msg,
-    timed_out=timed_out,
-    budget_exceeded=budget_exceeded,
-    max_turns_reached=max_turns_reached,
-    operator_paused=operator_paused,
-    max_tokens_reached=max_tokens_reached,
-  )
 
 
 async def _force_close_runner(runner: Any, *, timeout: float) -> None:
@@ -330,206 +336,6 @@ async def run_session(
   if error_msg and not output.error:
     output.error = error_msg
   return output
-
-
-def run_output_exit_code(run_output: RunOutput) -> int:
-  if run_output.timed_out:
-    return 124
-  if run_output.exit_reason == "post_run_guard_failed":
-    return 1
-  if run_output.error:
-    return 1
-  if run_output.budget_exceeded:
-    return 2
-  if run_output.max_turns_reached:
-    return 3
-  if run_output.max_tokens_reached:
-    return 4
-  return 0
-
-
-def run_output_outcome(run_output: RunOutput) -> str:
-  if run_output.timed_out:
-    return "timeout"
-  if run_output.exit_reason:
-    return run_output.exit_reason
-  if run_output.error:
-    return "error"
-  if run_output.budget_exceeded:
-    return "budget_exceeded"
-  if run_output.max_turns_reached:
-    return "max_turns"
-  if run_output.max_tokens_reached:
-    return "max_tokens"
-  if run_output.operator_paused:
-    return "operator_pause"
-  return "success"
-
-
-def mark_post_run_guard_failure(
-  run_output: RunOutput,
-  *,
-  guard: str,
-  message: str,
-  details: dict[str, Any] | None = None,
-) -> None:
-  payload = {
-    "guard": guard,
-    "message": message,
-  }
-  if details:
-    payload.update(details)
-  run_output.error = message
-  run_output.exit_reason = "post_run_guard_failed"
-  run_output.post_run_guard = payload
-
-
-def load_state(
-  state_dir: str | Path,
-  state_file: str = "state.json",
-) -> dict[str, Any]:
-  return _read_json_object(Path(state_dir) / state_file)
-
-
-def save_state(
-  state_dir: str | Path,
-  state: dict[str, Any],
-  state_file: str = "state.json",
-) -> None:
-  _atomic_write_json(Path(state_dir) / state_file, dict(state))
-
-
-def extract_state_update(text: str) -> dict[str, Any]:
-  if not str(text or "").strip():
-    return {}
-
-  section = text
-  marker_idx = text.rfind(_STATE_JSON_MARKER)
-  if marker_idx >= 0:
-    section = text[marker_idx:]
-
-  matches = list(_JSON_FENCE_RE.finditer(section))
-  for match in reversed(matches):
-    candidate = match.group(1)
-    try:
-      payload = json.loads(candidate)
-    except json.JSONDecodeError:
-      continue
-    if isinstance(payload, dict):
-      return payload
-  return {}
-
-
-def build_state_payload(
-  previous_state: dict[str, Any],
-  model_state: dict[str, Any],
-  run_output: RunOutput,
-  model_name: str = "",
-  briefing_file: str = "",
-  connected_servers: Sequence[str] | None = None,
-  active_servers: Sequence[str] | None = None,
-  extract_summary_fn: Callable[[str], str] | None = None,
-) -> dict[str, Any]:
-  state: dict[str, Any] = {}
-  if isinstance(previous_state, dict):
-    state.update(previous_state)
-  if isinstance(model_state, dict):
-    state.update(model_state)
-
-  summary_fn = extract_summary_fn or _extract_summary
-  connected_server_names = sorted({str(name) for name in (connected_servers or []) if str(name).strip()})
-  active_server_names = sorted({str(name) for name in (active_servers or []) if str(name).strip()})
-
-  state["last_run"] = datetime.now(tz=timezone.utc).isoformat()
-  state["model"] = model_name
-  state["briefing_file"] = briefing_file
-  state["timed_out"] = run_output.timed_out
-  state["budget_exceeded"] = run_output.budget_exceeded
-  state["max_turns_reached"] = run_output.max_turns_reached
-  state["max_tokens_reached"] = run_output.max_tokens_reached
-  state["operator_paused"] = run_output.operator_paused
-  state["connected_servers"] = connected_server_names
-  state["active_servers"] = active_server_names
-  state["tools_used"] = sorted({name for name in run_output.tools_used if name})
-  state["usage"] = run_output.usage
-  state["last_summary"] = summary_fn(run_output.response)
-
-  if run_output.error:
-    state["error"] = run_output.error
-  else:
-    state.pop("error", None)
-
-  alerts = _ensure_string_list(state.get("alerts"))
-  next_session = _ensure_string_list(state.get("next_session"))
-  if alerts:
-    state["alerts"] = alerts
-  if next_session:
-    state["next_session"] = next_session
-
-  return state
-
-
-def format_run_summary(
-  run_output: RunOutput,
-  label: str | None = None,
-  state: dict[str, Any] | None = None,
-  format_state_fn: Callable[[dict[str, Any]], str] | None = None,
-) -> str:
-  status = "timed out" if run_output.timed_out else "completed"
-  if run_output.exit_reason == "post_run_guard_failed" and not run_output.timed_out:
-    status = "post-run guard failed"
-  elif run_output.error and not run_output.timed_out:
-    status = "failed"
-  elif run_output.budget_exceeded:
-    status = "budget exceeded"
-  elif run_output.max_turns_reached:
-    status = "max turns reached"
-  elif run_output.max_tokens_reached:
-    status = "max tokens reached"
-  elif run_output.operator_paused:
-    status = "operator paused"
-
-  usage = run_output.usage if isinstance(run_output.usage, dict) else {}
-  in_tokens = usage.get("input_tokens", "?")
-  out_tokens = usage.get("output_tokens", "?")
-  est_cost = usage.get("estimated_cost", "?")
-  tools_used = sorted({name for name in run_output.tools_used if name})
-  tools_preview = ", ".join(tools_used[:8]) if tools_used else "none"
-  if len(tools_used) > 8:
-    tools_preview += f", ... (+{len(tools_used) - 8})"
-
-  lines = [
-    label or "Autonomous run",
-    f"Status: {status}",
-  ]
-  if isinstance(state, dict) and state.get("briefing_file"):
-    lines.append(f"Briefing: {state['briefing_file']}")
-  lines.extend([
-    f"Usage: in={in_tokens} out={out_tokens} est_cost={est_cost}",
-    f"Tools: {tools_preview}",
-  ])
-
-  if state and format_state_fn is not None:
-    formatted_state = str(format_state_fn(state) or "").strip()
-    if formatted_state:
-      lines.extend(["", *formatted_state.splitlines()])
-
-  summary = _extract_summary(run_output.response, limit=1200)
-  if summary:
-    lines.extend(["", "Summary:", summary])
-  if run_output.exit_reason:
-    lines.extend(["", f"Exit reason: {run_output.exit_reason}"])
-  if run_output.post_run_guard:
-    guard_name = run_output.post_run_guard.get("guard")
-    if guard_name:
-      lines.append(f"Post-run guard: {guard_name}")
-  if run_output.error:
-    lines.extend(["", f"Error: {run_output.error}"])
-
-  message = "\n".join(lines)
-  if len(message) > 3900:
-    message = message[:3897] + "..."
-  return message
 
 
 def split_messages(text: str, max_len: int = 4096) -> list[str]:

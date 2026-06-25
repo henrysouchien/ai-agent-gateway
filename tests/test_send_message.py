@@ -24,6 +24,7 @@ from agent_gateway import (
   make_send_message_tool_def,
 )
 from agent_gateway.runner import StreamTurnResult
+import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway.sub_agent import _DEFAULT_EXCLUDED_TOOLS
 
 
@@ -147,6 +148,20 @@ def test_make_send_message_handler_delivers_message_by_task_id() -> None:
   parent_message = entry.message_inbox.get_nowait()
   assert parent_message.text == "Check the appendix"
   assert parent_message.message_id in entry.delivered_messages
+
+
+def test_make_send_message_handler_preserves_sub_agent_export() -> None:
+  assert make_send_message_handler is sub_agent_module.make_send_message_handler
+  registry = TaskRegistry()
+  entry = registry.register("background_agent", agent_name="writer")
+  registry.transition(entry.task_id, TaskState.RUNNING)
+  handler = sub_agent_module.make_send_message_handler([_RegistryRunner(registry)])
+
+  result, error = _run(handler({"to": entry.task_id, "message": "Use direct import"}))
+
+  assert error is None
+  assert result == {"status": "delivered", "task_id": entry.task_id}
+  assert entry.message_inbox.get_nowait().text == "Use direct import"
 
 
 def test_make_send_message_handler_emits_parent_message_sent_with_correlation() -> None:

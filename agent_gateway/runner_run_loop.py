@@ -490,12 +490,20 @@ class RunnerRunLoopMixin:
           turn_cost = self._estimate_usage_cost(config["model"], turn_usage)
           turn_usage_payload = turn_usage_payload_fn(turn_usage, estimated_cost=turn_cost.total)
           await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=turn_usage))
-        await self._append_assistant_message_event(
-          content_blocks=turn.content_blocks,
-          stop_reason=turn.stop_reason,
-          model=config["model"],
-          usage=turn_usage,
-        )
+        assistant_message_persisted = False
+
+        async def persist_assistant_message_once() -> None:
+          nonlocal assistant_message_persisted
+          if assistant_message_persisted:
+            return
+          await self._append_assistant_message_event(
+            content_blocks=turn.content_blocks,
+            stop_reason=turn.stop_reason,
+            model=config["model"],
+            usage=turn_usage,
+          )
+          assistant_message_persisted = True
+
         self._append(build_turn_complete_event(turn=turn_count, usage=turn_usage_payload))
 
         turn_log_summary = stream_turn_log_summary(
@@ -536,20 +544,23 @@ class RunnerRunLoopMixin:
           )
           self._last_reported_cost = budget_progress.last_reported_cost
           exceeded_state = budget_progress.exceeded_state
-          if exceeded_state is not None and not turn.tool_uses:
-            await emit_budget_exceeded_stop(exceeded_state)
-            break
         else:
           exceeded_state = None
 
-        if self._operator_pause_requested():
+        if turn.tool_uses and self._operator_pause_requested():
+          await persist_assistant_message_once()
           logger.info("[%s] Operator pause requested after turn; stopping before tool dispatch", self._sid)
           clean_detach_reason = "operator_pause"
           await self._emit_operator_pause_event("after_turn_before_tools")
           break
 
         if not turn.tool_uses:
-          if not final_answer_guard_fired and self._final_answer_guard is not None:
+          final_answer_guard_allowed = turn.stop_reason not in {"max_tokens", "pause_turn", "compaction"}
+          if (
+            final_answer_guard_allowed
+            and not final_answer_guard_fired
+            and self._final_answer_guard is not None
+          ):
             guard_message = self._final_answer_guard(
               current_messages,
               turn.full_text,
@@ -560,9 +571,19 @@ class RunnerRunLoopMixin:
             if guard_message:
               final_answer_guard_fired = True
               logger.info("[%s] Final-answer guard injected follow-up before completing turn", self._sid)
-              self._append(
-                build_runtime_guard_event(guard="final_answer", message=guard_message)
+              runtime_guard_event = build_runtime_guard_event(guard="final_answer", message=guard_message)
+              self._append(runtime_guard_event)
+              durable_runtime_guard_event = dict(runtime_guard_event)
+              durable_runtime_guard_event.update(
+                {
+                  "draft_content_blocks": list(turn.content_blocks),
+                  "draft_stop_reason": turn.stop_reason,
+                  "draft_model": config["model"],
+                  "draft_provider": self._provider.name,
+                  "draft_usage": dict(turn_usage),
+                }
               )
+              await self._append_durable_event(durable_runtime_guard_event)
               current_messages.append(
                 assistant_turn_message(
                   turn.content_blocks,
@@ -572,7 +593,19 @@ class RunnerRunLoopMixin:
                 )
               )
               current_messages.append(user_turn_message(guard_message))
+              if exceeded_state is not None:
+                await emit_budget_exceeded_stop(exceeded_state)
+                break
               continue
+          await persist_assistant_message_once()
+          if exceeded_state is not None:
+            await emit_budget_exceeded_stop(exceeded_state)
+            break
+          if self._operator_pause_requested():
+            logger.info("[%s] Operator pause requested after turn; stopping before tool dispatch", self._sid)
+            clean_detach_reason = "operator_pause"
+            await self._emit_operator_pause_event("after_turn_before_tools")
+            break
           no_tool_outcome = no_tool_use_turn_outcome(
             content_blocks=turn.content_blocks,
             provider=self._provider.name,
@@ -611,6 +644,7 @@ class RunnerRunLoopMixin:
             continue
           break
 
+        await persist_assistant_message_once()
         current_messages.append(
           assistant_turn_message(
             turn.content_blocks,

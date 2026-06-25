@@ -54,6 +54,18 @@ def test_system_prompt_detects_tool_only_turn_instruction_case_insensitively() -
     )
     is True
   )
+  assert (
+    system_prompt_requires_tool_only_turns(
+      "Every assistant message before the FMS call must be tool-only (`text=0`)."
+    )
+    is True
+  )
+  assert (
+    system_prompt_requires_tool_only_turns(
+      "No visible pre-FMS prose. All pre-FMS tool turns must be tool-only with text=0."
+    )
+    is True
+  )
   assert system_prompt_requires_tool_only_turns("normal prompt") is False
 
 
@@ -117,4 +129,12 @@ def test_messages_detect_tool_only_turn_instruction_in_any_message_content() -> 
   ]
 
   assert messages_require_tool_only_turns(messages) is True
+  assert (
+    messages_require_tool_only_turns(
+      [
+        {"role": "user", "content": "Every assistant message before the FMS call must be tool-only (`text=0`)."}
+      ]
+    )
+    is True
+  )
   assert messages_require_tool_only_turns([{"role": "user", "content": "ordinary"}, "bad"]) is False

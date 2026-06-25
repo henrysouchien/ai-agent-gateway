@@ -105,6 +105,7 @@ def test_tool_dispatcher_injects_run_context_into_mcp_meta_when_present() -> Non
       {"ticker": "AAPL"},
       skill_run_id="skill-run-123",
       workspace_dir="/tmp/workspace",
+      batch_id=23,
     )
   )
 
@@ -121,6 +122,7 @@ def test_tool_dispatcher_injects_run_context_into_mcp_meta_when_present() -> Non
         "role": "invite",
         "skill_run_id": "skill-run-123",
         "workspace_dir": "/tmp/workspace",
+        "batch_id": "23",
       },
     }
   ]
@@ -156,6 +158,7 @@ def test_tool_dispatcher_omits_run_context_from_mcp_meta_when_absent() -> None:
   }
   assert "skill_run_id" not in mcp.calls[0]["meta"]
   assert "workspace_dir" not in mcp.calls[0]["meta"]
+  assert "batch_id" not in mcp.calls[0]["meta"]
 
 
 def test_tool_dispatcher_session_param_injection_still_works() -> None:

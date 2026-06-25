@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import asyncio
 import json
 import logging
@@ -13,6 +15,8 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentSessionLog, AgentSessionRef, QueryCursor, resolve_agent_session_id
+import agent_gateway.agent_session_log as session_log_module
+import agent_gateway.agent_session_log_records as session_log_records
 from agent_gateway.agent_session_log import agent_session_logical_path_for_jsonl, slugify
 
 
@@ -94,6 +98,22 @@ def test_agent_session_log_creates_parent_dirs_and_file_from_session_ref(tmp_pat
   assert log.path == base_dir / "analyst" / "agentsess_analyst_henry.jsonl"
   assert log.path.parent.is_dir()
   assert log.path.is_file()
+
+
+def test_agent_session_log_record_helpers_are_parent_aliases() -> None:
+  assert session_log_module.AgentSessionRef is session_log_records.AgentSessionRef
+  assert session_log_module.LogEntry is session_log_records.LogEntry
+  assert session_log_module.QueryCursor is session_log_records.QueryCursor
+  assert session_log_module._QuerySpec is session_log_records._QuerySpec
+  assert session_log_module._Segment is session_log_records._Segment
+  assert session_log_module._SLUG_RE is session_log_records._SLUG_RE
+  assert session_log_module._SEGMENT_FILE_RE is session_log_records._SEGMENT_FILE_RE
+  assert session_log_module._REVERSE_SCAN_CHUNK_SIZE == session_log_records._REVERSE_SCAN_CHUNK_SIZE
+  assert session_log_module._MANIFEST_SCHEMA_VERSION == session_log_records._MANIFEST_SCHEMA_VERSION
+  assert session_log_module.slugify is session_log_records.slugify
+  assert session_log_module.resolve_agent_session_id is session_log_records.resolve_agent_session_id
+  assert session_log_module.agent_session_logical_path_for_jsonl is session_log_records.agent_session_logical_path_for_jsonl
+  assert session_log_module._atomic_write_sidecar is session_log_records._atomic_write_sidecar
 
 
 def test_append_assigns_seq_timestamp_and_schema_version(tmp_path: Path) -> None:

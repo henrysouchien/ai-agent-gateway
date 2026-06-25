@@ -4,9 +4,10 @@ import os
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional
 
+from ..agent_telemetry import make_prepare_env_with_agent_telemetry
 from ..runner import ToolResultContext
 from ..session import GatewaySession
 from ..tool_dispatcher import ApprovalKeyQualifier, LocalToolHandler
@@ -101,6 +102,10 @@ def build_code_execution(
     if not resolved_host:
       return None, {"code": "internal_error", "message": "Backend resolution failed"}
 
+    per_call_config = replace(
+      cfg,
+      prepare_env=make_prepare_env_with_agent_telemetry(cfg.prepare_env, tool_ctx),
+    )
     backend = _get_backend(resolved_host)
     if not backend.available():
       return None, {"code": "backend_unavailable", "message": f"Backend '{resolved_host}' unavailable"}
@@ -124,7 +129,7 @@ def build_code_execution(
       if error is not None:
         return None, error
       assert timeout_ms is not None
-      env = _prepare_code_execute_env(cfg)
+      env = _prepare_code_execute_env(per_call_config)
       task_id = f"ce_{os.urandom(4).hex()}"
       stdout_buf = OutputRingBuffer()
       stderr_buf = OutputRingBuffer()
@@ -179,7 +184,7 @@ def build_code_execution(
       session_work_dir=work_dir,
       on_output=_on_chunk,
       backend=backend,
-      config=cfg,
+      config=per_call_config,
     )
 
   async def _handle_code_execute_status(tool_input: Dict[str, Any], **_: Any):

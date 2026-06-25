@@ -58,3 +58,27 @@ def test_dispatch_injects_session_id_only_for_configured_mcp_servers() -> None:
     ("browser_snapshot", {"url": "https://example.com", "_session_id": "sess_browser_123"}),
     ("filesystem_read", {"path": "/tmp/example.txt"}),
   ]
+
+
+def test_dispatch_rejects_mcp_tool_outside_scoped_allowlist() -> None:
+  mcp_client = _CaptureMcpClient()
+  dispatcher = ToolDispatcher(
+    mcp_client=mcp_client,
+    local_tool_handlers={},
+    allowed_mcp_tools_by_server={"browser": {"browser_snapshot"}},
+  )
+
+  allowed_result, allowed_error = _run(
+    dispatcher.dispatch("tool_1", "browser_snapshot", {"url": "https://example.com"})
+  )
+  denied_result, denied_error = _run(
+    dispatcher.dispatch("tool_2", "filesystem_read", {"path": "/tmp/example.txt"})
+  )
+
+  assert allowed_error is None
+  assert allowed_result == {"ok": True}
+  assert denied_result is None
+  assert denied_error is not None
+  assert denied_error["code"] == "mcp_tool_not_allowed"
+  assert "filesystem.filesystem_read" in denied_error["message"]
+  assert mcp_client.calls == [("browser_snapshot", {"url": "https://example.com"})]

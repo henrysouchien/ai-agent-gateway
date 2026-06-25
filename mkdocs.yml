@@ -1,0 +1,24 @@
+site_name: ai-agent-gateway
+site_description: Production runtime for tool-using AI agents
+docs_dir: docs
+repo_url: https://github.com/henrychien/ai-agent-gateway
+
+theme:
+  name: mkdocs
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Concepts:
+      - Architecture: architecture.md
+      - HTTP API: http-api.md
+      - Comparison: comparison.md
+  - API Reference: api-reference.md
+  - Tutorials:
+      - Build a Daily Briefing Agent: tutorials/daily-briefing-agent.md
+      - Add a Custom MCP Server: tutorials/add-mcp-server.md
+      - Build a Domain Agent: tutorials/domain-agent.md
+  - MCP Server Catalog: mcp-server-catalog.md

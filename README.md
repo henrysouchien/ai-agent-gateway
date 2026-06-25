@@ -11,19 +11,32 @@ Start with a system prompt. Add MCP tools, local Python tools, skills, and code 
 
 `create_agent()` is the fastest path to a working agent server. It uses Anthropic by default, and you can switch to OpenAI with `provider="openai"`. Use [`create_gateway_app()`](./docs/api-reference.md#server) when you need lower-level runtime control.
 
-Install the package and `uvicorn`:
+Install the package:
 
 ```bash
-pip install "ai-agent-gateway[anthropic]" uvicorn
+pip install "ai-agent-gateway[anthropic]"
 export ANTHROPIC_API_KEY="your-anthropic-api-key"
 ```
 
 For OpenAI instead:
 
 ```bash
-pip install "ai-agent-gateway[openai]" uvicorn
+pip install "ai-agent-gateway[openai]"
 export OPENAI_API_KEY="your-openai-api-key"
 ```
+
+Scaffold and run a project:
+
+```bash
+agent init my-agent
+cd my-agent
+agent run
+```
+
+The generated project is a small `agent.yaml`, an `agent.py` compatibility
+module, a callable starter skill, and a `skill_state.json` path for skills that
+emit `## STATE_UPDATE_JSON`. Edit `agent.yaml` to change the prompt, provider,
+MCP servers, skills, or local port.
 
 Create `agent.py`:
 
@@ -68,6 +81,11 @@ data: {"type":"stream_complete","usage":{"input_tokens":...,"output_tokens":...}
 ```
 
 Full 5-minute walkthrough: [Quickstart](./docs/quickstart.md)
+
+Project examples:
+
+- [10 Daily Briefing](./examples/10-daily-briefing/) shows `agent.yaml`, MCP filesystem reads, and a callable briefing skill.
+- [11 Research Report](./examples/11-research-report/) shows a local source pack plus multiple callable skills.
 
 ## Features
 

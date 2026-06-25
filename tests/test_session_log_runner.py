@@ -261,7 +261,20 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
   assert entries[6].event["reason"] == "completed"
 
 
-def test_runner_suppresses_text_from_tool_only_turns(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+  "tool_only_instruction",
+  [
+    (
+      "Tool-call messages are tool-only. Every assistant message that contains any tool call "
+      "must contain zero visible text. Run lookup."
+    ),
+    "Every assistant message before the FMS call must be tool-only (`text=0`). Run lookup.",
+  ],
+)
+def test_runner_suppresses_text_from_tool_only_turns(
+  tmp_path: Path,
+  tool_only_instruction: str,
+) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "tool-only.jsonl")
   provider = _ScriptedProvider([
     _mixed_text_tool_turn(text="scratch before tool"),
@@ -285,10 +298,7 @@ def test_runner_suppresses_text_from_tool_only_turns(tmp_path: Path) -> None:
       messages=[
         {
           "role": "user",
-          "content": (
-            "Tool-call messages are tool-only. Every assistant message that contains any tool call "
-            "must contain zero visible text. Run lookup."
-          ),
+          "content": tool_only_instruction,
         }
       ],
     )

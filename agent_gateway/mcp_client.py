@@ -10,13 +10,15 @@ import time
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Set, Tuple
 
 from . import mcp_client_catalog as _catalog_helpers
+from . import mcp_client_connections as _connection_helpers
 from . import mcp_client_config as _config_helpers
 from . import mcp_client_errors as _error_helpers
 from . import mcp_client_oauth_storage as _oauth_storage
 from . import mcp_client_runtime as _runtime_helpers
+from .policy_imports import load_server_policy_helpers
 
 try:
   from mcp.client.session import ClientSession
@@ -430,219 +432,91 @@ class McpClientManager:
       self._apply_collision_filtering()
       self._started = True
 
+  def _connection_runtime(self) -> _connection_helpers.McpConnectionRuntime:
+    return _connection_helpers.McpConnectionRuntime(
+      startup_concurrency_limit=_startup_concurrency_limit,
+      startup_failure_from_exception=_startup_failure_from_exception,
+      streamable_http_types=set(_STREAMABLE_HTTP_TYPES),
+      stdio_connect_retries=_stdio_connect_retries,
+      stdio_connect_retry_delay=_stdio_connect_retry_delay,
+      stdio_connect_stabilize_delay=_stdio_connect_stabilize_delay,
+      is_retryable_stdio_connect_error=_is_retryable_stdio_connect_error,
+      build_mcp_env=_build_mcp_env,
+      build_http_headers=_build_http_headers,
+      safe_cache_name=_safe_cache_name,
+      close_contexts=self._close_contexts,
+      server_state_factory=_ServerState,
+      stdio_server_parameters_factory=StdioServerParameters,
+      stdio_client_factory=stdio_client,
+      client_session_factory=ClientSession,
+      httpx_module=httpx,
+      streamable_http_client_factory=streamable_http_client,
+      json_file_key_value_factory=_JsonFileKeyValue,
+      fastmcp_oauth_factory=FastMCPOAuth,
+      path_factory=Path,
+      httpx_import_error=HTTPX_IMPORT_ERROR,
+      streamable_http_import_error=STREAMABLE_HTTP_IMPORT_ERROR,
+      fastmcp_oauth_import_error=FASTMCP_OAUTH_IMPORT_ERROR,
+      environ=os.environ,
+      logger=log,
+    )
+
   async def _connect_startup_servers(
     self,
     connect_jobs: Sequence[tuple[str, Dict[str, Any]]],
   ) -> list[_ServerState | None]:
-    concurrency = _startup_concurrency_limit()
-    if concurrency <= 0 or concurrency >= len(connect_jobs):
-      return await asyncio.gather(
-        *(
-          self._connect_or_warn(server_name, server_config)
-          for server_name, server_config in connect_jobs
-        )
-      )
-
-    log.info(
-      "MCP startup concurrency limited to %d for %d server(s)",
-      concurrency,
-      len(connect_jobs),
-    )
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def _connect_limited(
-      server_name: str,
-      server_config: Dict[str, Any],
-    ) -> _ServerState | None:
-      async with semaphore:
-        return await self._connect_or_warn(server_name, server_config)
-
-    return await asyncio.gather(
-      *(_connect_limited(server_name, server_config) for server_name, server_config in connect_jobs)
+    return await _connection_helpers.connect_startup_servers(
+      self,
+      connect_jobs,
+      self._connection_runtime(),
     )
 
   async def _connect_or_warn(self, name: str, config: Dict[str, Any]) -> _ServerState | None:
-    try:
-      state = await self._connect(name, config)
-      self._startup_diagnostics.pop(self._canonical_server_name(name), None)
-      return state
-    except Exception as exc:
-      message = str(exc).strip() or type(exc).__name__
-      diagnostic = _startup_failure_from_exception(exc)
-      self._set_startup_diagnostic(
-        name,
-        category=str(diagnostic["category"]),
-        message=str(diagnostic["message"]),
-        retryable=bool(diagnostic["retryable"]),
-        error_type=str(diagnostic["error_type"]) if diagnostic.get("error_type") else None,
-      )
-      log.warning("MCP server %s failed to connect: %s", name, message)
-      return None
+    return await _connection_helpers.connect_or_warn(
+      self,
+      name,
+      config,
+      self._connection_runtime(),
+    )
 
   async def _connect(self, name: str, config: Dict[str, Any]) -> _ServerState:
-    server_type = str(config.get("type", "stdio")).strip().lower()
-    if server_type in _STREAMABLE_HTTP_TYPES:
-      return await self._connect_streamable_http(name, config)
-    if server_type == "stdio":
-      return await self._connect_stdio_with_retries(name, config)
-    raise ValueError(f"unsupported type {server_type}")
+    return await _connection_helpers.connect(
+      self,
+      name,
+      config,
+      self._connection_runtime(),
+    )
 
   async def _connect_stdio_with_retries(self, name: str, config: Dict[str, Any]) -> _ServerState:
-    total_attempts = 1 + _stdio_connect_retries()
-    for attempt in range(1, total_attempts + 1):
-      try:
-        return await self._connect_stdio(name, config)
-      except Exception as exc:
-        if attempt >= total_attempts or not _is_retryable_stdio_connect_error(exc):
-          raise
-        delay = _stdio_connect_retry_delay(attempt)
-        message = str(exc).strip() or type(exc).__name__
-        log.warning(
-          "MCP stdio server %s connect attempt %d/%d failed with transient transport error; "
-          "retrying in %.2fs: %s",
-          name,
-          attempt,
-          total_attempts,
-          delay,
-          message,
-        )
-        if delay > 0:
-          await asyncio.sleep(delay)
-    raise RuntimeError("unreachable stdio connect retry state")
+    return await _connection_helpers.connect_stdio_with_retries(
+      self,
+      name,
+      config,
+      self._connection_runtime(),
+    )
 
   async def _connect_stdio(self, name: str, config: Dict[str, Any]) -> _ServerState:
-    exit_contexts: List[Any] = []
-    success = False
-    try:
-      command = str(config.get("command", "")).strip()
-      if not command:
-        raise ValueError("missing command")
-
-      args_raw = config.get("args", [])
-      args = [str(arg) for arg in args_raw] if isinstance(args_raw, list) else []
-
-      env_raw = config.get("env")
-      env = _build_mcp_env(env_raw if isinstance(env_raw, dict) else None)
-
-      cwd = config.get("cwd")
-      tool_prefix = str(config.get("tool_prefix", "") or "").strip()
-      server_params = StdioServerParameters(
-        command=command,
-        args=args,
-        env=env,
-        cwd=cwd,
-      )
-
-      devnull = open(os.devnull, "w")
-      stdio_cm = stdio_client(server_params, errlog=devnull)
-      read_stream, write_stream = await stdio_cm.__aenter__()
-      exit_contexts.append(stdio_cm)
-
-      session = ClientSession(read_stream, write_stream)
-      await session.__aenter__()
-      exit_contexts.append(session)
-
-      state = await self._initialize_session_state(
-        name=name,
-        session=session,
-        exit_contexts=exit_contexts,
-        tool_prefix=tool_prefix,
-      )
-      await self._verify_stdio_session_stable(session)
-      state.config = dict(config)
-      success = True
-      return state
-    finally:
-      if not success:
-        await self._close_contexts(exit_contexts)
+    return await _connection_helpers.connect_stdio(
+      self,
+      name,
+      config,
+      self._connection_runtime(),
+    )
 
   async def _connect_streamable_http(self, name: str, config: Dict[str, Any]) -> _ServerState:
-    if HTTPX_IMPORT_ERROR is not None:
-      raise RuntimeError(f"HTTP MCP transport unavailable: {HTTPX_IMPORT_ERROR}")
-    if STREAMABLE_HTTP_IMPORT_ERROR is not None or streamable_http_client is None:
-      raise RuntimeError(f"HTTP MCP transport unavailable: {STREAMABLE_HTTP_IMPORT_ERROR}")
-
-    exit_contexts: List[Any] = []
-    success = False
-    try:
-      url = str(config.get("url") or "").strip()
-      if not url:
-        raise ValueError("missing url")
-
-      headers_raw = config.get("headers")
-      headers = _build_http_headers(headers_raw if isinstance(headers_raw, dict) else None)
-      timeout_seconds = float(config.get("timeout", self._startup_timeout))
-      sse_read_timeout_seconds = float(config.get("sse_read_timeout", 300))
-      terminate_on_close = bool(config.get("terminate_on_close", True))
-      tool_prefix = str(config.get("tool_prefix", "") or "").strip()
-      auth = self._build_http_auth(name, url, config)
-
-      http_client = httpx.AsyncClient(
-        headers=headers,
-        timeout=httpx.Timeout(timeout_seconds, read=sse_read_timeout_seconds),
-        auth=auth,
-      )
-      await http_client.__aenter__()
-      exit_contexts.append(http_client)
-
-      stream_cm = streamable_http_client(
-        url,
-        http_client=http_client,
-        terminate_on_close=terminate_on_close,
-      )
-      read_stream, write_stream, _get_session_id = await stream_cm.__aenter__()
-      exit_contexts.append(stream_cm)
-
-      session = ClientSession(read_stream, write_stream)
-      await session.__aenter__()
-      exit_contexts.append(session)
-
-      state = await self._initialize_session_state(
-        name=name,
-        session=session,
-        exit_contexts=exit_contexts,
-        tool_prefix=tool_prefix,
-      )
-      success = True
-      return state
-    finally:
-      if not success:
-        await self._close_contexts(exit_contexts)
+    return await _connection_helpers.connect_streamable_http(
+      self,
+      name,
+      config,
+      self._connection_runtime(),
+    )
 
   def _build_http_auth(self, name: str, url: str, config: Dict[str, Any]) -> Any | None:
-    oauth_raw = config.get("oauth")
-    if not oauth_raw:
-      return None
-    if FASTMCP_OAUTH_IMPORT_ERROR is not None or FastMCPOAuth is None:
-      raise RuntimeError(f"OAuth MCP transport unavailable: {FASTMCP_OAUTH_IMPORT_ERROR}")
-    if oauth_raw is True:
-      oauth_config: dict[str, Any] = {}
-    elif isinstance(oauth_raw, dict):
-      oauth_config = dict(oauth_raw)
-    else:
-      raise ValueError("oauth must be true or an object")
-
-    cache_path = oauth_config.get("cache_path")
-    if cache_path is None:
-      cache_dir = Path(
-        os.environ.get(
-          "AGENT_GATEWAY_MCP_OAUTH_CACHE_DIR",
-          str(Path.home() / ".cache" / "agent-gateway" / "mcp-oauth"),
-        )
-      )
-      cache_path = cache_dir / f"{_safe_cache_name(name)}.json"
-    storage = _JsonFileKeyValue(Path(str(cache_path)).expanduser())
-    scopes = oauth_config.get("scopes")
-    callback_port = oauth_config.get("callback_port")
-    return FastMCPOAuth(
-      mcp_url=url,
-      scopes=scopes,
-      client_name=str(oauth_config.get("client_name") or f"agent-gateway:{name}"),
-      token_storage=storage,
-      callback_port=int(callback_port) if callback_port is not None else None,
-      client_metadata_url=oauth_config.get("client_metadata_url"),
-      client_id=oauth_config.get("client_id"),
-      client_secret=oauth_config.get("client_secret"),
+    return _connection_helpers.build_http_auth(
+      name,
+      url,
+      config,
+      self._connection_runtime(),
     )
 
   async def _initialize_session_state(
@@ -653,47 +527,20 @@ class McpClientManager:
     exit_contexts: List[Any],
     tool_prefix: str,
   ) -> _ServerState:
-    await asyncio.wait_for(session.initialize(), timeout=self._startup_timeout)
-
-    tools: List[Any] = []
-    cursor: str | None = None
-    while True:
-      listed = await asyncio.wait_for(
-        session.list_tools(cursor=cursor),
-        timeout=self._startup_timeout,
-      )
-      tools.extend(listed.tools or [])
-      if listed.nextCursor is None:
-        break
-      cursor = listed.nextCursor
-
-    tool_definitions: List[Dict[str, Any]] = []
-    for tool in tools:
-      input_schema = tool.inputSchema or {"type": "object", "properties": {}}
-      tool_definitions.append(
-        {
-          "name": tool.name,
-          "description": tool.description or "",
-          "input_schema": copy.deepcopy(input_schema),
-        }
-      )
-
-    return _ServerState(
+    return await _connection_helpers.initialize_session_state(
+      self,
       name=name,
       session=session,
       exit_contexts=exit_contexts,
-      tool_definitions=tool_definitions,
-      tool_names={tool["name"] for tool in tool_definitions},
       tool_prefix=tool_prefix,
+      runtime=self._connection_runtime(),
     )
 
   async def _verify_stdio_session_stable(self, session: ClientSession) -> None:
-    delay = _stdio_connect_stabilize_delay()
-    if delay > 0:
-      await asyncio.sleep(delay)
-    await asyncio.wait_for(
-      session.list_tools(cursor=None),
-      timeout=self._startup_timeout,
+    await _connection_helpers.verify_stdio_session_stable(
+      self,
+      session,
+      self._connection_runtime(),
     )
 
   def get_tool_definitions(self) -> List[Dict[str, Any]]:
@@ -728,6 +575,9 @@ class McpClientManager:
 
   def get_server_for_tool(self, name: str) -> str | None:
     return self._tool_to_server.get(name)
+
+  def get_original_tool_name(self, name: str) -> str:
+    return self._prefixed_to_original.get(name, name)
 
   def resolve_tool_name(self, server_name: str, original_name: str) -> str | None:
     """Return the exposed tool name for a server-owned tool."""
@@ -965,7 +815,11 @@ class McpClientManager:
       self._startup_diagnostics = {}
       self._started = False
 
-  def _apply_collision_filtering(self) -> None:
+  def _apply_collision_filtering(
+    self,
+    *,
+    policy_server_for_tool: Callable[[str], str | None] | None = None,
+  ) -> None:
     result = _catalog_helpers.apply_collision_filtering(
       servers=self._servers,
       builtin_tool_names=self._builtin_tool_names,
@@ -976,6 +830,77 @@ class McpClientManager:
     self._tool_to_server = result.tool_to_server
     self._prefixed_to_original = result.prefixed_to_original
     self._mcp_tool_names = result.mcp_tool_names
+    self._apply_policy_owner_invariant(policy_server_for_tool=policy_server_for_tool)
+
+  def _apply_policy_owner_invariant(
+    self,
+    *,
+    policy_server_for_tool: Callable[[str], str | None] | None = None,
+  ) -> None:
+    if policy_server_for_tool is None:
+      _get_forbidden_tools_for_session, get_server_for_policy_tool, _get_tool_class = load_server_policy_helpers()
+      if get_server_for_policy_tool is None:
+        log.warning("Skipping MCP policy-owner invariant: server policy module unavailable")
+        return
+      policy_server_for_tool = get_server_for_policy_tool
+
+    hidden_by_server: dict[str, list[tuple[str, str, str]]] = {}
+    for exposed_name, runtime_server in sorted(self._tool_to_server.items()):
+      original_name = self._prefixed_to_original.get(exposed_name, exposed_name)
+      policy_server = policy_server_for_tool(original_name)
+      if policy_server and policy_server != runtime_server:
+        hidden_by_server.setdefault(runtime_server, []).append(
+          (exposed_name, original_name, policy_server)
+        )
+
+    if not hidden_by_server:
+      return
+
+    hidden_names = {
+      exposed_name
+      for mismatches in hidden_by_server.values()
+      for exposed_name, _original_name, _policy_server in mismatches
+    }
+    self._tool_definitions = [
+      tool_def
+      for tool_def in self._tool_definitions
+      if tool_def.get("name") not in hidden_names
+    ]
+    for exposed_name in hidden_names:
+      self._tool_to_server.pop(exposed_name, None)
+      self._prefixed_to_original.pop(exposed_name, None)
+      self._mcp_tool_names.discard(exposed_name)
+
+    for runtime_server, mismatches in hidden_by_server.items():
+      server_hidden_names = {
+        exposed_name
+        for exposed_name, _original_name, _policy_server in mismatches
+      }
+      state = self._servers.get(runtime_server)
+      if state is not None:
+        state.tool_definitions = [
+          tool_def
+          for tool_def in state.tool_definitions
+          if tool_def.get("name") not in server_hidden_names
+        ]
+        state.tool_names.difference_update(server_hidden_names)
+
+      mismatch_summary = ", ".join(
+        f"{exposed_name}({original_name}->{policy_server})"
+        for exposed_name, original_name, policy_server in mismatches
+      )
+      message = (
+        "MCP runtime owner does not match gateway policy owner; "
+        f"hiding tools: {mismatch_summary}"
+      )
+      self._set_startup_diagnostic(
+        runtime_server,
+        category="policy_owner_mismatch",
+        message=message,
+        retryable=False,
+        error_type="PolicyOwnerMismatch",
+      )
+      log.error("%s on runtime server %s", message, runtime_server)
 
   @staticmethod
   def _extract_text(content: Any) -> str:

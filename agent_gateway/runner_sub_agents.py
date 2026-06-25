@@ -144,6 +144,7 @@ class RunnerSubAgentMixin:
       code_execution_spill_dir_provider=self._spill_dir_provider,
       skill_run_id=self._skill_run_id,
       workspace_dir=self._workspace_dir,
+      batch_id=getattr(self, "_batch_id", None),
       context_surfaces=self._context_surfaces_provider or self._context_surfaces_static,
     )
 
@@ -304,6 +305,7 @@ class RunnerSubAgentMixin:
       code_execution_spill_dir_provider=self._spill_dir_provider,
       skill_run_id=self._skill_run_id,
       workspace_dir=self._workspace_dir,
+      batch_id=getattr(self, "_batch_id", None),
       context_surfaces=self._context_surfaces_provider or self._context_surfaces_static,
     )
 

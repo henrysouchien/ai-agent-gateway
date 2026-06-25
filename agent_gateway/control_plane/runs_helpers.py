@@ -21,6 +21,8 @@ from agent_gateway.fixture_gate import (
 )
 from agent_gateway.session import AuthManager, GatewaySession
 
+_SKILL_LOADER_MODULE_NAMES = frozenset({"agent", "agent.skills", "agent.skills.loader"})
+
 ChatRunState = Literal[
   "starting",
   "queued",
@@ -601,7 +603,9 @@ async def _deny_autonomous_pending_approvals_for_cancel(
 def _loader_api() -> Any:
   try:
     from agent.skills import loader as skill_loader
-  except ModuleNotFoundError:
+  except ModuleNotFoundError as exc:
+    if exc.name not in _SKILL_LOADER_MODULE_NAMES:
+      raise
     from api.agent.skills import loader as skill_loader  # type: ignore
   return skill_loader
 

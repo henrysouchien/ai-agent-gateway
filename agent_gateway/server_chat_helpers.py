@@ -26,7 +26,7 @@ from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, event_to_
 from .product_config import gateway_product_id
 from .providers import StreamEvent
 from .session import GatewaySession, SessionStore, SessionStream, StreamSubscriber
-from .session_recap import compute_recap, emit_recap_then_terminal
+from .session_recap import compute_recap, compute_recap_from_events, emit_recap_then_terminal
 from .tool_dispatcher import ApprovalDecision, ApprovalRequest
 from .tool_redaction import get_audit_hmac_secret, redact_tool_input as default_redact_tool_input
 from .server_artifact_helpers import _json_dumps, _model_to_dict
@@ -176,6 +176,65 @@ def _compute_session_recap_payload(
 ) -> Dict[str, Any]:
   recap = compute_recap(
     active_turn.event_log,
+    session_id=session.session_id,
+    started_at=float(session.created_at),
+    trigger=trigger,  # type: ignore[arg-type]
+    usage=getattr(session, "cached_usage", None),
+  )
+  return event_to_dict(recap)
+
+
+def _read_session_transcript_events(
+  transcript_dir: Optional[Path],
+  session_id: str,
+) -> list[Dict[str, Any]]:
+  if transcript_dir is None:
+    return []
+  path = transcript_dir / f"{session_id}.jsonl"
+  if not path.exists():
+    return []
+
+  events: list[Dict[str, Any]] = []
+  try:
+    lines = path.read_text(encoding="utf-8").splitlines()
+  except OSError:
+    return []
+
+  for line in lines:
+    if not line.strip():
+      continue
+    try:
+      payload = json_mod.loads(line)
+    except json_mod.JSONDecodeError:
+      continue
+    if not isinstance(payload, dict):
+      continue
+    if payload.get("type") == "session_recap":
+      continue
+    events.append(dict(payload))
+  return events
+
+
+def _compute_cumulative_session_recap_payload(
+  session: GatewaySession,
+  active_turn: SessionStream | None,
+  transcript_dir: Optional[Path],
+  *,
+  trigger: str,
+) -> Dict[str, Any]:
+  events = _read_session_transcript_events(transcript_dir, session.session_id)
+  if active_turn is not None:
+    written_seqs = active_turn.transcript_written_seqs if transcript_dir is not None else set()
+    for entry in active_turn.event_log.entries:
+      if entry.seq in written_seqs:
+        continue
+      event = _event_for_wire(entry, active_turn.event_log)
+      if event.get("type") == "session_recap":
+        continue
+      events.append(event)
+
+  recap = compute_recap_from_events(
+    events,
     session_id=session.session_id,
     started_at=float(session.created_at),
     trigger=trigger,  # type: ignore[arg-type]

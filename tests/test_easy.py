@@ -506,6 +506,33 @@ def test_create_agent_forwards_outputs_dir(
   assert captured["kwargs"]["outputs_dir"] == outputs_dir
 
 
+def test_create_agent_forwards_skill_state_file(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  skills_dir = tmp_path / "skills"
+  state_file = tmp_path / "skill_state.json"
+  skills_dir.mkdir(parents=True, exist_ok=True)
+  captured: dict[str, object] = {}
+
+  async def _fake_run_agent(_tool_input, **_kwargs):
+    return {"response": "ok"}, None
+
+  def _fake_make_run_agent_handler(*args, **kwargs):
+    _ = args
+    captured["kwargs"] = kwargs
+    return _fake_run_agent
+
+  monkeypatch.setattr(sub_agent_module, "make_run_agent_handler", _fake_make_run_agent_handler)
+
+  app = create_agent("test", skills_dir=skills_dir, skill_state_file=state_file)
+
+  _build_runtime(app)
+
+  store = captured["kwargs"]["skill_state_store"]
+  assert store.state_file == state_file
+
+
 def test_create_agent_forwards_needs_approval_and_cache_denylist() -> None:
   async def _tool(_tool_input, **_kwargs):
     return {"ok": True}, None

@@ -17,13 +17,13 @@ from starlette.background import BackgroundTask
 
 from ._provider_utils import _get_allowed_models_for_provider_name
 from .artifact_paths import (
-  ArtifactPath,
-  ArtifactPathError,
-  artifact_json_paths_for_request,
-  artifact_json_path_for_request,
-  letter_docx_path_for_request,
-  reject_unsafe_path,
-  ticker_artifact_paths_for_request,
+  ArtifactPath as ArtifactPath,
+  ArtifactPathError as ArtifactPathError,
+  artifact_json_paths_for_request as artifact_json_paths_for_request,
+  artifact_json_path_for_request as artifact_json_path_for_request,
+  letter_docx_path_for_request as letter_docx_path_for_request,
+  reject_unsafe_path as reject_unsafe_path,
+  ticker_artifact_paths_for_request as ticker_artifact_paths_for_request,
 )
 from .auth import (
   ChannelMismatchError,
@@ -43,6 +43,7 @@ from .providers import StreamEvent
 from .session import AuthManager, GatewaySession, SessionStore, StreamSubscriber
 
 from . import server_chat_helpers as _server_chat_helpers  # noqa: F401 - dynamic streaming deps alias
+from . import server_artifact_routes as _server_artifact_routes  # noqa: F401 - dynamic artifact route deps alias
 from . import server_streaming as _server_streaming
 from .server_models import (  # noqa: F401
   SystemPrompt,
@@ -133,6 +134,7 @@ from .server_chat_helpers import (  # noqa: F401
   _write_transcript,
   _cleanup_old_transcripts,
   _compute_session_recap_payload,
+  _compute_cumulative_session_recap_payload,
   _redact_tool_input_for_event,
   _cleanup_sessions_loop,
   _maybe_await,
@@ -288,6 +290,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     auth_manager: AuthManager | None,
   ) -> ChatRuntime:
     _ = auth_manager
+    try:
+      from .control_plane.valuation_ready_tools import make_valuation_ready_skill_tool_bundle
+
+      session.gateway_local_skill_tools = [
+        make_valuation_ready_skill_tool_bundle(app_state=app.state, session=session)
+      ]
+    except Exception:
+      log.warning("Gateway-local skill tool injection failed", exc_info=True)
     return await _call_build_chat_runtime(
       config.build_chat_runtime,
       session=session,
@@ -684,10 +694,49 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       raise HTTPException(status_code=403, detail="Cannot recap a different session")
 
     scope = str(body.scope or "active_turn").strip().lower()
-    if scope == "session_cumulative":
-      raise HTTPException(status_code=501, detail="session_cumulative recap is not implemented")
     if scope != "active_turn":
-      raise HTTPException(status_code=400, detail="scope must be active_turn or session_cumulative")
+      if scope != "session_cumulative":
+        raise HTTPException(status_code=400, detail="scope must be active_turn or session_cumulative")
+      active_turn = session.active_turn
+      recap_payload = _compute_cumulative_session_recap_payload(
+        session,
+        active_turn,
+        transcript_dir,
+        trigger="explicit",
+      )
+      if active_turn is not None:
+        for entry in active_turn.event_log.entries:
+          entry_seq = int(entry.seq)
+          if entry_seq in active_turn.transcript_written_seqs:
+            continue
+          active_turn.transcript_written_seqs.add(entry_seq)
+          _write_transcript(
+            transcript_dir,
+            session.session_id,
+            _event_for_wire(entry, active_turn.event_log),
+            user_id=session.user_id,
+            channel=session.channel,
+          )
+      if active_turn is not None and not active_turn.event_log.closed:
+        appended = active_turn.event_log.append(recap_payload)
+        if appended is not None:
+          active_turn.transcript_written_seqs.add(int(appended.seq))
+        _write_transcript(
+          transcript_dir,
+          session.session_id,
+          recap_payload,
+          user_id=session.user_id,
+          channel=session.channel,
+        )
+      else:
+        _write_transcript(
+          transcript_dir,
+          session.session_id,
+          recap_payload,
+          user_id=session.user_id,
+          channel=session.channel,
+        )
+      return JSONResponse(content=recap_payload)
 
     active_turn = session.active_turn
     if active_turn is None:
@@ -704,7 +753,16 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       )
     else:
       appended = active_turn.event_log.append(recap_payload)
-      if appended is None:
+      if appended is not None:
+        active_turn.transcript_written_seqs.add(int(appended.seq))
+        _write_transcript(
+          transcript_dir,
+          session.session_id,
+          _event_for_wire(appended, active_turn.event_log),
+          user_id=session.user_id,
+          channel=session.channel,
+        )
+      else:
         _write_transcript(
           transcript_dir,
           session.session_id,
@@ -717,19 +775,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
   @router.get("/artifacts/{ticker}/{skill}/latest")
   async def artifact_latest(request: Request, ticker: str, skill: str) -> JSONResponse:
-    user_id = _artifact_auth_dependency(request)
-    filters = _artifact_request_filters(request)
-    try:
-      artifacts = artifact_json_paths_for_request(user_id, ticker=ticker, skill=skill)
-    except ArtifactPathError as exc:
-      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-    for artifact in reversed(artifacts):
-      try:
-        return _artifact_json_response(artifact, user_id=user_id, filters=filters)
-      except HTTPException as exc:
-        if exc.status_code != 404:
-          raise
-    raise HTTPException(status_code=404, detail="Artifact not found")
+    return _server_artifact_routes.artifact_latest_response(globals(), request, ticker, skill)
 
   @router.get("/artifacts/{ticker}/{skill}/{artifact_id}")
   async def artifact_by_id(
@@ -738,98 +784,23 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     skill: str,
     artifact_id: str,
   ) -> JSONResponse:
-    user_id = _artifact_auth_dependency(request)
-    filters = _artifact_request_filters(request)
-    try:
-      artifact = artifact_json_path_for_request(
-        user_id,
-        ticker=ticker,
-        skill=skill,
-        artifact_id=artifact_id,
-      )
-    except ArtifactPathError as exc:
-      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-    return _artifact_json_response(artifact, user_id=user_id, filters=filters)
+    return _server_artifact_routes.artifact_by_id_response(globals(), request, ticker, skill, artifact_id)
 
   @router.get("/artifacts/{ticker}")
   async def artifact_index(request: Request, ticker: str) -> JSONResponse:
-    user_id = _artifact_auth_dependency(request)
-    filters = _artifact_request_filters(request)
-    try:
-      artifacts_by_skill = ticker_artifact_paths_for_request(user_id, ticker=ticker)
-    except ArtifactPathError as exc:
-      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-    decorated: list[dict[str, Any]] = []
-    for skill, artifacts in sorted(artifacts_by_skill.items(), key=lambda item: item[0]):
-      matching: list[tuple[ArtifactPath, dict[str, Any]]] = []
-      for artifact in artifacts:
-        path = _assert_artifact_path_still_safe(artifact)
-        if not path.is_file():
-          continue
-        payload = _decorate_artifact_payload(_artifact_payload_from_path(path), user_id=user_id)
-        if _artifact_payload_matches_filters(payload, filters=filters):
-          matching.append((artifact, payload))
-      if not matching:
-        continue
-      latest_artifact, latest_payload = matching[-1]
-      recent_artifact_ids = [
-        str(artifact.artifact_id)
-        for artifact, _payload in reversed(matching[-_ARTIFACT_INDEX_RECENT_LIMIT:])
-        if artifact.artifact_id is not None
-      ]
-      decorated.append({
-        "skill": skill,
-        "latest_artifact_id": latest_artifact.artifact_id,
-        "artifact_count": len(matching),
-        "recent_artifact_ids": recent_artifact_ids,
-        "research_file_id": latest_payload.get("research_file_id"),
-        "control_run_id": latest_payload.get("control_run_id"),
-        "has_research_file": latest_payload.get("has_research_file") is True,
-        "origin_kind": latest_payload.get("origin_kind"),
-        "visibility": latest_payload.get("visibility"),
-        "origin_ref": latest_payload.get("origin_ref"),
-        "classification_source": latest_payload.get("classification_source"),
-      })
-    return JSONResponse(content=decorated)
+    return _server_artifact_routes.artifact_index_response(globals(), request, ticker)
 
   @router.get("/letters/{ticker}/{artifact_id}")
   async def letter_by_id(request: Request, ticker: str, artifact_id: str) -> FileResponse:
-    user_id = _artifact_auth_dependency(request)
-    try:
-      artifact = letter_docx_path_for_request(
-        user_id,
-        ticker=ticker,
-        artifact_id=artifact_id,
-      )
-    except ArtifactPathError as exc:
-      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-
-    path = _assert_artifact_path_still_safe(artifact)
-    if not path.is_file():
-      raise HTTPException(status_code=404, detail="Letter artifact not found")
-    headers = _file_cache_headers(path)
-    headers["Content-Disposition"] = (
-      f'attachment; filename="{_letter_filename(artifact.ticker, artifact.artifact_id or artifact_id)}"'
-    )
-    return FileResponse(path, media_type=_ARTIFACT_DOCX_MEDIA_TYPE, headers=headers)
+    return _server_artifact_routes.letter_by_id_response(globals(), request, ticker, artifact_id)
 
   @router.get("/artifacts/{artifact_path:path}")
   async def artifact_path_guard(request: Request, artifact_path: str) -> JSONResponse:
-    _artifact_auth_dependency(request)
-    try:
-      reject_unsafe_path(artifact_path)
-    except ArtifactPathError as exc:
-      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-    raise HTTPException(status_code=404, detail="Artifact not found")
+    return _server_artifact_routes.artifact_path_guard_response(globals(), request, artifact_path)
 
   @router.get("/letters/{letter_path:path}")
   async def letter_path_guard(request: Request, letter_path: str) -> JSONResponse:
-    _artifact_auth_dependency(request)
-    try:
-      reject_unsafe_path(letter_path)
-    except ArtifactPathError as exc:
-      raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
-    raise HTTPException(status_code=404, detail="Letter artifact not found")
+    return _server_artifact_routes.letter_path_guard_response(globals(), request, letter_path)
 
   @router.post("/chat/tool-result")
   async def tool_result(request: Request, payload: ToolResultRequest) -> JSONResponse:

@@ -19,7 +19,7 @@ from .rates import load_rate_table
 from .runner import AgentRunner, ToolResultContext
 from .server import ChatRequest, ChatRuntime, GatewayServerConfig, _make_request_approval, create_gateway_app
 from .session import AuthManager, GatewaySession
-from .skills import SkillLoader
+from .skills import SkillLoader, SkillStateStore
 from .task_registry import CoordinatorConfig
 from .tool_dispatcher import LocalToolHandler, ToolDispatcher
 
@@ -62,6 +62,7 @@ def create_agent(
   tool_definitions: list[dict[str, Any]] | None = None,
   skills_dir: str | Path | None = None,
   skills_excluded_tools: set[str] | None = None,
+  skill_state_file: str | Path | None = None,
   outputs_dir: str | Path | None = None,
   code_execution: bool = False,
   code_execution_config: CodeExecutionConfig | None = None,
@@ -143,6 +144,10 @@ def create_agent(
     skills_dir: Directory of markdown skill files. When set, `run_agent` is
       registered automatically unless you override it yourself.
     skills_excluded_tools: Tool names hidden from spawned sub-agents.
+    skill_state_file: Optional JSON file used by callable skills with
+      `persist_state: true`. Previous state is injected into the sub-agent
+      prompt and `## STATE_UPDATE_JSON` updates from the final response are
+      merged back into this file.
     outputs_dir: Directory for named-skill output files. Stale same-day outputs are cleaned before background sub-agent launch.
     code_execution: Enable built-in `code_execute` and `code_execute_status`.
       Docker is preferred; subprocess is the fallback when registered.
@@ -214,6 +219,7 @@ def create_agent(
     )
     ```
   """
+  skill_state_store = SkillStateStore(skill_state_file) if skill_state_file is not None else None
   if credentials_resolver is None:
     provider_instance, _provider_name, auth_config = _resolve_provider(
       provider,
@@ -296,6 +302,7 @@ def create_agent(
         mcp_session_inject_servers=mcp_session_inject_servers,
         local_tool_handlers=local_handlers,
         excluded_tools=skills_excluded_tools,
+        skill_state_store=skill_state_store,
         outputs_dir=Path(outputs_dir) if outputs_dir is not None else None,
         default_model=model,
         allowed_models=allowed_models,

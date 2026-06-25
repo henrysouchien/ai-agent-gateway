@@ -17,6 +17,7 @@ dependencies = [
   "fastmcp>=3.2.0",
   "httpx>=0.27.0",
   "pydantic",
+  "uvicorn>=0.27.0",
 ]
 
 [project.optional-dependencies]
@@ -24,10 +25,14 @@ anthropic = ["anthropic>=0.40.0"]
 openai = ["openai>=1.0.0"]
 all = ["anthropic>=0.40.0", "openai>=1.0.0"]
 dev = ["pytest", "pytest-asyncio"]
+docs = ["mkdocs>=1.6"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["agent_gateway*"]
+
+[project.scripts]
+agent = "agent_gateway.cli:main"
 
 [tool.setuptools.package-data]
 agent_gateway = ["rates/*.json", "dashboard_artifact/*.json"]

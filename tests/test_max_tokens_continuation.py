@@ -62,7 +62,12 @@ class _StubProvider:
     return CostEstimate()
 
 
-def _make_runner(provider: _StubProvider, *, auth_config: dict[str, Any] | None = None) -> AgentRunner:
+def _make_runner(
+  provider: _StubProvider,
+  *,
+  auth_config: dict[str, Any] | None = None,
+  final_answer_guard: Any | None = None,
+) -> AgentRunner:
   event_log = EventLog()
   return AgentRunner(
     event_log=event_log,
@@ -76,6 +81,7 @@ def _make_runner(provider: _StubProvider, *, auth_config: dict[str, Any] | None 
     provider=provider,
     auth_config=auth_config or {"api_key": "k", "model": "stub-model"},
     get_tool_definitions=lambda: [],
+    final_answer_guard=final_answer_guard,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -117,6 +123,42 @@ def test_max_tokens_turn_with_no_tool_use_continues_with_nudge() -> None:
     replayed_assistant = follow_up[-2]
     assert replayed_assistant["role"] == "assistant"
     assert all(block.get("type") != "tool_use" for block in replayed_assistant["content"])
+
+  _run(_case())
+
+
+def test_max_tokens_turn_bypasses_final_answer_guard_until_continuation() -> None:
+  async def _case() -> None:
+    guard_turns: list[int] = []
+
+    def guard(messages, answer_text, tools_used, tool_definitions, turn_count):
+      _ = messages, answer_text, tools_used, tool_definitions
+      guard_turns.append(turn_count)
+      return "verify before final" if turn_count == 1 else None
+
+    runner = _make_runner(_StubProvider(), final_answer_guard=guard)
+    seen_messages: list[list[dict[str, Any]]] = []
+
+    async def _fake_stream_turn(**kwargs: Any):
+      seen_messages.append(list(kwargs["current_messages"]))
+      if len(seen_messages) == 1:
+        return object(), StreamTurnResult(
+          full_text="truncated 43.5 / 47.0 - 1",
+          stop_reason="max_tokens",
+          content_blocks=[{"type": "text", "text": "truncated 43.5 / 47.0 - 1"}],
+        )
+      return object(), StreamTurnResult(
+        full_text="done",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+      )
+
+    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
+
+    assert len(seen_messages) == 2
+    assert seen_messages[1][-1] == {"role": "user", "content": _MAX_TOKENS_NUDGE}
+    assert guard_turns == [2]
 
   _run(_case())
 

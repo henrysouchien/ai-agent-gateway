@@ -201,6 +201,53 @@ def test_transcript_reconstructs_messages_and_preserves_thinking(tmp_path: Path)
   assert messages[2]["content"][0]["tool_use_id"] == "tool-a"
 
 
+def test_transcript_reconstructs_final_answer_guard_draft(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "guard-draft-transcript.jsonl")
+  _run(
+    log.append(
+      {
+        "type": "task_registered",
+        "task_id": "bg_3",
+        "task_type": "background",
+        "agent_name": "earnings-review",
+        "sub_agent_id": "sub3:sess-parent",
+        "started_at": 1.0,
+      }
+    )
+  )
+  _run(
+    log.append(
+      {
+        "type": "runtime_guard",
+        "sub_agent_id": "sub3:sess-parent",
+        "role": "sub_agent",
+        "guard": "final_answer",
+        "message": "Verify the arithmetic with code_execute before final.",
+        "draft_content_blocks": [{"type": "text", "text": "Rough answer: 7.4% BEAT"}],
+        "draft_model": "claude-sonnet-4-6",
+        "draft_provider": "anthropic",
+        "draft_stop_reason": "end_turn",
+      }
+    )
+  )
+
+  messages = _run(reconstruct_messages_for_task(log, "bg_3"))
+
+  assert messages == [
+    {
+      "role": "assistant",
+      "content": [{"type": "text", "text": "Rough answer: 7.4% BEAT"}],
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "provider": "anthropic",
+    },
+    {
+      "role": "user",
+      "content": "Verify the arithmetic with code_execute before final.",
+    },
+  ]
+
+
 def test_orphan_detection_parallel_synthesizes_only_missing_and_places_first(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "orphans.jsonl")
   _run(_append_task_log(log))
@@ -653,6 +700,9 @@ extra_excluded_tools:
       assert "memory_write" in captured["excluded_tools"]
       assert "file_write" in captured["excluded_tools"]
       assert dispatcher._local["emit_html_artifact"] is not _stub_emit_html_artifact
+      advertised_tools = {tool["name"] for tool in dispatcher._get_tool_definitions()}
+      assert "emit_html_artifact" in advertised_tools
+      assert "emit_dashboard_artifact" in advertised_tools
       emit_result, emit_error = await dispatcher.dispatch(
         "tool_html_resume",
         "emit_html_artifact",

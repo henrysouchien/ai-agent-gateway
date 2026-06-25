@@ -396,6 +396,26 @@ class SessionContextBuilder:
         message["stop_reason"] = event["stop_reason"]
       return message
 
+    if event_type == "runtime_guard" and event.get("guard") == "final_answer":
+      messages: list[Message] = []
+      draft_content_blocks = event.get("draft_content_blocks")
+      if isinstance(draft_content_blocks, list):
+        draft_message: Message = {
+          "role": "assistant",
+          "content": draft_content_blocks,
+        }
+        if event.get("draft_model"):
+          draft_message["model"] = event["draft_model"]
+        if event.get("draft_stop_reason"):
+          draft_message["stop_reason"] = event["draft_stop_reason"]
+        if event.get("draft_provider"):
+          draft_message["provider"] = event["draft_provider"]
+        messages.append(draft_message)
+      guard_message = event.get("message")
+      if isinstance(guard_message, str) and guard_message:
+        messages.append({"role": "user", "content": guard_message})
+      return messages or None
+
     if event_type == "tool_call_complete":
       tool_call_id = str(event.get("tool_call_id") or "")
       if not tool_call_id:

@@ -7,13 +7,13 @@ This gets you from `pip install` to a streaming agent response in about five min
 ## 1. Install
 
 ```bash
-pip install "ai-agent-gateway[anthropic]" uvicorn
+pip install "ai-agent-gateway[anthropic]"
 ```
 
 OpenAI variant:
 
 ```bash
-pip install "ai-agent-gateway[openai]" uvicorn
+pip install "ai-agent-gateway[openai]"
 ```
 
 ## 2. Set Your Provider Credential
@@ -30,7 +30,31 @@ For OpenAI:
 export OPENAI_API_KEY="your-openai-api-key"
 ```
 
-## 3. Create `agent.py`
+## 3. Create an Agent Project
+
+```bash
+agent init my-agent
+cd my-agent
+```
+
+This creates `agent.yaml`, `agent.py`, a callable `skills/general.md`, an
+`outputs/` directory, and a `skill_state.json` path for skills that emit
+`## STATE_UPDATE_JSON`. The default project runs on `127.0.0.1:8000` with API
+routes under `/api`.
+
+## 4. Run It
+
+```bash
+agent run
+```
+
+The server is now listening on `http://127.0.0.1:8000`.
+
+## Manual Python Variant
+
+You can still build the project by hand if you prefer direct Python files.
+
+Create `agent.py`:
 
 Save this as `agent.py`:
 
@@ -59,7 +83,7 @@ That is enough to start a working gateway. By default:
 - session init accepts any non-empty API key unless you configure `valid_api_keys`
 - the server streams responses over SSE
 
-## 4. Run It With Uvicorn
+Run it with uvicorn:
 
 ```bash
 uvicorn agent:app --reload --port 8000
@@ -144,6 +168,7 @@ Full event and endpoint details: [HTTP API](./http-api.md)
 - Add code execution: see [`../examples/04-code-execution/`](../examples/04-code-execution/)
 - Add skills and sub-agents: see [`../examples/05-skills/`](../examples/05-skills/)
 - Run headless (cron/batch): see [`../examples/09-autonomous/`](../examples/09-autonomous/)
+- Start from complete `agent.yaml` projects: see [`../examples/10-daily-briefing/`](../examples/10-daily-briefing/) and [`../examples/11-research-report/`](../examples/11-research-report/)
 - Move to `create_gateway_app()`: see [Architecture](./architecture.md) and [API Reference](./api-reference.md)
 
 ## Troubleshooting

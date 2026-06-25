@@ -165,6 +165,114 @@ def _registry(tmp_path: Path):
   )
 
 
+def test_autonomous_runner_state_helper_preserves_parent_aliases() -> None:
+  from agent_gateway import autonomous_runner
+  from agent_gateway import autonomous_runner_claims
+  from agent_gateway import autonomous_runner_state
+
+  assert autonomous_runner.AutonomousTask is autonomous_runner_state.AutonomousTask
+  assert autonomous_runner._ManifestTrackedList is autonomous_runner_state._ManifestTrackedList
+  assert autonomous_runner.sign_user_claim is autonomous_runner_claims.sign_user_claim
+  assert (
+    autonomous_runner.get_agent_api_claim_ttl_seconds
+    is autonomous_runner_claims.get_agent_api_claim_ttl_seconds
+  )
+  assert (
+    autonomous_runner.AutonomousRegistry._task_from_manifest
+    is autonomous_runner_state.AutonomousRegistryStateMixin._task_from_manifest
+  )
+  assert (
+    autonomous_runner.AutonomousRegistry._write_task_manifest
+    is autonomous_runner_state.AutonomousRegistryStateMixin._write_task_manifest
+  )
+  assert (
+    autonomous_runner.AutonomousRegistry.rehydrate
+    is autonomous_runner_state.AutonomousRegistryStateMixin.rehydrate
+  )
+
+
+def test_autonomous_runner_event_helper_preserves_parent_override_seams(tmp_path) -> None:
+  from agent_gateway.autonomous_runner import AutonomousRegistry
+
+  _write_manifest(tmp_path, "bg_0", control_run_id="run-0")
+  registry = AutonomousRegistry(api_dir=tmp_path, log_dir=tmp_path)
+  record = registry._tasks["bg_0"]
+  record.event_lines = [{"type": "custom", "marker": "same"}]
+
+  def duplicate_key(event: dict) -> tuple[str, str] | None:
+    marker = event.get("marker")
+    if not marker:
+      return None
+    return ("custom", str(marker))
+
+  registry._event_duplicate_key = duplicate_key  # type: ignore[method-assign]
+  assert registry._event_already_recorded(record, {"type": "other", "marker": "same"})
+
+  registry._operator_inbox_record_for_message_id = (  # type: ignore[method-assign]
+    lambda _record, _message_id: {
+      "message": "from inbox",
+      "sent_at": "from-inbox",
+      "sender": {"user_id": "operator"},
+    }
+  )
+  registry._event_for_record = (  # type: ignore[method-assign]
+    lambda _record, event: {**event, "run_id": "patched-run", "control_run_id": "patched-run"}
+  )
+
+  parent_event = registry._parent_message_event(
+    record,
+    message_id="msg-1",
+    text="fallback",
+    user_id=USER_ID,
+    sent_at=123.0,
+  )
+
+  assert parent_event["message"] == "from inbox"
+  assert parent_event["sent_at"] == "from-inbox"
+  assert parent_event["sender"] == {"user_id": "operator"}
+  assert parent_event["run_id"] == "patched-run"
+
+
+def test_autonomous_runner_claim_helper_uses_parent_aliases(monkeypatch) -> None:
+  from agent_gateway import autonomous_runner
+
+  class _Clock:
+    @staticmethod
+    def time() -> float:
+      return 1000.0
+
+  patched_env_vars = {
+    "audience": "PATCHED_AUDIENCE",
+    "issued_at": "PATCHED_ISSUED_AT",
+    "expiry": "PATCHED_EXPIRY",
+    "user_id": "PATCHED_USER_ID",
+    "user_email": "PATCHED_USER_EMAIL",
+    "nonce": "PATCHED_NONCE",
+    "signature": "PATCHED_SIGNATURE",
+  }
+  monkeypatch.delenv("AGENT_API_CLAIM_TTL_SECONDS", raising=False)
+  monkeypatch.setattr(autonomous_runner, "_AGENT_API_CLAIM_TTL_SECONDS_DEFAULT", 123)
+  monkeypatch.setattr(autonomous_runner, "_AGENT_API_CLAIM_AUDIENCE", "patched_audience")
+  monkeypatch.setattr(autonomous_runner, "_AGENT_API_CLAIM_ENV_VARS", patched_env_vars)
+  monkeypatch.setattr(autonomous_runner, "time", _Clock)
+
+  claim = autonomous_runner.sign_user_claim(
+    HMAC_KEY,
+    user_id=USER_ID,
+    user_email=None,
+    ttl_seconds=5,
+  )
+
+  assert autonomous_runner.get_agent_api_claim_ttl_seconds() == 123
+  assert claim["PATCHED_AUDIENCE"] == "patched_audience"
+  assert claim["PATCHED_ISSUED_AT"] == "1000"
+  assert claim["PATCHED_EXPIRY"] == "1005"
+  assert claim["PATCHED_USER_ID"] == USER_ID
+  assert claim["PATCHED_USER_EMAIL"] == ""
+  assert claim["PATCHED_NONCE"]
+  assert claim["PATCHED_SIGNATURE"]
+
+
 def _manifest_path(tmp_path: Path, task_id: str = "bg_0") -> Path:
   return tmp_path / f"{task_id}.task.json"
 

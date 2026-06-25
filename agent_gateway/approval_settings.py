@@ -14,8 +14,8 @@ APPROVAL_WAIT_SECONDS_ENV = "GATEWAY_APPROVAL_WAIT_SECONDS"
 # window doesn't then execute against a just-expired preview. 270s leaves ~30s of
 # margin under the 300s preview TTL. 120s was too short for a momentary step-away
 # and caused preview churn on irreversible trade approvals.
-# (Proper coupling — deriving the window from the preview's *remaining* TTL — is
-# a backend follow-up; see TRD-8 notes.)
+# This is only the global ceiling. Trade execution approvals are further capped
+# against the preview's remaining TTL by `effective_trade_approval_expiry_seconds`.
 DEFAULT_APPROVAL_WAIT_SECONDS = 270.0
 MIN_APPROVAL_WAIT_SECONDS = 10.0
 # Ceiling raised so operators can extend the window for non-time-bound approvals

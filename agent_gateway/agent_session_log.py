@@ -1,186 +1,44 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-from datetime import UTC, datetime
-import hashlib
-import json
 import logging
 import os
-import re
-import tempfile
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 import fcntl
 
+from . import agent_session_log_sidecars as _sidecar_helpers
+from .agent_session_log_records import (
+  EVENT_SCHEMA_VERSION,
+  AgentSessionRef,
+  LogEntry,
+  QueryCursor,
+  _MANIFEST_SCHEMA_VERSION,
+  _QuerySpec,
+  _REVERSE_SCAN_CHUNK_SIZE,
+  _SEGMENT_FILE_RE,
+  _SLUG_RE,  # noqa: F401 - re-exported private compatibility constant
+  _Segment,
+  _atomic_write_json,
+  _atomic_write_sidecar,
+  _contains_text,
+  _encode_entry,
+  _event_has_error,
+  _fsync_parent_dir,
+  _iter_lines_reverse,
+  _matches_entry,
+  _now_iso,
+  _parse_entry,
+  _read_json_dict,
+  agent_session_logical_path_for_jsonl,
+  resolve_agent_session_id,
+  slugify,
+)
 
-EVENT_SCHEMA_VERSION = 1
-_REVERSE_SCAN_CHUNK_SIZE = 64 * 1024
-_SLUG_RE = re.compile(r"[^a-z0-9_-]")
-_SEGMENT_FILE_RE = re.compile(r"^(?P<first>\d{12})-(?P<last>\d{12})-g(?P<generation>\d{6})\.jsonl$")
-_MANIFEST_SCHEMA_VERSION = 1
 log = logging.getLogger("agent_gateway.agent_session_log")
-
-
-@dataclass(frozen=True)
-class AgentSessionRef:
-  """Identifier for a durable agent session log."""
-
-  user_id: str
-  agent_id: str
-  agent_session_id: str
-
-
-@dataclass(frozen=True)
-class LogEntry:
-  """Single durable session log entry."""
-
-  seq: int
-  timestamp: float
-  event: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class QueryCursor:
-  """Opaque pagination cursor returned by query()."""
-
-  after_seq: int
-  direction: Literal["asc", "desc"]
-
-
-@dataclass(frozen=True)
-class _QuerySpec:
-  event_types: set[str] | None
-  tool_name: str | None
-  tool_call_id: str | None
-  sub_agent_id: str | None
-  runner_id: str | None
-  role: str | None
-  after_seq: int | None
-  before_seq: int | None
-  after_ts: float | None
-  before_ts: float | None
-  contains_text: str | None
-  has_error: bool | None
-
-
-@dataclass(frozen=True)
-class _Segment:
-  path: Path
-  first_seq: int
-  last_seq: int
-  active: bool = False
-
-
-def slugify(value: str) -> str:
-  slug = _SLUG_RE.sub("_", str(value).strip().lower())[:64]
-  if not slug:
-    raise ValueError("slugify() produced an empty slug")
-  return slug
-
-
-def resolve_agent_session_id(user_id: str, agent_id: str) -> str:
-  return f"agentsess_{slugify(agent_id)}_{slugify(user_id)}"
-
-
-def _now_iso() -> str:
-  return datetime.now(UTC).isoformat()
-
-
-def _fsync_parent_dir(path: Path) -> None:
-  fd = os.open(str(path), os.O_RDONLY)
-  try:
-    os.fsync(fd)
-  finally:
-    os.close(fd)
-
-
-def _atomic_write_sidecar(meta_path: Path, meta: dict[str, Any]) -> None:
-  """Write a sidecar atomically on local POSIX filesystems."""
-  if meta_path.exists():
-    return
-  parent = meta_path.parent
-  parent.mkdir(parents=True, exist_ok=True)
-  fd, tmp_name = tempfile.mkstemp(prefix=f"{meta_path.name}.", suffix=".tmp", dir=parent)
-  try:
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-      json.dump(meta, handle, separators=(",", ":"), ensure_ascii=True)
-      handle.write("\n")
-      handle.flush()
-      os.fsync(handle.fileno())
-    if meta_path.exists():
-      with contextlib.suppress(OSError):
-        os.unlink(tmp_name)
-      return
-    os.replace(tmp_name, meta_path)
-    _fsync_parent_dir(parent)
-  except Exception:
-    with contextlib.suppress(OSError):
-      os.unlink(tmp_name)
-    raise
-
-
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-  parent = path.parent
-  parent.mkdir(parents=True, exist_ok=True)
-  fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=parent)
-  try:
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-      json.dump(payload, handle, indent=2, sort_keys=True)
-      handle.write("\n")
-      handle.flush()
-      os.fsync(handle.fileno())
-    os.replace(tmp_name, path)
-    _fsync_parent_dir(parent)
-  except Exception:
-    with contextlib.suppress(OSError):
-      os.unlink(tmp_name)
-    raise
-
-
-def _read_json_dict(path: Path) -> dict[str, Any] | None:
-  try:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-  except (OSError, json.JSONDecodeError):
-    return None
-  return payload if isinstance(payload, dict) else None
-
-
-def agent_session_logical_path_for_jsonl(path: str | Path) -> Path | None:
-  """Return the logical active stream path for an AgentSessionLog JSONL file.
-
-  Active v1/no-sidecar files map to themselves. Closed v2 segment files map to
-  their sidecar's logical_stream_id. Segment files without a valid v2 sidecar
-  fall back to their sibling active stream path when the rotated filename is
-  well-formed, so readers can repair crash-window segment metadata.
-  """
-  jsonl_path = Path(path).expanduser()
-  sidecar = _read_json_dict(jsonl_path.with_suffix(".meta.json"))
-
-  if jsonl_path.parent.name.endswith(".segments"):
-    if sidecar is None or sidecar.get("schema_version") != 2 or sidecar.get("file_role") != "segment":
-      if _SEGMENT_FILE_RE.fullmatch(jsonl_path.name) is None:
-        return None
-      active_stem = jsonl_path.parent.name[: -len(".segments")]
-      return (jsonl_path.parent.parent / f"{active_stem}.jsonl").resolve()
-    logical_stream_id = sidecar.get("logical_stream_id")
-    if not isinstance(logical_stream_id, str) or not logical_stream_id:
-      if _SEGMENT_FILE_RE.fullmatch(jsonl_path.name) is None:
-        return None
-      active_stem = jsonl_path.parent.name[: -len(".segments")]
-      return (jsonl_path.parent.parent / f"{active_stem}.jsonl").resolve()
-    return Path(logical_stream_id).expanduser().resolve()
-
-  if sidecar is not None and sidecar.get("schema_version") == 2:
-    logical_stream_id = sidecar.get("logical_stream_id")
-    if isinstance(logical_stream_id, str) and logical_stream_id:
-      return Path(logical_stream_id).expanduser().resolve()
-
-  return jsonl_path.resolve()
 
 
 class AgentSessionLog:
@@ -579,36 +437,24 @@ class AgentSessionLog:
     return value if value > 0 else None
 
   def _logical_stream_id(self) -> str:
-    return str(self.path.resolve())
+    return _sidecar_helpers.logical_stream_id(self.path)
 
   def _stream_hash(self) -> str:
-    return hashlib.sha1(self._logical_stream_id().encode("utf-8")).hexdigest()[:16]
+    return _sidecar_helpers.stream_hash(logical_stream_id_fn=self._logical_stream_id)
 
   def _telemetry_source_id(self, role: str, suffix: str) -> str:
-    return f"agent_session_log:{self._stream_hash()}:{role}:{suffix}"
+    return _sidecar_helpers.telemetry_source_id(role, suffix, stream_hash_fn=self._stream_hash)
 
   def _active_sidecar_payload(self, base: dict[str, Any], *, active_generation: int) -> dict[str, Any]:
-    payload = dict(base)
-    payload.update(
-      {
-        "schema_version": 2,
-        "file_role": "active",
-        "logical_stream_id": self._logical_stream_id(),
-        "telemetry_source_id": self._telemetry_source_id("active", f"{active_generation:06d}"),
-        "active_generation": active_generation,
-      }
+    return _sidecar_helpers.active_sidecar_payload(
+      base,
+      active_generation=active_generation,
+      logical_stream_id_fn=self._logical_stream_id,
+      telemetry_source_id_fn=self._telemetry_source_id,
     )
-    return payload
 
   def _load_sidecar_payload(self) -> dict[str, Any] | None:
-    meta_path = self.path.with_suffix(".meta.json")
-    if not meta_path.exists():
-      return None
-    try:
-      payload = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-      return None
-    return payload if isinstance(payload, dict) else None
+    return _sidecar_helpers.load_sidecar_payload(self.path)
 
   def _segment_sidecar_payload(
     self,
@@ -620,99 +466,46 @@ class AgentSessionLog:
     active_generation: int,
     rotated_from_file_identity: dict[str, int],
   ) -> dict[str, Any]:
-    payload = {
-      "schema_version": 2,
-      "agent_session_id": str(base.get("agent_session_id") or self.path.stem),
-      "agent_id": base.get("agent_id"),
-      "user_id": base.get("user_id"),
-      "product_id": base.get("product_id"),
-      "file_kind": base.get("file_kind") or "canonical",
-      "channel": base.get("channel"),
-      "profile": base.get("profile"),
-      "created_at": base.get("created_at") or _now_iso(),
-      "file_role": "segment",
-      "logical_stream_id": self._logical_stream_id(),
-      "telemetry_source_id": self._telemetry_source_id("segment", segment_id),
-      "active_generation": active_generation,
-      "segment_id": segment_id,
-      "first_seq": first_seq,
-      "last_seq": last_seq,
-      "rotated_from_source_id": self._telemetry_source_id("active", f"{active_generation:06d}"),
-      "rotated_from_path": str(self.path),
-      "rotated_from_file_identity": rotated_from_file_identity,
-    }
-    return payload
+    return _sidecar_helpers.segment_sidecar_payload(
+      self.path,
+      base,
+      segment_id=segment_id,
+      first_seq=first_seq,
+      last_seq=last_seq,
+      active_generation=active_generation,
+      rotated_from_file_identity=rotated_from_file_identity,
+      logical_stream_id_fn=self._logical_stream_id,
+      telemetry_source_id_fn=self._telemetry_source_id,
+      now_iso_fn=_now_iso,
+    )
 
   def _fallback_sidecar_base(self) -> dict[str, Any]:
-    user_id = "unknown"
-    if self.path.stem.startswith("agentsess_"):
-      remainder = self.path.stem[len("agentsess_") :]
-      if "_" in remainder:
-        user_id = remainder.rsplit("_", 1)[1] or "unknown"
-    return {
-      "agent_session_id": self.path.stem,
-      "agent_id": self.path.parent.name or "unknown",
-      "user_id": user_id,
-      "product_id": None,
-      "file_kind": "canonical",
-      "channel": None,
-      "profile": None,
-      "created_at": _now_iso(),
-    }
+    return _sidecar_helpers.fallback_sidecar_base(self.path, now_iso_fn=_now_iso)
 
   def _sidecar_base_from_segment_meta(self, meta: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(meta, dict):
-      return None
-    base = {
-      key: meta.get(key)
-      for key in ("agent_session_id", "agent_id", "user_id", "product_id", "file_kind", "channel", "profile", "created_at")
-      if key in meta
-    }
-    return base or None
+    return _sidecar_helpers.sidecar_base_from_segment_meta(meta)
 
   def _sidecar_base_for_repair(self, segment_metas: list[dict[str, Any]]) -> dict[str, Any]:
-    active_base = self._load_sidecar_payload()
-    if active_base is not None:
-      return active_base
-    for meta in segment_metas:
-      segment_base = self._sidecar_base_from_segment_meta(meta)
-      if segment_base is not None:
-        return segment_base
-    return self._fallback_sidecar_base()
+    return _sidecar_helpers.sidecar_base_for_repair(
+      segment_metas,
+      load_sidecar_payload_fn=self._load_sidecar_payload,
+      sidecar_base_from_segment_meta_fn=self._sidecar_base_from_segment_meta,
+      fallback_sidecar_base_fn=self._fallback_sidecar_base,
+    )
 
   def _file_identity(self, path: Path) -> dict[str, int]:
-    stat = path.stat()
-    return {
-      "st_dev": int(stat.st_dev),
-      "st_ino": int(stat.st_ino),
-      "size": int(stat.st_size),
-      "mtime_ns": int(stat.st_mtime_ns),
-    }
+    return _sidecar_helpers.file_identity(path)
 
   def _new_manifest(self) -> dict[str, Any]:
-    return {
-      "schema_version": _MANIFEST_SCHEMA_VERSION,
-      "logical_stream_id": self._logical_stream_id(),
-      "active_path": f"../{self.path.name}",
-      "active_generation": 0,
-      "active_telemetry_source_id": self._telemetry_source_id("active", "000000"),
-      "segments": [],
-      "min_seq_available": 1,
-      "latest_seq": 0,
-    }
+    return _sidecar_helpers.new_manifest(
+      self.path,
+      manifest_schema_version=_MANIFEST_SCHEMA_VERSION,
+      logical_stream_id_fn=self._logical_stream_id,
+      telemetry_source_id_fn=self._telemetry_source_id,
+    )
 
   def _load_manifest(self) -> dict[str, Any] | None:
-    if not self.manifest_path.exists():
-      return None
-    try:
-      payload = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-      log.warning("Ignoring unreadable AgentSessionLog manifest: %s", self.manifest_path)
-      return None
-    if not isinstance(payload, dict):
-      log.warning("Ignoring malformed AgentSessionLog manifest: %s", self.manifest_path)
-      return None
-    return payload
+    return _sidecar_helpers.load_manifest(self.manifest_path, log)
 
   def _write_manifest(self, manifest: dict[str, Any]) -> None:
     _atomic_write_json(self.manifest_path, manifest)
@@ -1069,100 +862,22 @@ class AgentSessionLog:
     self._write_manifest(manifest)
 
   def _encode_entry(self, entry: LogEntry) -> bytes:
-    payload = {
-      "seq": entry.seq,
-      "timestamp": entry.timestamp,
-      "event": entry.event,
-    }
-    return (json.dumps(payload, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+    return _encode_entry(entry)
 
   def _parse_entry(self, raw: bytes, *, is_last_line: bool) -> LogEntry | None:
-    stripped = raw.strip()
-    if not stripped:
-      return None
-    try:
-      payload = json.loads(stripped.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-      if is_last_line:
-        log.warning("Skipping truncated trailing JSONL line in %s", self.path)
-      else:
-        log.warning("Skipping malformed JSONL line in %s", self.path)
-      return None
-    if not isinstance(payload, dict):
-      log.warning("Skipping malformed JSONL line in %s", self.path)
-      return None
-    event = payload.get("event")
-    if not isinstance(event, dict):
-      log.warning("Skipping malformed JSONL line in %s", self.path)
-      return None
-    try:
-      seq = int(payload["seq"])
-      timestamp = float(payload["timestamp"])
-    except (KeyError, TypeError, ValueError):
-      log.warning("Skipping malformed JSONL line in %s", self.path)
-      return None
-    return LogEntry(seq=seq, timestamp=timestamp, event=event)
+    return _parse_entry(raw, is_last_line=is_last_line, path=self.path, logger=log)
 
   def _iter_lines_reverse(self, handle: Any, chunk_size: int = _REVERSE_SCAN_CHUNK_SIZE):
-    handle.seek(0, os.SEEK_END)
-    position = handle.tell()
-    buffer = b""
-    is_last_line = True
-
-    while position > 0:
-      read_size = min(chunk_size, position)
-      position -= read_size
-      handle.seek(position)
-      chunk = handle.read(read_size)
-      buffer = chunk + buffer
-      parts = buffer.split(b"\n")
-      buffer = parts[0]
-      for line in reversed(parts[1:]):
-        if not line:
-          continue
-        yield line, is_last_line
-        is_last_line = False
-
-    if buffer:
-      yield buffer, is_last_line
+    yield from _iter_lines_reverse(handle, chunk_size=chunk_size)
 
   def _matches(self, entry: LogEntry, spec: _QuerySpec) -> bool:
-    event = entry.event
-    event_type = str(event.get("type") or "")
-    if spec.event_types is not None and event_type not in spec.event_types:
-      return False
-    if spec.tool_name is not None and event.get("tool_name") != spec.tool_name:
-      return False
-    if spec.tool_call_id is not None and event.get("tool_call_id") != spec.tool_call_id:
-      return False
-    if spec.sub_agent_id is not None and event.get("sub_agent_id") != spec.sub_agent_id:
-      return False
-    if spec.runner_id is not None and event.get("runner_id") != spec.runner_id:
-      return False
-    if spec.role is not None and event.get("role") != spec.role:
-      return False
-    if spec.after_ts is not None and entry.timestamp < spec.after_ts:
-      return False
-    if spec.before_ts is not None and entry.timestamp > spec.before_ts:
-      return False
-    if spec.contains_text is not None and not self._contains_text(event, spec.contains_text):
-      return False
-    if spec.has_error is not None and self._event_has_error(event) != spec.has_error:
-      return False
-    return True
+    return _matches_entry(entry, spec, contains_text=self._contains_text, event_has_error=self._event_has_error)
 
   def _contains_text(self, value: Any, needle: str) -> bool:
-    if isinstance(value, str):
-      return needle in value.lower()
-    if isinstance(value, dict):
-      return any(self._contains_text(item, needle) for item in value.values())
-    if isinstance(value, (list, tuple)):
-      return any(self._contains_text(item, needle) for item in value)
-    return False
+    return _contains_text(value, needle)
 
   def _event_has_error(self, event: dict[str, Any]) -> bool:
-    error = event.get("error")
-    return error not in (None, "", {}, [])
+    return _event_has_error(event)
 
 
 __all__ = [

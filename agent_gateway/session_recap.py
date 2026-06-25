@@ -5,7 +5,7 @@ import time
 from dataclasses import replace
 from typing import Any
 
-from .event_log import EventLog
+from .event_log import EventLog, LogEntry
 from .events import (
   RecapApproval,
   RecapArtifact,
@@ -30,9 +30,53 @@ def compute_recap(
   pending_failure: RecapFailure | None = None,
   usage: SessionUsageSummary | None = None,
 ) -> SessionRecapEvent:
-  entries = event_log.entries
-  first_seq = entries[0].seq if entries else event_log.next_seq
-  last_seq = entries[-1].seq if entries else event_log.next_seq - 1
+  return _compute_recap_entries(
+    event_log.entries,
+    empty_next_seq=event_log.next_seq,
+    session_id=session_id,
+    started_at=started_at,
+    trigger=trigger,
+    pending_failure=pending_failure,
+    usage=usage,
+  )
+
+
+def compute_recap_from_events(
+  events: list[dict[str, Any]],
+  *,
+  session_id: str,
+  started_at: float,
+  trigger: RecapTrigger,
+  pending_failure: RecapFailure | None = None,
+  usage: SessionUsageSummary | None = None,
+) -> SessionRecapEvent:
+  entries = [
+    LogEntry(seq=index, timestamp=_event_ts(event, time.time()), event=dict(event))
+    for index, event in enumerate(events, start=1)
+  ]
+  return _compute_recap_entries(
+    entries,
+    empty_next_seq=len(entries) + 1,
+    session_id=session_id,
+    started_at=started_at,
+    trigger=trigger,
+    pending_failure=pending_failure,
+    usage=usage,
+  )
+
+
+def _compute_recap_entries(
+  entries: list[LogEntry],
+  *,
+  empty_next_seq: int,
+  session_id: str,
+  started_at: float,
+  trigger: RecapTrigger,
+  pending_failure: RecapFailure | None,
+  usage: SessionUsageSummary | None,
+) -> SessionRecapEvent:
+  first_seq = entries[0].seq if entries else empty_next_seq
+  last_seq = entries[-1].seq if entries else empty_next_seq - 1
 
   artifacts: list[RecapArtifact] = []
   verdicts: list[RecapVerdict] = []
@@ -349,4 +393,4 @@ def _failure_detail(event: dict[str, Any]) -> str:
   return str(event.get("type") or "failure")
 
 
-__all__ = ["compute_recap", "emit_recap_then_terminal"]
+__all__ = ["compute_recap", "compute_recap_from_events", "emit_recap_then_terminal"]

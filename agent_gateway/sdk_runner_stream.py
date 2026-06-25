@@ -242,6 +242,8 @@ class _SDKRunnerStreamMixin:
       duration_ms=duration_ms,
       is_error=event["is_error"],
       result_bytes=result_bytes,
+      tool_call_id=tool_call_id,
+      request_id=self._request_id,
     )
 
   def _flush_pending_tool_calls(self, *, outcome: str | None = None) -> None:

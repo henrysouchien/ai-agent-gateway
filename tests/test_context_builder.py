@@ -89,6 +89,39 @@ def test_context_builder_missing_regime_does_not_crash(tmp_path: Path) -> None:
   assert "Regime:" not in messages[0]["content"]
 
 
+def test_context_builder_replays_final_answer_guard_draft(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "guard-draft.jsonl")
+  _run(
+    log.append(
+      {
+        "type": "runtime_guard",
+        "guard": "final_answer",
+        "message": "Verify the arithmetic with code_execute before final.",
+        "draft_content_blocks": [{"type": "text", "text": "Rough answer: 7.4% BEAT"}],
+        "draft_model": "claude-sonnet-4-6",
+        "draft_provider": "anthropic",
+        "draft_stop_reason": "end_turn",
+      }
+    )
+  )
+
+  messages = _run(SessionContextBuilder(agent_session_log=log).build())
+
+  assert messages == [
+    {
+      "role": "assistant",
+      "content": [{"type": "text", "text": "Rough answer: 7.4% BEAT"}],
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "provider": "anthropic",
+    },
+    {
+      "role": "user",
+      "content": "Verify the arithmetic with code_execute before final.",
+    },
+  ]
+
+
 def test_context_builder_tool_call_complete_backward_compat_with_final_blocks(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "tool-result-compat.jsonl")
   _run(

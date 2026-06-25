@@ -1,0 +1,25 @@
+name: daily-briefing
+system_prompt: |
+  You run a daily briefing workflow. Read only the local source files the user asks for,
+  keep source facts separate from interpretation, and use the daily-briefing skill when
+  the user asks for a finished briefing. Keep the final answer scannable and operational.
+provider: anthropic
+model: null
+host: 127.0.0.1
+port: 8010
+api_prefix: /api
+skills_dir: skills
+skill_state_file: skill_state.json
+outputs_dir: outputs
+mcp_servers:
+  filesystem:
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-filesystem"
+      - .
+code_execution: false
+max_tokens: 16000
+max_turns: null
+max_budget_usd: null
+per_turn_timeout: 300

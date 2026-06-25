@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .anthropic import AnthropicProvider
 from .base import CostEstimate
+from ..policy_imports import load_server_policy_helpers
 
 
 SDK_PINNED_VERSION = "0.1.50"
@@ -117,18 +118,14 @@ def build_disallowed_tools(
     blocked.add(f"mcp__{server_name}__*")
   if extra_blocked:
     blocked |= extra_blocked
-  try:
-    from agent.shared.server_policies import get_forbidden_tools_for_session, get_server_for_policy_tool
-  except Exception:
-    try:
-      from api.agent.shared.server_policies import get_forbidden_tools_for_session, get_server_for_policy_tool
-    except Exception:
-      get_forbidden_tools_for_session = None  # type: ignore[assignment]
-      get_server_for_policy_tool = None  # type: ignore[assignment]
+  get_forbidden_tools_for_session, get_server_for_policy_tool, _get_tool_class = load_server_policy_helpers()
 
   if get_forbidden_tools_for_session is not None and get_server_for_policy_tool is not None:
     for tool_name in get_forbidden_tools_for_session(session):
-      server_name = get_server_for_policy_tool(tool_name) or "portfolio-mcp"
+      server_name = get_server_for_policy_tool(tool_name)
+      if server_name is None:
+        blocked.add(tool_name)
+        continue
       blocked.add(f"mcp__{server_name}__{tool_name}")
   return sorted(blocked)
 

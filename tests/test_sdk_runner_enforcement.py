@@ -15,8 +15,12 @@ ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
+API_DIR = ROOT / "api"
+if str(API_DIR) not in sys.path:
+  sys.path.insert(0, str(API_DIR))
 
 from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog, SessionStore  # noqa: E402
+from agent_gateway import policy_imports  # noqa: E402
 from agent_gateway.approval_policy import ApprovalDecision as PolicyApprovalDecision, ApprovalRequest, ApprovalRequestPayload, RunContext  # noqa: E402
 from agent_gateway.approval_store import SQLiteApprovalStore  # noqa: E402
 from agent_gateway.approvals import _record_vote_and_unblock  # noqa: E402
@@ -158,6 +162,50 @@ def test_sdk_runner_static_disallowed_tool_denied_without_approval(monkeypatch: 
 
   allowed = _run(callback("file_read", {"path": "x"}, None))
   assert allowed.behavior == "allow"
+
+
+def test_sdk_runner_stale_prefixed_mcp_tool_denied_without_approval(monkeypatch: pytest.MonkeyPatch) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  from agent.shared import server_policies
+
+  monkeypatch.setattr(
+    server_policies,
+    "get_server_for_policy_tool",
+    lambda tool_name: "portfolio-trades-mcp" if tool_name == "execute_trade" else None,
+  )
+  runner = _make_runner()
+
+  denied = _run(
+    runner._can_use_tool_callback(
+      "mcp__portfolio-mcp__execute_trade",
+      {"preview_id": "p1"},
+      None,
+    )
+  )
+
+  assert denied.behavior == "deny"
+  assert "policy owner for 'execute_trade' is 'portfolio-trades-mcp'" in denied.message
+
+
+def test_sdk_runner_stale_prefixed_mcp_tool_policy_import_drift_fails_loud(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+
+  def fake_import_module(_name: str):
+    raise ModuleNotFoundError("No module named 'broken_dependency'", name="broken_dependency")
+
+  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
+  runner = _make_runner()
+
+  with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
+    _run(
+      runner._can_use_tool_callback(
+        "mcp__portfolio-mcp__execute_trade",
+        {"preview_id": "p1"},
+        None,
+      )
+    )
 
 
 def test_sdk_runner_relay_policy_denial_uses_machine_readable_message(

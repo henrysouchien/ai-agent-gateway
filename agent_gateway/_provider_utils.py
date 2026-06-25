@@ -9,6 +9,12 @@ from .providers import AnthropicProvider, CodexProvider, FixtureProvider, ModelP
 
 log = logging.getLogger("agent_gateway.provider_utils")
 _SUB_AGENT_DEFAULT_MODEL_WARNED: set[str] = set()
+_API_CREDENTIALS_MODULE_NAMES = frozenset({"api", "api.credentials"})
+_API_TOOL_CATALOG_MODULE_NAMES = frozenset(
+  {"api", "api.agent", "api.agent.shared", "api.agent.shared.tool_catalog"}
+)
+_CREDENTIALS_MODULE_NAMES = frozenset({"credentials"})
+_TOOL_CATALOG_MODULE_NAMES = frozenset({"agent", "agent.shared", "agent.shared.tool_catalog"})
 
 _FALLBACK_DEFAULT_MODELS = {
   "agent-sdk": "claude-sonnet-4-6",
@@ -41,10 +47,14 @@ def _get_default_model_for_provider(provider: str | None = None) -> str:
   resolved = str(provider or "anthropic").strip().lower() or "anthropic"
   try:
     from credentials import get_default_model as get_default_model
-  except ModuleNotFoundError:
+  except ModuleNotFoundError as exc:
+    if exc.name not in _CREDENTIALS_MODULE_NAMES:
+      raise
     try:
       from api.credentials import get_default_model as get_default_model
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as exc:
+      if exc.name not in _API_CREDENTIALS_MODULE_NAMES:
+        raise
       return _FALLBACK_DEFAULT_MODELS.get(resolved, _FALLBACK_DEFAULT_MODELS["anthropic"])
   try:
     model = str(get_default_model(resolved)).strip()
@@ -59,10 +69,14 @@ def _get_allowed_models_for_provider_name(provider: str | None = None) -> set[st
   resolved = str(provider or "anthropic").strip().lower() or "anthropic"
   try:
     from agent.shared.tool_catalog import get_allowed_models as get_allowed_models
-  except ModuleNotFoundError:
+  except ModuleNotFoundError as exc:
+    if exc.name not in _TOOL_CATALOG_MODULE_NAMES:
+      raise
     try:
       from api.agent.shared.tool_catalog import get_allowed_models as get_allowed_models
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as exc:
+      if exc.name not in _API_TOOL_CATALOG_MODULE_NAMES:
+        raise
       models = set(_FALLBACK_ALLOWED_MODELS.get(resolved, set()))
       default_model = _get_default_model_for_provider(resolved)
       if default_model:

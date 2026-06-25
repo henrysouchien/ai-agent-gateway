@@ -9,6 +9,8 @@ from pydantic import BaseModel
 
 from agent_gateway.session import AuthManager
 
+_SKILL_LOADER_MODULE_NAMES = frozenset({"agent", "agent.skills", "agent.skills.loader"})
+
 
 class SkillMetadataResponse(BaseModel):
   name: str
@@ -39,7 +41,9 @@ class SkillDetailResponse(SkillMetadataResponse):
 def _loader_api() -> Any:
   try:
     from agent.skills import loader as skill_loader
-  except ModuleNotFoundError:
+  except ModuleNotFoundError as exc:
+    if exc.name not in _SKILL_LOADER_MODULE_NAMES:
+      raise
     from api.agent.skills import loader as skill_loader  # type: ignore
   return skill_loader
 

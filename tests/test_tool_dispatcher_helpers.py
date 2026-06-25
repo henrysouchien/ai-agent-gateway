@@ -73,3 +73,36 @@ def test_tool_execution_context_emits_and_tracks_abort() -> None:
 def test_intercept_decision_rejects_unknown_action() -> None:
   with pytest.raises(ValueError, match="Invalid interceptor action"):
     dispatcher_module.InterceptDecision("maybe")
+
+
+def test_run_interceptors_helper_returns_first_pending_ask_and_warnings() -> None:
+  event_log = EventLog()
+
+  async def _warn(ctx: dispatcher_helpers.InterceptContext) -> dispatcher_helpers.InterceptDecision:
+    assert ctx.session_id == "sess-1"
+    return dispatcher_helpers.InterceptDecision("warn", message="watch it", code="warn_policy")
+
+  async def _ask(ctx: dispatcher_helpers.InterceptContext) -> dispatcher_helpers.InterceptDecision:
+    assert ctx.tool_name == "demo"
+    return dispatcher_helpers.InterceptDecision("ask", message="needs review", code="ask_policy")
+
+  result = asyncio.run(
+    dispatcher_helpers.run_interceptors(
+      "call-1",
+      "demo",
+      {"x": 1},
+      interceptors=[_warn, _ask],
+      event_log=event_log,
+      session_id="sess-1",
+      log=dispatcher_module.log,
+    )
+  )
+
+  assert result.proceed is True
+  assert result.warnings == ["watch it"]
+  assert result.pending_ask == dispatcher_helpers.InterceptDecision(
+    "ask",
+    message="needs review",
+    code="ask_policy",
+  )
+  assert [entry.event["action"] for entry in event_log.entries] == ["warn", "ask"]

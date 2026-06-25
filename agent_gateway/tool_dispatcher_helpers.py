@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Sequence as AbcSequence
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from . import approval_settings
 from .event_log import EventLog
@@ -23,6 +25,215 @@ ToolResult.__doc__ = "Standard tool return type: `(result, error)`."
 
 def _approval_queue_timeout_seconds(expiry_seconds: float | int | None) -> float:
   return min(float(expiry_seconds or 600), approval_settings.approval_wait_seconds())
+
+
+def active_local_tool_schema(
+  get_tool_definitions: Callable[[], Sequence[Mapping[str, Any]]] | None,
+  tool_name: str,
+) -> tuple[Mapping[str, Any] | None, Dict[str, Any] | None]:
+  if get_tool_definitions is None:
+    return None, None
+  try:
+    tool_definitions = get_tool_definitions()
+  except Exception as exc:
+    return None, {
+      "code": "tool_schema_unavailable",
+      "message": f"Could not load active tool schema for local tool '{tool_name}': {exc}",
+      "details": {"tool_name": tool_name},
+      "fix": "Retry after the active tool catalog is available.",
+    }
+
+  for definition in tool_definitions or []:
+    if not isinstance(definition, Mapping):
+      continue
+    if str(definition.get("name") or "") != tool_name:
+      continue
+    schema = definition.get("input_schema") or definition.get("parameters")
+    if isinstance(schema, Mapping):
+      return schema, None
+    return None, None
+
+  return None, {
+    "code": "tool_not_advertised",
+    "message": f"Local tool '{tool_name}' is not advertised in the active tool definitions for this run",
+    "details": {"tool_name": tool_name},
+    "fix": "Call only tools present in the active tool catalog.",
+  }
+
+
+def json_type_name(value: Any) -> str:
+  if value is None:
+    return "null"
+  if isinstance(value, bool):
+    return "boolean"
+  if isinstance(value, dict):
+    return "object"
+  if isinstance(value, list):
+    return "array"
+  if isinstance(value, str):
+    return "string"
+  if isinstance(value, int):
+    return "integer"
+  if isinstance(value, float):
+    return "number"
+  return type(value).__name__
+
+
+def matches_json_type(value: Any, expected_type: Any) -> bool:
+  if isinstance(expected_type, AbcSequence) and not isinstance(expected_type, str):
+    return any(matches_json_type(value, item) for item in expected_type)
+  if expected_type == "object":
+    return isinstance(value, dict)
+  if expected_type == "array":
+    return isinstance(value, list)
+  if expected_type == "string":
+    return isinstance(value, str)
+  if expected_type == "boolean":
+    return isinstance(value, bool)
+  if expected_type == "integer":
+    return isinstance(value, int) and not isinstance(value, bool)
+  if expected_type == "number":
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+  if expected_type == "null":
+    return value is None
+  return True
+
+
+def format_expected_type(expected_type: Any) -> str:
+  if isinstance(expected_type, AbcSequence) and not isinstance(expected_type, str):
+    return "|".join(str(item) for item in expected_type)
+  return str(expected_type)
+
+
+def tool_input_schema_error(
+  tool_name: str,
+  *,
+  message: str,
+  details: Dict[str, Any],
+) -> Dict[str, Any]:
+  return {
+    "code": "invalid_tool_input_schema",
+    "message": f"Tool '{tool_name}' input does not match its active input_schema: {message}",
+    "details": {"tool_name": tool_name, **details},
+    "fix": "Call the tool with a JSON object matching its active input_schema, including required fields.",
+  }
+
+
+def validate_against_local_schema(
+  tool_name: str,
+  tool_input: Any,
+  schema: Mapping[str, Any],
+  *,
+  json_type_name_fn: Callable[[Any], str] = json_type_name,
+  matches_json_type_fn: Callable[[Any, Any], bool] = matches_json_type,
+  format_expected_type_fn: Callable[[Any], str] = format_expected_type,
+  tool_input_schema_error_fn: Callable[..., Dict[str, Any]] = tool_input_schema_error,
+) -> Dict[str, Any] | None:
+  expects_object = (
+    schema.get("type") == "object"
+    or "properties" in schema
+    or "required" in schema
+    or "additionalProperties" in schema
+  )
+  if expects_object and not isinstance(tool_input, dict):
+    got = json_type_name_fn(tool_input)
+    return tool_input_schema_error_fn(
+      tool_name,
+      message=f"expected object, got {got}",
+      details={"expected": "object", "got": got},
+    )
+  if not isinstance(tool_input, dict):
+    return None
+
+  required = [
+    str(item)
+    for item in (schema.get("required") or [])
+    if isinstance(item, str) and item
+  ]
+  missing = [name for name in required if name not in tool_input]
+
+  raw_properties = schema.get("properties")
+  properties = raw_properties if isinstance(raw_properties, Mapping) else {}
+  unexpected: list[str] = []
+  if schema.get("additionalProperties") is False:
+    allowed = set(str(key) for key in properties.keys())
+    unexpected = sorted(str(key) for key in tool_input.keys() if str(key) not in allowed)
+
+  type_errors: list[dict[str, str]] = []
+  for schema_field, field_schema in properties.items():
+    field_name = str(schema_field)
+    if field_name not in tool_input or not isinstance(field_schema, Mapping):
+      continue
+    expected_type = field_schema.get("type")
+    if expected_type is None:
+      continue
+    value = tool_input[field_name]
+    if not matches_json_type_fn(value, expected_type):
+      type_errors.append({
+        "field": field_name,
+        "expected": format_expected_type_fn(expected_type),
+        "got": json_type_name_fn(value),
+      })
+
+  if not missing and not unexpected and not type_errors:
+    return None
+
+  parts: list[str] = []
+  if missing:
+    parts.append(f"missing required field(s): {', '.join(missing)}")
+  if unexpected:
+    parts.append(f"unexpected field(s): {', '.join(unexpected)}")
+  if type_errors:
+    first = type_errors[0]
+    parts.append(
+      f"field '{first['field']}' expected {first['expected']}, got {first['got']}"
+    )
+  return tool_input_schema_error_fn(
+    tool_name,
+    message="; ".join(parts),
+    details={
+      "missing": missing,
+      "unexpected": unexpected,
+      "type_errors": type_errors,
+    },
+  )
+
+
+def validate_local_tool_input(
+  tool_call_id: str,
+  tool_name: str,
+  tool_input: Any,
+  *,
+  local_tool_handlers: Mapping[str, Callable[..., Awaitable[ToolResult]]],
+  get_tool_definitions: Callable[[], Sequence[Mapping[str, Any]]] | None,
+  event_log: EventLog | None,
+  active_local_tool_schema_fn: Callable[[str], tuple[Mapping[str, Any] | None, Dict[str, Any] | None]] | None = None,
+  validate_against_local_schema_fn: Callable[[str, Any, Mapping[str, Any]], Dict[str, Any] | None] | None = None,
+) -> Dict[str, Any] | None:
+  if tool_name not in local_tool_handlers or get_tool_definitions is None:
+    return None
+
+  schema, schema_error = (
+    active_local_tool_schema_fn(tool_name)
+    if active_local_tool_schema_fn is not None
+    else active_local_tool_schema(get_tool_definitions, tool_name)
+  )
+  error = schema_error
+  if error is None and schema is not None:
+    validate_schema = validate_against_local_schema_fn or validate_against_local_schema
+    error = validate_schema(tool_name, tool_input, schema)
+  if error is not None and event_log is not None:
+    event_log.append(
+      {
+        "type": "tool_input_validation_failed",
+        "tool_call_id": tool_call_id,
+        "tool_name": tool_name,
+        "code": error.get("code"),
+        "message": error.get("message"),
+        "details": error.get("details"),
+      }
+    )
+  return error
 
 
 @dataclass
@@ -119,6 +330,108 @@ ToolInterceptor.__doc__ = (
 HeadlessAskCallback = Callable[[InterceptContext, InterceptDecision], Awaitable[str] | str]
 
 
+async def run_interceptors(
+  tool_call_id: str,
+  tool_name: str,
+  tool_input: Dict[str, Any],
+  *,
+  interceptors: Sequence[ToolInterceptor],
+  event_log: EventLog | None,
+  session_id: str,
+  log: logging.Logger,
+) -> InterceptResult:
+  """Run interceptor chain and return a structured result."""
+  if not interceptors:
+    return InterceptResult(proceed=True)
+
+  ctx = InterceptContext(
+    tool_call_id=tool_call_id,
+    tool_name=tool_name,
+    tool_input=tool_input,
+    session_id=session_id,
+  )
+  warnings: list[str] = []
+  pending_ask: InterceptDecision | None = None
+
+  for interceptor in interceptors:
+    try:
+      decision = await interceptor(ctx)
+    except Exception as exc:
+      is_critical = getattr(interceptor, "__intercept_critical__", False)
+      if is_critical:
+        log.error("Critical interceptor %s failed: %s — denying", interceptor, exc)
+        if event_log is not None:
+          event_log.append(
+            {
+              "type": "interceptor_decision",
+              "tool_call_id": tool_call_id,
+              "tool_name": tool_name,
+              "action": "deny",
+              "code": "interceptor_error",
+              "message": f"Critical safety interceptor failed: {exc}",
+            }
+          )
+        return InterceptResult(
+          proceed=False,
+          error={
+            "code": "interceptor_error",
+            "message": f"Safety check failed due to an internal error. Tool '{tool_name}' was blocked.",
+          },
+        )
+      log.warning("Interceptor %s error (non-fatal): %s", interceptor, exc)
+      continue
+
+    if decision.action == "deny":
+      if event_log is not None:
+        event_log.append(
+          {
+            "type": "interceptor_decision",
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "action": "deny",
+            "code": decision.code,
+            "message": decision.message,
+          }
+        )
+      return InterceptResult(
+        proceed=False,
+        error={
+          "code": decision.code,
+          "message": decision.message or f"Tool '{tool_name}' was blocked by a runtime policy",
+        },
+      )
+    if decision.action == "warn":
+      warnings.append(decision.message)
+      if event_log is not None:
+        event_log.append(
+          {
+            "type": "interceptor_decision",
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "action": "warn",
+            "code": decision.code,
+            "message": decision.message,
+          }
+        )
+      continue
+    if decision.action == "ask":
+      if event_log is not None:
+        event_log.append(
+          {
+            "type": "interceptor_decision",
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "action": "ask",
+            "code": decision.code,
+            "message": decision.message,
+          }
+        )
+      if pending_ask is None:
+        pending_ask = decision
+
+  return InterceptResult(proceed=True, warnings=warnings, pending_ask=pending_ask)
+
+
 @dataclass
 class ToolExecutionContext:
   """Context object passed to local tool handlers.
@@ -134,6 +447,9 @@ class ToolExecutionContext:
   abort_event: asyncio.Event | None = None
   skill_run_id: str | None = None
   workspace_dir: str | None = None
+  batch_id: int | str | None = None
+  request_id: str | None = None
+  run_id: str | None = None
 
   def emit(self, event: Dict[str, Any]) -> None:
     """Append a custom event to the active event log."""

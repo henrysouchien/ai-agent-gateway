@@ -4,6 +4,8 @@ import json
 import sys
 from typing import Any, Dict, List, Mapping
 
+from .policy_imports import load_server_policy_helpers
+
 
 _PARENT_MODULE = "agent_gateway.sdk_runner"
 
@@ -132,6 +134,20 @@ def server_for_tool(tool_name: str) -> str | None:
   return parts[1]
 
 
+def policy_owner_mismatch(tool_name: str) -> tuple[str, str, str] | None:
+  runtime_server = _compat("_server_for_tool")(tool_name)
+  if not runtime_server:
+    return None
+  policy_tool = _compat("_policy_tool_name")(tool_name)
+  _get_forbidden_tools_for_session, get_server_for_policy_tool, _get_tool_class = load_server_policy_helpers()
+  if get_server_for_policy_tool is None:
+    return None
+  policy_server = get_server_for_policy_tool(policy_tool)
+  if policy_server and policy_server != runtime_server:
+    return runtime_server, policy_tool, policy_server
+  return None
+
+
 def redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
   try:
     from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
@@ -168,6 +184,7 @@ __all__ = [
   "get_attr",
   "join_system_prompt",
   "parse_result_payload",
+  "policy_owner_mismatch",
   "policy_tool_name",
   "redact_tool_input_for_event",
   "server_for_tool",

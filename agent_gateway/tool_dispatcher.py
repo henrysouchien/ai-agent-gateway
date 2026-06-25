@@ -5,10 +5,9 @@ import inspect
 import logging
 import os
 import time
-from collections.abc import Sequence as AbcSequence
 from datetime import timedelta
 from dataclasses import replace
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, TYPE_CHECKING
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, TYPE_CHECKING
 
 from . import approval_settings
 from .approval_policy import (
@@ -24,7 +23,9 @@ from .approval_policy import (
 )
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
 from .event_log import EventLog
+from .policy_imports import resolve_server_policy_tool_class
 from .skill_context import current_skill
+from . import tool_dispatcher_approval_lifecycle as _approval_lifecycle_helpers
 from . import tool_dispatcher_source_pack as _source_pack_helpers
 from .tool_dispatcher_helpers import (
   ApprovalCallback as ApprovalCallback,
@@ -45,7 +46,15 @@ from .tool_dispatcher_helpers import (
   TransportApprovalRequest as TransportApprovalRequest,
   TransportApprovalResult as TransportApprovalResult,
   _approval_queue_timeout_seconds as _approval_queue_timeout_seconds,
+  active_local_tool_schema as _active_local_tool_schema_helper,
+  format_expected_type as _format_expected_type_helper,
+  json_type_name as _json_type_name_helper,
+  matches_json_type as _matches_json_type_helper,
   resolve_denied_provenance as resolve_denied_provenance,
+  run_interceptors as _run_interceptors_helper,
+  tool_input_schema_error as _tool_input_schema_error_helper,
+  validate_against_local_schema as _validate_against_local_schema_helper,
+  validate_local_tool_input as _validate_local_tool_input_helper,
 )
 
 if TYPE_CHECKING:
@@ -94,6 +103,7 @@ class ToolDispatcher:
     policy: ApprovalPolicy | None = None,
     run_context: RunContext | None = None,
     get_tool_definitions: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
+    allowed_mcp_tools_by_server: Mapping[str, Set[str]] | None = None,
   ) -> None:
     self._mcp = mcp_client
     self._local = local_tool_handlers or {}
@@ -121,83 +131,60 @@ class ToolDispatcher:
     self._run_context = run_context
     self._get_tool_definitions = get_tool_definitions
     self._mcp_accepts_abort_event = self._callable_accepts_kw(getattr(self._mcp, "call_tool", None), "abort_event")
+    self._allowed_mcp_tools_by_server = (
+      None
+      if allowed_mcp_tools_by_server is None
+      else {
+        str(server_name): {str(tool_name) for tool_name in tool_names}
+        for server_name, tool_names in allowed_mcp_tools_by_server.items()
+      }
+    )
+
+  def ensure_gateway_local_tool_handler(self, tool_name: str) -> bool:
+    normalized_tool = str(tool_name or "").strip()
+    if not normalized_tool:
+      return False
+    if normalized_tool in self._local:
+      return True
+    active_skill = current_skill()
+    if not active_skill or self._session is None:
+      return False
+    bundles = getattr(self._session, "gateway_local_skill_tools", None)
+    if isinstance(bundles, dict):
+      bundles = [bundles]
+    if not isinstance(bundles, (list, tuple)):
+      return False
+    for bundle in bundles:
+      if not isinstance(bundle, dict):
+        continue
+      if str(bundle.get("skill_name") or "").strip() != active_skill:
+        continue
+      handlers = bundle.get("handlers")
+      if not isinstance(handlers, dict):
+        continue
+      handler = handlers.get(normalized_tool)
+      if callable(handler):
+        self._local[normalized_tool] = handler
+        return True
+    return False
 
   def _active_local_tool_schema(
     self,
     tool_name: str,
   ) -> tuple[Mapping[str, Any] | None, Dict[str, Any] | None]:
-    if self._get_tool_definitions is None:
-      return None, None
-    try:
-      tool_definitions = self._get_tool_definitions()
-    except Exception as exc:
-      return None, {
-        "code": "tool_schema_unavailable",
-        "message": f"Could not load active tool schema for local tool '{tool_name}': {exc}",
-        "details": {"tool_name": tool_name},
-        "fix": "Retry after the active tool catalog is available.",
-      }
-
-    for definition in tool_definitions or []:
-      if not isinstance(definition, Mapping):
-        continue
-      if str(definition.get("name") or "") != tool_name:
-        continue
-      schema = definition.get("input_schema") or definition.get("parameters")
-      if isinstance(schema, Mapping):
-        return schema, None
-      return None, None
-
-    return None, {
-      "code": "tool_not_advertised",
-      "message": f"Local tool '{tool_name}' is not advertised in the active tool definitions for this run",
-      "details": {"tool_name": tool_name},
-      "fix": "Call only tools present in the active tool catalog.",
-    }
+    return _active_local_tool_schema_helper(self._get_tool_definitions, tool_name)
 
   @staticmethod
   def _json_type_name(value: Any) -> str:
-    if value is None:
-      return "null"
-    if isinstance(value, bool):
-      return "boolean"
-    if isinstance(value, dict):
-      return "object"
-    if isinstance(value, list):
-      return "array"
-    if isinstance(value, str):
-      return "string"
-    if isinstance(value, int):
-      return "integer"
-    if isinstance(value, float):
-      return "number"
-    return type(value).__name__
+    return _json_type_name_helper(value)
 
   @classmethod
   def _matches_json_type(cls, value: Any, expected_type: Any) -> bool:
-    if isinstance(expected_type, AbcSequence) and not isinstance(expected_type, str):
-      return any(cls._matches_json_type(value, item) for item in expected_type)
-    if expected_type == "object":
-      return isinstance(value, dict)
-    if expected_type == "array":
-      return isinstance(value, list)
-    if expected_type == "string":
-      return isinstance(value, str)
-    if expected_type == "boolean":
-      return isinstance(value, bool)
-    if expected_type == "integer":
-      return isinstance(value, int) and not isinstance(value, bool)
-    if expected_type == "number":
-      return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if expected_type == "null":
-      return value is None
-    return True
+    return _matches_json_type_helper(value, expected_type)
 
   @classmethod
   def _format_expected_type(cls, expected_type: Any) -> str:
-    if isinstance(expected_type, AbcSequence) and not isinstance(expected_type, str):
-      return "|".join(str(item) for item in expected_type)
-    return str(expected_type)
+    return _format_expected_type_helper(expected_type)
 
   def _tool_input_schema_error(
     self,
@@ -206,12 +193,7 @@ class ToolDispatcher:
     message: str,
     details: Dict[str, Any],
   ) -> Dict[str, Any]:
-    return {
-      "code": "invalid_tool_input_schema",
-      "message": f"Tool '{tool_name}' input does not match its active input_schema: {message}",
-      "details": {"tool_name": tool_name, **details},
-      "fix": "Call the tool with a JSON object matching its active input_schema, including required fields.",
-    }
+    return _tool_input_schema_error_helper(tool_name, message=message, details=details)
 
   def _validate_against_local_schema(
     self,
@@ -219,73 +201,14 @@ class ToolDispatcher:
     tool_input: Any,
     schema: Mapping[str, Any],
   ) -> Dict[str, Any] | None:
-    expects_object = (
-      schema.get("type") == "object"
-      or "properties" in schema
-      or "required" in schema
-      or "additionalProperties" in schema
-    )
-    if expects_object and not isinstance(tool_input, dict):
-      got = self._json_type_name(tool_input)
-      return self._tool_input_schema_error(
-        tool_name,
-        message=f"expected object, got {got}",
-        details={"expected": "object", "got": got},
-      )
-    if not isinstance(tool_input, dict):
-      return None
-
-    required = [
-      str(item)
-      for item in (schema.get("required") or [])
-      if isinstance(item, str) and item
-    ]
-    missing = [name for name in required if name not in tool_input]
-
-    raw_properties = schema.get("properties")
-    properties = raw_properties if isinstance(raw_properties, Mapping) else {}
-    unexpected: list[str] = []
-    if schema.get("additionalProperties") is False:
-      allowed = set(str(key) for key in properties.keys())
-      unexpected = sorted(str(key) for key in tool_input.keys() if str(key) not in allowed)
-
-    type_errors: list[dict[str, str]] = []
-    for field, field_schema in properties.items():
-      field_name = str(field)
-      if field_name not in tool_input or not isinstance(field_schema, Mapping):
-        continue
-      expected_type = field_schema.get("type")
-      if expected_type is None:
-        continue
-      value = tool_input[field_name]
-      if not self._matches_json_type(value, expected_type):
-        type_errors.append({
-          "field": field_name,
-          "expected": self._format_expected_type(expected_type),
-          "got": self._json_type_name(value),
-        })
-
-    if not missing and not unexpected and not type_errors:
-      return None
-
-    parts: list[str] = []
-    if missing:
-      parts.append(f"missing required field(s): {', '.join(missing)}")
-    if unexpected:
-      parts.append(f"unexpected field(s): {', '.join(unexpected)}")
-    if type_errors:
-      first = type_errors[0]
-      parts.append(
-        f"field '{first['field']}' expected {first['expected']}, got {first['got']}"
-      )
-    return self._tool_input_schema_error(
+    return _validate_against_local_schema_helper(
       tool_name,
-      message="; ".join(parts),
-      details={
-        "missing": missing,
-        "unexpected": unexpected,
-        "type_errors": type_errors,
-      },
+      tool_input,
+      schema,
+      json_type_name_fn=self._json_type_name,
+      matches_json_type_fn=self._matches_json_type,
+      format_expected_type_fn=self._format_expected_type,
+      tool_input_schema_error_fn=self._tool_input_schema_error,
     )
 
   def _validate_local_tool_input(
@@ -294,25 +217,16 @@ class ToolDispatcher:
     tool_name: str,
     tool_input: Any,
   ) -> Dict[str, Any] | None:
-    if tool_name not in self._local or self._get_tool_definitions is None:
-      return None
-
-    schema, schema_error = self._active_local_tool_schema(tool_name)
-    error = schema_error
-    if error is None and schema is not None:
-      error = self._validate_against_local_schema(tool_name, tool_input, schema)
-    if error is not None and self._event_log is not None:
-      self._event_log.append(
-        {
-          "type": "tool_input_validation_failed",
-          "tool_call_id": tool_call_id,
-          "tool_name": tool_name,
-          "code": error.get("code"),
-          "message": error.get("message"),
-          "details": error.get("details"),
-        }
-      )
-    return error
+    return _validate_local_tool_input_helper(
+      tool_call_id,
+      tool_name,
+      tool_input,
+      local_tool_handlers=self._local,
+      get_tool_definitions=self._get_tool_definitions,
+      event_log=self._event_log,
+      active_local_tool_schema_fn=self._active_local_tool_schema,
+      validate_against_local_schema_fn=self._validate_against_local_schema,
+    )
 
   async def _run_interceptors(
     self,
@@ -320,96 +234,34 @@ class ToolDispatcher:
     tool_name: str,
     tool_input: Dict[str, Any],
   ) -> InterceptResult:
-    """Run interceptor chain and return a structured result."""
-    if not self._interceptors:
-      return InterceptResult(proceed=True)
-
-    ctx = InterceptContext(
-      tool_call_id=tool_call_id,
-      tool_name=tool_name,
-      tool_input=tool_input,
+    return await _run_interceptors_helper(
+      tool_call_id,
+      tool_name,
+      tool_input,
+      interceptors=self._interceptors,
+      event_log=self._event_log,
       session_id=self._session_id,
+      log=log,
     )
-    warnings: List[str] = []
-    pending_ask: InterceptDecision | None = None
 
-    for interceptor in self._interceptors:
-      try:
-        decision = await interceptor(ctx)
-      except Exception as exc:
-        is_critical = getattr(interceptor, "__intercept_critical__", False)
-        if is_critical:
-          log.error("Critical interceptor %s failed: %s — denying", interceptor, exc)
-          if self._event_log is not None:
-            self._event_log.append(
-              {
-                "type": "interceptor_decision",
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "action": "deny",
-                "code": "interceptor_error",
-                "message": f"Critical safety interceptor failed: {exc}",
-              }
-            )
-          return InterceptResult(
-            proceed=False,
-            error={
-              "code": "interceptor_error",
-              "message": f"Safety check failed due to an internal error. Tool '{tool_name}' was blocked.",
-            },
-          )
-        log.warning("Interceptor %s error (non-fatal): %s", interceptor, exc)
-        continue
-
-      if decision.action == "deny":
-        if self._event_log is not None:
-          self._event_log.append(
-            {
-              "type": "interceptor_decision",
-              "tool_call_id": tool_call_id,
-              "tool_name": tool_name,
-              "action": "deny",
-              "code": decision.code,
-              "message": decision.message,
-            }
-          )
-        return InterceptResult(
-          proceed=False,
-          error={
-            "code": decision.code,
-            "message": decision.message or f"Tool '{tool_name}' was blocked by a runtime policy",
-          },
-        )
-      if decision.action == "warn":
-        warnings.append(decision.message)
-        if self._event_log is not None:
-          self._event_log.append(
-            {
-              "type": "interceptor_decision",
-              "tool_call_id": tool_call_id,
-              "tool_name": tool_name,
-              "action": "warn",
-              "code": decision.code,
-              "message": decision.message,
-            }
-          )
-        continue
-      if decision.action == "ask":
-        if self._event_log is not None:
-          self._event_log.append(
-            {
-              "type": "interceptor_decision",
-              "tool_call_id": tool_call_id,
-              "tool_name": tool_name,
-              "action": "ask",
-              "code": decision.code,
-              "message": decision.message,
-            }
-          )
-        if pending_ask is None:
-          pending_ask = decision
-
-    return InterceptResult(proceed=True, warnings=warnings, pending_ask=pending_ask)
+  def _mcp_scope_error(self, tool_name: str, server_name: str | None) -> Dict[str, Any] | None:
+    if self._allowed_mcp_tools_by_server is None:
+      return None
+    if not server_name:
+      return {
+        "code": "mcp_tool_not_allowed",
+        "message": f"MCP tool '{tool_name}' is not allowed in this scoped child run.",
+      }
+    allowed_tools = self._allowed_mcp_tools_by_server.get(server_name, set())
+    if tool_name in allowed_tools:
+      return None
+    return {
+      "code": "mcp_tool_not_allowed",
+      "message": (
+        f"MCP tool '{server_name}.{tool_name}' is not allowed in this scoped child run. "
+        "Use one of the MCP tools declared by the active skill."
+      ),
+    }
 
   async def dispatch(
     self,
@@ -421,6 +273,7 @@ class ToolDispatcher:
     abort_event: asyncio.Event | None = None,
     skill_run_id: str | None = None,
     workspace_dir: str | None = None,
+    batch_id: int | str | None = None,
   ) -> ToolResult:
     """Execute one tool call and return `(result, error)`.
 
@@ -442,6 +295,7 @@ class ToolDispatcher:
     if abort_event is not None and abort_event.is_set():
       raise asyncio.CancelledError()
 
+    self.ensure_gateway_local_tool_handler(tool_name)
     input_schema_error = self._validate_local_tool_input(tool_call_id, tool_name, tool_input)
     if input_schema_error is not None:
       return None, input_schema_error
@@ -453,6 +307,11 @@ class ToolDispatcher:
     )
     if not ir.proceed:
       return None, ir.error
+
+    if tool_name not in self._local and self._mcp.is_mcp_tool(tool_name):
+      scope_error = self._mcp_scope_error(tool_name, self._mcp.get_server_for_tool(tool_name))
+      if scope_error is not None:
+        return None, scope_error
 
     qualifier = ""
     if self._approval_key_qualifier is not None:
@@ -667,6 +526,7 @@ class ToolDispatcher:
 
       tool_ctx = None
       if self._event_log is not None:
+        run_context = self._resolve_run_context()
         tool_ctx = ToolExecutionContext(
           tool_call_id=tool_call_id,
           tool_name=tool_name,
@@ -675,6 +535,9 @@ class ToolDispatcher:
           abort_event=abort_event,
           skill_run_id=skill_run_id,
           workspace_dir=workspace_dir,
+          batch_id=batch_id,
+          request_id=run_context.request_id,
+          run_id=run_context.run_id,
         )
       result, error = await self._local[tool_name](final_tool_input, call_index=call_index, tool_ctx=tool_ctx)
     elif self._mcp.is_mcp_tool(tool_name):
@@ -695,6 +558,8 @@ class ToolDispatcher:
           meta["skill_run_id"] = skill_run_id
         if workspace_dir is not None:
           meta["workspace_dir"] = workspace_dir
+        if batch_id is not None:
+          meta["batch_id"] = str(batch_id)
         result, error = await self._call_mcp_tool(tool_name, final_tool_input, meta=meta, abort_event=abort_event)
       elif server and server in self._mcp_session_inject_servers:
         final_tool_input = {**final_tool_input, "_session_id": self._session_id}
@@ -848,61 +713,18 @@ class ToolDispatcher:
     allow_persistent: bool,
     timeout_seconds: float,
   ) -> dict[str, Any] | None:
-    session = self._session
-    if session is None:
-      return None
-    approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
-    session.pending_tools[request.tool_call_id] = {
-      "approval_id": request.approval_id,
-      "nonce": nonce,
-      "requested_at": int(time.time()),
-      "status": "approval_pending",
-      "tool_name": request.tool_name,
-      "resolved_qualifier": resolved_qualifier,
-    }
-    session.approval_queues[request.tool_call_id] = approval_queue
-
-    approval_event = {
-      "type": "tool_approval_request",
-      "tool_call_id": request.tool_call_id,
-      "approval_id": request.approval_id,
-      "nonce": nonce,
-      "tool_name": request.tool_name,
-      "tool_input": request.tool_args_redacted,
-      "resolved_qualifier": resolved_qualifier,
-      "reason": decision.reason,
-      "allow_persistent_approval": allow_persistent and decision.allow_persistent_grant,
-      "ts": time.time(),
-    }
-    if self._event_log is not None:
-      self._event_log.append(approval_event)
-    session_log = getattr(session, "agent_session_log", None)
-    if session_log is not None:
-      try:
-        await session_log.append(approval_event)
-      except Exception:
-        log.warning("Failed to persist approval request event for %s", request.tool_call_id, exc_info=True)
-
-    try:
-      return await asyncio.wait_for(approval_queue.get(), timeout=max(0.1, timeout_seconds))
-    except asyncio.TimeoutError:
-      store = self._approval_store
-      if store is not None:
-        try:
-          latest = await store.get(request.approval_id)
-          if latest is not None and latest.state == "pending_user":
-            await store.transition_state(
-              latest.approval_id,
-              "expired",
-              expected_state_version=latest.state_version,
-              decision_reason="Timed out waiting for user approval",
-            )
-        except Exception:
-          log.warning("Failed to expire timed-out approval request %s", request.approval_id, exc_info=True)
-      return None
-    finally:
-      session.pending_tools.pop(request.tool_call_id, None)
-      session.approval_queues.pop(request.tool_call_id, None)
+    return await _approval_lifecycle_helpers.await_user_approval_via_pending_tools(
+      session=self._session,
+      approval_store=self._approval_store,
+      event_log=self._event_log,
+      request=request,
+      decision=decision,
+      nonce=nonce,
+      resolved_qualifier=resolved_qualifier,
+      allow_persistent=allow_persistent,
+      timeout_seconds=timeout_seconds,
+      log=log,
+    )
 
   def _resolve_run_context(self) -> RunContext:
     if self._run_context is not None:
@@ -921,17 +743,26 @@ class ToolDispatcher:
     )
 
   def _resolve_tool_class(self, tool_name: str) -> str:
-    try:
-      from agent.shared.server_policies import get_server_for_policy_tool, get_tool_class
-
-      server = self._mcp.get_server_for_tool(tool_name) if self._mcp.is_mcp_tool(tool_name) else None
-      server = server or get_server_for_policy_tool(tool_name)
-      if server:
-        cls = get_tool_class(server, tool_name)
-        if cls is not None:
-          return cls
-    except Exception:
-      pass
+    is_mcp_tool = getattr(self._mcp, "is_mcp_tool", None)
+    get_server_for_tool = getattr(self._mcp, "get_server_for_tool", None)
+    server = (
+      get_server_for_tool(tool_name)
+      if callable(is_mcp_tool) and callable(get_server_for_tool) and is_mcp_tool(tool_name)
+      else None
+    )
+    policy_tool_name = tool_name
+    if server:
+      original_tool_name = getattr(self._mcp, "get_original_tool_name", None)
+      if callable(original_tool_name):
+        policy_tool_name = original_tool_name(tool_name)
+    cls = resolve_server_policy_tool_class(
+      tool_name,
+      policy_tool_name=policy_tool_name,
+      runtime_server=server,
+      default="",
+    )
+    if cls:
+      return cls
     try:
       from agent.shared.tool_catalog import GATED_ADDIN_TOOLS
 
@@ -942,26 +773,21 @@ class ToolDispatcher:
     return "state_write"
 
   def _redact_for_approval_request(self, tool_name: str, tool_input: Dict[str, Any]) -> tuple[dict[str, Any], str]:
-    try:
-      from agent.shared.tool_redaction import get_audit_hmac_secret, get_audit_hmac_key_id, hmac_value, redact_tool_input
-
-      secret = get_audit_hmac_secret()
-      key_id = get_audit_hmac_key_id()
-      redacted = redact_tool_input(
-        tool_name,
-        tool_input,
-        deployment_secret=secret,
-        key_id=key_id,
-        redaction_scope="fresh_raw",
-      )
-      redacted = enrich_trade_approval_args(tool_name, redacted, event_log=self._event_log)
-      args_hash = hmac_value(tool_input, deployment_secret=secret, key_id=key_id)
-      return redacted, args_hash
-    except Exception:
-      return {}, sha256_args(tool_input)
+    return _approval_lifecycle_helpers.redact_for_approval_request(
+      tool_name,
+      tool_input,
+      event_log=self._event_log,
+      enrich_trade_approval_args_fn=enrich_trade_approval_args,
+      sha256_args_fn=sha256_args,
+    )
 
   def _approval_transport_input(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
-    return enrich_trade_approval_args(tool_name, dict(tool_input), event_log=self._event_log)
+    return _approval_lifecycle_helpers.approval_transport_input(
+      tool_name,
+      tool_input,
+      event_log=self._event_log,
+      enrich_trade_approval_args_fn=enrich_trade_approval_args,
+    )
 
   def _effective_trade_approval_decision(
     self,
@@ -969,16 +795,14 @@ class ToolDispatcher:
     tool_args_redacted: Dict[str, Any],
     decision: PolicyApprovalDecision,
   ) -> PolicyApprovalDecision:
-    expiry_seconds = effective_trade_approval_expiry_seconds(
+    return _approval_lifecycle_helpers.effective_trade_approval_decision(
       tool_name,
       tool_args_redacted,
-      requested_expiry_seconds=decision.expiry_seconds,
-      max_wait_seconds=approval_settings.approval_wait_seconds(),
-      now=utc_now(),
+      decision,
+      effective_trade_approval_expiry_seconds_fn=effective_trade_approval_expiry_seconds,
+      approval_wait_seconds_fn=approval_settings.approval_wait_seconds,
+      utc_now_fn=utc_now,
     )
-    if expiry_seconds == decision.expiry_seconds:
-      return decision
-    return replace(decision, expiry_seconds=expiry_seconds)
 
   async def _emit_execution_audit(
     self,
@@ -1005,7 +829,6 @@ class ToolDispatcher:
     finally:
       raw_args.clear()
       del raw_args
-
   async def _call_mcp_tool(
     self,
     tool_name: str,

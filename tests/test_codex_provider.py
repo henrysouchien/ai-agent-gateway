@@ -13,8 +13,10 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.providers import CodexProvider
+from agent_gateway.providers.base import ThinkingLevel
 import agent_gateway.providers.codex as codex_provider_module
 import agent_gateway.providers.codex_helpers as codex_helpers
+import agent_gateway.providers.codex_model_info as codex_model_info
 from agent_gateway.providers.codex import (
   JWT_CLAIM_PATH,
   _ResponsesStreamState,
@@ -72,6 +74,16 @@ def test_codex_provider_helper_exports_are_parent_aliases() -> None:
 
   for name in helper_names:
     assert getattr(codex_provider_module, name) is getattr(codex_helpers, name)
+
+  model_info_helper_names = (
+    "_MODEL_INFO_BY_TAG",
+    "_model_matches_tag",
+    "_map_reasoning_effort",
+    "_clamp_reasoning_effort",
+  )
+
+  for name in model_info_helper_names:
+    assert getattr(codex_helpers, name) is getattr(codex_model_info, name)
 
 
 def _fake_jwt(account_id: str) -> str:
@@ -158,6 +170,30 @@ def test_build_request_params_omits_unsupported_temperature() -> None:
   )
 
   assert "temperature" not in params
+
+
+def test_build_request_params_preserves_reasoning_effort_clamps() -> None:
+  provider = CodexProvider()
+
+  gpt55_params = provider.build_request_params(
+    model="gpt-5.5",
+    messages=[{"role": "user", "content": "hello"}],
+    system_prompt="system",
+    tools=[],
+    max_tokens=1024,
+    thinking_level=ThinkingLevel.MINIMAL,
+  )
+  mini_params = provider.build_request_params(
+    model="gpt-5.1-codex-mini",
+    messages=[{"role": "user", "content": "hello"}],
+    system_prompt="system",
+    tools=[],
+    max_tokens=1024,
+    thinking_level=ThinkingLevel.LOW,
+  )
+
+  assert gpt55_params["reasoning"]["effort"] == "low"
+  assert mini_params["reasoning"]["effort"] == "medium"
 
 
 def test_resolve_codex_url_normalizes_backend_api_variants() -> None:

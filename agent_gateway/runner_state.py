@@ -665,6 +665,7 @@ class ToolResultContext:
   result_entry: Dict[str, Any] | None
   skill_run_id: str | None = None
   workspace_dir: str | None = None
+  batch_id: int | str | None = None
 
 
 @dataclass

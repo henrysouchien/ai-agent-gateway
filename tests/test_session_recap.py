@@ -338,6 +338,12 @@ def _transcript_events(transcript_dir: Path, session_id: str) -> list[dict[str, 
   return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _append_transcript_event(transcript_dir: Path, session_id: str, event: dict[str, Any]) -> None:
+  path = transcript_dir / f"{session_id}.jsonl"
+  with open(path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(event) + "\n")
+
+
 def _usage_summary(session_id: str, *, request_id: str = "req-1") -> SessionUsageSummary:
   return SessionUsageSummary(
     user_id="alice",
@@ -381,6 +387,11 @@ def test_post_chat_recap_appends_to_open_event_log(tmp_path: Path) -> None:
       "artifact_ready",
       "session_recap",
     ]
+    assert active_turn.transcript_written_seqs == {2}
+    transcript_events = _transcript_events(tmp_path, session.session_id)
+    assert [event["type"] for event in transcript_events] == ["session_recap"]
+    assert transcript_events[0]["trigger"] == "explicit"
+    assert transcript_events[0]["usage"]["session_id"] == session.session_id
 
   _run(case())
 
@@ -444,7 +455,8 @@ def test_post_chat_recap_auth_scope_and_missing_active_turn_errors(tmp_path: Pat
         headers=_headers(alice),
         json={"session_id": alice["session_id"], "scope": "session_cumulative"},
       )
-      assert cumulative.status_code == 501
+      assert cumulative.status_code == 200
+      assert cumulative.json()["type"] == "session_recap"
 
       invalid_scope = await client.post(
         "/api/chat/recap",
@@ -452,6 +464,132 @@ def test_post_chat_recap_auth_scope_and_missing_active_turn_errors(tmp_path: Pat
         json={"session_id": alice["session_id"], "scope": "unknown"},
       )
       assert invalid_scope.status_code == 400
+
+  _run(case())
+
+
+def test_post_chat_recap_session_cumulative_uses_transcript_without_active_turn(tmp_path: Path) -> None:
+  async def case() -> None:
+    app = _make_recap_app(tmp_path)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session_id = session_info["session_id"]
+      _append_transcript_event(
+        tmp_path,
+        session_id,
+        {
+          "type": "artifact_ready",
+          "artifact_id": "artifact-old",
+          "skill": "html-artifact",
+          "contract_name": "HtmlArtifact",
+          "artifact_path": "artifacts/research/MSFT/html-artifact.json",
+          "ts": 2.0,
+        },
+      )
+      _append_transcript_event(
+        tmp_path,
+        session_id,
+        {
+          "type": "session_recap",
+          "session_id": session_id,
+          "seq_range": [1, 1],
+          "trigger": "explicit",
+          "ts": 3.0,
+        },
+      )
+
+      response = await client.post(
+        "/api/chat/recap",
+        headers=_headers(session_info),
+        json={"session_id": session_id, "scope": "session_cumulative"},
+      )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["type"] == "session_recap"
+    assert payload["seq_range"] == [1, 1]
+    assert [artifact["artifact_id"] for artifact in payload["artifacts"]] == ["artifact-old"]
+    assert [event["type"] for event in _transcript_events(tmp_path, session_id)] == [
+      "artifact_ready",
+      "session_recap",
+      "session_recap",
+    ]
+
+  _run(case())
+
+
+def test_post_chat_recap_session_cumulative_includes_unwritten_active_turn(tmp_path: Path) -> None:
+  async def case() -> None:
+    app = _make_recap_app(tmp_path)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+      _append_transcript_event(
+        tmp_path,
+        session.session_id,
+        {
+          "type": "artifact_ready",
+          "artifact_id": "artifact-old",
+          "skill": "html-artifact",
+          "contract_name": "HtmlArtifact",
+          "artifact_path": "artifacts/research/MSFT/html-artifact.json",
+          "ts": 2.0,
+        },
+      )
+      active_turn = _attach_active_turn(session)
+
+      response = await client.post(
+        "/api/chat/recap",
+        headers=_headers(session_info),
+        json={"session_id": session.session_id, "scope": "session_cumulative"},
+      )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["seq_range"] == [1, 2]
+    assert [artifact["artifact_id"] for artifact in payload["artifacts"]] == ["artifact-old", "artifact-1"]
+    assert [entry.event["type"] for entry in active_turn.event_log.entries] == [
+      "artifact_ready",
+      "session_recap",
+    ]
+    assert active_turn.transcript_written_seqs == {1, 2}
+    assert [event["type"] for event in _transcript_events(tmp_path, session.session_id)] == [
+      "artifact_ready",
+      "artifact_ready",
+      "session_recap",
+    ]
+
+  _run(case())
+
+
+def test_post_chat_recap_session_cumulative_flushes_closed_active_turn(tmp_path: Path) -> None:
+  async def case() -> None:
+    app = _make_recap_app(tmp_path)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+      active_turn = _attach_active_turn(session, closed=True)
+
+      response = await client.post(
+        "/api/chat/recap",
+        headers=_headers(session_info),
+        json={"session_id": session.session_id, "scope": "session_cumulative"},
+      )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["seq_range"] == [1, 2]
+    assert active_turn.transcript_written_seqs == {1, 2}
+    assert [event["type"] for event in _transcript_events(tmp_path, session.session_id)] == [
+      "artifact_ready",
+      "stream_complete",
+      "session_recap",
+    ]
 
   _run(case())
 

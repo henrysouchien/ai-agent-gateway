@@ -22,12 +22,26 @@ def system_prompt_text(system_prompt: Optional[Union[str, List[Tuple[str, bool]]
   return ""
 
 
-def system_prompt_requires_tool_only_turns(system_prompt: Optional[Union[str, List[Tuple[str, bool]]]]) -> bool:
-  text = system_prompt_text(system_prompt).lower()
+def _text_requires_tool_only_turns(text: str) -> bool:
+  normalized = text.lower().replace("`", "")
   return (
-    "tool-call messages are tool-only" in text
-    or "every assistant message that contains any tool call must contain zero visible text" in text
+    "tool-call messages are tool-only" in normalized
+    or "every assistant message that contains any tool call must contain zero visible text" in normalized
+    or (
+      "tool-only" in normalized
+      and "text=0" in normalized
+      and (
+        "assistant message" in normalized
+        or "tool turn" in normalized
+        or "tool-call message" in normalized
+        or "tool call" in normalized
+      )
+    )
   )
+
+
+def system_prompt_requires_tool_only_turns(system_prompt: Optional[Union[str, List[Tuple[str, bool]]]]) -> bool:
+  return _text_requires_tool_only_turns(system_prompt_text(system_prompt))
 
 
 def message_content_text(content: Any) -> str:
@@ -57,10 +71,6 @@ def messages_require_tool_only_turns(messages: List[Dict[str, Any]]) -> bool:
   for message in messages:
     if not isinstance(message, dict):
       continue
-    text = message_content_text(message.get("content")).lower()
-    if (
-      "tool-call messages are tool-only" in text
-      or "every assistant message that contains any tool call must contain zero visible text" in text
-    ):
+    if _text_requires_tool_only_turns(message_content_text(message.get("content"))):
       return True
   return False

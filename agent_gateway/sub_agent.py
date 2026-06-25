@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import datetime
+import json
+import logging
 import secrets
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from .autonomous_output import extract_state_update
 from ._provider_utils import _get_allowed_models_for_provider_name, sub_agent_default_model
 from .events import SkillRunStartedEvent, event_to_dict
 from .event_log import EventLog
 from .runner import _derive_sub_agent_id
 from .session import GatewaySession
 from .skill_result_events import build_skill_result_captured_event
-from .skills import SkillLoader, resolve_blocks
+from .skills import SkillLoader, SkillStateStore, resolve_blocks
 from .sub_agent_helpers import (
   DEFAULT_SUB_AGENT_TIMEOUT_SECONDS as DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
   ExcludedToolsResolver as ExcludedToolsResolver,
@@ -50,7 +53,9 @@ from .sub_agent_helpers import (
   make_run_agent_tool_def as make_run_agent_tool_def,
   make_send_message_tool_def as make_send_message_tool_def,
 )
-from .task_registry import CoordinatorConfig, ParentMessage, ProviderResolver
+from .sub_agent_messages import make_send_message_handler as _make_send_message_handler
+from . import sub_agent_tool_definitions as _sub_agent_tool_definitions
+from .task_registry import CoordinatorConfig, ProviderResolver
 from .tool_dispatcher import ToolDispatcher
 from .transcript import (
   build_synthetic_tool_results,
@@ -61,34 +66,52 @@ from .transcript import (
 )
 
 
+log = logging.getLogger("agent_gateway.sub_agent")
+
+
 def _child_tool_definitions_getter(
   *,
   runner: Any,
   mcp_client: Any,
   excluded_tools: set[str],
+  extra_tool_definitions: list[dict[str, Any]] | None = None,
 ) -> Callable[[], list[dict[str, Any]]] | None:
-  child_excluded_tools = {str(name) for name in excluded_tools}
-  parent_get_tool_definitions = getattr(runner, "_get_tool_definitions", None)
-  mcp_get_tool_definitions = getattr(mcp_client, "get_tool_definitions", None)
-  if not callable(parent_get_tool_definitions) and not callable(mcp_get_tool_definitions):
-    return None
+  return _sub_agent_tool_definitions.child_tool_definitions_getter(
+    runner=runner,
+    mcp_client=mcp_client,
+    excluded_tools=excluded_tools,
+    extra_tool_definitions=extra_tool_definitions,
+  )
 
-  def _child_tool_definitions() -> list[dict[str, Any]]:
-    if callable(parent_get_tool_definitions):
-      definitions = list(parent_get_tool_definitions())
-    elif callable(mcp_get_tool_definitions):
-      definitions = list(mcp_get_tool_definitions())
-    else:
-      definitions = []
-    if not child_excluded_tools:
-      return definitions
-    return [
-      definition
-      for definition in definitions
-      if str(definition.get("name") or "") not in child_excluded_tools
-    ]
 
-  return _child_tool_definitions
+def _artifact_emit_tool_definitions(installed_tool_names: set[str]) -> list[dict[str, Any]]:
+  return _sub_agent_tool_definitions.artifact_emit_tool_definitions(
+    installed_tool_names,
+    artifact_emit_tools=_ARTIFACT_EMIT_TOOLS,
+  )
+
+
+def _result_response_text(result: Any | None) -> str:
+  if isinstance(result, dict):
+    response = result.get("response")
+    return response if isinstance(response, str) else ""
+  if result is None:
+    return ""
+  return str(result)
+
+
+def _skill_state_prompt(skill_name: str, previous_state: dict[str, Any]) -> str:
+  state_json = json.dumps(previous_state, indent=2, sort_keys=True)
+  return (
+    "## Persisted Skill State\n"
+    f"Previous state for `{skill_name}`:\n"
+    "```json\n"
+    f"{state_json}\n"
+    "```\n\n"
+    "Use this state as continuity context when it is relevant. To update the "
+    "persisted state, include a final `## STATE_UPDATE_JSON` section containing "
+    "a fenced JSON object. Omitted keys keep their previous values."
+  )
 
 
 def make_run_agent_handler(
@@ -116,6 +139,7 @@ def make_run_agent_handler(
   on_background_complete: Callable[[Any], Awaitable[None]] | None = None,
   provider_resolver: ProviderResolver | None = None,
   outputs_dir: Path | None = None,
+  skill_state_store: SkillStateStore | None = None,
   coordinator_config: CoordinatorConfig | None = None,
   approval_key_qualifier: Callable[[str, dict[str, Any]], str] | None = None,
 ):
@@ -129,6 +153,7 @@ def make_run_agent_handler(
     allowed_models if allowed_models is not None else _get_allowed_models_for_provider_name("anthropic")
   )
   effective_coordinator = coordinator_config if coordinator_config is not None and coordinator_config.enabled else None
+  skill_state_lock = asyncio.Lock()
 
   async def _handle_run_agent(tool_input: dict[str, Any], **kwargs: Any):
     runner = runner_ref[0]
@@ -211,6 +236,13 @@ def make_run_agent_handler(
         skill_prompt=skill_prompt,
         date=datetime.date.today().isoformat(),
       )
+      if profile.persist_state and skill_state_store is not None:
+        try:
+          previous_state = skill_state_store.get(profile.name)
+        except Exception:
+          log.warning("Failed to load persisted state for skill %s", profile.name, exc_info=True)
+          previous_state = {}
+        system_prompt = f"{system_prompt}\n\n{_skill_state_prompt(profile.name, previous_state)}"
       effective_max_turns = profile.max_turns if profile.max_turns is not None else default_max_turns
       effective_timeout = profile.timeout if profile.timeout is not None else default_timeout
       effective_max_tokens = profile.max_tokens if profile.max_tokens is not None else default_max_tokens
@@ -334,6 +366,33 @@ def make_run_agent_handler(
         )
       )
 
+    async def _persist_skill_state(result: Any | None, error: dict[str, Any] | None) -> None:
+      if not (agent_name and profile is not None and profile.persist_state and skill_state_store is not None):
+        return
+      response_text = _result_response_text(result)
+      try:
+        model_state = extract_state_update(response_text)
+      except Exception:
+        log.warning("Failed to extract state update for skill %s", profile.name, exc_info=True)
+        model_state = {}
+      async with skill_state_lock:
+        try:
+          previous_state = skill_state_store.get(profile.name)
+          next_state = dict(previous_state)
+          next_state.update(model_state)
+          next_state["last_run"] = datetime.datetime.now(datetime.UTC).isoformat()
+          next_state["model"] = effective_model
+          next_state["run_count"] = int(previous_state.get("run_count", 0) or 0) + 1
+          if profile.version is not None:
+            next_state["version"] = profile.version
+          if error:
+            next_state["last_error"] = dict(error)
+          else:
+            next_state.pop("last_error", None)
+          skill_state_store.set(profile.name, next_state)
+        except Exception:
+          log.warning("Failed to persist state for skill %s", profile.name, exc_info=True)
+
     if skill_run_id and profile is not None and agent_name:
       child_excluded = _skill_html_excluded_tools(effective_excluded, skill_profile=profile)
       if "emit_html_artifact" not in child_excluded:
@@ -381,6 +440,11 @@ def make_run_agent_handler(
         runner=runner,
         mcp_client=mcp_client,
         excluded_tools=child_excluded,
+        extra_tool_definitions=(
+          _artifact_emit_tool_definitions(set(sub_local))
+          if profile is not None
+          else None
+        ),
       ),
     )
 
@@ -447,6 +511,7 @@ def make_run_agent_handler(
       async def _on_background_complete(bg_task: Any) -> None:
         if on_background_complete is not None:
           await on_background_complete(bg_task)
+        await _persist_skill_state(bg_task.result, bg_task.error)
         _emit_skill_result_captured(bg_task.result, bg_task.error)
 
       return await runner._register_background_task(
@@ -458,6 +523,7 @@ def make_run_agent_handler(
         on_complete=_on_background_complete if (skill_run_id or on_background_complete is not None) else None,
       )
     result, error = await _dispatch_sub_agent(tool_input, call_index=call_index)
+    await _persist_skill_state(result, error)
     _emit_skill_result_captured(result, error)
     return result, error
 
@@ -779,6 +845,7 @@ def make_resume_handler(
         runner=runner,
         mcp_client=mcp_client,
         excluded_tools=child_excluded,
+        extra_tool_definitions=_artifact_emit_tool_definitions(set(sub_local)),
       ),
     )
 
@@ -852,81 +919,7 @@ def make_resume_handler(
 
 
 def make_send_message_handler(runner_ref: list[Any]):
-  """Build send_message handler using runner_ref late binding."""
-
-  async def _handle_send_message(tool_input: dict[str, Any], **kwargs: Any):
-    _ = kwargs
-    runner = runner_ref[0]
-    if runner is None:
-      return None, {"code": "internal_error", "message": "Runner not initialized"}
-    registry = getattr(runner, "_task_registry", None)
-    if registry is None:
-      return None, {"code": "not_available", "message": "Task registry not configured"}
-
-    target = tool_input.get("to", "")
-    if isinstance(target, str):
-      target = target.strip()
-    if not target or not isinstance(target, str):
-      return None, {"code": "invalid_input", "message": "'to' is required"}
-
-    message = tool_input.get("message", "")
-    if isinstance(message, str):
-      message = message.strip()
-    if not message or not isinstance(message, str):
-      return None, {"code": "invalid_input", "message": "'message' is required"}
-
-    entry = registry.get(target)
-    if entry is None:
-      from .task_registry import TaskState
-
-      matches = [entry for entry in registry.list_tasks(state=TaskState.RUNNING) if entry.agent_name == target]
-      if len(matches) > 1:
-        ids = ", ".join(entry.task_id for entry in matches)
-        return None, {
-          "code": "ambiguous_target",
-          "message": f"Multiple running agents named '{target}': {ids}. Use task_id instead.",
-        }
-      entry = matches[0] if matches else None
-
-    if entry is None:
-      return None, {"code": "not_found", "message": f"No running agent: {target}"}
-    if entry.completed:
-      return None, {"code": "already_completed", "message": f"Agent {target} already finished"}
-
-    message_id = str(tool_input.get("message_id") or uuid.uuid4())
-    if message_id in entry.delivered_messages:
-      return {"status": "delivered", "task_id": entry.task_id}, None
-
-    sent_at = datetime.datetime.now(datetime.UTC).timestamp()
-    append_durable_event = getattr(runner, "_append_durable_event", None)
-    if append_durable_event is not None:
-      metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
-      await append_durable_event(
-        {
-          "type": "parent_message_sent",
-          "task_id": entry.task_id,
-          "owner_runner_id": metadata.get("owner_runner_id", getattr(runner, "_runner_id", None)),
-          "owner_role": metadata.get("owner_role", getattr(runner, "_role", None)),
-          "sub_agent_id": metadata.get("sub_agent_id"),
-          "parent_turn_id": metadata.get("parent_turn_id"),
-          "call_index": metadata.get("call_index"),
-          "task_type": metadata.get("task_type", "background"),
-          "provider_name": metadata.get("provider_name", entry.provider_name),
-          "model": metadata.get("model", entry.model),
-          "message_id": message_id,
-          "sender": {
-            "session_id": getattr(runner, "_full_session_id", None),
-            "user_id": getattr(runner, "_usage_user_id", None),
-          },
-          "sent_at": sent_at,
-          "message": message,
-        }
-      )
-    await entry.message_inbox.put(ParentMessage(message_id=message_id, text=message, sent_at=sent_at))
-    entry.delivered_messages.add(message_id)
-    return {"status": "delivered", "task_id": entry.task_id}, None
-
-  return _handle_send_message
+  return _make_send_message_handler(runner_ref)
 
 
 
