@@ -17,7 +17,9 @@ from . import mcp_client_connections as _connection_helpers
 from . import mcp_client_config as _config_helpers
 from . import mcp_client_errors as _error_helpers
 from . import mcp_client_oauth_storage as _oauth_storage
+from . import mcp_client_policy_owner as _policy_owner_helpers
 from . import mcp_client_runtime as _runtime_helpers
+from . import mcp_client_startup as _startup_helpers
 from .policy_imports import load_server_policy_helpers
 
 try:
@@ -72,6 +74,59 @@ _MCP_STDIO_CONNECT_BACKOFF_DEFAULT = _config_helpers.MCP_STDIO_CONNECT_BACKOFF_D
 _MCP_STDIO_CONNECT_STABILIZE_DEFAULT = _config_helpers.MCP_STDIO_CONNECT_STABILIZE_DEFAULT
 _MCP_STDIO_RETRYABLE_EXCEPTION_NAMES = _config_helpers.MCP_STDIO_RETRYABLE_EXCEPTION_NAMES
 _MCP_STDIO_RETRYABLE_MESSAGE_MARKERS = _config_helpers.MCP_STDIO_RETRYABLE_MESSAGE_MARKERS
+_PROVIDER_SYMBOL_SYMBOL_TOOLS = frozenset({
+  "compare_peers",
+  "fmp_fetch",
+  "fmp_market_cap_check",
+  "get_earnings_transcript",
+  "get_etf_holdings",
+  "get_insider_trades",
+  "get_institutional_ownership",
+  "get_price_performance_windows",
+  "get_technical_analysis",
+  "industry_peer_comparison",
+})
+_PROVIDER_SYMBOL_TICKER_TOOLS = frozenset({
+  "cite_concept",
+  "concept_trend",
+  "describe_filing",
+  "get_concept",
+  "get_estimate_revisions",
+  "get_event_filings",
+  "get_extraction_series",
+  "get_filing_cover_facts",
+  "get_filing_document",
+  "get_filing_evidence",
+  "get_filing_extractions",
+  "get_filing_sections",
+  "get_filing_tables",
+  "get_filings",
+  "get_financials",
+  "get_metric",
+  "get_metric_series",
+  "get_operational_kpi_drivers",
+  "get_statement",
+  "list_metrics",
+  "search_extractions",
+  "search_filing_tables",
+  "search_filing_text",
+  "search_metrics",
+})
+_PROVIDER_SYMBOL_SCALAR_KEYS: dict[str, tuple[str, ...]] = {
+  **{tool: ("symbol",) for tool in _PROVIDER_SYMBOL_SYMBOL_TOOLS},
+  **{tool: ("ticker",) for tool in _PROVIDER_SYMBOL_TICKER_TOOLS},
+}
+_PROVIDER_SYMBOL_COMMA_KEYS: dict[str, str] = {
+  "get_events_calendar": "symbols",
+  "get_news": "symbols",
+  "get_sector_overview": "symbols",
+  "screen_estimate_revisions": "tickers",
+}
+_PROVIDER_SYMBOL_TOOL_NAMES = (
+  frozenset(_PROVIDER_SYMBOL_SCALAR_KEYS)
+  | frozenset(_PROVIDER_SYMBOL_COMMA_KEYS)
+  | frozenset({"fmp_profile"})
+)
 
 
 def _resolve_mcp_config_path(config_path: Path | str | None | object = _UNSET) -> Path | None:
@@ -299,138 +354,23 @@ class McpClientManager:
     self,
     mcp_servers: Dict[str, Dict[str, Any]],
   ) -> Dict[str, Dict[str, Any]]:
-    canonical_configs: Dict[str, Dict[str, Any]] = {}
-    source_names: Dict[str, str] = {}
-    for server_name, server_config in mcp_servers.items():
-      canonical_name = self._canonical_server_name(server_name)
-      existing_source = source_names.get(canonical_name)
-      if existing_source is not None:
-        if server_name == canonical_name and existing_source != canonical_name:
-          log.info(
-            "MCP server %s overrides alias %s for canonical server %s",
-            server_name,
-            existing_source,
-            canonical_name,
-          )
-          canonical_configs[canonical_name] = server_config
-          source_names[canonical_name] = server_name
-        else:
-          log.warning(
-            "Skipping MCP server %s: resolves to already configured canonical server %s",
-            server_name,
-            canonical_name,
-          )
-        continue
-
-      if server_name != canonical_name:
-        log.info("Using MCP server alias %s as %s", server_name, canonical_name)
-      canonical_configs[canonical_name] = server_config
-      source_names[canonical_name] = server_name
-    return canonical_configs
+    return _startup_helpers.canonicalize_server_configs(
+      mcp_servers,
+      canonical_server_name=self._canonical_server_name,
+      logger=log,
+    )
 
   async def startup(self, allowed_servers: Set[str] | None = None) -> None:
     async with self._lock:
       if self._started:
         return
-
-      self._startup_diagnostics = {}
-      requested_servers = (
-        self._canonical_server_names(set(allowed_servers))
-        if allowed_servers is not None
-        else None
+      await _startup_helpers.startup_manager(
+        self,
+        allowed_servers,
+        mcp_import_error=MCP_IMPORT_ERROR,
+        supported_server_types=set(_SUPPORTED_SERVER_TYPES),
+        logger=log,
       )
-
-      if MCP_IMPORT_ERROR is not None:
-        log.warning("MCP runtime unavailable; skipping startup: %s", MCP_IMPORT_ERROR)
-        for server_name in sorted(requested_servers or set()):
-          self._set_startup_diagnostic(
-            server_name,
-            category="runtime_unavailable",
-            message=f"MCP runtime unavailable: {MCP_IMPORT_ERROR}",
-            retryable=False,
-            error_type=type(MCP_IMPORT_ERROR).__name__,
-          )
-        self._started = True
-        return
-
-      config = self._read_claude_config()
-      mcp_servers = config.get("mcpServers", {})
-      if not isinstance(mcp_servers, dict):
-        mcp_servers = {}
-      mcp_servers = dict(mcp_servers)
-      mcp_servers.update(self._inline_servers)
-
-      effective_allowed_servers = self._allowed_servers
-      if requested_servers is not None:
-        if effective_allowed_servers is None:
-          effective_allowed_servers = requested_servers
-        else:
-          not_allowed = requested_servers - effective_allowed_servers
-          for server_name in sorted(not_allowed):
-            self._set_startup_diagnostic(
-              server_name,
-              category="not_allowed",
-              message="server requested for startup but absent from the MCP allowlist",
-              retryable=False,
-            )
-          effective_allowed_servers = set(effective_allowed_servers) & requested_servers
-
-      if not mcp_servers:
-        missing_config_targets = effective_allowed_servers if requested_servers is not None else set()
-        for server_name in sorted(missing_config_targets or set()):
-          self._set_startup_diagnostic(
-            server_name,
-            category="config_missing",
-            message="server requested for startup but absent from the MCP config",
-            retryable=False,
-          )
-        self._started = True
-        return
-      mcp_servers = self._canonicalize_server_configs(mcp_servers)
-
-      if requested_servers is not None and effective_allowed_servers is not None:
-        for server_name in sorted(effective_allowed_servers - set(mcp_servers)):
-          self._set_startup_diagnostic(
-            server_name,
-            category="config_missing",
-            message="server requested for startup but absent from the MCP config",
-            retryable=False,
-          )
-
-      connect_jobs: list[tuple[str, Dict[str, Any]]] = []
-      for server_name, server_config in mcp_servers.items():
-        if effective_allowed_servers is not None and server_name not in effective_allowed_servers:
-          continue
-        if not isinstance(server_config, dict):
-          log.warning("Skipping MCP server %s: invalid config", server_name)
-          self._set_startup_diagnostic(
-            server_name,
-            category="invalid_config",
-            message="invalid MCP server config",
-            retryable=False,
-          )
-          continue
-
-        server_type = str(server_config.get("type", "stdio")).strip().lower()
-        if server_type not in _SUPPORTED_SERVER_TYPES:
-          log.info("Skipping MCP server %s: unsupported type %s", server_name, server_type)
-          self._set_startup_diagnostic(
-            server_name,
-            category="unsupported_type",
-            message=f"unsupported MCP server type: {server_type}",
-            retryable=False,
-          )
-          continue
-
-        connect_jobs.append((server_name, server_config))
-
-      if connect_jobs:
-        for state in await self._connect_startup_servers(connect_jobs):
-          if state is not None:
-            self._servers[state.name] = state
-
-      self._apply_collision_filtering()
-      self._started = True
 
   def _connection_runtime(self) -> _connection_helpers.McpConnectionRuntime:
     return _connection_helpers.McpConnectionRuntime(
@@ -588,6 +528,50 @@ class McpClientManager:
     exposed_name = f"{state.tool_prefix}{original_name}" if state.tool_prefix else original_name
     return exposed_name if self._tool_to_server.get(exposed_name) == server_name else None
 
+  def _translate_provider_symbol(
+    self,
+    original_name: str,
+    tool_input: Dict[str, Any],
+  ) -> Dict[str, Any]:
+    try:
+      if original_name not in _PROVIDER_SYMBOL_TOOL_NAMES:
+        return tool_input
+
+      from research.source_html import sec_native_symbol_cached_only
+
+      def translate(value: Any) -> Any:
+        return sec_native_symbol_cached_only(value) or value
+
+      if original_name == "fmp_profile":
+        translated = dict(tool_input)
+        present_keys = [key for key in ("symbol", "ticker") if key in translated]
+        translated_values = {key: translate(translated[key]) for key in present_keys}
+        if len(present_keys) == 2 and translated_values["symbol"] != translated_values["ticker"]:
+          return translated
+        for key, value in translated_values.items():
+          translated[key] = value
+        return translated
+
+      scalar_keys = _PROVIDER_SYMBOL_SCALAR_KEYS.get(original_name)
+      if scalar_keys is not None:
+        translated = dict(tool_input)
+        for key in scalar_keys:
+          if key in translated:
+            translated[key] = translate(translated[key])
+        return translated
+
+      comma_key = _PROVIDER_SYMBOL_COMMA_KEYS.get(original_name)
+      if comma_key is not None:
+        translated = dict(tool_input)
+        value = translated.get(comma_key)
+        if isinstance(value, str):
+          translated[comma_key] = ",".join(str(translate(token)) for token in value.split(","))
+        return translated
+
+      return tool_input
+    except Exception:
+      return tool_input
+
   async def call_tool(
     self,
     name: str,
@@ -605,12 +589,13 @@ class McpClientManager:
     original_name = self._prefixed_to_original.get(name, name)
 
     timeout_seconds = self._timeout_for_tool(server_name, name, original_name)
+    effective_input = self._translate_provider_symbol(original_name, tool_input)
 
     try:
       result = await self._call_tool_once(
         server=server,
         original_name=original_name,
-        tool_input=tool_input,
+        tool_input=effective_input,
         meta=meta,
         abort_event=abort_event,
         timeout_seconds=timeout_seconds,
@@ -621,7 +606,7 @@ class McpClientManager:
           server_name=server_name,
           server=server,
           original_name=original_name,
-          tool_input=tool_input,
+          tool_input=effective_input,
           meta=meta,
           abort_event=abort_event,
           timeout_seconds=timeout_seconds,
@@ -820,6 +805,16 @@ class McpClientManager:
     *,
     policy_server_for_tool: Callable[[str], str | None] | None = None,
   ) -> None:
+    if policy_server_for_tool is None:
+      _get_forbidden_tools_for_session, get_server_for_policy_tool, _get_tool_class = load_server_policy_helpers()
+      if get_server_for_policy_tool is None:
+        log.warning("Skipping MCP policy-owner invariant: server policy module unavailable")
+      else:
+        policy_server_for_tool = get_server_for_policy_tool
+
+    if policy_server_for_tool is not None:
+      self._prefilter_policy_owner_mismatches(policy_server_for_tool=policy_server_for_tool)
+
     result = _catalog_helpers.apply_collision_filtering(
       servers=self._servers,
       builtin_tool_names=self._builtin_tool_names,
@@ -830,7 +825,53 @@ class McpClientManager:
     self._tool_to_server = result.tool_to_server
     self._prefixed_to_original = result.prefixed_to_original
     self._mcp_tool_names = result.mcp_tool_names
-    self._apply_policy_owner_invariant(policy_server_for_tool=policy_server_for_tool)
+    if policy_server_for_tool is not None:
+      self._apply_policy_owner_invariant(policy_server_for_tool=policy_server_for_tool)
+
+  def _prefilter_policy_owner_mismatches(
+    self,
+    *,
+    policy_server_for_tool: Callable[[str], str | None],
+  ) -> None:
+    for server_name, state in self._servers.items():
+      kept_tool_definitions: list[dict[str, Any]] = []
+      mismatches: list[tuple[str, str]] = []
+      for tool_def in state.tool_definitions:
+        original_name = str(tool_def.get("name") or "").strip()
+        if not original_name:
+          kept_tool_definitions.append(tool_def)
+          continue
+        policy_server = policy_server_for_tool(original_name)
+        if policy_server and policy_server != server_name:
+          mismatches.append((original_name, policy_server))
+          continue
+        kept_tool_definitions.append(tool_def)
+
+      if not mismatches:
+        continue
+
+      state.tool_definitions = kept_tool_definitions
+      state.tool_names = {
+        f"{state.tool_prefix}{tool_def['name']}" if state.tool_prefix else tool_def["name"]
+        for tool_def in kept_tool_definitions
+        if isinstance(tool_def.get("name"), str)
+      }
+      mismatch_summary = ", ".join(
+        f"{original_name}->{policy_server}"
+        for original_name, policy_server in mismatches
+      )
+      message = (
+        "MCP runtime owner does not match gateway policy owner; "
+        f"pre-filtering tools before catalog merge: {mismatch_summary}"
+      )
+      self._set_startup_diagnostic(
+        server_name,
+        category="policy_owner_mismatch",
+        message=message,
+        retryable=False,
+        error_type="PolicyOwnerMismatch",
+      )
+      log.error("%s on runtime server %s", message, server_name)
 
   def _apply_policy_owner_invariant(
     self,
@@ -844,63 +885,20 @@ class McpClientManager:
         return
       policy_server_for_tool = get_server_for_policy_tool
 
-    hidden_by_server: dict[str, list[tuple[str, str, str]]] = {}
-    for exposed_name, runtime_server in sorted(self._tool_to_server.items()):
-      original_name = self._prefixed_to_original.get(exposed_name, exposed_name)
-      policy_server = policy_server_for_tool(original_name)
-      if policy_server and policy_server != runtime_server:
-        hidden_by_server.setdefault(runtime_server, []).append(
-          (exposed_name, original_name, policy_server)
-        )
-
-    if not hidden_by_server:
-      return
-
-    hidden_names = {
-      exposed_name
-      for mismatches in hidden_by_server.values()
-      for exposed_name, _original_name, _policy_server in mismatches
-    }
-    self._tool_definitions = [
-      tool_def
-      for tool_def in self._tool_definitions
-      if tool_def.get("name") not in hidden_names
-    ]
-    for exposed_name in hidden_names:
-      self._tool_to_server.pop(exposed_name, None)
-      self._prefixed_to_original.pop(exposed_name, None)
-      self._mcp_tool_names.discard(exposed_name)
-
-    for runtime_server, mismatches in hidden_by_server.items():
-      server_hidden_names = {
-        exposed_name
-        for exposed_name, _original_name, _policy_server in mismatches
-      }
-      state = self._servers.get(runtime_server)
-      if state is not None:
-        state.tool_definitions = [
-          tool_def
-          for tool_def in state.tool_definitions
-          if tool_def.get("name") not in server_hidden_names
-        ]
-        state.tool_names.difference_update(server_hidden_names)
-
-      mismatch_summary = ", ".join(
-        f"{exposed_name}({original_name}->{policy_server})"
-        for exposed_name, original_name, policy_server in mismatches
-      )
-      message = (
-        "MCP runtime owner does not match gateway policy owner; "
-        f"hiding tools: {mismatch_summary}"
-      )
-      self._set_startup_diagnostic(
-        runtime_server,
-        category="policy_owner_mismatch",
-        message=message,
-        retryable=False,
-        error_type="PolicyOwnerMismatch",
-      )
-      log.error("%s on runtime server %s", message, runtime_server)
+    result = _policy_owner_helpers.apply_policy_owner_invariant(
+      servers=self._servers,
+      tool_definitions=self._tool_definitions,
+      tool_to_server=self._tool_to_server,
+      prefixed_to_original=self._prefixed_to_original,
+      mcp_tool_names=self._mcp_tool_names,
+      policy_server_for_tool=policy_server_for_tool,
+      set_startup_diagnostic=self._set_startup_diagnostic,
+      logger=log,
+    )
+    self._tool_definitions = result.tool_definitions
+    self._tool_to_server = result.tool_to_server
+    self._prefixed_to_original = result.prefixed_to_original
+    self._mcp_tool_names = result.mcp_tool_names
 
   @staticmethod
   def _extract_text(content: Any) -> str:

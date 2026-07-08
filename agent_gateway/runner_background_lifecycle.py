@@ -40,6 +40,7 @@ from .runner_notifications import (
   consume_notifications as _consume_notifications,
   inject_system_prompt_reminder as _inject_system_prompt_reminder,
 )
+from .runner_run_loop_defaults import MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFICATIONS_PER_TURN
 from .runner_session_lifecycle import _runner_attr
 from .runner_state import BackgroundTask
 from .task_registry import TaskEntry, TaskState
@@ -49,7 +50,6 @@ BackgroundTaskHandler = Callable[..., Awaitable[Tuple[Optional[Any], Optional[Di
 BackgroundTaskCallback = Callable[[BackgroundTask | TaskEntry], Awaitable[None] | None]
 
 log = logging.getLogger("agent_gateway.runner")
-_MAX_NOTIFICATIONS_PER_TURN = 5
 
 
 def _runner_module_attr(name: str, fallback: Any) -> Any:

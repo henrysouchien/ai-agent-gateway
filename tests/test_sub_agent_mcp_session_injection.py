@@ -63,7 +63,7 @@ def test_make_run_agent_handler_forwards_meta_user_context_to_dispatcher() -> No
     [runner],
     skill_loader=None,
     mcp_client=_StubMcpClient(),
-    mcp_meta_inject_servers=frozenset({"portfolio-mcp", "research-corpus-mcp"}),
+    mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp", "research-corpus-mcp"}),
     user_id="42",
     credentials_resolver_active=True,
     local_tool_handlers={"keep_tool": _dummy_tool},
@@ -74,6 +74,6 @@ def test_make_run_agent_handler_forwards_meta_user_context_to_dispatcher() -> No
   assert error is None
   assert result == {"response": "ok"}
   dispatcher = runner.calls[0]["dispatcher"]
-  assert dispatcher._mcp_meta_inject_servers == frozenset({"portfolio-mcp", "research-corpus-mcp"})
+  assert dispatcher._mcp_meta_inject_servers == frozenset({"portfolio-reads-mcp", "research-corpus-mcp"})
   assert dispatcher._user_id == "42"
   assert dispatcher._credentials_resolver_active is True

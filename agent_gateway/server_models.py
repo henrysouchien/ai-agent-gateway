@@ -28,6 +28,10 @@ ExecutionLocationResolver = Callable[[str], Optional[str]]
 BuildChatRuntime = Callable[[GatewaySession, "ChatRequest", Optional[str], AuthManager], Awaitable["ChatRuntime"]]
 RequestApproval = Callable[[ApprovalRequest], Awaitable[Optional[ApprovalDecision]]]
 BuildRunner = Callable[..., AgentRunner | AgentSDKRunner]
+DispatchScopeValidator = Callable[
+  [GatewaySession, dict[str, Any]],
+  Awaitable[dict[str, Any] | None] | dict[str, Any] | None,
+]
 
 _AGENT_API_CLAIM_AUDIENCE = "agent_api_v1"
 _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS = 60
@@ -49,7 +53,7 @@ _ARTIFACT_VISIBILITY_VALUES = frozenset({"default", "sandbox", "archived"})
 _ARTIFACT_VISIBILITY_FILTER_VALUES = frozenset({"default", "sandbox", "archived", "all"})
 _ARTIFACT_INDEX_RECENT_LIMIT = 5
 _DEFAULT_CHAT_PROFILE = "analyst"
-_CHAT_PROFILE_ALIASES = {"hank": "analyst"}
+_CHAT_PROFILE_ALIASES = {"hank": "analyst", "hank-community": "community"}
 _ACTIVE_TURN_GRACE_SECONDS = 60.0
 _STREAM_SUBSCRIBER_QUEUE_MAX = 256
 _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS = 15.0
@@ -336,6 +340,9 @@ class GatewayServerConfig:
     credentials_resolver: Optional init-time resolver for per-user credentials.
     credentials_refresh_resolver: Optional stream-time resolver used to rotate
       credentials after provider rate-limit, billing, or auth failures.
+    dispatch_scope_validator: Optional dispatch-time validator for structured
+      portfolio scopes. The callback may canonicalize the redacted scope or
+      raise an HTTPException/ValueError to stop run creation.
     mcp_client: Optional shared `McpClientManager`.
     sdk_config: Optional `AgentSDKConfig` when using `AgentSDKRunner`.
     per_turn_timeout: Default per-turn timeout in seconds.
@@ -343,6 +350,9 @@ class GatewayServerConfig:
     compaction_instructions: Default compaction instructions.
     allowed_models: Model allowlist enforced at request time.
     model_catalog: Optional model discovery metadata returned by `POST /chat/init`.
+    channel_profile_allowlist: Optional mapping from authoritative session
+      channel to profile names allowed on that channel. Channels absent from
+      the mapping are unrestricted.
     build_chat_runtime: Required async callback that returns a `ChatRuntime`.
     on_event: Optional event observer invoked for every appended `EventLog`
       entry.
@@ -387,6 +397,7 @@ class GatewayServerConfig:
   auth_config: Dict[str, Any] = field(default_factory=dict)
   credentials_resolver: CredentialsResolver | None = None
   credentials_refresh_resolver: CredentialsRefreshResolver | None = None
+  dispatch_scope_validator: DispatchScopeValidator | None = None
   resolver_timeout_seconds: float = 5.0
   mcp_client: Optional[McpClientManager] = None
   sdk_config: AgentSDKConfig | None = None
@@ -395,6 +406,7 @@ class GatewayServerConfig:
   compaction_instructions: str | None = None
   allowed_models: Set[str] | None = None
   model_catalog: Optional[ModelCatalog] = None
+  channel_profile_allowlist: Mapping[str, frozenset[str]] | None = None
   build_chat_runtime: Optional[BuildChatRuntime] = None
   on_event: Optional[Callable[..., Any]] = None
   on_tool_result: Optional[Callable[..., Any]] = None

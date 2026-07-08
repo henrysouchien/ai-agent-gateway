@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Set
 
+_MODEL_WRITER_TERMINAL_DOORS = frozenset({"fms_persist_business_model"})
+
 
 def default_tool_definitions(get_tool_definitions: Any, mcp_client: Any) -> List[Dict[str, Any]]:
   if get_tool_definitions is not None:
@@ -56,11 +58,16 @@ def is_report_door_clear_event(
     return False
   if not expected_skill:
     return False
+  tool_name = str(event.get("tool_name") or "").strip()
   result = event.get("result")
   if not (
     isinstance(result, dict)
     and "subcommand" in result
-    and str(result.get("mutation_mode") or "").strip() == "preview"
+  ):
+    return False
+  mutation_mode = str(result.get("mutation_mode") or "").strip()
+  if mutation_mode != "preview" and not (
+    mutation_mode == "model_writer" and tool_name in _MODEL_WRITER_TERMINAL_DOORS
   ):
     return False
   return str(result.get("status") or "").strip().lower() in success_statuses

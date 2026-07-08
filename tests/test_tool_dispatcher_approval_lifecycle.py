@@ -18,6 +18,7 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import EventLog, ToolDispatcher
 from agent_gateway import policy_imports
+from agent_gateway import tool_dispatcher as dispatcher_module
 from agent_gateway import tool_dispatcher_approval_lifecycle as lifecycle_helpers
 
 
@@ -96,16 +97,43 @@ def test_tool_dispatcher_resolve_tool_class_uses_policy_owner(
   assert dispatcher._resolve_tool_class("execute_trade") == "irreversible"
 
 
+def test_tool_dispatcher_resolve_tool_class_preserves_parent_policy_resolver_seam(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  calls: list[dict[str, Any]] = []
+
+  def fake_resolve_server_policy_tool_class(tool_name: str, **kwargs: Any) -> str:
+    calls.append({"tool_name": tool_name, **kwargs})
+    return "artifact_write"
+
+  monkeypatch.setattr(
+    dispatcher_module,
+    "resolve_server_policy_tool_class",
+    fake_resolve_server_policy_tool_class,
+  )
+  dispatcher = ToolDispatcher(mcp_client=_NullMcp(), local_tool_handlers={}, event_log=EventLog())
+
+  assert dispatcher._resolve_tool_class("emit_artifact") == "artifact_write"
+  assert calls == [
+    {
+      "tool_name": "emit_artifact",
+      "policy_tool_name": "emit_artifact",
+      "runtime_server": None,
+      "default": "",
+    }
+  ]
+
+
 def test_tool_dispatcher_resolve_tool_class_does_not_require_mcp_lookup_methods(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   policy_module = SimpleNamespace(
     get_forbidden_tools_for_session=lambda _session: frozenset({"record_workflow_action"}),
-    get_server_for_policy_tool=lambda tool_name: "portfolio-mcp"
+    get_server_for_policy_tool=lambda tool_name: "portfolio-reads-mcp"
     if tool_name == "record_workflow_action"
     else None,
     get_tool_class=lambda server_name, tool_name: "state_write"
-    if (server_name, tool_name) == ("portfolio-mcp", "record_workflow_action")
+    if (server_name, tool_name) == ("portfolio-reads-mcp", "record_workflow_action")
     else None,
   )
 
@@ -149,11 +177,11 @@ def test_tool_dispatcher_resolve_tool_class_uses_policy_owner_after_split_runtim
 ) -> None:
   policy_module = SimpleNamespace(
     get_forbidden_tools_for_session=lambda _session: frozenset({"execute_trade"}),
-    get_server_for_policy_tool=lambda tool_name: "portfolio-mcp"
+    get_server_for_policy_tool=lambda tool_name: "portfolio-trades-mcp"
     if tool_name == "execute_trade"
     else None,
     get_tool_class=lambda server_name, tool_name: "irreversible"
-    if (server_name, tool_name) == ("portfolio-mcp", "execute_trade")
+    if (server_name, tool_name) == ("portfolio-trades-mcp", "execute_trade")
     else None,
   )
 
@@ -202,7 +230,7 @@ def test_tool_dispatcher_resolve_tool_class_raises_when_policy_module_lacks_clas
 ) -> None:
   policy_module = SimpleNamespace(
     get_forbidden_tools_for_session=lambda _session: frozenset({"execute_trade"}),
-    get_server_for_policy_tool=lambda tool_name: "portfolio-mcp"
+    get_server_for_policy_tool=lambda tool_name: "portfolio-reads-mcp"
     if tool_name == "execute_trade"
     else None,
   )
@@ -362,3 +390,58 @@ def test_tool_dispatcher_pending_approval_wrapper_threads_instance_state(monkeyp
   assert captured["resolved_qualifier"] == "qual-1"
   assert captured["allow_persistent"] is True
   assert captured["timeout_seconds"] == 15
+
+
+def test_tool_dispatcher_run_approval_lifecycle_wrapper_threads_instance_state(monkeypatch) -> None:
+  captured: dict[str, Any] = {}
+
+  async def fake_run_approval_lifecycle(**kwargs: Any) -> dict[str, bool]:
+    captured.update(kwargs)
+    return {"approved": True}
+
+  monkeypatch.setattr(
+    lifecycle_helpers,
+    "run_approval_lifecycle",
+    fake_run_approval_lifecycle,
+  )
+  session = SimpleNamespace(
+    pending_tools={},
+    approval_queues={},
+    approval_store="store",
+    approval_policy="policy",
+  )
+  dispatcher = ToolDispatcher(
+    mcp_client=_NullMcp(),
+    local_tool_handlers={},
+    event_log=EventLog(),
+    session=session,
+  )
+
+  result = asyncio.run(
+    dispatcher._run_approval_lifecycle(
+      tool_call_id="call-1",
+      tool_name="place_order",
+      tool_input={"ticker": "MSFT"},
+      qualifier="qual-1",
+      reason="needs approval",
+      allow_persistent=True,
+    )
+  )
+
+  assert result == {"approved": True}
+  assert captured["store"] == "store"
+  assert captured["policy"] == "policy"
+  assert captured["session"] is session
+  assert captured["tool_call_id"] == "call-1"
+  assert captured["tool_name"] == "place_order"
+  assert captured["tool_input"] == {"ticker": "MSFT"}
+  assert captured["qualifier"] == "qual-1"
+  assert captured["reason"] == "needs approval"
+  assert captured["allow_persistent"] is True
+  assert captured["resolve_run_context_fn"].__self__ is dispatcher
+  assert captured["redact_for_approval_request_fn"].__self__ is dispatcher
+  assert captured["resolve_tool_class_fn"].__self__ is dispatcher
+  assert captured["effective_trade_approval_decision_fn"].__self__ is dispatcher
+  assert captured["await_user_approval_via_pending_tools_fn"].__self__ is dispatcher
+  assert callable(captured["current_skill_fn"])
+  assert callable(captured["approval_queue_timeout_seconds_fn"])

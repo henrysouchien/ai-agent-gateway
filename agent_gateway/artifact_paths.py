@@ -33,7 +33,10 @@ _EXCHANGE_SUFFIXES = (
   ".L",
   ".T",
 )
-_SHARE_CLASS_SUFFIXES = (".A", ".B")
+# Share-class suffixes are collapsed to a trailing letter (BRK.B / BRK-B -> BRKB).
+# Preferred lines (for example EFC-PC, PPL-PA) are intentionally left hyphenated
+# so they fail _TICKER_RE and cannot become common-equity artifact paths.
+_SHARE_CLASS_SUFFIXES = (".A", ".B", "-A", "-B")
 _TICKER_RE = re.compile(r"^[A-Z]{1,6}$")
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
@@ -287,6 +290,10 @@ def _validate_user_id(user_id: str) -> str:
 
 
 def _validate_ticker(ticker: str) -> str:
+  return normalize_ticker_for_artifact_request(ticker)
+
+
+def normalize_ticker_for_artifact_request(ticker: str) -> str:
   decoded = _validate_path_component(ticker, "ticker")
   normalized = _normalize_ticker(decoded)
   if not _TICKER_RE.match(normalized):
@@ -346,7 +353,7 @@ def _normalize_ticker(raw: str) -> str:
       break
 
   for suffix in _SHARE_CLASS_SUFFIXES:
-    if value.endswith(suffix):
+    if value.endswith(suffix) and len(value) > len(suffix):
       value = value[: -len(suffix)] + suffix[-1]
       break
 
@@ -360,6 +367,7 @@ __all__ = [
   "artifact_json_path_for_request",
   "latest_artifact_json_path_for_request",
   "letter_docx_path_for_request",
+  "normalize_ticker_for_artifact_request",
   "reject_unsafe_path",
   "ticker_artifact_index_for_request",
   "ticker_artifact_paths_for_request",

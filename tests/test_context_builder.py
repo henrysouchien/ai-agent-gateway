@@ -71,7 +71,7 @@ def test_context_builder_missing_regime_does_not_crash(tmp_path: Path) -> None:
         "type": "state_update",
         "payload": {
           "alerts": ["Watch guidance"],
-          "active_servers": ["portfolio-mcp"],
+          "active_servers": ["portfolio-reads-mcp"],
         },
         "runner_id": "runner_test",
         "generated_at": 1.0,

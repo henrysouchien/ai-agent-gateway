@@ -51,6 +51,11 @@ from .runner_prompt_rules import (
   system_prompt_requires_tool_only_turns as _system_prompt_requires_tool_only_turns,  # noqa: F401 - compatibility alias
   system_prompt_text as _system_prompt_text,  # noqa: F401 - compatibility alias
 )
+from .runner_run_loop_defaults import (
+  MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFICATIONS_PER_TURN,  # noqa: F401 - compatibility alias
+  MAX_TOKENS_CONTINUATIONS as _MAX_TOKENS_CONTINUATIONS,  # noqa: F401 - compatibility alias
+  MAX_TOKENS_NUDGE as _MAX_TOKENS_NUDGE,  # noqa: F401 - compatibility alias
+)
 from .runner_background_lifecycle import RunnerBackgroundLifecycleMixin
 from .runner_hooks_lifecycle import RunnerHooksLifecycleMixin
 from .runner_auth import (
@@ -251,24 +256,11 @@ STREAM_GUARD_POLL_INTERVAL = 2.0
 STREAM_RETRY_MAX = 3
 STREAM_RETRY_DELAY = 2.0
 STREAM_RETRY_BACKOFF = 2.0
-_MAX_NOTIFICATIONS_PER_TURN = 5
 # Backstop cap for inline run_agent dispatch (ACUI-1). Must comfortably exceed
 # sub_agent.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS (1800s) so the inner spawn
 # timeout fires first and returns a clean tool error; this only triggers if
 # that inner await itself never resolves.
 _RUN_AGENT_DISPATCH_TIMEOUT_SECONDS = 2100.0
-# A turn that exhausts max_tokens with no usable tool call (e.g. long interleaved
-# thinking + a very large tool-call JSON truncated mid-stream) must not silently
-# end the run (ACUI-27): nudge and continue, bounded to avoid loops.
-_MAX_TOKENS_CONTINUATIONS = 3
-_MAX_TOKENS_NUDGE = (
-  "[System: Your previous response hit the output-token limit and was truncated; "
-  "any partial tool call was discarded. Continue the task now with a tool-first "
-  "response: if a required tool/report/persist door is available, call it now with "
-  "the smallest valid JSON payload. Trim verbose rationale fields, omit optional "
-  "narrative, and split only when the tool contract requires it. Do not spend "
-  "another turn on hidden analysis or restate prior reasoning.]"
-)
 _ACTIVE_SKILL_DENY_RESULT_KEY = "_active_skill_deny"
 _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
 # Report doors are the only auto-clear doors in scope and normally return noop;
@@ -471,9 +463,14 @@ class AgentRunner(
         or "workspace_dir" in dispatch_params
         or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in dispatch_params.values())
       )
+      self._dispatcher_accepts_readable_resource_snapshot = (
+        "capture_readable_resource_snapshot" in dispatch_params
+        or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in dispatch_params.values())
+      )
     except (TypeError, ValueError):
       self._dispatcher_accepts_abort_event = False
       self._dispatcher_accepts_skill_run_context = False
+      self._dispatcher_accepts_readable_resource_snapshot = False
     task_registry_auto_created = task_registry is None
     self._task_registry = task_registry or TaskRegistry(
       max_inflight=self._max_background_tasks,

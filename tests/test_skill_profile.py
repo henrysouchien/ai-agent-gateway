@@ -625,7 +625,7 @@ def test_invalid_mcp_server_entry_type_rejected(tmp_path: Path) -> None:
     tmp_path,
     """
     mcp_servers:
-      - portfolio-mcp
+      - portfolio-reads-mcp
       - 7
     """,
   )
@@ -638,7 +638,7 @@ def test_scalar_mcp_servers_shape_rejected(tmp_path: Path) -> None:
   skill_path = _write_skill(
     tmp_path,
     """
-    mcp_servers: portfolio-mcp
+    mcp_servers: portfolio-reads-mcp
     """,
   )
 
@@ -651,7 +651,7 @@ def test_empty_mcp_tools_is_none(tmp_path: Path) -> None:
     tmp_path,
     """
     mcp_tools:
-      portfolio-mcp: []
+      portfolio-reads-mcp: []
     """,
   )
 

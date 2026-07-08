@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
+import hashlib
 import importlib
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .artifact_readback import readback_artifact_ready_event
 from .runner_session_events import (
   build_tool_call_complete_event as _build_tool_call_complete_event,
   build_tool_call_start_event as _build_tool_call_start_event,
@@ -22,6 +26,8 @@ log = logging.getLogger("agent_gateway.runner")
 _RUN_AGENT_DISPATCH_TIMEOUT_SECONDS = 2100.0
 _ACTIVE_SKILL_DENY_RESULT_KEY = "_active_skill_deny"
 _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
+_READABLE_RESOURCE_SNAPSHOT_RESULT_KEY = "_readable_resource_snapshot"
+_READABLE_RESOURCE_MAX_CONTENT_BYTES = 2_000_000
 _REPEATED_TOOL_EXCLUDED_STOP_AFTER_COUNT = 2
 _FMS_WRITER_TOOL_FALLBACKS = frozenset({
   "fms_link_thesis",
@@ -71,6 +77,19 @@ _FMS_COMMIT_TOOL_STAGES = {
   "fms_report_thesis_consultation": "diligence",
   "fms_resolve_outcome_contracts": "review",
 }
+_OUTPUT_FILE_GATED_TOOL_FALLBACKS = frozenset({
+  "analyze_stock",
+})
+_OUTPUT_FILE_GATED_TOOL_ALTERNATIVES: dict[str, dict[str, Any]] = {
+  "analyze_stock": {
+    "suggested_tools": ["get_quote", "industry_peer_comparison"],
+    "resolution": (
+      "Use inline read tools instead: get_quote for price/profile context and "
+      "industry_peer_comparison(symbol=...) for peer metrics. For methodology-backed "
+      "risk analysis, use the quantifying-risk skill."
+    ),
+  },
+}
 
 
 def _record_tool_excluded_attempt(runner: Any, tool_name: str) -> int:
@@ -112,6 +131,89 @@ def _augment_repeated_tool_excluded_error(
   return augmented
 
 
+def _readable_resource_created_at(timestamp: float) -> str:
+  return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _readable_resource_event_from_snapshot(
+  runner: Any,
+  snapshot: Any,
+  *,
+  tool_call_id: str,
+  tool_name: str,
+  timestamp: float,
+) -> dict[str, Any] | None:
+  if not isinstance(snapshot, dict):
+    return None
+  content = snapshot.get("content")
+  if not isinstance(content, str) or not content.strip():
+    return None
+  content_bytes_payload = content.encode("utf-8")
+  if len(content_bytes_payload) > _READABLE_RESOURCE_MAX_CONTENT_BYTES:
+    return None
+  content_sha256 = snapshot.get("content_sha256")
+  if not isinstance(content_sha256, str) or not content_sha256.strip():
+    return None
+  normalized_sha256 = content_sha256.lower()
+  if hashlib.sha256(content_bytes_payload).hexdigest() != normalized_sha256:
+    return None
+  source_path = snapshot.get("source_path")
+  if not isinstance(source_path, str) or not source_path.strip():
+    return None
+  contract_name = snapshot.get("contract_name")
+  if not isinstance(contract_name, str) or not contract_name.strip():
+    return None
+  content_type = snapshot.get("content_type")
+  if content_type not in {"text/markdown", "text/plain"}:
+    return None
+  content_class = snapshot.get("content_class")
+  if content_class != "human_readable":
+    return None
+  content_snapshot_id = snapshot.get("content_snapshot_id")
+  if not isinstance(content_snapshot_id, str) or not content_snapshot_id.strip():
+    return None
+  truncated = snapshot.get("truncated")
+  if not isinstance(truncated, bool):
+    return None
+  control_run_id = str(os.getenv("AGENT_AUTONOMOUS_CONTROL_RUN_ID") or getattr(runner, "_full_session_id", "")).strip()
+  if not control_run_id:
+    return None
+  seed = "\0".join([control_run_id, tool_call_id, source_path, normalized_sha256])
+  resource_id = f"rr:{hashlib.sha256(seed.encode('utf-8')).hexdigest()}"
+  skill_run_id = str(getattr(runner, "_skill_run_id", "") or "").strip() or f"tool:{tool_call_id}"
+  content_bytes = snapshot.get("content_bytes")
+  if not isinstance(content_bytes, int) or isinstance(content_bytes, bool):
+    return None
+  if content_bytes != len(content_bytes_payload):
+    return None
+  event: dict[str, Any] = {
+    "type": "readable_resource_ready",
+    "resource_id": resource_id,
+    "run_id": control_run_id,
+    "control_run_id": control_run_id,
+    "skill_run_id": skill_run_id,
+    "contract_name": contract_name.strip(),
+    "content_type": content_type,
+    "content_class": content_class,
+    "content_snapshot_id": content_snapshot_id.strip(),
+    "content_sha256": normalized_sha256,
+    "content_bytes": content_bytes,
+    "content": content,
+    "truncated": truncated,
+    "title": str(snapshot.get("title") or source_path),
+    "source_path": source_path,
+    "tool_name": str(snapshot.get("tool_name") or tool_name),
+    "tool_call_id": tool_call_id,
+    "created_at": _readable_resource_created_at(timestamp),
+    "ts": timestamp,
+  }
+  for key in ("byte_start", "byte_end"):
+    value = snapshot.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+      event[key] = value
+  return event
+
+
 def _fms_commit_tool_names() -> frozenset[str]:
   for module_name in ("agent.shared.server_policies", "api.agent.shared.server_policies"):
     try:
@@ -128,6 +230,26 @@ def _fms_commit_tool_names() -> frozenset[str]:
     if names:
       return frozenset(names)
   return _FMS_WRITER_TOOL_FALLBACKS
+
+
+def _output_file_gated_tool_names() -> frozenset[str]:
+  for module_name in ("agent.shared.server_policies", "api.agent.shared.server_policies"):
+    try:
+      server_policies = importlib.import_module(module_name)
+    except Exception:
+      continue
+    getter = getattr(server_policies, "get_output_file_tools", None)
+    if not callable(getter):
+      continue
+    try:
+      names = getter()
+    except Exception:
+      continue
+    try:
+      return frozenset(str(tool_name) for tool_name in names if str(tool_name or "").strip())
+    except TypeError:
+      continue
+  return _OUTPUT_FILE_GATED_TOOL_FALLBACKS
 
 
 def _fms_commit_blocker_error(tool_name: str) -> Dict[str, Any] | None:
@@ -175,6 +297,53 @@ def _fms_commit_blocker_error(tool_name: str) -> Dict[str, Any] | None:
   }
 
 
+def _output_file_gated_tool_error(tool_name: str) -> Dict[str, Any] | None:
+  normalized = str(tool_name or "").strip()
+  if normalized not in _output_file_gated_tool_names():
+    return None
+  alternatives = _OUTPUT_FILE_GATED_TOOL_ALTERNATIVES.get(normalized, {})
+  resolution = str(
+    alternatives.get("resolution")
+    or "Use an available inline read tool, or retry from an approved file-output workflow."
+  )
+  data: Dict[str, Any] = {
+    "blocked_tool": normalized,
+    "tool_class": "read",
+    "output_file_gated": True,
+    "resolution": resolution,
+  }
+  suggested_tools = alternatives.get("suggested_tools")
+  if isinstance(suggested_tools, list) and suggested_tools:
+    data["suggested_tools"] = [str(tool) for tool in suggested_tools if str(tool or "").strip()]
+  return {
+    "code": "tool_excluded",
+    "sub_code": "output_file_gated_tool_excluded",
+    "message": (
+      f"Tool '{normalized}' is output-file gated and is not available in this "
+      f"context without an approved output='file' workflow. {resolution}"
+    ),
+    "data": data,
+  }
+
+
+def _model_error_data(error: Dict[str, Any]) -> Dict[str, Any] | None:
+  raw_data = error.get("data")
+  data: Dict[str, Any] = dict(raw_data) if isinstance(raw_data, dict) else {}
+  hint = error.get("tool_usage_hint")
+  if isinstance(hint, str) and hint.strip() and "tool_usage_hint" not in data:
+    data["tool_usage_hint"] = hint
+  return data or None
+
+
+def _error_with_model_error_data(error: Dict[str, Any]) -> Dict[str, Any]:
+  data = _model_error_data(error)
+  if data is None or error.get("data") == data:
+    return error
+  enriched = dict(error)
+  enriched["data"] = data
+  return enriched
+
+
 class RunnerToolExecutionMixin:
   async def _execute_single_tool(
     self,
@@ -190,6 +359,15 @@ class RunnerToolExecutionMixin:
     asyncio_module = _runner_attr(self, "asyncio", asyncio)
     timeout_error_type = getattr(asyncio_module, "TimeoutError", asyncio.TimeoutError)
     cancelled_error_type = getattr(asyncio_module, "CancelledError", asyncio.CancelledError)
+
+    effective_tool_input = tool_input
+    resolve_effective_tool_input = getattr(self._dispatcher, "resolve_effective_tool_input", None)
+    if callable(resolve_effective_tool_input):
+      try:
+        effective_tool_input = resolve_effective_tool_input(tool_name, tool_input)
+      except Exception:
+        effective_tool_input = tool_input
+    tool_input = effective_tool_input
 
     redacted_tool_input = _runner_attr(self, "_redact_tool_input_for_event", _redact_tool_input_for_event)(
       tool_name,
@@ -258,10 +436,11 @@ class RunnerToolExecutionMixin:
     duration_ms = 0
     load_servers_signal: Optional[List[str]] = None
     load_local_tools_signal: Optional[List[str]] = None
+    readable_resource_snapshot: dict[str, Any] | None = None
 
     try:
       if tool_name in self._effective_excluded_tools():
-        error = _fms_commit_blocker_error(tool_name) or {
+        error = _fms_commit_blocker_error(tool_name) or _output_file_gated_tool_error(tool_name) or {
           "code": "tool_excluded",
           "message": f"Tool '{tool_name}' is not available in this context",
         }
@@ -283,6 +462,8 @@ class RunnerToolExecutionMixin:
           dispatch_kwargs["workspace_dir"] = self._workspace_dir
           if getattr(self, "_batch_id", None) is not None:
             dispatch_kwargs["batch_id"] = self._batch_id
+        if getattr(self, "_dispatcher_accepts_readable_resource_snapshot", False) and tool_name == "memory_write":
+          dispatch_kwargs["capture_readable_resource_snapshot"] = True
         dispatch_coro = self._dispatcher.dispatch(
           tool_id,
           tool_name,
@@ -337,6 +518,9 @@ class RunnerToolExecutionMixin:
       # model-bound tool_result content. _load_servers is a control signal -- capture
       # it for _refresh_tools (called after finally), then remove from result.
       if error is None and isinstance(result, dict):
+        popped_snapshot = result.pop(_READABLE_RESOURCE_SNAPSHOT_RESULT_KEY, None)
+        if isinstance(popped_snapshot, dict):
+          readable_resource_snapshot = popped_snapshot
         popped = result.pop("_load_servers", None)
         if isinstance(popped, list):
           load_servers_signal = [str(server_name) for server_name in popped if server_name]
@@ -411,6 +595,8 @@ class RunnerToolExecutionMixin:
       error = {"code": "internal_error", "message": str(exc)}
     finally:
       duration_ms = int((time_module.time() - tool_t0) * 1000)
+      if isinstance(error, dict):
+        error = _error_with_model_error_data(error)
       tool_complete_event = _runner_attr(
         self,
         "_build_tool_call_complete_event",
@@ -475,7 +661,7 @@ class RunnerToolExecutionMixin:
         str(error.get("code", "tool_error")),
         str(error.get("message", "Tool failed")),
         sub_code=str(error.get("sub_code", "")),
-        data=error.get("data") if isinstance(error.get("data"), dict) else None,
+        data=_model_error_data(error),
       )
     else:
       result_entry = {
@@ -508,4 +694,22 @@ class RunnerToolExecutionMixin:
     tool_complete_event["final_tool_result_blocks"] = final_tool_result_blocks
     await self._append_durable_event(tool_complete_event)
     self._append(tool_complete_event)
+    if error is None:
+      # Stored-artifact readbacks surface to the pane as artifact_ready
+      # (origin "readback") right behind their tool_call_complete.
+      readback_event = readback_artifact_ready_event(tool_name, result, tool_id)
+      if readback_event is not None:
+        await self._append_durable_event(readback_event)
+        self._append(readback_event)
+    if error is None and readable_resource_snapshot is not None:
+      resource_event = _readable_resource_event_from_snapshot(
+        self,
+        readable_resource_snapshot,
+        tool_call_id=tool_id,
+        tool_name=tool_name,
+        timestamp=time_module.time(),
+      )
+      if resource_event is not None:
+        await self._append_durable_event(resource_event)
+        self._append(resource_event)
     return live_entry, tool_name, extra_blocks

@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 
 from ..session import GatewaySession
+from ._provenance import delete_computation_sidecar_dir
 
 
 async def cleanup_code_execution(session: GatewaySession) -> None:
@@ -10,6 +11,10 @@ async def cleanup_code_execution(session: GatewaySession) -> None:
   for task in list(session.background_tasks.values()):
     try:
       await task.safe_cancel(task.backend)
+    except Exception:
+      pass
+    try:
+      delete_computation_sidecar_dir(task.handle.work_dir, getattr(task, "tool_call_id", None))
     except Exception:
       pass
   session.background_tasks.clear()

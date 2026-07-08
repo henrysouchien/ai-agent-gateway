@@ -35,6 +35,36 @@ def _normalize_required_user_id(user_id: str | None) -> str:
   return normalized
 
 
+def _normalize_optional_identity_value(value: str | None) -> str | None:
+  normalized = value.strip() if isinstance(value, str) else value
+  return normalized or None
+
+
+def _normalize_session_aliases(
+  *,
+  owner_user_id: str,
+  raw_user_id: str | None,
+  user_slug: str | None,
+  user_email: str | None,
+  user_aliases: tuple[str, ...] | list[str] | None,
+) -> tuple[str, ...]:
+  aliases: list[str] = []
+
+  def add(value: str | None) -> None:
+    normalized = value.strip() if isinstance(value, str) else value
+    if normalized and normalized not in aliases:
+      aliases.append(normalized)
+
+  add(owner_user_id)
+  if user_aliases:
+    for alias in user_aliases:
+      add(str(alias))
+  add(raw_user_id)
+  add(user_slug)
+  add(user_email.strip().lower() if isinstance(user_email, str) else user_email)
+  return tuple(aliases)
+
+
 @dataclass
 class StreamSubscriber:
   """One connected client reading a session's active turn stream."""
@@ -83,6 +113,11 @@ class GatewaySession:
   kind: Literal["chat", "control"] = "chat"
   auth_config: dict[str, Any] | None = None
   channel: Optional[str] = None
+  owner_user_id: str | None = None
+  raw_user_id: str | None = None
+  user_slug: str | None = None
+  user_aliases: tuple[str, ...] = field(default_factory=tuple)
+  identity_status: str | None = None
   is_public: bool = False
   schema_version: int = DEFAULT_SCHEMA_VERSION
   stream_active: bool = False
@@ -103,6 +138,7 @@ class GatewaySession:
   control_chat_tasks: Dict[str, asyncio.Task[Any]] = field(default_factory=dict)
   event_history: SessionEventHistory = field(default_factory=SessionEventHistory)
   initial_message: str = ""
+  dispatch_scope: dict[str, Any] | None = None
   _expiring: bool = False
 
 
@@ -139,11 +175,36 @@ class SessionStore:
     auth_config: dict[str, Any] | None = None,
     ttl_seconds: int | None = None,
     schema_version: int = DEFAULT_SCHEMA_VERSION,
+    owner_user_id: str | None = None,
+    raw_user_id: str | None = None,
+    user_slug: str | None = None,
+    user_aliases: tuple[str, ...] | list[str] | None = None,
+    identity_status: str | None = None,
   ) -> GatewaySession:
     now = int(time.time())
     ttl = self.ttl if ttl_seconds is None else int(ttl_seconds)
     session_id = f"sess_{uuid.uuid4().hex}"
     normalized_user_id = _normalize_required_user_id(user_id)
+    try:
+      normalized_risk_user_id = int(risk_user_id or 0)
+    except (TypeError, ValueError):
+      normalized_risk_user_id = 0
+    normalized_owner_user_id = _normalize_optional_identity_value(owner_user_id)
+    if normalized_owner_user_id is None:
+      normalized_owner_user_id = str(normalized_risk_user_id) if normalized_risk_user_id > 0 else normalized_user_id
+    normalized_raw_user_id = _normalize_optional_identity_value(raw_user_id) or normalized_user_id
+    normalized_user_slug = _normalize_optional_identity_value(user_slug)
+    if (
+      normalized_user_slug is None
+      and normalized_risk_user_id > 0
+      and normalized_raw_user_id != normalized_owner_user_id
+      and not normalized_raw_user_id.isdecimal()
+    ):
+      normalized_user_slug = normalized_raw_user_id
+    normalized_identity_status = (
+      _normalize_optional_identity_value(identity_status)
+      or ("fallback_canonical" if normalized_risk_user_id > 0 else "legacy_user_id_fallback")
+    )
     session = GatewaySession(
       session_id=session_id,
       api_key_hash=api_key_hash,
@@ -151,10 +212,21 @@ class SessionStore:
       expires_at=now + ttl,
       user_id=normalized_user_id,
       user_email=user_email,
-      risk_user_id=risk_user_id,
+      risk_user_id=normalized_risk_user_id,
       role=role,
       kind=kind,
       auth_config=dict(auth_config) if auth_config is not None else None,
+      owner_user_id=normalized_owner_user_id,
+      raw_user_id=normalized_raw_user_id,
+      user_slug=normalized_user_slug,
+      user_aliases=_normalize_session_aliases(
+        owner_user_id=normalized_owner_user_id,
+        raw_user_id=normalized_raw_user_id,
+        user_slug=normalized_user_slug,
+        user_email=user_email,
+        user_aliases=user_aliases,
+      ),
+      identity_status=normalized_identity_status,
       schema_version=int(schema_version),
       result_queue=asyncio.Queue(),
     )

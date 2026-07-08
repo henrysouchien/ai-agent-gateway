@@ -19,7 +19,7 @@ from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.session import GatewaySession
 from agent_gateway.skills import SkillLoader, SkillProfile
 from agent_gateway.sub_agent import make_resume_handler, make_resume_tool_def
-from agent_gateway.task_registry import ParentMessage
+from agent_gateway.task_registry import CoordinatorConfig, ParentMessage, ResolvedProvider
 from agent_gateway.transcript import (
   build_synthetic_tool_results,
   detect_orphan_tool_uses,
@@ -505,6 +505,100 @@ def test_resume_handler_uses_sub_agent_default_model_knob(
     assert resumed_entry is not None
     await resumed_entry.asyncio_task
     assert captured["model"] == "claude-opus-4-8"
+
+  _run(_case())
+
+
+def test_resume_handler_uses_skill_specific_invalid_model_message_for_resolved_provider(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir, "earnings-review")
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_invalid_openai_model",
+      agent_name="earnings-review",
+      user_message="Resume earnings review.",
+    )
+
+    def _resolve_provider(name: str) -> ResolvedProvider:
+      assert name == "openai"
+      return ResolvedProvider(
+        provider=_NoCredentialProvider(),
+        auth_config={"api_key": "openai-key"},
+        allowed_models={"gpt-4o-mini"},
+        default_model="gpt-4o-mini",
+      )
+
+    handler = make_resume_handler(
+      [runner],
+      skill_loader=SkillLoader(skills_dir),
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+      provider_resolver=_resolve_provider,
+    )
+
+    result, error = await handler({
+      "task_id": "bg_invalid_openai_model",
+      "provider": "openai",
+      "model": "bad-model",
+    })
+
+    assert result is None
+    assert error == {
+      "code": "invalid_input",
+      "message": "Invalid model 'bad-model' for skill 'earnings-review'",
+    }
+
+  _run(_case())
+
+
+def test_resume_handler_records_coordinator_default_provider_in_task_metadata(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir, "earnings-review")
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_default_provider",
+      agent_name="earnings-review",
+      user_message="Resume earnings review.",
+    )
+    captured: dict[str, Any] = {}
+
+    async def _register_background_task(**kwargs: Any):
+      captured.update(kwargs)
+      return {"task_id": "bg_default_provider_r1", "status": "running"}, None
+
+    def _resolve_provider(name: str) -> ResolvedProvider:
+      assert name == "openai"
+      return ResolvedProvider(
+        provider=_NoCredentialProvider(),
+        auth_config={"api_key": "openai-key"},
+        allowed_models={"gpt-4o-mini"},
+        default_model="gpt-4o-mini",
+      )
+
+    runner._register_background_task = _register_background_task  # type: ignore[method-assign]
+    handler = make_resume_handler(
+      [runner],
+      skill_loader=SkillLoader(skills_dir),
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+      provider_resolver=_resolve_provider,
+      coordinator_config=CoordinatorConfig(enabled=True, default_worker_provider="openai"),
+    )
+
+    result, error = await handler({"task_id": "bg_default_provider"})
+
+    assert error is None
+    assert result is not None
+    assert captured["tool_input"]["provider"] == "openai"
+    assert captured["tool_input"]["model"] == "gpt-4o-mini"
 
   _run(_case())
 

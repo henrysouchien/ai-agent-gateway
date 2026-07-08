@@ -145,6 +145,19 @@ def test_report_door_clear_event_helper_matches_success_contract() -> None:
     success_statuses={"staged"},
   )
 
+  model_writer_event = {
+    "type": "tool_call_complete",
+    "tool_name": "fms_persist_business_model",
+    "error": None,
+    "result": {"status": "staged", "subcommand": "persist_business_model", "mutation_mode": "model_writer"},
+  }
+  assert is_report_door_clear_event(model_writer_event, expected_skill="skill", success_statuses={"staged"})
+  assert not is_report_door_clear_event(
+    {**model_writer_event, "tool_name": "fms_persist_dcf_relative_valuation"},
+    expected_skill="skill",
+    success_statuses={"staged"},
+  )
+
 
 def test_runner_skill_gate_delegates_filter_and_activate() -> None:
   runner = _make_runner(["read", "write", "always_hidden"])

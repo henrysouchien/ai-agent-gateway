@@ -62,23 +62,36 @@ def test_control_skills_lists_catalog_metadata(
   comparative = next(entry for entry in skills if entry["name"] == "comparative-analysis")
   assert comparative == {
     "name": "comparative-analysis",
+    "label": "Comparative Analysis",
     "description": next(entry.description for entry in expected if entry.name == "comparative-analysis"),
     "agent_description": next(entry.agent_description for entry in expected if entry.name == "comparative-analysis"),
     "version": "1.1",
     "scope": "ticker",
     "requires_portfolio_context": False,
-    "required_context": [],
+    "required_context": ["ticker"],
     "agent_callable": True,
     "resumable": True,
     "max_turns": 20,
     "max_budget_usd": 4.0,
     "persist_state": False,
     "typed_contract": None,
+    "profiles": ["analyst", "research_producer"],
+    "modes": ["skill"],
+    "outputs": ["text", "schedule_safe_report"],
+    "action_class": "state_write",
+    "approval_policy": "human_review_before_apply",
+    "tier_availability": ["paid"],
+    "credential_requirements": ["market_data"],
+    "schedule_eligible": True,
+    "can_launch": True,
+    "can_schedule": True,
+    "blocked_reason": None,
     "catalog": True,
     "path": "api/memory/workspace/notes/skills/comparative-analysis.md",
   }
   performance_review = next(entry for entry in skills if entry["name"] == "performance-review")
   assert performance_review["scope"] == "portfolio"
+  assert performance_review["profiles"] == ["advisor"]
   assert performance_review["requires_portfolio_context"] is True
   assert performance_review["required_context"] == ["portfolio"]
   strategy_executor = next(entry for entry in skills if entry["name"] == "strategy-executor")
@@ -89,6 +102,11 @@ def test_control_skills_lists_catalog_metadata(
   assert macro_review["scope"] == "portfolio"
   assert macro_review["requires_portfolio_context"] is False
   assert macro_review["required_context"] == []
+  valuation_inputs = next(entry for entry in skills if entry["name"] == "valuation-inputs")
+  assert valuation_inputs["required_context"] == ["ticker"]
+  assert valuation_inputs["blocked_reason"] == "dev_mode_required"
+  assert valuation_inputs["can_launch"] is False
+  assert valuation_inputs["can_schedule"] is False
 
 
 def test_control_skill_detail_returns_metadata_and_resolved_body(
@@ -145,7 +163,12 @@ def test_fixture_html_artifact_is_hidden_but_resumable_for_live_qa(monkeypatch) 
   for name in ("ENVIRONMENT", "AGENT_GATEWAY_ENV", "NODE_ENV"):
     monkeypatch.delenv(name, raising=False)
 
-  for skill_name in ("fixture-html-artifact", "fixture-dashboard-artifact", "fixture-approval-html-artifact"):
+  expected_allowed_tools = {
+    "fixture-html-artifact": ["emit_html_artifact"],
+    "fixture-dashboard-artifact": ["emit_dashboard_artifact"],
+    "fixture-approval-html-artifact": ["emit_html_artifact", "fixture_approval_gate"],
+  }
+  for skill_name, allowed_tools in expected_allowed_tools.items():
     metadata = load_skill_metadata(skill_name, SKILLS_DIR, include_catalog_false=True)
     profile = parse_skill_file(SKILLS_DIR / f"{skill_name}.md")
 
@@ -155,6 +178,8 @@ def test_fixture_html_artifact_is_hidden_but_resumable_for_live_qa(monkeypatch) 
     assert metadata.agent_callable is False
     assert metadata.resumable is True
     assert profile.state_class == "advisor-with-decision-log"
+    assert profile.metadata is not None
+    assert profile.metadata["allowed_tools"] == allowed_tools
 
 
 def test_fixture_html_artifact_stays_hidden_from_control_skill_routes(
@@ -215,6 +240,7 @@ typed_contract: DemoContract
 
   assert metadata == SkillMetadata(
     name="frontmatter-only",
+    label="Frontmatter Only",
     description="Frontmatter only.",
     agent_description=None,
     version="1.0",
@@ -228,6 +254,17 @@ typed_contract: DemoContract
     persist_state=False,
     typed_contract="DemoContract",
     mutation_mode=None,
+    profiles=["analyst"],
+    modes=["skill"],
+    outputs=["text", "structured_artifact"],
+    action_class="read_only",
+    approval_policy="none",
+    tier_availability=["paid"],
+    credential_requirements=[],
+    schedule_eligible=True,
+    can_launch=True,
+    can_schedule=True,
+    blocked_reason=None,
     catalog=True,
     path=(skills_dir / "frontmatter-only.md").as_posix(),
   )

@@ -14,6 +14,7 @@ _SKILL_LOADER_MODULE_NAMES = frozenset({"agent", "agent.skills", "agent.skills.l
 
 class SkillMetadataResponse(BaseModel):
   name: str
+  label: str
   description: str
   agent_description: str | None
   version: str
@@ -27,6 +28,17 @@ class SkillMetadataResponse(BaseModel):
   persist_state: bool
   typed_contract: str | None
   catalog: bool
+  profiles: list[str]
+  modes: list[str]
+  outputs: list[str]
+  action_class: str
+  approval_policy: str
+  tier_availability: list[str]
+  credential_requirements: list[str]
+  schedule_eligible: bool
+  can_launch: bool
+  can_schedule: bool
+  blocked_reason: str | None
   path: str
 
 

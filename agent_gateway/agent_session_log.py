@@ -3,14 +3,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import threading
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 import fcntl
 
+from .agent_session_log_cache import ActiveFileIdentity, ActiveFileOffsetCache
 from . import agent_session_log_sidecars as _sidecar_helpers
+from . import agent_session_log_rotation as _rotation_helpers
 from .agent_session_log_records import (
   EVENT_SCHEMA_VERSION,
   AgentSessionRef,
@@ -27,7 +28,6 @@ from .agent_session_log_records import (
   _contains_text,
   _encode_entry,
   _event_has_error,
-  _fsync_parent_dir,
   _iter_lines_reverse,
   _matches_entry,
   _now_iso,
@@ -70,11 +70,7 @@ class AgentSessionLog:
     self.append_mutex_path = self.path.with_name(f"{self.path.name}.append_mutex")
     self.write_lease_meta_path = self.path.with_name(f"{self.path.name}.write_lease.meta")
 
-    self._cache_lock = threading.Lock()
-    self._seq_offsets: dict[int, int] = {}
-    self._max_cached_seq = 0
-    self._cache_complete = False
-    self._cache_file_identity: tuple[int, int, int, int] | None = None
+    self._active_offset_cache = ActiveFileOffsetCache()
 
     if session_ref is not None:
       self._write_meta_sidecar(session_ref)
@@ -89,30 +85,14 @@ class AgentSessionLog:
     return agent_dir / f"{expected_agent_session_id}.jsonl"
 
   def _write_meta_sidecar(self, session_ref: AgentSessionRef) -> None:
-    meta_path = self.path.with_suffix(".meta.json")
-    if meta_path.exists():
-      return
-    try:
-      from .product_config import gateway_product_id
-
-      _atomic_write_sidecar(
-        meta_path,
-        self._active_sidecar_payload(
-          {
-            "agent_session_id": session_ref.agent_session_id,
-            "agent_id": session_ref.agent_id,
-            "user_id": session_ref.user_id,
-            "product_id": gateway_product_id() or None,
-            "file_kind": "canonical",
-            "channel": None,
-            "profile": None,
-            "created_at": _now_iso(),
-          },
-          active_generation=0,
-        ),
-      )
-    except Exception:
-      log.warning("Sidecar write failed for %s (telemetry-only)", meta_path, exc_info=True)
+    _sidecar_helpers.write_meta_sidecar(
+      self.path,
+      session_ref,
+      active_sidecar_payload_fn=lambda base: self._active_sidecar_payload(base, active_generation=0),
+      atomic_write_sidecar_fn=_atomic_write_sidecar,
+      now_iso_fn=_now_iso,
+      logger=log,
+    )
 
   async def append(self, event: dict[str, Any]) -> LogEntry:
     return await asyncio.to_thread(self._append_sync, dict(event))
@@ -353,77 +333,48 @@ class AgentSessionLog:
         return entry.seq
     return 0
 
-  def _active_file_identity(self) -> tuple[int, int, int, int] | None:
+  def _active_file_identity(self) -> ActiveFileIdentity | None:
     try:
       stat = self.path.stat()
     except OSError:
       return None
     return (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
 
-  def _refresh_active_cache_identity_locked(self, active_identity: tuple[int, int, int, int] | None) -> None:
-    if self._cache_file_identity == active_identity:
-      return
-    self._seq_offsets.clear()
-    self._max_cached_seq = 0
-    self._cache_complete = False
-    self._cache_file_identity = active_identity
-
   def _starting_offset_for_seq(
     self,
     after_seq: int | None,
     *,
-    active_identity: tuple[int, int, int, int] | None = None,
+    active_identity: ActiveFileIdentity | None = None,
   ) -> int:
-    if after_seq is None or after_seq <= 1:
-      return 0
-    if active_identity is None:
+    if active_identity is None and after_seq is not None and after_seq > 1:
       active_identity = self._active_file_identity()
-    with self._cache_lock:
-      self._refresh_active_cache_identity_locked(active_identity)
-      if after_seq in self._seq_offsets:
-        return self._seq_offsets[after_seq]
-      if self._cache_complete and after_seq > self._max_cached_seq:
-        return active_identity[2] if active_identity is not None else 0
-      if self._max_cached_seq > 0 and after_seq > self._max_cached_seq:
-        return self._seq_offsets.get(self._max_cached_seq, 0)
-    return 0
+    return self._active_offset_cache.starting_offset_for_seq(after_seq, active_identity=active_identity)
 
   def _update_cache(
     self,
     *,
     seq: int,
     offset: int,
-    active_identity: tuple[int, int, int, int] | None = None,
+    active_identity: ActiveFileIdentity | None = None,
   ) -> None:
     if active_identity is None:
       active_identity = self._active_file_identity()
-    with self._cache_lock:
-      self._refresh_active_cache_identity_locked(active_identity)
-      existing = self._seq_offsets.get(seq)
-      if existing is None or offset < existing:
-        self._seq_offsets[seq] = offset
-      if seq > self._max_cached_seq:
-        self._max_cached_seq = seq
+    self._active_offset_cache.update(seq=seq, offset=offset, active_identity=active_identity)
 
   def _mark_active_cache_complete(
     self,
     *,
-    active_identity: tuple[int, int, int, int] | None,
+    active_identity: ActiveFileIdentity | None,
     file_size: int,
   ) -> None:
-    current_identity = self._active_file_identity()
-    if active_identity is None or current_identity != active_identity or current_identity[2] != file_size:
-      return
-    with self._cache_lock:
-      self._refresh_active_cache_identity_locked(active_identity)
-      self._cache_complete = True
+    self._active_offset_cache.mark_complete(
+      active_identity=active_identity,
+      current_identity=self._active_file_identity(),
+      file_size=file_size,
+    )
 
   def _clear_active_cache(self) -> None:
-    with self._cache_lock:
-      self._seq_offsets.clear()
-      self._max_cached_seq = 0
-      self._cache_complete = False
-      self._cache_file_identity = None
+    self._active_offset_cache.clear()
 
   def _configured_max_active_bytes(self) -> int | None:
     raw = os.getenv("AGENT_SESSION_LOG_MAX_ACTIVE_BYTES")
@@ -779,87 +730,10 @@ class AgentSessionLog:
     return segments
 
   def _rotate_active_if_needed_locked(self) -> None:
-    if self._max_active_bytes is None:
-      return
-    try:
-      active_size = self.path.stat().st_size
-    except FileNotFoundError:
-      self.path.touch(exist_ok=True)
-      return
-    if active_size == 0 or active_size <= self._max_active_bytes:
-      return
-
-    first_seq, last_seq = self._seq_bounds_for_file(self.path)
-    if first_seq <= 0 or last_seq <= 0:
-      return
-
-    manifest = self._load_manifest() or self._new_manifest()
-    active_generation = int(manifest.get("active_generation") or 0)
-    segment_id = f"{first_seq:012d}-{last_seq:012d}-g{active_generation:06d}"
-    self.segments_dir.mkdir(parents=True, exist_ok=True)
-    segment_path = self.segments_dir / f"{segment_id}.jsonl"
-    file_identity = self._file_identity(self.path)
-    base_meta = self._load_sidecar_payload() or {}
-
-    os.replace(self.path, segment_path)
-    _fsync_parent_dir(self.segments_dir)
-    segment_meta_path = segment_path.with_suffix(".meta.json")
-    _atomic_write_json(
-      segment_meta_path,
-      self._segment_sidecar_payload(
-        base_meta,
-        segment_id=segment_id,
-        first_seq=first_seq,
-        last_seq=last_seq,
-        active_generation=active_generation,
-        rotated_from_file_identity=file_identity,
-      ),
-    )
-
-    segments = [item for item in manifest.get("segments", []) if isinstance(item, dict)]
-    segments.append(
-      {
-        "segment_id": segment_id,
-        "path": segment_path.name,
-        "first_seq": first_seq,
-        "last_seq": last_seq,
-        "bytes": active_size,
-        "telemetry_source_id": self._telemetry_source_id("segment", segment_id),
-        "rotated_from_source_id": self._telemetry_source_id("active", f"{active_generation:06d}"),
-        "rotated_from_path": f"../{self.path.name}",
-        "rotated_from_file_identity": file_identity,
-        "created_at": _now_iso(),
-        "closed_at": _now_iso(),
-      }
-    )
-    next_generation = active_generation + 1
-    manifest.update(
-      {
-        "schema_version": _MANIFEST_SCHEMA_VERSION,
-        "logical_stream_id": self._logical_stream_id(),
-        "active_path": f"../{self.path.name}",
-        "active_generation": next_generation,
-        "active_telemetry_source_id": self._telemetry_source_id("active", f"{next_generation:06d}"),
-        "segments": segments,
-        "min_seq_available": int(manifest.get("min_seq_available") or 1),
-        "latest_seq": max(int(manifest.get("latest_seq") or 0), last_seq),
-      }
-    )
-    self._write_manifest(manifest)
-
-    self.path.touch(exist_ok=True)
-    if base_meta:
-      _atomic_write_json(self.path.with_suffix(".meta.json"), self._active_sidecar_payload(base_meta, active_generation=next_generation))
-    self._clear_active_cache()
+    _rotation_helpers.rotate_active_if_needed_locked(self)
 
   def _update_manifest_latest_seq_locked(self, seq: int) -> None:
-    manifest = self._load_manifest()
-    if manifest is None:
-      return
-    if seq <= int(manifest.get("latest_seq") or 0):
-      return
-    manifest["latest_seq"] = seq
-    self._write_manifest(manifest)
+    _rotation_helpers.update_manifest_latest_seq_locked(self, seq)
 
   def _encode_entry(self, entry: LogEntry) -> bytes:
     return _encode_entry(entry)

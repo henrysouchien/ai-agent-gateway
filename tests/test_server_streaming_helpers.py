@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
 from agent_gateway import server as gateway_server
+from agent_gateway import server_chat_helpers
 from agent_gateway import server_streaming
 
 
@@ -91,3 +93,34 @@ def test_stream_subscriber_sse_injects_live_parent_dependencies(monkeypatch: pyt
   assert deps.keepalive_seconds == 3.5
   assert deps.done_marker is gateway_server._STREAM_SUBSCRIBER_DONE
   assert deps.cleanup_stream_subscriber is fake_cleanup
+
+
+def test_chat_helpers_stream_sse_closes_core_generator_on_outer_aclose(monkeypatch: pytest.MonkeyPatch) -> None:
+  cleanup_complete = False
+
+  async def fake_core_sse(**_kwargs):
+    nonlocal cleanup_complete
+    try:
+      yield b"data: first\n\n"
+      await asyncio.Event().wait()
+    finally:
+      cleanup_complete = True
+
+  monkeypatch.setattr(server_chat_helpers._chat_stream_core, "stream_subscriber_sse", fake_core_sse)
+
+  async def run() -> None:
+    stream = server_chat_helpers._stream_subscriber_sse(
+      session=object(),
+      active_turn=object(),
+      subscriber=object(),
+      transcript_dir=None,
+      channel=None,
+      write_transcript=False,
+      log=logging.getLogger("test.server_chat_helpers"),
+    )
+    assert await stream.__anext__() == b"data: first\n\n"
+    await stream.aclose()
+
+  asyncio.run(run())
+
+  assert cleanup_complete

@@ -168,6 +168,7 @@ def _registry(tmp_path: Path):
 def test_autonomous_runner_state_helper_preserves_parent_aliases() -> None:
   from agent_gateway import autonomous_runner
   from agent_gateway import autonomous_runner_claims
+  from agent_gateway import autonomous_runner_start
   from agent_gateway import autonomous_runner_state
 
   assert autonomous_runner.AutonomousTask is autonomous_runner_state.AutonomousTask
@@ -188,6 +189,10 @@ def test_autonomous_runner_state_helper_preserves_parent_aliases() -> None:
   assert (
     autonomous_runner.AutonomousRegistry.rehydrate
     is autonomous_runner_state.AutonomousRegistryStateMixin.rehydrate
+  )
+  assert (
+    autonomous_runner.AutonomousRegistry.start
+    is autonomous_runner_start.AutonomousRegistryStartMixin.start
   )
 
 
@@ -231,6 +236,116 @@ def test_autonomous_runner_event_helper_preserves_parent_override_seams(tmp_path
   assert parent_event["sent_at"] == "from-inbox"
   assert parent_event["sender"] == {"user_id": "operator"}
   assert parent_event["run_id"] == "patched-run"
+
+
+def test_autonomous_runner_status_helper_preserves_parent_tail_override(tmp_path) -> None:
+  from agent_gateway import autonomous_runner
+  from agent_gateway import autonomous_runner_status
+  from agent_gateway.autonomous_runner import AutonomousRegistry
+
+  assert autonomous_runner.AutonomousRegistry._status_payload.__module__ == autonomous_runner.__name__
+  assert autonomous_runner_status.status_payload.__module__ == autonomous_runner_status.__name__
+
+  _write_manifest(tmp_path, "bg_0", state="failed", exit_code=2, error="boom")
+  registry = AutonomousRegistry(api_dir=tmp_path, log_dir=tmp_path)
+  record = registry._tasks["bg_0"]
+
+  def tail_lines(log_path: Path, line_count: int) -> tuple[list[str], int]:
+    assert log_path == record.log_path
+    assert line_count == autonomous_runner._STATUS_TAIL_LINES
+    return ["patched line"], 1
+
+  registry._tail_lines = tail_lines  # type: ignore[method-assign]
+
+  assert registry._status_payload(record) == {
+    "state": "failed",
+    "elapsed_sec": record.elapsed_sec,
+    "exit_code": 2,
+    "error": "boom",
+    "log_tail": "patched line",
+  }
+
+
+def test_autonomous_runner_status_tail_lines_counts_and_tails(tmp_path) -> None:
+  from agent_gateway import autonomous_runner_status
+
+  log_path = tmp_path / "run.log"
+  log_path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+  assert autonomous_runner_status.tail_lines(log_path, 2) == (["two", "three"], 3)
+  assert autonomous_runner_status.tail_lines(log_path, 0) == ([], 3)
+  assert autonomous_runner_status.tail_lines(tmp_path / "missing.log", 10) == ([], 0)
+
+
+def test_autonomous_runner_command_helper_preserves_parent_override_seams(monkeypatch, tmp_path) -> None:
+  from agent_gateway import autonomous_runner
+  from agent_gateway import autonomous_runner_commands
+  from agent_gateway.autonomous_runner import AutonomousRegistry
+
+  assert autonomous_runner._AUTONOMOUS_PROFILE_NAME_RE is autonomous_runner_commands._AUTONOMOUS_PROFILE_NAME_RE
+  assert autonomous_runner.normalize_autonomous_profile.__module__ == autonomous_runner.__name__
+  assert (
+    autonomous_runner_commands.normalize_autonomous_profile.__module__
+    == autonomous_runner_commands.__name__
+  )
+
+  checks: list[str] = []
+
+  def normalize_profile(profile: str) -> str:
+    checks.append(f"profile:{profile}")
+    return "patched_profile"
+
+  def is_fixture_profile(profile: str) -> bool:
+    checks.append(f"fixture-profile:{profile}")
+    return False
+
+  def is_fixture_skill(skill: str) -> bool:
+    checks.append(f"fixture-skill:{skill}")
+    return skill == "patched-fixture"
+
+  def require_fixture_provider_available(reason: str, **kwargs) -> None:
+    checks.append(f"guard:{reason}:{kwargs['error_type'].__name__}")
+
+  monkeypatch.setattr(autonomous_runner, "normalize_autonomous_profile", normalize_profile)
+  monkeypatch.setattr(autonomous_runner, "is_fixture_profile_name", is_fixture_profile)
+  monkeypatch.setattr(autonomous_runner, "is_fixture_skill_name", is_fixture_skill)
+  monkeypatch.setattr(
+    autonomous_runner,
+    "require_fixture_provider_available",
+    require_fixture_provider_available,
+  )
+
+  registry = AutonomousRegistry(api_dir=tmp_path, python_executable="py", log_dir=tmp_path)
+  cmd = registry._build_cmd(
+    profile="Analyst",
+    mode="skill",
+    task=None,
+    skill="patched-fixture",
+    context=" context ",
+    ticker="msft",
+    dev_mode=True,
+  )
+
+  assert cmd == [
+    "py",
+    "-m",
+    "agent.autonomous",
+    "--profile",
+    "patched_profile",
+    "--dev",
+    "--skill",
+    "patched-fixture",
+    "--ticker",
+    "MSFT",
+    "--context",
+    "context",
+  ]
+  assert checks == [
+    "profile:Analyst",
+    "fixture-profile:patched_profile",
+    "fixture-skill:patched-fixture",
+    "guard:fixture skill dispatch:ValueError",
+  ]
 
 
 def test_autonomous_runner_claim_helper_uses_parent_aliases(monkeypatch) -> None:
@@ -341,6 +456,9 @@ async def _start_and_capture_env(
   *,
   user_id: str = USER_ID,
   user_email: str = USER_EMAIL,
+  owner_user_id: str | None = None,
+  user_slug: str | None = None,
+  risk_user_id: int | None = None,
   ttl_seconds: int | None = None,
 ) -> dict[str, str]:
   from agent_gateway import autonomous_runner
@@ -365,6 +483,9 @@ async def _start_and_capture_env(
     task="summarize",
     user_id=user_id,
     user_email=user_email,
+    owner_user_id=owner_user_id,
+    user_slug=user_slug,
+    risk_user_id=risk_user_id,
   )
   await registry.wait(payload["task_id"], timeout_sec=1)
   return captured
@@ -580,6 +701,45 @@ def test_autonomous_registry_rehydrates_manifest_with_event_history(tmp_path) ->
 
   record.resumed_as.append("run-5")
   assert _read_manifest(tmp_path, "bg_3")["resumed_as"] == ["run-4", "run-5"]
+
+
+def test_autonomous_registry_rehydrates_v1_slug_manifest_to_canonical_owner(monkeypatch, tmp_path) -> None:
+  monkeypatch.setenv(
+    "GATEWAY_USER_KEYS",
+    json.dumps([
+      {
+        "key": "mcp-key",
+        "channel": "mcp",
+        "slug": "henry",
+        "email": "henry@example.com",
+        "risk_user_id": 1,
+        "role": "owner",
+      }
+    ]),
+  )
+  _write_manifest(
+    tmp_path,
+    "bg_4",
+    control_run_id="run-4",
+    user_id="henry",
+    user_email="henry@example.com",
+  )
+
+  registry = _registry(tmp_path)
+
+  record = registry._tasks["bg_4"]
+  assert record.user_id == "1"
+  assert record.owner_user_id == "1"
+  assert record.raw_user_id == "henry"
+  assert record.user_slug == "henry"
+  assert record.risk_user_id == 1
+  assert record.user_aliases == ["1", "henry", "henry@example.com"]
+  assert record.identity_status == "gateway_user_key_mapping"
+  upgraded_manifest = _read_manifest(tmp_path, "bg_4")
+  assert upgraded_manifest["manifest_version"] == 2
+  assert upgraded_manifest["owner_user_id"] == "1"
+  assert upgraded_manifest["user_id"] == "1"
+  assert upgraded_manifest["raw_user_id"] == "henry"
 
 
 def test_autonomous_registry_rehydrates_budget_exceeded_as_budget_limited(tmp_path) -> None:
@@ -886,6 +1046,7 @@ def test_autonomous_manifest_written_post_spawn_with_full_field_set(monkeypatch,
 
     monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+    monkeypatch.delenv("GATEWAY_USER_KEYS", raising=False)
     registry = _registry(tmp_path)
     payload = await registry.start(
       profile="analyst",
@@ -906,8 +1067,14 @@ def test_autonomous_manifest_written_post_spawn_with_full_field_set(monkeypatch,
         "manifest_version",
         "task_id",
         "control_run_id",
+        "owner_user_id",
         "user_id",
+        "raw_user_id",
+        "user_slug",
+        "risk_user_id",
         "user_email",
+        "user_aliases",
+        "identity_status",
         "profile",
         "mode",
         "task",
@@ -916,6 +1083,7 @@ def test_autonomous_manifest_written_post_spawn_with_full_field_set(monkeypatch,
         "ticker",
         "channel",
         "dev_mode",
+        "dispatch_scope",
         "cmd",
         "log_path",
         "events_path",
@@ -928,12 +1096,20 @@ def test_autonomous_manifest_written_post_spawn_with_full_field_set(monkeypatch,
         "completed_at",
         "resumed_from",
         "resumed_as",
+        "schedule_id",
+        "schedule_name",
       }
-      assert manifest["manifest_version"] == 1
+      assert manifest["manifest_version"] == 2
       assert manifest["task_id"] == payload["task_id"] == "bg_0"
       assert manifest["control_run_id"] == "run-custom"
+      assert manifest["owner_user_id"] == USER_ID
       assert manifest["user_id"] == USER_ID
+      assert manifest["raw_user_id"] == USER_ID
+      assert manifest["user_slug"] is None
+      assert manifest["risk_user_id"] == 1
       assert manifest["user_email"] is None
+      assert manifest["user_aliases"] == [USER_ID]
+      assert manifest["identity_status"] == "numeric_user_id"
       assert manifest["profile"] == "analyst"
       assert manifest["mode"] == "skill"
       assert manifest["task"] is None
@@ -942,6 +1118,7 @@ def test_autonomous_manifest_written_post_spawn_with_full_field_set(monkeypatch,
       assert manifest["ticker"] == "MSFT"
       assert manifest["channel"] == "tui"
       assert manifest["dev_mode"] is True
+      assert manifest["dispatch_scope"] is None
       assert manifest["cmd"][:5] == ["python3", "-m", "agent.autonomous", "--profile", "analyst"]
       assert "--dev" in manifest["cmd"]
       assert manifest["log_path"] == str(tmp_path / "bg_0.log")
@@ -955,6 +1132,8 @@ def test_autonomous_manifest_written_post_spawn_with_full_field_set(monkeypatch,
       assert manifest["completed_at"] is None
       assert manifest["resumed_from"] == "prior-run"
       assert manifest["resumed_as"] == []
+      assert manifest["schedule_id"] is None
+      assert manifest["schedule_name"] is None
       assert "proc" not in manifest
       assert "reaper_task" not in manifest
       assert "events_tail_task" not in manifest
@@ -962,6 +1141,37 @@ def test_autonomous_manifest_written_post_spawn_with_full_field_set(monkeypatch,
     finally:
       await registry.cancel(payload["task_id"])
       await registry.shutdown(grace_sec=0.1)
+
+  asyncio.run(_case())
+
+
+def test_autonomous_start_rejects_unredacted_dispatch_scope_before_spawn(monkeypatch, tmp_path) -> None:
+  async def _case() -> None:
+    from agent_gateway import autonomous_runner
+
+    async def fake_exec(*args, **kwargs):
+      _ = args, kwargs
+      raise AssertionError("dispatch_scope validation must run before spawn")
+
+    monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
+    registry = _registry(tmp_path)
+    with pytest.raises(ValueError, match="dispatch_scope"):
+      await registry.start(
+        profile="analyst",
+        mode="task",
+        task="Review scope.",
+        user_id=USER_ID,
+        user_email=None,
+        dispatch_scope={
+          "kind": "portfolio",
+          "source": "user_selected",
+          "portfolio_name": "taxable_combined",
+          "account_id": "acc-1",
+        },
+      )
+
+    assert registry._tasks == {}
+    assert not _manifest_path(tmp_path).exists()
 
   asyncio.run(_case())
 
@@ -1064,6 +1274,43 @@ def test_autonomous_manifest_updates_on_reaper_failure(monkeypatch, tmp_path) ->
   assert manifest["exit_code"] is None
   assert manifest["error"] == "reaper failed: reap boom"
   assert isinstance(manifest["completed_at"], float)
+
+
+@pytest.mark.parametrize("state", ["starting", "queued", "waiting"])
+def test_autonomous_reaper_terminalizes_non_running_active_states(monkeypatch, tmp_path, state: str) -> None:
+  async def _case() -> None:
+    from agent_gateway import autonomous_runner
+
+    processes: list[SlowFakeProcess] = []
+
+    async def fake_exec(*args, **kwargs):
+      _ = args, kwargs
+      process = SlowFakeProcess()
+      processes.append(process)
+      return process
+
+    monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+    registry = _registry(tmp_path)
+    payload = await registry.start(
+      profile="analyst",
+      mode="task",
+      task="summarize",
+      user_id=USER_ID,
+      user_email=USER_EMAIL,
+    )
+    record = registry._tasks[payload["task_id"]]
+    record.state = state
+    processes[0].returncode = 0
+
+    await registry.wait(payload["task_id"], timeout_sec=1)
+
+    manifest = _read_manifest(tmp_path)
+    assert manifest["state"] == "completed"
+    assert manifest["exit_code"] == 0
+    assert isinstance(manifest["completed_at"], float)
+
+  asyncio.run(_case())
 
 
 def test_autonomous_manifest_updates_on_cancel(monkeypatch, tmp_path) -> None:
@@ -1367,9 +1614,40 @@ def test_autonomous_start_aliases_autonomous_identity(monkeypatch, tmp_path) -> 
   env = asyncio.run(_start_and_capture_env(monkeypatch, tmp_path))
 
   assert env["AUTONOMOUS_USER_ID"] == USER_ID
+  assert env["AUTONOMOUS_RAW_USER_ID"] == USER_ID
+  assert env["AUTONOMOUS_USER_SLUG"] == ""
   assert env["AUTONOMOUS_USER_EMAIL"] == USER_EMAIL
   assert env["AUTONOMOUS_USER_ID"] == env["AGENT_API_CLAIM_USER_ID"]
   assert env["AUTONOMOUS_USER_EMAIL"] == env["AGENT_API_CLAIM_USER_EMAIL"]
+
+
+def test_autonomous_start_resolves_slug_metadata_to_canonical_owner(monkeypatch, tmp_path) -> None:
+  monkeypatch.setenv(
+    "GATEWAY_USER_KEYS",
+    json.dumps([
+      {
+        "key": "mcp-key-for-henry",
+        "channel": "mcp",
+        "slug": "henry",
+        "email": USER_EMAIL,
+        "risk_user_id": 1,
+        "role": "owner",
+      }
+    ]),
+  )
+  env = asyncio.run(
+    _start_and_capture_env(
+      monkeypatch,
+      tmp_path,
+      user_id="henry",
+      user_email=USER_EMAIL,
+    )
+  )
+
+  assert env["AUTONOMOUS_USER_ID"] == "1"
+  assert env["AUTONOMOUS_RAW_USER_ID"] == "henry"
+  assert env["AUTONOMOUS_USER_SLUG"] == "henry"
+  assert env["AGENT_API_CLAIM_USER_ID"] == "1"
 
 
 def test_autonomous_start_overrides_preexisting_autonomous_identity(monkeypatch, tmp_path) -> None:
@@ -1379,6 +1657,8 @@ def test_autonomous_start_overrides_preexisting_autonomous_identity(monkeypatch,
   env = asyncio.run(_start_and_capture_env(monkeypatch, tmp_path))
 
   assert env["AUTONOMOUS_USER_ID"] == USER_ID
+  assert env["AUTONOMOUS_RAW_USER_ID"] == USER_ID
+  assert env["AUTONOMOUS_USER_SLUG"] == ""
   assert env["AUTONOMOUS_USER_EMAIL"] == USER_EMAIL
   assert env["AGENT_API_CLAIM_USER_ID"] == USER_ID
   assert env["AGENT_API_CLAIM_USER_EMAIL"] == USER_EMAIL

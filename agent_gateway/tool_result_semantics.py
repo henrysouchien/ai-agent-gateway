@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from typing import Any
+
+_REPAIR_HINT_EXAMPLE_LIMIT = 600
 
 
 def classify_semantic_tool_error(result: Any) -> dict[str, Any] | None:
@@ -17,15 +20,23 @@ def classify_semantic_tool_error(result: Any) -> dict[str, Any] | None:
 
   status = result.get("status")
   if isinstance(status, str) and status.strip().lower() == "error":
+    empty_detail = not status_error_has_detail(result)
     payload = {
       "code": "tool_status_error",
-      "message": _semantic_error_message(result, "Tool result reported status=error"),
+      "message": _semantic_error_message(
+        result,
+        "Tool result reported status=error without error detail"
+        if empty_detail
+        else "Tool result reported status=error",
+      ),
       "source": "status",
       "status": status,
     }
     nested_code = _nested_error_code(result)
     if nested_code:
       payload["sub_code"] = nested_code
+    elif empty_detail:
+      payload["sub_code"] = "empty_error_detail"
     return payload
 
   return None
@@ -42,8 +53,43 @@ def _semantic_error_message(result: dict[str, Any], fallback: str) -> str:
   if not validation_summary and isinstance(nested, dict):
     validation_summary = _validation_errors_summary(nested)
   if validation_summary and "validation_errors:" not in message:
-    return f"{message}; {validation_summary}"
+    message = f"{message}; {validation_summary}"
+  repair_hint = _repair_hint_summary(result, existing_message=message)
+  if repair_hint:
+    message = f"{message}; {repair_hint}"
   return message
+
+
+def _repair_hint_summary(result: dict[str, Any], *, existing_message: str = "") -> str:
+  """Surface structured repair hints (data.fix / data.example) to the model.
+
+  FMS door rejections ship a `fix` instruction and a concrete passing
+  `example` inside error.data; without them the model is left guessing
+  field names across retries.
+  """
+  data = None
+  nested = result.get("error")
+  if isinstance(nested, dict):
+    data = nested.get("data")
+  if not isinstance(data, dict):
+    data = result.get("data")
+  if not isinstance(data, dict):
+    return ""
+
+  parts: list[str] = []
+  fix = data.get("fix")
+  if isinstance(fix, str) and fix.strip() and "fix=" not in existing_message:
+    parts.append(f"fix={fix.strip()}")
+  example = data.get("example")
+  if example not in (None, "", {}, []) and "example=" not in existing_message:
+    try:
+      rendered = json.dumps(example, default=str, separators=(",", ":"))
+    except (TypeError, ValueError):
+      rendered = str(example)
+    if len(rendered) > _REPAIR_HINT_EXAMPLE_LIMIT:
+      rendered = rendered[: _REPAIR_HINT_EXAMPLE_LIMIT - 3].rstrip() + "..."
+    parts.append(f"example={rendered}")
+  return "; ".join(parts)
 
 
 def _base_semantic_error_message(result: dict[str, Any], fallback: str) -> str:
@@ -62,6 +108,27 @@ def _base_semantic_error_message(result: dict[str, Any], fallback: str) -> str:
       return value.strip()
 
   return fallback
+
+
+def status_error_has_detail(result: dict[str, Any]) -> bool:
+  nested = result.get("error")
+  if isinstance(nested, dict):
+    if _nested_error_code(result) or _base_semantic_error_message({"error": nested}, "") or _validation_errors_summary(nested):
+      return True
+  elif isinstance(nested, str):
+    if nested.strip():
+      return True
+  elif nested not in (None, "", {}, []):
+    return True
+
+  for key in ("message", "error_message", "detail", "reason", "code", "sub_code", "error_code", "error_type"):
+    value = result.get(key)
+    if isinstance(value, str) and value.strip():
+      return True
+    if value not in (None, "", {}, []):
+      return True
+
+  return bool(_validation_errors_summary(result))
 
 
 def _format_validation_error(error: Any) -> str:

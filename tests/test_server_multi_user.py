@@ -130,6 +130,8 @@ def _make_app(
   credentials_resolver=None,
   credentials_refresh_resolver=None,
   resolver_timeout_seconds: float = 5.0,
+  channel_profile_allowlist: dict[str, frozenset[str]] | None = None,
+  transcript_dir: Path | None = None,
 ):
   captured_requests: list[Any] = []
   run_calls: list[dict[str, Any]] = []
@@ -148,7 +150,9 @@ def _make_app(
       credentials_resolver=credentials_resolver,
       credentials_refresh_resolver=credentials_refresh_resolver,
       resolver_timeout_seconds=resolver_timeout_seconds,
+      channel_profile_allowlist=channel_profile_allowlist,
       build_chat_runtime=_build_chat_runtime,
+      transcript_dir=transcript_dir,
     )
   )
   return app, captured_requests, run_calls
@@ -415,6 +419,168 @@ def test_chat_init_accepts_resolver_derived_user_without_request_user_id() -> No
   assert session.is_public is False
 
 
+def test_channel_profile_allowlist_none_preserves_profile_resolution() -> None:
+  async def _resolver(_api_key: str, init_request):
+    return _resolver_result_for(init_request.user_id, channel="x")
+
+  app, captured_requests, _run_calls = _make_app(credentials_resolver=_resolver)
+
+  with TestClient(app) as client:
+    init_response = _init_session(client, user_id="alice")
+    _consume_chat_stream(
+      client,
+      init_response["session_token"],
+      {
+        "user_id": "alice",
+        "messages": [{"role": "user", "content": "hello"}],
+        "context": {"profile": "analyst"},
+      },
+    )
+    _consume_chat_stream(
+      client,
+      init_response["session_token"],
+      {
+        "user_id": "alice",
+        "messages": [{"role": "user", "content": "hello"}],
+        "context": {"profile": "community"},
+      },
+    )
+
+  assert [item["request"].context["profile"] for item in captured_requests] == ["analyst", "community"]
+
+
+def test_channel_profile_allowlist_rejects_disallowed_session_channel_profile() -> None:
+  async def _resolver(_api_key: str, init_request):
+    return _resolver_result_for(init_request.user_id, channel="x")
+
+  app, captured_requests, _run_calls = _make_app(
+    credentials_resolver=_resolver,
+    channel_profile_allowlist={"x": frozenset({"community"})},
+  )
+
+  with TestClient(app, raise_server_exceptions=False) as client:
+    init_response = _init_session(client, user_id="alice")
+    response = client.post(
+      "/api/chat",
+      headers={"Authorization": f"Bearer {init_response['session_token']}"},
+      json={
+        "user_id": "alice",
+        "messages": [{"role": "user", "content": "hello"}],
+        "context": {"channel": "unrestricted-client-claim", "profile": "analyst"},
+      },
+    )
+
+  assert response.status_code == 403
+  assert response.json()["detail"] == "Profile 'analyst' is not permitted on channel 'x'"
+  assert captured_requests == []
+  session = app.state.auth.session_store.get_session(init_response["session_id"])
+  assert session.stream_active is False
+  assert session.active_turn is None
+
+
+def test_discord_channel_profile_allowlist_rejects_analyst_and_hank_alias() -> None:
+  async def _resolver(_api_key: str, init_request):
+    return _resolver_result_for(init_request.user_id, channel="discord")
+
+  app, captured_requests, _run_calls = _make_app(
+    credentials_resolver=_resolver,
+    channel_profile_allowlist={"discord": frozenset({"community"})},
+  )
+
+  with TestClient(app, raise_server_exceptions=False) as client:
+    init_response = _init_session(client, user_id="alice")
+    for requested_profile, resolved_profile in (("analyst", "analyst"), ("hank", "analyst")):
+      response = client.post(
+        "/api/chat",
+        headers={"Authorization": f"Bearer {init_response['session_token']}"},
+        json={
+          "user_id": "alice",
+          "messages": [{"role": "user", "content": "hello"}],
+          "context": {"profile": requested_profile},
+        },
+      )
+      assert response.status_code == 403
+      assert response.json()["detail"] == (
+        f"Profile {resolved_profile!r} is not permitted on channel 'discord'"
+      )
+
+  assert captured_requests == []
+
+
+def test_discord_hank_community_alias_resolves_to_community_profile() -> None:
+  async def _resolver(_api_key: str, init_request):
+    return _resolver_result_for(init_request.user_id, channel="discord")
+
+  app, captured_requests, _run_calls = _make_app(
+    credentials_resolver=_resolver,
+    channel_profile_allowlist={"discord": frozenset({"community"})},
+  )
+
+  with TestClient(app) as client:
+    init_response = _init_session(client, user_id="alice")
+    _consume_chat_stream(
+      client,
+      init_response["session_token"],
+      {
+        "user_id": "alice",
+        "messages": [{"role": "user", "content": "hello"}],
+        "context": {"profile": "hank-community"},
+      },
+    )
+
+  assert [item["request"].context["profile"] for item in captured_requests] == ["community"]
+
+
+def test_discord_session_channel_profile_allowlist_ignores_claimed_context_channel() -> None:
+  async def _resolver(_api_key: str, init_request):
+    return _resolver_result_for(init_request.user_id, channel="discord")
+
+  app, captured_requests, _run_calls = _make_app(
+    credentials_resolver=_resolver,
+    channel_profile_allowlist={"discord": frozenset({"community"})},
+  )
+
+  with TestClient(app, raise_server_exceptions=False) as client:
+    init_response = _init_session(client, user_id="alice")
+    response = client.post(
+      "/api/chat",
+      headers={"Authorization": f"Bearer {init_response['session_token']}"},
+      json={
+        "user_id": "alice",
+        "messages": [{"role": "user", "content": "hello"}],
+        "context": {"channel": "web", "profile": "analyst"},
+      },
+    )
+
+  assert response.status_code == 403
+  assert response.json()["detail"] == "Profile 'analyst' is not permitted on channel 'discord'"
+  assert captured_requests == []
+
+
+def test_channel_profile_allowlist_absent_channel_is_unrestricted() -> None:
+  async def _resolver(_api_key: str, init_request):
+    return _resolver_result_for(init_request.user_id, channel="y")
+
+  app, captured_requests, _run_calls = _make_app(
+    credentials_resolver=_resolver,
+    channel_profile_allowlist={"x": frozenset({"community"})},
+  )
+
+  with TestClient(app) as client:
+    init_response = _init_session(client, user_id="alice")
+    _consume_chat_stream(
+      client,
+      init_response["session_token"],
+      {
+        "user_id": "alice",
+        "messages": [{"role": "user", "content": "hello"}],
+        "context": {"profile": "analyst"},
+      },
+    )
+
+  assert [item["request"].context["profile"] for item in captured_requests] == ["analyst"]
+
+
 def test_chat_init_calls_resolver_and_stores_auth_config() -> None:
   calls: list[tuple[str, Any]] = []
 
@@ -591,6 +757,41 @@ def test_chat_request_id_uses_consumer_value_or_gateway_uuid() -> None:
   assert captured_requests[0]["request"].request_id == "req-123"
   assert captured_requests[1]["request"].request_id != "req-123"
   assert str(uuid.UUID(captured_requests[1]["request"].request_id)) == captured_requests[1]["request"].request_id
+
+
+def test_chat_metadata_reaches_runtime_and_transcript(tmp_path: Path) -> None:
+  app, captured_requests, _run_calls = _make_app(transcript_dir=tmp_path)
+  metadata = {
+    "contextual_chat": {
+      "id": "ctx-holding-1",
+      "schemaVersion": "contextual-chat-v1",
+      "surface": "portfolio",
+      "objectType": "holding",
+      "objectId": "AAPL",
+      "visibleText": "AAPL row",
+    }
+  }
+
+  with TestClient(app) as client:
+    init_response = _init_session(client, user_id="alice")
+    _consume_chat_stream(
+      client,
+      init_response["session_token"],
+      {
+        "messages": [{"role": "user", "content": "Review this row"}],
+        "metadata": metadata,
+      },
+    )
+
+  assert captured_requests[0]["request"].metadata == metadata
+  transcript_path = tmp_path / f"{init_response['session_id']}.jsonl"
+  transcript_events = [
+    json.loads(line)
+    for line in transcript_path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+  ]
+  chat_request = next(event for event in transcript_events if event.get("type") == "chat_request")
+  assert chat_request["metadata"] == metadata
 
 
 def test_credentials_resolver_timeout_returns_structured_error() -> None:

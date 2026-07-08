@@ -177,7 +177,7 @@ def test_sdk_runner_stale_prefixed_mcp_tool_denied_without_approval(monkeypatch:
 
   denied = _run(
     runner._can_use_tool_callback(
-      "mcp__portfolio-mcp__execute_trade",
+      "mcp__portfolio-reads-mcp__execute_trade",
       {"preview_id": "p1"},
       None,
     )
@@ -201,7 +201,7 @@ def test_sdk_runner_stale_prefixed_mcp_tool_policy_import_drift_fails_loud(
   with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
     _run(
       runner._can_use_tool_callback(
-        "mcp__portfolio-mcp__execute_trade",
+        "mcp__portfolio-reads-mcp__execute_trade",
         {"preview_id": "p1"},
         None,
       )
@@ -342,7 +342,7 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
     {
       "type": "tool_call_complete",
       "tool_call_id": "preview-1",
-      "tool_name": "mcp__portfolio-mcp__preview_trade",
+      "tool_name": "mcp__portfolio-reads-mcp__preview_trade",
       "result": {
         "status": "success",
         "metadata": {
@@ -394,7 +394,7 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
     )
 
     callback_task = asyncio.create_task(
-      runner._can_use_tool_callback("mcp__portfolio-mcp__execute_trade", {"preview_id": "p1"}, None)
+      runner._can_use_tool_callback("mcp__portfolio-trades-mcp__execute_trade", {"preview_id": "p1"}, None)
     )
     for _ in range(100):
       if session.pending_tools:
@@ -541,6 +541,71 @@ def test_sdk_runner_report_door_clears_active_skill_gate(monkeypatch: pytest.Mon
 
     assert runner._active_skill_deny == set()
     assert current_skill() is None
+  finally:
+    clear_current_skill()
+
+
+def test_sdk_runner_model_writer_terminal_door_clears_build_model_deny(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  runner = _make_runner()
+  runner._active_skill_deny = {"build_model"}
+  runner._active_skill_report_doors = {"fms_persist_business_model": "business-model-construction"}
+  set_current_skill("business-model-construction")
+
+  try:
+    denied = _run(runner._can_use_tool_callback("build_model", {}, None))
+    assert denied.behavior == "deny"
+
+    cleared = runner._clear_active_skill_if_report_door_completed(
+      tool_name="fms_persist_business_model",
+      result={
+        "status": "staged",
+        "subcommand": "persist_business_model",
+        "mutation_mode": "model_writer",
+      },
+      error=None,
+    )
+
+    assert cleared is True
+    assert runner._active_skill_deny == set()
+    assert runner._active_skill_report_doors == {}
+    assert current_skill() is None
+
+    allowed = _run(runner._can_use_tool_callback("build_model", {}, None))
+    assert allowed.behavior == "allow"
+  finally:
+    clear_current_skill()
+
+
+def test_sdk_runner_model_writer_mid_skill_build_model_deny_holds(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  runner = _make_runner()
+  runner._active_skill_deny = {"build_model"}
+  runner._active_skill_report_doors = {"fms_persist_business_model": "business-model-construction"}
+  set_current_skill("business-model-construction")
+
+  try:
+    denied = _run(runner._can_use_tool_callback("build_model", {}, None))
+    assert denied.behavior == "deny"
+
+    cleared = runner._clear_active_skill_if_report_door_completed(
+      tool_name="fms_report_build_model",
+      result={
+        "status": "staged",
+        "subcommand": "report_build_model",
+        "mutation_mode": "preview",
+      },
+      error=None,
+    )
+
+    assert cleared is False
+    assert runner._active_skill_deny == {"build_model"}
+    assert runner._active_skill_report_doors == {"fms_persist_business_model": "business-model-construction"}
+    assert current_skill() == "business-model-construction"
   finally:
     clear_current_skill()
 

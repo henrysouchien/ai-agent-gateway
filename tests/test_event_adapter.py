@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agent_gateway.event_adapter import (
+  ControlV1Adapter,
   V1_FIELD_PROJECTION,
   V1_WIRE_EVENT_TYPES,
   V1Adapter,
@@ -35,7 +36,7 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
       "tool_input": {"ticker": "MSFT"},
       "execution_location": "backend",
       "call_index": 0,
-      "server": "portfolio-mcp",
+      "server": "portfolio-reads-mcp",
       "started_at": 1000.0,
       "parent_assistant_message_seq": 7,
     },
@@ -46,7 +47,7 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
       "result": {"ok": True},
       "error": None,
       "duration_ms": 12,
-      "server": "portfolio-mcp",
+      "server": "portfolio-reads-mcp",
       "is_error": False,
       "semantic_error": None,
       "execution_location": "backend",
@@ -200,6 +201,23 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
     assert set(event) <= allowed, event["type"]
 
 
+def test_v1_adapter_preserves_artifact_ready_origin() -> None:
+  adapted = V1Adapter().transform(
+    {
+      "type": "artifact_ready",
+      "skill_run_id": "readback-toolu_1",
+      "ticker": "PCTY",
+      "skill": "quantifying-risk",
+      "artifact_id": "a-1",
+      "origin": "readback",
+      "future_only": "strip-me",
+    }
+  )
+
+  assert adapted["origin"] == "readback"
+  assert "future_only" not in adapted
+
+
 def test_v1_adapter_strips_unknown_fields_for_known_type() -> None:
   adapted = V1Adapter().transform(
     {
@@ -218,6 +236,38 @@ def test_v1_adapter_strips_unknown_fields_for_known_type() -> None:
     "tool_name": "build_model",
     "tool_input": {"ticker": "MSFT"},
     "execution_location": "backend",
+  }
+
+
+@pytest.mark.parametrize(
+  ("raw_state", "projected_state"),
+  [
+    ("budget_limited", "failed"),
+    ("budget_exceeded", "failed"),
+    ("blocked", "failed"),
+    ("remediating", "running"),
+    ("killed", "cancelled"),
+    ("interrupted", "interrupted"),
+  ],
+)
+def test_control_v1_adapter_normalizes_run_state_changed_states(raw_state: str, projected_state: str) -> None:
+  adapted = ControlV1Adapter().transform(
+    {
+      "type": "run_state_changed",
+      "run_id": "bg_1",
+      "control_run_id": "bg_1",
+      "state": raw_state,
+      "ts": 100,
+      "future_only": "strip-me",
+    }
+  )
+
+  assert adapted == {
+    "type": "run_state_changed",
+    "run_id": "bg_1",
+    "control_run_id": "bg_1",
+    "state": projected_state,
+    "ts": 100,
   }
 
 

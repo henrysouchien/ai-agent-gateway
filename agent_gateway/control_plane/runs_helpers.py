@@ -5,10 +5,9 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal, Union
+from typing import Any
 
-from fastapi import Body, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import HTTPException, Request
 
 from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
@@ -20,50 +19,70 @@ from agent_gateway.fixture_gate import (
   is_fixture_skill_name,
 )
 from agent_gateway.session import AuthManager, GatewaySession
+from agent_gateway.control_run_lifecycle import (
+  CONTROL_ACTIVE_RUN_STATES,
+  CONTROL_RUN_STATES,
+  CONTROL_TERMINAL_RUN_STATES,
+  canonical_control_run_state,
+  coerce_control_run_state,
+  is_autonomous_run_internal_messageable_state,
+  is_autonomous_run_internal_resumable_state,
+  is_control_run_active_state,
+)
+from .runs_models import (
+  AutonomousDispatchRequest,
+  AutonomousDispatchResponse,
+  AutonomousResumeRequest,
+  AutonomousRunMessageRequest,
+  AutonomousRunResponse,
+  AutonomousRunState,
+  ChatContinuationRequest,
+  ChatDispatchRequest,
+  ChatDispatchResponse,
+  ChatMessage,
+  ChatRunResponse,
+  ChatRunState,
+  ControlRunDispatchRequest,
+  DispatchScope,
+  PendingApprovalResponse,
+  RunDispatchResponse,
+  RunEnvelopeResponse,
+  RunLogsResponse,
+  RunMessageRequest,
+  RunResponse,
+  RunsListResponse,
+  VerdictSummaryResponse,
+)
+
+__all__ = [
+  "AutonomousDispatchRequest",
+  "AutonomousDispatchResponse",
+  "AutonomousResumeRequest",
+  "AutonomousRunMessageRequest",
+  "AutonomousRunResponse",
+  "AutonomousRunState",
+  "ChatContinuationRequest",
+  "ChatDispatchRequest",
+  "ChatDispatchResponse",
+  "ChatMessage",
+  "ChatRunResponse",
+  "ChatRunState",
+  "ControlRunDispatchRequest",
+  "DispatchScope",
+  "PendingApprovalResponse",
+  "RunDispatchResponse",
+  "RunEnvelopeResponse",
+  "RunLogsResponse",
+  "RunMessageRequest",
+  "RunResponse",
+  "RunsListResponse",
+  "VerdictSummaryResponse",
+]
 
 _SKILL_LOADER_MODULE_NAMES = frozenset({"agent", "agent.skills", "agent.skills.loader"})
 
-ChatRunState = Literal[
-  "starting",
-  "queued",
-  "waiting",
-  "running",
-  "approval_pending",
-  "completed",
-  "failed",
-  "cancelled",
-  "budget_limited",
-  "blocked",
-  "remediating",
-]
-AutonomousRunState = Literal[
-  "starting",
-  "queued",
-  "waiting",
-  "running",
-  "approval_pending",
-  "completed",
-  "failed",
-  "cancelled",
-  "budget_limited",
-  "blocked",
-  "remediating",
-  "interrupted",
-]
-_CHAT_RUN_STATES = {
-  "starting",
-  "queued",
-  "waiting",
-  "running",
-  "approval_pending",
-  "remediating",
-  "completed",
-  "failed",
-  "cancelled",
-  "budget_limited",
-  "blocked",
-}
-_TERMINAL_RUN_STATES = {"completed", "failed", "cancelled", "budget_limited", "blocked"}
+_CHAT_RUN_STATES = set(CONTROL_RUN_STATES)
+_TERMINAL_RUN_STATES = set(CONTROL_TERMINAL_RUN_STATES)
 _CONTROL_CHAT_TASK_PREFIX = "control_chat_turn:"
 _AUTONOMOUS_RESUME_EVENT_TAIL = 40
 _AUTONOMOUS_RESUME_EVENT_BLOCK_MAX_CHARS = 1200
@@ -85,157 +104,6 @@ _QA_FIXTURE_APPROVAL_ARTIFACT_VALUE = "fixture-approval-artifact"
 _QA_FIXTURE_TERMINAL_FAILURE_VALUE = "fixture-terminal-failure"
 
 
-class VerdictSummaryResponse(BaseModel):
-  verdict_token: str
-  confidence: str | None
-  one_line_summary: str
-  skill_run_id: str
-
-
-class PendingApprovalResponse(BaseModel):
-  pending_id: str
-  tool_name: str
-  tool_input: dict[str, Any]
-  resolved_qualifier: str | None
-  reason: str | None
-  allow_persistent_approval: bool
-  requested_at: str
-
-
-class ChatRunResponse(BaseModel):
-  kind: Literal["chat"]
-  run_id: str
-  session_id: str
-  agent: Literal["hank"]
-  channel: str
-  user_id: str
-  state: ChatRunState
-  started_at: str
-  ended_at: str | None
-  cost_usd: float | None
-  initial_message: str
-  skill_run_ids: list[str]
-  current_verdict: VerdictSummaryResponse | None
-  pending_approval: PendingApprovalResponse | None
-
-
-class AutonomousRunResponse(BaseModel):
-  kind: Literal["autonomous"]
-  run_id: str
-  task_id: str
-  agent: Literal["hank"]
-  profile: str
-  mode: str
-  skill: str | None
-  task: str | None
-  ticker: str | None
-  channel: str
-  user_id: str
-  state: AutonomousRunState
-  messageable: bool = False
-  started_at: str
-  ended_at: str | None
-  cost_usd: float | None
-  skill_run_ids: list[str]
-  current_verdict: VerdictSummaryResponse | None
-  resumable: bool = False
-  resumed_from: str | None = None
-  resumed_as: list[str] = Field(default_factory=list)
-  latest_resume_run_id: str | None = None
-
-
-class ChatMessage(BaseModel):
-  role: str
-  content: str
-
-
-class ChatDispatchRequest(BaseModel):
-  kind: Literal["chat"]
-  message: str = Field(..., min_length=1)
-  channel: str = Field(..., min_length=1)
-  skill: str | None = None
-  ticker: str | None = None
-  dev_mode: bool = False
-  deadline_sec: int | None = Field(default=None, ge=1)
-
-
-class AutonomousDispatchRequest(BaseModel):
-  kind: Literal["autonomous"]
-  profile: str | None = None
-  mode: str | None = None
-  skill: str | None = None
-  task: str | None = None
-  ticker: str | None = None
-  context: str | None = None
-  channel: str | None = None
-  dev_mode: bool = False
-
-
-ControlRunDispatchRequest = Annotated[
-  Union[ChatDispatchRequest, AutonomousDispatchRequest],
-  Body(discriminator="kind"),
-]
-
-
-class AutonomousDispatchResponse(BaseModel):
-  run: AutonomousRunResponse
-  task_id: str
-  run_id: str
-  log_path: str
-  started_at: int
-  cmd: list[str]
-  resumed_from: str | None = None
-
-
-class ChatDispatchResponse(BaseModel):
-  run: ChatRunResponse
-  chat_session_token: str
-  chat_session_id: str
-  chat_session_expires_at: int
-
-
-RunDispatchResponse = Union[ChatDispatchResponse, AutonomousDispatchResponse]
-RunResponse = Union[ChatRunResponse, AutonomousRunResponse]
-
-
-class RunsListResponse(BaseModel):
-  runs: list[RunResponse]
-
-
-class RunLogsResponse(BaseModel):
-  run_id: str
-  log_lines: list[str]
-  more_available: bool
-
-
-class ChatContinuationRequest(BaseModel):
-  messages: list[ChatMessage]
-  request_id: str | None = None
-  context: dict[str, Any] = Field(default_factory=dict)
-  model: str | None = None
-  deadline_sec: int | None = Field(default=None, ge=1)
-
-
-class AutonomousRunMessageRequest(BaseModel):
-  message: str = Field(..., min_length=1)
-  message_id: str | None = None
-
-
-class AutonomousResumeRequest(BaseModel):
-  context: str | None = None
-  message: str | None = None
-  request_id: str | None = None
-
-
-RunMessageRequest = Union[ChatContinuationRequest, AutonomousRunMessageRequest]
-
-
-class RunEnvelopeResponse(BaseModel):
-  run: RunResponse
-  message_id: str | None = None
-  delivery_status: Literal["delivered", "duplicate"] | None = None
-
-
 def _iso_from_unix(timestamp: int | float | None) -> str:
   try:
     value = float(timestamp if timestamp is not None else 0)
@@ -249,6 +117,45 @@ def _require_bearer_session(request: Request, auth: AuthManager) -> GatewaySessi
   return auth.verify_token(token)
 
 
+def _session_owner_user_id(session: GatewaySession) -> str:
+  owner_user_id = getattr(session, "owner_user_id", None)
+  if isinstance(owner_user_id, str) and owner_user_id.strip():
+    return owner_user_id.strip()
+  risk_user_id = int(getattr(session, "risk_user_id", 0) or 0)
+  if risk_user_id > 0:
+    return str(risk_user_id)
+  return str(session.user_id)
+
+
+def _record_owner_user_id(record: AutonomousTask) -> str:
+  owner_user_id = getattr(record, "owner_user_id", None)
+  if isinstance(owner_user_id, str) and owner_user_id.strip():
+    return owner_user_id.strip()
+  return str(record.user_id)
+
+
+def _positive_risk_user_id(value: Any) -> int | None:
+  try:
+    risk_user_id = int(value or 0)
+  except (TypeError, ValueError):
+    return None
+  return risk_user_id if risk_user_id > 0 else None
+
+
+def _identity_aliases(raw_aliases: Any, owner_user_id: str) -> list[str]:
+  aliases = [owner_user_id]
+  if isinstance(raw_aliases, (list, tuple)):
+    for alias in raw_aliases:
+      normalized = str(alias).strip()
+      if normalized and normalized not in aliases:
+        aliases.append(normalized)
+  return aliases
+
+
+def _session_matches_owner(session: GatewaySession, owner_user_id: str) -> bool:
+  return _session_owner_user_id(session) == owner_user_id
+
+
 def _state_from_session(session: GatewaySession, events: list[dict[str, Any]]) -> ChatRunState:
   if any(pending.get("status") == "approval_pending" for pending in session.pending_tools.values()):
     return "approval_pending"
@@ -258,9 +165,9 @@ def _state_from_session(session: GatewaySession, events: list[dict[str, Any]]) -
   for event in reversed(events):
     event_type = event.get("type")
     if event_type == "run_state_changed":
-      state = event.get("state")
-      if state in _CHAT_RUN_STATES:
-        return state  # type: ignore[return-value]
+      state = coerce_control_run_state(event.get("state"))
+      if state is not None:
+        return state
     if raw_terminal_state is None:
       if event_type == "error":
         raw_terminal_state = "failed"
@@ -273,8 +180,8 @@ def _ended_at_from_events(events: list[dict[str, Any]]) -> str | None:
   for event in reversed(events):
     if event.get("type") != "run_state_changed":
       continue
-    state = event.get("state")
-    if state not in _TERMINAL_RUN_STATES:
+    state = coerce_control_run_state(event.get("state"))
+    if state not in CONTROL_TERMINAL_RUN_STATES:
       continue
     return _iso_from_unix(event.get("ts"))
   return None
@@ -399,21 +306,7 @@ def _verdict_summary_from_skill_result(event: dict[str, Any]) -> dict[str, Any] 
 
 
 def _autonomous_state(state: str) -> AutonomousRunState:
-  if state == "killed":
-    return "cancelled"
-  if state in {"budget_limited", "budget_exceeded"}:
-    return "budget_limited"
-  if state == "blocked":
-    return "blocked"
-  if state in {"finished", "completed"}:
-    return "completed"
-  if state == "failed":
-    return "failed"
-  if state in {"queued", "waiting", "running", "approval_pending", "remediating", "interrupted"}:
-    return state
-  if state == "starting":
-    return "starting"
-  return "running"
+  return canonical_control_run_state(state)
 
 
 def _pending_approval(session: GatewaySession) -> PendingApprovalResponse | None:
@@ -437,13 +330,21 @@ def _pending_approval(session: GatewaySession) -> PendingApprovalResponse | None
 def _chat_run_from_session(session: GatewaySession) -> ChatRunResponse:
   events = session.event_history.snapshot()
   state = _state_from_session(session, events)
+  owner_user_id = _session_owner_user_id(session)
   return ChatRunResponse(
     kind="chat",
     run_id=session.session_id,
     session_id=session.session_id,
     agent="hank",
     channel=session.channel or "web",
-    user_id=session.user_id,
+    user_id=owner_user_id,
+    owner_user_id=owner_user_id,
+    raw_user_id=getattr(session, "raw_user_id", None) or session.user_id,
+    user_slug=getattr(session, "user_slug", None),
+    risk_user_id=_positive_risk_user_id(getattr(session, "risk_user_id", None)),
+    user_email=session.user_email,
+    user_aliases=_identity_aliases(getattr(session, "user_aliases", None), owner_user_id),
+    identity_status=getattr(session, "identity_status", None),
     state=state,
     started_at=_iso_from_unix(session.created_at),
     ended_at=_ended_at_from_events(events) if state in _TERMINAL_RUN_STATES else None,
@@ -452,6 +353,7 @@ def _chat_run_from_session(session: GatewaySession) -> ChatRunResponse:
     skill_run_ids=_skill_run_ids(events),
     current_verdict=_current_verdict(events),
     pending_approval=_pending_approval(session),
+    dispatch_scope=session.dispatch_scope,
   )
 
 
@@ -538,6 +440,7 @@ async def _deny_autonomous_pending_approvals_for_cancel(
   pending_events = _autonomous_pending_approval_events(record)
   if not pending_events:
     return
+  owner_user_id = _session_owner_user_id(authenticated)
 
   store = getattr(app_state, "gateway_approval_store", None)
   policy = getattr(app_state, "gateway_approval_policy", None)
@@ -561,7 +464,7 @@ async def _deny_autonomous_pending_approvals_for_cancel(
       api_key_hash="control-autonomous",
       created_at=int(record.started_at),
       expires_at=int(time.time()) + 600,
-      user_id=record.user_id,
+      user_id=_record_owner_user_id(record),
       user_email=record.user_email,
       role=authenticated.role,
       kind="chat",
@@ -577,7 +480,7 @@ async def _deny_autonomous_pending_approvals_for_cancel(
       pending_entry=pending_entry,
       tool_call_id=tool_call_id,
       nonce=nonce,
-      decider_id=authenticated.user_id,
+      decider_id=owner_user_id,
       decider_role=getattr(authenticated, "role", None),
       approved=False,
       allow_tool_type=False,
@@ -587,7 +490,7 @@ async def _deny_autonomous_pending_approvals_for_cancel(
     try:
       await registry.send_approval_decision(
         record.control_run_id,
-        user_id=authenticated.user_id,
+        user_id=owner_user_id,
         channel=authenticated.channel,
         approval_id=approval_id,
         tool_call_id=tool_call_id,
@@ -627,7 +530,7 @@ def _skill_is_resumable(skills_dir: Path | None, skill: str | None) -> bool:
 def _autonomous_task_resumable(record: AutonomousTask, skills_dir: Path | None) -> bool:
   if record.mode != "skill" or not record.skill:
     return False
-  if _autonomous_state(record.state) not in {"failed", "cancelled", "interrupted"}:
+  if not is_autonomous_run_internal_resumable_state(record.state):
     return False
   return _skill_is_resumable(skills_dir, record.skill)
 
@@ -638,7 +541,9 @@ def _autonomous_task_messageable(
   state: AutonomousRunState,
   events: list[dict[str, Any]],
 ) -> bool:
-  if state not in {"running", "waiting", "approval_pending"}:
+  if not is_control_run_active_state(state):
+    return False
+  if not is_autonomous_run_internal_messageable_state(record.state):
     return False
   if record.operator_inbox_path is None:
     return False
@@ -651,8 +556,9 @@ def _autonomous_run_from_task(record: AutonomousTask, *, skills_dir: Path | None
   events = _autonomous_events(record)
   resumed_as = list(record.resumed_as)
   state = _autonomous_state(record.state)
-  if state == "running" and _autonomous_has_pending_approval(events):
+  if state in CONTROL_ACTIVE_RUN_STATES and _autonomous_has_pending_approval(events):
     state = "approval_pending"
+  owner_user_id = _record_owner_user_id(record)
   return AutonomousRunResponse(
     kind="autonomous",
     run_id=record.control_run_id,
@@ -664,7 +570,14 @@ def _autonomous_run_from_task(record: AutonomousTask, *, skills_dir: Path | None
     task=record.task,
     ticker=record.ticker,
     channel=record.channel or "web",
-    user_id=record.user_id,
+    user_id=owner_user_id,
+    owner_user_id=owner_user_id,
+    raw_user_id=record.raw_user_id or record.user_id,
+    user_slug=record.user_slug,
+    risk_user_id=_positive_risk_user_id(record.risk_user_id),
+    user_email=record.user_email,
+    user_aliases=_identity_aliases(record.user_aliases, owner_user_id),
+    identity_status=record.identity_status,
     state=state,
     messageable=_autonomous_task_messageable(record, state=state, events=events),
     started_at=_iso_from_unix(record.started_at),
@@ -676,6 +589,9 @@ def _autonomous_run_from_task(record: AutonomousTask, *, skills_dir: Path | None
     resumed_from=record.resumed_from,
     resumed_as=resumed_as,
     latest_resume_run_id=resumed_as[-1] if resumed_as else None,
+    dispatch_scope=record.dispatch_scope,
+    schedule_id=record.schedule_id,
+    schedule_name=record.schedule_name,
   )
 
 
@@ -684,7 +600,7 @@ def _chat_session_for_user(auth: AuthManager, run_id: str, user_id: str) -> Gate
   if (
     session is None
     or session.kind != "chat"
-    or session.user_id != user_id
+    or not _session_matches_owner(session, user_id)
     or not _chat_session_has_run_activity(session)
   ):
     raise HTTPException(status_code=404, detail="Run not found")
@@ -709,7 +625,7 @@ def _autonomous_task_for_user(
       (task for task in resolved_registry._tasks.values() if task.control_run_id == control_run_id),
       None,
     )
-  if record is None or record.user_id != user_id:
+  if record is None or _record_owner_user_id(record) != user_id:
     raise HTTPException(status_code=404, detail="Run not found")
   return record
 
@@ -748,7 +664,7 @@ def _require_autonomous_channel(record: AutonomousTask, channel: str | None) -> 
   _require_run_channel(record.channel, channel)
 
 
-def _payload_field_was_set(payload: BaseModel, field_name: str) -> bool:
+def _payload_field_was_set(payload: Any, field_name: str) -> bool:
   fields_set = getattr(payload, "model_fields_set", None)
   if fields_set is None:
     fields_set = getattr(payload, "__fields_set__", set())

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sys
 import time
 from pathlib import Path
@@ -11,12 +12,12 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-import agent_gateway
-import agent_gateway.autonomous as autonomous
-import agent_gateway.autonomous_output as autonomous_output
-from agent_gateway._provider_utils import _get_default_model_for_provider
-from agent_gateway import EventLog
-from agent_gateway.providers import ModelInfo, ModelProvider
+import agent_gateway  # noqa: E402
+import agent_gateway.autonomous as autonomous  # noqa: E402
+import agent_gateway.autonomous_output as autonomous_output  # noqa: E402
+from agent_gateway._provider_utils import _get_default_model_for_provider  # noqa: E402
+from agent_gateway import EventLog  # noqa: E402
+from agent_gateway.providers import ModelInfo, ModelProvider  # noqa: E402
 
 
 def _run(coro):
@@ -297,6 +298,45 @@ def test_run_session_no_wall_clock(
   assert output.timed_out is False
   assert output.error is None
   assert output.response == "completed"
+
+
+def test_run_session_writer_lease_collision_is_info_skip(
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  event_log = EventLog()
+
+  class _LeaseHeldRunner:
+    async def run(self, **kwargs: Any) -> None:
+      _ = kwargs
+      raise autonomous.WriterLeaseAlreadyHeldError(
+        "Writer lease already held for /tmp/agentsess_analyst_1.jsonl"
+      )
+
+  with caplog.at_level(logging.INFO, logger="agent_gateway.autonomous"):
+    output = _run(
+      autonomous.run_session(
+        _LeaseHeldRunner(),  # type: ignore[arg-type]
+        event_log,
+        model="claude-sonnet-4-6",
+        max_turns=3,
+        timeout_seconds=None,
+        initial_message="hello",
+        system_prompt="You are helpful.",
+      )
+    )
+
+  assert output.error == (
+    "WriterLeaseAlreadyHeldError: Writer lease already held for "
+    "/tmp/agentsess_analyst_1.jsonl"
+  )
+  assert output.exit_reason == "writer_lease_already_held"
+  assert "Autonomous run skipped: WriterLeaseAlreadyHeldError" in caplog.text
+  assert "Traceback (most recent call last)" not in caplog.text
+  assert not [
+    record
+    for record in caplog.records
+    if record.name == "agent_gateway.autonomous" and record.levelno >= logging.WARNING
+  ]
 
 
 def test_run_autonomous_tolerates_model_free_auth_config(monkeypatch: pytest.MonkeyPatch) -> None:

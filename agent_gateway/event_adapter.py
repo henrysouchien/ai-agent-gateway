@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from .control_run_lifecycle import canonical_control_run_state
 from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 
 
@@ -199,6 +200,7 @@ V1_FIELD_PROJECTION: dict[str, frozenset[str]] = {
     "ts",
     "scope",
     "portfolio_id",
+    "origin",
   ),
   "artifact_failed": _fields(
     "skill_run_id",
@@ -334,7 +336,10 @@ class ControlV1Adapter:
     if event_type not in CONTROL_V1_WIRE_EVENT_TYPES:
       return None
     allowed_keys = CONTROL_V1_FIELD_PROJECTION.get(str(event_type), frozenset())
-    return {key: value for key, value in event.items() if key in allowed_keys}
+    projected = {key: value for key, value in event.items() if key in allowed_keys}
+    if event_type == "run_state_changed" and "state" in projected:
+      projected["state"] = canonical_control_run_state(projected["state"])
+    return projected
 
 
 ADAPTERS: dict[int, SchemaAdapter] = {

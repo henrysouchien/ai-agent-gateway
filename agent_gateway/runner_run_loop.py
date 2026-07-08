@@ -15,6 +15,11 @@ from .runner_limits import (
   token_estimate_snapshot as _token_estimate_snapshot,
 )
 from .runner_prompt_rules import prepend_system_prompt_preamble as _prepend_system_prompt_preamble
+from .runner_run_loop_defaults import (
+  MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFICATIONS_PER_TURN,
+  MAX_TOKENS_CONTINUATIONS as _MAX_TOKENS_CONTINUATIONS,
+  MAX_TOKENS_NUDGE as _MAX_TOKENS_NUDGE,
+)
 from .runner_session_lifecycle import _runner_attr
 from .runner_session_events import (
   build_budget_exceeded_event as _build_budget_exceeded_event,
@@ -62,16 +67,6 @@ from .task_registry import (
 
 
 log = logging.getLogger("agent_gateway.runner")
-_MAX_NOTIFICATIONS_PER_TURN = 5
-_MAX_TOKENS_CONTINUATIONS = 3
-_MAX_TOKENS_NUDGE = (
-  "[System: Your previous response hit the output-token limit and was truncated; "
-  "any partial tool call was discarded. Continue the task now with a tool-first "
-  "response: if a required tool/report/persist door is available, call it now with "
-  "the smallest valid JSON payload. Trim verbose rationale fields, omit optional "
-  "narrative, and split only when the tool contract requires it. Do not spend "
-  "another turn on hidden analysis or restate prior reasoning.]"
-)
 
 
 class RunnerRunLoopMixin:
@@ -84,25 +79,7 @@ class RunnerRunLoopMixin:
     *,
     resume_initial_messages: List[Dict[str, Any]] | None = None,
   ) -> None:
-    """Execute the full chat loop and stream events into `EventLog`.
-
-    AgentRunner instances are single-use. Construct a new runner for each
-    subsequent run.
-
-    Args:
-      messages: Conversation history for the current request.
-      system_prompt: Optional prompt string or cached prompt blocks.
-      model_override: Optional per-request model override.
-      max_turns: Optional maximum number of model/tool turns.
-
-    Behavior:
-      - emits `text_delta`, `thinking_delta`, and tool lifecycle events
-      - retries transient stream failures
-      - appends `stream_complete` on success
-      - appends `error` on terminal failure
-      - appends `max_turns_reached` or `budget_exceeded` when limits stop the
-        loop early
-    """
+    """Execute the full chat loop and stream events into `EventLog`."""
     if self._summary_emitted:
       raise RuntimeError("AgentRunner is single-use; construct a new runner for subsequent runs")
     asyncio_module = _runner_attr(self, "asyncio", asyncio)

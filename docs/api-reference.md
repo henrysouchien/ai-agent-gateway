@@ -183,6 +183,7 @@ Key fields:
 - `build_chat_runtime`: required async factory that returns `ChatRuntime`
 - `valid_api_keys`, `jwt_secret`, `session_ttl`: auth and session envelope
 - `allowed_models`: request-time allowlist
+- `dispatch_scope_validator`: optional dispatch-time validator/canonicalizer for redacted structured portfolio scope
 - `cors_origins`, `prefix`: HTTP surface
 - `on_event`, `on_startup`, `on_shutdown`: app lifecycle hooks
 - `transcript_dir`: JSONL transcript output

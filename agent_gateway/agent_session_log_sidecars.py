@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-from .agent_session_log_records import _now_iso
+from .agent_session_log_records import _atomic_write_sidecar, _now_iso
 
 
 def logical_stream_id(path: Path) -> str:
@@ -38,6 +38,41 @@ def active_sidecar_payload(
     }
   )
   return payload
+
+
+def write_meta_sidecar(
+  path: Path,
+  session_ref: Any,
+  *,
+  active_sidecar_payload_fn: Callable[[dict[str, Any]], dict[str, Any]],
+  atomic_write_sidecar_fn: Callable[[Path, dict[str, Any]], None] = _atomic_write_sidecar,
+  now_iso_fn: Callable[[], str] = _now_iso,
+  logger: Any | None = None,
+) -> None:
+  meta_path = path.with_suffix(".meta.json")
+  if meta_path.exists():
+    return
+  try:
+    from .product_config import gateway_product_id
+
+    atomic_write_sidecar_fn(
+      meta_path,
+      active_sidecar_payload_fn(
+        {
+          "agent_session_id": session_ref.agent_session_id,
+          "agent_id": session_ref.agent_id,
+          "user_id": session_ref.user_id,
+          "product_id": gateway_product_id() or None,
+          "file_kind": "canonical",
+          "channel": None,
+          "profile": None,
+          "created_at": now_iso_fn(),
+        },
+      ),
+    )
+  except Exception:
+    if logger is not None:
+      logger.warning("Sidecar write failed for %s (telemetry-only)", meta_path, exc_info=True)
 
 
 def load_sidecar_payload(path: Path) -> dict[str, Any] | None:

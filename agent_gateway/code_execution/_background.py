@@ -36,6 +36,7 @@ class BackgroundTask:
   backend: ExecutionBackend
   stdout_buf: OutputRingBuffer
   stderr_buf: OutputRingBuffer
+  tool_call_id: str | None = None
   result: Optional[dict] = None
   started_at: float = 0.0
   _terminated: bool = False

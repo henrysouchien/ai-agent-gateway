@@ -16,6 +16,7 @@ from ._backends import DockerBackend, ExecutionBackend, SubprocessBackend
 from ._config import CodeExecutionConfig
 from ._helpers import _boolean_input, _prepare_code_execute_env, _string_input, _timeout_ms_input, code_execute
 from ._hooks import strip_code_execute_base64_hook
+from ._provenance import AGENT_CODE_EXECUTE_WORK_DIR_ENV, collect_computation_sidecars, delete_computation_sidecar_dir
 from ._tool_defs import make_code_execute_status_tool_def, make_code_execute_tool_def
 
 
@@ -88,6 +89,27 @@ def build_code_execution(
     process = backend_data.get("process")
     return process is not None and getattr(process, "returncode", None) is not None
 
+  def _sandbox_work_dir_for_env(backend: ExecutionBackend, work_dir: str) -> str:
+    if backend.name == "docker":
+      return "/workspace"
+    return work_dir
+
+  def _prepare_config_for_call(
+    *,
+    tool_ctx: Any | None,
+    backend: ExecutionBackend,
+    work_dir: str,
+  ) -> CodeExecutionConfig:
+    telemetry_prepare_env = make_prepare_env_with_agent_telemetry(cfg.prepare_env, tool_ctx)
+    sandbox_work_dir = _sandbox_work_dir_for_env(backend, work_dir)
+
+    def _prepare_env(env: Dict[str, str]) -> Dict[str, str]:
+      prepared = telemetry_prepare_env(env)
+      prepared[AGENT_CODE_EXECUTE_WORK_DIR_ENV] = sandbox_work_dir
+      return prepared
+
+    return replace(cfg, prepare_env=_prepare_env)
+
   async def _handle_code_execute(tool_input: Dict[str, Any], **kwargs: Any):
     host, error = _string_input(tool_input, "host", default="auto")
     if error is not None:
@@ -102,15 +124,16 @@ def build_code_execution(
     if not resolved_host:
       return None, {"code": "internal_error", "message": "Backend resolution failed"}
 
-    per_call_config = replace(
-      cfg,
-      prepare_env=make_prepare_env_with_agent_telemetry(cfg.prepare_env, tool_ctx),
-    )
     backend = _get_backend(resolved_host)
     if not backend.available():
       return None, {"code": "backend_unavailable", "message": f"Backend '{resolved_host}' unavailable"}
 
     work_dir = _ensure_code_execution_work_dir()
+    per_call_config = _prepare_config_for_call(
+      tool_ctx=tool_ctx,
+      backend=backend,
+      work_dir=work_dir,
+    )
     background, error = _boolean_input(tool_input, "background", default=False)
     if error is not None:
       return None, error
@@ -155,6 +178,7 @@ def build_code_execution(
         stdout_buf=stdout_buf,
         stderr_buf=stderr_buf,
         started_at=time.time(),
+        tool_call_id=getattr(tool_ctx, "tool_call_id", None),
       )
       return {
         "status": "running",
@@ -179,13 +203,20 @@ def build_code_execution(
         }
       )
 
-    return await code_execute(
+    result, error = await code_execute(
       tool_input,
       session_work_dir=work_dir,
       on_output=_on_chunk,
       backend=backend,
       config=per_call_config,
     )
+    if result is not None and tool_ctx is not None:
+      collect_computation_sidecars(
+        result,
+        work_dir=work_dir,
+        tool_call_id=getattr(tool_ctx, "tool_call_id", None),
+      )
+    return result, error
 
   async def _handle_code_execute_status(tool_input: Dict[str, Any], **_: Any):
     task_id, error = _string_input(
@@ -220,16 +251,29 @@ def build_code_execution(
         result = await task.safe_collect(backend)
         if task._terminated:
           session.background_tasks.pop(task_id, None)
+        if isinstance(result, dict):
+          collect_computation_sidecars(
+            result,
+            work_dir=task.handle.work_dir,
+            tool_call_id=task.tool_call_id,
+          )
         return result, None
       await task.safe_cancel(backend)
       if task._terminated:
         session.background_tasks.pop(task_id, None)
+      delete_computation_sidecar_dir(task.handle.work_dir, task.tool_call_id)
       return {"status": "cancelled", "task_id": task_id}, None
 
     if poll_result.get("status") == "completed" or _handle_has_exited(task.handle):
       result = await task.safe_collect(backend)
       if task._terminated:
         session.background_tasks.pop(task_id, None)
+      if isinstance(result, dict):
+        collect_computation_sidecars(
+          result,
+          work_dir=task.handle.work_dir,
+          tool_call_id=task.tool_call_id,
+        )
       return result, None
 
     stdout_tail = task.stdout_buf.tail(20) or str(poll_result.get("stdout_tail") or "")

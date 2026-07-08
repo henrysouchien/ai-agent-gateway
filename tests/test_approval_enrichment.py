@@ -90,7 +90,7 @@ def test_trade_approval_args_overwrite_untrusted_existing_summary() -> None:
   _append_preview(log)
 
   assert enrich_trade_approval_args(
-    "mcp__portfolio-mcp__execute_trade",
+    "mcp__portfolio-trades-mcp__execute_trade",
     {"preview_id": "pv-1", "approval_summary": {"ticker": "USER"}},
     event_log=log,
   )["approval_summary"]["ticker"] == "SGOV"

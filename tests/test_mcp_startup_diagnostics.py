@@ -16,16 +16,16 @@ def test_connect_or_warn_logs_timeout_exception_class(caplog):
   manager._connect = _raise_timeout
 
   async def _run():
-    return await manager._connect_or_warn("portfolio-mcp", {"command": "python3"})
+    return await manager._connect_or_warn("portfolio-reads-mcp", {"command": "python3"})
 
   caplog.set_level(logging.WARNING, logger="agent_gateway.mcp_client")
 
   result = asyncio.run(_run())
 
   assert result is None
-  assert "MCP server portfolio-mcp failed to connect: TimeoutError" in caplog.text
-  assert manager.get_startup_diagnostics()["portfolio-mcp"] == {
-    "server": "portfolio-mcp",
+  assert "MCP server portfolio-reads-mcp failed to connect: TimeoutError" in caplog.text
+  assert manager.get_startup_diagnostics()["portfolio-reads-mcp"] == {
+    "server": "portfolio-reads-mcp",
     "category": "transient_timeout",
     "retryable": True,
     "message": "TimeoutError",
@@ -72,7 +72,7 @@ def test_startup_records_disallowed_requested_server(tmp_path):
   )
   manager = McpClientManager(
     config_path=config_path,
-    allowed_servers={"portfolio-mcp"},
+    allowed_servers={"portfolio-reads-mcp"},
   )
 
   asyncio.run(manager.startup(allowed_servers={"research-corpus-mcp"}))

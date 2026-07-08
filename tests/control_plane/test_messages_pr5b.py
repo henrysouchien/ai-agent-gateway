@@ -143,7 +143,7 @@ def test_chat_messages_continue_with_chat_session_token_and_full_transcript() ->
           {"role": "assistant", "content": "echo:first"},
           {"role": "user", "content": "second"},
         ],
-        "context": {"channel": "tui"},
+        "context": {"client_note": "continue from full transcript"},
         "request_id": "continue-second",
       },
     )
@@ -208,7 +208,7 @@ def test_chat_messages_continue_with_chat_session_token_and_full_transcript() ->
           {"role": "assistant", "content": "echo:first"},
           {"role": "user", "content": "different duplicate text"},
         ],
-        "context": {"channel": "tui"},
+        "context": {"client_note": "duplicate continuation"},
         "request_id": "continue-second",
       },
     )

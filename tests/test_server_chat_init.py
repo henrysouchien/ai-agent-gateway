@@ -115,6 +115,80 @@ def test_chat_init_response_includes_resolved_user_id() -> None:
   assert response.json()["user_id"] == "alice"
 
 
+def test_chat_init_session_preserves_canonical_identity_metadata() -> None:
+  async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    return _resolver_result(channel="cli")
+
+  app = _make_app(_resolver)
+
+  with TestClient(app) as client:
+    response = client.post(
+      "/api/chat/init",
+      json={"api_key": "cli-key", "context": {"channel": "cli"}},
+    )
+
+  assert response.status_code == 200
+  session = app.state.auth.session_store.get_session(response.json()["session_id"])
+  assert session is not None
+  assert session.user_id == "alice"
+  assert session.owner_user_id == "101"
+  assert session.raw_user_id == "alice"
+  assert session.user_slug == "alice"
+  assert session.risk_user_id == 101
+  assert session.user_email == "alice@example.com"
+  assert session.user_aliases == ("101", "alice", "alice@example.com")
+  assert session.identity_status == "risk_user_id_authoritative"
+
+
+def test_chat_init_session_stores_identity_derived_numeric_risk_user_id() -> None:
+  app = _make_app(None)
+
+  with TestClient(app) as client:
+    response = client.post("/api/chat/init", json={"api_key": "legacy-key", "user_id": "101"})
+
+  assert response.status_code == 200
+  session = app.state.auth.session_store.get_session(response.json()["session_id"])
+  assert session is not None
+  assert session.user_id == "101"
+  assert session.owner_user_id == "101"
+  assert session.raw_user_id == "101"
+  assert session.risk_user_id == 101
+  assert session.identity_status == "numeric_user_id"
+  _verified_session, claims = app.state.auth.verify_token_with_payload(response.json()["session_token"])
+  assert claims["risk_user_id"] == 101
+
+
+def test_chat_init_session_stores_identity_mapped_email(monkeypatch) -> None:
+  monkeypatch.setenv(
+    "GATEWAY_USER_KEYS",
+    '[{"key":"mapped-key","channel":"mcp","slug":"henry","email":"henry@example.com","risk_user_id":1,"role":"owner"}]',
+  )
+  app = _make_app(None)
+
+  with TestClient(app) as client:
+    response = client.post("/api/chat/init", json={"api_key": "legacy-key", "user_id": "henry"})
+
+  assert response.status_code == 200
+  session = app.state.auth.session_store.get_session(response.json()["session_id"])
+  assert session is not None
+  assert session.owner_user_id == "1"
+  assert session.user_email == "henry@example.com"
+  assert session.user_aliases == ("1", "henry", "henry@example.com")
+  _verified_session, claims = app.state.auth.verify_token_with_payload(response.json()["session_token"])
+  assert claims["user_email"] == "henry@example.com"
+
+
+def test_chat_init_identity_config_error_returns_http_error(monkeypatch) -> None:
+  monkeypatch.setenv("GATEWAY_USER_KEYS", "{not-json")
+  app = _make_app(None)
+
+  with TestClient(app) as client:
+    response = client.post("/api/chat/init", json={"api_key": "legacy-key", "user_id": "alice"})
+
+  assert response.status_code == 400
+  assert response.json()["error"] == "credential_resolver_invalid"
+
+
 def test_httpexception_from_resolver_passes_through_status() -> None:
   async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
     raise HTTPException(status_code=401, detail="API key is not mapped to a user identity")

@@ -19,7 +19,9 @@ from agent_gateway import EventLog
 from agent_gateway.html_artifact_store import read_html_artifact_content, read_html_artifact_sidecar
 from agent_gateway.session import GatewaySession
 import agent_gateway.sub_agent as sub_agent_module
+import agent_gateway.sub_agent_background_result as sub_agent_background_result
 import agent_gateway.sub_agent_helpers as sub_agent_helpers
+import agent_gateway.sub_agent_skill_events as sub_agent_skill_events
 import agent_gateway.sub_agent_tool_definitions as sub_agent_tool_definitions
 from agent_gateway.sub_agent import (
   _DEFAULT_EXCLUDED_TOOLS,
@@ -77,6 +79,11 @@ def test_sub_agent_helper_exports_are_parent_aliases() -> None:
   for name in helper_names:
     assert getattr(sub_agent_module, name) is getattr(sub_agent_helpers, name)
 
+  assert (
+    sub_agent_module.make_get_background_result_handler
+    is sub_agent_background_result.make_get_background_result_handler
+  )
+
 
 def test_sub_agent_tool_definition_wrappers_preserve_parent_behavior(
   monkeypatch: pytest.MonkeyPatch,
@@ -119,6 +126,95 @@ def test_sub_agent_tool_definition_wrappers_preserve_parent_behavior(
   assert sub_agent_module._artifact_emit_tool_definitions({"emit_html_artifact"})[0]["name"] == (
     "emit_html_artifact"
   )
+
+
+def test_skill_run_event_emitter_emits_started_once_and_captures_result() -> None:
+  sub_log = EventLog()
+  parent_events: list[dict[str, Any]] = []
+  profile = type("Profile", (), {"name": "html-research"})()
+  emitter = sub_agent_skill_events.SkillRunEventEmitter(
+    skill_run_id="skill-1",
+    profile=profile,
+    context_ticker="pcty",
+    event_log_getter=lambda: sub_log,
+    tool_ctx=type("Ctx", (), {"emit": parent_events.append})(),
+    ticker_fn=lambda _profile, ticker: ticker.upper(),
+    scope_fn=lambda _profile, _ticker: "ticker",
+    time_fn=lambda: 123.0,
+  )
+
+  emitter.emit_started()
+  emitter.emit_started()
+  emitter.emit_result_captured({"response": "done"}, None)
+
+  events = [entry.event for entry in sub_log.entries]
+  assert [event["type"] for event in events] == ["skill_run_started", "skill_result_captured"]
+  assert events == parent_events
+  assert events[0]["skill_run_id"] == "skill-1"
+  assert events[0]["skill"] == "html-research"
+  assert events[0]["ticker"] == "PCTY"
+  assert events[0]["ts"] == 123.0
+  assert events[1]["status"] == "success"
+
+
+def test_skill_run_event_emitter_captures_existing_artifact_events() -> None:
+  sub_log = EventLog()
+  profile = type("Profile", (), {"name": "html-research"})()
+  emitter = sub_agent_skill_events.SkillRunEventEmitter(
+    skill_run_id="skill-artifact",
+    profile=profile,
+    context_ticker="",
+    event_log_getter=lambda: sub_log,
+    tool_ctx=object(),
+    ticker_fn=lambda _profile, _ticker: None,
+    scope_fn=lambda _profile, _ticker: "portfolio",
+    time_fn=lambda: 123.0,
+  )
+  artifact_event = {
+    "type": "artifact_ready",
+    "skill_run_id": "skill-artifact",
+    "ticker": "PCTY",
+    "skill": "_html",
+    "artifact_id": "art-1",
+    "artifact_path": "artifacts/_html/art-1.json",
+    "contract_name": "HtmlArtifact",
+    "data_source": "live",
+    "ts": 124.0,
+  }
+
+  emitter.emit_started()
+  emitter.emit_parent_event(artifact_event)
+  emitter.emit_result_captured({"response": "done"}, None)
+
+  captured = sub_log.entries[-1].event
+  assert captured["type"] == "skill_result_captured"
+  assert captured["ticker"] == "PCTY"
+  assert captured["artifact_events"] == [artifact_event]
+  assert captured["artifact_refs"] == ["artifacts/_html/art-1.json"]
+
+
+def test_skill_run_event_emitter_preserves_parent_emit_before_log_exists() -> None:
+  parent_events: list[dict[str, Any]] = []
+  profile = type("Profile", (), {"name": "resume-skill"})()
+
+  def missing_log() -> Any:
+    raise NameError("sub_log")
+
+  emitter = sub_agent_skill_events.SkillRunEventEmitter(
+    skill_run_id="skill-2",
+    profile=profile,
+    context_ticker="",
+    event_log_getter=missing_log,
+    tool_ctx=type("Ctx", (), {"emit": parent_events.append})(),
+    ticker_fn=lambda _profile, _ticker: None,
+    scope_fn=lambda _profile, _ticker: "portfolio",
+    time_fn=lambda: 456.0,
+  )
+
+  emitter.emit_started()
+
+  assert [event["type"] for event in parent_events] == ["skill_run_started"]
+  assert parent_events[0]["scope"] == "portfolio"
 
 
 def test_skill_html_excluded_tools_rejects_malformed_extra_exclusions() -> None:
@@ -903,6 +999,29 @@ def test_make_run_agent_handler_validates_effective_skill_model(tmp_path: Path) 
   assert error == {
     "code": "invalid_input",
     "message": "Invalid model 'custom-model' for skill 'research'",
+  }
+
+
+def test_make_run_agent_handler_provider_error_precedes_skill_block_resolution(tmp_path: Path) -> None:
+  skills_dir = tmp_path / "skills"
+  _write_skill(
+    skills_dir,
+    "research",
+    _callable_skill("provider: openai", body="Research.\n{{MISSING_BLOCK}}\n"),
+  )
+  handler = make_run_agent_handler(
+    [_StubRunner()],
+    skill_loader=SkillLoader(skills_dir),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+  )
+
+  result, error = _run(handler({"agent": "research", "task": "Collect"}))
+
+  assert result is None
+  assert error == {
+    "code": "provider_not_supported",
+    "message": "Provider 'openai' requested but no provider_resolver configured",
   }
 
 

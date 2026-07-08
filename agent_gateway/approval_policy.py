@@ -21,6 +21,8 @@ ToolClass = Literal[
   "irreversible",
 ]
 
+ApprovalNotificationPolicy = Literal["auto", "interrupt", "skip"]
+
 ApprovalState = Literal[
   "created",
   "auto_approved",
@@ -198,6 +200,8 @@ class ApprovalRequest:
   tool_schema_version: str | None = None
   mcp_server_version: str | None = None
   skill: str | None = None
+  notification_policy: ApprovalNotificationPolicy = "auto"
+  notification: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -215,6 +219,7 @@ class ApprovalDecision:
   modified_tool_args: dict[str, Any] | None = None
   chain_trust_window_seconds: int | None = None
   args_predicate: dict[str, Any] | None = None
+  notification_policy: ApprovalNotificationPolicy = "auto"
   policy_id: str = "single-user"
   policy_version: str = "1"
 
@@ -339,6 +344,7 @@ def apply_decision_to_request(request: ApprovalRequest, decision: ApprovalDecisi
     route_target=decision.route_target,
     route_target_type=decision.route_target_type,
     reason=decision.reason,
+    notification_policy=decision.notification_policy,
   )
 
 

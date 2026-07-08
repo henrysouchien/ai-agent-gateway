@@ -1,0 +1,318 @@
+from __future__ import annotations
+
+from typing import Annotated, Any, Literal, Union
+
+from fastapi import Body
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from agent_gateway.control_run_lifecycle import ControlRunState
+
+ChatRunState = ControlRunState
+AutonomousRunState = ControlRunState
+_CONTROL_CONTEXT_AUTHORITY_FIELDS = frozenset({
+  "account_id",
+  "account_ids",
+  "api_key",
+  "auth",
+  "authorization",
+  "channel",
+  "credential",
+  "credential_id",
+  "credential_ids",
+  "credentials",
+  "dev_mode",
+  "dispatch_scope",
+  "email",
+  "owner",
+  "owner_id",
+  "owner_user_id",
+  "portfolio",
+  "portfolio_id",
+  "portfolio_name",
+  "refresh_token",
+  "risk_user_id",
+  "route",
+  "route_id",
+  "token",
+  "user",
+  "user_email",
+  "user_id",
+})
+_CONTROL_CONTEXT_AUTHORITY_KEYS = frozenset(
+  "".join(character.lower() for character in field if character.isalnum())
+  for field in _CONTROL_CONTEXT_AUTHORITY_FIELDS
+)
+
+
+def _context_key_is_authority_field(key: Any) -> bool:
+  normalized = "".join(character.lower() for character in str(key) if character.isalnum())
+  return normalized in _CONTROL_CONTEXT_AUTHORITY_KEYS
+
+
+def _context_authority_paths(value: Any, *, path: str = "context") -> list[str]:
+  paths: list[str] = []
+  if isinstance(value, dict):
+    for key, nested_value in value.items():
+      key_text = str(key)
+      child_path = f"{path}.{key_text}"
+      if _context_key_is_authority_field(key_text):
+        paths.append(child_path)
+      paths.extend(_context_authority_paths(nested_value, path=child_path))
+    return paths
+  if isinstance(value, list):
+    for index, nested_value in enumerate(value):
+      paths.extend(_context_authority_paths(nested_value, path=f"{path}[{index}]"))
+  return paths
+
+
+def _reject_context_authority_fields(value: dict[str, Any]) -> dict[str, Any]:
+  paths = _context_authority_paths(value)
+  if paths:
+    preview = ", ".join(paths[:5])
+    if len(paths) > 5:
+      preview += f", ... (+{len(paths) - 5} more)"
+    raise ValueError(
+      "context must not include portfolio, account, owner, credential, token, "
+      f"route, channel, or dispatch-scope authority fields: {preview}"
+    )
+  return value
+
+
+class VerdictSummaryResponse(BaseModel):
+  verdict_token: str
+  confidence: str | None
+  one_line_summary: str
+  skill_run_id: str
+
+
+class PendingApprovalResponse(BaseModel):
+  pending_id: str
+  tool_name: str
+  tool_input: dict[str, Any]
+  resolved_qualifier: str | None
+  reason: str | None
+  allow_persistent_approval: bool
+  requested_at: str
+
+
+class DispatchScope(BaseModel):
+  """Redacted, browser-safe structured scope for control-plane dispatches."""
+
+  model_config = ConfigDict(extra="forbid")
+
+  kind: Literal["portfolio"]
+  source: Literal["active_default", "user_selected"]
+  portfolio_name: str
+  portfolio_id: str | None = None
+  display_name: str | None = None
+
+  @field_validator("portfolio_name")
+  @classmethod
+  def _validate_portfolio_name(cls, value: str) -> str:
+    if not value.strip():
+      raise ValueError("portfolio_name must be a non-empty string")
+    if len(value) > 256:
+      raise ValueError("portfolio_name must be 256 characters or fewer")
+    return value
+
+  @field_validator("portfolio_id", "display_name")
+  @classmethod
+  def _validate_optional_scope_string(cls, value: str | None, info: Any) -> str | None:
+    if value is None:
+      return value
+    if not value.strip():
+      raise ValueError(f"{info.field_name} must be omitted, null, or a non-empty string")
+    if len(value) > 256:
+      raise ValueError(f"{info.field_name} must be 256 characters or fewer")
+    return value
+
+
+class ChatRunResponse(BaseModel):
+  kind: Literal["chat"]
+  run_id: str
+  session_id: str
+  agent: Literal["hank"]
+  channel: str
+  user_id: str
+  owner_user_id: str | None = None
+  raw_user_id: str | None = None
+  user_slug: str | None = None
+  risk_user_id: int | None = None
+  user_email: str | None = None
+  user_aliases: list[str] = Field(default_factory=list)
+  identity_status: str | None = None
+  state: ChatRunState
+  started_at: str
+  ended_at: str | None
+  cost_usd: float | None
+  initial_message: str
+  skill_run_ids: list[str]
+  current_verdict: VerdictSummaryResponse | None
+  pending_approval: PendingApprovalResponse | None
+  dispatch_scope: DispatchScope | None = None
+
+
+class AutonomousRunResponse(BaseModel):
+  kind: Literal["autonomous"]
+  run_id: str
+  task_id: str
+  agent: Literal["hank"]
+  profile: str
+  mode: str
+  skill: str | None
+  task: str | None
+  ticker: str | None
+  channel: str
+  user_id: str
+  owner_user_id: str | None = None
+  raw_user_id: str | None = None
+  user_slug: str | None = None
+  risk_user_id: int | None = None
+  user_email: str | None = None
+  user_aliases: list[str] = Field(default_factory=list)
+  identity_status: str | None = None
+  state: AutonomousRunState
+  messageable: bool = False
+  started_at: str
+  ended_at: str | None
+  cost_usd: float | None
+  skill_run_ids: list[str]
+  current_verdict: VerdictSummaryResponse | None
+  resumable: bool = False
+  resumed_from: str | None = None
+  resumed_as: list[str] = Field(default_factory=list)
+  latest_resume_run_id: str | None = None
+  dispatch_scope: DispatchScope | None = None
+  schedule_id: str | None = None
+  schedule_name: str | None = None
+
+
+class ChatMessage(BaseModel):
+  role: str
+  content: str
+
+
+class ChatDispatchRequest(BaseModel):
+  kind: Literal["chat"]
+  message: str = Field(..., min_length=1)
+  channel: str = Field(..., min_length=1)
+  skill: str | None = None
+  ticker: str | None = None
+  dev_mode: bool = False
+  deadline_sec: int | None = Field(default=None, ge=1)
+  context: dict[str, Any] = Field(default_factory=dict)
+  dispatch_scope: DispatchScope | None = None
+
+  @field_validator("context")
+  @classmethod
+  def _reject_context_authority_fields(cls, value: dict[str, Any]) -> dict[str, Any]:
+    return _reject_context_authority_fields(value)
+
+
+class AutonomousDispatchRequest(BaseModel):
+  kind: Literal["autonomous"]
+  profile: str | None = None
+  mode: str | None = None
+  skill: str | None = None
+  task: str | None = None
+  ticker: str | None = None
+  context: str | None = None
+  channel: str | None = None
+  dev_mode: bool = False
+  dispatch_scope: DispatchScope | None = None
+
+
+ControlRunDispatchRequest = Annotated[
+  Union[ChatDispatchRequest, AutonomousDispatchRequest],
+  Body(discriminator="kind"),
+]
+
+
+class AutonomousDispatchResponse(BaseModel):
+  run: AutonomousRunResponse
+  task_id: str
+  run_id: str
+  log_path: str
+  started_at: int
+  cmd: list[str]
+  resumed_from: str | None = None
+
+
+class ChatDispatchResponse(BaseModel):
+  run: ChatRunResponse
+  chat_session_token: str
+  chat_session_id: str
+  chat_session_expires_at: int
+
+
+RunDispatchResponse = Union[ChatDispatchResponse, AutonomousDispatchResponse]
+RunResponse = Union[ChatRunResponse, AutonomousRunResponse]
+
+
+class RunsListResponse(BaseModel):
+  runs: list[RunResponse]
+
+
+class RunLogsResponse(BaseModel):
+  run_id: str
+  log_lines: list[str]
+  more_available: bool
+
+
+class ChatContinuationRequest(BaseModel):
+  messages: list[ChatMessage]
+  request_id: str | None = None
+  context: dict[str, Any] = Field(default_factory=dict)
+  model: str | None = None
+  deadline_sec: int | None = Field(default=None, ge=1)
+
+  @field_validator("context")
+  @classmethod
+  def _reject_context_authority_fields(cls, value: dict[str, Any]) -> dict[str, Any]:
+    return _reject_context_authority_fields(value)
+
+
+class AutonomousRunMessageRequest(BaseModel):
+  message: str = Field(..., min_length=1)
+  message_id: str | None = None
+
+
+class AutonomousResumeRequest(BaseModel):
+  context: str | None = None
+  message: str | None = None
+  request_id: str | None = None
+
+
+RunMessageRequest = Union[ChatContinuationRequest, AutonomousRunMessageRequest]
+
+
+class RunEnvelopeResponse(BaseModel):
+  run: RunResponse
+  message_id: str | None = None
+  delivery_status: Literal["delivered", "duplicate"] | None = None
+
+
+__all__ = [
+  "AutonomousDispatchRequest",
+  "AutonomousDispatchResponse",
+  "AutonomousResumeRequest",
+  "AutonomousRunMessageRequest",
+  "AutonomousRunResponse",
+  "AutonomousRunState",
+  "ChatContinuationRequest",
+  "ChatDispatchRequest",
+  "ChatDispatchResponse",
+  "ChatMessage",
+  "ChatRunResponse",
+  "ChatRunState",
+  "ControlRunDispatchRequest",
+  "DispatchScope",
+  "PendingApprovalResponse",
+  "RunDispatchResponse",
+  "RunEnvelopeResponse",
+  "RunLogsResponse",
+  "RunMessageRequest",
+  "RunResponse",
+  "RunsListResponse",
+  "VerdictSummaryResponse",
+]

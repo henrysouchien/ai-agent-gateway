@@ -24,6 +24,30 @@ def test_resolve_display_seed_map_renders_product_label_and_detail() -> None:
   }
 
 
+def test_resolve_display_price_target_uses_research_identity_not_ticker() -> None:
+  display = resolve_display(
+    "mcp__portfolio-reads-mcp__get_price_target",
+    {"ticker": "MSCI", "research_file_id": 42, "handoff_id": 314},
+  )
+
+  assert display == {
+    "label": "Pulling price target",
+    "detail": "42 - 314",
+  }
+
+
+def test_resolve_display_model_insights_uses_research_identity_not_ticker() -> None:
+  display = resolve_display(
+    "mcp__portfolio-reads-mcp__get_model_insights",
+    {"ticker": "MSCI", "research_file_id": 42, "model_insights_id": "mi_123"},
+  )
+
+  assert display == {
+    "label": "Reviewing model insights",
+    "detail": "42 - mi_123",
+  }
+
+
 def test_resolve_display_generic_fallback_strips_mcp_prefix_and_uses_salient_arg() -> None:
   display = resolve_display(
     "mcp__research-corpus-mcp__custom_lookup_tool",

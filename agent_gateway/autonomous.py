@@ -35,6 +35,7 @@ from .mcp_client import McpClientManager
 from .multi_user.billing import SessionUsageSummary, UsageEvent
 from .providers import ModelProvider
 from .runner import AgentRunner, ToolResultContext
+from .runner_session_lifecycle import WriterLeaseAlreadyHeldError
 from .skills import SkillLoader
 from .sub_agent import (
   make_get_background_result_handler,
@@ -287,6 +288,7 @@ async def run_session(
 ) -> RunOutput:
   timed_out = False
   error_msg: str | None = None
+  lease_skip = False
   coro = runner.run(
     messages=[{"role": "user", "content": initial_message}],
     system_prompt=system_prompt,
@@ -328,6 +330,10 @@ async def run_session(
       if not drained:
         run_task.add_done_callback(_consume_late_run_task_result)
     raise
+  except WriterLeaseAlreadyHeldError as exc:
+    lease_skip = True
+    error_msg = f"{type(exc).__name__}: {exc}"
+    log.info("Autonomous run skipped: %s", error_msg)
   except Exception as exc:
     error_msg = f"{type(exc).__name__}: {exc}"
     log.error("Autonomous run failed: %s", error_msg, exc_info=True)
@@ -335,6 +341,8 @@ async def run_session(
   output = collect_run_output(event_log, timed_out=timed_out)
   if error_msg and not output.error:
     output.error = error_msg
+  if lease_skip:
+    output.exit_reason = "writer_lease_already_held"
   return output
 
 
@@ -702,6 +710,7 @@ def run_autonomous_sync(
 __all__ = [
   "DeliveryConfig",
   "RunOutput",
+  "WriterLeaseAlreadyHeldError",
   "build_state_payload",
   "collect_run_output",
   "deliver",

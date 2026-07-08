@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import time
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ from fastapi import APIRouter, Body, HTTPException, Query, Request
 
 from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock
 from agent_gateway.autonomous_runner import AutonomousRegistry
+from agent_gateway.control_run_lifecycle import is_control_run_active_state
 from agent_gateway.session import AuthManager
 
 from .runs_helpers import (  # noqa: F401
@@ -36,6 +38,7 @@ from .runs_helpers import (  # noqa: F401
   PendingApprovalResponse,
   ChatRunResponse,
   AutonomousRunResponse,
+  DispatchScope,
   ChatMessage,
   ChatDispatchRequest,
   AutonomousDispatchRequest,
@@ -78,8 +81,11 @@ from .runs_helpers import (  # noqa: F401
   _chat_session_for_user,
   _require_autonomous_registry,
   _autonomous_task_for_user,
+  _record_owner_user_id,
   _render_log_line,
   _session_has_cancel_event,
+  _session_matches_owner,
+  _session_owner_user_id,
   _normalize_channel,
   _run_channel_matches,
   _require_run_channel,
@@ -130,13 +136,71 @@ def build_runs_router(
   auth: AuthManager,
   autonomous_registry: AutonomousRegistry | None = None,
   skills_dir: Path | None = None,
+  dispatch_scope_validator: Any | None = None,
 ) -> APIRouter:
   router = APIRouter(prefix="/runs")
   skills_root = Path(skills_dir) if skills_dir is not None else None
 
+  def _dispatch_scope_payload(scope: DispatchScope | None) -> dict[str, Any] | None:
+    if scope is None:
+      return None
+    return scope.model_dump()
+
+  async def _validated_dispatch_scope_payload(
+    scope: DispatchScope | None,
+    *,
+    session: Any,
+  ) -> dict[str, Any] | None:
+    payload = _dispatch_scope_payload(scope)
+    if payload is None or dispatch_scope_validator is None:
+      return payload
+    try:
+      validation_result = dispatch_scope_validator(session, dict(payload))
+      if inspect.isawaitable(validation_result):
+        validation_result = await validation_result
+    except HTTPException:
+      raise
+    except ValueError as exc:
+      raise HTTPException(
+        status_code=422,
+        detail={
+          "error": "dispatch_scope_validation_failed",
+          "message": str(exc) or "Selected dispatch scope is not valid.",
+        },
+      ) from exc
+    except Exception as exc:
+      raise HTTPException(
+        status_code=422,
+        detail={
+          "error": "dispatch_scope_validation_failed",
+          "message": "Selected dispatch scope could not be validated.",
+        },
+      ) from exc
+    if validation_result is None:
+      validation_result = payload
+    if not isinstance(validation_result, dict):
+      raise HTTPException(
+        status_code=422,
+        detail={
+          "error": "dispatch_scope_validation_failed",
+          "message": "Dispatch scope validator returned an invalid payload.",
+        },
+      )
+    try:
+      return DispatchScope.model_validate(validation_result).model_dump()
+    except ValueError as exc:
+      raise HTTPException(
+        status_code=422,
+        detail={
+          "error": "dispatch_scope_validation_failed",
+          "message": "Dispatch scope validator returned a non-redacted scope.",
+        },
+      ) from exc
+
   @router.post("", response_model=RunDispatchResponse)
   async def dispatch_run(request: Request, payload: ControlRunDispatchRequest) -> RunDispatchResponse:
     authenticated = _require_bearer_session(request, auth)
+    owner_user_id = _session_owner_user_id(authenticated)
     if payload.kind == "chat":
       _require_control_session(authenticated)
       requested_channel = _normalize_channel(payload.channel)
@@ -146,26 +210,38 @@ def build_runs_router(
       channel = session_channel or requested_channel
       chat_session = auth.session_store.create_session(
         api_key_hash=authenticated.api_key_hash,
-        user_id=authenticated.user_id,
+        user_id=owner_user_id,
         user_email=authenticated.user_email,
         risk_user_id=authenticated.risk_user_id,
         role=authenticated.role,
         kind="chat",
         auth_config=authenticated.auth_config,
       )
+      chat_session.owner_user_id = owner_user_id
+      chat_session.raw_user_id = authenticated.user_id
+      chat_session.user_slug = getattr(authenticated, "user_slug", None)
+      chat_session.user_aliases = tuple(getattr(authenticated, "user_aliases", ()) or (owner_user_id,))
+      chat_session.identity_status = getattr(authenticated, "identity_status", None)
       chat_session.channel = channel
       chat_session.is_public = channel == "public"
       chat_session.approval_store = getattr(request.app.state, "gateway_approval_store", None)
       chat_session.approval_policy = getattr(request.app.state, "gateway_approval_policy", None)
       chat_session.initial_message = payload.message
 
-      context: dict[str, Any] = {"channel": channel} if channel is not None else {}
+      context: dict[str, Any] = dict(payload.context or {})
+      if channel is not None:
+        context["channel"] = channel
       if payload.skill is not None:
         context["skill"] = payload.skill
       if payload.ticker is not None:
         context["ticker"] = payload.ticker
       if payload.dev_mode:
         context["dev_mode"] = True
+      dispatch_scope = await _validated_dispatch_scope_payload(payload.dispatch_scope, session=authenticated)
+      if dispatch_scope is not None:
+        context["dispatch_scope"] = dispatch_scope
+        context.setdefault("portfolio_name", dispatch_scope["portfolio_name"])
+        chat_session.dispatch_scope = dispatch_scope
 
       run = await _dispatch_control_chat_turn(
         request=request,
@@ -213,6 +289,12 @@ def build_runs_router(
         dev_mode=payload.dev_mode,
         user_id=authenticated.user_id,
         user_email=authenticated.user_email,
+        owner_user_id=owner_user_id,
+        user_slug=getattr(authenticated, "user_slug", None),
+        risk_user_id=authenticated.risk_user_id,
+        user_aliases=list(getattr(authenticated, "user_aliases", ()) or (owner_user_id,)),
+        identity_status=getattr(authenticated, "identity_status", None),
+        dispatch_scope=await _validated_dispatch_scope_payload(payload.dispatch_scope, session=authenticated),
       )
     except ValueError as exc:
       raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -220,7 +302,7 @@ def build_runs_router(
       detail = str(exc)
       status_code = 429 if "concurrency limit" in detail.lower() else 409
       raise HTTPException(status_code=status_code, detail=detail) from exc
-    record = _autonomous_task_for_user(registry, str(start_payload["task_id"]), authenticated.user_id)
+    record = _autonomous_task_for_user(registry, str(start_payload["task_id"]), owner_user_id)
     run = _autonomous_run_from_task(record, skills_dir=skills_root)
     return AutonomousDispatchResponse(
       run=run,
@@ -238,11 +320,12 @@ def build_runs_router(
     payload: RunMessageRequest = Body(...),
   ) -> RunEnvelopeResponse:
     authenticated = _require_bearer_session(request, auth)
+    owner_user_id = _session_owner_user_id(authenticated)
     target_session = auth.session_store.get_session(control_run_id)
     if target_session is None:
       if autonomous_registry is not None:
         try:
-          record = _autonomous_task_for_user(autonomous_registry, control_run_id, authenticated.user_id)
+          record = _autonomous_task_for_user(autonomous_registry, control_run_id, owner_user_id)
         except HTTPException as exc:
           if exc.status_code != 404:
             raise
@@ -255,7 +338,7 @@ def build_runs_router(
           try:
             delivery = await autonomous_registry.send_operator_message(
               control_run_id,
-              user_id=authenticated.user_id,
+              user_id=owner_user_id,
               channel=authenticated.channel,
               message=payload.message,
               message_id=payload.message_id,
@@ -283,7 +366,13 @@ def build_runs_router(
 
     context = dict(payload.context or {})
     if target_session.channel is not None:
-      context.setdefault("channel", target_session.channel)
+      context["channel"] = target_session.channel
+    dispatch_scope = getattr(target_session, "dispatch_scope", None)
+    if isinstance(dispatch_scope, dict):
+      context["dispatch_scope"] = dict(dispatch_scope)
+      portfolio_name = dispatch_scope.get("portfolio_name")
+      if isinstance(portfolio_name, str) and portfolio_name.strip():
+        context.setdefault("portfolio_name", portfolio_name)
     latest_user_message = _latest_user_message_content(list(payload.messages))
     message_id = _control_message_id(payload.request_id) if latest_user_message is not None else None
     if message_id is not None and _has_parent_message_event(target_session, message_id):
@@ -316,10 +405,11 @@ def build_runs_router(
   ) -> AutonomousDispatchResponse:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
+    owner_user_id = _session_owner_user_id(authenticated)
 
     registry = _require_autonomous_registry(autonomous_registry)
     registry.set_user_event_bus(getattr(request.app.state, "user_event_bus", None))
-    record = _autonomous_task_for_user(registry, control_run_id, authenticated.user_id)
+    record = _autonomous_task_for_user(registry, control_run_id, owner_user_id)
     _require_autonomous_channel(record, authenticated.channel)
 
     async with record.resume_lock:
@@ -329,7 +419,7 @@ def build_runs_router(
       for resumed_run_id in reversed(record.resumed_as):
         resumed_record = registry._find_by_control_run_id(resumed_run_id)
         resumed_state = _autonomous_run_from_task(resumed_record, skills_dir=skills_root).state if resumed_record is not None else None
-        if resumed_state in {"starting", "running", "approval_pending"}:
+        if is_control_run_active_state(resumed_state):
           raise HTTPException(status_code=409, detail="Autonomous run already has an active resume")
 
       resume_payload = payload or AutonomousResumeRequest()
@@ -344,8 +434,14 @@ def build_runs_router(
           ticker=record.ticker,
           channel=record.channel,
           dev_mode=record.dev_mode,
-          user_id=authenticated.user_id,
+          user_id=getattr(record, "raw_user_id", None) or authenticated.user_id,
           user_email=authenticated.user_email,
+          owner_user_id=owner_user_id,
+          user_slug=getattr(authenticated, "user_slug", None) or record.user_slug,
+          risk_user_id=authenticated.risk_user_id or record.risk_user_id,
+          user_aliases=list(getattr(authenticated, "user_aliases", ()) or record.user_aliases or (owner_user_id,)),
+          identity_status=getattr(authenticated, "identity_status", None) or record.identity_status,
+          dispatch_scope=record.dispatch_scope,
           resumed_from=record.control_run_id,
         )
       except ValueError as exc:
@@ -353,7 +449,7 @@ def build_runs_router(
       except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-      resumed_record = _autonomous_task_for_user(registry, str(start_payload["task_id"]), authenticated.user_id)
+      resumed_record = _autonomous_task_for_user(registry, str(start_payload["task_id"]), owner_user_id)
       record.resumed_as.append(resumed_record.control_run_id)
       resume_event = {
         "type": "run_resumed",
@@ -395,6 +491,7 @@ def build_runs_router(
   ) -> RunsListResponse:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
+    owner_user_id = _session_owner_user_id(authenticated)
     auth.session_store.cleanup_expired()
     if kind is not None and kind not in {"chat", "autonomous"}:
       return RunsListResponse(runs=[])
@@ -406,7 +503,7 @@ def build_runs_router(
         for session in auth.session_store.sessions.values()
         if (
           session.kind == "chat"
-          and session.user_id == authenticated.user_id
+          and _session_matches_owner(session, owner_user_id)
           and _run_channel_matches(session.channel, authenticated.channel)
           and _chat_session_has_run_activity(session)
         )
@@ -415,7 +512,7 @@ def build_runs_router(
       runs.extend(
         _autonomous_run_from_task(record, skills_dir=skills_root)
         for record in autonomous_registry._tasks.values()
-        if record.user_id == authenticated.user_id and _run_channel_matches(record.channel, authenticated.channel)
+        if _record_owner_user_id(record) == owner_user_id and _run_channel_matches(record.channel, authenticated.channel)
       )
     if state is not None:
       runs = [run for run in runs if run.state == state]
@@ -426,14 +523,15 @@ def build_runs_router(
   async def get_run(request: Request, control_run_id: str) -> RunResponse:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
+    owner_user_id = _session_owner_user_id(authenticated)
     if control_run_id.startswith("bg_") or (
       autonomous_registry is not None
       and any(task.control_run_id == control_run_id for task in autonomous_registry._tasks.values())
     ):
-      record = _autonomous_task_for_user(autonomous_registry, control_run_id, authenticated.user_id)
+      record = _autonomous_task_for_user(autonomous_registry, control_run_id, owner_user_id)
       _require_autonomous_channel(record, authenticated.channel)
       return _autonomous_run_from_task(record, skills_dir=skills_root)
-    session = _chat_session_for_user(auth, control_run_id, authenticated.user_id)
+    session = _chat_session_for_user(auth, control_run_id, owner_user_id)
     _require_run_channel(session.channel, authenticated.channel)
     return _chat_run_from_session(session)
 
@@ -445,12 +543,13 @@ def build_runs_router(
   ) -> RunLogsResponse:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
+    owner_user_id = _session_owner_user_id(authenticated)
     if control_run_id.startswith("bg_") or (
       autonomous_registry is not None
       and any(task.control_run_id == control_run_id for task in autonomous_registry._tasks.values())
     ):
       registry = _require_autonomous_registry(autonomous_registry)
-      record = _autonomous_task_for_user(registry, control_run_id, authenticated.user_id)
+      record = _autonomous_task_for_user(registry, control_run_id, owner_user_id)
       _require_autonomous_channel(record, authenticated.channel)
       logs = registry.logs(record.task_id, tail=tail)
       total_lines = int(logs.get("total_lines", 0) or 0)
@@ -459,7 +558,7 @@ def build_runs_router(
         log_lines=list(logs.get("lines", [])),
         more_available=total_lines > tail,
       )
-    session = _chat_session_for_user(auth, control_run_id, authenticated.user_id)
+    session = _chat_session_for_user(auth, control_run_id, owner_user_id)
     _require_run_channel(session.channel, authenticated.channel)
     total_events = len(session.event_history)
     events = session.event_history.snapshot(tail=tail)
@@ -473,10 +572,11 @@ def build_runs_router(
   async def delete_run(request: Request, control_run_id: str) -> RunResponse:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
+    owner_user_id = _session_owner_user_id(authenticated)
     if not control_run_id.startswith("bg_"):
       session = auth.session_store.get_session(control_run_id)
       if session is not None:
-        if session.kind != "chat" or session.user_id != authenticated.user_id:
+        if session.kind != "chat" or not _session_matches_owner(session, owner_user_id):
           raise HTTPException(status_code=404, detail="Run not found")
         _require_run_channel(session.channel, authenticated.channel)
         pending_snapshot = [
@@ -491,7 +591,7 @@ def build_runs_router(
               pending_entry=pending_entry,
               tool_call_id=tool_call_id,
               nonce=str(pending_entry.get("nonce") or ""),
-              decider_id=authenticated.user_id,
+              decider_id=owner_user_id,
               decider_role=getattr(authenticated, "role", None),
               approved=False,
               allow_tool_type=False,
@@ -503,17 +603,17 @@ def build_runs_router(
 
         cancelled_event = _run_state_event(control_run_id, "cancelled")
         session.event_history.append(cancelled_event)
-        await _publish_control_event(request.app.state, session.user_id, control_run_id, cancelled_event)
+        await _publish_control_event(request.app.state, _session_owner_user_id(session), control_run_id, cancelled_event)
         await _cancel_control_chat_background_tasks(
           session,
           settle_timeout=0.05 if pending_snapshot else 0.0,
         )
         run = _chat_run_from_session(session)
         await auth.session_store.expire_session_async(control_run_id)
-        await _cleanup_run_buffer(request.app.state, session.user_id, control_run_id)
+        await _cleanup_run_buffer(request.app.state, _session_owner_user_id(session), control_run_id)
         return run
     registry = _require_autonomous_registry(autonomous_registry)
-    record = _autonomous_task_for_user(registry, control_run_id, authenticated.user_id)
+    record = _autonomous_task_for_user(registry, control_run_id, owner_user_id)
     _require_autonomous_channel(record, authenticated.channel)
     try:
       await _deny_autonomous_pending_approvals_for_cancel(

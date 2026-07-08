@@ -20,23 +20,35 @@ def _load_result_payload(ctx: ToolResultContext) -> Dict[str, Any] | None:
 
 
 def strip_code_execute_base64_hook(ctx: ToolResultContext) -> None:
-  """Replace inline image base64 payloads with filename markers.
+  """Sanitize model-visible code-execution results.
 
   Use this in `on_tool_result` pipelines when you want tool results to stay
   readable in logs or downstream model messages.
   """
-  if ctx.tool_name != "code_execute" or ctx.result_entry is None or ctx.error is not None:
+  if ctx.tool_name not in {"code_execute", "code_execute_status"} or ctx.result_entry is None or ctx.error is not None:
     return
 
   result = _load_result_payload(ctx)
   if result is None:
     return
 
-  images = result.get("images")
-  if not isinstance(images, list):
+  updated = False
+  for key in ("computations", "computations_dropped"):
+    if key in result:
+      result.pop(key, None)
+      updated = True
+
+  if ctx.tool_name != "code_execute":
+    if updated:
+      ctx.result_entry["content"] = json.dumps(result, default=str)
     return
 
-  updated = False
+  images = result.get("images")
+  if not isinstance(images, list):
+    if updated:
+      ctx.result_entry["content"] = json.dumps(result, default=str)
+    return
+
   sanitized_images = []
   for image in images:
     if not isinstance(image, dict):

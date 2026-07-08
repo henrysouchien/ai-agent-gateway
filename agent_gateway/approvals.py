@@ -24,9 +24,20 @@ class ApprovalActionError(Exception):
 
 def _approval_request_to_dict(request_record: Any) -> dict[str, Any]:
   if is_dataclass(request_record):
-    return jsonable_encoder(asdict(request_record))
+    encoded = jsonable_encoder(asdict(request_record))
+    if isinstance(encoded, dict):
+      encoded.pop("notification_policy", None)
+      if encoded.get("notification") is None:
+        encoded.pop("notification", None)
+    return encoded
   encoded = jsonable_encoder(request_record)
-  return dict(encoded) if isinstance(encoded, dict) else {"approval": encoded}
+  if isinstance(encoded, dict):
+    result = dict(encoded)
+    result.pop("notification_policy", None)
+    if result.get("notification") is None:
+      result.pop("notification", None)
+    return result
+  return {"approval": encoded}
 
 
 def _resolve_store_and_policy(*, target_session: GatewaySession, app_state: Any) -> tuple[Any | None, Any | None]:

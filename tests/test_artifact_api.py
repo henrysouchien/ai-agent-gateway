@@ -169,6 +169,43 @@ def test_artifact_index_returns_latest_and_recent_history_per_skill(
   assert empty_response.json() == []
 
 
+def test_hyphen_share_class_ticker_index_uses_normalized_artifact_dir(
+  artifact_api: ArtifactApiFixture,
+) -> None:
+  artifact_id = "2026-06-30T000000.000-run-hps"
+  _write_artifact(
+    artifact_api.data_dir,
+    USER_ID,
+    "HPSA",
+    "earnings-scenarios",
+    artifact_id,
+    payload={"artifact_id": artifact_id, "ticker": "HPSA", "skill": "earnings-scenarios"},
+  )
+
+  with TestClient(artifact_api.app) as client:
+    response = client.get("/api/artifacts/HPS-A", headers=_signed_headers())
+    empty_response = client.get("/api/artifacts/MOG-A", headers=_signed_headers())
+
+  assert response.status_code == 200
+  assert response.json() == [
+    {
+      "skill": "earnings-scenarios",
+      "latest_artifact_id": artifact_id,
+      "artifact_count": 1,
+      "recent_artifact_ids": [artifact_id],
+      "research_file_id": None,
+      "control_run_id": None,
+      "has_research_file": False,
+      "origin_kind": "product",
+      "visibility": "default",
+      "origin_ref": None,
+      "classification_source": "legacy_default",
+    }
+  ]
+  assert empty_response.status_code == 200
+  assert empty_response.json() == []
+
+
 def test_default_artifact_reads_skip_newer_sandbox_sidecars(
   artifact_api: ArtifactApiFixture,
 ) -> None:

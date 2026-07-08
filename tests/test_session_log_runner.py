@@ -207,6 +207,11 @@ async def _semantic_error_tool(tool_input: dict[str, Any], **kwargs: Any):
   }, None
 
 
+async def _empty_status_error_tool(tool_input: dict[str, Any], **kwargs: Any):
+  _ = tool_input, kwargs
+  return {"status": "error", "error": ""}, None
+
+
 async def _decision_log_validation_error_tool(tool_input: dict[str, Any], **kwargs: Any):
   _ = tool_input, kwargs
   return {
@@ -362,6 +367,51 @@ def test_semantic_tool_error_is_visible_in_trace_and_timing(tmp_path: Path) -> N
   durable_entries, _ = _run(log.query(event_types={"tool_call_complete"}, order="asc"))
   assert durable_entries[0].event["is_error"] is True
   assert durable_entries[0].event["semantic_error"]["message"] == "X not found"
+
+
+def test_semantic_tool_error_without_detail_warns_model_context(tmp_path: Path) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "semantic-empty-error.jsonl")
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"get_skill_artifact": _empty_status_error_tool}),
+    session_id="sess-parent",
+    provider=_ScriptedProvider([
+      _tool_turn(tool_name="get_skill_artifact", tool_input={"ticker": "ADI"}),
+      _text_turn("handled"),
+    ]),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "Run lookup"}]))
+
+  complete_events = [
+    entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_complete"
+  ]
+  assert len(complete_events) == 1
+  complete = complete_events[0]
+  assert complete["result"] == {"status": "error", "error": ""}
+  assert complete["semantic_error"] == {
+    "code": "tool_status_error",
+    "message": "Tool result reported status=error without error detail",
+    "source": "status",
+    "status": "error",
+    "sub_code": "empty_error_detail",
+  }
+  final_content = json.loads(complete["final_tool_result_blocks"][0]["content"])
+  assert final_content == {
+    "status": "error",
+    "error": "",
+    "_runner_warning": (
+      "Tool get_skill_artifact returned status=error without error detail; "
+      "do not retry unchanged input unless required context changed or there is new evidence the failure was transient."
+    ),
+  }
+  assert complete["final_tool_result_blocks"][0]["is_error"] is True
 
 
 def test_native_runner_semantic_error_includes_validation_details(tmp_path: Path) -> None:

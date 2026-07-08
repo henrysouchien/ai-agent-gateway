@@ -243,12 +243,53 @@ def _require_batch_owner(registry: Any, batch_id: int, user_id: str) -> dict[str
 
 
 def _batch_detail_payload(registry: Any, batch_id: int, *, top_n: int) -> dict[str, Any]:
+  batch = registry.get_batch_digest(batch_id)
   return {
-    "batch": registry.get_batch_digest(batch_id),
+    "batch": batch,
     "verdict_matrix": registry.get_batch_verdict_matrix(batch_id),
     "candidates": registry.get_batch_candidates(batch_id, top_n),
-    "failures": registry.get_batch_failures(batch_id),
+    "failures": _annotate_batch_failures(registry.get_batch_failures(batch_id), batch=batch),
+    "diligence_prs": _list_diligence_prs(registry, batch_id),
   }
+
+
+def _list_diligence_prs(registry: Any, batch_id: int) -> list[dict[str, Any]]:
+  list_prs = getattr(registry, "list_diligence_prs", None)
+  if not callable(list_prs):
+    return []
+  return list_prs(batch_id)
+
+
+def _annotate_batch_failures(failures: list[dict[str, Any]], *, batch: dict[str, Any]) -> list[dict[str, Any]]:
+  return [_annotate_batch_failure(row, batch=batch) for row in failures]
+
+
+def _annotate_batch_failure(row: dict[str, Any], *, batch: dict[str, Any]) -> dict[str, Any]:
+  annotated = dict(row)
+  if str(annotated.get("error") or "").strip() != "skipped_existing_unroutable":
+    return annotated
+  ticker = str(annotated.get("ticker") or "").strip().upper()
+  annotated["repair_hint"] = (
+    "This ticker already has a research file that could not be routed for this batch source. "
+    "Rerun it by calling start_diligence_batch with gates.force_rerun_existing=true."
+  )
+  annotated["retry_spec"] = _force_rerun_retry_spec(batch, ticker=ticker)
+  return annotated
+
+
+def _force_rerun_retry_spec(batch: dict[str, Any], *, ticker: str) -> dict[str, Any]:
+  try:
+    spec = json.loads(str(batch.get("spec_json") or "{}"))
+  except json.JSONDecodeError:
+    spec = {}
+  if not isinstance(spec, dict):
+    spec = {}
+  retry_spec = dict(spec)
+  retry_spec["universe"] = [ticker] if ticker else []
+  gates = retry_spec.get("gates") if isinstance(retry_spec.get("gates"), dict) else {}
+  retry_spec["gates"] = {**gates, "force_rerun_existing": True}
+  retry_spec["force_rerun_existing"] = True
+  return retry_spec
 
 
 def _seed_fixture_batch(registry: Any, *, user_id: str, host: str, pid: int | None) -> int:

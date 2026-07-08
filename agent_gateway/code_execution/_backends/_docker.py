@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from ...agent_telemetry import AGENT_TELEMETRY_ENV_TO_HEADER
 from .._config import CodeExecutionConfig
 from .._helpers import (
   _STREAM_READER_LIMIT,
@@ -22,6 +23,7 @@ from .._helpers import (
   _task_stdout_path,
   _write_code_execute_script,
 )
+from .._provenance import AGENT_CODE_EXECUTE_WORK_DIR_ENV
 from ._base import ExecutionBackend, ExecutionHandle, OnOutputChunk
 
 
@@ -318,7 +320,12 @@ class DockerBackend(ExecutionBackend):
     if not env:
       return []
     args: list[str] = []
-    for key in ("PYTHONPATH",):
+    forwarded_keys = (
+      "PYTHONPATH",
+      AGENT_CODE_EXECUTE_WORK_DIR_ENV,
+      *(env_name for env_name, _header_name in AGENT_TELEMETRY_ENV_TO_HEADER),
+    )
+    for key in forwarded_keys:
       value = env.get(key)
       if value:
         args.extend(["-e", f"{key}={value}"])

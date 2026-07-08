@@ -235,6 +235,7 @@ def test_control_batches_dispatch_list_and_get(fake_batch_control: FakeBatchCont
         "result_status": "staged",
       }
     ]
+    assert detail["diligence_prs"] == []
 
     list_response = client.get("/api/control/batches", headers=headers)
     assert list_response.status_code == 200, list_response.text
@@ -242,6 +243,92 @@ def test_control_batches_dispatch_list_and_get(fake_batch_control: FakeBatchCont
     assert [item["batch_id"] for item in batches] == [batch_id]
     assert batches[0]["cost_usd"] == pytest.approx(0.125)
     assert fake_batch_control.run_calls[0]["identity"] == ("alice", "alice@example.com")
+
+
+def test_batch_detail_adds_force_rerun_hint_for_existing_unroutable(tmp_path: Path) -> None:
+  registry = BatchRegistry(tmp_path / "batch.db")
+  batch_id = registry.acquire_batch(
+    user_id="alice",
+    host="test-host",
+    spec={
+      "source": "quality_screen",
+      "universe": ["MSFT", "AAPL"],
+      "budget_usd": 3.0,
+      "max_concurrency": 2,
+      "gates": {"skip_source_mismatch": True},
+    },
+    budget_usd=3.0,
+    pid=None,
+  )
+  registry.allocate_run(
+    batch_id=batch_id,
+    ticker="MSFT",
+    stage="pipeline",
+    skill=None,
+    status="skipped",
+    dispatch_status="skipped",
+    item_source="quality_screen",
+    error="skipped_existing_unroutable",
+  )
+
+  detail = batches_module._batch_detail_payload(registry, batch_id, top_n=10)
+
+  assert detail["failures"] == [
+    {
+      "ticker": "MSFT",
+      "skill": None,
+      "status": "skipped",
+      "error": "skipped_existing_unroutable",
+      "repair_hint": (
+        "This ticker already has a research file that could not be routed for this batch source. "
+        "Rerun it by calling start_diligence_batch with gates.force_rerun_existing=true."
+      ),
+      "retry_spec": {
+        "source": "quality_screen",
+        "universe": ["MSFT"],
+        "budget_usd": 3.0,
+        "max_concurrency": 2,
+        "gates": {"skip_source_mismatch": True, "force_rerun_existing": True},
+        "force_rerun_existing": True,
+      },
+    }
+  ]
+  assert detail["diligence_prs"] == []
+  registry.close()
+
+
+def test_batch_detail_includes_diligence_prs(tmp_path: Path) -> None:
+  registry = BatchRegistry(tmp_path / "batch.db")
+  batch_id = registry.acquire_batch(
+    user_id="alice",
+    host="test-host",
+    spec={"source": "quality_screen", "universe": ["MSFT"]},
+    budget_usd=3.0,
+    pid=None,
+  )
+  registry.ensure_diligence_pr_for_admitted_stage(
+    batch_id=batch_id,
+    ticker="MSFT",
+    run_seq=1,
+    skill="business-quality-assessment",
+    dispatch_start=100.0,
+    workspace_payload={
+      "workspace_ref": "model_workspaces/batch_1/MSFT/workspace.json",
+      "workspace_id": "batch_1_MSFT",
+    },
+    base_hashes={"schema_version": 1, "thesis": {"hash": "sha256:abc"}},
+    now=101.0,
+  )
+
+  detail = batches_module._batch_detail_payload(registry, batch_id, top_n=10)
+
+  assert len(detail["diligence_prs"]) == 1
+  pr = detail["diligence_prs"][0]
+  assert pr["ticker"] == "MSFT"
+  assert pr["state"] == "open"
+  assert pr["workspace_id"] == "batch_1_MSFT"
+  assert pr["base_hashes"]["thesis"]["hash"] == "sha256:abc"
+  registry.close()
 
 
 def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
@@ -330,9 +417,9 @@ def test_control_batches_workflows_catalog(fake_batch_control: FakeBatchControll
   assert workflows["valuation-ready"]["pipeline_template"] == "valuation-ready"
   assert workflows["valuation-ready"]["source_pipeline_template"] == "compounder"
   assert workflows["valuation-ready"]["default_max_concurrency"] == 2
-  assert workflows["full-diligence"]["reservation_budget_usd_per_name"] == 45.0
-  assert workflows["full-diligence"]["suggested_budget_usd_per_name"] == 45.0
-  assert workflows["valuation-ready"]["reservation_budget_usd_per_name"] == 21.0
+  assert workflows["full-diligence"]["reservation_budget_usd_per_name"] == 49.0
+  assert workflows["full-diligence"]["suggested_budget_usd_per_name"] == 49.0
+  assert workflows["valuation-ready"]["reservation_budget_usd_per_name"] == 25.0
   assert (
     workflows["full-diligence"]["budget_model"]["admission_formula"]
     == "spent_usd + in_flight_reserved_usd + next_stage_reserved_usd <= budget_usd"
@@ -370,7 +457,11 @@ def test_fixture_batch_refuses_production_even_with_dev_flags(
   assert fake_batch_control.run_calls == []
 
 
-def test_fixture_batch_seeds_registry_without_controller(fake_batch_control: FakeBatchController) -> None:
+def test_fixture_batch_seeds_registry_without_controller(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("APP_ENV", "test")
   app = _make_app()
   with TestClient(app) as client:
     headers = _headers(_control_session(client))
@@ -393,6 +484,7 @@ def test_fixture_batch_seeds_registry_without_controller(fake_batch_control: Fak
     }
     assert [row["ticker"] for row in payload["verdict_matrix"]] == ["MSFT", "AAPL", "TSLA"]
     assert payload["candidates"][0]["proposal_id"] == "fixture-proposal-msft"
+    assert payload["diligence_prs"] == []
     assert payload["failures"] == [
       {
         "ticker": "TSLA",

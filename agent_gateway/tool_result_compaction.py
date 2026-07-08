@@ -6,6 +6,8 @@ import re
 import uuid
 from typing import Any, Callable, Dict
 
+from .tool_result_semantics import status_error_has_detail
+
 MODEL_TOOL_RESULT_MAX_CHARS = 60_000
 MODEL_TOOL_RESULT_MAX_CHARS_ENV = "AGENT_GATEWAY_MAX_MODEL_TOOL_RESULT_CHARS"
 MODEL_TOOL_RESULT_MIN_CHARS = 4_000
@@ -66,6 +68,13 @@ def annotate_result(result: Any, tool_name: str = "") -> Any:
     if sub_warning:
       warnings.append(f"Sub-agent warning: {sub_warning}")
 
+  if _status_error_without_detail(result):
+    tool_label = f"Tool {tool_name}" if tool_name else "Tool"
+    warnings.append(
+      f"{tool_label} returned status=error without error detail; "
+      "do not retry unchanged input unless required context changed or there is new evidence the failure was transient."
+    )
+
   if not warnings:
     return result
 
@@ -74,6 +83,11 @@ def annotate_result(result: Any, tool_name: str = "") -> Any:
   if low_match:
     enriched["_runner_warning_detail"] = str(low_match)
   return enriched
+
+
+def _status_error_without_detail(result: dict[str, Any]) -> bool:
+  status = result.get("status")
+  return isinstance(status, str) and status.strip().lower() == "error" and not status_error_has_detail(result)
 
 
 def make_error_result(

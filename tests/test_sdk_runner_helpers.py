@@ -17,7 +17,9 @@ if str(API_DIR) not in sys.path:
   sys.path.insert(0, str(API_DIR))
 
 from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog  # noqa: E402
+from agent_gateway import approval_policy  # noqa: E402
 import agent_gateway.sdk_runner as sdk_runner  # noqa: E402
+import agent_gateway.sdk_runner_approval as sdk_runner_approval  # noqa: E402
 import agent_gateway.sdk_runner_context as sdk_runner_context  # noqa: E402
 from agent_gateway import policy_imports  # noqa: E402
 from agent_gateway import sdk_runner_helpers  # noqa: E402
@@ -41,6 +43,7 @@ def _make_runner() -> AgentSDKRunner:
 
 
 def test_sdk_runner_helper_aliases_remain_on_parent_module() -> None:
+  assert sdk_runner._sdk_runner_approval is sdk_runner_approval
   assert sdk_runner._as_dict is sdk_runner_helpers.as_dict
   assert sdk_runner._as_plain_dict is sdk_runner_helpers.as_plain_dict
   assert sdk_runner._extract_text is sdk_runner_helpers.extract_text
@@ -54,6 +57,36 @@ def test_sdk_runner_helper_aliases_remain_on_parent_module() -> None:
   assert sdk_runner._should_escrow_raw_tool_input is sdk_runner_helpers.should_escrow_raw_tool_input
   assert sdk_runner._summarize_error_payload is sdk_runner_helpers.summarize_error_payload
   assert sdk_runner._PATCH_OP_RAW_INPUT_TOOLS is sdk_runner_helpers.PATCH_OP_RAW_INPUT_TOOLS
+  assert sdk_runner.apply_decision_to_request is approval_policy.apply_decision_to_request
+  assert sdk_runner.build_approval_request is approval_policy.build_approval_request
+  assert sdk_runner.call_policy_safely is approval_policy.call_policy_safely
+  assert sdk_runner.sha256_args is approval_policy.sha256_args
+  assert sdk_runner.utc_now is approval_policy.utc_now
+
+
+def test_sdk_runner_approval_wrapper_threads_parent_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+  runner = _make_runner()
+  captured: dict[str, object] = {}
+
+  def fake_resolve_tool_class(tool_name: str, **kwargs):
+    captured["tool_name"] = tool_name
+    captured.update(kwargs)
+    return "patched-class"
+
+  def fake_policy_tool_name(tool_name: str) -> str:
+    return f"policy:{tool_name}"
+
+  def fake_server_for_tool(tool_name: str) -> str:
+    return f"server:{tool_name}"
+
+  monkeypatch.setattr(sdk_runner_approval, "resolve_tool_class", fake_resolve_tool_class)
+  monkeypatch.setattr(sdk_runner, "_policy_tool_name", fake_policy_tool_name)
+  monkeypatch.setattr(sdk_runner, "_server_for_tool", fake_server_for_tool)
+
+  assert runner._resolve_tool_class("runtime-tool") == "patched-class"
+  assert captured["tool_name"] == "runtime-tool"
+  assert captured["policy_tool_name_fn"] is fake_policy_tool_name
+  assert captured["server_for_tool_fn"] is fake_server_for_tool
 
 
 def test_sdk_runner_context_sidecar_preserves_prompt_and_parent_alias(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -159,7 +192,7 @@ def test_sdk_runner_stream_forwards_ids_and_hook_resolves_namespaced_mcp(
   )
   runner._pending_tool_calls["tool-sdk-1"] = sdk_runner.ToolCallInfo(
     tool_call_id="tool-sdk-1",
-    tool_name="mcp__portfolio-mcp__documents_search",
+    tool_name="mcp__portfolio-reads-mcp__documents_search",
     tool_input={},
     started_at=10.0,
   )
@@ -179,22 +212,22 @@ def test_sdk_runner_stream_forwards_ids_and_hook_resolves_namespaced_mcp(
     ).fetchone()
 
   assert tuple(row) == (
-    "mcp:portfolio-mcp:documents_search",
+    "mcp:portfolio-reads-mcp:documents_search",
     "mcp",
     "req-sdk-timing",
     "tool-sdk-1",
-    "portfolio-mcp",
-    "mcp__portfolio-mcp__documents_search",
+    "portfolio-reads-mcp",
+    "mcp__portfolio-reads-mcp__documents_search",
   )
 
 
 def test_sdk_runner_helpers_preserve_core_payload_behavior() -> None:
-  assert sdk_runner_helpers.server_for_tool("mcp__portfolio-mcp__preview_trade") == "portfolio-mcp"
-  assert sdk_runner_helpers.policy_tool_name("mcp__portfolio-mcp__preview_trade") == "preview_trade"
+  assert sdk_runner_helpers.server_for_tool("mcp__portfolio-reads-mcp__preview_trade") == "portfolio-reads-mcp"
+  assert sdk_runner_helpers.policy_tool_name("mcp__portfolio-reads-mcp__preview_trade") == "preview_trade"
   assert sdk_runner_helpers.policy_tool_name("file_write") == "file_write"
   assert sdk_runner_helpers.policy_owner_mismatch("file_write") is None
-  assert sdk_runner_helpers.should_escrow_raw_tool_input("mcp__portfolio-mcp__apply_patch_ops") is True
-  assert sdk_runner_helpers.should_escrow_raw_tool_input("mcp__portfolio-mcp__preview_trade") is False
+  assert sdk_runner_helpers.should_escrow_raw_tool_input("mcp__portfolio-reads-mcp__apply_patch_ops") is True
+  assert sdk_runner_helpers.should_escrow_raw_tool_input("mcp__portfolio-reads-mcp__preview_trade") is False
   assert sdk_runner_helpers.join_system_prompt([("a", True), ("", False), ("b", False)]) == "a\n\nb"
   assert sdk_runner_helpers.extract_text([{"type": "text", "text": "hello"}, "world"]) == "hello\nworld"
   assert sdk_runner_helpers.summarize_error_payload({"error": {"message": "bad"}}) == "bad"
@@ -210,8 +243,8 @@ def test_sdk_runner_helpers_detect_policy_owner_mismatch(monkeypatch: pytest.Mon
   )
 
   assert sdk_runner_helpers.policy_owner_mismatch(
-    "mcp__portfolio-mcp__execute_trade"
-  ) == ("portfolio-mcp", "execute_trade", "portfolio-trades-mcp")
+    "mcp__portfolio-reads-mcp__execute_trade"
+  ) == ("portfolio-reads-mcp", "execute_trade", "portfolio-trades-mcp")
   assert sdk_runner_helpers.policy_owner_mismatch("mcp__portfolio-trades-mcp__execute_trade") is None
 
 
@@ -227,7 +260,7 @@ def test_sdk_runner_helpers_policy_owner_mismatch_falls_back_when_policy_modules
 
   monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
 
-  assert sdk_runner_helpers.policy_owner_mismatch("mcp__portfolio-mcp__execute_trade") is None
+  assert sdk_runner_helpers.policy_owner_mismatch("mcp__portfolio-reads-mcp__execute_trade") is None
 
 
 def test_sdk_runner_helpers_policy_owner_mismatch_raises_when_agent_policy_import_breaks(
@@ -239,7 +272,7 @@ def test_sdk_runner_helpers_policy_owner_mismatch_raises_when_agent_policy_impor
   monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
 
   with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
-    sdk_runner_helpers.policy_owner_mismatch("mcp__portfolio-mcp__execute_trade")
+    sdk_runner_helpers.policy_owner_mismatch("mcp__portfolio-reads-mcp__execute_trade")
 
 
 def test_sdk_runner_helpers_policy_owner_mismatch_raises_when_api_policy_import_breaks(
@@ -255,7 +288,7 @@ def test_sdk_runner_helpers_policy_owner_mismatch_raises_when_api_policy_import_
   monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
 
   with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
-    sdk_runner_helpers.policy_owner_mismatch("mcp__portfolio-mcp__execute_trade")
+    sdk_runner_helpers.policy_owner_mismatch("mcp__portfolio-reads-mcp__execute_trade")
 
 
 def test_sdk_runner_parent_helper_monkeypatches_still_drive_methods(monkeypatch: pytest.MonkeyPatch) -> None:

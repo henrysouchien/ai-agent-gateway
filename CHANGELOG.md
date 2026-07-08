@@ -1,8 +1,16 @@
 # Changelog
 
-## Unreleased (post-0.15.3)
+## Unreleased (post-0.15.4)
 
 _No unreleased changes recorded yet._
+
+## 0.15.4 (2026-07-08)
+
+### Added
+
+- Forwarded a stable code-execution work-dir environment variable into subprocess
+  and Docker sandboxes, and collected bounded helper computation sidecars into
+  terminal `code_execute` / `code_execute_status` results for citation minting.
 
 ## 0.15.3 (2026-06-19)
 

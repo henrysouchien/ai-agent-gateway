@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ from typing import Any
 _AUTONOMOUS_TASK_ID_RE = re.compile(r"^bg_\d+$")
 _AUTONOMOUS_RUN_FILE_RE = re.compile(r"^bg_(\d+)\..+")
 _AUTONOMOUS_MANIFEST_FILE_RE = re.compile(r"^bg_(\d+)\.task\.json$")
-_ACTIVE_AUTONOMOUS_PROCESS_STATES = {"running", "approval_pending", "remediating"}
+_ACTIVE_AUTONOMOUS_PROCESS_STATES = {"starting", "queued", "waiting", "running", "approval_pending", "remediating"}
 _REHYDRATED_ACTIVE_STATES = {"running", "approval_pending", "queued", "waiting", "remediating"}
 _TERMINAL_AUTONOMOUS_STATES = {
   "completed",
@@ -30,11 +31,12 @@ _TERMINAL_AUTONOMOUS_STATES = {
 _REHYDRATION_INTERRUPTED_ERROR = "gateway restarted while run was active"
 _REHYDRATE_EVENTS_SIZE_CAP_BYTES = 5 * 1024 * 1024
 _REHYDRATE_EVENTS_TAIL_LINES = 2000
-_TASK_MANIFEST_VERSION = 1
+_TASK_MANIFEST_VERSION = 2
 _RUN_SEQUENCE_CURSOR_FILE = ".autonomous-sequence.json"
 _RUN_RETENTION_DAYS_ENV = "AGENT_AUTONOMOUS_RUN_RETENTION_DAYS"
 _RUN_RETENTION_SECONDS_PER_DAY = 86400.0
 _LOGGER = logging.getLogger("agent_gateway.autonomous_runner")
+_DISPATCH_SCOPE_KEYS = frozenset({"kind", "source", "portfolio_name", "portfolio_id", "display_name"})
 
 
 def _runtime_module() -> Any:
@@ -126,6 +128,7 @@ class AutonomousTask:
   ticker: str | None
   channel: str | None
   dev_mode: bool
+  dispatch_scope: dict[str, Any] | None
   cmd: list[str]
   log_path: Path
   events_path: Path | None
@@ -143,15 +146,211 @@ class AutonomousTask:
   slot_reserved: bool = False
   event_lines: list[dict[str, Any]] | None = None
   delivered_messages: set[str] = field(default_factory=set)
+  owner_user_id: str | None = None
+  raw_user_id: str | None = None
+  user_slug: str | None = None
+  risk_user_id: int = 0
+  user_aliases: list[str] = field(default_factory=list)
+  identity_status: str = "legacy_user_id_fallback"
   operator_message_lock: Any = field(default_factory=lambda: _runtime_attr("asyncio", asyncio).Lock())
   resume_lock: Any = field(default_factory=lambda: _runtime_attr("asyncio", asyncio).Lock())
   resumed_from: str | None = None
   resumed_as: list[str] = field(default_factory=list)
+  schedule_id: str | None = None
+  schedule_name: str | None = None
+
+  def __post_init__(self) -> None:
+    if self.owner_user_id is None:
+      self.owner_user_id = self.user_id
+    if self.raw_user_id is None:
+      self.raw_user_id = self.user_id
+    if not self.user_aliases:
+      self.user_aliases = _normalize_identity_aliases(
+        self.owner_user_id,
+        self.raw_user_id,
+        self.user_slug,
+        self.user_email,
+      )
 
   @property
   def elapsed_sec(self) -> int:
     end_time = self.completed_at if self.completed_at is not None else _time_time()
     return max(0, int(end_time - self.started_at))
+
+
+def _positive_int(value: Any) -> int | None:
+  if isinstance(value, bool):
+    return None
+  if isinstance(value, int):
+    return value if value > 0 else None
+  if isinstance(value, str):
+    cleaned = value.strip()
+    if cleaned.isdecimal():
+      parsed = int(cleaned)
+      return parsed if parsed > 0 else None
+  return None
+
+
+def _normalize_identity_str(value: Any) -> str | None:
+  if isinstance(value, bool):
+    return None
+  cleaned = str(value or "").strip()
+  return cleaned or None
+
+
+def _normalize_identity_aliases(*values: Any) -> list[str]:
+  aliases: list[str] = []
+  for value in values:
+    if isinstance(value, (list, tuple)):
+      for item in value:
+        normalized_item = _normalize_identity_str(item)
+        if normalized_item is not None and normalized_item not in aliases:
+          aliases.append(normalized_item)
+      continue
+    normalized = _normalize_identity_str(value)
+    if normalized is not None and normalized not in aliases:
+      aliases.append(normalized)
+  return aliases
+
+
+def _normalize_dispatch_scope(value: Any) -> dict[str, Any] | None:
+  if value is None:
+    return None
+  if not isinstance(value, dict):
+    return None
+  if set(value) - _DISPATCH_SCOPE_KEYS:
+    return None
+  if value.get("kind") != "portfolio":
+    return None
+  if value.get("source") not in {"active_default", "user_selected"}:
+    return None
+  portfolio_name = value.get("portfolio_name")
+  if not isinstance(portfolio_name, str) or not portfolio_name.strip() or len(portfolio_name) > 256:
+    return None
+  normalized: dict[str, Any] = {
+    "kind": "portfolio",
+    "source": value["source"],
+    "portfolio_name": portfolio_name,
+    "portfolio_id": None,
+    "display_name": None,
+  }
+  for key in ("portfolio_id", "display_name"):
+    raw = value.get(key)
+    if raw is None:
+      continue
+    if not isinstance(raw, str) or not raw.strip() or len(raw) > 256:
+      return None
+    normalized[key] = raw
+  return normalized
+
+
+def _user_identity_api() -> Any | None:
+  api_dir = Path(__file__).resolve().parents[3] / "api"
+  if api_dir.exists() and str(api_dir) not in sys.path:
+    sys.path.insert(0, str(api_dir))
+  try:
+    return importlib.import_module("user_identity")
+  except ModuleNotFoundError as exc:
+    if exc.name not in {"user_identity", "api"}:
+      raise
+    try:
+      return importlib.import_module("api.user_identity")
+    except ModuleNotFoundError as nested_exc:
+      if nested_exc.name not in {"user_identity", "api"}:
+        raise
+      return None
+
+
+def _fallback_identity_payload(
+  *,
+  user_id: str,
+  user_email: str | None,
+  identity_status: str,
+  risk_user_id: Any = None,
+  owner_user_id: Any = None,
+  raw_user_id: Any = None,
+  user_slug: Any = None,
+  user_aliases: Any = None,
+) -> dict[str, Any]:
+  normalized_owner = _normalize_identity_str(owner_user_id) or _normalize_identity_str(user_id) or ""
+  normalized_raw = _normalize_identity_str(raw_user_id) or _normalize_identity_str(user_id)
+  normalized_slug = _normalize_identity_str(user_slug)
+  normalized_risk = _positive_int(risk_user_id) or _positive_int(normalized_owner) or 0
+  aliases = _normalize_identity_aliases(
+    normalized_owner,
+    normalized_raw,
+    normalized_slug,
+    user_email,
+    user_aliases if isinstance(user_aliases, list) else None,
+  )
+  return {
+    "owner_user_id": normalized_owner,
+    "raw_user_id": normalized_raw,
+    "user_slug": normalized_slug,
+    "risk_user_id": normalized_risk,
+    "user_aliases": aliases,
+    "identity_status": identity_status,
+  }
+
+
+def _manifest_identity_payload(manifest: dict[str, Any], *, user_id: str, user_email: str | None) -> dict[str, Any]:
+  manifest_version = manifest.get("manifest_version")
+  current_version = _runtime_attr("_TASK_MANIFEST_VERSION", _TASK_MANIFEST_VERSION)
+  if manifest_version == current_version:
+    owner_user_id = _normalize_identity_str(manifest.get("owner_user_id")) or user_id
+    return _fallback_identity_payload(
+      user_id=owner_user_id,
+      user_email=user_email,
+      identity_status=_normalize_identity_str(manifest.get("identity_status")) or "manifest_v2",
+      risk_user_id=manifest.get("risk_user_id"),
+      owner_user_id=owner_user_id,
+      raw_user_id=manifest.get("raw_user_id") or user_id,
+      user_slug=manifest.get("user_slug"),
+      user_aliases=manifest.get("user_aliases"),
+    )
+
+  api = _user_identity_api()
+  resolver = getattr(api, "resolve_canonical_user_identity", None) if api is not None else None
+  if callable(resolver):
+    try:
+      identity = resolver(
+        user_id,
+        risk_user_id=manifest.get("risk_user_id"),
+        user_email=user_email,
+        mapped_slug=manifest.get("user_slug"),
+        allow_legacy_fallback=True,
+      )
+      status = str(identity.identity_status)
+      if status == "legacy_user_id_fallback" and _positive_int(user_id) is None:
+        status = "legacy_unresolved"
+      return {
+        "owner_user_id": str(identity.owner_user_id),
+        "raw_user_id": user_id,
+        "user_slug": identity.user_slug,
+        "risk_user_id": int(identity.risk_user_id),
+        "user_aliases": [str(alias) for alias in identity.aliases],
+        "identity_status": status,
+      }
+    except ValueError:
+      pass
+
+  raw_numeric = _positive_int(user_id)
+  if raw_numeric is not None:
+    return _fallback_identity_payload(
+      user_id=str(raw_numeric),
+      user_email=user_email,
+      identity_status="numeric_user_id",
+      risk_user_id=raw_numeric,
+      owner_user_id=str(raw_numeric),
+      raw_user_id=user_id,
+    )
+  return _fallback_identity_payload(
+    user_id=user_id,
+    user_email=user_email,
+    identity_status="legacy_unresolved",
+    raw_user_id=user_id,
+    user_slug=user_id,
+  )
 
 
 class AutonomousRegistryStateMixin:
@@ -261,7 +460,7 @@ class AutonomousRegistryStateMixin:
     *,
     cutoff_ts: float,
   ) -> bool:
-    if manifest.get("manifest_version") != _runtime_attr("_TASK_MANIFEST_VERSION", _TASK_MANIFEST_VERSION):
+    if manifest.get("manifest_version") not in {1, _runtime_attr("_TASK_MANIFEST_VERSION", _TASK_MANIFEST_VERSION)}:
       return False
     state = str(manifest.get("state") or "").strip().lower()
     if state not in {"completed", "finished"}:
@@ -323,12 +522,20 @@ class AutonomousRegistryStateMixin:
     return self._log_dir / f"{task_id}.task.json"
 
   def _manifest_payload(self, record: AutonomousTask) -> dict[str, Any]:
+    owner_user_id = _normalize_identity_str(record.owner_user_id) or record.user_id
+    raw_user_id = _normalize_identity_str(record.raw_user_id) or record.user_id
     return {
       "manifest_version": _runtime_attr("_TASK_MANIFEST_VERSION", _TASK_MANIFEST_VERSION),
       "task_id": record.task_id,
       "control_run_id": record.control_run_id,
-      "user_id": record.user_id,
+      "owner_user_id": owner_user_id,
+      "user_id": owner_user_id,
+      "raw_user_id": raw_user_id,
+      "user_slug": record.user_slug,
+      "risk_user_id": record.risk_user_id,
       "user_email": record.user_email,
+      "user_aliases": list(record.user_aliases),
+      "identity_status": record.identity_status,
       "profile": record.profile,
       "mode": record.mode,
       "task": record.task,
@@ -337,6 +544,7 @@ class AutonomousRegistryStateMixin:
       "ticker": record.ticker,
       "channel": record.channel,
       "dev_mode": record.dev_mode,
+      "dispatch_scope": _normalize_dispatch_scope(record.dispatch_scope),
       "cmd": list(record.cmd),
       "log_path": str(record.log_path),
       "events_path": str(record.events_path) if record.events_path is not None else None,
@@ -353,6 +561,8 @@ class AutonomousRegistryStateMixin:
       "completed_at": record.completed_at,
       "resumed_from": record.resumed_from,
       "resumed_as": list(record.resumed_as),
+      "schedule_id": record.schedule_id,
+      "schedule_name": record.schedule_name,
     }
 
   def _attach_manifest_tracking(self, record: AutonomousTask) -> None:
@@ -530,7 +740,8 @@ class AutonomousRegistryStateMixin:
     manifest_path: Path,
     rehydrate_time: float,
   ) -> AutonomousTask | None:
-    if manifest.get("manifest_version") != _runtime_attr("_TASK_MANIFEST_VERSION", _TASK_MANIFEST_VERSION):
+    manifest_version = manifest.get("manifest_version")
+    if manifest_version not in {1, _runtime_attr("_TASK_MANIFEST_VERSION", _TASK_MANIFEST_VERSION)}:
       _LOGGER.warning("Skipping autonomous manifest with unsupported version: %s", manifest_path)
       return None
 
@@ -576,14 +787,16 @@ class AutonomousRegistryStateMixin:
     cmd = manifest.get("cmd")
     resumed_as = manifest.get("resumed_as")
     user_email = manifest.get("user_email")
+    user_email = user_email if isinstance(user_email, str) else None
+    identity = _manifest_identity_payload(manifest, user_id=user_id, user_email=user_email)
     exit_code = manifest.get("exit_code")
     started_at = manifest.get("started_at")
 
     record = AutonomousTask(
       task_id=task_id,
       control_run_id=control_run_id,
-      user_id=user_id,
-      user_email=user_email if isinstance(user_email, str) else None,
+      user_id=str(identity["owner_user_id"]),
+      user_email=user_email,
       profile=profile,
       mode=mode,
       task=self._coerce_manifest_str(manifest, "task"),
@@ -592,6 +805,7 @@ class AutonomousRegistryStateMixin:
       ticker=self._coerce_manifest_str(manifest, "ticker"),
       channel=self._coerce_manifest_str(manifest, "channel"),
       dev_mode=bool(manifest.get("dev_mode", False)),
+      dispatch_scope=_normalize_dispatch_scope(manifest.get("dispatch_scope")),
       cmd=[str(part) for part in cmd] if isinstance(cmd, list) else [],
       log_path=self._path_from_manifest(
         manifest,
@@ -621,11 +835,23 @@ class AutonomousRegistryStateMixin:
       log_handle=None,
       slot_reserved=False,
       event_lines=events,
+      owner_user_id=str(identity["owner_user_id"]),
+      raw_user_id=identity["raw_user_id"],
+      user_slug=identity["user_slug"],
+      risk_user_id=int(identity["risk_user_id"]),
+      user_aliases=list(identity["user_aliases"]),
+      identity_status=str(identity["identity_status"]),
       resumed_from=self._coerce_manifest_str(manifest, "resumed_from"),
       resumed_as=[str(item) for item in resumed_as] if isinstance(resumed_as, list) else [],
+      schedule_id=self._coerce_manifest_str(manifest, "schedule_id"),
+      schedule_name=self._coerce_manifest_str(manifest, "schedule_name"),
     )
     self._attach_manifest_tracking(record)
-    if was_interrupted or record.state != raw_manifest_state:
+    if (
+      was_interrupted
+      or record.state != raw_manifest_state
+      or manifest_version != _runtime_attr("_TASK_MANIFEST_VERSION", _TASK_MANIFEST_VERSION)
+    ):
       self._write_task_manifest(record)
     return record
 

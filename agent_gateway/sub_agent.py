@@ -2,21 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import json
 import logging
 import secrets
-import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .autonomous_output import extract_state_update
 from ._provider_utils import _get_allowed_models_for_provider_name, sub_agent_default_model
-from .events import SkillRunStartedEvent, event_to_dict
 from .event_log import EventLog
 from .runner import _derive_sub_agent_id
 from .session import GatewaySession
-from .skill_result_events import build_skill_result_captured_event
 from .skills import SkillLoader, SkillStateStore, resolve_blocks
+from .sub_agent_skill_events import SkillRunEventEmitter
 from .sub_agent_helpers import (
   DEFAULT_SUB_AGENT_TIMEOUT_SECONDS as DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
   ExcludedToolsResolver as ExcludedToolsResolver,
@@ -53,7 +50,10 @@ from .sub_agent_helpers import (
   make_run_agent_tool_def as make_run_agent_tool_def,
   make_send_message_tool_def as make_send_message_tool_def,
 )
+from .sub_agent_background_result import make_get_background_result_handler
 from .sub_agent_messages import make_send_message_handler as _make_send_message_handler
+from .sub_agent_model_resolution import resolve_sub_agent_model
+from . import sub_agent_skill_state as _sub_agent_skill_state
 from . import sub_agent_tool_definitions as _sub_agent_tool_definitions
 from .task_registry import CoordinatorConfig, ProviderResolver
 from .tool_dispatcher import ToolDispatcher
@@ -92,26 +92,11 @@ def _artifact_emit_tool_definitions(installed_tool_names: set[str]) -> list[dict
 
 
 def _result_response_text(result: Any | None) -> str:
-  if isinstance(result, dict):
-    response = result.get("response")
-    return response if isinstance(response, str) else ""
-  if result is None:
-    return ""
-  return str(result)
+  return _sub_agent_skill_state.result_response_text(result)
 
 
 def _skill_state_prompt(skill_name: str, previous_state: dict[str, Any]) -> str:
-  state_json = json.dumps(previous_state, indent=2, sort_keys=True)
-  return (
-    "## Persisted Skill State\n"
-    f"Previous state for `{skill_name}`:\n"
-    "```json\n"
-    f"{state_json}\n"
-    "```\n\n"
-    "Use this state as continuity context when it is relevant. To update the "
-    "persisted state, include a final `## STATE_UPDATE_JSON` section containing "
-    "a fenced JSON object. Omitted keys keep their previous values."
-  )
+  return _sub_agent_skill_state.skill_state_prompt(skill_name, previous_state)
 
 
 def make_run_agent_handler(
@@ -149,9 +134,7 @@ def make_run_agent_handler(
   constructs a constrained sub-agent dispatcher, and delegates execution to
   `AgentRunner.spawn_sub_agent()`.
   """
-  effective_allowed_models = (
-    allowed_models if allowed_models is not None else _get_allowed_models_for_provider_name("anthropic")
-  )
+  effective_allowed_models = allowed_models if allowed_models is not None else _get_allowed_models_for_provider_name("anthropic")
   effective_coordinator = coordinator_config if coordinator_config is not None and coordinator_config.enabled else None
   skill_state_lock = asyncio.Lock()
 
@@ -190,7 +173,6 @@ def make_run_agent_handler(
     profile = None
     context_ticker = ""
     skill_run_id: str | None = None
-    skill_run_started_emitted = False
     if agent_name and skill_loader is not None:
       try:
         profile = skill_loader.load(agent_name)
@@ -211,24 +193,22 @@ def make_run_agent_handler(
     profile_provider = getattr(profile, "provider", None) if profile is not None else None
     if profile_provider:
       raw_provider = raw_provider or profile_provider
-    if raw_provider is None and effective_coordinator is not None and effective_coordinator.default_worker_provider:
-      raw_provider = effective_coordinator.default_worker_provider
-
-    effective_provider_resolver = provider_resolver
-    if effective_provider_resolver is None and effective_coordinator is not None:
-      effective_provider_resolver = effective_coordinator.provider_resolver
-
-    resolved = None
-    if raw_provider:
-      if effective_provider_resolver is None:
-        return None, {
-          "code": "provider_not_supported",
-          "message": f"Provider '{raw_provider}' requested but no provider_resolver configured",
-        }
-      try:
-        resolved = effective_provider_resolver(raw_provider)
-      except Exception as exc:
-        return None, {"code": "invalid_provider", "message": str(exc)}
+    model_resolution, model_error = resolve_sub_agent_model(
+      raw_provider=raw_provider,
+      raw_model=raw_model,
+      profile_model=profile.model if profile else None,
+      effective_allowed_models=effective_allowed_models,
+      provider_resolver=provider_resolver,
+      effective_coordinator=effective_coordinator,
+      default_model=default_model,
+      invalid_model_skill=agent_name if profile is not None else None,
+      default_model_selector=sub_agent_default_model,
+    )
+    if model_error is not None:
+      return None, model_error
+    assert model_resolution is not None
+    resolved = model_resolution.resolved_provider
+    effective_model = model_resolution.model
 
     if profile is not None:
       skill_prompt = resolve_blocks(profile.system_prompt, skill_loader.skills_dir / "_blocks")
@@ -253,42 +233,6 @@ def make_run_agent_handler(
       effective_max_turns = default_max_turns
       effective_timeout = default_timeout
       effective_max_tokens = default_max_tokens
-
-    if resolved is not None:
-      effective_allowed = resolved.allowed_models
-      effective_model = (
-        raw_model
-        or (profile.model if profile else None)
-        or sub_agent_default_model(effective_allowed)
-        or (
-          effective_coordinator.default_worker_model
-          if effective_coordinator is not None
-          else None
-        )
-        or resolved.default_model
-        or default_model
-      )
-    else:
-      effective_allowed = effective_allowed_models
-      effective_model = (
-        raw_model
-        or (profile.model if profile else None)
-        or sub_agent_default_model(effective_allowed)
-        or (
-          effective_coordinator.default_worker_model
-          if effective_coordinator is not None
-          else None
-        )
-        or default_model
-      )
-
-    if effective_allowed and effective_model not in effective_allowed:
-      if profile is not None and resolved is None:
-        return None, {
-          "code": "invalid_input",
-          "message": f"Invalid model '{effective_model}' for skill '{agent_name}'",
-        }
-      return None, {"code": "invalid_input", "message": f"Invalid model: {effective_model}"}
 
     effective_excluded = _DEFAULT_EXCLUDED_TOOLS | set(excluded_tools or set())
     if effective_coordinator is not None and effective_coordinator.worker_excluded_tools:
@@ -325,73 +269,45 @@ def make_run_agent_handler(
       or getattr(parent_session, "user_email", None)
     )
 
+    skill_event_emitter = (
+      SkillRunEventEmitter(
+        skill_run_id=skill_run_id,
+        profile=profile,
+        context_ticker=context_ticker,
+        event_log_getter=lambda: sub_log,
+        tool_ctx=tool_ctx,
+        ticker_fn=_html_artifact_ticker,
+        scope_fn=_html_artifact_scope,
+      )
+      if skill_run_id and profile is not None and agent_name
+      else None
+    )
+
     def _emit_parent_event(event: dict[str, Any]) -> None:
-      try:
-        sub_log.append(event)
-      except NameError:
-        pass
-      emit = getattr(tool_ctx, "emit", None)
-      if callable(emit):
-        emit(event)
+      if skill_event_emitter is not None:
+        skill_event_emitter.emit_parent_event(event)
 
     def _emit_skill_run_started() -> None:
-      nonlocal skill_run_started_emitted
-      if skill_run_started_emitted or not (skill_run_id and profile is not None and agent_name):
-        return
-      _emit_parent_event(
-        event_to_dict(
-          SkillRunStartedEvent(
-            skill_run_id=skill_run_id,
-            skill=profile.name,
-            ticker=_html_artifact_ticker(profile, context_ticker),
-            ts=time.time(),
-            scope=_html_artifact_scope(profile, context_ticker),
-          )
-        )
-      )
-      skill_run_started_emitted = True
+      if skill_event_emitter is not None:
+        skill_event_emitter.emit_started()
 
     def _emit_skill_result_captured(result: Any | None, error: dict[str, Any] | None) -> None:
-      if not (skill_run_id and profile is not None and agent_name):
-        return
-      _emit_skill_run_started()
-      _emit_parent_event(
-        build_skill_result_captured_event(
-          skill_run_id=skill_run_id,
-          skill=profile.name,
-          ticker=_html_artifact_ticker(profile, context_ticker),
-          entries=sub_log.entries,
-          result=result,
-          error=error,
-        )
-      )
+      if skill_event_emitter is not None:
+        skill_event_emitter.emit_result_captured(result, error)
 
     async def _persist_skill_state(result: Any | None, error: dict[str, Any] | None) -> None:
-      if not (agent_name and profile is not None and profile.persist_state and skill_state_store is not None):
-        return
-      response_text = _result_response_text(result)
-      try:
-        model_state = extract_state_update(response_text)
-      except Exception:
-        log.warning("Failed to extract state update for skill %s", profile.name, exc_info=True)
-        model_state = {}
-      async with skill_state_lock:
-        try:
-          previous_state = skill_state_store.get(profile.name)
-          next_state = dict(previous_state)
-          next_state.update(model_state)
-          next_state["last_run"] = datetime.datetime.now(datetime.UTC).isoformat()
-          next_state["model"] = effective_model
-          next_state["run_count"] = int(previous_state.get("run_count", 0) or 0) + 1
-          if profile.version is not None:
-            next_state["version"] = profile.version
-          if error:
-            next_state["last_error"] = dict(error)
-          else:
-            next_state.pop("last_error", None)
-          skill_state_store.set(profile.name, next_state)
-        except Exception:
-          log.warning("Failed to persist state for skill %s", profile.name, exc_info=True)
+      await _sub_agent_skill_state.persist_skill_state(
+        result,
+        error,
+        agent_name=agent_name,
+        profile=profile,
+        skill_state_store=skill_state_store,
+        skill_state_lock=skill_state_lock,
+        effective_model=effective_model,
+        extract_state_update_fn=extract_state_update,
+        result_response_text_fn=_result_response_text,
+        logger=log,
+      )
 
     if skill_run_id and profile is not None and agent_name:
       child_excluded = _skill_html_excluded_tools(effective_excluded, skill_profile=profile)
@@ -530,31 +446,6 @@ def make_run_agent_handler(
   return _handle_run_agent
 
 
-def make_get_background_result_handler(runner_ref: list[Any]):
-  """Build the local handler used by the ``get_background_result`` tool.
-
-  The returned handler delegates to ``AgentRunner.get_background_result()``,
-  which polls or waits for background sub-agent tasks registered via
-  ``run_agent(background=true)``.
-
-  Args:
-    runner_ref: Single-element list holding the active ``AgentRunner`` (or
-      ``None`` before the runner is initialized).
-
-  Returns:
-    An async handler with signature ``(tool_input, **kwargs) -> (result, error)``.
-  """
-
-  async def _handle_get_background_result(tool_input: dict[str, Any], **kwargs: Any):
-    _ = kwargs
-    runner = runner_ref[0]
-    if runner is None:
-      return None, {"code": "internal_error", "message": "Sub-agent runner not initialized"}
-    return await runner.get_background_result(tool_input)
-
-  return _handle_get_background_result
-
-
 def make_resume_handler(
   runner_ref: list[Any],
   *,
@@ -581,9 +472,7 @@ def make_resume_handler(
   if excluded_tools_resolver is None:
     raise ValueError("make_resume_handler requires excluded_tools_resolver")
 
-  effective_allowed_models = (
-    allowed_models if allowed_models is not None else _get_allowed_models_for_provider_name("anthropic")
-  )
+  effective_allowed_models = allowed_models if allowed_models is not None else _get_allowed_models_for_provider_name("anthropic")
   effective_coordinator = coordinator_config if coordinator_config is not None and coordinator_config.enabled else None
 
   async def _handle_resume(tool_input: dict[str, Any], **kwargs: Any):
@@ -664,49 +553,27 @@ def make_resume_handler(
     profile_provider = getattr(profile, "provider", None)
     if profile_provider:
       raw_provider = raw_provider or profile_provider
-    if raw_provider is None and effective_coordinator is not None and effective_coordinator.default_worker_provider:
-      raw_provider = effective_coordinator.default_worker_provider
-
-    effective_provider_resolver = provider_resolver
-    if effective_provider_resolver is None and effective_coordinator is not None:
-      effective_provider_resolver = effective_coordinator.provider_resolver
-
-    resolved = None
-    if raw_provider:
-      if effective_provider_resolver is None:
-        return None, {
-          "code": "provider_not_supported",
-          "message": f"Provider '{raw_provider}' requested but no provider_resolver configured",
-        }
-      try:
-        resolved = effective_provider_resolver(raw_provider)
-      except Exception as exc:
-        return None, {"code": "invalid_provider", "message": str(exc)}
-
     raw_model = tool_input.get("model")
     if raw_model is not None and not isinstance(raw_model, str):
       return None, {"code": "invalid_input", "message": "model must be a string"}
-    if resolved is not None:
-      effective_allowed = resolved.allowed_models
-      effective_model = (
-        raw_model
-        or profile.model
-        or sub_agent_default_model(effective_allowed)
-        or (effective_coordinator.default_worker_model if effective_coordinator is not None else None)
-        or resolved.default_model
-        or default_model
-      )
-    else:
-      effective_allowed = effective_allowed_models
-      effective_model = (
-        raw_model
-        or profile.model
-        or sub_agent_default_model(effective_allowed)
-        or (effective_coordinator.default_worker_model if effective_coordinator is not None else None)
-        or default_model
-      )
-    if effective_allowed and effective_model not in effective_allowed:
-      return None, {"code": "invalid_input", "message": f"Invalid model '{effective_model}' for skill '{agent_name}'"}
+    model_resolution, model_error = resolve_sub_agent_model(
+      raw_provider=raw_provider,
+      raw_model=raw_model,
+      profile_model=profile.model,
+      effective_allowed_models=effective_allowed_models,
+      provider_resolver=provider_resolver,
+      effective_coordinator=effective_coordinator,
+      default_model=default_model,
+      invalid_model_skill=agent_name,
+      skill_specific_invalid_model=True,
+      default_model_selector=sub_agent_default_model,
+    )
+    if model_error is not None:
+      return None, model_error
+    assert model_resolution is not None
+    resolved = model_resolution.resolved_provider
+    effective_provider_name = model_resolution.provider_name
+    effective_model = model_resolution.model
 
     skill_prompt = resolve_blocks(profile.system_prompt, skill_loader.skills_dir / "_blocks")
     system_prompt = _SKILL_SYSTEM_PROMPT_TEMPLATE.format(
@@ -761,46 +628,24 @@ def make_resume_handler(
       parent_messages,
       additional_context,
     )
-    skill_run_started_emitted = False
+    skill_event_emitter = SkillRunEventEmitter(
+      skill_run_id=skill_run_id,
+      profile=profile,
+      context_ticker=context_ticker,
+      event_log_getter=lambda: sub_log,
+      tool_ctx=tool_ctx,
+      ticker_fn=_html_artifact_ticker,
+      scope_fn=_html_artifact_scope,
+    )
 
     def _emit_parent_event(event: dict[str, Any]) -> None:
-      try:
-        sub_log.append(event)
-      except NameError:
-        pass
-      emit = getattr(tool_ctx, "emit", None)
-      if callable(emit):
-        emit(event)
+      skill_event_emitter.emit_parent_event(event)
 
     def _emit_skill_run_started() -> None:
-      nonlocal skill_run_started_emitted
-      if skill_run_started_emitted:
-        return
-      _emit_parent_event(
-        event_to_dict(
-          SkillRunStartedEvent(
-            skill_run_id=skill_run_id,
-            skill=profile.name,
-            ticker=_html_artifact_ticker(profile, context_ticker),
-            ts=time.time(),
-            scope=_html_artifact_scope(profile, context_ticker),
-          )
-        )
-      )
-      skill_run_started_emitted = True
+      skill_event_emitter.emit_started()
 
     def _emit_skill_result_captured(result: Any | None, error: dict[str, Any] | None) -> None:
-      _emit_skill_run_started()
-      _emit_parent_event(
-        build_skill_result_captured_event(
-          skill_run_id=skill_run_id,
-          skill=profile.name,
-          ticker=_html_artifact_ticker(profile, context_ticker),
-          entries=sub_log.entries,
-          result=result,
-          error=error,
-        )
-      )
+      skill_event_emitter.emit_result_captured(result, error)
 
     if "emit_html_artifact" not in child_excluded:
       _install_emit_html_artifact_handler(
@@ -894,7 +739,7 @@ def make_resume_handler(
       "task_id": task_id,
       "agent": agent_name,
       "model": effective_model,
-      "provider": raw_provider,
+      "provider": effective_provider_name,
       "resumable": True,
     }
     if child_budget_usd is not None:
@@ -920,7 +765,6 @@ def make_resume_handler(
 
 def make_send_message_handler(runner_ref: list[Any]):
   return _make_send_message_handler(runner_ref)
-
 
 
 __all__ = [

@@ -53,7 +53,7 @@ def test_sdk_runner_stream_parent_monkeypatches_drive_tool_start(monkeypatch: py
   runner._handle_stream_event(
     {
       "type": "content_block_start",
-      "content_block": {"type": "tool_use", "id": "tool-1", "name": "mcp__portfolio-mcp__preview_trade"},
+      "content_block": {"type": "tool_use", "id": "tool-1", "name": "mcp__portfolio-reads-mcp__preview_trade"},
     }
   )
   runner._handle_stream_event(
@@ -69,7 +69,7 @@ def test_sdk_runner_stream_parent_monkeypatches_drive_tool_start(monkeypatch: py
     {
       "type": "tool_call_start",
       "tool_call_id": "tool-1",
-      "tool_name": "mcp__portfolio-mcp__preview_trade",
+      "tool_name": "mcp__portfolio-reads-mcp__preview_trade",
       "tool_input": {"redacted": True},
       "display": {"summary": "patched"},
       "product_id": "hank-test",

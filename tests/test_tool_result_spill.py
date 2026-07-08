@@ -355,6 +355,26 @@ def test_annotate_result_collects_policy_low_match_and_subagent_warnings() -> No
   assert "_interceptor_warnings" not in result
 
 
+def test_annotate_result_warns_on_empty_status_error_detail() -> None:
+  result = {"status": "error", "error": ""}
+
+  annotated = annotate_result(result, tool_name="get_skill_artifact")
+
+  assert annotated["_runner_warning"] == (
+    "Tool get_skill_artifact returned status=error without error detail; "
+    "do not retry unchanged input unless required context changed or there is new evidence the failure was transient."
+  )
+  assert "_runner_warning" not in result
+
+
+def test_annotate_result_keeps_detailed_status_error_unchanged() -> None:
+  result = {"status": "error", "error": {"code": "not_found", "message": "missing"}}
+
+  annotated = annotate_result(result, tool_name="get_skill_artifact")
+
+  assert annotated is result
+
+
 def test_make_error_result_includes_optional_sub_code() -> None:
   result = make_error_result("tool-1", "invalid_input", "bad payload", sub_code="too_large")
 

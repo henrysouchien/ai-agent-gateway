@@ -107,6 +107,10 @@ def test_chat_dispatch_mints_chat_session_token_and_returns_chat_run() -> None:
     assert run["run_id"] == payload["chat_session_id"]
     assert run["channel"] == "tui"
     assert run["user_id"] == "alice"
+    assert run["owner_user_id"] == "alice"
+    assert run["raw_user_id"] == "alice"
+    assert run["user_aliases"] == ["alice"]
+    assert run["identity_status"] == "legacy_user_id_fallback"
     assert run["state"] == "completed"
     assert run["ended_at"] is not None
     assert run["initial_message"] == "review AAPL"

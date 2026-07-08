@@ -565,6 +565,49 @@ def test_control_artifacts_default_reads_skip_sandbox_sidecars(artifact_pr8: Art
   assert sandbox_latest.json()["artifact_id"] == sandbox_id
 
 
+def test_control_artifacts_facade_monkeypatches_still_drive_filter_helpers(
+  artifact_pr8: ArtifactPr8Fixture,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.control_plane import artifacts as artifact_routes
+
+  product_id = "2026-05-20T120000.000-run-product"
+  sandbox_id = "2026-05-20T130000.000-run-harness"
+  _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    product_id,
+    mtime=1_800_000_001,
+  )
+  _write_artifact(
+    artifact_pr8.data_dir,
+    USER_ID,
+    "PCTY",
+    "earnings-scenarios",
+    sandbox_id,
+    mtime=1_800_000_002,
+    payload_updates={
+      "origin_kind": "harness",
+      "visibility": "sandbox",
+    },
+  )
+
+  with monkeypatch.context() as patch:
+    patch.setattr(artifact_routes, "_origin_filter", lambda _value: "product")
+    with TestClient(artifact_pr8.app) as client:
+      response = client.get(
+        "/api/control/artifacts?visibility=all&origin_kind=harness",
+        headers=_bearer_headers(client, USER_ID),
+      )
+
+  artifact_routes._sync_compat_globals()
+
+  assert response.status_code == 200
+  assert [artifact["artifact_id"] for artifact in response.json()["artifacts"]] == [product_id]
+
+
 def test_control_artifacts_default_reads_skip_sandbox_auxiliary_artifacts(
   artifact_pr8: ArtifactPr8Fixture,
 ) -> None:

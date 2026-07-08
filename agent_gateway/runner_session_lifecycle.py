@@ -32,6 +32,10 @@ from .task_registry import TaskEntry, TaskRegistry
 log = logging.getLogger("agent_gateway.runner")
 
 
+class WriterLeaseAlreadyHeldError(RuntimeError):
+  """Raised when another writer owns the durable session lease."""
+
+
 def _runner_attr(instance: Any, name: str, fallback: Any) -> Any:
   for cls in type(instance).__mro__:
     module = sys.modules.get(getattr(cls, "__module__", ""))
@@ -234,7 +238,7 @@ class RunnerSessionLifecycleMixin:
       fcntl_module.flock(lease_file.fileno(), fcntl_module.LOCK_EX | fcntl_module.LOCK_NB)
     except BlockingIOError as exc:
       lease_file.close()
-      raise RuntimeError(f"Writer lease already held for {self._agent_session_log.path}") from exc
+      raise WriterLeaseAlreadyHeldError(f"Writer lease already held for {self._agent_session_log.path}") from exc
     self._write_lease_file = lease_file
 
     last_known_safe_seq = 0

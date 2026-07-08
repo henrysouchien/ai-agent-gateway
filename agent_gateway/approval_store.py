@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-import json
 import os
 import sqlite3
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Protocol
 
+from . import approval_store_rows as _rows
+from .approval_notifications import (
+  ApprovalNotificationDestinationResolver,
+  ApprovalNotificationSender,
+  approval_notification_policy_for_request,
+  maybe_await,
+  normalize_approval_notification_destinations,
+  render_approval_notification_message,
+)
 from .approval_policy import (
   ApprovalRequest,
   ApprovalState,
@@ -23,31 +31,10 @@ from .approval_policy import (
 TERMINAL_STATES = frozenset({"auto_approved", "auto_denied", "approved", "denied", "expired"})
 
 
-def _dt_to_text(value: datetime | None) -> str | None:
-  if value is None:
-    return None
-  if value.tzinfo is None:
-    value = value.replace(tzinfo=UTC)
-  return value.astimezone(UTC).isoformat()
-
-
-def _dt_from_text(value: str | None) -> datetime | None:
-  if value is None:
-    return None
-  parsed = datetime.fromisoformat(value)
-  if parsed.tzinfo is None:
-    parsed = parsed.replace(tzinfo=UTC)
-  return parsed.astimezone(UTC)
-
-
-def _json_dumps(value: Any) -> str:
-  return json.dumps(value, sort_keys=True, default=str)
-
-
-def _json_loads(value: str | None) -> Any:
-  if not value:
-    return None
-  return json.loads(value)
+_dt_to_text = _rows.dt_to_text
+_dt_from_text = _rows.dt_from_text
+_json_dumps = _rows.json_dumps
+_json_loads = _rows.json_loads
 
 
 class ApprovalRequestStore(Protocol):
@@ -97,10 +84,20 @@ class ApprovalRequestStore(Protocol):
 class SQLiteApprovalStore:
   """SQLite-backed approval store with atomic vote recording."""
 
-  def __init__(self, path: str | os.PathLike[str] = "data/gateway/approvals.sqlite3", *, audit_emitter: Any | None = None) -> None:
+  def __init__(
+    self,
+    path: str | os.PathLike[str] = "data/gateway/approvals.sqlite3",
+    *,
+    audit_emitter: Any | None = None,
+    notification_destination_resolver: ApprovalNotificationDestinationResolver | None = None,
+    notification_sender: ApprovalNotificationSender | None = None,
+  ) -> None:
     self.path = Path(path)
     self.path.parent.mkdir(parents=True, exist_ok=True)
     self._audit_emitter = audit_emitter
+    self._notification_destination_resolver = notification_destination_resolver
+    self._notification_sender = notification_sender
+    self._notification_delivery_task: asyncio.Task | None = None
     self._lock = asyncio.Lock()
     self._init_schema()
 
@@ -173,7 +170,8 @@ class SQLiteApprovalStore:
           system_prompt_hash TEXT,
           tool_schema_version TEXT,
           mcp_server_version TEXT,
-          skill TEXT
+          skill TEXT,
+          notification_policy TEXT NOT NULL DEFAULT 'auto'
         );
         CREATE INDEX IF NOT EXISTS idx_approval_requests_tool_call_id
           ON approval_requests(tool_call_id);
@@ -231,6 +229,23 @@ class SQLiteApprovalStore:
         );
         CREATE INDEX IF NOT EXISTS idx_delegation_grants_lookup
           ON delegation_grants(delegator_user_id, bound_excel_session_id, bound_relay_request_id);
+
+        CREATE TABLE IF NOT EXISTS approval_notification_outbox (
+          approval_id TEXT NOT NULL REFERENCES approval_requests(approval_id) ON DELETE CASCADE,
+          channel TEXT NOT NULL,
+          destination TEXT NOT NULL,
+          state TEXT NOT NULL,
+          message TEXT NOT NULL,
+          dedupe_key TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          sent_at TEXT,
+          PRIMARY KEY (approval_id, channel, destination)
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_notification_outbox_state
+          ON approval_notification_outbox(state, updated_at);
         """
       )
       columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(approval_requests)").fetchall()}
@@ -238,6 +253,8 @@ class SQLiteApprovalStore:
         conn.execute("ALTER TABLE approval_requests ADD COLUMN skill TEXT")
       if "delegation_id" not in columns:
         conn.execute("ALTER TABLE approval_requests ADD COLUMN delegation_id TEXT")
+      if "notification_policy" not in columns:
+        conn.execute("ALTER TABLE approval_requests ADD COLUMN notification_policy TEXT NOT NULL DEFAULT 'auto'")
 
   async def create(self, request: ApprovalRequest) -> ApprovalRequest:
     async with self._lock:
@@ -255,7 +272,8 @@ class SQLiteApprovalStore:
             args_predicate, chain_trust_window_seconds, route_target, route_target_type,
             external_callback_id, policy_id, policy_version, policy_bundle_hash,
             persistent_grant_scope, tenant_id, model_id, model_version,
-            system_prompt_hash, tool_schema_version, mcp_server_version, skill
+            system_prompt_hash, tool_schema_version, mcp_server_version, skill,
+            notification_policy
           ) VALUES (
             :approval_id, :tool_call_id, :parent_approval_id, :approval_chain_id,
             :delegation_id, :request_id, :session_id, :run_id, :user_id, :profile, :channel,
@@ -266,7 +284,8 @@ class SQLiteApprovalStore:
             :args_predicate, :chain_trust_window_seconds, :route_target, :route_target_type,
             :external_callback_id, :policy_id, :policy_version, :policy_bundle_hash,
             :persistent_grant_scope, :tenant_id, :model_id, :model_version,
-            :system_prompt_hash, :tool_schema_version, :mcp_server_version, :skill
+            :system_prompt_hash, :tool_schema_version, :mcp_server_version, :skill,
+            :notification_policy
           )
           """,
           self._request_to_row(request),
@@ -281,7 +300,7 @@ class SQLiteApprovalStore:
         "SELECT * FROM approval_requests WHERE approval_id = ?",
         (approval_id,),
       ).fetchone()
-    return self._row_to_request(row) if row is not None else None
+    return self._row_to_request_with_projection(row) if row is not None else None
 
   async def get_by_tool_call_id(self, tool_call_id: str) -> ApprovalRequest | None:
     with self._connection() as conn:
@@ -289,7 +308,7 @@ class SQLiteApprovalStore:
         "SELECT * FROM approval_requests WHERE tool_call_id = ? ORDER BY requested_at DESC LIMIT 1",
         (tool_call_id,),
       ).fetchone()
-    return self._row_to_request(row) if row is not None else None
+    return self._row_to_request_with_projection(row) if row is not None else None
 
   async def update_request(self, request: ApprovalRequest) -> ApprovalRequest:
     async with self._lock:
@@ -311,7 +330,8 @@ class SQLiteApprovalStore:
             policy_id = :policy_id,
             policy_version = :policy_version,
             policy_bundle_hash = :policy_bundle_hash,
-            persistent_grant_scope = :persistent_grant_scope
+            persistent_grant_scope = :persistent_grant_scope,
+            notification_policy = :notification_policy
           WHERE approval_id = :approval_id
           """,
           self._request_to_row(request),
@@ -698,6 +718,140 @@ class SQLiteApprovalStore:
       await self._emit("expired", request)
     return len(expired)
 
+  async def enqueue_pending_approval_notification(self, request: ApprovalRequest) -> dict[str, Any] | None:
+    if request.state != "pending_user":
+      return None
+    now_text = _dt_to_text(utc_now())
+    if approval_notification_policy_for_request(request) == "skip":
+      async with self._lock:
+        with self._connection() as conn:
+          conn.execute("BEGIN IMMEDIATE")
+          self._insert_notification_row(
+            conn,
+            approval_id=request.approval_id,
+            channel="",
+            destination="",
+            state="skipped_policy",
+            message="",
+            now_text=now_text,
+          )
+          projection = self._notification_projection_for_conn(conn, request.approval_id)
+          conn.commit()
+      return projection
+
+    destinations = await self._resolve_notification_destinations(request)
+    if not destinations:
+      async with self._lock:
+        with self._connection() as conn:
+          conn.execute("BEGIN IMMEDIATE")
+          self._insert_notification_row(
+            conn,
+            approval_id=request.approval_id,
+            channel="",
+            destination="",
+            state="skipped_no_destination",
+            message="",
+            now_text=now_text,
+          )
+          projection = self._notification_projection_for_conn(conn, request.approval_id)
+          conn.commit()
+      return projection
+
+    message = render_approval_notification_message(request)
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for destination in destinations:
+          self._insert_notification_row(
+            conn,
+            approval_id=request.approval_id,
+            channel=destination.channel,
+            destination=destination.destination,
+            state="pending",
+            message=message,
+            now_text=now_text,
+          )
+        projection = self._notification_projection_for_conn(conn, request.approval_id)
+        conn.commit()
+    return projection
+
+  async def deliver_pending_approval_notifications(self, *, limit: int = 50) -> int:
+    if self._notification_sender is None:
+      return 0
+    rows = await self._claim_pending_notification_rows(limit=max(1, int(limit)))
+    delivered_or_failed = 0
+    for row in rows:
+      now_text = _dt_to_text(utc_now())
+      try:
+        await maybe_await(self._notification_sender(row))
+      except Exception as exc:
+        await self._mark_notification_failed(row, type(exc).__name__, now_text=now_text)
+      else:
+        await self._mark_notification_sent(row, now_text=now_text)
+      delivered_or_failed += 1
+    return delivered_or_failed
+
+  def schedule_approval_notification_delivery(self, *, limit: int = 50) -> bool:
+    if self._notification_sender is None:
+      return False
+    try:
+      loop = asyncio.get_running_loop()
+    except RuntimeError:
+      return False
+    if self._notification_delivery_task is not None and not self._notification_delivery_task.done():
+      return False
+    self._notification_delivery_task = loop.create_task(
+      self.deliver_pending_approval_notifications(limit=limit)
+    )
+    return True
+
+  async def get_approval_notification_projection(self, approval_id: str) -> dict[str, Any] | None:
+    with self._connection() as conn:
+      return self._notification_projection_for_conn(conn, approval_id)
+
+  async def retry_failed_approval_notifications(self, approval_id: str) -> dict[str, Any]:
+    now_text = _dt_to_text(utc_now())
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+          """
+          UPDATE approval_notification_outbox
+          SET state = 'pending',
+              updated_at = ?,
+              last_error = NULL
+          WHERE approval_id = ?
+            AND state = 'failed_retryable'
+            AND EXISTS (
+              SELECT 1
+              FROM approval_requests
+              WHERE approval_requests.approval_id = approval_notification_outbox.approval_id
+                AND approval_requests.state = 'pending_user'
+            )
+          """,
+          (now_text, approval_id),
+        )
+        projection = self._notification_projection_for_conn(conn, approval_id)
+        conn.commit()
+    return {
+      "approval_id": approval_id,
+      "requeued": int(cursor.rowcount or 0),
+      "notification": projection,
+    }
+
+  async def list_approval_notification_outbox(self, approval_id: str | None = None) -> list[dict[str, Any]]:
+    with self._connection() as conn:
+      if approval_id is None:
+        rows = conn.execute(
+          "SELECT * FROM approval_notification_outbox ORDER BY created_at ASC"
+        ).fetchall()
+      else:
+        rows = conn.execute(
+          "SELECT * FROM approval_notification_outbox WHERE approval_id = ? ORDER BY created_at ASC",
+          (approval_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
   async def _emit(self, event_type: str, request: ApprovalRequest, **kwargs: Any) -> None:
     if self._audit_emitter is None:
       return
@@ -733,142 +887,184 @@ class SQLiteApprovalStore:
       "expired": "expired",
     }.get(state, state)
 
+  async def _resolve_notification_destinations(self, request: ApprovalRequest):
+    if self._notification_destination_resolver is None:
+      return []
+    raw_destinations = await maybe_await(self._notification_destination_resolver(request))
+    return normalize_approval_notification_destinations(raw_destinations or [])
+
+  async def _claim_pending_notification_rows(self, *, limit: int) -> list[dict[str, Any]]:
+    now_text = _dt_to_text(utc_now())
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = [
+          dict(row)
+          for row in conn.execute(
+            """
+            SELECT outbox.*
+            FROM approval_notification_outbox AS outbox
+            JOIN approval_requests AS approvals
+              ON approvals.approval_id = outbox.approval_id
+            WHERE outbox.state = 'pending'
+              AND approvals.state = 'pending_user'
+            ORDER BY outbox.created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+          ).fetchall()
+        ]
+        for row in rows:
+          conn.execute(
+            """
+            UPDATE approval_notification_outbox
+            SET state = 'processing',
+                updated_at = ?,
+                attempt_count = attempt_count + 1
+            WHERE approval_id = ?
+              AND channel = ?
+              AND destination = ?
+              AND state = 'pending'
+            """,
+            (now_text, row["approval_id"], row["channel"], row["destination"]),
+          )
+        conn.commit()
+    return rows
+
+  @staticmethod
+  def _insert_notification_row(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: str,
+    channel: str,
+    destination: str,
+    state: str,
+    message: str,
+    now_text: str | None,
+  ) -> None:
+    conn.execute(
+      """
+      INSERT OR IGNORE INTO approval_notification_outbox (
+        approval_id, channel, destination, state, message, dedupe_key,
+        attempt_count, last_error, created_at, updated_at, sent_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, NULL)
+      """,
+      (
+        approval_id,
+        channel,
+        destination,
+        state,
+        message,
+        f"approval:{approval_id}:{channel}:{destination}",
+        now_text,
+        now_text,
+      ),
+    )
+
+  async def _mark_notification_sent(self, row: dict[str, Any], *, now_text: str | None) -> None:
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+          """
+          UPDATE approval_notification_outbox
+          SET state = 'sent',
+              updated_at = ?,
+              sent_at = ?,
+              last_error = NULL
+          WHERE approval_id = ?
+            AND channel = ?
+            AND destination = ?
+            AND state IN ('pending', 'processing')
+          """,
+          (now_text, now_text, row["approval_id"], row["channel"], row["destination"]),
+        )
+        conn.commit()
+
+  async def _mark_notification_failed(self, row: dict[str, Any], error: str, *, now_text: str | None) -> None:
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+          """
+          UPDATE approval_notification_outbox
+          SET state = 'failed_retryable',
+              updated_at = ?,
+              last_error = ?
+          WHERE approval_id = ?
+            AND channel = ?
+            AND destination = ?
+            AND state IN ('pending', 'processing')
+          """,
+          (now_text, error[:500], row["approval_id"], row["channel"], row["destination"]),
+        )
+        conn.commit()
+
+  def _row_to_request_with_projection(self, row: sqlite3.Row) -> ApprovalRequest:
+    request = self._row_to_request(row)
+    with self._connection() as conn:
+      notification = self._notification_projection_for_conn(conn, request.approval_id)
+    if notification is None:
+      return request
+    return replace(request, notification=notification)
+
+  @staticmethod
+  def _notification_projection_for_conn(conn: sqlite3.Connection, approval_id: str) -> dict[str, Any] | None:
+    rows = conn.execute(
+      """
+      SELECT state, channel, sent_at
+      FROM approval_notification_outbox
+      WHERE approval_id = ?
+      """,
+      (approval_id,),
+    ).fetchall()
+    if not rows:
+      return None
+    states = {"pending" if str(row["state"]) == "processing" else str(row["state"]) for row in rows}
+    state_order = [
+      "sent",
+      "failed_retryable",
+      "failed_terminal",
+      "pending",
+      "skipped_no_destination",
+      "skipped_policy",
+    ]
+    state = next((candidate for candidate in state_order if candidate in states), None)
+    if state is None:
+      return None
+    channels: list[str] = []
+    for row in rows:
+      channel = str(row["channel"] or "")
+      if not channel or channel not in {"telegram", "email", "push"}:
+        continue
+      row_state = "pending" if row["state"] == "processing" else row["state"]
+      if state == "sent" and row_state != "sent":
+        continue
+      if state != "sent" and row_state != state:
+        continue
+      if channel not in channels:
+        channels.append(channel)
+    projection: dict[str, Any] = {"state": state, "channels": channels}
+    sent_values = sorted(str(row["sent_at"]) for row in rows if row["sent_at"])
+    if sent_values:
+      projection["last_sent_at"] = sent_values[-1]
+    return projection
+
   @staticmethod
   def _request_to_row(request: ApprovalRequest) -> dict[str, Any]:
-    return {
-      "approval_id": request.approval_id,
-      "tool_call_id": request.tool_call_id,
-      "parent_approval_id": request.parent_approval_id,
-      "approval_chain_id": request.approval_chain_id,
-      "delegation_id": request.delegation_id,
-      "request_id": request.request_id,
-      "session_id": request.session_id,
-      "run_id": request.run_id,
-      "skill": request.skill,
-      "user_id": request.user_id,
-      "profile": request.profile,
-      "channel": request.channel,
-      "tool_name": request.tool_name,
-      "tool_class": request.tool_class,
-      "tool_args_redacted": _json_dumps(request.tool_args_redacted),
-      "args_hash": request.args_hash,
-      "reason": request.reason,
-      "blast_radius_summary": request.blast_radius_summary,
-      "state": request.state,
-      "state_version": request.state_version,
-      "requested_at": _dt_to_text(request.requested_at),
-      "decided_at": _dt_to_text(request.decided_at),
-      "expires_at": _dt_to_text(request.expires_at),
-      "decider_id": request.decider_id,
-      "decider_role": request.decider_role,
-      "decision": request.decision,
-      "decision_reason": request.decision_reason,
-      "required_decider_count": request.required_decider_count,
-      "eligible_decider_count": request.eligible_decider_count,
-      "votes_received_count": request.votes_received_count,
-      "args_predicate": _json_dumps(request.args_predicate) if request.args_predicate is not None else None,
-      "chain_trust_window_seconds": request.chain_trust_window_seconds,
-      "route_target": request.route_target,
-      "route_target_type": request.route_target_type,
-      "external_callback_id": request.external_callback_id,
-      "policy_id": request.policy_id,
-      "policy_version": request.policy_version,
-      "policy_bundle_hash": request.policy_bundle_hash,
-      "persistent_grant_scope": request.persistent_grant_scope,
-      "tenant_id": request.tenant_id,
-      "model_id": request.model_id,
-      "model_version": request.model_version,
-      "system_prompt_hash": request.system_prompt_hash,
-      "tool_schema_version": request.tool_schema_version,
-      "mcp_server_version": request.mcp_server_version,
-    }
+    return _rows.request_to_row(request)
 
   @staticmethod
   def _row_to_request(row: sqlite3.Row) -> ApprovalRequest:
-    return ApprovalRequest(
-      approval_id=str(row["approval_id"]),
-      tool_call_id=str(row["tool_call_id"]),
-      parent_approval_id=row["parent_approval_id"],
-      approval_chain_id=str(row["approval_chain_id"]),
-      delegation_id=row["delegation_id"] if "delegation_id" in row.keys() else None,
-      request_id=str(row["request_id"]),
-      session_id=row["session_id"],
-      run_id=row["run_id"],
-      skill=row["skill"] if "skill" in row.keys() else None,
-      user_id=str(row["user_id"]),
-      profile=str(row["profile"]),
-      channel=str(row["channel"]),
-      tool_name=str(row["tool_name"]),
-      tool_class=str(row["tool_class"]),  # type: ignore[arg-type]
-      tool_args_redacted=_json_loads(row["tool_args_redacted"]) or {},
-      args_hash=str(row["args_hash"]),
-      reason=row["reason"],
-      blast_radius_summary=str(row["blast_radius_summary"]),
-      state=str(row["state"]),  # type: ignore[arg-type]
-      state_version=int(row["state_version"] or 0),
-      requested_at=_dt_from_text(row["requested_at"]) or utc_now(),
-      decided_at=_dt_from_text(row["decided_at"]),
-      expires_at=_dt_from_text(row["expires_at"]),
-      decider_id=row["decider_id"],
-      decider_role=row["decider_role"],
-      decision=row["decision"],  # type: ignore[arg-type]
-      decision_reason=row["decision_reason"],
-      required_decider_count=int(row["required_decider_count"] or 1),
-      eligible_decider_count=int(row["eligible_decider_count"] or 1),
-      votes_received_count=int(row["votes_received_count"] or 0),
-      args_predicate=_json_loads(row["args_predicate"]),
-      chain_trust_window_seconds=row["chain_trust_window_seconds"],
-      route_target=row["route_target"],
-      route_target_type=row["route_target_type"],
-      external_callback_id=row["external_callback_id"],
-      policy_id=str(row["policy_id"]),
-      policy_version=str(row["policy_version"]),
-      policy_bundle_hash=str(row["policy_bundle_hash"]),
-      persistent_grant_scope=row["persistent_grant_scope"],
-      tenant_id=row["tenant_id"],
-      model_id=row["model_id"],
-      model_version=row["model_version"],
-      system_prompt_hash=row["system_prompt_hash"],
-      tool_schema_version=row["tool_schema_version"],
-      mcp_server_version=row["mcp_server_version"],
-    )
+    return _rows.row_to_request(row)
 
   @staticmethod
   def _row_to_grant(row: sqlite3.Row) -> PersistentGrant:
-    return PersistentGrant(
-      grant_id=str(row["grant_id"]),
-      user_id=str(row["user_id"]),
-      tool_name=str(row["tool_name"]),
-      scope_hint=str(row["scope_hint"]),
-      args_predicate=_json_loads(row["args_predicate"]),
-      granted_at=_dt_from_text(row["granted_at"]) or utc_now(),
-      expires_at=_dt_from_text(row["expires_at"]),
-      revoked_at=_dt_from_text(row["revoked_at"]),
-      granted_via_approval_id=str(row["granted_via_approval_id"]),
-      policy_id=str(row["policy_id"]),
-    )
+    return _rows.row_to_grant(row)
 
   @staticmethod
   def _row_to_delegation_grant(row: sqlite3.Row) -> DelegationGrant:
-    return DelegationGrant(
-      delegation_id=str(row["delegation_id"]),
-      delegator_user_id=str(row["delegator_user_id"]),
-      delegator_run_id=row["delegator_run_id"],
-      delegator_session_id=row["delegator_session_id"],
-      delegator_profile=str(row["delegator_profile"]),
-      delegator_channel=str(row["delegator_channel"]),
-      bound_excel_session_id=str(row["bound_excel_session_id"]),
-      bound_relay_request_id=str(row["bound_relay_request_id"]),
-      bound_workbook=row["bound_workbook"],
-      tool_class_ceiling=frozenset(_json_loads(row["tool_class_ceiling"]) or []),  # type: ignore[arg-type]
-      args_predicate=_json_loads(row["args_predicate"]),
-      window_seconds=int(row["window_seconds"]),
-      exclude_external_write_bypass=bool(row["exclude_external_write_bypass"]),
-      created_at=_dt_from_text(row["created_at"]) or utc_now(),
-      expires_at=_dt_from_text(row["expires_at"]),
-      revoked_at=_dt_from_text(row["revoked_at"]),
-      consumed_at=_dt_from_text(row["consumed_at"]),
-    )
+    return _rows.row_to_delegation_grant(row)
 
 
 async def expire_pending_loop(store: ApprovalRequestStore, *, interval_seconds: float = 30.0) -> None:

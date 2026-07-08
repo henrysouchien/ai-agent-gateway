@@ -18,6 +18,8 @@ from .runs_helpers import (
   _CONTROL_CHAT_TASK_PREFIX,
   _chat_run_from_session,
   _require_run_channel,
+  _session_matches_owner,
+  _session_owner_user_id,
   _session_has_cancel_event,
   _state_from_session,
 )
@@ -30,7 +32,7 @@ def _require_control_session(session: GatewaySession) -> None:
 def _require_chat_session_for_run(authenticated: GatewaySession, target: GatewaySession) -> None:
   if authenticated.kind == "chat" and authenticated.session_id == target.session_id:
     return
-  if authenticated.kind == "control" and authenticated.user_id == target.user_id:
+  if authenticated.kind == "control" and _session_matches_owner(target, _session_owner_user_id(authenticated)):
     _require_run_channel(target.channel, authenticated.channel)
     return
   raise HTTPException(status_code=401, detail="Chat session token or matching control session required for this run")
@@ -139,13 +141,13 @@ async def _record_chat_parent_message_event(
     "channel": session.channel or "web",
     "sender": {
       "session_id": control_run_id,
-      "user_id": session.user_id,
+      "user_id": _session_owner_user_id(session),
     },
     "sent_at": sent_at,
     "ts": sent_at,
   }
   session.event_history.append(event)
-  await _publish_control_event(app_state, session.user_id, control_run_id, event)
+  await _publish_control_event(app_state, _session_owner_user_id(session), control_run_id, event)
 
 
 async def _cancel_control_chat_background_tasks(
@@ -196,10 +198,10 @@ async def _finalize_control_chat_task(
   finally:
     session.control_chat_tasks.pop(task_key, None)
     if _session_has_cancel_event(session):
-      await _cleanup_run_buffer(app_state, session.user_id, session.session_id)
+      await _cleanup_run_buffer(app_state, _session_owner_user_id(session), session.session_id)
       return
     if state not in {"approval_pending", "running", "starting"}:
-      await _cleanup_run_buffer(app_state, session.user_id, session.session_id)
+      await _cleanup_run_buffer(app_state, _session_owner_user_id(session), session.session_id)
 
 
 async def _dispatch_control_chat_turn(
@@ -235,11 +237,11 @@ async def _dispatch_control_chat_turn(
 
   async def _on_event(event: dict[str, Any]) -> None:
     event_with_run = _event_for_run(event, control_run_id)
-    await _publish_control_event(app_state, session.user_id, control_run_id, event_with_run)
+    await _publish_control_event(app_state, _session_owner_user_id(session), control_run_id, event_with_run)
     if event_with_run.get("type") == "tool_approval_request":
       await _publish_control_event(
         app_state,
-        session.user_id,
+        _session_owner_user_id(session),
         control_run_id,
         _run_state_event(control_run_id, "approval_pending"),
       )
@@ -282,7 +284,7 @@ async def _dispatch_control_chat_turn(
     result = await dispatch_task
     state = str(getattr(result, "state", "") or _state_from_session(session, session.event_history.snapshot()))
     if state not in {"approval_pending", "running", "starting"}:
-      await _cleanup_run_buffer(app_state, session.user_id, control_run_id)
+      await _cleanup_run_buffer(app_state, _session_owner_user_id(session), control_run_id)
     return _chat_run_from_session(session)
 
   if pending_task in done:

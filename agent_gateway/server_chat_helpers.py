@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 import inspect
-import json as json_mod
 import logging
-import os
 import time
 import uuid
 from pathlib import Path
@@ -16,17 +13,23 @@ from fastapi import FastAPI, HTTPException
 from ._provider_utils import _get_allowed_models_for_provider_name
 from .agent_session_log import _atomic_write_sidecar
 from .approval_audit import ApprovalAuditEmitter
+from .approval_notifications import (
+  build_env_approval_notification_destination_resolver,
+  build_env_telegram_approval_notification_sender,
+)
 from .approval_resolver import resolve_policy
 from .approval_store import SQLiteApprovalStore
 from .audit_resolver import resolve_audit_writer
 from .auth import CredentialRefreshRequest, CredentialsResolver, ProviderCredentialFailure
 from .event_adapter import adapt_event
 from .event_log import EventLog
-from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, event_to_dict
+from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 from .product_config import gateway_product_id
 from .providers import StreamEvent
 from .session import GatewaySession, SessionStore, SessionStream, StreamSubscriber
-from .session_recap import compute_recap, compute_recap_from_events, emit_recap_then_terminal
+from .session_recap import emit_recap_then_terminal
+from . import server_chat_stream_core as _chat_stream_core
+from . import server_chat_transcripts as _chat_transcripts
 from .tool_dispatcher import ApprovalDecision, ApprovalRequest
 from .tool_redaction import get_audit_hmac_secret, redact_tool_input as default_redact_tool_input
 from .server_artifact_helpers import _json_dumps, _model_to_dict
@@ -39,7 +42,6 @@ from .server_models import (
   GatewayServerConfig,
   RequestApproval,
   _ACTIVE_TURN_GRACE_SECONDS,
-  _SIDECAR_SLUG_RE,
   _STREAM_SUBSCRIBER_DONE,
   _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS,
   _STREAM_SUBSCRIBER_QUEUE_MAX,
@@ -60,14 +62,11 @@ def _drain_result_queue(queue: Optional[asyncio.Queue]) -> None:
 
 
 def _now_iso() -> str:
-  return datetime.now(UTC).isoformat()
+  return _chat_transcripts._now_iso()
 
 
 def _sidecar_slug(value: str | None) -> str | None:
-  if value is None:
-    return None
-  slug = _SIDECAR_SLUG_RE.sub("-", str(value).strip().lower().replace("_", "-")).strip("-")[:64]
-  return slug or None
+  return _chat_transcripts._sidecar_slug(value)
 
 
 def _maybe_write_chat_log_meta(
@@ -77,27 +76,15 @@ def _maybe_write_chat_log_meta(
   user_id: str | None,
   channel: str | None,
 ) -> None:
-  meta_path = transcript_dir / f"{session_id}.meta.json"
-  if meta_path.exists():
-    try:
-      now = time.time()
-      os.utime(meta_path, (now, now))
-    except OSError:
-      pass
-    return
-  _atomic_write_sidecar(
-    meta_path,
-    {
-      "schema_version": 1,
-      "agent_session_id": session_id,
-      "agent_id": None,
-      "user_id": user_id,
-      "product_id": gateway_product_id() or None,
-      "file_kind": None,
-      "channel": _sidecar_slug(channel),
-      "profile": None,
-      "created_at": _now_iso(),
-    },
+  return _chat_transcripts._maybe_write_chat_log_meta(
+    transcript_dir,
+    session_id,
+    user_id=user_id,
+    channel=channel,
+    atomic_write_sidecar=_atomic_write_sidecar,
+    now_iso=_now_iso,
+    product_id_resolver=gateway_product_id,
+    sidecar_slug=_sidecar_slug,
   )
 
 
@@ -109,27 +96,15 @@ def _write_transcript(
   user_id: str | None = None,
   channel: str | None = None,
 ) -> None:
-  if transcript_dir is None:
-    return
-  try:
-    _maybe_write_chat_log_meta(transcript_dir, session_id, user_id=user_id, channel=channel)
-  except Exception:
-    log.warning("Chat log sidecar write failed for %s (telemetry-only)", session_id, exc_info=True)
-  payload = dict(entry)
-  payload["ts"] = time.time()
-  path = transcript_dir / f"{session_id}.jsonl"
-  try:
-    with open(path, "a", encoding="utf-8") as handle:
-      handle.write(json_mod.dumps(payload, default=str) + "\n")
-  except Exception:
-    pass
-  try:
-    meta_path = transcript_dir / f"{session_id}.meta.json"
-    if meta_path.exists():
-      transcript_mtime = path.stat().st_mtime
-      os.utime(meta_path, (transcript_mtime, transcript_mtime))
-  except OSError:
-    pass
+  return _chat_transcripts._write_transcript(
+    transcript_dir,
+    session_id,
+    entry,
+    user_id=user_id,
+    channel=channel,
+    write_chat_log_meta=_maybe_write_chat_log_meta,
+    warn=log.warning,
+  )
 
 
 def _cleanup_old_transcripts(
@@ -138,34 +113,7 @@ def _cleanup_old_transcripts(
   *,
   now: float | None = None,
 ) -> int:
-  if transcript_dir is None or retention_days <= 0 or not transcript_dir.exists():
-    return 0
-
-  cutoff = (time.time() if now is None else now) - (retention_days * 86400)
-  removed = 0
-  transcript_freshness: dict[str, float] = {}
-  for transcript in transcript_dir.glob("*.jsonl"):
-    try:
-      transcript_freshness[transcript.name.removesuffix(".jsonl")] = transcript.stat().st_mtime
-    except OSError:
-      continue
-
-  for path in transcript_dir.iterdir():
-    if not path.is_file():
-      continue
-    if path.suffix != ".jsonl" and not path.name.endswith(".meta.json"):
-      continue
-    try:
-      effective_mtime = path.stat().st_mtime
-      if path.name.endswith(".meta.json"):
-        session_key = path.name.removesuffix(".meta.json")
-        effective_mtime = max(effective_mtime, transcript_freshness.get(session_key, 0.0))
-      if effective_mtime <= cutoff:
-        path.unlink()
-        removed += 1
-    except OSError:
-      continue
-  return removed
+  return _chat_transcripts._cleanup_old_transcripts(transcript_dir, retention_days, now=now)
 
 
 def _compute_session_recap_payload(
@@ -174,45 +122,14 @@ def _compute_session_recap_payload(
   *,
   trigger: str,
 ) -> Dict[str, Any]:
-  recap = compute_recap(
-    active_turn.event_log,
-    session_id=session.session_id,
-    started_at=float(session.created_at),
-    trigger=trigger,  # type: ignore[arg-type]
-    usage=getattr(session, "cached_usage", None),
-  )
-  return event_to_dict(recap)
+  return _chat_transcripts._compute_session_recap_payload(session, active_turn, trigger=trigger)
 
 
 def _read_session_transcript_events(
   transcript_dir: Optional[Path],
   session_id: str,
 ) -> list[Dict[str, Any]]:
-  if transcript_dir is None:
-    return []
-  path = transcript_dir / f"{session_id}.jsonl"
-  if not path.exists():
-    return []
-
-  events: list[Dict[str, Any]] = []
-  try:
-    lines = path.read_text(encoding="utf-8").splitlines()
-  except OSError:
-    return []
-
-  for line in lines:
-    if not line.strip():
-      continue
-    try:
-      payload = json_mod.loads(line)
-    except json_mod.JSONDecodeError:
-      continue
-    if not isinstance(payload, dict):
-      continue
-    if payload.get("type") == "session_recap":
-      continue
-    events.append(dict(payload))
-  return events
+  return _chat_transcripts._read_session_transcript_events(transcript_dir, session_id)
 
 
 def _compute_cumulative_session_recap_payload(
@@ -222,25 +139,13 @@ def _compute_cumulative_session_recap_payload(
   *,
   trigger: str,
 ) -> Dict[str, Any]:
-  events = _read_session_transcript_events(transcript_dir, session.session_id)
-  if active_turn is not None:
-    written_seqs = active_turn.transcript_written_seqs if transcript_dir is not None else set()
-    for entry in active_turn.event_log.entries:
-      if entry.seq in written_seqs:
-        continue
-      event = _event_for_wire(entry, active_turn.event_log)
-      if event.get("type") == "session_recap":
-        continue
-      events.append(event)
-
-  recap = compute_recap_from_events(
-    events,
-    session_id=session.session_id,
-    started_at=float(session.created_at),
-    trigger=trigger,  # type: ignore[arg-type]
-    usage=getattr(session, "cached_usage", None),
+  return _chat_transcripts._compute_cumulative_session_recap_payload(
+    session,
+    active_turn,
+    transcript_dir,
+    trigger=trigger,
+    event_for_wire=_event_for_wire,
   )
-  return event_to_dict(recap)
 
 
 def _redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
@@ -327,38 +232,25 @@ async def _cleanup_active_turn_on_expiry(session: GatewaySession) -> None:
 
 
 def _event_for_wire(entry: Any, event_log: EventLog) -> Dict[str, Any]:
-  event = dict(entry.event)
-  pid = gateway_product_id()
-  if pid is not None:
-    event["product_id"] = pid
-  if event.get("type") in {"tool_call_start", "tool_call_complete"}:
-    tool_name = event.get("tool_name")
-    execution_location_resolver = getattr(event_log, "_gateway_execution_location", None)
-    if isinstance(tool_name, str) and execution_location_resolver is not None:
-      execution_location = execution_location_resolver(tool_name)
-      if execution_location is not None:
-        event["execution_location"] = execution_location
-  return event
+  return _chat_stream_core.event_for_wire(entry, event_log, product_id_resolver=gateway_product_id)
 
 
 def _resolve_schema_version(schema_version: int | None) -> int:
-  resolved = DEFAULT_SCHEMA_VERSION if schema_version is None else int(schema_version)
-  if resolved not in SUPPORTED_SCHEMA_VERSIONS:
-    supported = ", ".join(str(version) for version in sorted(SUPPORTED_SCHEMA_VERSIONS))
-    raise HTTPException(
-      status_code=400,
-      detail=f"Unsupported schema_version {resolved}; supported: [{supported}]",
-    )
-  return resolved
+  return _chat_stream_core.resolve_schema_version(
+    schema_version,
+    default_schema_version=DEFAULT_SCHEMA_VERSION,
+    supported_schema_versions=SUPPORTED_SCHEMA_VERSIONS,
+    http_exception_cls=HTTPException,
+  )
 
 
 def _stream_envelope(*, entry: Any, session_id: str, schema_version: int, event: Dict[str, Any]) -> Dict[str, Any]:
-  return {
-    "seq": entry.seq,
-    "session_id": session_id,
-    "schema_version": schema_version,
-    "event": event,
-  }
+  return _chat_stream_core.stream_envelope(
+    entry=entry,
+    session_id=session_id,
+    schema_version=schema_version,
+    event=event,
+  )
 
 
 def _disconnect_stream_subscriber_for_backpressure(
@@ -366,16 +258,10 @@ def _disconnect_stream_subscriber_for_backpressure(
   *,
   done_marker: object = _STREAM_SUBSCRIBER_DONE,
 ) -> None:
-  subscriber.disconnect_reason = "backpressure"
-  while True:
-    try:
-      subscriber.queue.get_nowait()
-    except asyncio.QueueEmpty:
-      break
-  try:
-    subscriber.queue.put_nowait(done_marker)
-  except asyncio.QueueFull:
-    pass
+  return _chat_stream_core.disconnect_stream_subscriber_for_backpressure(
+    subscriber,
+    done_marker=done_marker,
+  )
 
 
 async def _pump_stream_subscriber(
@@ -386,20 +272,13 @@ async def _pump_stream_subscriber(
   done_marker: object = _STREAM_SUBSCRIBER_DONE,
   disconnect_stream_subscriber_for_backpressure: Callable[[StreamSubscriber], None] = _disconnect_stream_subscriber_for_backpressure,
 ) -> None:
-  try:
-    async for entry in active_turn.event_log.iter_from(after_seq):
-      try:
-        subscriber.queue.put_nowait(entry)
-      except asyncio.QueueFull:
-        disconnect_stream_subscriber_for_backpressure(subscriber)
-        return
-  except asyncio.CancelledError:
-    raise
-  else:
-    try:
-      subscriber.queue.put_nowait(done_marker)
-    except asyncio.QueueFull:
-      disconnect_stream_subscriber_for_backpressure(subscriber)
+  await _chat_stream_core.pump_stream_subscriber(
+    active_turn,
+    subscriber,
+    after_seq,
+    done_marker=done_marker,
+    disconnect_stream_subscriber_for_backpressure=disconnect_stream_subscriber_for_backpressure,
+  )
 
 
 def _register_stream_subscriber(
@@ -410,27 +289,26 @@ def _register_stream_subscriber(
   queue_max: int = _STREAM_SUBSCRIBER_QUEUE_MAX,
   pump_stream_subscriber: Callable[[SessionStream, StreamSubscriber, int], asyncio.Task | Any] | None = None,
 ) -> StreamSubscriber:
-  subscriber = StreamSubscriber(
-    subscriber_id=f"sub:{uuid.uuid4().hex}",
-    connected_at=time.time(),
-    last_sent_seq=max(int(after_seq), 0),
-    queue=asyncio.Queue(maxsize=queue_max),
+  return _chat_stream_core.register_stream_subscriber(
+    active_turn,
+    after_seq=after_seq,
     client_label=client_label,
+    queue_max=queue_max,
+    queue_factory=asyncio.Queue,
+    task_factory=asyncio.create_task,
+    uuid_hex_factory=lambda: uuid.uuid4().hex,
+    time_fn=time.time,
+    default_pump_stream_subscriber=_pump_stream_subscriber,
+    pump_stream_subscriber=pump_stream_subscriber,
   )
-  active_turn.subscribers[subscriber.subscriber_id] = subscriber
-  pump = _pump_stream_subscriber if pump_stream_subscriber is None else pump_stream_subscriber
-  subscriber.pump_task = asyncio.create_task(pump(active_turn, subscriber, subscriber.last_sent_seq))
-  return subscriber
 
 
 async def _cleanup_stream_subscriber(active_turn: SessionStream, subscriber_id: str) -> None:
-  subscriber = active_turn.subscribers.pop(subscriber_id, None)
-  if subscriber is None:
-    return
-  pump_task = subscriber.pump_task
-  if pump_task is not None and not pump_task.done():
-    pump_task.cancel()
-    await asyncio.gather(pump_task, return_exceptions=True)
+  await _chat_stream_core.cleanup_stream_subscriber(
+    active_turn,
+    subscriber_id,
+    gather_fn=asyncio.gather,
+  )
 
 
 async def _stream_subscriber_sse(
@@ -446,83 +324,33 @@ async def _stream_subscriber_sse(
   done_marker: object = _STREAM_SUBSCRIBER_DONE,
   cleanup_stream_subscriber: Callable[[SessionStream, str], Any] = _cleanup_stream_subscriber,
 ) -> AsyncIterator[bytes]:
-  event_log = active_turn.event_log
+  inner_stream = _chat_stream_core.stream_subscriber_sse(
+    session=session,
+    active_turn=active_turn,
+    subscriber=subscriber,
+    transcript_dir=transcript_dir,
+    channel=channel,
+    write_transcript=write_transcript,
+    log=log,
+    keepalive_seconds=keepalive_seconds,
+    done_marker=done_marker,
+    cleanup_stream_subscriber=cleanup_stream_subscriber,
+    wait_for_fn=asyncio.wait_for,
+    timeout_error=asyncio.TimeoutError,
+    event_for_wire_fn=_event_for_wire,
+    write_transcript_fn=_write_transcript,
+    adapt_event_fn=adapt_event,
+    stream_envelope_fn=_stream_envelope,
+    json_dumps_fn=_json_dumps,
+    default_schema_version=DEFAULT_SCHEMA_VERSION,
+  )
   try:
-    while True:
-      try:
-        item = await asyncio.wait_for(
-          subscriber.queue.get(),
-          timeout=keepalive_seconds,
-        )
-      except asyncio.TimeoutError:
-        pump_task = subscriber.pump_task
-        if pump_task is not None and pump_task.done() and subscriber.disconnect_reason:
-          return
-        yield b":keepalive\n\n"
-        continue
-
-      if item is done_marker:
-        return
-
-      entry = item
-      subscriber.last_sent_seq = int(entry.seq)
-      event = _event_for_wire(entry, event_log)
-      entry_seq = int(entry.seq)
-      if write_transcript and entry_seq not in active_turn.transcript_written_seqs:
-        active_turn.transcript_written_seqs.add(entry_seq)
-        _write_transcript(
-          transcript_dir=transcript_dir,
-          session_id=session.session_id,
-          entry=event,
-          user_id=session.user_id,
-          channel=channel,
-        )
-
-      try:
-        adapted_event = adapt_event(event, session.schema_version)
-      except ValueError as adapter_exc:
-        log.error(
-          "SSE adapter failed for session=%s schema_version=%s event_type=%s: %s",
-          session.session_id,
-          session.schema_version,
-          event.get("type"),
-          adapter_exc,
-          exc_info=True,
-        )
-        error_event = {"type": "stream_error", "error": str(adapter_exc)}
-        adapted_event = adapt_event(error_event, DEFAULT_SCHEMA_VERSION)
-      if adapted_event is None:
-        continue
-
-      envelope = _stream_envelope(
-        entry=entry,
-        session_id=session.session_id,
-        schema_version=session.schema_version,
-        event=adapted_event,
-      )
-      try:
-        yield f"data: {_json_dumps(envelope)}\n\n".encode("utf-8")
-      except Exception as ser_exc:
-        log.error(
-          "SSE serialization failed for event type=%s: %s",
-          event.get("type"),
-          ser_exc,
-          exc_info=True,
-        )
-        try:
-          error_event = {"type": "stream_error", "error": f"SSE serialization failed: {ser_exc}"}
-          error_envelope = {
-            "seq": subscriber.last_sent_seq,
-            "session_id": session.session_id,
-            "schema_version": session.schema_version,
-            "event": adapt_event(error_event, session.schema_version) or error_event,
-          }
-          yield f"data: {_json_dumps(error_envelope)}\n\n".encode("utf-8")
-        except Exception:
-          pass
-        return
+    async for chunk in inner_stream:
+      yield chunk
   finally:
-    await cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
+    aclose = getattr(inner_stream, "aclose", None)
+    if aclose is not None:
+      await aclose()
 
 
 def _legacy_request_approval(session: GatewaySession, event_log: EventLog) -> RequestApproval:
@@ -636,23 +464,17 @@ async def _dispatch_chat_turn(
   if session.stream_active:
     raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
 
-  session.stream_active = True
-  sid = session.session_id
-  active_turn = SessionStream(
-    event_log=event_log,
-    runner_task=asyncio.current_task(),
-  )
-  session.active_turn = active_turn
   request_id = inputs.request_id.strip() if isinstance(inputs.request_id, str) else inputs.request_id
   request_id = request_id or str(uuid.uuid4())
   context = dict(inputs.context or {})
   context["profile"] = _resolve_chat_profile_name(context)
+  request_metadata = dict(inputs.metadata or {})
   request = ChatRequest(
     messages=list(inputs.messages),
     user_id=session.user_id,
     request_id=request_id,
     context=context,
-    metadata=dict(inputs.metadata or {}),
+    metadata=request_metadata,
     model=inputs.model,
   )
 
@@ -663,7 +485,23 @@ async def _dispatch_chat_turn(
   resolver_timeout_seconds = float(getattr(build_chat_runtime, "_gateway_resolver_timeout_seconds", 5.0))
   config_auth_config = getattr(build_chat_runtime, "_gateway_auth_config", {})
   allowed_models = getattr(build_chat_runtime, "_gateway_allowed_models", None)
+  channel_profile_allowlist = getattr(build_chat_runtime, "_gateway_channel_profile_allowlist", None)
   auth_manager = getattr(build_chat_runtime, "_gateway_auth_manager", None)
+  if channel_profile_allowlist is not None and session.channel is not None:
+    allowed_profiles = channel_profile_allowlist.get(session.channel)
+    if allowed_profiles is not None and context["profile"] not in set(allowed_profiles):
+      raise HTTPException(
+        status_code=403,
+        detail=f"Profile '{context['profile']}' is not permitted on channel '{session.channel}'",
+      )
+
+  session.stream_active = True
+  sid = session.session_id
+  active_turn = SessionStream(
+    event_log=event_log,
+    runner_task=asyncio.current_task(),
+  )
+  session.active_turn = active_turn
 
   previous_on_event = getattr(event_log, "_on_event", None)
   previous_session_id = getattr(event_log, "_session_id", "")
@@ -797,6 +635,8 @@ async def _dispatch_chat_turn(
       session.initial_message = str(last_user)
     log.info("Chat request | session=%s | msgs=%d | user=%s", sid, len(messages), last_user[:200])
     event = {"type": "chat_request", "messages": messages, "context": context}
+    if request_metadata:
+      event["metadata"] = request_metadata
     pid = gateway_product_id()
     if pid is not None:
       event["product_id"] = pid
@@ -913,7 +753,11 @@ def _init_approval_subsystem(app: FastAPI, config: GatewayServerConfig) -> None:
     key_id=config.audit_hmac_key_id_resolver(),
     tool_input_redactor=config.tool_input_redactor,
   )
-  store = SQLiteApprovalStore(audit_emitter=audit_emitter)
+  store = SQLiteApprovalStore(
+    audit_emitter=audit_emitter,
+    notification_destination_resolver=build_env_approval_notification_destination_resolver(),
+    notification_sender=build_env_telegram_approval_notification_sender(),
+  )
   policy = resolve_policy(store=store)
   app.state.gateway_approval_audit_writer = audit_writer
   app.state.gateway_approval_audit_emitter = audit_emitter

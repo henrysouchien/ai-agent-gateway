@@ -6,7 +6,7 @@ import threading
 import time
 from typing import Any
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 from agent_gateway.event_log import EventLog
@@ -98,9 +98,15 @@ class _StreamingHangingTurnRunner(_HangingTurnRunner):
       raise
 
 
-def _make_app():
+def _make_app(
+  captured_contexts: list[dict[str, Any]] | None = None,
+  *,
+  dispatch_scope_validator: Any | None = None,
+):
   async def _build_chat_runtime(*, session, request, channel, auth_manager):
     _ = session, request, channel, auth_manager
+    if captured_contexts is not None:
+      captured_contexts.append(dict(request.context))
     return ChatRuntime(
       system_prompt="system",
       build_runner=lambda event_log, _sid: _EchoTurnRunner(event_log),
@@ -113,6 +119,7 @@ def _make_app():
       auth_config={"model": "test-model"},
       allowed_models=set(),
       build_chat_runtime=_build_chat_runtime,
+      dispatch_scope_validator=dispatch_scope_validator,
     )
   )
 
@@ -395,6 +402,190 @@ def test_list_runs_returns_user_chat_sessions_and_excludes_control_sessions() ->
     assert empty_message.status_code == 404
 
 
+def test_chat_dispatch_persists_redacted_dispatch_scope() -> None:
+  captured_contexts: list[dict[str, Any]] = []
+  app = _make_app(captured_contexts)
+  dispatch_scope = {
+    "kind": "portfolio",
+    "source": "active_default",
+    "portfolio_name": "core",
+    "portfolio_id": None,
+    "display_name": "Core Portfolio",
+  }
+
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    start = client.post(
+      "/api/control/runs",
+      headers=_headers(control),
+      json={
+        "kind": "chat",
+        "message": "Start portfolio chat.",
+        "channel": "tui",
+        "context": {"purpose": "risk-review"},
+        "dispatch_scope": dispatch_scope,
+      },
+    )
+
+    assert start.status_code == 200, start.text
+    start_payload = start.json()
+    assert start_payload["run"]["dispatch_scope"] == dispatch_scope
+    chat_session_id = start_payload["chat_session_id"]
+    session = app.state.auth.session_store.get_session(chat_session_id)
+    assert session is not None
+    assert session.dispatch_scope == dispatch_scope
+
+    detail = client.get(f"/api/control/runs/{chat_session_id}", headers=_headers(control))
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["dispatch_scope"] == dispatch_scope
+    listed = client.get("/api/control/runs?kind=chat", headers=_headers(control))
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["runs"][0]["dispatch_scope"] == dispatch_scope
+
+    follow_up = client.post(
+      f"/api/control/runs/{chat_session_id}/messages",
+      headers=_headers(control),
+      json={
+        "messages": [{"role": "user", "content": "Continue portfolio chat."}],
+        "context": {"purpose": "follow-up"},
+      },
+    )
+    assert follow_up.status_code == 200, follow_up.text
+    assert follow_up.json()["run"]["dispatch_scope"] == dispatch_scope
+    assert captured_contexts[-1]["purpose"] == "follow-up"
+    assert captured_contexts[-1]["channel"] == "tui"
+    assert captured_contexts[-1]["portfolio_name"] == "core"
+    assert captured_contexts[-1]["dispatch_scope"] == dispatch_scope
+
+
+def test_chat_dispatch_rejects_unknown_dispatch_scope_before_runtime() -> None:
+  captured_contexts: list[dict[str, Any]] = []
+
+  async def validator(_session, scope: dict[str, Any]) -> dict[str, Any]:
+    assert scope["portfolio_name"] == "unknown"
+    raise HTTPException(
+      status_code=422,
+      detail={
+        "error": "dispatch_scope_portfolio_not_visible",
+        "field": "dispatch_scope.portfolio_name",
+      },
+    )
+
+  app = _make_app(captured_contexts, dispatch_scope_validator=validator)
+
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    response = client.post(
+      "/api/control/runs",
+      headers=_headers(control),
+      json={
+        "kind": "chat",
+        "message": "Start portfolio chat.",
+        "channel": "tui",
+        "dispatch_scope": {
+          "kind": "portfolio",
+          "source": "user_selected",
+          "portfolio_name": "unknown",
+        },
+      },
+    )
+
+  assert response.status_code == 422, response.text
+  assert response.json()["detail"]["error"] == "dispatch_scope_portfolio_not_visible"
+  assert captured_contexts == []
+
+
+def test_chat_dispatch_uses_canonicalized_dispatch_scope() -> None:
+  captured_contexts: list[dict[str, Any]] = []
+
+  def validator(_session, scope: dict[str, Any]) -> dict[str, Any]:
+    return {
+      **scope,
+      "portfolio_id": "portfolio-1",
+      "display_name": "Canonical Portfolio",
+    }
+
+  app = _make_app(captured_contexts, dispatch_scope_validator=validator)
+
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    response = client.post(
+      "/api/control/runs",
+      headers=_headers(control),
+      json={
+        "kind": "chat",
+        "message": "Start portfolio chat.",
+        "channel": "tui",
+        "dispatch_scope": {
+          "kind": "portfolio",
+          "source": "user_selected",
+          "portfolio_name": "taxable_combined",
+          "display_name": "Client Portfolio",
+        },
+      },
+    )
+
+  assert response.status_code == 200, response.text
+  canonical_scope = {
+    "kind": "portfolio",
+    "source": "user_selected",
+    "portfolio_name": "taxable_combined",
+    "portfolio_id": "portfolio-1",
+    "display_name": "Canonical Portfolio",
+  }
+  assert response.json()["run"]["dispatch_scope"] == canonical_scope
+  assert captured_contexts[-1]["dispatch_scope"] == canonical_scope
+  assert captured_contexts[-1]["portfolio_name"] == "taxable_combined"
+
+
+def test_chat_dispatch_rejects_context_authority_fields() -> None:
+  app = _make_app()
+
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    response = client.post(
+      "/api/control/runs",
+      headers=_headers(control),
+      json={
+        "kind": "chat",
+        "message": "Start portfolio chat.",
+        "channel": "tui",
+        "context": {"nested": {"portfolioName": "spoofed"}},
+      },
+    )
+
+  assert response.status_code == 422, response.text
+
+
+def test_chat_continuation_rejects_context_authority_fields() -> None:
+  app = _make_app()
+
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    start = client.post(
+      "/api/control/runs",
+      headers=_headers(control),
+      json={
+        "kind": "chat",
+        "message": "Start chat.",
+        "channel": "tui",
+      },
+    )
+    assert start.status_code == 200, start.text
+    chat_session_id = start.json()["chat_session_id"]
+
+    response = client.post(
+      f"/api/control/runs/{chat_session_id}/messages",
+      headers=_headers(control),
+      json={
+        "messages": [{"role": "user", "content": "Continue."}],
+        "context": {"dispatchScope": {"portfolio_name": "spoofed"}},
+      },
+    )
+
+  assert response.status_code == 422, response.text
+
+
 def test_get_run_returns_chat_run_shape_and_404s_unknown_or_cross_user() -> None:
   app = _make_app()
   with TestClient(app) as client:
@@ -431,6 +622,13 @@ def test_get_run_returns_chat_run_shape_and_404s_unknown_or_cross_user() -> None
       "agent": "hank",
       "channel": "tui",
       "user_id": "alice",
+      "owner_user_id": "alice",
+      "raw_user_id": "alice",
+      "user_slug": "alice",
+      "risk_user_id": None,
+      "user_email": None,
+      "user_aliases": ["alice"],
+      "identity_status": "legacy_user_id_fallback",
       "state": "starting",
       "started_at": payload["started_at"],
       "ended_at": None,
@@ -444,6 +642,7 @@ def test_get_run_returns_chat_run_shape_and_404s_unknown_or_cross_user() -> None
         "skill_run_id": "skill-1",
       },
       "pending_approval": None,
+      "dispatch_scope": None,
     }
 
     unknown = client.get("/api/control/runs/not-a-run", headers=_headers(alice_control))

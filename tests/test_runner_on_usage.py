@@ -639,7 +639,7 @@ def test_runner_tool_timing_forwards_tool_call_and_request_ids() -> None:
 
   runner._call_on_tool_timing(
     tool_name="documents_search",
-    server="portfolio-mcp",
+    server="portfolio-reads-mcp",
     duration_ms=12,
     is_error=False,
     result_bytes=34,
@@ -651,7 +651,7 @@ def test_runner_tool_timing_forwards_tool_call_and_request_ids() -> None:
     {
       "session_id": "sess-parent",
       "tool_name": "documents_search",
-      "server": "portfolio-mcp",
+      "server": "portfolio-reads-mcp",
       "duration_ms": 12,
       "is_error": False,
       "result_bytes": 34,

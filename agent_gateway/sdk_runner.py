@@ -6,7 +6,6 @@ import os
 import time
 import uuid
 from dataclasses import replace
-from datetime import timedelta
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Sequence
 
 from .approval_policy import (
@@ -35,8 +34,10 @@ from .runner import (
   _detect_user_id_param,
 )
 from .runner_introspection import detect_keyword_param as _detect_keyword_param
+from .runner_skill_gate import is_report_door_clear_event as _is_report_door_clear_event
 from .session_recap import emit_recap_then_terminal
 from .skill_context import clear_current_skill, current_skill
+from . import sdk_runner_approval as _sdk_runner_approval
 from . import sdk_runner_context as _sdk_runner_context
 from . import sdk_runner_helpers as _sdk_runner_helpers
 from .sdk_runner_stream import ToolCallInfo, _ActiveToolUse, _SDKRunnerStreamMixin
@@ -71,7 +72,10 @@ _ActiveToolUse.__module__ = __name__
 
 
 def _approval_queue_timeout_seconds(expiry_seconds: float | int | None) -> float:
-  return min(float(expiry_seconds or 600), approval_settings.approval_wait_seconds())
+  return _sdk_runner_approval.approval_queue_timeout_seconds(
+    expiry_seconds,
+    approval_wait_seconds_fn=approval_settings.approval_wait_seconds,
+  )
 
 
 class _PromptMessages:
@@ -333,15 +337,16 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
       return False
     normalized_tool_name = str(tool_name or "").strip()
     expected_skill = self._active_skill_report_doors.get(normalized_tool_name)
-    if not expected_skill:
-      return False
-    if not (
-      isinstance(result, dict)
-      and "subcommand" in result
-      and str(result.get("mutation_mode") or "").strip() == "preview"
+    if not _is_report_door_clear_event(
+      {
+        "type": "tool_call_complete",
+        "tool_name": normalized_tool_name,
+        "result": result,
+        "error": None,
+      },
+      expected_skill=expected_skill,
+      success_statuses=_REPORT_DOOR_CLEAR_SUCCESS_STATUSES,
     ):
-      return False
-    if str(result.get("status") or "").strip().lower() not in _REPORT_DOOR_CLEAR_SUCCESS_STATUSES:
       return False
     if current_skill() != expected_skill:
       return False
@@ -429,42 +434,38 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     return hooks
 
   def _approval_lifecycle_configured(self) -> bool:
-    return self._approval_store is not None and self._approval_policy is not None and self._session is not None
+    return _sdk_runner_approval.approval_lifecycle_configured(
+      store=self._approval_store,
+      policy=self._approval_policy,
+      session=self._session,
+    )
 
   def _resolve_run_context(self) -> RunContext:
-    if self._run_context is not None:
-      return self._run_context
-    return RunContext(
-      user_id=str(self._usage_user_id or getattr(self._session, "user_id", "") or "unknown"),
+    return _sdk_runner_approval.resolve_run_context(
+      run_context=self._run_context,
+      usage_user_id=self._usage_user_id,
+      session=self._session,
+      approval_policy=self._approval_policy,
       request_id=self._request_id,
       session_id=self._session_id,
-      profile="chat",
-      channel=str(self._channel or getattr(self._session, "channel", None) or "web"),
-      decider_role=str(getattr(self._session, "role", "owner") or "owner"),
-      policy_bundle_hash=str(getattr(self._approval_policy, "policy_bundle_hash", "unknown")),
-      model_id=self._effective_model,
+      channel=self._channel,
+      effective_model=self._effective_model,
     )
 
   def _resolve_tool_class(self, tool_name: str) -> str:
-    policy_tool = _policy_tool_name(tool_name)
-    return resolve_server_policy_tool_class(
+    return _sdk_runner_approval.resolve_tool_class(
       tool_name,
-      policy_tool_name=policy_tool,
-      runtime_server=_server_for_tool(tool_name),
+      policy_tool_name_fn=_policy_tool_name,
+      server_for_tool_fn=_server_for_tool,
+      resolve_server_policy_tool_class_fn=resolve_server_policy_tool_class,
     )
 
   def _redact_for_approval_request(self, tool_name: str, tool_input: Dict[str, Any]) -> tuple[dict[str, Any], str]:
-    try:
-      from agent.shared.tool_redaction import get_audit_hmac_secret, get_audit_hmac_key_id, hmac_value, redact_tool_input
-
-      secret = get_audit_hmac_secret()
-      key_id = get_audit_hmac_key_id()
-      return (
-        redact_tool_input(tool_name, tool_input, deployment_secret=secret, key_id=key_id),
-        hmac_value(tool_input, deployment_secret=secret, key_id=key_id),
-      )
-    except Exception:
-      return {}, sha256_args(tool_input)
+    return _sdk_runner_approval.redact_for_approval_request(
+      tool_name,
+      tool_input,
+      sha256_args_fn=sha256_args,
+    )
 
   async def _await_user_approval_via_pending_tools(
     self,
@@ -473,153 +474,40 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     *,
     nonce: str,
   ) -> dict[str, Any] | None:
-    session = self._session
-    if session is None:
-      return None
-    approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
-    session.pending_tools[request.tool_call_id] = {
-      "approval_id": request.approval_id,
-      "nonce": nonce,
-      "requested_at": int(time.time()),
-      "status": "approval_pending",
-      "tool_name": request.tool_name,
-      "resolved_qualifier": "",
-    }
-    session.approval_queues[request.tool_call_id] = approval_queue
-    approval_event = {
-      "type": "tool_approval_request",
-      "tool_call_id": request.tool_call_id,
-      "approval_id": request.approval_id,
-      "nonce": nonce,
-      "tool_name": request.tool_name,
-      "tool_input": request.tool_args_redacted,
-      "resolved_qualifier": "",
-      "reason": decision.reason,
-      "allow_persistent_approval": decision.allow_persistent_grant,
-      "ts": time.time(),
-    }
-    self._append(approval_event)
-    session_log = getattr(session, "agent_session_log", None)
-    if session_log is not None:
-      try:
-        await session_log.append(approval_event)
-      except Exception:
-        log.warning("Failed to persist approval request event for %s", request.tool_call_id, exc_info=True)
-    try:
-      return await asyncio.wait_for(
-        approval_queue.get(),
-        timeout=max(0.1, _approval_queue_timeout_seconds(decision.expiry_seconds)),
-      )
-    except asyncio.TimeoutError:
-      store = self._approval_store
-      if store is not None:
-        try:
-          latest = await store.get(request.approval_id)
-          if latest is not None and latest.state == "pending_user":
-            await store.transition_state(
-              latest.approval_id,
-              "expired",
-              expected_state_version=latest.state_version,
-              decision_reason="Timed out waiting for user approval",
-            )
-        except Exception:
-          log.warning("Failed to expire timed-out approval request %s", request.approval_id, exc_info=True)
-      return None
-    finally:
-      session.pending_tools.pop(request.tool_call_id, None)
-      session.approval_queues.pop(request.tool_call_id, None)
+    return await _sdk_runner_approval.await_user_approval_via_pending_tools(
+      session=self._session,
+      approval_store=self._approval_store,
+      request=request,
+      decision=decision,
+      nonce=nonce,
+      append_event_fn=self._append,
+      timeout_seconds=_approval_queue_timeout_seconds(decision.expiry_seconds),
+      log=log,
+      time_fn=time.time,
+    )
 
   async def _can_use_tool_callback(self, tool_name: str, input_data: dict[str, Any], _context: Any) -> Any:
-    import claude_agent_sdk
-
-    allow_cls = getattr(claude_agent_sdk, "PermissionResultAllow")
-    deny_cls = getattr(claude_agent_sdk, "PermissionResultDeny")
-    if tool_name in self._effective_disallowed_tools():
-      return deny_cls(message=f"Tool '{tool_name}' is not available in this context")
-    mismatch = _policy_owner_mismatch(tool_name)
-    if mismatch is not None:
-      runtime_server, policy_tool, policy_server = mismatch
-      return deny_cls(
-        message=(
-          f"Tool '{tool_name}' is not available from MCP server "
-          f"'{runtime_server}'; policy owner for '{policy_tool}' is '{policy_server}'"
-        )
-      )
-    if not self._approval_lifecycle_configured():
-      return allow_cls()
-    store = self._approval_store
-    policy = self._approval_policy
-    assert store is not None and policy is not None
-    run_context = self._resolve_run_context()
-    active_skill = current_skill()
-    if active_skill and run_context.skill is None:
-      run_context = replace(run_context, skill=active_skill)
-    policy_tool = _policy_tool_name(tool_name)
-    redacted, args_hash = self._redact_for_approval_request(tool_name, input_data)
-    redacted = enrich_trade_approval_args(policy_tool, redacted, event_log=self._log)
-    request = build_approval_request(
-      tool_call_id=f"sdk-{uuid.uuid4().hex}",
-      tool_name=policy_tool,
-      tool_class=self._resolve_tool_class(tool_name),
-      tool_args_redacted=redacted,
-      args_hash=args_hash,
-      run_context=run_context,
+    return await _sdk_runner_approval.can_use_tool_callback(
+      self,
+      tool_name,
+      input_data,
+      _context,
+      policy_owner_mismatch_fn=_policy_owner_mismatch,
+      policy_tool_name_fn=_policy_tool_name,
+      current_skill_fn=current_skill,
+      replace_fn=replace,
+      enrich_trade_approval_args_fn=enrich_trade_approval_args,
+      build_approval_request_fn=build_approval_request,
+      call_policy_safely_fn=call_policy_safely,
+      apply_decision_to_request_fn=apply_decision_to_request,
+      effective_trade_approval_expiry_seconds_fn=effective_trade_approval_expiry_seconds,
+      approval_wait_seconds_fn=approval_settings.approval_wait_seconds,
+      utc_now_fn=utc_now,
+      uuid_hex_fn=lambda: uuid.uuid4().hex,
+      os_urandom_fn=os.urandom,
+      relay_policy_denied_sub_code=RELAY_POLICY_DENIED_SUB_CODE,
+      relay_policy_denied_message=RELAY_POLICY_DENIED_MESSAGE,
     )
-    await store.create(request)
-    raw_args = dict(input_data)
-    try:
-      decision = await call_policy_safely(policy, request, raw_args, run_context)
-    finally:
-      raw_args.clear()
-      del raw_args
-    expiry_seconds = effective_trade_approval_expiry_seconds(
-      policy_tool,
-      request.tool_args_redacted,
-      requested_expiry_seconds=decision.expiry_seconds,
-      max_wait_seconds=approval_settings.approval_wait_seconds(),
-      now=utc_now(),
-    )
-    if expiry_seconds != decision.expiry_seconds:
-      decision = replace(decision, expiry_seconds=expiry_seconds)
-    request = apply_decision_to_request(request, decision)
-    await store.update_request(request)
-
-    if decision.outcome == "auto_approve":
-      request = await store.transition_state(request.approval_id, "auto_approved", expected_state_version=request.state_version)
-      await policy.on_resolve(request=request)
-      if decision.modified_tool_args is not None:
-        return allow_cls(updated_input=decision.modified_tool_args)
-      return allow_cls()
-    if decision.outcome == "auto_deny":
-      request = await store.transition_state(request.approval_id, "auto_denied", expected_state_version=request.state_version)
-      await policy.on_resolve(request=request)
-      return deny_cls(message=decision.reason)
-    if decision.outcome == "route_external":
-      await store.transition_state(
-        request.approval_id,
-        "routed_external",
-        route_target=decision.route_target,
-        route_target_type=decision.route_target_type,
-        expires_at=utc_now() + timedelta(seconds=decision.expiry_seconds or 600),
-        expected_state_version=request.state_version,
-      )
-      return deny_cls(message="external approval route is pending")
-
-    request = await store.transition_state(
-      request.approval_id,
-      "pending_user",
-      route_target_type="pending_tools",
-      expires_at=utc_now() + timedelta(seconds=decision.expiry_seconds or 600),
-      expected_state_version=request.state_version,
-    )
-    approval = await self._await_user_approval_via_pending_tools(request, decision, nonce=os.urandom(8).hex())
-    if approval and approval.get("approved"):
-      if decision.modified_tool_args is not None:
-        return allow_cls(updated_input=decision.modified_tool_args)
-      return allow_cls()
-    if approval and approval.get("denied_by") == "relay_policy":
-      return deny_cls(message=f"[{RELAY_POLICY_DENIED_SUB_CODE}] {RELAY_POLICY_DENIED_MESSAGE}")
-    return deny_cls(message="user denied")
 
   async def _close_query_iterator(self) -> None:
     iterator = self._query_iter

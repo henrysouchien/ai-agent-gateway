@@ -34,8 +34,9 @@ from .auth import (
 from .autonomous_runner import AutonomousRegistry
 from .control_plane import create_control_plane_router
 from .control_plane.middleware import add_control_plane_version_header_middleware
+from .control_plane.session import _resolve_control_identity
 from .event_log import EventLog, UserEventBus
-from .approvals import ApprovalActionError, _record_vote_and_unblock
+from .approvals import ApprovalActionError, _record_vote_and_unblock  # noqa: F401
 from .approval_resolver import resolve_policy  # noqa: F401 - compatibility alias
 from .approval_store import SQLiteApprovalStore, expire_pending_loop  # noqa: F401
 from .package_info import package_health
@@ -43,8 +44,10 @@ from .providers import StreamEvent
 from .session import AuthManager, GatewaySession, SessionStore, StreamSubscriber
 
 from . import server_chat_helpers as _server_chat_helpers  # noqa: F401 - dynamic streaming deps alias
+from . import server_chat_control_routes as _server_chat_control_routes
 from . import server_artifact_routes as _server_artifact_routes  # noqa: F401 - dynamic artifact route deps alias
 from . import server_streaming as _server_streaming
+from . import server_tool_routes as _server_tool_routes
 from .server_models import (  # noqa: F401
   SystemPrompt,
   ExecutionLocationResolver,
@@ -260,11 +263,17 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     startup_complete = False
     try:
       await _maybe_await(config.on_startup)
+      agent_schedule_runner = getattr(app.state, "agent_run_schedule_runner", None)
+      if agent_schedule_runner is not None:
+        agent_schedule_runner.start()
       startup_complete = True
       yield
     finally:
       if startup_complete:
         await _maybe_await(config.on_shutdown)
+      agent_schedule_runner = getattr(app.state, "agent_run_schedule_runner", None)
+      if agent_schedule_runner is not None:
+        await agent_schedule_runner.shutdown()
       subprocess_registry = getattr(app.state, "subprocess_registry", None)
       if subprocess_registry is not None:
         await subprocess_registry.shutdown()
@@ -309,6 +318,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   setattr(_build_chat_runtime_for_dispatch, "_gateway_auth_manager", auth)
   setattr(_build_chat_runtime_for_dispatch, "_gateway_auth_config", config.auth_config)
   setattr(_build_chat_runtime_for_dispatch, "_gateway_allowed_models", config.allowed_models)
+  setattr(_build_chat_runtime_for_dispatch, "_gateway_channel_profile_allowlist", config.channel_profile_allowlist)
   setattr(_build_chat_runtime_for_dispatch, "_gateway_log", log)
   setattr(_build_chat_runtime_for_dispatch, "_gateway_resolver_timeout_seconds", config.resolver_timeout_seconds)
   app.state.gateway_build_chat_runtime = _build_chat_runtime_for_dispatch
@@ -320,6 +330,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     log_dir=_default_autonomous_log_dir(),
     max_running=int(os.getenv("AGENT_GATEWAY_AUTONOMOUS_MAX_RUNNING", "2") or "2"),
     approval_db_path=getattr(app.state.gateway_approval_store, "path", None),
+  )
+  from .control_plane.schedules import AgentRunScheduleRunner, AgentRunScheduleStore
+
+  app.state.agent_run_schedule_store = AgentRunScheduleStore()
+  app.state.agent_run_schedule_runner = AgentRunScheduleRunner(
+    store=app.state.agent_run_schedule_store,
+    autonomous_registry=app.state.subprocess_registry,
+    user_event_bus_factory=lambda: getattr(app.state, "user_event_bus", None),
   )
   app.state.batch_task_registry = BatchTaskRegistry()
   control_prefix = _route_path(route_prefix, "/control")
@@ -434,15 +452,32 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       )
       return JSONResponse(error_payload, status_code=status)
 
+    try:
+      identity = _resolve_control_identity(
+        user_id=resolved_user_id,
+        risk_user_id=resolved_risk_user_id,
+        user_email=resolved_user_email,
+        role=resolved_role,
+        channel=resolved_channel,
+      )
+    except (ValueError, SystemExit) as exc:
+      status, error_payload = _resolver_contract_payload(str(exc), user_id=resolved_user_id)
+      return JSONResponse(error_payload, status_code=status)
+
     session = auth.session_store.create_session(
       api_key_hash=AuthManager.hash_api_key(payload.api_key),
       user_id=resolved_user_id,
-      user_email=resolved_user_email,
-      risk_user_id=resolved_risk_user_id,
+      user_email=identity.user_email,
+      risk_user_id=identity.risk_user_id,
       role=resolved_role,  # type: ignore[arg-type]
       kind="chat",
       auth_config=resolved_auth_config,
       schema_version=schema_version,
+      owner_user_id=str(identity.owner_user_id),
+      raw_user_id=str(identity.raw_user_id),
+      user_slug=identity.user_slug,
+      user_aliases=tuple(str(alias) for alias in identity.aliases),
+      identity_status=str(identity.identity_status),
     )
     session.channel = resolved_channel
     session.is_public = resolved_channel == "public"
@@ -618,160 +653,41 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
   @router.get("/chat/subscribe")
   async def chat_subscribe(request: Request) -> StreamingResponse:
-    token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
-    session = auth.verify_token(token)
-    if "schema_version" in request.query_params:
-      raise HTTPException(
-        status_code=400,
-        detail="schema_version is set at session init via POST /chat/init; create a new session to change versions",
-      )
-    requested_session_id = request.query_params.get("session_id") or session.session_id
-    if requested_session_id != session.session_id:
-      raise HTTPException(status_code=403, detail="Cannot subscribe to a different session")
-
-    raw_after_seq = request.query_params.get("after_seq", "0")
-    try:
-      after_seq = max(int(raw_after_seq), 0)
-    except (TypeError, ValueError):
-      raise HTTPException(status_code=400, detail="after_seq must be an integer")
-
-    active_turn = session.active_turn
-    if active_turn is None:
-      raise HTTPException(status_code=404, detail="No active turn for this session")
-
-    subscriber = _register_stream_subscriber(
-      active_turn,
-      after_seq=after_seq,
-      client_label=request.query_params.get("client_label") or "subscriber",
+    return await _server_chat_control_routes.chat_subscribe_response(
+      request,
+      auth=auth,
+      get_bearer_token=AuthManager.get_bearer_token,
+      register_stream_subscriber=_register_stream_subscriber,
+      cleanup_stream_subscriber=_cleanup_stream_subscriber,
+      stream_subscriber_sse=_stream_subscriber_sse,
+      transcript_dir=transcript_dir,
+      log=log,
     )
-    headers = {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache, no-store, must-revalidate",
-      "X-Accel-Buffering": "no",
-      "Connection": "keep-alive",
-    }
-
-    async def cleanup() -> None:
-      await _cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
-
-    async def event_generator():
-      try:
-        async for chunk in _stream_subscriber_sse(
-          session=session,
-          active_turn=active_turn,
-          subscriber=subscriber,
-          transcript_dir=transcript_dir,
-          channel=session.channel,
-          write_transcript=True,
-          log=log,
-        ):
-          yield chunk
-      finally:
-        await cleanup()
-
-    return StreamingResponse(event_generator(), headers=headers, background=BackgroundTask(cleanup))
 
   @router.post("/chat/cancel")
   async def chat_cancel(request: Request, body: ChatCancelRequest = Body(...)) -> JSONResponse:
-    token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
-    session = auth.verify_token(token)
-    if body.session_id != session.session_id:
-      raise HTTPException(status_code=403, detail="Cannot cancel a different session")
-
-    active_turn = session.active_turn
-    if active_turn is None:
-      raise HTTPException(status_code=404, detail="No active turn for this session")
-
-    await _cancel_active_turn_runner(active_turn)
-    _clear_active_turn(session, active_turn)
-    return JSONResponse(content={"status": "cancelled", "session_id": session.session_id})
+    return await _server_chat_control_routes.chat_cancel_response(
+      request,
+      body,
+      auth=auth,
+      get_bearer_token=AuthManager.get_bearer_token,
+      cancel_active_turn_runner=_cancel_active_turn_runner,
+      clear_active_turn=_clear_active_turn,
+    )
 
   @router.post("/chat/recap")
   async def chat_recap(request: Request, body: ChatRecapRequest = Body(...)) -> JSONResponse:
-    token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
-    session = auth.verify_token(token)
-    if body.session_id != session.session_id:
-      raise HTTPException(status_code=403, detail="Cannot recap a different session")
-
-    scope = str(body.scope or "active_turn").strip().lower()
-    if scope != "active_turn":
-      if scope != "session_cumulative":
-        raise HTTPException(status_code=400, detail="scope must be active_turn or session_cumulative")
-      active_turn = session.active_turn
-      recap_payload = _compute_cumulative_session_recap_payload(
-        session,
-        active_turn,
-        transcript_dir,
-        trigger="explicit",
-      )
-      if active_turn is not None:
-        for entry in active_turn.event_log.entries:
-          entry_seq = int(entry.seq)
-          if entry_seq in active_turn.transcript_written_seqs:
-            continue
-          active_turn.transcript_written_seqs.add(entry_seq)
-          _write_transcript(
-            transcript_dir,
-            session.session_id,
-            _event_for_wire(entry, active_turn.event_log),
-            user_id=session.user_id,
-            channel=session.channel,
-          )
-      if active_turn is not None and not active_turn.event_log.closed:
-        appended = active_turn.event_log.append(recap_payload)
-        if appended is not None:
-          active_turn.transcript_written_seqs.add(int(appended.seq))
-        _write_transcript(
-          transcript_dir,
-          session.session_id,
-          recap_payload,
-          user_id=session.user_id,
-          channel=session.channel,
-        )
-      else:
-        _write_transcript(
-          transcript_dir,
-          session.session_id,
-          recap_payload,
-          user_id=session.user_id,
-          channel=session.channel,
-        )
-      return JSONResponse(content=recap_payload)
-
-    active_turn = session.active_turn
-    if active_turn is None:
-      raise HTTPException(status_code=404, detail="No active turn for this session")
-
-    recap_payload = _compute_session_recap_payload(session, active_turn, trigger="explicit")
-    if active_turn.event_log.closed:
-      _write_transcript(
-        transcript_dir,
-        session.session_id,
-        recap_payload,
-        user_id=session.user_id,
-        channel=session.channel,
-      )
-    else:
-      appended = active_turn.event_log.append(recap_payload)
-      if appended is not None:
-        active_turn.transcript_written_seqs.add(int(appended.seq))
-        _write_transcript(
-          transcript_dir,
-          session.session_id,
-          _event_for_wire(appended, active_turn.event_log),
-          user_id=session.user_id,
-          channel=session.channel,
-        )
-      else:
-        _write_transcript(
-          transcript_dir,
-          session.session_id,
-          recap_payload,
-          user_id=session.user_id,
-          channel=session.channel,
-        )
-
-    return JSONResponse(content=recap_payload)
+    return await _server_chat_control_routes.chat_recap_response(
+      request,
+      body,
+      auth=auth,
+      get_bearer_token=AuthManager.get_bearer_token,
+      transcript_dir=transcript_dir,
+      compute_session_recap_payload=_compute_session_recap_payload,
+      compute_cumulative_session_recap_payload=_compute_cumulative_session_recap_payload,
+      event_for_wire=_event_for_wire,
+      write_transcript=_write_transcript,
+    )
 
   @router.get("/artifacts/{ticker}/{skill}/latest")
   async def artifact_latest(request: Request, ticker: str, skill: str) -> JSONResponse:
@@ -804,64 +720,22 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
   @router.post("/chat/tool-result")
   async def tool_result(request: Request, payload: ToolResultRequest) -> JSONResponse:
-    token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
-    session = auth.verify_token(token)
-
-    pending = session.pending_tools.get(payload.tool_call_id)
-    if not pending:
-      return JSONResponse({"error": "Unknown tool_call_id"}, status_code=404)
-
-    if pending.get("status") == "received":
-      return JSONResponse({"error": "Result already submitted"}, status_code=409)
-
-    if pending.get("status") != "pending":
-      return JSONResponse({"error": "Invalid pending tool state for result submission"}, status_code=409)
-
-    if pending.get("nonce") != payload.nonce:
-      return JSONResponse({"error": "Nonce mismatch"}, status_code=409)
-
-    if int(time.time()) > int(pending.get("expires_at", 0)):
-      session.pending_tools.pop(payload.tool_call_id, None)
-      return JSONResponse({"error": "Tool call expired"}, status_code=410)
-
-    pending["status"] = "received"
-    if session.result_queue is None:
-      session.result_queue = asyncio.Queue()
-    await session.result_queue.put({"result": payload.result, "error": payload.error})
-
-    tool_name = pending.get("tool_name", "?")
-    if payload.error:
-      log.warning("Tool result: %s | error=%s", tool_name, payload.error)
-    else:
-      log.info("Tool result: %s | success", tool_name)
-    return JSONResponse({"status": "ok"})
+    return await _server_tool_routes.tool_result_response(
+      request,
+      payload,
+      auth=auth,
+      log=log,
+      time_time=time.time,
+    )
 
   @router.post("/chat/tool-approval")
   async def tool_approval(request: Request, payload: ToolApprovalRequest) -> JSONResponse:
-    token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
-    session = auth.verify_token(token)
-
-    pending = session.pending_tools.get(payload.tool_call_id)
-    if not pending:
-      return JSONResponse({"error": "Unknown tool_call_id"}, status_code=404)
-
-    try:
-      result = await _record_vote_and_unblock(
-        target_session=session,
-        pending_entry=pending,
-        tool_call_id=payload.tool_call_id,
-        nonce=payload.nonce,
-        decider_id=session.user_id,
-        decider_role=getattr(session, "role", None),
-        approved=payload.approved,
-        allow_tool_type=payload.allow_tool_type,
-        reason=None,
-        app_state=request.app.state,
-        denied_by=payload.denied_by,
-      )
-    except ApprovalActionError as exc:
-      return JSONResponse(exc.payload, status_code=exc.status_code)
-    return JSONResponse(result)
+    return await _server_tool_routes.tool_approval_response(
+      request,
+      payload,
+      auth=auth,
+      record_vote_and_unblock=_record_vote_and_unblock,
+    )
 
   @router.get("/health")
   async def health() -> JSONResponse:
@@ -882,8 +756,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       skills_dir=config.control_skills_dir or _default_control_skills_dir(),
       artifact_auth_dependency=_artifact_auth_dependency,
       autonomous_registry=app.state.subprocess_registry,
+      agent_schedule_store=app.state.agent_run_schedule_store,
+      agent_schedule_runner=app.state.agent_run_schedule_runner,
       approval_store=app.state.gateway_approval_store,
       approval_policy=app.state.gateway_approval_policy,
+      dispatch_scope_validator=config.dispatch_scope_validator,
     ),
     prefix=control_prefix,
   )

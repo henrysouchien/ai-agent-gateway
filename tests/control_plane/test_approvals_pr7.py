@@ -9,6 +9,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from agent_gateway.approval_audit import ApprovalAuditEmitter
+from agent_gateway.approval_notifications import ApprovalNotificationDestination
 from agent_gateway.approval_policy import (
   ApprovalRequest,
   ApprovalRequestPayload,
@@ -400,6 +401,73 @@ def test_control_approval_endpoints_reject_chat_session_tokens(tmp_path) -> None
     )
     assert response.status_code == 401
     assert response.json()["detail"] == "Control session required"
+    retry_response = client.post(
+      f"/api/control/runs/{chat['session_id']}/approvals/{approval.approval_id}/notifications/retry",
+      headers=_headers(chat),
+    )
+    assert retry_response.status_code == 401
+    assert retry_response.json()["detail"] == "Control session required"
+    assert queue.empty()
+
+
+def test_control_approval_notification_retry_requeues_failed_outbox_with_redacted_response(tmp_path) -> None:
+  async def failing_sender(_row: dict[str, Any]) -> None:
+    raise RuntimeError("telegram down")
+
+  app, store, _policy, _writer = _make_app(tmp_path)
+  store._notification_destination_resolver = lambda _request: [  # type: ignore[attr-defined]
+    ApprovalNotificationDestination(channel="telegram", destination="chat-private")
+  ]
+  store._notification_sender = failing_sender  # type: ignore[attr-defined]
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    approval, queue = _install_pending_approval(
+      app=app,
+      store=store,
+      chat_payload=chat,
+      user_id="alice",
+    )
+    _run(store.enqueue_pending_approval_notification(approval))
+    assert _run(store.deliver_pending_approval_notifications()) == 1
+    failed_rows = _run(store.list_approval_notification_outbox(approval.approval_id))
+    assert failed_rows[0]["state"] == "failed_retryable"
+    assert failed_rows[0]["destination"] == "chat-private"
+    store._notification_sender = None  # type: ignore[attr-defined]
+
+    response = client.post(
+      f"/api/control/runs/{chat['session_id']}/approvals/{approval.approval_id}/notifications/retry",
+      headers=_headers(control),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body == {
+      "status": "queued",
+      "approval_id": approval.approval_id,
+      "requeued": 1,
+      "delivery_scheduled": False,
+      "notification": {"state": "pending", "channels": ["telegram"]},
+    }
+    assert "chat-private" not in response.text
+    assert "message" not in body
+    requeued_rows = _run(store.list_approval_notification_outbox(approval.approval_id))
+    assert requeued_rows[0]["state"] == "pending"
+    assert requeued_rows[0]["last_error"] is None
+
+    repeat = client.post(
+      f"/api/control/runs/{chat['session_id']}/approvals/{approval.approval_id}/notifications/retry",
+      headers=_headers(control),
+    )
+
+    assert repeat.status_code == 200, repeat.text
+    assert repeat.json() == {
+      "status": "queued",
+      "approval_id": approval.approval_id,
+      "requeued": 0,
+      "delivery_scheduled": False,
+      "notification": {"state": "pending", "channels": ["telegram"]},
+    }
     assert queue.empty()
 
 
@@ -1089,6 +1157,20 @@ def test_terminal_and_expired_approval_states_are_rejected(tmp_path) -> None:
 
     assert terminal_response.status_code == 409
     assert expired_response.status_code == 410
+
+    terminal_retry = client.post(
+      f"/api/control/runs/{chat['session_id']}/approvals/{terminal.approval_id}/notifications/retry",
+      headers=_headers(control),
+    )
+    expired_retry = client.post(
+      f"/api/control/runs/{chat['session_id']}/approvals/{expired.approval_id}/notifications/retry",
+      headers=_headers(control),
+    )
+
+    assert terminal_retry.status_code == 409
+    assert terminal_retry.json()["error"] == "Approval request already resolved"
+    assert expired_retry.status_code == 410
+    assert expired_retry.json()["error"] == "Approval request expired"
 
 
 def test_chat_tool_approval_endpoint_uses_shared_helper(tmp_path) -> None:

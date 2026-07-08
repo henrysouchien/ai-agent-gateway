@@ -8,7 +8,12 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from agent_gateway.approvals import ApprovalActionError, _approval_request_to_dict, _record_vote_and_unblock
+from agent_gateway.approvals import (
+  TERMINAL_APPROVAL_STATES,
+  ApprovalActionError,
+  _approval_request_to_dict,
+  _record_vote_and_unblock,
+)
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
 from agent_gateway.session import AuthManager, GatewaySession
 
@@ -234,6 +239,66 @@ async def _approval_records_for_autonomous_task(store: Any, record: AutonomousTa
   return approvals
 
 
+async def _visible_pending_approval_for_run(
+  *,
+  auth: AuthManager,
+  store: Any,
+  autonomous_registry: AutonomousRegistry | None,
+  run_id: str,
+  approval_id: str,
+  authenticated: GatewaySession,
+) -> Any | None:
+  target_session = _target_chat_session_for_user(auth, run_id, authenticated.user_id, authenticated.channel)
+  if target_session is not None:
+    pending = _find_pending_approval(target_session, approval_id)
+    if pending is not None:
+      return await store.get(approval_id)
+
+  delegated_target = await _delegated_pending_approval_for_user(
+    auth,
+    store,
+    run_id,
+    approval_id,
+    authenticated.user_id,
+    authenticated.channel,
+    {},
+  )
+  if delegated_target is not None:
+    return await store.get(approval_id)
+
+  record = _autonomous_record_for_user(
+    autonomous_registry,
+    run_id,
+    authenticated.user_id,
+    authenticated.channel,
+  )
+  if record is None:
+    return None
+  if not _autonomous_run_accepts_approval_decisions(record):
+    return None
+  if _autonomous_pending_event(record, approval_id) is None:
+    return None
+  return await store.get(approval_id)
+
+
+def _approval_retry_state_error(request_record: Any, approval_id: str) -> JSONResponse | None:
+  state = getattr(request_record, "state", None)
+  if state == "expired":
+    return _json_error(410, "Approval request expired")
+  if state in TERMINAL_APPROVAL_STATES:
+    return _json_error(409, "Approval request already resolved")
+  if state != "pending_user":
+    return JSONResponse(
+      {
+        "error": "Invalid approval request state for notification retry",
+        "approval_id": approval_id,
+        "state": state,
+      },
+      status_code=409,
+    )
+  return None
+
+
 def build_approvals_router(
   *,
   auth: AuthManager,
@@ -274,6 +339,52 @@ def build_approvals_router(
           continue
         approvals.extend(await _approval_records_for_autonomous_task(store, record))
     return JSONResponse({"approvals": approvals})
+
+  @router.post("/runs/{run_id}/approvals/{approval_id}/notifications/retry")
+  async def retry_approval_notification(request: Request, run_id: str, approval_id: str) -> JSONResponse:
+    authenticated = _require_bearer_session(request, auth)
+    _require_control_session(authenticated)
+    store = getattr(request.app.state, "gateway_approval_store", None)
+    if store is None:
+      return _json_error(503, "Approval subsystem unavailable")
+
+    request_record = await _visible_pending_approval_for_run(
+      auth=auth,
+      store=store,
+      autonomous_registry=autonomous_registry,
+      run_id=run_id,
+      approval_id=approval_id,
+      authenticated=authenticated,
+    )
+    if request_record is None:
+      return _json_error(404, "Run approval not found")
+
+    state_error = _approval_retry_state_error(request_record, approval_id)
+    if state_error is not None:
+      return state_error
+
+    retry_failed = getattr(store, "retry_failed_approval_notifications", None)
+    if retry_failed is None:
+      return _json_error(503, "Approval notification retry unavailable")
+    retry_result = await retry_failed(approval_id)
+    requeued = int(retry_result.get("requeued") or 0)
+    notification = retry_result.get("notification")
+    notification_state = notification.get("state") if isinstance(notification, dict) else None
+    queueable = requeued > 0 or notification_state == "pending"
+    delivery_scheduled = False
+    if queueable:
+      schedule_delivery = getattr(store, "schedule_approval_notification_delivery", None)
+      if schedule_delivery is not None:
+        delivery_scheduled = bool(schedule_delivery())
+    return JSONResponse(
+      {
+        "status": "queued" if queueable else "not_retryable",
+        "approval_id": approval_id,
+        "requeued": requeued,
+        "delivery_scheduled": delivery_scheduled,
+        "notification": notification,
+      }
+    )
 
   @router.post("/runs/{run_id}/approvals/{approval_id}")
   async def resolve_approval(

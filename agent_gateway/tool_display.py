@@ -48,8 +48,8 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   "model_find": _spec("Finding model items", "ticker", "query"),
   "model_values": _spec("Reading model values", "ticker", "range"),
   "model_sensitivity": _spec("Running sensitivity analysis", "ticker", "scenario"),
-  "get_model_insights": _spec("Reviewing model insights", "ticker", "query"),
-  "get_price_target": _spec("Pulling price target", "ticker", "scenario"),
+  "get_model_insights": _spec("Reviewing model insights", "research_file_id", "model_insights_id"),
+  "get_price_target": _spec("Pulling price target", "research_file_id", "handoff_id"),
   # Excel add-in.
   "read_cells": _spec("Reading cells", "workbook", "sheet", "range"),
   "write_cells": _spec("Writing cells", "workbook", "sheet", "range"),

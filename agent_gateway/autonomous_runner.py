@@ -3,12 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
-import re
+import os  # noqa: F401 - compatibility alias for autonomous_runner_state
 import secrets
 import sys
 import time
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -17,8 +15,8 @@ from .autonomous_runner_claims import (
   _AGENT_API_CLAIM_AUDIENCE as _AGENT_API_CLAIM_AUDIENCE,
   _AGENT_API_CLAIM_ENV_VARS as _AGENT_API_CLAIM_ENV_VARS,
   _AGENT_API_CLAIM_TTL_SECONDS_DEFAULT as _AGENT_API_CLAIM_TTL_SECONDS_DEFAULT,
-  get_agent_api_claim_ttl_seconds,
-  sign_user_claim,
+  get_agent_api_claim_ttl_seconds as get_agent_api_claim_ttl_seconds,  # noqa: F401 - compatibility alias
+  sign_user_claim as sign_user_claim,  # noqa: F401 - compatibility alias
 )
 from .autonomous_runner_state import (
   _ACTIVE_AUTONOMOUS_PROCESS_STATES,
@@ -39,25 +37,28 @@ from .autonomous_runner_state import (
   AutonomousTask,
 )
 from . import autonomous_runner_events as _runner_events
+from . import autonomous_runner_status as _runner_status
+from . import autonomous_runner_commands as _runner_commands
+from .autonomous_runner_start import (
+  _SPAWN_CLEANUP_GRACE_SEC as _SPAWN_CLEANUP_GRACE_SEC,
+  AutonomousRegistryStartMixin,
+)
 
 _STATUS_TAIL_LINES = 40
-_SPAWN_CLEANUP_GRACE_SEC = 1.0
-_AUTONOMOUS_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_AUTONOMOUS_PROFILE_NAME_RE = _runner_commands._AUTONOMOUS_PROFILE_NAME_RE
 _LOGGER = logging.getLogger(__name__)
+_APPROVAL_DECISION_AUTONOMOUS_STATES = {"running", "approval_pending", "remediating"}
 
 
 def normalize_autonomous_profile(profile: str) -> str:
-  normalized_profile = str(profile or "").strip().lower()
-  if not normalized_profile:
-    raise ValueError("profile is required")
-  if is_fixture_profile_name(normalized_profile):
-    return normalized_profile
-  if not _AUTONOMOUS_PROFILE_NAME_RE.fullmatch(normalized_profile):
-    raise ValueError("profile must be a Python module-safe name using letters, numbers, and underscores")
-  return normalized_profile
+  return _runner_commands.normalize_autonomous_profile(
+    profile,
+    is_fixture_profile_name_func=is_fixture_profile_name,
+    profile_name_re=_AUTONOMOUS_PROFILE_NAME_RE,
+  )
 
 
-class AutonomousRegistry(AutonomousRegistryStateMixin):
+class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMixin):
   def __init__(
     self,
     *,
@@ -103,48 +104,20 @@ class AutonomousRegistry(AutonomousRegistryStateMixin):
     ticker: str | None = None,
     dev_mode: bool = False,
   ) -> list[str]:
-    normalized_profile = normalize_autonomous_profile(profile)
-    if is_fixture_profile_name(normalized_profile):
-      require_fixture_provider_available("fixture profile dispatch", error_type=ValueError)
-
-    normalized_mode = mode.strip().lower()
-    if normalized_mode not in {"once", "task", "skill"}:
-      raise ValueError("mode must be once, task, or skill")
-
-    if dev_mode and normalized_mode == "task":
-      raise ValueError("dev_mode is implicit for mode='task'; do not pass dev_mode=True")
-    if dev_mode and normalized_mode == "once":
-      raise ValueError("dev_mode requires mode='skill'; use mode='task' for dev tasks instead")
-
-    cmd = [self._python, "-m", "agent.autonomous", "--profile", normalized_profile]
-    if dev_mode:
-      cmd.append("--dev")
-
-    if normalized_mode == "once":
-      if task or skill or context:
-        raise ValueError("mode='once' does not accept task, skill, or context")
-      return cmd
-
-    if normalized_mode == "task":
-      if not task or not task.strip():
-        raise ValueError("task is required when mode='task'")
-      if skill or context:
-        raise ValueError("mode='task' only accepts the task parameter")
-      cmd.extend(["--task", task.strip()])
-      return cmd
-
-    if not skill or not skill.strip():
-      raise ValueError("skill is required when mode='skill'")
-    if is_fixture_skill_name(skill):
-      require_fixture_provider_available("fixture skill dispatch", error_type=ValueError)
-    if task:
-      raise ValueError("mode='skill' does not accept task")
-    cmd.extend(["--skill", skill.strip()])
-    if ticker and ticker.strip():
-      cmd.extend(["--ticker", ticker.strip().upper()])
-    if context and context.strip():
-      cmd.extend(["--context", context.strip()])
-    return cmd
+    return _runner_commands.build_autonomous_cmd(
+      python_executable=self._python,
+      profile=profile,
+      mode=mode,
+      task=task,
+      skill=skill,
+      context=context,
+      ticker=ticker,
+      dev_mode=dev_mode,
+      normalize_autonomous_profile_func=normalize_autonomous_profile,
+      is_fixture_profile_name_func=is_fixture_profile_name,
+      is_fixture_skill_name_func=is_fixture_skill_name,
+      require_fixture_provider_available_func=require_fixture_provider_available,
+    )
 
   def _start_payload(self, record: AutonomousTask) -> dict[str, Any]:
     return {
@@ -319,35 +292,14 @@ class AutonomousRegistry(AutonomousRegistryStateMixin):
     return False
 
   def _tail_lines(self, log_path: Path, line_count: int) -> tuple[list[str], int]:
-    if not log_path.exists():
-      return [], 0
-    if line_count <= 0:
-      total_lines = 0
-      with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-        for total_lines, _ in enumerate(handle, start=1):
-          pass
-      return [], total_lines
-
-    total_lines = 0
-    recent = deque(maxlen=line_count)
-    with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-      for total_lines, line in enumerate(handle, start=1):
-        recent.append(line.rstrip("\n"))
-    return list(recent), total_lines
+    return _runner_status.tail_lines(log_path, line_count)
 
   def _status_payload(self, record: AutonomousTask) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-      "state": record.state,
-      "elapsed_sec": record.elapsed_sec,
-    }
-    if record.exit_code is not None:
-      payload["exit_code"] = record.exit_code
-    if record.error:
-      payload["error"] = record.error
-    lines, _total = self._tail_lines(record.log_path, _STATUS_TAIL_LINES)
-    if lines:
-      payload["log_tail"] = "\n".join(lines)
-    return payload
+    return _runner_status.status_payload(
+      record,
+      tail_lines_func=self._tail_lines,
+      status_tail_lines=_STATUS_TAIL_LINES,
+    )
 
   def _get(self, task_id: str) -> AutonomousTask:
     record = self._tasks.get(task_id)
@@ -370,195 +322,6 @@ class AutonomousRegistry(AutonomousRegistryStateMixin):
       for record in self._tasks.values()
       if record.proc is not None and record.proc.returncode is None
     )
-
-  async def _reserve_slot(self) -> None:
-    async with self._slot_lock:
-      if self._reserved_slots >= self._max_running:
-        raise RuntimeError(f"Autonomous concurrency limit reached ({self._max_running})")
-      self._reserved_slots += 1
-
-  async def _release_slot(self, record: AutonomousTask | None = None) -> None:
-    async with self._slot_lock:
-      if record is None:
-        self._reserved_slots = max(0, self._reserved_slots - 1)
-        return
-      if not record.slot_reserved:
-        return
-      record.slot_reserved = False
-      self._reserved_slots = max(0, self._reserved_slots - 1)
-
-  async def _await_cleanup(self, cleanup_coro) -> None:
-    cleanup_task = asyncio.create_task(cleanup_coro)
-    try:
-      await asyncio.shield(cleanup_task)
-    except asyncio.CancelledError:
-      await cleanup_task
-      raise
-
-  async def _terminate_unowned_process(self, record: AutonomousTask | None) -> None:
-    proc = None if record is None else record.proc
-    if proc is None or proc.returncode is not None:
-      return
-    try:
-      proc.terminate()
-    except ProcessLookupError:
-      return
-    try:
-      await asyncio.wait_for(proc.wait(), timeout=_SPAWN_CLEANUP_GRACE_SEC)
-    except asyncio.TimeoutError:
-      try:
-        proc.kill()
-      except ProcessLookupError:
-        pass
-      await proc.wait()
-
-  async def _cleanup_uncommitted_start(
-    self,
-    *,
-    task_id: str,
-    record: AutonomousTask | None,
-    log_handle: Any | None,
-  ) -> None:
-    self._tasks.pop(task_id, None)
-    self._delete_task_manifest(task_id)
-    await self._terminate_unowned_process(record)
-    if log_handle is not None:
-      log_handle.close()
-    if record is not None:
-      record.log_handle = None
-      if record.events_tail_task is not None and not record.events_tail_task.done():
-        record.events_tail_task.cancel()
-        await asyncio.gather(record.events_tail_task, return_exceptions=True)
-      await self._release_slot(record)
-    else:
-      await self._release_slot()
-
-  async def start(
-    self,
-    *,
-    profile: str,
-    mode: str,
-    user_id: str,
-    user_email: str | None,
-    control_run_id: str | None = None,
-    task: str | None = None,
-    skill: str | None = None,
-    context: str | None = None,
-    ticker: str | None = None,
-    channel: str | None = None,
-    dev_mode: bool = False,
-    resumed_from: str | None = None,
-  ) -> dict[str, Any]:
-    await self._reserve_slot()
-    task_id = self._next_task_id()
-    control_run_id = control_run_id or task_id
-    log_handle = None
-    record: AutonomousTask | None = None
-    ownership_transferred = False
-    try:
-      cmd = self._build_cmd(
-        profile=profile,
-        mode=mode,
-        task=task,
-        skill=skill,
-        context=context,
-        ticker=ticker,
-        dev_mode=dev_mode,
-      )
-      normalized_mode = mode.strip().lower()
-      effective_dev_mode = bool(dev_mode or normalized_mode == "task")
-      log_path = self._log_dir / f"{task_id}.log"
-      events_path = self._log_dir / f"{task_id}.events.jsonl"
-      operator_inbox_path = self._log_dir / f"{task_id}.operator-messages.jsonl"
-      approval_decisions_path = self._log_dir / f"{task_id}.approval-decisions.jsonl"
-      self._log_dir.mkdir(parents=True, exist_ok=True)
-      events_path.write_text("", encoding="utf-8")
-      operator_inbox_path.write_text("", encoding="utf-8")
-      approval_decisions_path.write_text("", encoding="utf-8")
-      log_handle = log_path.open("wb")
-      record = AutonomousTask(
-        task_id=task_id,
-        control_run_id=control_run_id,
-        user_id=user_id,
-        user_email=user_email,
-        profile=normalize_autonomous_profile(profile),
-        mode=mode.strip().lower(),
-        task=task.strip() if isinstance(task, str) and task.strip() else None,
-        skill=skill.strip() if isinstance(skill, str) and skill.strip() else None,
-        context=context.strip() if isinstance(context, str) and context.strip() else None,
-        ticker=ticker.strip().upper() if isinstance(ticker, str) and ticker.strip() else None,
-        channel=channel.strip().lower() if isinstance(channel, str) and channel.strip() else None,
-        dev_mode=effective_dev_mode,
-        cmd=cmd,
-        log_path=log_path,
-        events_path=events_path,
-        operator_inbox_path=operator_inbox_path,
-        approval_decisions_path=approval_decisions_path,
-        started_at=time.time(),
-        log_handle=log_handle,
-        slot_reserved=True,
-        event_lines=[],
-        resumed_from=resumed_from.strip() if isinstance(resumed_from, str) and resumed_from.strip() else None,
-      )
-      self._attach_manifest_tracking(record)
-      self._tasks[task_id] = record
-      record.events_tail_task = asyncio.create_task(self._tail_events_file(task_id))
-
-      env = dict(os.environ)
-      env["PYTHONUNBUFFERED"] = "1"
-      hmac_key = os.getenv("AGENT_API_USER_CLAIM_HMAC_KEY", "").strip()
-      if not hmac_key:
-        raise RuntimeError(
-          "AGENT_API_USER_CLAIM_HMAC_KEY required for autonomous dispatch. "
-          "Set it in the gateway env (.env or process env)."
-        )
-      claim_env = sign_user_claim(
-        hmac_key,
-        user_id=user_id,
-        user_email=user_email,
-        ttl_seconds=get_agent_api_claim_ttl_seconds(),
-      )
-      env.update(claim_env)
-      env["AUTONOMOUS_USER_ID"] = user_id
-      env["AUTONOMOUS_USER_EMAIL"] = user_email or ""
-      env["AGENT_AUTONOMOUS_EVENTS_PATH"] = str(events_path)
-      env["AGENT_AUTONOMOUS_OPERATOR_INBOX_PATH"] = str(operator_inbox_path)
-      env["AGENT_AUTONOMOUS_APPROVAL_DECISIONS_PATH"] = str(approval_decisions_path)
-      env["AGENT_AUTONOMOUS_GATEWAY_SESSION_ID"] = (
-        f"agent-control:{control_run_id}:{int(record.started_at)}"
-      )
-      env["AGENT_AUTONOMOUS_CONTROL_RUN_ID"] = control_run_id
-      env["AGENT_AUTONOMOUS_CONTROL_CHANNEL"] = record.channel or ""
-      if record.dev_mode:
-        env[f"{record.profile.upper().replace('-', '_')}_DEV_MODE"] = "true"
-      if self._approval_db_path is not None:
-        env["AGENT_AUTONOMOUS_APPROVALS_DB_PATH"] = str(self._approval_db_path)
-      record.proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(self._api_dir),
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=log_handle,
-        stderr=asyncio.subprocess.STDOUT,
-        env=env,
-      )
-
-      assert record is not None
-      record.reaper_task = asyncio.create_task(self._reap(task_id))
-      await self._publish_run_state(record, "running")
-      ownership_transferred = True
-      self._write_task_manifest(record)
-      return self._start_payload(record)
-    except OSError as exc:
-      raise RuntimeError(f"spawn failed: {exc}") from exc
-    finally:
-      if not ownership_transferred:
-        await self._await_cleanup(
-          self._cleanup_uncommitted_start(
-            task_id=task_id,
-            record=record,
-            log_handle=log_handle,
-          )
-        )
 
   async def _tail_events_file(self, task_id: str) -> None:
     record = self._tasks.get(task_id)
@@ -687,7 +450,7 @@ class AutonomousRegistry(AutonomousRegistryStateMixin):
     record = self._find_by_control_run_id(control_run_id)
     if record is None:
       raise ValueError(f"Unknown control_run_id: {control_run_id}")
-    if record.user_id != user_id:
+    if (record.owner_user_id or record.user_id) != user_id:
       raise PermissionError("Run not found")
 
     normalized_channel = channel.strip().lower() if isinstance(channel, str) and channel.strip() else None
@@ -792,14 +555,14 @@ class AutonomousRegistry(AutonomousRegistryStateMixin):
     record = self._find_by_control_run_id(control_run_id)
     if record is None:
       raise ValueError(f"Unknown control_run_id: {control_run_id}")
-    if record.user_id != user_id:
+    if (record.owner_user_id or record.user_id) != user_id:
       raise PermissionError("Run not found")
 
     normalized_channel = channel.strip().lower() if isinstance(channel, str) and channel.strip() else None
     if record.channel is not None and normalized_channel != record.channel:
       raise PermissionError("Run not found")
 
-    if not self._is_active_process_state(record) or (
+    if record.state not in _APPROVAL_DECISION_AUTONOMOUS_STATES or (
       record.proc is not None and record.proc.returncode is not None
     ):
       raise RuntimeError("Autonomous run is not running")

@@ -20,6 +20,71 @@ def test_classifies_status_error_payload() -> None:
   assert is_semantic_tool_error(payload) is True
 
 
+def test_does_not_classify_status_not_found_payload() -> None:
+  payload = {
+    "status": "not_found",
+    "error_type": "artifact_not_found",
+    "error": "Artifact not found",
+  }
+
+  assert classify_semantic_tool_error(payload) is None
+  assert is_semantic_tool_error(payload) is False
+
+
+def test_classifies_status_error_payload_without_detail() -> None:
+  payload = {
+    "status": "error",
+    "error": "",
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error == {
+    "code": "tool_status_error",
+    "message": "Tool result reported status=error without error detail",
+    "source": "status",
+    "status": "error",
+    "sub_code": "empty_error_detail",
+  }
+
+
+def test_classifies_status_error_payload_with_empty_nested_error_and_top_level_message() -> None:
+  payload = {
+    "status": "error",
+    "error": {},
+    "message": "Artifact not found",
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error == {
+    "code": "tool_status_error",
+    "message": "Artifact not found",
+    "source": "status",
+    "status": "error",
+  }
+
+
+def test_classifies_status_error_payload_with_nested_validation_details() -> None:
+  payload = {
+    "status": "error",
+    "error": {
+      "validation_errors": [
+        {"type": "missing", "loc": ["artifact_id"], "msg": "Field required"},
+      ],
+    },
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error == {
+    "code": "tool_status_error",
+    "message": "Tool result reported status=error; validation_errors: artifact_id: Field required",
+    "source": "status",
+    "status": "error",
+  }
+
+
 def test_classifies_success_false_payload() -> None:
   payload = {
     "success": False,
@@ -126,3 +191,87 @@ def test_runner_soft_error_wrapper_calls_module_alias(monkeypatch) -> None:
 
   assert gateway_runner.AgentRunner._is_soft_error(payload) is True
   assert calls == [payload]
+
+
+def test_status_error_surfaces_repair_fix_and_example() -> None:
+  payload = {
+    "status": "error",
+    "error": {
+      "code": "tool_status_error",
+      "message": "invalid model-writer judgment field: targets_by_scenario.bull.dcf.wacc",
+      "recoverable": True,
+      "data": {
+        "field": "targets_by_scenario.bull.dcf.wacc",
+        "got": {"2026": 0.105},
+        "fix": "include numeric WACC/discount-rate used for the scenario DCF",
+        "example": {"wacc_pct": 0.105},
+      },
+    },
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error is not None
+  message = semantic_error["message"]
+  assert "invalid model-writer judgment field: targets_by_scenario.bull.dcf.wacc" in message
+  assert "fix=include numeric WACC/discount-rate used for the scenario DCF" in message
+  assert 'example={"wacc_pct":0.105}' in message
+
+
+def test_status_error_truncates_oversized_repair_example() -> None:
+  payload = {
+    "status": "error",
+    "error": {
+      "message": "invalid model-writer judgment field: targets_by_scenario",
+      "data": {
+        "fix": "include bull/base/bear scenario targets",
+        "example": {"targets_by_scenario": {str(i): {"target": float(i)} for i in range(200)}},
+      },
+    },
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error is not None
+  message = semantic_error["message"]
+  assert "fix=include bull/base/bear scenario targets" in message
+  assert "example=" in message
+  example_part = message.split("example=", 1)[1]
+  assert len(example_part) <= 600
+  assert example_part.endswith("...")
+
+
+def test_status_error_without_repair_data_is_unchanged() -> None:
+  payload = {
+    "status": "error",
+    "error": {"code": "not_found", "message": "Ticker X not found"},
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error is not None
+  assert semantic_error["message"] == "Ticker X not found"
+
+
+def test_status_error_with_fix_in_message_still_surfaces_example() -> None:
+  payload = {
+    "status": "error",
+    "error": {
+      "message": (
+        "invalid model-writer judgment field: dcf_calibration_review "
+        "(dcf_calibration_not_review_overridable; recommended_verdict=INSUFFICIENT_DATA; "
+        "fix=repair target aliases, complete relative methods, or return the recommended verdict)"
+      ),
+      "data": {
+        "fix": "repair target aliases, complete relative methods, or return the recommended verdict",
+        "example": {"targets_by_method": {"dcf": {"target": 122.0}}},
+      },
+    },
+  }
+
+  semantic_error = classify_semantic_tool_error(payload)
+
+  assert semantic_error is not None
+  message = semantic_error["message"]
+  assert message.count("fix=") == 1
+  assert 'example={"targets_by_method":{"dcf":{"target":122.0}}}' in message
