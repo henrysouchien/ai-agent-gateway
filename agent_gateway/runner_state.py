@@ -655,6 +655,13 @@ def usage_cache_status(usage_totals: Dict[str, int]) -> str:
   return "miss"
 
 
+@dataclass(frozen=True)
+class RegistryScope:
+  scope_type: str
+  scope_id: str
+  store_dir: str
+
+
 @dataclass
 class ToolResultContext:
   """Context passed to `on_tool_result` hooks.
@@ -675,6 +682,7 @@ class ToolResultContext:
   result_entry: Dict[str, Any] | None
   skill_run_id: str | None = None
   workspace_dir: str | None = None
+  registry_scope: RegistryScope | None = None
   batch_id: int | str | None = None
 
 

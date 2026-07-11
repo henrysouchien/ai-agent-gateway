@@ -186,6 +186,7 @@ from .runner_streaming import (
   STREAM_THINKING_STALL_TIMEOUT as STREAM_THINKING_STALL_TIMEOUT,
   classify_guard_outcome,  # noqa: F401 - compatibility alias
   effective_stream_stall_timeout,  # noqa: F401 - compatibility alias
+  observed_thinking_in_messages,  # noqa: F401 - compatibility alias
   thinking_level,  # noqa: F401 - compatibility alias
 )
 from .runner_tool_audit import (

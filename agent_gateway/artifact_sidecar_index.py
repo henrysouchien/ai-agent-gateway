@@ -7,6 +7,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from .artifact_paths import canonicalize_ticker
+
 
 INDEX_VERSION = 1
 _INDEX_RELATIVE_PATH = ("artifacts", "_index", "artifact_sidecars.sqlite3")
@@ -457,11 +459,18 @@ def _skill_artifact_path_fields(
     }
   if parts[1].startswith("_"):
     raise ValueError("reserved artifact directory is not a skill artifact sidecar")
+  raw_ticker = _text_or_none(payload.get("ticker")) or parts[1]
+  try:
+    indexed_ticker = canonicalize_ticker(raw_ticker)
+  except ValueError:
+    # Preserve indexability of legacy invalid records; exact readers still
+    # reject invalid request tickers at their public lookup boundary.
+    indexed_ticker = raw_ticker.strip().upper()
   return {
     "artifact_ref": artifact_ref,
     "artifact_id": artifact_id,
     "scope": "ticker",
-    "ticker": _text_or_none(payload.get("ticker")) or parts[1],
+    "ticker": indexed_ticker,
     "skill": _text_or_none(payload.get("skill")) or parts[2],
   }
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from .artifact_paths import canonicalize_ticker
+
 
 FMS_DOOR_PREFIX = "fms_"
 
@@ -196,14 +198,14 @@ def _result_ticker(
       continue
     raw = item.get("ticker")
     if raw is not None and str(raw).strip():
-      return str(raw).strip().upper()
+      return canonicalize_ticker(raw)
   for event in artifact_events:
     if not isinstance(event, dict):
       continue
     raw = event.get("ticker")
     if raw is not None and str(raw).strip():
-      return str(raw).strip().upper()
-  return context_ticker
+      return canonicalize_ticker(raw)
+  return canonicalize_ticker(context_ticker) if context_ticker else None
 
 
 __all__ = [

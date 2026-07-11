@@ -24,6 +24,7 @@ from .runner_streaming import (
   STREAM_THINKING_STALL_TIMEOUT,
   classify_guard_outcome,
   effective_stream_stall_timeout,
+  observed_thinking_in_messages,
   thinking_level,
 )
 from .runner_usage import (
@@ -59,12 +60,21 @@ class RunnerStreamTurnMixin:
     config: Dict[str, Any],
     model_info: ModelInfo,
     max_tokens: int,
+    current_messages: List[Dict[str, Any]] | None = None,
   ) -> float:
+    observed_thinking = _runner_module_attr(
+      "observed_thinking_in_messages",
+      observed_thinking_in_messages,
+    )(
+      current_messages or [],
+      model_info=model_info,
+    )
     return _runner_attr(self, "effective_stream_stall_timeout", effective_stream_stall_timeout)(
       self._stream_stall_timeout,
       config=config,
       model_info=model_info,
       max_tokens=max_tokens,
+      observed_thinking=observed_thinking,
       stream_stall_timeout_default=_runner_attr(self, "STREAM_STALL_TIMEOUT", STREAM_STALL_TIMEOUT),
       stream_thinking_stall_timeout_default=_runner_attr(
         self,
@@ -114,6 +124,7 @@ class RunnerStreamTurnMixin:
       config=config,
       model_info=model_info,
       max_tokens=max_tokens,
+      current_messages=current_messages,
     )
 
     def _make_params() -> Dict[str, Any]:

@@ -8,6 +8,7 @@ import time
 from typing import Any, Callable, FrozenSet
 
 from .session import GatewaySession
+from .artifact_paths import canonicalize_ticker
 from .skills import SkillLoader, SkillProfile
 from .task_registry import ParentMessage
 
@@ -66,6 +67,12 @@ def _entry_child_budget_usd(entry: Any) -> float | None:
 
 
 _CONTEXT_TICKER_RE = re.compile(r"\b([A-Z0-9]{1,6}(?:\.[A-Z]{1,2})?)\b")
+_DISCOVERY_EXCLUSION_RE = re.compile(
+  r"^(?:(?:FY)?\d{2,4}E|FY\d{2,4}E?|(?:[1-4]Q|Q[1-4])(?:FY)?\d{0,4}E?|"
+  r"(?:[12]H|H[12])\d{0,4}|\d{1,2}[KQ]|(?:10K|10Q|8K|6K|20F)|"
+  r"\d{2,4}Q[1-4]E?|FY\d{2,4}Q[1-4]E?|\d+[KMGTP]?B)$"
+)
+_B3_DISCOVERY_RE = re.compile(r"^[A-Z]{4}(?:3|4|5|6|7|8|11|31|32|33|34|35)$")
 _TICKER_STOPWORDS = {
   "THE",
   "AND",
@@ -128,10 +135,12 @@ def _render_agent_param_description(entries: list[tuple[str, str]]) -> str:
 def _extract_ticker_from_task(task: str) -> str:
   for match in _CONTEXT_TICKER_RE.finditer(task):
     candidate = match.group(1).strip().upper()
-    if candidate.startswith("20") or candidate.startswith("Q"):
+    if candidate.startswith("20") or candidate.startswith("Q") or _DISCOVERY_EXCLUSION_RE.fullmatch(candidate):
+      continue
+    if any(char.isdigit() for char in candidate) and not _B3_DISCOVERY_RE.fullmatch(candidate):
       continue
     if candidate not in _TICKER_STOPWORDS:
-      return candidate
+      return canonicalize_ticker(candidate)
   return ""
 
 
@@ -221,7 +230,7 @@ def _extract_research_file_id_from_resume_messages(
 
 
 def _html_artifact_ticker(profile: SkillProfile, context_ticker: str) -> str | None:
-  return (context_ticker or None) if profile.scope == "ticker" else None
+  return canonicalize_ticker(context_ticker) if profile.scope == "ticker" and context_ticker else None
 
 
 def _html_artifact_scope(profile: SkillProfile, context_ticker: str) -> str:
@@ -229,7 +238,7 @@ def _html_artifact_scope(profile: SkillProfile, context_ticker: str) -> str:
 
 
 def _dashboard_artifact_ticker(profile: SkillProfile, context_ticker: str) -> str | None:
-  return (context_ticker or None) if profile.scope == "ticker" else None
+  return canonicalize_ticker(context_ticker) if profile.scope == "ticker" and context_ticker else None
 
 
 def _dashboard_artifact_scope(profile: SkillProfile, context_ticker: str) -> str:

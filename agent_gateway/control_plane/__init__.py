@@ -11,6 +11,7 @@ from agent_gateway.session import AuthManager
 from .approvals import build_approvals_router
 from .artifacts import build_artifacts_router
 from .batches import build_batches_router
+from .diligence_prs import build_diligence_prs_router
 from .events import build_events_router
 from .health import build_health_router
 from .profiles import build_profiles_router
@@ -61,6 +62,7 @@ def create_control_plane_router(
     dispatch_scope_validator=dispatch_scope_validator,
   ))
   router.include_router(build_batches_router(auth=auth))
+  router.include_router(build_diligence_prs_router(auth=auth))
   router.include_router(build_approvals_router(auth=auth, autonomous_registry=autonomous_registry))
   router.include_router(build_events_router(auth=auth))
   router.include_router(build_readable_resources_router(

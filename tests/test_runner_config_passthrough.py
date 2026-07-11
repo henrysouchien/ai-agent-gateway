@@ -125,6 +125,26 @@ def test_explicit_stream_stall_timeout_overrides_thinking_default() -> None:
   ) == 42
 
 
+def test_observed_thinking_history_extends_later_turns_when_request_flag_is_false() -> None:
+  runner = _make_runner()
+  model_info = ModelInfo(id="claude-sonnet-5", provider="anthropic", supports_thinking=True)
+  current_messages = [
+    {
+      "role": "assistant",
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "content": [{"type": "thinking", "thinking": "", "signature": "sig"}],
+    }
+  ]
+
+  assert runner._effective_stream_stall_timeout(
+    config={"thinking": False},
+    model_info=model_info,
+    max_tokens=16384,
+    current_messages=current_messages,
+  ) == STREAM_THINKING_STALL_TIMEOUT
+
+
 def test_runner_stall_timeout_delegate_uses_runner_module_constants(monkeypatch) -> None:
   runner = _make_runner()
   monkeypatch.setattr(gateway_runner, "STREAM_STALL_TIMEOUT", 7)

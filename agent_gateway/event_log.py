@@ -34,9 +34,12 @@ class EventLog:
     *,
     on_event: OnEvent | None = None,
     session_id: str = "",
+    defer_terminal_close: bool = False,
   ) -> None:
     self._entries: List[LogEntry] = []
     self._closed = False
+    self._has_terminal = False
+    self._defer_terminal_close = bool(defer_terminal_close)
     self._next_seq = 1
     self._version = 0
     self._updated = asyncio.Event()
@@ -59,7 +62,9 @@ class EventLog:
         pass
 
     if entry.event.get("type") in TERMINAL_EVENT_TYPES:
-      self._closed = True
+      self._has_terminal = True
+      if not self._defer_terminal_close:
+        self._closed = True
 
     self._version += 1
     self._updated.set()
@@ -69,8 +74,7 @@ class EventLog:
     if self._closed:
       return
 
-    has_terminal = any(entry.event.get("type") in TERMINAL_EVENT_TYPES for entry in self._entries)
-    if has_terminal:
+    if self._has_terminal:
       self._closed = True
       self._version += 1
       self._updated.set()
@@ -78,6 +82,10 @@ class EventLog:
 
     reason = error or "stream closed"
     self.append({"type": "error", "error": reason})
+    if self._defer_terminal_close:
+      self._closed = True
+      self._version += 1
+      self._updated.set()
 
   async def iter_from(self, after_seq: int = 0) -> AsyncIterator[LogEntry]:
     index = max(after_seq, 0)
@@ -87,7 +95,7 @@ class EventLog:
         entry = self._entries[index]
         index += 1
         yield entry
-        if entry.event.get("type") in TERMINAL_EVENT_TYPES:
+        if entry.event.get("type") in TERMINAL_EVENT_TYPES and not self._defer_terminal_close:
           return
 
       if self._closed:
@@ -126,8 +134,23 @@ class EventLog:
     return self._closed
 
   @property
+  def has_terminal(self) -> bool:
+    return self._has_terminal
+
+  @property
+  def defer_terminal_close(self) -> bool:
+    return self._defer_terminal_close
+
+  @property
   def next_seq(self) -> int:
     return self._next_seq
+
+
+def log_has_terminal(log: Any) -> bool:
+  has_terminal = getattr(log, "has_terminal", None)
+  if has_terminal is not None:
+    return bool(has_terminal)
+  return bool(log.closed)
 
 
 @dataclass(frozen=True)

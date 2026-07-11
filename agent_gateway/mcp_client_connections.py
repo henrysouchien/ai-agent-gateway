@@ -16,7 +16,7 @@ class McpConnectionRuntime:
   stdio_connect_retries: Callable[[], int]
   stdio_connect_retry_delay: Callable[[int], float]
   stdio_connect_stabilize_delay: Callable[[], float]
-  is_retryable_stdio_connect_error: Callable[[BaseException], bool]
+  is_retryable_stdio_startup_error: Callable[[BaseException], bool]
   build_mcp_env: Callable[[dict[str, Any] | None], dict[str, str]]
   build_http_headers: Callable[[dict[str, Any] | None], dict[str, str]]
   safe_cache_name: Callable[[str], str]
@@ -127,7 +127,7 @@ async def connect_stdio_with_retries(
     try:
       return await manager._connect_stdio(name, config)
     except Exception as exc:
-      if attempt >= total_attempts or not runtime.is_retryable_stdio_connect_error(exc):
+      if attempt >= total_attempts or not runtime.is_retryable_stdio_startup_error(exc):
         raise
       delay = runtime.stdio_connect_retry_delay(attempt)
       message = str(exc).strip() or type(exc).__name__

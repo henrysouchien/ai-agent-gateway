@@ -85,6 +85,19 @@ def test_sub_agent_helper_exports_are_parent_aliases() -> None:
   )
 
 
+@pytest.mark.parametrize("ticker", ["AXIA7", "JBSS32", "AURA33", "TAEE11", "AAPL"])
+def test_lh16_context_ticker_discovery_positive_vectors(ticker: str) -> None:
+  assert sub_agent_helpers._extract_ticker_from_task(f"Analyze {ticker} now") == ticker
+
+
+@pytest.mark.parametrize(
+  "token",
+  ["AXIA1", "AXIA2", "DGS10", "E2E", "F128", "FY2026", "FY26E", "2026E", "2026Q1", "10KB"],
+)
+def test_lh16_context_ticker_discovery_exclusion_vectors(token: str) -> None:
+  assert sub_agent_helpers._extract_ticker_from_task(token) == ""
+
+
 def test_sub_agent_tool_definition_wrappers_preserve_parent_behavior(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:

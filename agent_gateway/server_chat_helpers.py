@@ -22,7 +22,7 @@ from .approval_store import SQLiteApprovalStore
 from .audit_resolver import resolve_audit_writer
 from .auth import CredentialRefreshRequest, CredentialsResolver, ProviderCredentialFailure
 from .event_adapter import adapt_event
-from .event_log import EventLog
+from .event_log import EventLog, log_has_terminal
 from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 from .product_config import gateway_product_id
 from .providers import StreamEvent
@@ -455,6 +455,33 @@ async def _dispatch_chat_turn(
   publish_lifecycle_events: bool = False,
 ) -> ChatTurnResult:
   """Run one chat turn outside the ASGI response lifecycle."""
+  try:
+    return await _dispatch_chat_turn_body(
+      session,
+      inputs,
+      event_log=event_log,
+      on_event=on_event,
+      build_chat_runtime=build_chat_runtime,
+      credentials_resolver=credentials_resolver,
+      transcript_dir=transcript_dir,
+      publish_lifecycle_events=publish_lifecycle_events,
+    )
+  finally:
+    if getattr(event_log, "defer_terminal_close", False):
+      event_log.close()
+
+
+async def _dispatch_chat_turn_body(
+  session: GatewaySession,
+  inputs: ChatTurnInputs,
+  *,
+  event_log: EventLog,
+  on_event: Callable[[StreamEvent], Awaitable[None]],
+  build_chat_runtime: BuildChatRuntime,
+  credentials_resolver: CredentialsResolver | None,
+  transcript_dir: Path | None,
+  publish_lifecycle_events: bool = False,
+) -> ChatTurnResult:
   if session.kind != "chat":
     raise HTTPException(status_code=400, detail="control sessions cannot dispatch chat turns")
   if _active_turn_is_running(session.active_turn):
@@ -688,7 +715,7 @@ async def _dispatch_chat_turn(
       except Exception as exc:
         _emit_terminal({"type": "error", "error": str(exc)})
       finally:
-        if not event_log.closed:
+        if not log_has_terminal(event_log):
           _emit_terminal({"type": "error", "error": "stream closed"})
 
     runner_task = asyncio.create_task(run_agent())
@@ -724,8 +751,9 @@ async def _dispatch_chat_turn(
     _emit_terminal({"type": "error", "error": "stream failed"})
     raise
   finally:
-    if not event_log.closed:
+    if not log_has_terminal(event_log):
       _emit_terminal({"type": "error", "error": "stream closed"})
+    event_log.close()
     await _stop_fanout_worker()
     setattr(event_log, "_on_event", previous_on_event)
     setattr(event_log, "_session_id", previous_session_id)

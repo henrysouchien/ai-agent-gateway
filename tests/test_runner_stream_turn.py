@@ -63,6 +63,7 @@ def test_stream_turn_helpers_resolve_parent_module_aliases(monkeypatch) -> None:
     "config": {"thinking": True},
     "model_info": model_info,
     "max_tokens": 128,
+    "observed_thinking": False,
     "stream_stall_timeout_default": 12.0,
     "stream_thinking_stall_timeout_default": 34.0,
   }

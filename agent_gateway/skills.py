@@ -26,6 +26,15 @@ SKILL_STATE_CLASSES = frozenset({
 Mode = Literal["read_only", "preview", "apply", "model_writer"]
 
 
+@dataclass(frozen=True)
+class DataRequirement:
+  endpoint: str
+  symbol: str
+  params: dict[str, Any]
+  required: bool
+  freshness: str
+
+
 @dataclass
 class SkillProfile:
   """Parsed markdown skill definition.
@@ -70,6 +79,8 @@ class SkillProfile:
   # through mutation_mode); inserting a field mid-struct shifts later fields and
   # breaks positional callers.
   provider: str | None = None
+  data_requirements: tuple[DataRequirement, ...] = ()
+  max_structured_reads: int | None = None
 
 
 def _clean_string(value: Any) -> str | None:
@@ -283,6 +294,89 @@ def _coerce_optional_state_class(value: Any, *, field_name: str, path: Path) -> 
   return text
 
 
+def _coerce_data_requirement_text(
+  value: Any,
+  *,
+  field_name: str,
+  path: Path,
+) -> str:
+  if not isinstance(value, str):
+    raise ValueError(f"{path}: '{field_name}' must be a string")
+  text = value.strip()
+  if not text:
+    raise ValueError(f"{path}: '{field_name}' must be a non-empty string")
+  return text
+
+
+def _coerce_optional_data_requirements(
+  value: Any,
+  *,
+  path: Path,
+) -> tuple[DataRequirement, ...]:
+  if value is None:
+    return ()
+  if not isinstance(value, (list, tuple)):
+    raise ValueError(f"{path}: 'data_requirements' must be a list of mappings")
+
+  requirements: list[DataRequirement] = []
+  for index, raw_item in enumerate(value):
+    field_prefix = f"data_requirements[{index}]"
+    if not isinstance(raw_item, dict):
+      raise ValueError(f"{path}: '{field_prefix}' must be a mapping")
+    allowed_keys = {"endpoint", "symbol", "params", "required", "freshness"}
+    extra_keys = set(raw_item) - allowed_keys
+    if extra_keys:
+      extras = ", ".join(sorted(str(key) for key in extra_keys))
+      raise ValueError(f"{path}: '{field_prefix}' has unsupported keys: {extras}")
+    missing_keys = allowed_keys - set(raw_item)
+    if missing_keys:
+      missing = ", ".join(sorted(missing_keys))
+      raise ValueError(f"{path}: '{field_prefix}' missing required keys: {missing}")
+
+    endpoint = _coerce_data_requirement_text(
+      raw_item.get("endpoint"),
+      field_name=f"{field_prefix}.endpoint",
+      path=path,
+    )
+    if not re.fullmatch(r"[A-Za-z0-9_]+", endpoint):
+      raise ValueError(f"{path}: '{field_prefix}.endpoint' must contain only letters, numbers, and underscores")
+    symbol = _coerce_data_requirement_text(
+      raw_item.get("symbol"),
+      field_name=f"{field_prefix}.symbol",
+      path=path,
+    )
+    raw_params = raw_item.get("params")
+    if not isinstance(raw_params, dict):
+      raise ValueError(f"{path}: '{field_prefix}.params' must be a mapping")
+    params: dict[str, Any] = {}
+    for raw_key, raw_value in raw_params.items():
+      if not isinstance(raw_key, str) or not raw_key.strip():
+        raise ValueError(f"{path}: '{field_prefix}.params' keys must be non-empty strings")
+      params[raw_key.strip()] = raw_value
+    required = _coerce_optional_bool(
+      raw_item.get("required"),
+      field_name=f"{field_prefix}.required",
+      path=path,
+    )
+    freshness = _coerce_data_requirement_text(
+      raw_item.get("freshness"),
+      field_name=f"{field_prefix}.freshness",
+      path=path,
+    )
+    if freshness not in {"immutable_history", "daily_ttl"}:
+      raise ValueError(f"{path}: '{field_prefix}.freshness' must be 'immutable_history' or 'daily_ttl'")
+    requirements.append(
+      DataRequirement(
+        endpoint=endpoint,
+        symbol=symbol,
+        params=params,
+        required=required,
+        freshness=freshness,
+      )
+    )
+  return tuple(requirements)
+
+
 def _split_frontmatter(text: str, *, path: Path) -> tuple[dict[str, Any], str]:
   lines = text.splitlines()
   if not lines or lines[0].strip() != _FRONTMATTER_DELIMITER:
@@ -345,6 +439,8 @@ def parse_skill_file(path: Path) -> SkillProfile:
   raw_mutation_mode = frontmatter.pop("mutation_mode", None)
   raw_extra_excluded_tools = frontmatter.pop("extra_excluded_tools", None)
   raw_tool_packs_enabled = frontmatter.pop("tool_packs_enabled", None)
+  raw_data_requirements = frontmatter.pop("data_requirements", None)
+  raw_max_structured_reads = frontmatter.pop("max_structured_reads", None)
   raw_metadata = frontmatter.pop("metadata", None)
 
   if raw_metadata is None:
@@ -450,6 +546,17 @@ def parse_skill_file(path: Path) -> SkillProfile:
       path=path,
     )
   )
+  coerced_data_requirements = _coerce_optional_data_requirements(
+    raw_data_requirements,
+    path=path,
+  )
+  coerced_max_structured_reads = _coerce_optional_int(
+    raw_max_structured_reads,
+    field_name="max_structured_reads",
+    path=path,
+  )
+  if coerced_max_structured_reads is not None and coerced_max_structured_reads < 1:
+    raise ValueError(f"{path}: 'max_structured_reads' must be greater than or equal to 1")
 
   for key, coerced in [
     ("mcp_servers", coerced_mcp_servers),
@@ -502,9 +609,11 @@ def parse_skill_file(path: Path) -> SkillProfile:
     mode=coerced_mode,
     extra_excluded_tools=coerced_extra_excluded_tools,
     tool_packs_enabled=coerced_tool_packs_enabled,
-    provider=_clean_string(raw_provider),
     state_class=coerced_state_class,
     mutation_mode=_clean_string(raw_mutation_mode),
+    provider=_clean_string(raw_provider),
+    data_requirements=coerced_data_requirements,
+    max_structured_reads=coerced_max_structured_reads,
   )
 
 
@@ -627,6 +736,7 @@ class SkillStateStore:
 __all__ = [
   "AGENT_DESCRIPTION_MAX_CHARS",
   "AGENT_DESCRIPTION_PLACEHOLDER",
+  "DataRequirement",
   "Mode",
   "SkillLoader",
   "SkillProfile",

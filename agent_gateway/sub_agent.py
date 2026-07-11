@@ -459,6 +459,7 @@ def make_resume_handler(
   user_id: str | None = None,
   credentials_resolver_active: bool = False,
   local_tool_handlers: dict[str, Any] | None = None,
+  fms_rebinder: Callable[[dict[str, Any], int], None] | None = None,
   excluded_tools_resolver: ExcludedToolsResolver | None = None,
   default_model: str = "claude-opus-4-7",
   default_max_turns: int = 15,
@@ -628,6 +629,10 @@ def make_resume_handler(
       parent_messages,
       additional_context,
     )
+    if context_research_file_id == 0:
+      context_research_file_id = None
+    if fms_rebinder is not None and context_research_file_id is not None and context_research_file_id > 0:
+      fms_rebinder(sub_local, context_research_file_id)
     skill_event_emitter = SkillRunEventEmitter(
       skill_run_id=skill_run_id,
       profile=profile,

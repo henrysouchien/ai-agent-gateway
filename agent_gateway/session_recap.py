@@ -5,7 +5,7 @@ import time
 from dataclasses import replace
 from typing import Any
 
-from .event_log import EventLog, LogEntry
+from .event_log import EventLog, LogEntry, log_has_terminal
 from .events import (
   RecapApproval,
   RecapArtifact,
@@ -209,7 +209,7 @@ def emit_recap_then_terminal(
   pending_failure: RecapFailure | None = None,
   usage: SessionUsageSummary | None = None,
 ) -> None:
-  if event_log.closed:
+  if log_has_terminal(event_log):
     return
 
   terminal_payload = dict(terminal_event)

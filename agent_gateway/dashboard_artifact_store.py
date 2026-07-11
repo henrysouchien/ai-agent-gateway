@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifact_sidecar_index import artifact_sidecar_index_path, register_dashboard_artifact_sidecar
+from .artifact_paths import canonicalize_ticker
 from schema.dashboard_artifact import DashboardArtifact
 
 
@@ -97,6 +98,7 @@ def list_dashboard_artifacts(
   if not directory.is_dir() or limit <= 0:
     return []
 
+  ticker = canonicalize_ticker(ticker) if ticker is not None else None
   artifacts: list[tuple[int, Path, DashboardArtifact]] = []
   for sidecar_path in sorted(directory.glob("*.json"), key=lambda path: path.name):
     try:

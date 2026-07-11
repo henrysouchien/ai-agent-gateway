@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from .artifact_sidecar_index import artifact_sidecar_index_path, register_html_artifact_sidecar
+from .artifact_paths import canonicalize_ticker
 from schema.html_artifact import HtmlArtifact
 
 
@@ -120,6 +121,7 @@ def list_html_artifacts(
   if not directory.is_dir() or limit <= 0:
     return []
 
+  ticker = canonicalize_ticker(ticker) if ticker is not None else None
   artifacts: list[tuple[int, Path, HtmlArtifact]] = []
   for sidecar_path in sorted(directory.glob("*.json"), key=lambda path: path.name):
     try:

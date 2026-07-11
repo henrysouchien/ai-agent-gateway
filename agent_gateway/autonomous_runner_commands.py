@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .fixture_gate import is_fixture_profile_name, is_fixture_skill_name, require_fixture_provider_available
+from .artifact_paths import canonicalize_ticker
 
 _AUTONOMOUS_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
@@ -78,7 +79,7 @@ def build_autonomous_cmd(
     raise ValueError("mode='skill' does not accept task")
   cmd.extend(["--skill", skill.strip()])
   if ticker and ticker.strip():
-    cmd.extend(["--ticker", ticker.strip().upper()])
+    cmd.extend(["--ticker", canonicalize_ticker(ticker)])
   if context and context.strip():
     cmd.extend(["--context", context.strip()])
   return cmd

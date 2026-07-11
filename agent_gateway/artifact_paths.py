@@ -38,6 +38,13 @@ _EXCHANGE_SUFFIXES = (
 # so they fail _TICKER_RE and cannot become common-equity artifact paths.
 _SHARE_CLASS_SUFFIXES = (".A", ".B", "-A", "-B")
 _TICKER_RE = re.compile(r"^[A-Z]{1,6}$")
+# Non-US listings carry digits and exchange-suffix dots (B3 "TAEE11", HK
+# "0700"). The writer side (api/research/artifact_paths.py) accepts them
+# verbatim under this same path-safe rule; the read/list side must mirror it or
+# persisted artifacts become unreadable (Lane H LH-12 reader symmetry).
+# Hyphens stay excluded so preferred lines (EFC-PC, PPL-PA) keep failing per
+# the non-common-equity policy above.
+_EXTENDED_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.]{0,14}$")
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
 _ARTIFACT_INDEX_RECENT_LIMIT = 5
@@ -296,8 +303,22 @@ def _validate_ticker(ticker: str) -> str:
 def normalize_ticker_for_artifact_request(ticker: str) -> str:
   decoded = _validate_path_component(ticker, "ticker")
   normalized = _normalize_ticker(decoded)
-  if not _TICKER_RE.match(normalized):
-    raise ArtifactPathError("invalid ticker path component")
+  if _TICKER_RE.match(normalized):
+    return normalized
+  raw = decoded.strip().upper()
+  if _EXTENDED_TICKER_RE.match(raw) and ".." not in raw and not raw.endswith("."):
+    return raw
+  raise ArtifactPathError("invalid ticker path component")
+
+
+def canonicalize_ticker(ticker: object) -> str:
+  """Canonicalize and validate an explicit ticker without app imports."""
+  raw = str(ticker or "").strip().upper()
+  if ".." in raw:
+    raise ValueError("ticker must match the CONTRACT rule")
+  normalized = _normalize_ticker(raw)
+  if not _EXTENDED_TICKER_RE.fullmatch(normalized) or normalized.endswith("."):
+    raise ValueError("ticker must match the CONTRACT rule")
   return normalized
 
 
@@ -365,6 +386,7 @@ __all__ = [
   "ArtifactPathError",
   "artifact_json_paths_for_request",
   "artifact_json_path_for_request",
+  "canonicalize_ticker",
   "latest_artifact_json_path_for_request",
   "letter_docx_path_for_request",
   "normalize_ticker_for_artifact_request",

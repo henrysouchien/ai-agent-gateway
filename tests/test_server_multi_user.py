@@ -449,7 +449,7 @@ def test_channel_profile_allowlist_none_preserves_profile_resolution() -> None:
   assert [item["request"].context["profile"] for item in captured_requests] == ["analyst", "community"]
 
 
-def test_channel_profile_allowlist_rejects_disallowed_session_channel_profile() -> None:
+def test_channel_profile_allowlist_rejects_disallowed_session_channel_profile(monkeypatch) -> None:
   async def _resolver(_api_key: str, init_request):
     return _resolver_result_for(init_request.user_id, channel="x")
 
@@ -457,6 +457,14 @@ def test_channel_profile_allowlist_rejects_disallowed_session_channel_profile() 
     credentials_resolver=_resolver,
     channel_profile_allowlist={"x": frozenset({"community"})},
   )
+  subscriber_calls: list[Any] = []
+  original_register = server_module._register_stream_subscriber
+
+  def _record_register(*args, **kwargs):
+    subscriber_calls.append((args, kwargs))
+    return original_register(*args, **kwargs)
+
+  monkeypatch.setattr(server_module, "_register_stream_subscriber", _record_register)
 
   with TestClient(app, raise_server_exceptions=False) as client:
     init_response = _init_session(client, user_id="alice")
@@ -467,6 +475,7 @@ def test_channel_profile_allowlist_rejects_disallowed_session_channel_profile() 
         "user_id": "alice",
         "messages": [{"role": "user", "content": "hello"}],
         "context": {"channel": "unrestricted-client-claim", "profile": "analyst"},
+        "drain_trailing": True,
       },
     )
 
@@ -476,6 +485,7 @@ def test_channel_profile_allowlist_rejects_disallowed_session_channel_profile() 
   session = app.state.auth.session_store.get_session(init_response["session_id"])
   assert session.stream_active is False
   assert session.active_turn is None
+  assert subscriber_calls == []
 
 
 def test_discord_channel_profile_allowlist_rejects_analyst_and_hank_alias() -> None:
@@ -757,6 +767,26 @@ def test_chat_request_id_uses_consumer_value_or_gateway_uuid() -> None:
   assert captured_requests[0]["request"].request_id == "req-123"
   assert captured_requests[1]["request"].request_id != "req-123"
   assert str(uuid.UUID(captured_requests[1]["request"].request_id)) == captured_requests[1]["request"].request_id
+
+
+def test_chat_request_drain_trailing_constructs_deferred_event_log() -> None:
+  app, _captured_requests, _run_calls = _make_app()
+
+  with TestClient(app) as client:
+    init_response = _init_session(client, user_id="alice")
+    _consume_chat_stream(
+      client,
+      init_response["session_token"],
+      {
+        "messages": [{"role": "user", "content": "hello"}],
+        "drain_trailing": True,
+      },
+    )
+
+  session = app.state.auth.session_store.get_session(init_response["session_id"])
+  assert session.active_turn is not None
+  assert session.active_turn.event_log.defer_terminal_close is True
+  assert session.active_turn.event_log.closed is True
 
 
 def test_chat_metadata_reaches_runtime_and_transcript(tmp_path: Path) -> None:

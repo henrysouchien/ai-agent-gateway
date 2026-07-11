@@ -8,6 +8,7 @@ from typing import Any
 
 from .autonomous_runner_claims import get_agent_api_claim_ttl_seconds, sign_user_claim
 from .autonomous_runner_commands import normalize_autonomous_profile
+from .artifact_paths import canonicalize_ticker
 from .autonomous_runner_state import (
   AutonomousTask,
   _fallback_identity_payload,
@@ -237,7 +238,7 @@ class AutonomousRegistryStartMixin:
         task=task.strip() if isinstance(task, str) and task.strip() else None,
         skill=skill.strip() if isinstance(skill, str) and skill.strip() else None,
         context=context.strip() if isinstance(context, str) and context.strip() else None,
-        ticker=ticker.strip().upper() if isinstance(ticker, str) and ticker.strip() else None,
+        ticker=canonicalize_ticker(ticker) if isinstance(ticker, str) and ticker.strip() else None,
         channel=channel.strip().lower() if isinstance(channel, str) and channel.strip() else None,
         dev_mode=effective_dev_mode,
         dispatch_scope=normalized_dispatch_scope,

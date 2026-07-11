@@ -573,7 +573,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         except Exception:
           pass
 
-    event_log = EventLog(session_id=sid)
+    event_log = EventLog(session_id=sid, defer_terminal_close=bool(body.drain_trailing))
     inputs = ChatTurnInputs(
       messages=list(body.messages),
       request_id=body.request_id,

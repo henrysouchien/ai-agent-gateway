@@ -153,9 +153,16 @@ def test_runtime_mcp_scope_error_messages() -> None:
   assert runtime.mcp_scope_error(
     "browser_snapshot",
     "browser",
+    allowed_mcp_tools_by_server=None,
+  ) is None
+
+  assert runtime.mcp_scope_error(
+    "browser_snapshot",
+    "browser",
     allowed_mcp_tools_by_server={"browser": {"browser_snapshot"}},
   ) is None
 
+  expected_skill_serverless = "MCP tool 'unknown' is not allowed in this scoped child run."
   missing_server = runtime.mcp_scope_error(
     "unknown",
     None,
@@ -163,8 +170,13 @@ def test_runtime_mcp_scope_error_messages() -> None:
   )
   assert missing_server is not None
   assert missing_server["code"] == "mcp_tool_not_allowed"
-  assert "unknown" in missing_server["message"]
+  assert missing_server["sub_code"] == "skill_scope"
+  assert missing_server["message"] == expected_skill_serverless
 
+  expected_skill_scoped = (
+    "MCP tool 'filesystem.filesystem_read' is not allowed in this scoped child run. "
+    "Use one of the MCP tools declared by the active skill."
+  )
   wrong_server = runtime.mcp_scope_error(
     "filesystem_read",
     "filesystem",
@@ -172,7 +184,56 @@ def test_runtime_mcp_scope_error_messages() -> None:
   )
   assert wrong_server is not None
   assert wrong_server["code"] == "mcp_tool_not_allowed"
-  assert "filesystem.filesystem_read" in wrong_server["message"]
+  assert wrong_server["sub_code"] == "skill_scope"
+  assert wrong_server["message"] == expected_skill_scoped
+
+  explicit_skill = runtime.mcp_scope_error(
+    "filesystem_read",
+    "filesystem",
+    allowed_mcp_tools_by_server={"browser": {"browser_snapshot"}},
+    scope_context="skill",
+  )
+  assert explicit_skill is not None
+  assert explicit_skill["message"] == expected_skill_scoped
+
+  profile_with_closure = runtime.mcp_scope_error(
+    "filesystem_read",
+    "filesystem",
+    allowed_mcp_tools_by_server={"browser": {"browser_snapshot"}},
+    scope_context="profile",
+    describe_scope_block=lambda server_name, tool_name: f"profile closure: {server_name}.{tool_name}",
+  )
+  assert profile_with_closure is not None
+  assert profile_with_closure["code"] == "mcp_tool_not_allowed"
+  assert profile_with_closure["sub_code"] == "profile_scope"
+  assert profile_with_closure["message"] == "profile closure: filesystem.filesystem_read"
+
+  profile_fallback = runtime.mcp_scope_error(
+    "filesystem_read",
+    "filesystem",
+    allowed_mcp_tools_by_server={"browser": {"browser_snapshot"}},
+    scope_context="profile",
+  )
+  assert profile_fallback is not None
+  assert profile_fallback["code"] == "mcp_tool_not_allowed"
+  assert profile_fallback["sub_code"] == "profile_scope"
+  assert profile_fallback["message"] == (
+    "MCP tool 'filesystem.filesystem_read' is not in this session's active MCP tool scope. "
+    "Call load_tools(servers=['filesystem']) to arm that server's available tools, then retry; "
+    "if it stays blocked after loading, it is not available on this channel."
+  )
+
+  profile_serverless = runtime.mcp_scope_error(
+    "unknown",
+    None,
+    allowed_mcp_tools_by_server={"browser": {"browser_snapshot"}},
+    scope_context="profile",
+  )
+  assert profile_serverless is not None
+  assert profile_serverless["code"] == "mcp_tool_not_allowed"
+  assert profile_serverless["sub_code"] == "profile_scope"
+  assert "session instructions' deferred servers and tool packs list" in profile_serverless["message"]
+  assert "load_tools(servers=[" not in profile_serverless["message"]
 
 
 def test_tool_dispatcher_runtime_wrappers_preserve_parent_override_seams() -> None:
@@ -206,6 +267,35 @@ def test_tool_dispatcher_mcp_scope_wrapper_uses_instance_allowlist() -> None:
   error = dispatcher._mcp_scope_error("filesystem_read", "filesystem")
   assert error is not None
   assert error["code"] == "mcp_tool_not_allowed"
+  assert error["sub_code"] == "skill_scope"
+  assert error["message"] == (
+    "MCP tool 'filesystem.filesystem_read' is not allowed in this scoped child run. "
+    "Use one of the MCP tools declared by the active skill."
+  )
+
+
+def test_tool_dispatcher_mcp_scope_wrapper_passes_profile_context_and_describer() -> None:
+  calls: list[tuple[str | None, str]] = []
+
+  def describe(server_name: str | None, tool_name: str) -> str:
+    calls.append((server_name, tool_name))
+    return f"profile block for {server_name}.{tool_name}"
+
+  dispatcher = ToolDispatcher(
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={},
+    allowed_mcp_tools_by_server={"browser": {"browser_snapshot"}},
+    mcp_scope_context="profile",
+    describe_mcp_scope_block=describe,
+  )
+
+  error = dispatcher._mcp_scope_error("filesystem_read", "filesystem")
+
+  assert error is not None
+  assert error["code"] == "mcp_tool_not_allowed"
+  assert error["sub_code"] == "profile_scope"
+  assert error["message"] == "profile block for filesystem.filesystem_read"
+  assert calls == [("filesystem", "filesystem_read")]
 
 
 def test_tool_dispatcher_observes_post_construction_mutable_allowlist_updates() -> None:

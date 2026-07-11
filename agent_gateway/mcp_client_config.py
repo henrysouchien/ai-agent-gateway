@@ -221,6 +221,15 @@ def is_retryable_stdio_connect_error(exc: BaseException) -> bool:
   return False
 
 
+def is_retryable_stdio_startup_error(exc: BaseException) -> bool:
+  """Startup-connect retryability: transient transport errors (same as the tool-call gate) PLUS
+  transient connect timeouts. Timeouts are startup-only — a tool-call timeout must NOT trigger a
+  reconnect/re-run (duplicate side effects)."""
+  if is_retryable_stdio_connect_error(exc):
+    return True
+  return any(isinstance(candidate, TimeoutError) for candidate in iter_exception_tree(exc))
+
+
 def safe_cache_name(name: str) -> str:
   return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "server"
 
@@ -246,6 +255,7 @@ __all__ = [
   "env_nonnegative_int",
   "expand_env_refs",
   "is_retryable_stdio_connect_error",
+  "is_retryable_stdio_startup_error",
   "iter_exception_tree",
   "resolve_mcp_config_path",
   "safe_cache_name",

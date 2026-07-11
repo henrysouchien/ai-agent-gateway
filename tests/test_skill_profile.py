@@ -1,5 +1,6 @@
 import sys
 import textwrap
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ if str(API_DIR) not in sys.path:
 from agent_gateway.skills import (
   AGENT_DESCRIPTION_MAX_CHARS,
   AGENT_DESCRIPTION_PLACEHOLDER,
+  DataRequirement,
   SKILL_STATE_CLASSES,
   SkillLoader,
   SkillProfile,
@@ -141,6 +143,62 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
     "initial_message": "Run the workflow.",
     "delivery_label": "Daily Scan",
   }
+
+
+def test_parse_data_requirements_typed_field(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    name: data-skill
+    data_requirements:
+      - endpoint: key_metrics
+        symbol: "{ticker}"
+        params:
+          period: annual
+          limit: 12
+        required: true
+        freshness: immutable_history
+    custom: value
+    """,
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.data_requirements == (
+    DataRequirement(
+      endpoint="key_metrics",
+      symbol="{ticker}",
+      params={"period": "annual", "limit": 12},
+      required=True,
+      freshness="immutable_history",
+    ),
+  )
+  assert profile.metadata == {"custom": "value"}
+
+
+@pytest.mark.parametrize("raw", ["7", 7, 7.0])
+def test_parse_max_structured_reads(tmp_path: Path, raw: object) -> None:
+  skill_path = _write_skill(tmp_path, f"max_structured_reads: {raw}")
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.max_structured_reads == 7
+  assert profile.metadata is None
+
+
+@pytest.mark.parametrize("raw", [0, -1])
+def test_parse_max_structured_reads_requires_positive_value(tmp_path: Path, raw: int) -> None:
+  skill_path = _write_skill(tmp_path, f"max_structured_reads: {raw}")
+
+  with pytest.raises(ValueError, match="greater than or equal to 1"):
+    parse_skill_file(skill_path)
+
+
+def test_parse_max_structured_reads_rejects_non_integer(tmp_path: Path) -> None:
+  skill_path = _write_skill(tmp_path, "max_structured_reads: nope")
+
+  with pytest.raises(ValueError, match="must be an integer"):
+    parse_skill_file(skill_path)
 
 
 def test_list_callable_skills_with_descriptions_filters_truncates_and_placeholders(
@@ -523,6 +581,8 @@ def test_none_defaults(tmp_path: Path) -> None:
   assert profile.extra_excluded_tools == set()
   assert profile.tool_packs_enabled is True
   assert profile.state_class is None
+  assert profile.data_requirements == ()
+  assert profile.max_structured_reads is None
 
 
 def test_dataclass_construction_defaults() -> None:
@@ -543,11 +603,17 @@ def test_dataclass_construction_defaults() -> None:
   assert profile.extra_excluded_tools == set()
   assert profile.tool_packs_enabled is True
   assert profile.state_class is None
+  assert profile.data_requirements == ()
+  assert profile.max_structured_reads is None
 
 
 def test_positional_construction_compat() -> None:
   profile = SkillProfile("name", "prompt", None, None, None, None, None, False, None, False, {"custom": 1})
 
+  assert [field.name for field in fields(SkillProfile)][-2:] == [
+    "data_requirements",
+    "max_structured_reads",
+  ]
   assert profile.name == "name"
   assert profile.system_prompt == "prompt"
   assert profile.metadata == {"custom": 1}
@@ -557,6 +623,8 @@ def test_positional_construction_compat() -> None:
   assert profile.mode == "full"
   assert profile.extra_excluded_tools == set()
   assert profile.tool_packs_enabled is True
+  assert profile.data_requirements == ()
+  assert profile.max_structured_reads is None
 
 
 def test_agent_profile_subclass_compat() -> None:

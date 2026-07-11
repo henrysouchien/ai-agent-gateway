@@ -7,6 +7,8 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+from .event_log import log_has_terminal
+
 
 async def chat_subscribe_response(
   request: Request,
@@ -129,7 +131,7 @@ async def chat_recap_response(
     raise HTTPException(status_code=404, detail="No active turn for this session")
 
   recap_payload = compute_session_recap_payload(session, active_turn, trigger="explicit")
-  if active_turn.event_log.closed:
+  if log_has_terminal(active_turn.event_log):
     write_transcript(
       transcript_dir,
       session.session_id,
@@ -191,7 +193,7 @@ def _session_cumulative_recap_response(
         user_id=session.user_id,
         channel=session.channel,
       )
-  if active_turn is not None and not active_turn.event_log.closed:
+  if active_turn is not None and not log_has_terminal(active_turn.event_log):
     appended = active_turn.event_log.append(recap_payload)
     if appended is not None:
       active_turn.transcript_written_seqs.add(int(appended.seq))

@@ -110,6 +110,7 @@ V1_FIELD_PROJECTION: dict[str, frozenset[str]] = {
     "pending_task_count",
     "total_claims_detected",
     "total_sources_in_registry",
+    "registry_scope",
     "judge_called",
     "judge_path",
     "duration_ms",

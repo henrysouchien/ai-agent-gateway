@@ -114,6 +114,7 @@ class ChatRequest(BaseModel):
   context: Dict[str, Any] = Field(default_factory=dict)
   metadata: Dict[str, Any] = Field(default_factory=dict)
   model: Optional[str] = None
+  drain_trailing: bool = False
 
 
 class ChatRecapRequest(BaseModel):

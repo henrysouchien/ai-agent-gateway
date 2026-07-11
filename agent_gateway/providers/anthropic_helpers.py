@@ -74,6 +74,20 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
     ),
   ),
   (
+    ("claude-sonnet-5",),
+    ModelInfo(
+      id="claude-sonnet-5",
+      provider="anthropic",
+      max_output_tokens=64_000,
+      supports_thinking=True,
+      thinking_mode="adaptive",
+      input_cost_per_mtok=3.00,
+      output_cost_per_mtok=15.00,
+      cache_read_cost_per_mtok=0.30,
+      cache_write_cost_per_mtok=3.75,
+    ),
+  ),
+  (
     ("claude-sonnet-4-6",),
     ModelInfo(
       id="claude-sonnet-4-6",

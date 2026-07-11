@@ -139,6 +139,8 @@ class ToolDispatcher:
     run_context: RunContext | None = None,
     get_tool_definitions: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
     allowed_mcp_tools_by_server: Mapping[str, Set[str]] | None = None,
+    mcp_scope_context: str = "skill",
+    describe_mcp_scope_block: Callable[[str | None, str], str | None] | None = None,
   ) -> None:
     self._mcp = mcp_client
     self._local = local_tool_handlers or {}
@@ -166,6 +168,8 @@ class ToolDispatcher:
     self._approval_policy = policy or getattr(session, "approval_policy", None)
     self._run_context = run_context
     self._get_tool_definitions = get_tool_definitions
+    self._mcp_scope_context = mcp_scope_context
+    self._describe_mcp_scope_block = describe_mcp_scope_block
     self._mcp_accepts_abort_event = self._callable_accepts_kw(getattr(self._mcp, "call_tool", None), "abort_event")
     if allowed_mcp_tools_by_server is None:
       self._allowed_mcp_tools_by_server = None
@@ -266,6 +270,8 @@ class ToolDispatcher:
       tool_name,
       server_name,
       allowed_mcp_tools_by_server=self._allowed_mcp_tools_by_server,
+      scope_context=self._mcp_scope_context,
+      describe_scope_block=self._describe_mcp_scope_block,
     )
 
   async def dispatch(

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Awaitable, Callable
 
 from fastapi import HTTPException
 
 from agent_gateway.skill_context import current_skill
+from agent_gateway.artifact_paths import canonicalize_ticker
 
 from . import batches
 
@@ -13,7 +13,6 @@ VALUATION_READY_SKILL = "valuation-ready"
 VALUATION_READY_TEMPLATE = "valuation-ready"
 EXPLICIT_TICKER_SOURCE = "explicit_ticker"
 
-_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,15}$")
 _DILIGENCE_TRACKS_MODULE_NAMES = frozenset({"agent", "agent.skills", "agent.skills.diligence_tracks"})
 
 
@@ -108,10 +107,10 @@ def _guard_active_skill() -> dict[str, Any] | None:
 
 
 def _normalize_ticker(value: Any) -> str | None:
-  ticker = str(value or "").strip().upper()
-  if not ticker or not _TICKER_RE.fullmatch(ticker):
+  try:
+    return canonicalize_ticker(value)
+  except ValueError:
     return None
-  return ticker
 
 
 def _valuation_ready_defaults() -> dict[str, Any]:

@@ -188,6 +188,75 @@ async def _append_interrupted_skill_task(
   )
 
 
+@pytest.mark.parametrize(
+  ("recovered_id", "expects_rebind"),
+  [
+    (37, True),
+    (0, False),
+  ],
+)
+def test_resume_handler_rebinds_only_positive_recovered_research_file_id(
+  tmp_path: Path,
+  recovered_id: int,
+  expects_rebind: bool,
+) -> None:
+  async def _case() -> None:
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir, "earnings-review")
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id=f"bg_rebind_{recovered_id}",
+      agent_name="earnings-review",
+      user_message=f"Ticker: ADI\nRESEARCH_FILE_ID={recovered_id}",
+    )
+    captured: dict[str, Any] = {}
+    rebound_calls: list[int] = []
+
+    async def _parent_fms_handler(_tool_input: dict[str, Any], **_kwargs: Any):
+      return {"handler": "parent"}, None
+
+    async def _rebound_fms_handler(_tool_input: dict[str, Any], **_kwargs: Any):
+      return {"handler": "rebound"}, None
+
+    def _rebind_fms(handlers: dict[str, Any], research_file_id: int) -> None:
+      rebound_calls.append(research_file_id)
+      handlers["fms_probe"] = _rebound_fms_handler
+
+    async def _resume_sub_agent(**kwargs: Any):
+      captured.update(kwargs)
+      return {"response": "continued"}, None
+
+    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    handler = make_resume_handler(
+      [runner],
+      skill_loader=SkillLoader(skills_dir),
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"fms_probe": _parent_fms_handler},
+      fms_rebinder=_rebind_fms,
+      excluded_tools_resolver=frozenset,
+      default_model="claude-sonnet-4-6",
+      allowed_models={"claude-sonnet-4-6"},
+    )
+
+    result, error = await handler({"task_id": f"bg_rebind_{recovered_id}"})
+
+    assert error is None
+    assert result is not None
+    resumed_entry = runner._task_registry.get(result["task_id"])
+    assert resumed_entry is not None
+    await resumed_entry.asyncio_task
+    resumed_handler = captured["dispatcher"]._local["fms_probe"]
+    if expects_rebind:
+      assert rebound_calls == [recovered_id]
+      assert resumed_handler is _rebound_fms_handler
+    else:
+      assert rebound_calls == []
+      assert resumed_handler is _parent_fms_handler
+
+  _run(_case())
+
+
 def test_transcript_reconstructs_messages_and_preserves_thinking(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "transcript.jsonl")
   _run(_append_task_log(log))

@@ -76,7 +76,15 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
     {"type": "budget_exceeded", "total_cost": 1.2, "budget": 1.0},
     {"type": "runtime_guard", "guard": "final_answer", "message": "continue"},
     {"type": "operator_pause", "reason": "operator_pause", "safe_boundary": "before_turn"},
-    {"type": "citation_validation", "schema_version": 1, "turn": 1, "violations": [], "violation_count": 0, "warning_codes": []},
+    {
+      "type": "citation_validation",
+      "schema_version": 1,
+      "turn": 1,
+      "violations": [],
+      "violation_count": 0,
+      "warning_codes": [],
+      "registry_scope": "session",
+    },
     {"type": "heartbeat", "timestamp": 1},
     {
       "type": "interrupted",

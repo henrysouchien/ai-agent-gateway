@@ -110,7 +110,7 @@ from .send_prompt import send_prompt, send_prompt_sync
 from .sdk_runner import AgentSDKRunner
 from .session import AuthManager, GatewaySession, SessionStore
 from .session_event_history import SessionEventHistory
-from .skills import SkillLoader, SkillProfile, SkillStateStore, parse_skill_file
+from .skills import DataRequirement, SkillLoader, SkillProfile, SkillStateStore, parse_skill_file
 from .sub_agent import (
   make_get_background_result_handler,
   make_get_background_result_tool_def,
@@ -231,6 +231,7 @@ __all__ = [
   "Message",
   "DeliveryConfig",
   "DEFAULT_SCHEMA_VERSION",
+  "DataRequirement",
   "DockerBackend",
   "EventLog",
   "EventLogEntry",

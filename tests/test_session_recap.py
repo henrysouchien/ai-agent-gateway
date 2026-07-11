@@ -331,6 +331,24 @@ def _attach_active_turn(session, *, closed: bool = False) -> SessionStream:
   return active_turn
 
 
+def _attach_deferred_terminal_turn(session) -> SessionStream:
+  event_log = EventLog(session_id=session.session_id, defer_terminal_close=True)
+  event_log.append(
+    {
+      "type": "artifact_ready",
+      "artifact_id": "artifact-1",
+      "skill": "html-artifact",
+      "contract_name": "HtmlArtifact",
+      "artifact_path": "artifacts/research/PCTY/html-artifact.json",
+      "ts": 2.0,
+    }
+  )
+  event_log.append({"type": "stream_complete", "usage": {}, "ts": 3.0})
+  active_turn = SessionStream(event_log=event_log, runner_task=None)
+  session.active_turn = active_turn
+  return active_turn
+
+
 def _transcript_events(transcript_dir: Path, session_id: str) -> list[dict[str, Any]]:
   path = transcript_dir / f"{session_id}.jsonl"
   if not path.exists():
@@ -417,6 +435,33 @@ def test_post_chat_recap_closed_log_writes_transcript_only(tmp_path: Path) -> No
     transcript_events = _transcript_events(tmp_path, session.session_id)
     assert [event["type"] for event in transcript_events] == ["session_recap"]
     assert transcript_events[0]["trigger"] == "explicit"
+
+  _run(case())
+
+
+def test_post_chat_recap_deferred_post_terminal_writes_transcript_only(tmp_path: Path) -> None:
+  async def case() -> None:
+    app = _make_recap_app(tmp_path)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+      active_turn = _attach_deferred_terminal_turn(session)
+
+      response = await client.post(
+        "/api/chat/recap",
+        headers=_headers(session_info),
+        json={"session_id": session.session_id, "scope": "active_turn"},
+      )
+
+    assert response.status_code == 200, response.text
+    assert active_turn.event_log.closed is False
+    assert [entry.event["type"] for entry in active_turn.event_log.entries] == [
+      "artifact_ready",
+      "stream_complete",
+    ]
+    assert [event["type"] for event in _transcript_events(tmp_path, session.session_id)] == ["session_recap"]
 
   _run(case())
 
@@ -585,6 +630,37 @@ def test_post_chat_recap_session_cumulative_flushes_closed_active_turn(tmp_path:
     payload = response.json()
     assert payload["seq_range"] == [1, 2]
     assert active_turn.transcript_written_seqs == {1, 2}
+    assert [event["type"] for event in _transcript_events(tmp_path, session.session_id)] == [
+      "artifact_ready",
+      "stream_complete",
+      "session_recap",
+    ]
+
+  _run(case())
+
+
+def test_post_chat_recap_session_cumulative_deferred_post_terminal_is_transcript_only(tmp_path: Path) -> None:
+  async def case() -> None:
+    app = _make_recap_app(tmp_path)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+      active_turn = _attach_deferred_terminal_turn(session)
+
+      response = await client.post(
+        "/api/chat/recap",
+        headers=_headers(session_info),
+        json={"session_id": session.session_id, "scope": "session_cumulative"},
+      )
+
+    assert response.status_code == 200, response.text
+    assert active_turn.event_log.closed is False
+    assert [entry.event["type"] for entry in active_turn.event_log.entries] == [
+      "artifact_ready",
+      "stream_complete",
+    ]
     assert [event["type"] for event in _transcript_events(tmp_path, session.session_id)] == [
       "artifact_ready",
       "stream_complete",

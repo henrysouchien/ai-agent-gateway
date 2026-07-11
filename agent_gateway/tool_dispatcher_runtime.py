@@ -11,19 +11,52 @@ def mcp_scope_error(
   server_name: str | None,
   *,
   allowed_mcp_tools_by_server: Mapping[str, Set[str]] | None,
+  scope_context: str = "skill",
+  describe_scope_block: Callable[[str | None, str], str | None] | None = None,
 ) -> dict[str, Any] | None:
   if allowed_mcp_tools_by_server is None:
     return None
+  is_profile_scope = scope_context == "profile"
+  sub_code = "profile_scope" if is_profile_scope else "skill_scope"
   if not server_name:
+    if is_profile_scope:
+      message = describe_scope_block(server_name, tool_name) if describe_scope_block is not None else None
+      if not isinstance(message, str) or not message.strip():
+        message = (
+          f"MCP tool '{tool_name}' is not in this session's active MCP tool scope. "
+          "Check the session instructions' deferred servers and tool packs list, call load_tools "
+          "for the required server or pack, then retry; if it stays blocked after loading, "
+          "it is not available on this channel."
+        )
+      return {
+        "code": "mcp_tool_not_allowed",
+        "sub_code": sub_code,
+        "message": message,
+      }
     return {
       "code": "mcp_tool_not_allowed",
+      "sub_code": sub_code,
       "message": f"MCP tool '{tool_name}' is not allowed in this scoped child run.",
     }
   allowed_tools = allowed_mcp_tools_by_server.get(server_name, set())
   if tool_name in allowed_tools:
     return None
+  if is_profile_scope:
+    message = describe_scope_block(server_name, tool_name) if describe_scope_block is not None else None
+    if not isinstance(message, str) or not message.strip():
+      message = (
+        f"MCP tool '{server_name}.{tool_name}' is not in this session's active MCP tool scope. "
+        f"Call load_tools(servers=['{server_name}']) to arm that server's available tools, "
+        "then retry; if it stays blocked after loading, it is not available on this channel."
+      )
+    return {
+      "code": "mcp_tool_not_allowed",
+      "sub_code": sub_code,
+      "message": message,
+    }
   return {
     "code": "mcp_tool_not_allowed",
+    "sub_code": sub_code,
     "message": (
       f"MCP tool '{server_name}.{tool_name}' is not allowed in this scoped child run. "
       "Use one of the MCP tools declared by the active skill."

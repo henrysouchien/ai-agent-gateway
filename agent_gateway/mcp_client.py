@@ -200,6 +200,10 @@ def _is_retryable_stdio_connect_error(exc: BaseException) -> bool:
   return _config_helpers.is_retryable_stdio_connect_error(exc)
 
 
+def _is_retryable_stdio_startup_error(exc: BaseException) -> bool:
+  return _config_helpers.is_retryable_stdio_startup_error(exc)
+
+
 def _consume_mcp_tool_call_result(task: asyncio.Task[Any]) -> None:
   _runtime_helpers.consume_mcp_tool_call_result(task, logger=log)
 
@@ -380,7 +384,7 @@ class McpClientManager:
       stdio_connect_retries=_stdio_connect_retries,
       stdio_connect_retry_delay=_stdio_connect_retry_delay,
       stdio_connect_stabilize_delay=_stdio_connect_stabilize_delay,
-      is_retryable_stdio_connect_error=_is_retryable_stdio_connect_error,
+      is_retryable_stdio_startup_error=_is_retryable_stdio_startup_error,
       build_mcp_env=_build_mcp_env,
       build_http_headers=_build_http_headers,
       safe_cache_name=_safe_cache_name,
