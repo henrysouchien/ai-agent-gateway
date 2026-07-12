@@ -355,7 +355,7 @@ def test_parse_sse_and_map_event_translate_responses_stream() -> None:
     'data: {"type":"response.function_call_arguments.delta","delta":"{\\"path\\":\\""}\n\n'
     'data: {"type":"response.function_call_arguments.delta","delta":"README.md\\"}"}\n\n'
     'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_item_1","call_id":"call_1","name":"lookup","arguments":"{\\"path\\":\\"README.md\\"}"}}\n\n'
-    'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":2},"output_tokens":7}}}\n\n'
+    'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":2},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":3}}}}\n\n'
   )
 
   parsed, rest = _parse_sse(payload)
@@ -403,6 +403,7 @@ def test_parse_sse_and_map_event_translate_responses_stream() -> None:
 
   usage_update = events[10]
   assert usage_update.output_tokens == 7
+  assert usage_update.reasoning_tokens == 3
 
   message_end = events[11]
   assert message_end.stop_reason == "tool_use"

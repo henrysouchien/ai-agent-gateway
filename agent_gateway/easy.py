@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import os
@@ -12,6 +13,7 @@ from fastapi import FastAPI
 from ._provider_utils import _get_default_model_for_provider, _resolve_provider
 from .auth import CredentialsRefreshResolver, CredentialsResolver
 from .code_execution import CodeExecutionConfig, build_code_execution
+from .commercial_work_start import CommercialWorkStartGate
 from .mcp_client import McpClientManager
 from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, SessionUsageSummary, UsageEvent, UsageLedger
 from .providers import AnthropicProvider, ModelProvider
@@ -40,6 +42,35 @@ class _NullMcpClient:
 def _mcp_config_path_from_env() -> Path | None:
   env_path = os.getenv("MCP_CONFIG_PATH", "").strip()
   return Path(env_path).expanduser() if env_path else None
+
+
+def _call_commercial_usage_producer_factory(
+  factory: Callable[..., Awaitable[Any] | Any],
+  *,
+  session: GatewaySession,
+  request: ChatRequest,
+  channel: str | None,
+) -> Awaitable[Any] | Any:
+  commercial_work_start = request.commercial_work_start
+  try:
+    signature = inspect.signature(factory)
+  except (TypeError, ValueError):
+    return factory(session, request, channel)
+  params = signature.parameters
+  advertised = params.get("commercial_work_start")
+  legacy_args = (session, request, channel)
+  if advertised is not None and advertised.kind == advertised.POSITIONAL_ONLY:
+    args = (*legacy_args, commercial_work_start)
+    signature.bind(*args)
+    return factory(*args)
+  if advertised is not None or any(
+    param.kind == param.VAR_KEYWORD for param in params.values()
+  ):
+    call_kwargs = {"commercial_work_start": commercial_work_start}
+    signature.bind(*legacy_args, **call_kwargs)
+    return factory(*legacy_args, **call_kwargs)
+  signature.bind(*legacy_args)
+  return factory(*legacy_args)
 
 
 def create_agent(
@@ -88,6 +119,10 @@ def create_agent(
   usage_ledger: UsageLedger | None = None,
   usage_ledger_dlq_path: Path | None = None,
   coordinator: CoordinatorConfig | None = None,
+  commercial_usage_producer_factory: Callable[..., Awaitable[Any] | Any] | None = None,
+  commercial_usage_shipper: Any | None = None,
+  commercial_usage_reconciliation_shipper: Any | None = None,
+  commercial_work_start_gate: CommercialWorkStartGate | None = None,
 ) -> FastAPI:
   """Create a ready-to-run FastAPI gateway backed by a `ModelProvider`.
 
@@ -171,6 +206,8 @@ def create_agent(
     credentials_resolver: Optional init-time resolver for per-user credentials.
     credentials_refresh_resolver: Optional stream-time resolver for rotating
       resolver-backed credentials after provider rate-limit, billing, or auth failures.
+    commercial_work_start_gate: Default-off verifier and durable one-time
+      consumption gate run before request-scoped runtime construction.
 
   Returns:
     A configured FastAPI application exposing session init, chat SSE streaming,
@@ -264,6 +301,27 @@ def create_agent(
     )
 
   app_ref: list[FastAPI | None] = [None]
+  shipper_stop = asyncio.Event()
+  shipper_task: list[asyncio.Task | None] = [None]
+  reconciliation_shipper_task: list[asyncio.Task | None] = [None]
+
+  def _report_shipper_exit(task: asyncio.Task) -> None:
+    if task.cancelled():
+      return
+    error = task.exception()
+    if error is not None:
+      log.critical("commercial usage shipper exited unexpectedly: %s", error)
+    elif not shipper_stop.is_set():
+      log.critical("commercial usage shipper exited before shutdown")
+
+  def _report_reconciliation_shipper_exit(task: asyncio.Task) -> None:
+    if task.cancelled():
+      return
+    error = task.exception()
+    if error is not None:
+      log.critical("commercial reconciliation shipper exited unexpectedly: %s", error)
+    elif not shipper_stop.is_set():
+      log.critical("commercial reconciliation shipper exited before shutdown")
 
   async def _build_chat_runtime(
     session: GatewaySession,
@@ -272,6 +330,16 @@ def create_agent(
     auth_manager: AuthManager,
   ) -> ChatRuntime:
     _ = auth_manager
+    commercial_usage_producer = None
+    if commercial_usage_producer_factory is not None:
+      commercial_usage_producer = _call_commercial_usage_producer_factory(
+        commercial_usage_producer_factory,
+        session=session,
+        request=request,
+        channel=channel,
+      )
+      if inspect.isawaitable(commercial_usage_producer):
+        commercial_usage_producer = await commercial_usage_producer
     local_handlers = dict(tool_handlers or {})
     extra_tool_defs = list(tool_definitions or [])
     runner_ref: list[Any] = [None]
@@ -419,6 +487,7 @@ def create_agent(
         max_budget_usd=max_budget_usd,
         coordinator=coordinator,
         code_execution_spill_dir_provider=ce_bundle.ensure_work_dir if ce_bundle else None,
+        commercial_usage_producer=commercial_usage_producer,
       )
       runner_ref[0] = runner
       return runner
@@ -439,8 +508,41 @@ def create_agent(
       result = on_startup()
       if inspect.isawaitable(result):
         await result
+    if commercial_usage_shipper is not None and shipper_task[0] is None:
+      shipper_stop.clear()
+      shipper_task[0] = asyncio.create_task(
+        commercial_usage_shipper.run_forever(shipper_stop),
+        name="commercial-usage-shipper",
+      )
+      shipper_task[0].add_done_callback(_report_shipper_exit)
+    if (
+      commercial_usage_reconciliation_shipper is not None
+      and reconciliation_shipper_task[0] is None
+    ):
+      shipper_stop.clear()
+      reconciliation_shipper_task[0] = asyncio.create_task(
+        commercial_usage_reconciliation_shipper.run_forever(shipper_stop),
+        name="commercial-usage-reconciliation-shipper",
+      )
+      reconciliation_shipper_task[0].add_done_callback(
+        _report_reconciliation_shipper_exit
+      )
 
   async def _combined_shutdown() -> None:
+    if shipper_task[0] is not None:
+      shipper_stop.set()
+      try:
+        await shipper_task[0]
+      except Exception as exc:
+        log.error("commercial usage shipper stopped with an error: %s", exc)
+      shipper_task[0] = None
+    if reconciliation_shipper_task[0] is not None:
+      shipper_stop.set()
+      try:
+        await reconciliation_shipper_task[0]
+      except Exception as exc:
+        log.error("commercial reconciliation shipper stopped with an error: %s", exc)
+      reconciliation_shipper_task[0] = None
     if code_execution and app_ref[0] is not None:
       from .code_execution import cleanup_code_execution
 
@@ -469,6 +571,7 @@ def create_agent(
       credentials_resolver=credentials_resolver,
       credentials_refresh_resolver=credentials_refresh_resolver,
       resolver_timeout_seconds=resolver_timeout_seconds,
+      commercial_work_start_gate=commercial_work_start_gate,
       mcp_client=mcp_client,
       per_turn_timeout=per_turn_timeout,
       on_startup=_combined_startup,

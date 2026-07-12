@@ -527,6 +527,7 @@ class OpenAIProvider(ModelProvider):
     current_tool_signature = ""
     message_started = False
     reported_output_tokens = 0
+    reported_reasoning_tokens = 0
 
     def _finish_current_block() -> list[StreamEvent]:
       nonlocal current_block_type
@@ -619,18 +620,24 @@ class OpenAIProvider(ModelProvider):
         completion_details = _field(usage, "completion_tokens_details") or {}
         cache_read_tokens = int(_field(prompt_details, "cached_tokens", 0) or 0)
         reasoning_tokens = int(_field(completion_details, "reasoning_tokens", 0) or 0)
-        output_tokens = completion_tokens + reasoning_tokens
+        output_tokens = completion_tokens
         if not message_started:
           message_started = True
           yield StreamEvent(
             type="message_start",
-            input_tokens=prompt_tokens,
+            input_tokens=max(0, prompt_tokens - cache_read_tokens),
             cache_read_tokens=cache_read_tokens,
           )
         output_delta = max(0, output_tokens - reported_output_tokens)
-        if output_delta:
+        reasoning_delta = max(0, reasoning_tokens - reported_reasoning_tokens)
+        if output_delta or reasoning_delta:
           reported_output_tokens = output_tokens
-          yield StreamEvent(type="usage_update", output_tokens=output_delta)
+          reported_reasoning_tokens = reasoning_tokens
+          yield StreamEvent(
+            type="usage_update",
+            output_tokens=output_delta,
+            reasoning_tokens=reasoning_delta,
+          )
 
       if choice is None:
         continue

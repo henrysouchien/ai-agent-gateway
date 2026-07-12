@@ -26,6 +26,8 @@ from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregato
 from .policy_imports import resolve_server_policy_tool_class
 from .product_config import gateway_product_id
 from .providers.agent_sdk import AgentSDKConfig, estimate_cost, _validate_sdk_version
+from .providers.anthropic import _server_tool_unit_deltas
+from .usage_resilience import CommercialUsageCircuitOpen
 from .runner import (
   ToolResultContext,
   _ACTIVE_SKILL_DENY_RESULT_KEY,
@@ -132,6 +134,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     started_at: float | None = None,
     emit_session_recap: bool = True,
     context_surfaces: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
+    commercial_usage_producer: Any | None = None,
   ) -> None:
     self._log = event_log
     self._session_id = session_id or "no-session"
@@ -145,6 +148,10 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     self._allowed_tools = list(allowed_tools or [])
     self._max_turns = max_turns
     self._on_usage = on_usage
+    self._commercial_usage_producer = commercial_usage_producer
+    self._commercial_usage_emitted = False
+    self._sdk_provider_call_usage: dict[str, Any] | None = None
+    self._pending_sdk_usage_deltas: list[dict[str, Any]] = []
     self._on_session_summary = on_session_summary
     self._on_late_usage_event = on_late_usage_event
     self._on_tool_result = on_tool_result
@@ -163,8 +170,11 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     self._usage: Dict[str, Any] = {
       "input_tokens": 0,
       "output_tokens": 0,
+      "reasoning_tokens_observed": 0,
       "cache_creation_input_tokens": 0,
       "cache_read_input_tokens": 0,
+      "provider_reported_cost_usd": None,
+      "provider_unit_deltas": {},
     }
     self._num_turns = 0
     self._stream_terminal_emitted = False
@@ -222,8 +232,20 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
       return
     self._log.append(payload)
 
-  async def _call_on_usage(self, usage_event: UsageEvent) -> None:
-    await _sdk_runner_context.call_on_usage(self, usage_event, logger=log)
+  async def _call_on_usage(
+    self,
+    usage_event: UsageEvent,
+    *,
+    usage_state: str = "succeeded",
+    emit_commercial: bool = True,
+  ) -> None:
+    await _sdk_runner_context.call_on_usage(
+      self,
+      usage_event,
+      logger=log,
+      usage_state=usage_state,
+      emit_commercial=emit_commercial,
+    )
 
   async def _call_on_late_usage_event(self, usage_event: UsageEvent) -> None:
     await _sdk_runner_context.call_on_late_usage_event(self, usage_event, logger=log)
@@ -539,14 +561,23 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
 
   def _update_usage(self, usage: Any, *, total_cost_usd: float | None = None, num_turns: int | None = None) -> None:
     usage_dict = _as_dict(usage)
-    self._usage["input_tokens"] = int(usage_dict.get("input_tokens") or self._usage.get("input_tokens") or 0)
+    raw_input_tokens = int(usage_dict.get("input_tokens") or self._usage.get("input_tokens") or 0)
     self._usage["output_tokens"] = int(usage_dict.get("output_tokens") or self._usage.get("output_tokens") or 0)
+    self._usage["reasoning_tokens_observed"] = int(
+      usage_dict.get("reasoning_tokens")
+      or usage_dict.get("reasoning_tokens_observed")
+      or self._usage.get("reasoning_tokens_observed")
+      or 0
+    )
     self._usage["cache_creation_input_tokens"] = int(
       usage_dict.get("cache_creation_input_tokens") or self._usage.get("cache_creation_input_tokens") or 0
     )
     self._usage["cache_read_input_tokens"] = int(
       usage_dict.get("cache_read_input_tokens") or self._usage.get("cache_read_input_tokens") or 0
     )
+    self._usage["input_tokens"] = raw_input_tokens
+    self._usage["provider_unit_deltas"] = _server_tool_unit_deltas(usage_dict)
+    provider_reported_cost_usd = total_cost_usd
     if total_cost_usd is None:
       estimated = estimate_cost(
         self._effective_model,
@@ -557,10 +588,16 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
       )
       total_cost_usd = estimated.total
     self._usage["estimated_cost"] = float(total_cost_usd or 0.0)
+    self._usage["provider_reported_cost_usd"] = provider_reported_cost_usd
     if num_turns is not None:
       self._num_turns = int(num_turns)
 
-  async def _emit_usage_hook(self) -> None:
+  async def _emit_usage_hook(
+    self, *, usage_state: str = "succeeded", emit_commercial: bool = True
+  ) -> None:
+    # The SDK exposes one cumulative ResultMessage per query, not provider-call
+    # deltas. This event is therefore one agent-sdk query operation; a terminal
+    # path without a ResultMessage emits a zero observation for reconciliation.
     usage_event = UsageEvent(
       user_id=self._usage_user_id,
       session_id=self._session_id,
@@ -571,14 +608,62 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
       provider="agent-sdk",
       input_tokens=int(self._usage.get("input_tokens") or 0),
       output_tokens=int(self._usage.get("output_tokens") or 0),
+      reasoning_tokens_observed=int(self._usage.get("reasoning_tokens_observed") or 0),
       cache_read_tokens=int(self._usage.get("cache_read_input_tokens") or 0),
       cache_creation_tokens=int(self._usage.get("cache_creation_input_tokens") or 0),
       cost_usd=float(self._usage.get("estimated_cost") or 0.0),
+      provider_reported_cost_usd=(
+        str(self._usage["provider_reported_cost_usd"])
+        if self._usage.get("provider_reported_cost_usd") is not None else None
+      ),
+      provider_unit_deltas=dict(self._usage.get("provider_unit_deltas") or {}) or None,
       rate_table_version=self._rate_table_version,
       billing_mode=self._billing_mode,
       channel=self._channel,
     )
-    await self._call_on_usage(usage_event)
+    if emit_commercial and self._commercial_usage_producer is not None:
+      await self._commercial_usage_producer.emit(
+        replace(usage_event, provider="anthropic"), usage_state=usage_state
+      )
+      self._commercial_usage_emitted = True
+    await self._call_on_usage(
+      usage_event, usage_state=usage_state, emit_commercial=False
+    )
+
+  async def _emit_sdk_provider_call_usage(
+    self, usage: dict[str, Any], *, usage_state: str = "succeeded"
+  ) -> None:
+    model = str(usage.get("model") or self._effective_model)
+    cost = estimate_cost(
+      model,
+      int(usage.get("input_tokens") or 0),
+      int(usage.get("output_tokens") or 0),
+      cache_read_tokens=int(usage.get("cache_read_input_tokens") or 0),
+      cache_creation_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+    )
+    event = UsageEvent(
+      user_id=self._usage_user_id,
+      session_id=self._session_id,
+      request_id=self._request_id,
+      parent_turn_id=None,
+      timestamp=time.time(),
+      model=model,
+      provider="anthropic",
+      input_tokens=int(usage.get("input_tokens") or 0),
+      output_tokens=int(usage.get("output_tokens") or 0),
+      cache_read_tokens=int(usage.get("cache_read_input_tokens") or 0),
+      cache_creation_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+      provider_unit_deltas=dict(usage.get("provider_unit_deltas") or {}) or None,
+      cost_usd=float(cost.total),
+      rate_table_version=self._rate_table_version,
+      billing_mode=self._billing_mode,
+      channel=self._channel,
+    )
+    producer = self._commercial_usage_producer
+    if producer is None:
+      return
+    await producer.emit(event, usage_state=usage_state)
+    self._commercial_usage_emitted = True
 
   async def run(
     self,
@@ -589,6 +674,10 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
   ) -> None:
     if self._summary_emitted:
       raise RuntimeError("AgentSDKRunner is single-use; construct a new runner for subsequent runs")
+    if self._commercial_usage_producer is not None:
+      commercial_guard = getattr(self._commercial_usage_producer, "assert_work_allowed", None)
+      if callable(commercial_guard):
+        commercial_guard(self._billing_mode)
     _validate_sdk_version()
     try:
       import claude_agent_sdk
@@ -637,6 +726,17 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
       async for message in query_iter:
         if hasattr(message, "event"):
           self._handle_stream_event(_as_dict(getattr(message, "event")))
+          while self._pending_sdk_usage_deltas:
+            await self._emit_sdk_provider_call_usage(
+              self._pending_sdk_usage_deltas.pop(0)
+            )
+            commercial_guard = getattr(
+              self._commercial_usage_producer, "assert_work_allowed", None
+            )
+            if callable(commercial_guard):
+              # The SDK iterator cannot advance to another provider turn after
+              # a durability incident observed at this response boundary.
+              commercial_guard(self._billing_mode)
           continue
 
         if hasattr(message, "duration_ms") and hasattr(message, "num_turns"):
@@ -645,7 +745,9 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
             total_cost_usd=_get_attr(message, "total_cost_usd"),
             num_turns=_get_attr(message, "num_turns"),
           )
-          await self._emit_usage_hook()
+          await self._emit_usage_hook(
+            emit_commercial=not self._commercial_usage_emitted
+          )
           self._flush_pending_tool_calls(outcome="success")
           self._emit_stream_complete()
           continue
@@ -663,11 +765,30 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
 
       self._flush_pending_tool_calls(outcome="success")
       self._emit_stream_complete()
+    except CommercialUsageCircuitOpen as exc:
+      await self._close_query_iterator()
+      self._flush_pending_tool_calls(outcome="cancelled")
+      self._append({"type": "usage_durability_blocked", "error": str(exc)})
+      self._emit_stream_complete()
     except asyncio.CancelledError:
+      if self._commercial_usage_producer is not None and self._sdk_provider_call_usage is not None:
+        await self._emit_sdk_provider_call_usage(
+          self._sdk_provider_call_usage, usage_state="canceled"
+        )
+        self._sdk_provider_call_usage = None
+      elif self._commercial_usage_producer is not None and not self._commercial_usage_emitted:
+        await self._emit_usage_hook(usage_state="canceled")
       await self._close_query_iterator()
       self._flush_pending_tool_calls(outcome="cancelled")
       self._emit_stream_complete()
     except Exception as exc:
+      if self._commercial_usage_producer is not None and self._sdk_provider_call_usage is not None:
+        await self._emit_sdk_provider_call_usage(
+          self._sdk_provider_call_usage, usage_state="failed_billable"
+        )
+        self._sdk_provider_call_usage = None
+      elif self._commercial_usage_producer is not None and not self._commercial_usage_emitted:
+        await self._emit_usage_hook(usage_state="failed_unbilled")
       await self._close_query_iterator()
       self._flush_pending_tool_calls(outcome="tool_error")
       self._append({"type": "error", "error": str(exc)})

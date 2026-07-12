@@ -85,6 +85,19 @@ class VerdictSummaryResponse(BaseModel):
   skill_run_id: str
 
 
+class StagedProposalResponse(BaseModel):
+  """A proposal staged by the run that still requires an apply step (LH-26)."""
+
+  proposal_id: str
+  status: str
+  requires_apply: bool = True
+  expires_at: str | None = None
+  subcommand: str | None = None
+  ticker: str | None = None
+  research_file_id: int | None = None
+  skill_run_id: str | None = None
+
+
 class PendingApprovalResponse(BaseModel):
   pending_id: str
   tool_name: str
@@ -178,6 +191,7 @@ class AutonomousRunResponse(BaseModel):
   cost_usd: float | None
   skill_run_ids: list[str]
   current_verdict: VerdictSummaryResponse | None
+  staged_proposals: list[StagedProposalResponse] = Field(default_factory=list)
   resumable: bool = False
   resumed_from: str | None = None
   resumed_as: list[str] = Field(default_factory=list)

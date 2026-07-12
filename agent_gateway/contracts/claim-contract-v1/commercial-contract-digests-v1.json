@@ -1,0 +1,13 @@
+{
+  "contract_version": "commercial-cross-repository-contract-v1",
+  "digests": {
+    "canonicalization-v1-vectors.json": "sha256:84a5ea1934dde59b57f86567980c6a3107ce45bf5f7838ae95f3d1c20d7731a7",
+    "commercial-claim-verification-v1.json": "sha256:9571267bdf10264949b15b93815a6eb15b7c9b097856c3fc84ca968d6abb6f3e",
+    "commercial-claim.schema.json": "sha256:cd5bc136e1b01e94e8a65b2f77a6feee601eb9705b0da044bcec51d1a2c5756e",
+    "commercial-usage-event-v2.schema.json": "sha256:31b8fd79a8e90ed897e73f47c1805695534458d3bb6231cbfc82d39965d2302c",
+    "commercial-usage-event.schema.json": "sha256:6c458fe86d8919fd646486c90d4618fa5319cfcf77828eb4fb83a6a955edc171",
+    "commercial-v1-fixtures.json": "sha256:ab87040888ac542820b5996a28e9c578ca108f9aafe0fddc772287a2ed5d2cf2",
+    "commercial-work-authorization-verification-v1.json": "sha256:c97dd8837af3b0d1bb6fbf7d4083e70cd1ebe905d47d42e51632103f60aa2196",
+    "commercial-work-authorization.schema.json": "sha256:bb2888666279ee1204fc1306a3f13ff11cd179a163a73361d9e00ca57bce0615"
+  }
+}

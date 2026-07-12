@@ -84,6 +84,9 @@ class StreamEvent:
   stop_reason: str = ""
   input_tokens: int = 0
   output_tokens: int = 0
+  reasoning_tokens: int = 0
+  provider_units: int = 0
+  provider_unit_deltas: dict[str, int] | None = None
   cache_read_tokens: int = 0
   cache_creation_tokens: int = 0
   raw_block: Any = None

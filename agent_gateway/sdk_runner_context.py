@@ -39,10 +39,29 @@ def context_surface_records(runner: Any, *, logger: Any) -> list[dict[str, Any]]
     return runner._normalize_context_surfaces(runner._context_surfaces_static)
 
 
-async def call_on_usage(runner: Any, usage_event: Any, *, logger: Any) -> None:
+async def call_on_usage(
+  runner: Any,
+  usage_event: Any,
+  *,
+  logger: Any,
+  usage_state: str = "succeeded",
+  emit_commercial: bool = True,
+) -> None:
+  producer = getattr(runner, "_commercial_usage_producer", None)
+  if emit_commercial and producer is not None:
+    await producer.emit(usage_event, usage_state=usage_state)
   recorded = await runner._aggregator.record(usage_event)
   await runner._aggregator.set_turns(runner._num_turns)
   if not recorded or runner._summary_emitted:
+    if producer is not None:
+      mark_late = getattr(producer, "mark_late", None)
+      if callable(mark_late):
+        try:
+          late_result = mark_late(usage_event.event_id)
+          if inspect.isawaitable(late_result):
+            await late_result
+        except Exception as exc:
+          logger.warning("[%s] late commercial reconciliation failed: %s", runner._sid, exc)
     logger.warning("[%s] Usage event arrived after session summary emission: %s", runner._sid, usage_event.event_id)
     await runner._call_on_late_usage_event(usage_event)
     return
@@ -68,6 +87,14 @@ async def call_on_late_usage_event(runner: Any, usage_event: Any, *, logger: Any
 
 
 async def call_on_session_summary(runner: Any, summary: Any, *, logger: Any) -> None:
+  producer = getattr(runner, "_commercial_usage_producer", None)
+  if producer is not None:
+    reconcile = getattr(producer, "reconcile", None)
+    if callable(reconcile):
+      try:
+        await reconcile(summary)
+      except Exception as exc:
+        logger.warning("[%s] commercial usage reconciliation failed: %s", runner._sid, exc)
   if runner._on_session_summary is None:
     return
   try:

@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
@@ -35,6 +37,11 @@ from .autonomous_runner import AutonomousRegistry
 from .control_plane import create_control_plane_router
 from .control_plane.middleware import add_control_plane_version_header_middleware
 from .control_plane.session import _resolve_control_identity
+from .commercial_work_start import (
+  COMMERCIAL_CLAIM_HEADER,
+  COMMERCIAL_WORK_AUTHORIZATION_HEADER,
+  CommercialWorkStartError,
+)
 from .event_log import EventLog, UserEventBus
 from .approvals import ApprovalActionError, _record_vote_and_unblock  # noqa: F401
 from .approval_resolver import resolve_policy  # noqa: F401 - compatibility alias
@@ -288,6 +295,25 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       await asyncio.gather(cleanup_task, approval_expire_task, return_exceptions=True)
 
   app = FastAPI(lifespan=lifespan)
+
+  @app.exception_handler(RequestValidationError)
+  async def _sanitize_commercial_body_validation_error(
+    request: Request,
+    exc: RequestValidationError,
+  ):
+    sensitive_error_types = {
+      "commercial_bearer_material_forbidden",
+    }
+    if any(error.get("type") in sensitive_error_types for error in exc.errors()):
+      return JSONResponse(
+        {
+          "error": "commercial_bearer_material_in_body",
+          "message": "Commercial bearer material is accepted only in dedicated headers.",
+        },
+        status_code=422,
+      )
+    return await request_validation_exception_handler(request, exc)
+
   app.state.auth = auth
   app.state.gateway_config = config
 
@@ -548,6 +574,69 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       log.warning("Client claimed channel=%s; session bound to %s; using session", claimed_channel, channel)
     sid = session.session_id
 
+    commercial_work_start = None
+    commercial_dispatch_owner = None
+    commercial_gate = config.commercial_work_start_gate
+    if (
+      commercial_gate is not None
+      and commercial_gate.enabled
+      and (
+        _active_turn_is_running(session.active_turn)
+        or session.stream_active
+        or session._commercial_dispatch_owner is not None
+      )
+    ):
+      return JSONResponse(
+        {
+          "error": "turn_already_running",
+          "message": "A turn is already running; subscribe via /chat/subscribe",
+        },
+        status_code=409,
+      )
+    if commercial_gate is None:
+      if (
+        request.headers.get(COMMERCIAL_CLAIM_HEADER) is not None
+        or request.headers.get(COMMERCIAL_WORK_AUTHORIZATION_HEADER) is not None
+      ):
+        return JSONResponse(
+          {
+            "error": "commercial_work_start_disabled",
+            "message": "Commercial work-start authorization is disabled.",
+          },
+          status_code=403,
+        )
+    else:
+      try:
+        if commercial_gate.enabled:
+          commercial_dispatch_owner = object()
+          session._commercial_dispatch_owner = commercial_dispatch_owner
+        pending_work_start = commercial_gate.verify_request(
+          request.headers,
+          session=session,
+          request=body,
+          channel=channel,
+        )
+        # Keep the bounded local attach synchronous while this opaque owner is
+        # held. A detached worker cannot be cancelled safely after SQLite has
+        # begun committing the one-time consumption record.
+        commercial_work_start = commercial_gate.consume(pending_work_start)
+      except CommercialWorkStartError as exc:
+        if session._commercial_dispatch_owner is commercial_dispatch_owner:
+          session._commercial_dispatch_owner = None
+        log.warning(
+          "Commercial work start rejected | session=%s | code=%s",
+          sid,
+          exc.code,
+        )
+        return JSONResponse(
+          {"error": exc.code, "message": str(exc)},
+          status_code=exc.status_code,
+        )
+      except BaseException:
+        if session._commercial_dispatch_owner is commercial_dispatch_owner:
+          session._commercial_dispatch_owner = None
+        raise
+
     headers = {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -580,19 +669,26 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       context=dict(body.context or {}),
       metadata=dict(body.metadata or {}),
       model=body.model,
+      commercial_work_start=commercial_work_start,
+      commercial_dispatch_owner=commercial_dispatch_owner,
     )
-    dispatch_task = asyncio.create_task(
-      _dispatch_chat_turn(
-        session,
-        inputs,
-        event_log=event_log,
-        on_event=_on_chat_event,
-        build_chat_runtime=app.state.gateway_build_chat_runtime,
-        credentials_resolver=config.credentials_refresh_resolver,  # type: ignore[arg-type]
-        transcript_dir=transcript_dir,
-        publish_lifecycle_events=True,
+    try:
+      dispatch_task = asyncio.create_task(
+        _dispatch_chat_turn(
+          session,
+          inputs,
+          event_log=event_log,
+          on_event=_on_chat_event,
+          build_chat_runtime=app.state.gateway_build_chat_runtime,
+          credentials_resolver=config.credentials_refresh_resolver,  # type: ignore[arg-type]
+          transcript_dir=transcript_dir,
+          publish_lifecycle_events=True,
+        )
       )
-    )
+    except BaseException:
+      if session._commercial_dispatch_owner is commercial_dispatch_owner:
+        session._commercial_dispatch_owner = None
+      raise
     await asyncio.sleep(0)
     if dispatch_task.done():
       exc = dispatch_task.exception()

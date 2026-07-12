@@ -1,0 +1,205 @@
+{
+  "canonicalization_version": "hank-commercial-json-v1",
+  "usage_event_digest_vector": {
+    "canonical_utf8": "{\"billable_output_tokens\":200,\"cache_read_tokens\":300,\"cache_write_tokens\":100,\"capability_id\":\"portfolio.review\",\"channel\":\"mcp\",\"cost_observation_kind\":\"producer_estimate\",\"environment\":\"dev\",\"execution_context_id\":\"33333333-3333-4333-8333-333333333333\",\"funding_route_id\":\"fund_001\",\"is_batch\":false,\"model\":\"claude-sonnet-test\",\"occurred_at\":\"2026-05-28T20:25:00Z\",\"operation\":\"messages.create\",\"parent_turn_id\":\"turn_001\",\"producer_estimated_cost_usd\":0.0125,\"producer_rate_version\":\"anthropic-test-v1\",\"provider\":\"anthropic\",\"provider_reported_cost_usd\":null,\"provider_units\":null,\"raw_billing_mode\":\"metered\",\"reasoning_tokens_observed\":50,\"request_id\":\"req_001\",\"reservation_id\":\"res_001\",\"schema_version\":1,\"separately_billed_tool_cost_usd\":0,\"session_id\":\"sess_001\",\"shadow_rate_version\":\"commercial-rates-test-v1\",\"source_event_id\":\"evt_hank_001\",\"source_product\":\"hank-agent-gateway\",\"uncached_input_tokens\":1000,\"usage_state\":\"succeeded\",\"workflow_run_id\":\"wf_001\"}",
+    "excluded_top_level_fields": [
+      "source_payload_sha256"
+    ],
+    "normalization_model": "CommercialUsageEventV1",
+    "normalized_payload": {
+      "billable_output_tokens": 200,
+      "cache_read_tokens": 300,
+      "cache_write_tokens": 100,
+      "capability_id": "portfolio.review",
+      "channel": "mcp",
+      "cost_observation_kind": "producer_estimate",
+      "environment": "dev",
+      "execution_context_id": "33333333-3333-4333-8333-333333333333",
+      "funding_route_id": "fund_001",
+      "is_batch": false,
+      "model": "claude-sonnet-test",
+      "occurred_at": "2026-05-28T20:25:00Z",
+      "operation": "messages.create",
+      "parent_turn_id": "turn_001",
+      "producer_estimated_cost_usd": "0.0125",
+      "producer_rate_version": "anthropic-test-v1",
+      "provider": "anthropic",
+      "provider_reported_cost_usd": null,
+      "provider_units": null,
+      "raw_billing_mode": "metered",
+      "reasoning_tokens_observed": 50,
+      "request_id": "req_001",
+      "reservation_id": "res_001",
+      "schema_version": 1,
+      "separately_billed_tool_cost_usd": "0",
+      "session_id": "sess_001",
+      "shadow_rate_version": "commercial-rates-test-v1",
+      "source_event_id": "evt_hank_001",
+      "source_payload_sha256": "sha256:526acc60a5f2235f137d67dda41c9d706ee0cf55549461c719a200f6a4a7e612",
+      "source_product": "hank-agent-gateway",
+      "uncached_input_tokens": 1000,
+      "usage_state": "succeeded",
+      "workflow_run_id": "wf_001"
+    },
+    "producer_input": {
+      "billable_output_tokens": 200,
+      "cache_read_tokens": 300,
+      "cache_write_tokens": 100,
+      "capability_id": "portfolio.review",
+      "channel": "mcp",
+      "cost_observation_kind": "producer_estimate",
+      "environment": "dev",
+      "execution_context_id": "33333333-3333-4333-8333-333333333333",
+      "funding_route_id": "fund_001",
+      "model": "claude-sonnet-test",
+      "occurred_at": "2026-05-28T20:25:00Z",
+      "operation": "messages.create",
+      "parent_turn_id": "turn_001",
+      "producer_estimated_cost_usd": "0.0125",
+      "producer_rate_version": "anthropic-test-v1",
+      "provider": "anthropic",
+      "raw_billing_mode": "metered",
+      "reasoning_tokens_observed": 50,
+      "request_id": "req_001",
+      "reservation_id": "res_001",
+      "schema_version": 1,
+      "separately_billed_tool_cost_usd": "0",
+      "session_id": "sess_001",
+      "shadow_rate_version": "commercial-rates-test-v1",
+      "source_event_id": "evt_hank_001",
+      "source_product": "hank-agent-gateway",
+      "uncached_input_tokens": 1000,
+      "usage_state": "succeeded",
+      "workflow_run_id": "wf_001"
+    },
+    "sha256": "sha256:526acc60a5f2235f137d67dda41c9d706ee0cf55549461c719a200f6a4a7e612"
+  },
+  "vectors": [
+    {
+      "canonical_utf8": "{\"a\":1,\"z\":2}",
+      "description": "Object keys sort by Unicode scalar value; integers remain JSON numbers.",
+      "field_types": {},
+      "input_json": "{\"z\":2,\"a\":1}",
+      "name": "object-key-order",
+      "sha256": "sha256:99168216144c7fed5d4c54916cf98d9c66096280c04a499822a99b6658bd177a"
+    },
+    {
+      "canonical_utf8": "{\"value\":1.23}",
+      "description": "A parsed decimal 1.2300 removes insignificant trailing zeroes.",
+      "field_types": {
+        "/value": "decimal"
+      },
+      "input_json": "{\"value\":\"1.2300\"}",
+      "name": "fraction-trailing-zero",
+      "sha256": "sha256:7bbe836dc36452acd7eb996172d22aa5b1ad299e31ef020f5227481f13dce94c"
+    },
+    {
+      "canonical_utf8": "{\"value\":100000}",
+      "description": "A parsed decimal 1E+5 expands without exponent notation.",
+      "field_types": {
+        "/value": "decimal"
+      },
+      "input_json": "{\"value\":\"1E+5\"}",
+      "name": "positive-exponent",
+      "sha256": "sha256:858ff0da26e1298411976bc390ee9538f917bb49a649ae05d942511c86204a7a"
+    },
+    {
+      "canonical_utf8": "{\"value\":0.0000001}",
+      "description": "A parsed decimal 1E-7 expands without exponent notation.",
+      "field_types": {
+        "/value": "decimal"
+      },
+      "input_json": "{\"value\":\"1E-7\"}",
+      "name": "negative-exponent",
+      "sha256": "sha256:a0235b61201207df642a57f8701756f7b885f379de78f79c3c02799ab008f528"
+    },
+    {
+      "canonical_utf8": "{\"value\":0}",
+      "description": "All negative zero representations normalize to JSON number 0.",
+      "field_types": {
+        "/value": "decimal"
+      },
+      "input_json": "{\"value\":\"-0.000\"}",
+      "name": "negative-zero",
+      "sha256": "sha256:23d7b286bd429460b92a2a1c21b6afc34110446c5034c17363fda363aa0a7c5d"
+    },
+    {
+      "canonical_utf8": "{\"value\":0.12345678901234567890123456789}",
+      "description": "Decimal parsing preserves digits beyond binary floating-point precision.",
+      "field_types": {
+        "/value": "decimal"
+      },
+      "input_json": "{\"value\":\"0.123456789012345678901234567890\"}",
+      "name": "precision-boundary",
+      "sha256": "sha256:720db1a14ab4004c34880a78edb96d4d882d7b89b6b3d05090e572c052502a8d"
+    },
+    {
+      "canonical_utf8": "{\"value\":0.1}",
+      "description": "An ordinary finite host float uses its shortest round-trippable decimal form.",
+      "field_types": {},
+      "input_json": "{\"value\":0.1}",
+      "name": "ordinary-json-float",
+      "sha256": "sha256:097a678e9d1339735cc744964f1c2b1271b2e650d7c59c72d2ff1c93064ceb6e"
+    },
+    {
+      "canonical_utf8": "{\"value\":0.0000001}",
+      "description": "A small finite host float expands without exponent notation.",
+      "field_types": {},
+      "input_json": "{\"value\":1e-7}",
+      "name": "small-exponent-json-float",
+      "sha256": "sha256:a0235b61201207df642a57f8701756f7b885f379de78f79c3c02799ab008f528"
+    },
+    {
+      "canonical_utf8": "{\"value\":100000000000000000000}",
+      "description": "A large finite host float expands without exponent notation.",
+      "field_types": {},
+      "input_json": "{\"value\":1e20}",
+      "name": "large-exponent-json-float",
+      "sha256": "sha256:2426a224e9c5d971eeb3c6c4455aa6ed3c4790765f05f5fa0d169a68e1317b3a"
+    },
+    {
+      "canonical_utf8": "{\"text\":\"\u00e9\"}",
+      "description": "Unicode is encoded as supplied and is not normalized.",
+      "field_types": {},
+      "input_json": "{\"text\":\"\u00e9\"}",
+      "name": "unicode-composed",
+      "sha256": "sha256:42d3cbf59fdccced04e5dff14433fb52d34d58e385e9770ffd896ff517d63b92"
+    },
+    {
+      "canonical_utf8": "{\"text\":\"e\u0301\"}",
+      "description": "A canonically equivalent but decomposed string remains byte-distinct.",
+      "field_types": {},
+      "input_json": "{\"text\":\"e\u0301\"}",
+      "name": "unicode-decomposed",
+      "sha256": "sha256:9b53287cd41955684903378d2b1b4a3ddea9d80d67dcd026319a7c5a9a8a8b42"
+    },
+    {
+      "canonical_utf8": "{\"occurred_at\":\"2026-07-10T12:00:00Z\"}",
+      "description": "Aware datetimes convert to UTC RFC 3339 with Z.",
+      "field_types": {
+        "/occurred_at": "datetime"
+      },
+      "input_json": "{\"occurred_at\":\"2026-07-10T08:00:00-04:00\"}",
+      "name": "datetime-offset",
+      "sha256": "sha256:b65906caffafc0bafded566a793bb2412d632a9ab5159c14f7ecc21b88ad033b"
+    },
+    {
+      "canonical_utf8": "{\"id\":\"a0b1c2d3-e4f5-4678-9abc-def012345678\"}",
+      "description": "UUID values encode as canonical lowercase strings.",
+      "field_types": {
+        "/id": "uuid"
+      },
+      "input_json": "{\"id\":\"A0B1C2D3-E4F5-4678-9ABC-DEF012345678\"}",
+      "name": "uuid-lowercase",
+      "sha256": "sha256:8de162336fef8222444f80c5e29ef0be9e8a77291f448f39185c681714c79e84"
+    },
+    {
+      "canonical_utf8": "{\"items\":[null,true,\"line\\nquote\\\"\"]}",
+      "description": "Null, array order, and JSON string escaping are preserved.",
+      "field_types": {},
+      "input_json": "{\"items\":[null,true,\"line\\nquote\\\"\"]}",
+      "name": "null-array-and-escaping",
+      "sha256": "sha256:c66857da000e4c7f0f38432d30c675cbb88e789dc0052aa47a59b786bbfda429"
+    }
+  ]
+}

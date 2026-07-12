@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Tuple
 from . import sdk_runner_helpers as _sdk_runner_helpers
 from .tool_display import resolve_display
 from .tool_result_semantics import classify_semantic_tool_error
+from .providers.anthropic import _server_tool_unit_deltas
 
 
 log = logging.getLogger("agent_gateway.sdk_runner")
@@ -88,6 +89,39 @@ def _time() -> float:
 class _SDKRunnerStreamMixin:
   def _handle_stream_event(self, raw_event: Dict[str, Any]) -> None:
     event_type = str(raw_event.get("type") or "")
+    if event_type == "message_start":
+      if getattr(self, "_commercial_usage_producer", None) is None:
+        return
+      message = _as_dict(raw_event.get("message"))
+      usage = _as_dict(message.get("usage"))
+      self._sdk_provider_call_usage = {
+        "model": str(message.get("model") or self._effective_model),
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
+        "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+        "output_tokens": 0,
+        "provider_unit_deltas": _server_tool_unit_deltas(usage),
+      }
+      return
+
+    if event_type == "message_delta":
+      if getattr(self, "_commercial_usage_producer", None) is None:
+        return
+      usage = _as_dict(raw_event.get("usage"))
+      current = dict(getattr(self, "_sdk_provider_call_usage", None) or {})
+      current.setdefault("model", self._effective_model)
+      current.setdefault("input_tokens", 0)
+      current.setdefault("cache_read_input_tokens", 0)
+      current.setdefault("cache_creation_input_tokens", 0)
+      current["output_tokens"] = int(usage.get("output_tokens") or 0)
+      current["provider_unit_deltas"] = (
+        _server_tool_unit_deltas(usage)
+        or dict(current.get("provider_unit_deltas") or {})
+      )
+      self._pending_sdk_usage_deltas.append(current)
+      self._sdk_provider_call_usage = None
+      return
+
     if event_type == "content_block_start":
       block = _as_dict(raw_event.get("content_block"))
       if str(block.get("type") or "") == "tool_use":

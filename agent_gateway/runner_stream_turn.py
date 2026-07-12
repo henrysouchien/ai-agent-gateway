@@ -168,6 +168,8 @@ class RunnerStreamTurnMixin:
             input_tokens=event.input_tokens,
             cache_creation_tokens=event.cache_creation_tokens,
             cache_read_tokens=event.cache_read_tokens,
+            provider_units=event.provider_units,
+            provider_unit_deltas=event.provider_unit_deltas,
           )
           if first_turn:
             logger.info(
@@ -263,7 +265,12 @@ class RunnerStreamTurnMixin:
           continue
 
         if event_type == "usage_update":
-          _runner_attr(self, "_apply_usage_update", _apply_usage_update)(usage_totals, output_tokens=event.output_tokens)
+          _runner_attr(self, "_apply_usage_update", _apply_usage_update)(
+            usage_totals,
+            output_tokens=event.output_tokens,
+            reasoning_tokens=event.reasoning_tokens,
+            provider_units=event.provider_units,
+          )
           continue
 
         if event_type == "message_end":
@@ -329,6 +336,10 @@ class RunnerStreamTurnMixin:
         await asyncio_module.sleep(delay)
 
       last_progress_at = time_module.monotonic()
+      commercial_producer = getattr(self, "_commercial_usage_producer", None)
+      commercial_guard = getattr(commercial_producer, "assert_work_allowed", None)
+      if callable(commercial_guard):
+        commercial_guard(self._billing_mode)
       params = _make_params()
       result = _runner_attr(self, "StreamTurnResult", StreamTurnResult)()
       tokens_snapshot = dict(usage_totals)
@@ -352,6 +363,15 @@ class RunnerStreamTurnMixin:
       except cancelled_error_type:
         guard_task.cancel()
         stream_task.cancel()
+        partial_usage_state = _runner_attr(self, "_usage_delta_state", _usage_delta_state)(tokens_snapshot, usage_totals)
+        partial_usage = partial_usage_state.usage
+        usage_totals.clear()
+        usage_totals.update(tokens_snapshot)
+        if partial_usage_state.has_tokens:
+          await self._call_on_usage(
+            self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+            usage_state="canceled",
+          )
         await self.force_close()
         raise
       except Exception as exc:
@@ -370,6 +390,11 @@ class RunnerStreamTurnMixin:
           guard_message = guard_reason[1] if guard_reason else ""
           if action == "retry":
             stream_error = RuntimeError(guard_error)
+            if partial_usage_state.has_tokens:
+              await self._call_on_usage(
+                self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+                usage_state="canceled" if self._disconnected else "failed_billable",
+              )
             _raise_if_disconnected(stream_error)
             logger.warning(
               "[%s] Stream watchdog stall on turn %d after %.1fs (attempt %d/%d), retrying: %s",
@@ -392,7 +417,10 @@ class RunnerStreamTurnMixin:
             _runner_attr(self, "_format_exc", _format_exc)(exc),
           )
           if partial_usage_state.has_tokens:
-            await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=partial_usage))
+            await self._call_on_usage(
+              self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+              usage_state="failed_billable",
+            )
           await self._emit_error_event(guard_error)
           await self._close_client(client, timeout=5.0)
           return None
@@ -426,6 +454,11 @@ class RunnerStreamTurnMixin:
                 attempt=attempt,
                 error=f"credential refreshed after provider {credential_failure.kind} failure",
               )
+              if partial_usage_state.has_tokens:
+                await self._call_on_usage(
+                  self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+                  usage_state="failed_billable",
+                )
               continue
 
         formatted_exc = _runner_attr(self, "_format_exc", _format_exc)(exc)
@@ -438,7 +471,10 @@ class RunnerStreamTurnMixin:
             formatted_exc,
           )
           if partial_usage_state.has_tokens:
-            await self._call_on_usage(self._build_usage_event(model=config["model"], usage_totals=partial_usage))
+            await self._call_on_usage(
+              self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+              usage_state="failed_billable",
+            )
           await self._emit_error_event(formatted_exc)
           await self._close_client(client, timeout=5.0)
           return None
@@ -453,9 +489,19 @@ class RunnerStreamTurnMixin:
           formatted_exc,
         )
         if attempt < stream_retry_max:
+          if partial_usage_state.has_tokens:
+            await self._call_on_usage(
+              self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+              usage_state="canceled" if self._disconnected else "failed_billable",
+            )
           _raise_if_disconnected(exc)
           await self._emit_stream_retry_event(attempt=attempt, error=formatted_exc)
           continue
+        if partial_usage_state.has_tokens:
+          await self._call_on_usage(
+            self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+            usage_state="failed_billable",
+          )
       else:
         action, guard_error, _ = self._classify_guard_outcome(
           guard_reason,
@@ -464,10 +510,17 @@ class RunnerStreamTurnMixin:
         )
         if action != "not_guard":
           guard_message = guard_reason[1] if guard_reason else ""
+          partial_usage_state = _runner_attr(self, "_usage_delta_state", _usage_delta_state)(tokens_snapshot, usage_totals)
+          partial_usage = partial_usage_state.usage
+          usage_totals.clear()
+          usage_totals.update(tokens_snapshot)
           if action == "retry":
             stream_error = RuntimeError(guard_error)
-            usage_totals.clear()
-            usage_totals.update(tokens_snapshot)
+            if partial_usage_state.has_tokens:
+              await self._call_on_usage(
+                self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+                usage_state="canceled" if self._disconnected else "failed_billable",
+              )
             _raise_if_disconnected(stream_error)
             logger.warning(
               "[%s] Stream watchdog stall on turn %d after %.1fs (attempt %d/%d), retrying: %s",
@@ -480,6 +533,11 @@ class RunnerStreamTurnMixin:
             )
             await self._emit_stream_retry_event(attempt=attempt, error=guard_error)
             continue
+          if partial_usage_state.has_tokens:
+            await self._call_on_usage(
+              self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+              usage_state="failed_billable",
+            )
           await self._emit_error_event(guard_error)
           await self._close_client(client, timeout=5.0)
           return None

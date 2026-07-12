@@ -368,6 +368,7 @@ class AgentRunner(
     workspace_dir: str | Path | None = None,
     batch_id: int | str | None = None,
     context_surfaces: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
+    commercial_usage_producer: Any | None = None,
   ) -> None:
     if max_budget_usd is not None and max_budget_usd <= 0:
       raise ValueError("max_budget_usd must be positive when provided")
@@ -400,6 +401,7 @@ class AgentRunner(
     self._get_tool_definitions = get_tool_definitions
     self._on_tool_result = on_tool_result
     self._on_usage = on_usage
+    self._commercial_usage_producer = commercial_usage_producer
     self._on_session_summary = on_session_summary
     self._on_late_usage_event = on_late_usage_event
     self._on_before_stream_complete = on_before_stream_complete

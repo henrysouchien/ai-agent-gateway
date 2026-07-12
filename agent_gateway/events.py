@@ -557,7 +557,17 @@ def _session_usage_summary(value: Any) -> SessionUsageSummary | None:
     product_id=_optional_str(value.get("product_id")),
     model=_optional_str(value.get("model")),
     provider=_optional_str(value.get("provider")),
+    rate_table_version=_optional_str(value.get("rate_table_version")),
+    billing_mode=value.get("billing_mode"),
     context_surfaces=_mapping_list(value.get("context_surfaces", []), "session_recap.usage.context_surfaces"),
+    usage_event_count=int(value.get("usage_event_count", 0)),
+    usage_event_ids=tuple(
+      str(event_id) for event_id in (
+        value.get("usage_event_ids", [])
+        if isinstance(value.get("usage_event_ids", []), (list, tuple)) else []
+      )
+      if str(event_id).strip()
+    ),
   )
 
 

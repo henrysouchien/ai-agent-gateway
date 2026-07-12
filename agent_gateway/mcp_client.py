@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import hmac
 import json
 import logging
 import os
 import random
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -65,6 +68,13 @@ _SUPPORTED_SERVER_TYPES = _config_helpers.SUPPORTED_SERVER_TYPES
 _DEFAULT_ENV_ALLOWLIST = _config_helpers.DEFAULT_ENV_ALLOWLIST
 _MCP_CLOSE_TIMEOUT_SECONDS = 5.0
 _MCP_TOOL_CANCEL_GRACE_SECONDS = 1.0
+GSHEETS_BROKER_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+PER_USER_SESSION_TTL_SECONDS = 60 * 60
+PER_USER_EXPIRY_MARGIN_SECONDS = 5 * 60
+PER_USER_IDLE_REAP_SECONDS = 30 * 60
+PER_USER_REAPER_INTERVAL_SECONDS = 60.0
+PER_USER_INSTANCE_CAP = 32
+PER_USER_DRAIN_TIMEOUT_SECONDS = 60.0
 _MCP_STDIO_CONNECT_RETRIES_ENV = _config_helpers.MCP_STDIO_CONNECT_RETRIES_ENV
 _MCP_STDIO_CONNECT_BACKOFF_ENV = _config_helpers.MCP_STDIO_CONNECT_BACKOFF_ENV
 _MCP_STDIO_CONNECT_STABILIZE_ENV = _config_helpers.MCP_STDIO_CONNECT_STABILIZE_ENV
@@ -260,6 +270,21 @@ class _ServerState:
   config: Dict[str, Any] | None = None
 
 
+@dataclass
+class _PerUserServerState:
+  server: _ServerState
+  expires_at: float
+  last_used_at: float
+  active_calls: int = 0
+  draining: bool = False
+
+
+class _PerUserMcpError(RuntimeError):
+  def __init__(self, code: str, message: str | None = None) -> None:
+    super().__init__(message or code)
+    self.code = code
+
+
 class McpClientManager:
   """Manage MCP server lifecycles and tool routing.
 
@@ -288,6 +313,11 @@ class McpClientManager:
     self._lock = asyncio.Lock()
     self._started = False
     self._servers: Dict[str, _ServerState] = {}
+    self._per_user_servers: Dict[tuple[str, str], _PerUserServerState] = {}
+    self._per_user_spawn_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+    self._per_user_spawn_reservations: Dict[str, int] = {}
+    self._per_user_reaper_task: asyncio.Task[Any] | None = None
+    self._drain_tasks: Set[asyncio.Task[Any]] = set()
     self._tool_definitions: List[Dict[str, Any]] = []
     self._tool_to_server: Dict[str, str] = {}
     self._prefixed_to_original: Dict[str, str] = {}
@@ -520,6 +550,199 @@ class McpClientManager:
   def get_server_for_tool(self, name: str) -> str | None:
     return self._tool_to_server.get(name)
 
+  def is_per_user_server(self, server_name: str) -> bool:
+    state = self._servers.get(self._canonical_server_name(server_name))
+    config = getattr(state, "config", None)
+    return bool(config and config.get("per_user") is True)
+
+  @staticmethod
+  def _canonical_broker_body(payload: Dict[str, Any]) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+  async def _mint_gsheets_broker_session(self, user_id: str) -> tuple[str, float, str]:
+    hmac_key = os.environ.get("GATEWAY_GOOGLE_SHEETS_BROKER_HMAC_KEY", "").strip()
+    base_url = os.environ.get("GOOGLE_SHEETS_BROKER_URL", "").strip().rstrip("/")
+    if not hmac_key or not base_url:
+      raise _PerUserMcpError("sheets_unavailable", "Google Sheets broker is not configured")
+    timestamp = int(time.time())
+    payload = {
+      "user_id": user_id,
+      "scopes": [GSHEETS_BROKER_SCOPE],
+      "request_id": uuid.uuid4().hex,
+      "ttl_s": PER_USER_SESSION_TTL_SECONDS,
+    }
+    message = str(timestamp).encode("ascii") + b"\n" + self._canonical_broker_body(payload)
+    signature = hmac.new(hmac_key.encode("utf-8"), message, hashlib.sha256).hexdigest()
+    try:
+      async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+          f"{base_url}/api/internal/google/sheets-broker-session",
+          json=payload,
+          headers={
+            "X-Resolver-Timestamp": str(timestamp),
+            "X-Resolver-Signature": signature,
+          },
+        )
+    except Exception as exc:
+      raise _PerUserMcpError("sheets_unavailable", "Google Sheets broker is unavailable") from exc
+    try:
+      body = response.json()
+    except Exception:
+      body = {}
+    error_code = str(body.get("error") or "") if isinstance(body, dict) else ""
+    if response.status_code == 404 and error_code == "sheets_not_connected":
+      raise _PerUserMcpError("sheets_not_connected", "Connect Google Sheets before using this tool")
+    if response.status_code != 200:
+      unavailable_code = error_code if error_code in {"broker_rate_limited", "replay_rejected"} else "sheets_unavailable"
+      raise _PerUserMcpError(unavailable_code, "Google Sheets is temporarily unavailable")
+    token = body.get("session_token") if isinstance(body, dict) else None
+    expires_at = body.get("expires_at") if isinstance(body, dict) else None
+    if not isinstance(token, str) or not token or not isinstance(expires_at, (int, float)):
+      raise _PerUserMcpError("sheets_unavailable", "Google Sheets broker returned an invalid response")
+    return token, float(expires_at), base_url
+
+  async def _spawn_per_user_server(
+    self,
+    server_name: str,
+    user_id: str,
+    broker_session: tuple[str, float, str] | None = None,
+  ) -> _PerUserServerState:
+    definition = self._servers.get(server_name)
+    if definition is None or not definition.config:
+      raise _PerUserMcpError("sheets_unavailable", f"MCP server unavailable: {server_name}")
+    if broker_session is None:
+      broker_session = await self._mint_gsheets_broker_session(user_id)
+    token, expires_at, broker_url = broker_session
+    config = copy.deepcopy(definition.config)
+    env = dict(config.get("env") or {})
+    env.update({
+      "GSHEETS_TOKEN_MODE": "broker",
+      "GSHEETS_HEADLESS": "1",
+      "GSHEETS_BROKER_URL": broker_url,
+      "GSHEETS_BROKER_SESSION_TOKEN": token,
+    })
+    config["env"] = env
+    # The tier-1 credential is read only by this gateway process and is never
+    # copied into the child config/environment.
+    state = await self._connect_stdio_with_retries(f"{server_name}[user]", config)
+    return _PerUserServerState(state, expires_at, time.time())
+
+  async def _close_per_user_when_drained(self, state: _PerUserServerState) -> None:
+    deadline = time.monotonic() + PER_USER_DRAIN_TIMEOUT_SECONDS
+    while state.active_calls and time.monotonic() < deadline:
+      await asyncio.sleep(0.05)
+    await self._close_contexts(state.server.exit_contexts)
+
+  def _schedule_drain(self, state: _PerUserServerState) -> None:
+    if state.draining:
+      return
+    state.draining = True
+    task = asyncio.create_task(self._close_per_user_when_drained(state))
+    self._drain_tasks.add(task)
+    task.add_done_callback(self._drain_tasks.discard)
+
+  def _retire_per_user_spawn_lock(self, key: tuple[str, str]) -> None:
+    lock = self._per_user_spawn_locks.get(key)
+    waiters = getattr(lock, "_waiters", None) if lock is not None else None
+    if (
+      key not in self._per_user_servers
+      and lock is not None
+      and not lock.locked()
+      and not waiters
+    ):
+      self._per_user_spawn_locks.pop(key, None)
+
+  def _reap_idle_per_user_servers(self, now: float) -> None:
+    for key, state in list(self._per_user_servers.items()):
+      if state.active_calls == 0 and now - state.last_used_at > PER_USER_IDLE_REAP_SECONDS:
+        if self._per_user_servers.pop(key, None) is state:
+          self._schedule_drain(state)
+          self._retire_per_user_spawn_lock(key)
+
+  async def _run_per_user_reaper(self) -> None:
+    while True:
+      await asyncio.sleep(PER_USER_REAPER_INTERVAL_SECONDS)
+      self._reap_idle_per_user_servers(time.time())
+
+  def _ensure_per_user_reaper(self) -> None:
+    if self._per_user_reaper_task is None or self._per_user_reaper_task.done():
+      self._per_user_reaper_task = asyncio.create_task(self._run_per_user_reaper())
+
+  async def _get_per_user_server(self, server_name: str, user_id: str, *, force: bool = False) -> _PerUserServerState:
+    key = (server_name, user_id)
+    lock = self._per_user_spawn_locks.setdefault(key, asyncio.Lock())
+    try:
+      async with lock:
+        now = time.time()
+        self._reap_idle_per_user_servers(now)
+        current = self._per_user_servers.get(key)
+        alive = current is not None and not current.draining and bool(current.server.exit_contexts)
+        if alive and not force and current.expires_at - now > PER_USER_EXPIRY_MARGIN_SECONDS:
+          current.last_used_at = now
+          return current
+
+        # Mint before changing capacity accounting or evicting a healthy child.
+        broker_session = await self._mint_gsheets_broker_session(user_id)
+        current = self._per_user_servers.get(key)
+        old_state = None
+        if current is not None:
+          old_state = self._per_user_servers.pop(key, None)
+        else:
+          server_count = sum(
+            candidate_server == server_name
+            for candidate_server, _candidate_user in self._per_user_servers
+          )
+          server_count += self._per_user_spawn_reservations.get(server_name, 0)
+          if server_count >= PER_USER_INSTANCE_CAP:
+            idle = [
+              (candidate.last_used_at, candidate_key, candidate)
+              for candidate_key, candidate in self._per_user_servers.items()
+              if candidate_key[0] == server_name and candidate.active_calls == 0
+            ]
+            if not idle:
+              raise _PerUserMcpError(
+                "sheets_unavailable",
+                "Google Sheets per-user instance capacity reached",
+              )
+            _, evict_key, evicted = min(idle)
+            self._per_user_servers.pop(evict_key, None)
+            self._schedule_drain(evicted)
+            self._retire_per_user_spawn_lock(evict_key)
+        self._per_user_spawn_reservations[server_name] = (
+          self._per_user_spawn_reservations.get(server_name, 0) + 1
+        )
+        replacement = None
+        spawned = False
+        try:
+          replacement = await self._spawn_per_user_server(
+            server_name,
+            user_id,
+            broker_session=broker_session,
+          )
+          spawned = True
+        finally:
+          remaining = self._per_user_spawn_reservations.get(server_name, 0) - 1
+          if remaining > 0:
+            self._per_user_spawn_reservations[server_name] = remaining
+          else:
+            self._per_user_spawn_reservations.pop(server_name, None)
+          if spawned:
+            self._per_user_servers[key] = replacement
+          elif (
+            old_state is not None
+            and not old_state.draining
+            and bool(old_state.server.exit_contexts)
+          ):
+            self._per_user_servers[key] = old_state
+          elif old_state is not None:
+            self._schedule_drain(old_state)
+        self._ensure_per_user_reaper()
+        if old_state is not None and old_state is not replacement:
+          self._schedule_drain(old_state)
+        return replacement
+    finally:
+      self._retire_per_user_spawn_lock(key)
+
   def get_original_tool_name(self, name: str) -> str:
     return self._prefixed_to_original.get(name, name)
 
@@ -582,6 +805,7 @@ class McpClientManager:
     tool_input: Dict[str, Any],
     meta: Dict[str, Any] | None = None,
     abort_event: asyncio.Event | None = None,
+    user_id: str | int | None = None,
   ) -> Tuple[Any | None, Dict[str, Any] | None]:
     server_name = self._tool_to_server.get(name)
     if not server_name:
@@ -590,12 +814,28 @@ class McpClientManager:
     server = self._servers.get(server_name)
     if not server:
       return None, {"code": "mcp_tool_error", "message": f"MCP server unavailable: {server_name}"}
+    per_user_state: _PerUserServerState | None = None
+    normalized_user_id: str | None = None
+    if self.is_per_user_server(server_name):
+      normalized_user_id = str(user_id or "").strip()
+      if not normalized_user_id or not normalized_user_id.isdigit() or int(normalized_user_id) <= 0:
+        return None, {"code": "mcp_tool_error", "sub_code": "missing_user_identity", "message": "Google Sheets requires an authenticated user identity"}
+      try:
+        per_user_state = await self._get_per_user_server(server_name, normalized_user_id)
+      except _PerUserMcpError as exc:
+        return None, {"code": "mcp_tool_error", "sub_code": exc.code, "message": str(exc)}
+      except Exception:
+        return None, {"code": "mcp_tool_error", "sub_code": "sheets_unavailable", "message": "Google Sheets process could not be started"}
+      server = per_user_state.server
     original_name = self._prefixed_to_original.get(name, name)
 
     timeout_seconds = self._timeout_for_tool(server_name, name, original_name)
     effective_input = self._translate_provider_symbol(original_name, tool_input)
 
     try:
+      if per_user_state is not None:
+        per_user_state.active_calls += 1
+        per_user_state.last_used_at = time.time()
       result = await self._call_tool_once(
         server=server,
         original_name=original_name,
@@ -605,6 +845,18 @@ class McpClientManager:
         timeout_seconds=timeout_seconds,
       )
     except Exception as exc:
+      if per_user_state is not None:
+        key = (server_name, normalized_user_id or "")
+        if self._per_user_servers.get(key) is per_user_state:
+          self._per_user_servers.pop(key, None)
+          self._retire_per_user_spawn_lock(key)
+        self._schedule_drain(per_user_state)
+        msg = str(exc)
+        return None, {
+          "code": "tool_error",
+          "sub_code": _classify_exception(exc, msg),
+          "message": msg,
+        }
       try:
         retry_result = await self._retry_stdio_tool_call_after_reconnect(
           server_name=server_name,
@@ -634,11 +886,45 @@ class McpClientManager:
         }
     except asyncio.CancelledError:
       raise
+    finally:
+      if per_user_state is not None:
+        per_user_state.active_calls = max(0, per_user_state.active_calls - 1)
+        per_user_state.last_used_at = time.time()
+
+    if per_user_state is not None and self._result_has_error_code(result, "broker_session_expired"):
+      try:
+        replacement = await self._get_per_user_server(
+          server_name,
+          normalized_user_id or "",
+          force=True,
+        )
+        replacement.active_calls += 1
+        try:
+          result = await self._call_tool_once(
+            server=replacement.server,
+            original_name=original_name,
+            tool_input=effective_input,
+            meta=meta,
+            abort_event=abort_event,
+            timeout_seconds=timeout_seconds,
+          )
+        finally:
+          replacement.active_calls = max(0, replacement.active_calls - 1)
+          replacement.last_used_at = time.time()
+      except _PerUserMcpError as exc:
+        return None, {"code": "mcp_tool_error", "sub_code": exc.code, "message": str(exc)}
+      except Exception:
+        return None, {"code": "mcp_tool_error", "sub_code": "sheets_unavailable", "message": "Google Sheets process could not be restarted"}
+      if self._result_has_error_code(result, "broker_session_expired"):
+        message = self._result_message(result)
+        return None, {
+          "code": "mcp_tool_error",
+          "sub_code": "broker_session_expired",
+          "message": message or "Google Sheets broker session expired",
+        }
 
     if result.isError:
-      message = self._extract_text(result.content)
-      if not message and result.structuredContent is not None:
-        message = json.dumps(result.structuredContent, default=str)
+      message = self._result_message(result)
       return None, {
         "code": "mcp_tool_error",
         "sub_code": _classify_mcp_error(message or ""),
@@ -793,10 +1079,24 @@ class McpClientManager:
       if not self._started and not self._servers:
         return
 
+      reaper_task = self._per_user_reaper_task
+      self._per_user_reaper_task = None
+      if reaper_task is not None:
+        reaper_task.cancel()
+        await asyncio.gather(reaper_task, return_exceptions=True)
+
       for server in reversed(list(self._servers.values())):
         await self._close_contexts(server.exit_contexts)
 
+      for state in list(self._per_user_servers.values()):
+        await self._close_contexts(state.server.exit_contexts)
+      if self._drain_tasks:
+        await asyncio.gather(*list(self._drain_tasks), return_exceptions=True)
+
       self._servers.clear()
+      self._per_user_servers.clear()
+      self._per_user_spawn_locks.clear()
+      self._per_user_spawn_reservations.clear()
       self._tool_definitions = []
       self._tool_to_server = {}
       self._prefixed_to_original = {}
@@ -907,6 +1207,28 @@ class McpClientManager:
   @staticmethod
   def _extract_text(content: Any) -> str:
     return _runtime_helpers.extract_text(content)
+
+  def _result_message(self, result: Any) -> str:
+    message = self._extract_text(getattr(result, "content", None))
+    structured_content = getattr(result, "structuredContent", None)
+    if not message and structured_content is not None:
+      message = json.dumps(structured_content, default=str)
+    return message
+
+  def _result_has_error_code(self, result: Any, error_code: str) -> bool:
+    candidates = [getattr(result, "structuredContent", None)]
+    text_payload = self._extract_text(getattr(result, "content", None))
+    if text_payload:
+      candidates.append(text_payload)
+    for candidate in candidates:
+      if isinstance(candidate, str):
+        try:
+          candidate = json.loads(candidate)
+        except json.JSONDecodeError:
+          continue
+      if isinstance(candidate, dict) and candidate.get("error_code") == error_code:
+        return True
+    return False
 
   @staticmethod
   async def _close_contexts(

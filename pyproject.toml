@@ -4,13 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-agent-gateway"
-version = "0.15.6"
+version = "0.15.7"
 description = "Generic AI agent gateway with MCP tool support and streaming"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
+  "cryptography>=45.0.0",
   "fastapi",
+  "jsonschema>=4.22.0",
   "PyJWT",
   "PyYAML",
   "mcp",
@@ -35,4 +37,10 @@ include = ["agent_gateway*"]
 agent = "agent_gateway.cli:main"
 
 [tool.setuptools.package-data]
-agent_gateway = ["rates/*.json", "dashboard_artifact/*.json"]
+agent_gateway = [
+  "rates/*.json",
+  "dashboard_artifact/*.json",
+  "contracts/claim-contract-v1/*.json",
+  "contracts/usage-reconciliation-v1/*.json",
+  "contracts/usage-reconciliation-v2/*.json",
+]

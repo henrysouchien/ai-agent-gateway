@@ -467,6 +467,11 @@ async def _dispatch_chat_turn(
       publish_lifecycle_events=publish_lifecycle_events,
     )
   finally:
+    if (
+      inputs.commercial_dispatch_owner is not None
+      and session._commercial_dispatch_owner is inputs.commercial_dispatch_owner
+    ):
+      session._commercial_dispatch_owner = None
     if getattr(event_log, "defer_terminal_close", False):
       event_log.close()
 
@@ -482,6 +487,11 @@ async def _dispatch_chat_turn_body(
   transcript_dir: Path | None,
   publish_lifecycle_events: bool = False,
 ) -> ChatTurnResult:
+  if (
+    inputs.commercial_dispatch_owner is not None
+    and session._commercial_dispatch_owner is not inputs.commercial_dispatch_owner
+  ):
+    raise HTTPException(status_code=409, detail="Commercial dispatch ownership was lost")
   if session.kind != "chat":
     raise HTTPException(status_code=400, detail="control sessions cannot dispatch chat turns")
   if _active_turn_is_running(session.active_turn):
@@ -504,6 +514,7 @@ async def _dispatch_chat_turn_body(
     metadata=request_metadata,
     model=inputs.model,
   )
+  request._bind_commercial_work_start(inputs.commercial_work_start)
 
   raw_channel = context.get("channel")
   claimed_channel = raw_channel.strip().lower() if isinstance(raw_channel, str) else None
@@ -522,6 +533,12 @@ async def _dispatch_chat_turn_body(
         detail=f"Profile '{context['profile']}' is not permitted on channel '{session.channel}'",
       )
 
+  if inputs.commercial_dispatch_owner is not None:
+    if session._commercial_dispatch_owner is not inputs.commercial_dispatch_owner:
+      raise HTTPException(
+        status_code=409, detail="Commercial dispatch ownership was lost"
+      )
+    session._commercial_dispatch_owner = None
   session.stream_active = True
   sid = session.session_id
   active_turn = SessionStream(

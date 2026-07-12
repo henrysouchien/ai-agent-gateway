@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+import asyncio
 import sys
 import types
 from pathlib import Path
@@ -14,6 +15,35 @@ if str(PKG_DIR) not in sys.path:
 import agent_gateway.providers.openai as openai_provider_module
 import agent_gateway.providers.openai_helpers as openai_helpers
 from agent_gateway.providers import OpenAIProvider
+
+
+def test_stream_usage_keeps_reasoning_as_output_subset_and_input_uncached() -> None:
+  class Completions:
+    async def create(self, **params):
+      async def chunks():
+        yield {
+          "usage": {
+            "prompt_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 25},
+            "completion_tokens": 40,
+            "completion_tokens_details": {"reasoning_tokens": 10},
+          },
+          "choices": [{"finish_reason": "stop", "delta": {}}],
+        }
+      return chunks()
+
+  client = types.SimpleNamespace(
+    chat=types.SimpleNamespace(completions=Completions())
+  )
+
+  async def collect():
+    return [event async for event in OpenAIProvider().stream(client, {})]
+
+  events = asyncio.run(collect())
+  start = next(event for event in events if event.type == "message_start")
+  usage = next(event for event in events if event.type == "usage_update")
+  assert (start.input_tokens, start.cache_read_tokens) == (75, 25)
+  assert (usage.output_tokens, usage.reasoning_tokens) == (40, 10)
 
 
 @pytest.fixture(autouse=True)

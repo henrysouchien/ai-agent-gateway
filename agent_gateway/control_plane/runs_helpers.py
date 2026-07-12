@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +52,7 @@ from .runs_models import (
   RunMessageRequest,
   RunResponse,
   RunsListResponse,
+  StagedProposalResponse,
   VerdictSummaryResponse,
 )
 
@@ -76,6 +78,7 @@ __all__ = [
   "RunMessageRequest",
   "RunResponse",
   "RunsListResponse",
+  "StagedProposalResponse",
   "VerdictSummaryResponse",
 ]
 
@@ -216,6 +219,53 @@ def _current_verdict(events: list[dict[str, Any]]) -> VerdictSummaryResponse | N
       skill_run_id=skill_run_id,
     )
   return None
+
+
+def _staged_proposals(events: list[dict[str, Any]]) -> list[StagedProposalResponse]:
+  staged: dict[str, StagedProposalResponse] = {}
+  applied: set[str] = set()
+  for event in events:
+    if event.get("type") != "skill_result_captured":
+      continue
+    skill_run_id = event.get("skill_run_id")
+    fms_results = event.get("fms_results")
+    if not isinstance(fms_results, list):
+      continue
+    for result in fms_results:
+      if not isinstance(result, dict):
+        continue
+      proposal_id = result.get("proposal_id")
+      if not isinstance(proposal_id, str) or not proposal_id:
+        continue
+      status = str(result.get("status") or "")
+      if status == "applied":
+        applied.add(proposal_id)
+        continue
+      if status != "staged":
+        continue
+      raw_expires = result.get("expires_at")
+      expires_at_iso: str | None = None
+      if isinstance(raw_expires, (int, float)) and not isinstance(raw_expires, bool):
+        try:
+          if math.isfinite(raw_expires):
+            expires_at_iso = _iso_from_unix(raw_expires)
+        except (OverflowError, OSError, ValueError):
+          expires_at_iso = None
+      readback = result.get("readback")
+      raw_research_file_id = readback.get("research_file_id") if isinstance(readback, dict) else None
+      research_file_id_is_int = isinstance(raw_research_file_id, int) and not isinstance(raw_research_file_id, bool)
+      subcommand = result.get("subcommand")
+      ticker = result.get("ticker")
+      staged[proposal_id] = StagedProposalResponse(
+        proposal_id=proposal_id,
+        status=status,
+        expires_at=expires_at_iso,
+        subcommand=str(subcommand) if subcommand else None,
+        ticker=str(ticker) if ticker else None,
+        research_file_id=int(raw_research_file_id) if research_file_id_is_int else None,
+        skill_run_id=skill_run_id if isinstance(skill_run_id, str) else None,
+      )
+  return [proposal for proposal_id, proposal in staged.items() if proposal_id not in applied]
 
 
 def _coerce_cost_usd(value: Any) -> float | None:
@@ -585,6 +635,7 @@ def _autonomous_run_from_task(record: AutonomousTask, *, skills_dir: Path | None
     cost_usd=_events_cost_usd(events),
     skill_run_ids=_skill_run_ids(events),
     current_verdict=_current_verdict(events),
+    staged_proposals=_staged_proposals(events),
     resumable=_autonomous_task_resumable(record, skills_dir),
     resumed_from=record.resumed_from,
     resumed_as=resumed_as,

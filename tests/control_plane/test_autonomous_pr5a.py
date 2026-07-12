@@ -631,6 +631,16 @@ def test_rehydrated_autonomous_run_is_owner_scoped_with_event_derived_fields(mon
           "confidence": "medium",
           "one_line_summary": "Watch the setup",
         },
+        "fms_results": [
+          {
+            "proposal_id": "prop-monitoring-1",
+            "status": "staged",
+            "expires_at": 195.0,
+            "subcommand": "propose_monitoring_init",
+            "ticker": "STWD",
+            "readback": {"research_file_id": 2042},
+          }
+        ],
         "ts": 190,
       },
     ],
@@ -658,6 +668,18 @@ def test_rehydrated_autonomous_run_is_owner_scoped_with_event_derived_fields(mon
     "one_line_summary": "Watch the setup",
     "skill_run_id": "skill-run-1",
   }
+  assert runs[0]["staged_proposals"] == [
+    {
+      "proposal_id": "prop-monitoring-1",
+      "status": "staged",
+      "requires_apply": True,
+      "expires_at": "1970-01-01T00:03:15Z",
+      "subcommand": "propose_monitoring_init",
+      "ticker": "STWD",
+      "research_file_id": 2042,
+      "skill_run_id": "skill-run-1",
+    }
+  ]
   assert detail.status_code == 200, detail.text
   assert detail.json()["run_id"] == "run-rehydrated"
   assert detail.json()["cost_usd"] == 0.12

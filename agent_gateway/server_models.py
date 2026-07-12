@@ -1,18 +1,39 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import inspect
+import json
 import logging
 import re
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple
+from typing import (
+  TYPE_CHECKING,
+  Any,
+  Awaitable,
+  Callable,
+  Dict,
+  List,
+  Mapping,
+  Optional,
+  Set,
+  Tuple,
+)
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic_core import PydanticCustomError
 
 from .auth import CredentialsRefreshResolver, CredentialsResolver
+from .commercial_work_start import (
+  COMMERCIAL_CLAIM_HEADER,
+  COMMERCIAL_WORK_AUTHORIZATION_HEADER,
+)
+from .commercial_claims import COMMERCIAL_CLAIM_ISSUER
+from .commercial_work_authorization import WORK_AUTHORIZATION_ISSUER
 from .event_log import EventLog
 from .mcp_client import McpClientManager
 from .providers import ModelProvider
@@ -22,6 +43,12 @@ from .sdk_runner import AgentSDKRunner
 from .session import AuthManager, GatewaySession
 from .tool_dispatcher import ApprovalDecision, ApprovalRequest
 from .tool_redaction import get_audit_hmac_key_id, get_audit_hmac_secret
+
+if TYPE_CHECKING:
+  from .commercial_work_start import (
+    CommercialWorkStartContext,
+    CommercialWorkStartGate,
+  )
 
 SystemPrompt = str | List[Tuple[str, bool]]
 ExecutionLocationResolver = Callable[[str], Optional[str]]
@@ -60,6 +87,80 @@ _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS = 15.0
 _SIDECAR_SLUG_RE = re.compile(r"[^a-z0-9-]+")
 log = logging.getLogger("agent_gateway.server")
 _STREAM_SUBSCRIBER_DONE = object()
+_COMMERCIAL_BODY_TOKEN_KEYS = frozenset({
+  "commercial_claim",
+  "commercial_claim_token",
+  "commercial_execution_claim",
+  "commercial_execution_claim_token",
+  "commercial_work_authorization",
+  "commercial_work_authorization_token",
+  "hank_commercial_claim",
+  "hank_work_authorization",
+  "work_authorization",
+  "work_authorization_token",
+  "x_hank_commercial_claim",
+  "x_hank_work_authorization",
+})
+_COMMERCIAL_TOKEN_ISSUERS = frozenset({
+  COMMERCIAL_CLAIM_ISSUER,
+  WORK_AUTHORIZATION_ISSUER,
+})
+
+
+def _normalized_body_key(value: str) -> str:
+  return re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")
+
+
+def _looks_like_commercial_jwt(value: str) -> bool:
+  if not 1 <= len(value) <= 4096:
+    return False
+  segments = value.split(".")
+  if len(segments) != 3 or any(not segment for segment in segments):
+    return False
+  try:
+    payload_segment = segments[1]
+    padding = "=" * (-len(payload_segment) % 4)
+    payload = json.loads(base64.b64decode(
+      payload_segment + padding,
+      altchars=b"-_",
+      validate=True,
+    ))
+  except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+    return False
+  return isinstance(payload, dict) and payload.get("iss") in _COMMERCIAL_TOKEN_ISSUERS
+
+
+def _assert_no_commercial_bearer_material(value: Any) -> None:
+  stack = [value]
+  seen: set[int] = set()
+  while stack:
+    current = stack.pop()
+    if isinstance(current, Mapping):
+      identity = id(current)
+      if identity in seen:
+        continue
+      seen.add(identity)
+      for key, item in current.items():
+        if (
+          isinstance(key, str)
+          and _normalized_body_key(key) in _COMMERCIAL_BODY_TOKEN_KEYS
+        ):
+          raise PydanticCustomError(
+            "commercial_bearer_material_forbidden",
+            "commercial bearer material is accepted only in dedicated headers",
+          )
+        stack.append(item)
+    elif isinstance(current, (list, tuple)):
+      identity = id(current)
+      if identity in seen:
+        continue
+      seen.add(identity)
+      stack.extend(current)
+    elif isinstance(current, str) and _looks_like_commercial_jwt(current):
+      raise PydanticCustomError(
+        "commercial_bearer_material_forbidden",
+        "commercial bearer material is accepted only in dedicated headers",
+      )
 
 
 class ChatInitRequest(BaseModel):
@@ -115,6 +216,24 @@ class ChatRequest(BaseModel):
   metadata: Dict[str, Any] = Field(default_factory=dict)
   model: Optional[str] = None
   drain_trailing: bool = False
+  _commercial_work_start: "CommercialWorkStartContext | None" = PrivateAttr(
+    default=None
+  )
+
+  @model_validator(mode="before")
+  @classmethod
+  def _reject_commercial_bearer_material(cls, value: Any) -> Any:
+    _assert_no_commercial_bearer_material(value)
+    return value
+
+  @property
+  def commercial_work_start(self) -> "CommercialWorkStartContext | None":
+    return self._commercial_work_start
+
+  def _bind_commercial_work_start(
+    self, context: "CommercialWorkStartContext | None"
+  ) -> None:
+    self._commercial_work_start = context
 
 
 class ChatRecapRequest(BaseModel):
@@ -153,6 +272,11 @@ class ChatTurnInputs:
   context: dict[str, Any] | None
   metadata: dict[str, Any] | None
   model: str | None
+  commercial_work_start: "CommercialWorkStartContext | None" = field(
+    default=None,
+    repr=False,
+  )
+  commercial_dispatch_owner: object | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -344,6 +468,8 @@ class GatewayServerConfig:
     dispatch_scope_validator: Optional dispatch-time validator for structured
       portfolio scopes. The callback may canonicalize the redacted scope or
       raise an HTTPException/ValueError to stop run creation.
+    commercial_work_start_gate: Optional default-off gate that verifies header
+      authority and persists one-time consumption before runtime construction.
     mcp_client: Optional shared `McpClientManager`.
     sdk_config: Optional `AgentSDKConfig` when using `AgentSDKRunner`.
     per_turn_timeout: Default per-turn timeout in seconds.
@@ -391,6 +517,8 @@ class GatewayServerConfig:
     default_factory=lambda: [
       "Authorization",
       "Content-Type",
+      COMMERCIAL_CLAIM_HEADER,
+      COMMERCIAL_WORK_AUTHORIZATION_HEADER,
       *_AGENT_API_CLAIM_HEADERS.values(),
     ]
   )
@@ -399,6 +527,7 @@ class GatewayServerConfig:
   credentials_resolver: CredentialsResolver | None = None
   credentials_refresh_resolver: CredentialsRefreshResolver | None = None
   dispatch_scope_validator: DispatchScopeValidator | None = None
+  commercial_work_start_gate: "CommercialWorkStartGate | None" = None
   resolver_timeout_seconds: float = 5.0
   mcp_client: Optional[McpClientManager] = None
   sdk_config: AgentSDKConfig | None = None

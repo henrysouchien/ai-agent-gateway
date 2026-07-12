@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hank.internal/contracts/gateway-usage-reconciliation-evidence-v2",
+  "title": "Gateway Usage Reconciliation Evidence V2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evidence_schema_version", "evidence_revision", "supersedes_report_sha256",
+    "content_sha256", "environment", "source_product", "request_id", "session_id",
+    "execution_context_id", "workflow_run_id", "workflow_attempt_group_id",
+    "workflow_attempt_number", "retry_of_workflow_run_id", "workflow_attempt_kind",
+    "work_authorization_id", "status", "commercial_event_count",
+    "provider_call_event_count", "durable_provider_call_event_count",
+    "separate_unit_event_count", "expected_provider_call_count",
+    "provider_call_count_delta", "missing_event_id_count", "missing_source_event_ids",
+    "emergency_spooled_event_count", "durability_lost_event_count",
+    "conflicting_event_id_count", "conflicting_source_event_ids",
+    "late_event_count", "late_source_event_ids", "observed_source_event_ids",
+    "summary_usage_event_ids", "event_lines", "commercial_input_tokens",
+    "summary_input_tokens", "input_token_delta", "commercial_output_tokens",
+    "summary_output_tokens", "output_token_delta", "commercial_cache_read_tokens",
+    "summary_cache_read_tokens", "cache_read_token_delta",
+    "commercial_cache_write_tokens", "summary_cache_write_tokens",
+    "cache_write_token_delta", "reasoning_tokens_observed", "provider_units",
+    "commercial_producer_estimate_usd", "summary_estimate_usd",
+    "estimate_delta_usd", "drain_complete", "in_flight_task_count",
+    "summary_started_at", "summary_ended_at", "summary_emitted_as_cost_event"
+  ],
+  "properties": {
+    "evidence_schema_version": {"const": 2},
+    "evidence_revision": {"type": "integer", "minimum": 1},
+    "supersedes_report_sha256": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      ]
+    },
+    "content_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "environment": {"enum": ["dev", "staging", "prod"]},
+    "source_product": {"type": "string", "pattern": "^[a-z][a-z0-9._:-]{0,127}$"},
+    "request_id": {"type": "string", "minLength": 1, "maxLength": 255},
+    "session_id": {"type": "string", "minLength": 1, "maxLength": 255},
+    "execution_context_id": {"$ref": "#/$defs/uuid"},
+    "workflow_run_id": {"$ref": "#/$defs/uuid"},
+    "workflow_attempt_group_id": {"$ref": "#/$defs/uuid"},
+    "workflow_attempt_number": {"type": "integer", "minimum": 1},
+    "retry_of_workflow_run_id": {
+      "anyOf": [{"type": "null"}, {"$ref": "#/$defs/uuid"}]
+    },
+    "workflow_attempt_kind": {"enum": ["initial", "user_retry", "automatic_retry"]},
+    "work_authorization_id": {"$ref": "#/$defs/uuid"},
+    "status": {"enum": ["match", "mismatch", "incomplete"]},
+    "commercial_event_count": {"type": "integer", "minimum": 0},
+    "provider_call_event_count": {"type": "integer", "minimum": 0},
+    "durable_provider_call_event_count": {"type": "integer", "minimum": 0},
+    "separate_unit_event_count": {"type": "integer", "minimum": 0},
+    "expected_provider_call_count": {"type": "integer", "minimum": 0},
+    "provider_call_count_delta": {"type": "integer"},
+    "missing_event_id_count": {"type": "integer", "minimum": 0},
+    "missing_source_event_ids": {"$ref": "#/$defs/idList"},
+    "emergency_spooled_event_count": {"type": "integer", "minimum": 0},
+    "durability_lost_event_count": {"type": "integer", "minimum": 0},
+    "conflicting_event_id_count": {"type": "integer", "minimum": 0},
+    "conflicting_source_event_ids": {"$ref": "#/$defs/idList"},
+    "late_event_count": {"type": "integer", "minimum": 0},
+    "late_source_event_ids": {"$ref": "#/$defs/idList"},
+    "observed_source_event_ids": {"$ref": "#/$defs/idList"},
+    "summary_usage_event_ids": {"$ref": "#/$defs/idList"},
+    "event_lines": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/eventLine"},
+      "maxItems": 10000
+    },
+    "commercial_input_tokens": {"type": "integer", "minimum": 0},
+    "summary_input_tokens": {"type": "integer", "minimum": 0},
+    "input_token_delta": {"type": "integer"},
+    "commercial_output_tokens": {"type": "integer", "minimum": 0},
+    "summary_output_tokens": {"type": "integer", "minimum": 0},
+    "output_token_delta": {"type": "integer"},
+    "commercial_cache_read_tokens": {"type": "integer", "minimum": 0},
+    "summary_cache_read_tokens": {"type": "integer", "minimum": 0},
+    "cache_read_token_delta": {"type": "integer"},
+    "commercial_cache_write_tokens": {"type": "integer", "minimum": 0},
+    "summary_cache_write_tokens": {"type": "integer", "minimum": 0},
+    "cache_write_token_delta": {"type": "integer"},
+    "reasoning_tokens_observed": {"type": "integer", "minimum": 0},
+    "provider_units": {"$ref": "#/$defs/decimal"},
+    "commercial_producer_estimate_usd": {"$ref": "#/$defs/decimal"},
+    "summary_estimate_usd": {"$ref": "#/$defs/decimal"},
+    "estimate_delta_usd": {"$ref": "#/$defs/signedDecimal"},
+    "drain_complete": {"type": "boolean"},
+    "in_flight_task_count": {"type": "integer", "minimum": 0},
+    "summary_started_at": {"type": "number"},
+    "summary_ended_at": {"type": "number"},
+    "summary_emitted_as_cost_event": {"const": false}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"workflow_attempt_kind": {"const": "initial"}}},
+      "then": {
+        "properties": {
+          "workflow_attempt_number": {"const": 1},
+          "retry_of_workflow_run_id": {"type": "null"}
+        }
+      },
+      "else": {
+        "properties": {
+          "workflow_attempt_number": {"type": "integer", "minimum": 2},
+          "retry_of_workflow_run_id": {"$ref": "#/$defs/uuid"}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "idList": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "maxLength": 255},
+      "uniqueItems": true,
+      "maxItems": 10000
+    },
+    "decimal": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]+)?$"},
+    "signedDecimal": {"type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]+)?$"},
+    "eventLine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_event_id", "source_payload_sha256", "source_schema_version",
+        "workflow_attempt_group_id", "workflow_attempt_number",
+        "retry_of_workflow_run_id", "workflow_attempt_kind", "work_authorization_id",
+        "event_kind", "durability", "late", "occurred_at", "uncached_input_tokens",
+        "billable_output_tokens", "cache_read_tokens", "cache_write_tokens",
+        "reasoning_tokens_observed", "provider_units", "producer_estimated_cost_usd"
+      ],
+      "properties": {
+        "source_event_id": {"type": "string", "minLength": 1, "maxLength": 255},
+        "source_payload_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "source_schema_version": {"const": 2},
+        "workflow_attempt_group_id": {"$ref": "#/$defs/uuid"},
+        "workflow_attempt_number": {"type": "integer", "minimum": 1},
+        "retry_of_workflow_run_id": {
+          "anyOf": [{"type": "null"}, {"$ref": "#/$defs/uuid"}]
+        },
+        "workflow_attempt_kind": {
+          "enum": ["initial", "user_retry", "automatic_retry"]
+        },
+        "work_authorization_id": {"$ref": "#/$defs/uuid"},
+        "event_kind": {"enum": ["provider_call", "separate_unit"]},
+        "durability": {"enum": ["outbox", "emergency_spool", "lost"]},
+        "late": {"type": "boolean"},
+        "occurred_at": {"type": "string", "minLength": 1},
+        "uncached_input_tokens": {"type": "integer", "minimum": 0},
+        "billable_output_tokens": {"type": "integer", "minimum": 0},
+        "cache_read_tokens": {"type": "integer", "minimum": 0},
+        "cache_write_tokens": {"type": "integer", "minimum": 0},
+        "reasoning_tokens_observed": {
+          "anyOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]
+        },
+        "provider_units": {
+          "anyOf": [{"type": "null"}, {"$ref": "#/$defs/decimal"}]
+        },
+        "producer_estimated_cost_usd": {
+          "anyOf": [{"type": "null"}, {"$ref": "#/$defs/decimal"}]
+        }
+      }
+    }
+  }
+}

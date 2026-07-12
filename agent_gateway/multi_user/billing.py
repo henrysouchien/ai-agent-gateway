@@ -29,6 +29,12 @@ class UsageEvent:
   rate_table_version: str
   billing_mode: Literal["byok", "metered"]
   channel: str | None
+  reasoning_tokens_observed: int | None = None
+  provider_reported_cost_usd: str | None = None
+  separately_billed_tool_cost_usd: str = "0"
+  provider_units: str | int | float | None = None
+  provider_unit_deltas: dict[str, int] | None = None
+  is_batch: bool = False
   provider: str | None = None
   product_id: str | None = None
   event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -63,6 +69,8 @@ class SessionUsageSummary:
   rate_table_version: str | None = None
   billing_mode: Literal["byok", "metered"] | None = None
   context_surfaces: list[dict[str, Any]] = field(default_factory=list)
+  usage_event_count: int = 0
+  usage_event_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -137,6 +145,7 @@ class _UsageAggregator:
     self._turns = 0
     self._last_model: str | None = None
     self._last_provider: str | None = None
+    self._event_ids: list[str] = []
     self._closed = False
 
   async def record(self, event: UsageEvent) -> bool:
@@ -151,6 +160,7 @@ class _UsageAggregator:
       self._turns += 1
       self._last_model = event.model
       self._last_provider = event.provider
+      self._event_ids.append(event.event_id)
       return True
 
   async def close(self) -> None:
@@ -194,6 +204,8 @@ class _UsageAggregator:
           for surface in (context_surfaces or [])
           if isinstance(surface, dict)
         ],
+        usage_event_count=len(self._event_ids),
+        usage_event_ids=tuple(self._event_ids),
       )
 
 

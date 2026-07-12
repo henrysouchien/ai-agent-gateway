@@ -510,6 +510,11 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
     cached_tokens = int(input_details.get("cached_tokens") or 0) if isinstance(input_details, dict) else 0
     input_tokens = max(0, int(usage.get("input_tokens") or 0) - cached_tokens)
     output_tokens = int(usage.get("output_tokens") or 0)
+    output_details = usage.get("output_tokens_details") or {}
+    reasoning_tokens = (
+      int(output_details.get("reasoning_tokens") or 0)
+      if isinstance(output_details, dict) else 0
+    )
     events: list[StreamEvent] = []
     if not state.message_started:
       state.message_started = True
@@ -520,7 +525,11 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
           cache_read_tokens=cached_tokens,
         )
       )
-    events.append(StreamEvent(type="usage_update", output_tokens=output_tokens))
+    events.append(StreamEvent(
+      type="usage_update",
+      output_tokens=output_tokens,
+      reasoning_tokens=reasoning_tokens,
+    ))
     events.append(
       StreamEvent(
         type="message_end",

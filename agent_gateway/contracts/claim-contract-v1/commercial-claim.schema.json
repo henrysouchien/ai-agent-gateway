@@ -1,0 +1,163 @@
+{
+  "$id": "https://hank.investments/schemas/commercial/commercial-claim.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Short-lived, audience-bound commercial authority issued by risk_module.",
+  "properties": {
+    "agreement_id": {
+      "format": "uuid",
+      "title": "Agreement Id",
+      "type": "string"
+    },
+    "agreement_terms_revision": {
+      "exclusiveMinimum": 0,
+      "title": "Agreement Terms Revision",
+      "type": "integer"
+    },
+    "aud": {
+      "const": "hank-agent-gateway",
+      "title": "Aud",
+      "type": "string"
+    },
+    "authorized_work_start_deadline": {
+      "exclusiveMinimum": 0,
+      "title": "Authorized Work Start Deadline",
+      "type": "integer"
+    },
+    "budget_policy_version": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Budget Policy Version",
+      "type": "string"
+    },
+    "commercial_account_id": {
+      "format": "uuid",
+      "title": "Commercial Account Id",
+      "type": "string"
+    },
+    "effective_scopes": {
+      "items": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[a-z][a-z0-9._:-]*$",
+        "type": "string"
+      },
+      "title": "Effective Scopes",
+      "type": "array"
+    },
+    "entitlement_revision": {
+      "exclusiveMinimum": 0,
+      "title": "Entitlement Revision",
+      "type": "integer"
+    },
+    "environment": {
+      "enum": [
+        "dev",
+        "staging",
+        "prod"
+      ],
+      "title": "Environment",
+      "type": "string"
+    },
+    "exp": {
+      "exclusiveMinimum": 0,
+      "title": "Exp",
+      "type": "integer"
+    },
+    "iat": {
+      "exclusiveMinimum": 0,
+      "title": "Iat",
+      "type": "integer"
+    },
+    "iss": {
+      "const": "risk-module-commercial-control",
+      "title": "Iss",
+      "type": "string"
+    },
+    "jti": {
+      "format": "uuid",
+      "title": "Jti",
+      "type": "string"
+    },
+    "kid": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9._:-]*$",
+      "title": "Kid",
+      "type": "string"
+    },
+    "manifest_version": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Manifest Version",
+      "type": "string"
+    },
+    "offer_code": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9._:-]*$",
+      "title": "Offer Code",
+      "type": "string"
+    },
+    "payer_policy_version": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Payer Policy Version",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "shadow_rate_version": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Shadow Rate Version",
+      "type": "string"
+    },
+    "sub": {
+      "pattern": "^user:[1-9][0-9]*$",
+      "title": "Sub",
+      "type": "string"
+    },
+    "surface": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9._:-]*$",
+      "title": "Surface",
+      "type": "string"
+    },
+    "usage_accept_until": {
+      "exclusiveMinimum": 0,
+      "title": "Usage Accept Until",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "iss",
+    "aud",
+    "kid",
+    "sub",
+    "environment",
+    "surface",
+    "commercial_account_id",
+    "agreement_id",
+    "agreement_terms_revision",
+    "offer_code",
+    "effective_scopes",
+    "entitlement_revision",
+    "payer_policy_version",
+    "budget_policy_version",
+    "shadow_rate_version",
+    "manifest_version",
+    "authorized_work_start_deadline",
+    "usage_accept_until",
+    "iat",
+    "exp",
+    "jti"
+  ],
+  "title": "CommercialClaimV1",
+  "type": "object"
+}

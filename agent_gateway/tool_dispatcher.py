@@ -562,7 +562,15 @@ class ToolDispatcher:
       result, error = await self._local[tool_name](final_tool_input, **local_kwargs)
     elif self._mcp.is_mcp_tool(tool_name):
       server = self._mcp.get_server_for_tool(tool_name)
-      if server and server in self._mcp_meta_inject_servers:
+      if server and callable(getattr(self._mcp, "is_per_user_server", None)) and self._mcp.is_per_user_server(server):
+        resolved_risk_user_id = self._mcp_identity_overrides.get(server, self._risk_user_id)
+        result, error = await self._call_mcp_tool(
+          tool_name,
+          final_tool_input,
+          abort_event=abort_event,
+          user_id=resolved_risk_user_id,
+        )
+      elif server and server in self._mcp_meta_inject_servers:
         resolved_risk_user_id = self._mcp_identity_overrides.get(server, self._risk_user_id)
         if resolved_risk_user_id is None and self._user_id is not None and str(self._user_id).isdigit():
           resolved_risk_user_id = int(str(self._user_id))
@@ -847,12 +855,15 @@ class ToolDispatcher:
     *,
     meta: Dict[str, Any] | None = None,
     abort_event: asyncio.Event | None = None,
+    user_id: str | int | None = None,
   ) -> ToolResult:
     kwargs: Dict[str, Any] = {}
     if meta is not None:
       kwargs["meta"] = meta
     if abort_event is not None and self._mcp_accepts_abort_event:
       kwargs["abort_event"] = abort_event
+    if user_id is not None:
+      kwargs["user_id"] = user_id
     result, error = await self._mcp.call_tool(tool_name, tool_input, **kwargs)
     if isinstance(error, dict) and "tool_usage_hint" not in error and _is_mcp_validation_error(error):
       hint = self._mcp_tool_argument_guidance(tool_name)

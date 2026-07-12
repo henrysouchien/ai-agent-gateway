@@ -1,0 +1,198 @@
+{
+  "$id": "https://hank.investments/schemas/commercial/commercial-work-authorization.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "aud": {
+      "const": "hank-agent-gateway-work-start",
+      "title": "Aud",
+      "type": "string"
+    },
+    "billing_mode": {
+      "enum": [
+        "byok",
+        "metered"
+      ],
+      "title": "Billing Mode",
+      "type": "string"
+    },
+    "capability_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9._:-]*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Capability Id"
+    },
+    "environment": {
+      "enum": [
+        "dev",
+        "staging",
+        "prod"
+      ],
+      "title": "Environment",
+      "type": "string"
+    },
+    "execution_claim_jti": {
+      "format": "uuid",
+      "title": "Execution Claim Jti",
+      "type": "string"
+    },
+    "exp": {
+      "exclusiveMinimum": 0,
+      "title": "Exp",
+      "type": "integer"
+    },
+    "funding_route_id": {
+      "format": "uuid",
+      "title": "Funding Route Id",
+      "type": "string"
+    },
+    "iat": {
+      "exclusiveMinimum": 0,
+      "title": "Iat",
+      "type": "integer"
+    },
+    "iss": {
+      "const": "risk-module-commercial-work-control",
+      "title": "Iss",
+      "type": "string"
+    },
+    "jti": {
+      "format": "uuid",
+      "title": "Jti",
+      "type": "string"
+    },
+    "kid": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9._:-]*$",
+      "title": "Kid",
+      "type": "string"
+    },
+    "operation": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9._:-]*$",
+      "title": "Operation",
+      "type": "string"
+    },
+    "primary_inference_observability": {
+      "enum": [
+        "hank_metered",
+        "hank_byok_observed",
+        "external_unobserved",
+        "none"
+      ],
+      "title": "Primary Inference Observability",
+      "type": "string"
+    },
+    "provider": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9._:-]*$",
+      "title": "Provider",
+      "type": "string"
+    },
+    "request_id": {
+      "maxLength": 255,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$",
+      "title": "Request Id",
+      "type": "string"
+    },
+    "reservation_id": {
+      "anyOf": [
+        {
+          "format": "uuid",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Reservation Id"
+    },
+    "retry_of_workflow_run_id": {
+      "anyOf": [
+        {
+          "format": "uuid",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Retry Of Workflow Run Id"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "session_id": {
+      "maxLength": 255,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$",
+      "title": "Session Id",
+      "type": "string"
+    },
+    "workflow_attempt_group_id": {
+      "format": "uuid",
+      "title": "Workflow Attempt Group Id",
+      "type": "string"
+    },
+    "workflow_attempt_kind": {
+      "enum": [
+        "initial",
+        "user_retry",
+        "automatic_retry"
+      ],
+      "title": "Workflow Attempt Kind",
+      "type": "string"
+    },
+    "workflow_attempt_number": {
+      "exclusiveMinimum": 0,
+      "title": "Workflow Attempt Number",
+      "type": "integer"
+    },
+    "workflow_run_id": {
+      "format": "uuid",
+      "title": "Workflow Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "kid",
+    "iss",
+    "aud",
+    "jti",
+    "environment",
+    "execution_claim_jti",
+    "workflow_run_id",
+    "workflow_attempt_group_id",
+    "workflow_attempt_number",
+    "retry_of_workflow_run_id",
+    "workflow_attempt_kind",
+    "primary_inference_observability",
+    "funding_route_id",
+    "provider",
+    "billing_mode",
+    "reservation_id",
+    "operation",
+    "capability_id",
+    "request_id",
+    "session_id",
+    "iat",
+    "exp"
+  ],
+  "title": "CommercialWorkAuthorizationV1",
+  "type": "object"
+}

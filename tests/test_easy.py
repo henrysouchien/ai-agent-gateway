@@ -1,6 +1,9 @@
+# ruff: noqa: E402
+
 import asyncio
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -61,6 +64,136 @@ def _build_runtime_with_request(app, *, request: ChatRequest, channel: str | Non
     )
   )
   return session, runtime
+
+
+def test_commercial_usage_producer_factory_is_request_scoped() -> None:
+  produced = []
+
+  def factory(session, request, channel):
+    producer = object()
+    produced.append((session.user_id, request.request_id, channel, producer))
+    return producer
+
+  app = create_agent("test", commercial_usage_producer_factory=factory)
+  first_session = app.state.auth.session_store.create_session(api_key_hash="a", user_id="alice")
+  second_session = app.state.auth.session_store.create_session(api_key_hash="b", user_id="bob")
+  runtimes = []
+  for session, request_id in ((first_session, "req-a"), (second_session, "req-b")):
+    request = ChatRequest(
+      messages=[{"role": "user", "content": "hello"}],
+      context={},
+      request_id=request_id,
+    )
+    runtime = _run(app.state.gateway_config.build_chat_runtime(
+      session=session, request=request, channel="mcp", auth_manager=app.state.auth
+    ))
+    runtimes.append(runtime)
+
+  runners = [runtime.build_runner(EventLog(), f"session-{index}") for index, runtime in enumerate(runtimes)]
+  assert [(item[0], item[1], item[2]) for item in produced] == [
+    ("alice", "req-a", "mcp"),
+    ("bob", "req-b", "mcp"),
+  ]
+  assert runners[0]._commercial_usage_producer is produced[0][3]
+  assert runners[1]._commercial_usage_producer is produced[1][3]
+  assert produced[0][3] is not produced[1][3]
+
+
+def test_commercial_usage_factory_receives_verified_work_start_context() -> None:
+  produced = []
+
+  def factory(session, request, channel, commercial_work_start):
+    produced.append((session, request, channel, commercial_work_start))
+    return object()
+
+  app = create_agent("test", commercial_usage_producer_factory=factory)
+  request = ChatRequest(
+    messages=[{"role": "user", "content": "hello"}],
+    request_id="request-1",
+  )
+  verified_context = object()
+  request._bind_commercial_work_start(verified_context)
+  session, _ = _build_runtime_with_request(app, request=request, channel="mcp")
+
+  assert produced == [(session, request, "mcp", verified_context)]
+
+
+def test_commercial_usage_factory_preserves_legacy_positional_args_with_kwargs() -> None:
+  produced = []
+
+  def factory(a, b, c, **kwargs):
+    produced.append((a, b, c, kwargs))
+    return object()
+
+  app = create_agent("test", commercial_usage_producer_factory=factory)
+  request = ChatRequest(messages=[{"role": "user", "content": "hello"}])
+  session, _ = _build_runtime_with_request(app, request=request, channel="mcp")
+
+  assert produced == [(
+    session,
+    request,
+    "mcp",
+    {"commercial_work_start": None},
+  )]
+
+
+def test_commercial_usage_factory_preserves_legacy_varargs_arity() -> None:
+  produced = []
+
+  def factory(*args):
+    produced.append(args)
+    return object()
+
+  app = create_agent("test", commercial_usage_producer_factory=factory)
+  request = ChatRequest(messages=[{"role": "user", "content": "hello"}])
+  session, _ = _build_runtime_with_request(app, request=request, channel="mcp")
+
+  assert produced == [(session, request, "mcp")]
+
+
+def test_default_off_chat_request_accepts_large_benign_context() -> None:
+  request = ChatRequest(
+    messages=[{"role": "user", "content": "hello"}],
+    context={"cells": [{"value": index} for index in range(10_001)]},
+  )
+
+  assert len(request.context["cells"]) == 10_001
+
+
+def test_commercial_usage_shipper_runs_for_app_lifecycle() -> None:
+  started = threading.Event()
+  stopped = threading.Event()
+
+  class Shipper:
+    async def run_forever(self, stop):
+      started.set()
+      await stop.wait()
+      stopped.set()
+
+  app = create_agent("test", commercial_usage_shipper=Shipper())
+  with TestClient(app):
+    assert started.wait(timeout=1)
+    assert not stopped.is_set()
+  assert stopped.wait(timeout=1)
+
+
+def test_commercial_reconciliation_shipper_runs_for_app_lifecycle() -> None:
+  started = threading.Event()
+  stopped = threading.Event()
+
+  class Shipper:
+    async def run_forever(self, stop):
+      started.set()
+      await stop.wait()
+      stopped.set()
+
+  app = create_agent(
+    "test", commercial_usage_reconciliation_shipper=Shipper()
+  )
+  with TestClient(app):
+    assert started.wait(timeout=1)
+    assert not stopped.is_set()
+  assert stopped.wait(timeout=1)
 
 
 def _collect_sse_events(response) -> list[dict]:

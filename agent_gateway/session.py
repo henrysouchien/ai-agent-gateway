@@ -139,6 +139,7 @@ class GatewaySession:
   event_history: SessionEventHistory = field(default_factory=SessionEventHistory)
   initial_message: str = ""
   dispatch_scope: dict[str, Any] | None = None
+  _commercial_dispatch_owner: object | None = field(default=None, repr=False)
   _expiring: bool = False
 
 

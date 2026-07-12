@@ -1,0 +1,334 @@
+{
+  "$id": "https://hank.investments/schemas/commercial/commercial-usage-event.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One provider/model/tool economic delta from a trusted producer.\n\nAccount, agreement, offer, payer class, and budget identity are deliberately\nabsent.  The ingest service derives those trusted fields from the durable\nexecution context, reservation, and funding route.",
+  "properties": {
+    "billable_output_tokens": {
+      "default": 0,
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Billable Output Tokens",
+      "type": "integer"
+    },
+    "cache_read_tokens": {
+      "default": 0,
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Cache Read Tokens",
+      "type": "integer"
+    },
+    "cache_write_tokens": {
+      "default": 0,
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Cache Write Tokens",
+      "type": "integer"
+    },
+    "capability_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9._:-]*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Capability Id"
+    },
+    "channel": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9._:-]*$",
+      "title": "Channel",
+      "type": "string"
+    },
+    "cost_observation_kind": {
+      "enum": [
+        "producer_estimate",
+        "provider_response",
+        "unknown"
+      ],
+      "title": "Cost Observation Kind",
+      "type": "string"
+    },
+    "environment": {
+      "enum": [
+        "dev",
+        "staging",
+        "prod"
+      ],
+      "title": "Environment",
+      "type": "string"
+    },
+    "execution_context_id": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Execution Context Id",
+      "type": "string"
+    },
+    "funding_route_id": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Funding Route Id",
+      "type": "string"
+    },
+    "is_batch": {
+      "default": false,
+      "title": "Is Batch",
+      "type": "boolean"
+    },
+    "model": {
+      "anyOf": [
+        {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Model"
+    },
+    "occurred_at": {
+      "format": "date-time",
+      "title": "Occurred At",
+      "type": "string"
+    },
+    "operation": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9._:-]*$",
+      "title": "Operation",
+      "type": "string"
+    },
+    "parent_turn_id": {
+      "anyOf": [
+        {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Turn Id"
+    },
+    "producer_estimated_cost_usd": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,10}|(?=[\\d.]{1,19}0*$)\\d{0,10}\\.\\d{0,8}0*$)",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Producer Estimated Cost Usd"
+    },
+    "producer_rate_version": {
+      "anyOf": [
+        {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Producer Rate Version"
+    },
+    "provider": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9._:-]*$",
+      "title": "Provider",
+      "type": "string"
+    },
+    "provider_reported_cost_usd": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,10}|(?=[\\d.]{1,19}0*$)\\d{0,10}\\.\\d{0,8}0*$)",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Provider Reported Cost Usd"
+    },
+    "provider_units": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,14}|(?=[\\d.]{1,21}0*$)\\d{0,14}\\.\\d{0,6}0*$)",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Provider Units"
+    },
+    "raw_billing_mode": {
+      "enum": [
+        "byok",
+        "metered"
+      ],
+      "title": "Raw Billing Mode",
+      "type": "string"
+    },
+    "reasoning_tokens_observed": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reasoning Tokens Observed"
+    },
+    "request_id": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    },
+    "reservation_id": {
+      "anyOf": [
+        {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reservation Id"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "separately_billed_tool_cost_usd": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*(?:\\d{0,10}|(?=[\\d.]{1,19}0*$)\\d{0,10}\\.\\d{0,8}0*$)",
+          "type": "string"
+        }
+      ],
+      "default": "0",
+      "title": "Separately Billed Tool Cost Usd"
+    },
+    "session_id": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Session Id",
+      "type": "string"
+    },
+    "shadow_rate_version": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Shadow Rate Version",
+      "type": "string"
+    },
+    "source_event_id": {
+      "maxLength": 255,
+      "minLength": 1,
+      "title": "Source Event Id",
+      "type": "string"
+    },
+    "source_payload_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Source Payload Sha256",
+      "type": "string"
+    },
+    "source_product": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9._:-]*$",
+      "title": "Source Product",
+      "type": "string"
+    },
+    "uncached_input_tokens": {
+      "default": 0,
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Uncached Input Tokens",
+      "type": "integer"
+    },
+    "usage_state": {
+      "enum": [
+        "succeeded",
+        "failed_billable",
+        "failed_unbilled",
+        "canceled"
+      ],
+      "title": "Usage State",
+      "type": "string"
+    },
+    "workflow_run_id": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Workflow Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "source_product",
+    "source_event_id",
+    "environment",
+    "occurred_at",
+    "execution_context_id",
+    "request_id",
+    "session_id",
+    "workflow_run_id",
+    "funding_route_id",
+    "channel",
+    "provider",
+    "operation",
+    "usage_state",
+    "cost_observation_kind",
+    "shadow_rate_version",
+    "raw_billing_mode",
+    "source_payload_sha256"
+  ],
+  "title": "CommercialUsageEventV1",
+  "type": "object"
+}

@@ -1,0 +1,78 @@
+{
+  "cases": [
+    {
+      "expected": "accepted",
+      "name": "valid",
+      "payload": {
+        "agreement_id": "22222222-2222-4222-8222-222222222222",
+        "agreement_terms_revision": 2,
+        "aud": "hank-agent-gateway",
+        "authorized_work_start_deadline": 1780000300,
+        "budget_policy_version": "hp1_pro_budget@v1",
+        "commercial_account_id": "11111111-1111-4111-8111-111111111111",
+        "effective_scopes": [
+          "read",
+          "trade-preview"
+        ],
+        "entitlement_revision": 42,
+        "environment": "prod",
+        "exp": 1780000300,
+        "iat": 1780000000,
+        "iss": "risk-module-commercial-control",
+        "jti": "33333333-3333-4333-8333-333333333333",
+        "kid": "commercial-signing-fixture-v1",
+        "manifest_version": "mcp_exposure@2026-09-01",
+        "offer_code": "hp1_pro",
+        "payer_policy_version": "hp1_customer_host@v1",
+        "schema_version": 1,
+        "shadow_rate_version": "commercial_rates@2026-09-01",
+        "sub": "user:123",
+        "surface": "hp1",
+        "usage_accept_until": 1780003600
+      },
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImNvbW1lcmNpYWwtc2lnbmluZy1maXh0dXJlLXYxIiwidHlwIjoiSldUIn0.eyJzY2hlbWFfdmVyc2lvbiI6MSwia2lkIjoiY29tbWVyY2lhbC1zaWduaW5nLWZpeHR1cmUtdjEiLCJpc3MiOiJyaXNrLW1vZHVsZS1jb21tZXJjaWFsLWNvbnRyb2wiLCJhdWQiOiJoYW5rLWFnZW50LWdhdGV3YXkiLCJzdWIiOiJ1c2VyOjEyMyIsImVudmlyb25tZW50IjoicHJvZCIsInN1cmZhY2UiOiJocDEiLCJjb21tZXJjaWFsX2FjY291bnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ3JlZW1lbnRfaWQiOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhZ3JlZW1lbnRfdGVybXNfcmV2aXNpb24iOjIsIm9mZmVyX2NvZGUiOiJocDFfcHJvIiwiZWZmZWN0aXZlX3Njb3BlcyI6WyJyZWFkIiwidHJhZGUtcHJldmlldyJdLCJlbnRpdGxlbWVudF9yZXZpc2lvbiI6NDIsInBheWVyX3BvbGljeV92ZXJzaW9uIjoiaHAxX2N1c3RvbWVyX2hvc3RAdjEiLCJidWRnZXRfcG9saWN5X3ZlcnNpb24iOiJocDFfcHJvX2J1ZGdldEB2MSIsInNoYWRvd19yYXRlX3ZlcnNpb24iOiJjb21tZXJjaWFsX3JhdGVzQDIwMjYtMDktMDEiLCJtYW5pZmVzdF92ZXJzaW9uIjoibWNwX2V4cG9zdXJlQDIwMjYtMDktMDEiLCJhdXRob3JpemVkX3dvcmtfc3RhcnRfZGVhZGxpbmUiOjE3ODAwMDAzMDAsInVzYWdlX2FjY2VwdF91bnRpbCI6MTc4MDAwMzYwMCwiaWF0IjoxNzgwMDAwMDAwLCJleHAiOjE3ODAwMDAzMDAsImp0aSI6IjMzMzMzMzMzLTMzMzMtNDMzMy04MzMzLTMzMzMzMzMzMzMzMyJ9.Ff3oELfqaRYKypPydrVpGjtACetb7nrAtqyntpwCFBVwgMCS6DSSlAo8V6gIQKlszfhe8Gd7pz4rL5KPIshSBg"
+    },
+    {
+      "expected": "invalid_signature_or_registered_claim",
+      "name": "tampered",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImNvbW1lcmNpYWwtc2lnbmluZy1maXh0dXJlLXYxIiwidHlwIjoiSldUIn0.eyJzY2hlbWFfdmVyc2lvbiI6MSwia2lkIjoiY29tbWVyY2lhbC1zaWduaW5nLWZpeHR1cmUtdjEiLCJpc3MiOiJyaXNrLW1vZHVsZS1jb21tZXJjaWFsLWNvbnRyb2wiLCJhdWQiOiJoYW5rLWFnZW50LWdhdGV3YXkiLCJzdWIiOiJ1c2VyOjEyMyIsImVudmlyb25tZW50IjoicHJvZCIsInN1cmZhY2UiOiJocDEiLCJjb21tZXJjaWFsX2FjY291bnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ3JlZW1lbnRfaWQiOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhZ3JlZW1lbnRfdGVybXNfcmV2aXNpb24iOjIsIm9mZmVyX2NvZGUiOiJocDFfcHJvIiwiZWZmZWN0aXZlX3Njb3BlcyI6WyJyZWFkIiwidHJhZGUtcHJldmlldyJdLCJlbnRpdGxlbWVudF9yZXZpc2lvbiI6NDIsInBheWVyX3BvbGljeV92ZXJzaW9uIjoiaHAxX2N1c3RvbWVyX2hvc3RAdjEiLCJidWRnZXRfcG9saWN5X3ZlcnNpb24iOiJocDFfcHJvX2J1ZGdldEB2MSIsInNoYWRvd19yYXRlX3ZlcnNpb24iOiJjb21tZXJjaWFsX3JhdGVzQDIwMjYtMDktMDEiLCJtYW5pZmVzdF92ZXJzaW9uIjoibWNwX2V4cG9zdXJlQDIwMjYtMDktMDEiLCJhdXRob3JpemVkX3dvcmtfc3RhcnRfZGVhZGxpbmUiOjE3ODAwMDAzMDAsInVzYWdlX2FjY2VwdF91bnRpbCI6MTc4MDAwMzYwMCwiaWF0IjoxNzgwMDAwMDAwLCJleHAiOjE3ODAwMDAzMDAsImp0aSI6IjMzMzMzMzMzLTMzMzMtNDMzMy04MzMzLTMzMzMzMzMzMzMzMyJ9.Ff3oEAfqaRYKypPydrVpGjtACetb7nrAtqyntpwCFBVwgMCS6DSSlAo8V6gIQKlszfhe8Gd7pz4rL5KPIshSBg"
+    },
+    {
+      "expected": "start_authority_expired",
+      "name": "stale",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImNvbW1lcmNpYWwtc2lnbmluZy1maXh0dXJlLXYxIiwidHlwIjoiSldUIn0.eyJzY2hlbWFfdmVyc2lvbiI6MSwia2lkIjoiY29tbWVyY2lhbC1zaWduaW5nLWZpeHR1cmUtdjEiLCJpc3MiOiJyaXNrLW1vZHVsZS1jb21tZXJjaWFsLWNvbnRyb2wiLCJhdWQiOiJoYW5rLWFnZW50LWdhdGV3YXkiLCJzdWIiOiJ1c2VyOjEyMyIsImVudmlyb25tZW50IjoicHJvZCIsInN1cmZhY2UiOiJocDEiLCJjb21tZXJjaWFsX2FjY291bnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ3JlZW1lbnRfaWQiOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhZ3JlZW1lbnRfdGVybXNfcmV2aXNpb24iOjIsIm9mZmVyX2NvZGUiOiJocDFfcHJvIiwiZWZmZWN0aXZlX3Njb3BlcyI6WyJyZWFkIiwidHJhZGUtcHJldmlldyJdLCJlbnRpdGxlbWVudF9yZXZpc2lvbiI6NDIsInBheWVyX3BvbGljeV92ZXJzaW9uIjoiaHAxX2N1c3RvbWVyX2hvc3RAdjEiLCJidWRnZXRfcG9saWN5X3ZlcnNpb24iOiJocDFfcHJvX2J1ZGdldEB2MSIsInNoYWRvd19yYXRlX3ZlcnNpb24iOiJjb21tZXJjaWFsX3JhdGVzQDIwMjYtMDktMDEiLCJtYW5pZmVzdF92ZXJzaW9uIjoibWNwX2V4cG9zdXJlQDIwMjYtMDktMDEiLCJhdXRob3JpemVkX3dvcmtfc3RhcnRfZGVhZGxpbmUiOjE3Nzk5OTk3MDAsInVzYWdlX2FjY2VwdF91bnRpbCI6MTc4MDAwMzYwMCwiaWF0IjoxNzc5OTk5NDAwLCJleHAiOjE3Nzk5OTk3MDAsImp0aSI6IjMzMzMzMzMzLTMzMzMtNDMzMy04MzMzLTMzMzMzMzMzMzMzMyJ9.MiNokWG3J3A0Cp4zV2_dRc03-uw8h2qD4JBIiegRXFY8vN2dATLgqE0hgau-Zs0L-IPNLARdyKYYxDg0Dzz_Bg"
+    },
+    {
+      "expected": "manifest_skew",
+      "name": "manifest_skew",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImNvbW1lcmNpYWwtc2lnbmluZy1maXh0dXJlLXYxIiwidHlwIjoiSldUIn0.eyJzY2hlbWFfdmVyc2lvbiI6MSwia2lkIjoiY29tbWVyY2lhbC1zaWduaW5nLWZpeHR1cmUtdjEiLCJpc3MiOiJyaXNrLW1vZHVsZS1jb21tZXJjaWFsLWNvbnRyb2wiLCJhdWQiOiJoYW5rLWFnZW50LWdhdGV3YXkiLCJzdWIiOiJ1c2VyOjEyMyIsImVudmlyb25tZW50IjoicHJvZCIsInN1cmZhY2UiOiJocDEiLCJjb21tZXJjaWFsX2FjY291bnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ3JlZW1lbnRfaWQiOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhZ3JlZW1lbnRfdGVybXNfcmV2aXNpb24iOjIsIm9mZmVyX2NvZGUiOiJocDFfcHJvIiwiZWZmZWN0aXZlX3Njb3BlcyI6WyJyZWFkIiwidHJhZGUtcHJldmlldyJdLCJlbnRpdGxlbWVudF9yZXZpc2lvbiI6NDIsInBheWVyX3BvbGljeV92ZXJzaW9uIjoiaHAxX2N1c3RvbWVyX2hvc3RAdjEiLCJidWRnZXRfcG9saWN5X3ZlcnNpb24iOiJocDFfcHJvX2J1ZGdldEB2MSIsInNoYWRvd19yYXRlX3ZlcnNpb24iOiJjb21tZXJjaWFsX3JhdGVzQDIwMjYtMDktMDEiLCJtYW5pZmVzdF92ZXJzaW9uIjoibWNwX2V4cG9zdXJlQG9sZCIsImF1dGhvcml6ZWRfd29ya19zdGFydF9kZWFkbGluZSI6MTc4MDAwMDMwMCwidXNhZ2VfYWNjZXB0X3VudGlsIjoxNzgwMDAzNjAwLCJpYXQiOjE3ODAwMDAwMDAsImV4cCI6MTc4MDAwMDMwMCwianRpIjoiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzIn0.3VimPYrOkXW1CIQMaXvMXO9lbUxxgTZbloTDtvWJfgPWzq4ecQa07OjqC7EzRqlC7z-AX3MxBmYWuRFKcp_qCg"
+    },
+    {
+      "expected": "invalid_signature_or_registered_claim",
+      "name": "missing_lineage",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImNvbW1lcmNpYWwtc2lnbmluZy1maXh0dXJlLXYxIiwidHlwIjoiSldUIn0.eyJzY2hlbWFfdmVyc2lvbiI6MSwia2lkIjoiY29tbWVyY2lhbC1zaWduaW5nLWZpeHR1cmUtdjEiLCJpc3MiOiJyaXNrLW1vZHVsZS1jb21tZXJjaWFsLWNvbnRyb2wiLCJhdWQiOiJoYW5rLWFnZW50LWdhdGV3YXkiLCJzdWIiOiJ1c2VyOjEyMyIsImVudmlyb25tZW50IjoicHJvZCIsInN1cmZhY2UiOiJocDEiLCJjb21tZXJjaWFsX2FjY291bnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ3JlZW1lbnRfaWQiOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhZ3JlZW1lbnRfdGVybXNfcmV2aXNpb24iOjIsIm9mZmVyX2NvZGUiOiJocDFfcHJvIiwiZWZmZWN0aXZlX3Njb3BlcyI6WyJyZWFkIiwidHJhZGUtcHJldmlldyJdLCJlbnRpdGxlbWVudF9yZXZpc2lvbiI6NDIsInBheWVyX3BvbGljeV92ZXJzaW9uIjoiaHAxX2N1c3RvbWVyX2hvc3RAdjEiLCJidWRnZXRfcG9saWN5X3ZlcnNpb24iOiJocDFfcHJvX2J1ZGdldEB2MSIsInNoYWRvd19yYXRlX3ZlcnNpb24iOiJjb21tZXJjaWFsX3JhdGVzQDIwMjYtMDktMDEiLCJtYW5pZmVzdF92ZXJzaW9uIjoibWNwX2V4cG9zdXJlQDIwMjYtMDktMDEiLCJhdXRob3JpemVkX3dvcmtfc3RhcnRfZGVhZGxpbmUiOjE3ODAwMDAzMDAsInVzYWdlX2FjY2VwdF91bnRpbCI6MTc4MDAwMzYwMCwiaWF0IjoxNzgwMDAwMDAwLCJleHAiOjE3ODAwMDAzMDB9.yB7P5S0dhLslury_SJ3ZwcRFpvkvItm2EhThTnf_kw7p5n7256TOODKO-ujPspPsdZQtkl8roZRmUS-5nBVLAA"
+    }
+  ],
+  "contract_version": "commercial-claim-verification-v1",
+  "public_keys_by_id": {
+    "commercial-signing-fixture-v1": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAAOtnfWmfmcv7WqKfks3+ujQ1JHjDBGslWNuK2VJT9+U=\n-----END PUBLIC KEY-----\n"
+  },
+  "trust": {
+    "agreement_id": "22222222-2222-4222-8222-222222222222",
+    "budget_policy_versions": [
+      "hp1_pro_budget@v1"
+    ],
+    "current_agreement_terms_revision": 2,
+    "environment": "prod",
+    "manifest_versions": [
+      "mcp_exposure@2026-09-01"
+    ],
+    "payer_policy_versions": [
+      "hp1_customer_host@v1"
+    ],
+    "shadow_rate_versions": [
+      "commercial_rates@2026-09-01"
+    ]
+  },
+  "verification_time": 1780000000
+}

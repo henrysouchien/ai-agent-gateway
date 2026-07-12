@@ -140,7 +140,9 @@ class RunnerHooksLifecycleMixin:
       channel=self._channel,
     )
 
-  async def _call_on_usage(self, usage_event: UsageEvent) -> None:
+  async def _call_on_usage(
+    self, usage_event: UsageEvent, *, usage_state: str = "succeeded"
+  ) -> None:
     await _runner_attr(self, "_call_usage_event_hook", _call_usage_event_hook)(
       self._aggregator,
       usage_event,
@@ -151,6 +153,8 @@ class RunnerHooksLifecycleMixin:
       dlq_path=self._usage_ledger_dlq_path,
       log_session_id=self._sid,
       logger=log,
+      commercial_usage_producer=getattr(self, "_commercial_usage_producer", None),
+      usage_state=usage_state,
     )
 
   async def _call_on_late_usage_event(self, usage_event: UsageEvent) -> None:
@@ -167,6 +171,8 @@ class RunnerHooksLifecycleMixin:
       summary,
       log_session_id=self._sid,
       logger=log,
+      commercial_usage_producer=getattr(self, "_commercial_usage_producer", None),
+      emit_metric=self._call_metric,
     )
 
   def _estimate_usage_cost(self, model: str, usage_totals: Dict[str, int]):

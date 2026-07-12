@@ -43,6 +43,51 @@ from .anthropic_helpers import (
 log = logging.getLogger("agent_gateway.providers.anthropic")
 
 
+def _server_tool_unit_deltas(usage: Any) -> dict[str, int]:
+  if usage is None:
+    return {}
+  server_tool_use = (
+    usage.get("server_tool_use") if isinstance(usage, dict)
+    else getattr(usage, "server_tool_use", None)
+  )
+  raw = _to_plain_dict(server_tool_use)
+  if not isinstance(raw, dict):
+    return {}
+  known = {"web_search_requests", "web_fetch_requests"}
+  unknown_populated = {
+    key: value
+    for key, value in raw.items()
+    if key not in known
+    and value is not None
+    and not (type(value) in (int, float) and value == 0)
+  }
+  if unknown_populated:
+    raise ValueError(
+      f"unrecognized separately billed Anthropic server-tool units: {sorted(unknown_populated)}"
+    )
+  counts: dict[str, int] = {}
+  for key in known:
+    value = raw.get(key)
+    if value is None:
+      continue
+    if type(value) is not int or value < 0:
+      raise ValueError(f"invalid Anthropic server-tool unit count: {key}")
+    if value > 0:
+      counts[key.removesuffix("_requests")] = value
+  return {
+    key: counts[key]
+    for key in sorted(counts)
+  }
+
+
+def _server_tool_units(usage: Any) -> int:
+  """Compatibility helper for callers that require exactly one unit kind."""
+  deltas = _server_tool_unit_deltas(usage)
+  if len(deltas) > 1:
+    raise ValueError("multiple separately billed Anthropic unit kinds require distinct events")
+  return next(iter(deltas.values()), 0)
+
+
 class AnthropicProvider(ModelProvider):
   """`ModelProvider` implementation for Anthropic's Messages API.
 
@@ -434,6 +479,9 @@ class AnthropicProvider(ModelProvider):
               output_tokens=getattr(usage, "output_tokens", 0) if usage is not None else 0,
               cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) if usage is not None else 0,
               cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) if usage is not None else 0,
+              # Anthropic reports separately billed server-tool units on the
+              # final usage snapshot; avoid counting the same call twice.
+              provider_units=0,
             )
             continue
 
@@ -572,6 +620,7 @@ class AnthropicProvider(ModelProvider):
                 output_tokens=getattr(usage, "output_tokens", 0) or 0,
                 cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
                 cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+                provider_unit_deltas=_server_tool_unit_deltas(usage),
               )
     except Exception as exc:
       if self.is_retryable_error(exc):

@@ -509,6 +509,7 @@ async def run_autonomous(
   billing_mode: str,
   rate_table_version: str,
   coordinator: CoordinatorConfig | None = None,
+  commercial_usage_producer: Any | None = None,
 ) -> RunOutput:
   """Run a headless agent to completion without an HTTP server.
 
@@ -654,6 +655,7 @@ async def run_autonomous(
       max_concurrent_sub_agents=max_concurrent_sub_agents,
       compaction_instructions=compaction_instructions,
       coordinator=coordinator,
+      commercial_usage_producer=commercial_usage_producer,
     )
     runner_ref[0] = runner
 

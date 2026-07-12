@@ -175,10 +175,125 @@ class _UsageProvider(ModelProvider):
     yield StreamEvent(type="message_end", stop_reason="end_turn")
 
 
+class _RetryAfterUsageProvider(_UsageProvider):
+  def __init__(self) -> None:
+    self.calls = 0
+
+  def is_retryable_error(self, exc: Exception) -> bool:
+    return isinstance(exc, TimeoutError)
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    self.calls += 1
+    yield StreamEvent(type="message_start", input_tokens=10)
+    yield StreamEvent(type="usage_update", output_tokens=2)
+    if self.calls == 1:
+      raise TimeoutError("retry me")
+    yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+
+def test_retry_emits_failed_billable_delta_before_success(monkeypatch: pytest.MonkeyPatch) -> None:
+  states = []
+
+  class Producer:
+    async def emit(self, event, *, usage_state="succeeded"):
+      states.append((event.input_tokens, event.output_tokens, usage_state))
+
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 1)
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log),
+    session_id="sess-retry",
+    provider=_RetryAfterUsageProvider(),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    user_id="alice", request_id="req-retry", billing_mode="metered",
+    rate_table_version="v1", channel="web",
+    commercial_usage_producer=Producer(),
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  assert states == [(10, 2, "failed_billable"), (10, 2, "succeeded")]
+
+
+def test_terminal_watchdog_emits_accumulated_failed_billable_usage(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  states = []
+
+  class HangingProvider(_UsageProvider):
+    async def stream(self, client: Any, params: dict[str, Any]):
+      yield StreamEvent(type="message_start", input_tokens=10)
+      yield StreamEvent(type="usage_update", output_tokens=2)
+      await asyncio.Event().wait()
+
+  class Producer:
+    async def emit(self, event, *, usage_state="succeeded"):
+      states.append((event.input_tokens, event.output_tokens, usage_state))
+
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 0)
+  monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", 0.001)
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log, dispatcher=_make_dispatcher(event_log),
+    session_id="sess-watchdog", provider=HangingProvider(),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    user_id="alice", request_id="req-watchdog", billing_mode="metered",
+    rate_table_version="v1", channel="web", per_turn_timeout=0.01,
+    commercial_usage_producer=Producer(),
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  assert states == [(10, 2, "failed_billable")]
+
+
+def test_disconnect_on_retry_persists_canceled_partial_delta_first(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  states = []
+  runner_ref = []
+
+  class DisconnectingProvider(_UsageProvider):
+    def is_retryable_error(self, exc: Exception) -> bool:
+      return isinstance(exc, TimeoutError)
+
+    async def stream(self, client: Any, params: dict[str, Any]):
+      yield StreamEvent(type="message_start", input_tokens=10)
+      yield StreamEvent(type="usage_update", output_tokens=2)
+      runner_ref[0]._disconnected = True
+      raise TimeoutError("disconnect during provider call")
+
+  class Producer:
+    async def emit(self, event, *, usage_state="succeeded"):
+      states.append((event.input_tokens, event.output_tokens, usage_state))
+
+  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 1)
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log, dispatcher=_make_dispatcher(event_log),
+    session_id="sess-disconnect", provider=DisconnectingProvider(),
+    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    user_id="alice", request_id="req-disconnect", billing_mode="metered",
+    rate_table_version="v1", channel="web",
+    commercial_usage_producer=Producer(),
+  )
+  runner_ref.append(runner)
+
+  with pytest.raises(TimeoutError, match="disconnect during provider call"):
+    _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  assert states == [(10, 2, "canceled")]
+
+
 def test_usage_helper_functions_match_runner_usage_contract() -> None:
   assert empty_usage_totals() == {
     "input_tokens": 0,
     "output_tokens": 0,
+    "reasoning_tokens_observed": 0,
+    "provider_units": 0,
+    "provider_unit_deltas": {},
     "cache_creation_input_tokens": 0,
     "cache_read_input_tokens": 0,
   }
@@ -201,6 +316,9 @@ def test_usage_helper_functions_match_runner_usage_contract() -> None:
   assert delta == {
     "input_tokens": 10,
     "output_tokens": 0,
+    "reasoning_tokens_observed": 0,
+    "provider_units": 0,
+    "provider_unit_deltas": {},
     "cache_read_input_tokens": 3,
     "cache_creation_input_tokens": 5,
   }
@@ -229,6 +347,9 @@ def test_usage_delta_state_returns_delta_and_token_flag() -> None:
   assert state.usage == {
     "input_tokens": 5,
     "output_tokens": 0,
+    "reasoning_tokens_observed": 0,
+    "provider_units": 0,
+    "provider_unit_deltas": {},
     "cache_read_input_tokens": 0,
     "cache_creation_input_tokens": 0,
   }
@@ -248,6 +369,9 @@ def test_usage_delta_state_reports_false_for_empty_delta() -> None:
   assert state.usage == {
     "input_tokens": 0,
     "output_tokens": 0,
+    "reasoning_tokens_observed": 0,
+    "provider_units": 0,
+    "provider_unit_deltas": {},
     "cache_read_input_tokens": 0,
     "cache_creation_input_tokens": 0,
   }
@@ -275,6 +399,8 @@ def test_apply_message_start_usage_mutates_existing_totals() -> None:
     "output_tokens": 4,
     "cache_read_input_tokens": 13,
     "cache_creation_input_tokens": 9,
+    "provider_units": 0,
+    "provider_unit_deltas": {},
   }
 
 
@@ -292,6 +418,9 @@ def test_apply_usage_update_mutates_output_tokens_only() -> None:
   assert usage == {
     "input_tokens": 20,
     "output_tokens": 15,
+    "reasoning_tokens_observed": 0,
+    "provider_units": 0,
+    "provider_unit_deltas": {},
     "cache_read_input_tokens": 5,
     "cache_creation_input_tokens": 2,
   }
@@ -359,7 +488,7 @@ def test_estimate_usage_cost_passes_uncached_and_cache_token_counts() -> None:
   )
 
   assert cost.total == 0.42
-  assert calls == [("claude-sonnet-4-6", 85, 50, 10, 5)]
+  assert calls == [("claude-sonnet-4-6", 100, 50, 10, 5)]
 
 
 def test_build_usage_event_helper_sets_billing_fields() -> None:
@@ -546,6 +675,27 @@ def test_late_usage_and_summary_helpers_support_async_callbacks() -> None:
 
   assert late_events == [event]
   assert summaries == [summary]
+
+
+def test_reconciliation_failure_is_nonfatal_observable_and_summary_still_runs() -> None:
+  summaries = []
+  metrics = []
+
+  class Producer:
+    async def reconcile(self, summary):
+      raise RuntimeError("comparison failed")
+
+  _run(call_session_summary_hook(
+    summaries.append,
+    _session_summary(),
+    log_session_id="sess-parent",
+    logger=logging.getLogger("test_runner_on_usage"),
+    commercial_usage_producer=Producer(),
+    emit_metric=lambda name, value: metrics.append((name, value)),
+  ))
+
+  assert len(summaries) == 1
+  assert metrics == [("gateway.commercial_usage_reconciliation_error", 1)]
 
 
 class _TwoTurnTextProvider(_UsageProvider):
@@ -744,6 +894,9 @@ def test_final_answer_guard_can_inject_follow_up_turn() -> None:
   assert runtime_guard_events[0]["draft_usage"] == {
     "input_tokens": 10,
     "output_tokens": 5,
+    "reasoning_tokens_observed": 0,
+    "provider_units": 0,
+    "provider_unit_deltas": {},
     "cache_read_input_tokens": 0,
     "cache_creation_input_tokens": 0,
   }
@@ -873,7 +1026,7 @@ def test_on_usage_fires_once_per_turn_with_usage_event_fields() -> None:
   assert event.output_tokens == 50
   assert event.cache_read_tokens == 10
   assert event.cache_creation_tokens == 5
-  assert event.cost_usd == pytest.approx(0.00019375)
+  assert event.cost_usd == pytest.approx(0.00020875)
   assert event.rate_table_version == "2026-04-08"
   assert event.billing_mode == "metered"
   assert event.channel == "web"
@@ -930,7 +1083,7 @@ def test_stream_turn_failure_emits_partial_usage_and_rolls_back_totals() -> None
   assert event.output_tokens == 7
   assert event.cache_read_tokens == 4
   assert event.cache_creation_tokens == 3
-  assert event.cost_usd == pytest.approx(0.00005125)
+  assert event.cost_usd == pytest.approx(0.00005825)
   error_events = [entry.event for entry in event_log.entries if entry.event["type"] == "error"]
   assert len(error_events) == 1
   assert "stream exploded" in error_events[0]["error"]
@@ -1065,6 +1218,9 @@ def test_run_appends_turn_complete_event_to_event_log() -> None:
   assert turn_complete[0]["usage"] == {
     "input_tokens": 100,
     "output_tokens": 50,
+    "reasoning_tokens_observed": 0,
+    "provider_units": 0,
+    "provider_unit_deltas": {},
     "cache_read_input_tokens": 10,
     "cache_creation_input_tokens": 5,
     "estimated_cost": 0.0002,
@@ -1100,7 +1256,7 @@ def test_runner_emits_session_summary_once_after_run() -> None:
   assert summary.output_tokens == 50
   assert summary.cache_read_tokens == 10
   assert summary.cache_creation_tokens == 5
-  assert summary.cost == pytest.approx(0.00019375)
+  assert summary.cost == pytest.approx(0.00020875)
   assert summary.turns == 1
   assert summary.channel == "web"
   assert summary.rate_table_version == "unknown"

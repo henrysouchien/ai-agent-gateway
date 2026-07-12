@@ -20,6 +20,36 @@ import agent_gateway.providers.anthropic_helpers as anthropic_helpers
 from agent_gateway.providers.anthropic import _MODEL_INFO_BY_TAG, _format_anthropic_rejection_detail
 
 
+def test_server_tool_usage_preserves_known_billable_units_and_rejects_unknown_positive() -> None:
+  usage = SimpleNamespace(server_tool_use=SimpleNamespace(
+    web_search_requests=2, web_fetch_requests=3,
+  ))
+  assert anthropic_provider_module._server_tool_unit_deltas(usage) == {
+    "web_fetch": 3, "web_search": 2,
+  }
+
+  unknown = SimpleNamespace(server_tool_use={
+    "web_search_requests": 1, "future_paid_requests": 2,
+  })
+  with pytest.raises(ValueError, match="unrecognized separately billed"):
+    anthropic_provider_module._server_tool_units(unknown)
+  with pytest.raises(ValueError, match="invalid Anthropic"):
+    anthropic_provider_module._server_tool_unit_deltas(SimpleNamespace(
+      server_tool_use={"web_search_requests": True, "web_fetch_requests": 0},
+    ))
+  with pytest.raises(ValueError, match="invalid Anthropic"):
+    anthropic_provider_module._server_tool_unit_deltas(SimpleNamespace(
+      server_tool_use={"web_search_requests": 1.5, "web_fetch_requests": 0},
+    ))
+  with pytest.raises(ValueError, match="unrecognized separately billed"):
+    anthropic_provider_module._server_tool_unit_deltas(SimpleNamespace(
+      server_tool_use={
+        "web_search_requests": 0, "web_fetch_requests": 0,
+        "future_paid_requests": "1",
+      },
+    ))
+
+
 def _model_info() -> ModelInfo:
   return ModelInfo(id="claude-sonnet-4-6", provider="anthropic")
 
