@@ -164,6 +164,8 @@ from .tool_dispatcher import (
   resolve_denied_provenance,
 )
 from .approval_policy import (
+  ApprovalConstraint,
+  ApprovalConstraintError,
   ApprovalDecision as PolicyApprovalDecision,
   ApprovalPolicy,
   ApprovalRequest as PolicyApprovalRequest,
@@ -205,6 +207,8 @@ __all__ = [
   "AggregateReadyTrigger",
   "ApprovalDecision",
   "ApprovalDecisionSource",
+  "ApprovalConstraint",
+  "ApprovalConstraintError",
   "ApprovalOutcome",
   "ApprovalPolicy",
   "ApprovalRequestPayload",

@@ -240,6 +240,7 @@ def _install_batch_pending_approval(
     args_hash=f"cancel-hash-{suffix}",
     reason="requires approval",
     blast_radius_summary="state_write:memory_write",
+    approval_constraint="standard",
     state="pending_user",
     requested_at=utc_now(),
     required_decider_count=required_decider_count,
@@ -1926,6 +1927,7 @@ def test_batch_approval_cancel_interleaving_never_releases_approved_tool(
       args_hash="race-hash",
       reason="requires approval",
       blast_radius_summary="state_write:memory_write",
+      approval_constraint="standard",
       state="pending_user",
       requested_at=utc_now(),
     )
@@ -2301,6 +2303,7 @@ def test_batch_task_registry_shutdown_terminalizes_pending_before_projection_cle
       args_hash="shutdown-hash",
       reason="requires approval",
       blast_radius_summary="state_write:memory_write",
+      approval_constraint="standard",
       state="pending_user",
       requested_at=utc_now(),
       required_decider_count=3,
@@ -2393,6 +2396,7 @@ def test_batch_shutdown_quarantines_late_row_on_preregistered_empty_carrier(
       args_hash="shutdown-first-existing-hash",
       reason="requires approval",
       blast_radius_summary="state_write:memory_write",
+      approval_constraint="standard",
       state="pending_user",
       requested_at=utc_now(),
     )
@@ -2522,6 +2526,7 @@ def test_batch_task_registry_shutdown_rejects_projection_created_during_teardown
         args_hash=f"late-hash-{index}",
         reason="requires approval",
         blast_radius_summary="state_write:memory_write",
+        approval_constraint="standard",
         state="pending_user",
         requested_at=utc_now(),
       )
@@ -2755,6 +2760,7 @@ def test_batch_shutdown_retains_projection_published_between_snapshots(
       args_hash="between-shutdown-snapshots-hash",
       reason="requires approval",
       blast_radius_summary="state_write:memory_write",
+      approval_constraint="standard",
       state="pending_user",
       requested_at=utc_now(),
     )

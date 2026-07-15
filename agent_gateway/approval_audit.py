@@ -86,6 +86,8 @@ class ApprovalAuditEntry:
   system_prompt_hash: str | None
   tool_schema_version: str | None
   mcp_server_version: str | None
+  approval_constraint: str = "legacy_unknown"
+  required_owner_user_id: str | None = None
   identity_source: str | None = None
   change_set_id: str | None = None
   change_hash: str | None = None
@@ -222,6 +224,8 @@ def build_audit_entry(
     system_prompt_hash=request.system_prompt_hash,
     tool_schema_version=request.tool_schema_version,
     mcp_server_version=request.mcp_server_version,
+    approval_constraint=request.approval_constraint,
+    required_owner_user_id=request.required_owner_user_id,
     identity_source=request.identity_source,
     change_set_id=request.change_set_id,
     change_hash=request.change_hash,

@@ -33,6 +33,7 @@ def _planned_merge_handler(
   *,
   execution_result: dict[str, Any] | None = None,
   execution_error: dict[str, Any] | None = None,
+  owner_user_id: str = "101",
 ):
   test_nonce = uuid.uuid4().hex
 
@@ -48,7 +49,7 @@ def _planned_merge_handler(
     proposal_ids = list(tool_input["expected_proposal_ids"])
     pre_thesis = {
       "thesis_id": f"thesis-{test_nonce}",
-      "user_id": "tui-user",
+      "user_id": owner_user_id,
       "ticker": tool_input["expected_ticker"],
       "label": "default",
       "version": 1,
@@ -106,7 +107,7 @@ def _planned_merge_handler(
     )
     review_identity = {
       "pr_id": tool_input["pr_id"],
-      "owner_user_id": "tui-user",
+      "owner_user_id": owner_user_id,
       "ticker": tool_input["expected_ticker"],
       "workspace_id": tool_input["expected_workspace_id"],
       "review_bundle_ref": f"diligence_review_bundles/{test_nonce}",
@@ -134,7 +135,7 @@ def _planned_merge_handler(
       operation_semantics={
         "mode": "diligence_pr_merge",
         "pr_id": tool_input["pr_id"],
-        "owner_user_id": "tui-user",
+        "owner_user_id": owner_user_id,
         "ordered_proposal_ids": proposal_ids,
         "apply_effects_via_outbox": True,
       },
@@ -1179,6 +1180,7 @@ def test_merge_diligence_pr_route_delegates_to_s4m_handler(
   assert response.status_code == 200, response.text
   assert response.json()["pr"]["state"] == "merged"
   assert captured["session"].user_id == "tui-user"
+  assert captured["session"].owner_user_id == "101"
   assert captured["tool_input"] == {
     "pr_id": "dpr_7_MSFT_abc",
     "confirm_merge": True,
@@ -1200,7 +1202,10 @@ def test_merge_diligence_pr_route_delegates_to_s4m_handler(
   assert approval is not None
   assert approval.state == "approved"
   assert approval.decision == "approved"
-  assert approval.decider_id == "tui-user"
+  assert approval.user_id == "101"
+  assert approval.approval_constraint == "fresh_human_owner"
+  assert approval.required_owner_user_id == "101"
+  assert approval.decider_id == "101"
   assert approval.decider_role == "owner"
   assert approval.votes_received_count == 1
   assert approval.identity_source == "reviewed_change_binding"
@@ -1258,8 +1263,11 @@ def test_merge_diligence_pr_route_rejects_automatic_approval_before_execution(
   )
   store = control_plane_app.state.gateway_approval_store
   record_vote = store.record_vote
+  vote_calls = 0
 
   async def return_automatic_outcome(approval_id: str, vote: Any):
+    nonlocal vote_calls
+    vote_calls += 1
     approved = await record_vote(approval_id, vote)
     return replace(approved, state="auto_approved")
 
@@ -1273,6 +1281,7 @@ def test_merge_diligence_pr_route_rejects_automatic_approval_before_execution(
 
   assert response.status_code == 409, response.text
   assert response.json()["code"] == "owner_approval_identity_mismatch"
+  assert vote_calls == 1
   assert "prepared" not in captured
 
 
@@ -1308,6 +1317,103 @@ def test_merge_diligence_pr_route_reuses_exact_manual_approval_and_vote(
   assert approval is not None
   assert approval.state == "approved"
   assert approval.votes_received_count == 1
+
+
+@pytest.mark.parametrize(
+  ("approval_constraint", "required_owner_user_id"),
+  (
+    ("standard", None),
+    ("fresh_human_owner", "different-owner"),
+  ),
+  ids=("constraint-downgrade", "frozen-owner-change"),
+)
+def test_merge_diligence_pr_route_rejects_reused_approval_constraint_mismatch(
+  client: TestClient,
+  control_plane_app,
+  test_control_session: dict[str, Any],
+  monkeypatch,
+  approval_constraint: str,
+  required_owner_user_id: str | None,
+) -> None:
+  captured: dict[str, Any] = {}
+  handler = _planned_merge_handler(
+    captured,
+    execution_result={"status": "success", "pr": {"state": "merged"}},
+  )
+  monkeypatch.setattr(
+    diligence_prs_module,
+    "_merge_handler_for_session",
+    lambda _session: handler,
+  )
+  url = "/api/control/diligence-prs/dpr_7_MSFT_abc/merge"
+  headers = _headers(test_control_session)
+
+  first = client.post(url, headers=headers, json=_merge_payload())
+  assert first.status_code == 200, first.text
+  approval_id = captured["approval_id"]
+  store = control_plane_app.state.gateway_approval_store
+  with store._connection() as conn:
+    conn.execute(
+      """
+      UPDATE approval_requests
+      SET approval_constraint = ?, required_owner_user_id = ?
+      WHERE approval_id = ?
+      """,
+      (approval_constraint, required_owner_user_id, approval_id),
+    )
+  captured.pop("prepared")
+
+  second = client.post(url, headers=headers, json=_merge_payload())
+
+  assert second.status_code == 409, second.text
+  assert second.json()["code"] == "owner_approval_identity_mismatch"
+  assert "prepared" not in captured
+
+
+def test_merge_diligence_pr_route_rejects_different_canonical_owner_before_execution(
+  client: TestClient,
+  control_plane_app,
+  test_control_session: dict[str, Any],
+  monkeypatch,
+) -> None:
+  session = control_plane_app.state.auth.session_store.get_session(
+    test_control_session["session_id"]
+  )
+  assert session is not None
+  assert session.user_id == "tui-user"
+  assert session.owner_user_id == "101"
+  session.owner_user_id = "different-owner"
+  captured: dict[str, Any] = {}
+  handler = _planned_merge_handler(
+    captured,
+    execution_result={"status": "success", "pr": {"state": "merged"}},
+  )
+  monkeypatch.setattr(
+    diligence_prs_module,
+    "_merge_handler_for_session",
+    lambda _session: handler,
+  )
+  store = control_plane_app.state.gateway_approval_store
+  with store._connection() as conn:
+    before = int(
+      conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0]
+    )
+
+  response = client.post(
+    "/api/control/diligence-prs/dpr_7_MSFT_abc/merge",
+    headers=_headers(test_control_session),
+    json=_merge_payload(),
+  )
+
+  assert response.status_code == 409, response.text
+  assert response.json()["code"] == "owner_approval_identity_mismatch"
+  assert "tool_input" in captured
+  assert "prepared" not in captured
+  with store._connection() as conn:
+    after = int(
+      conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0]
+    )
+  assert after == before
 
 
 def test_merge_diligence_pr_route_rejects_tampered_durable_identity(

@@ -12,14 +12,20 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, TYPE_C
 
 from . import approval_settings
 from .approval_policy import (
+  ApprovalConstraintError,
   ApprovalDecision as PolicyApprovalDecision,
   ApprovalPolicy,
   ApprovalRequest as PolicyApprovalRequest,
   RunContext,
+  approval_is_executable,
   sha256_args,
   utc_now,
 )
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
+from .approval_constraints import (
+  constraint_for_catalog_action,
+  trusted_catalog_action,
+)
 from .event_log import EventLog
 from .mcp_client_catalog import tool_argument_guidance
 from .policy_imports import resolve_server_policy_tool_class
@@ -78,6 +84,7 @@ _MCP_VALIDATION_ERROR_MARKERS = (
   "[type=unexpected_keyword_argument]",
 )
 _PORTFOLIO_SCOPE_FIELDS = frozenset({"portfolio_id", "portfolio_name"})
+_CATALOG_ACTION_UNSET = object()
 
 
 def _is_mcp_validation_error(error: Mapping[str, Any]) -> bool:
@@ -290,35 +297,10 @@ class ToolDispatcher:
   def _catalog_action(tool_name: str) -> Any | None:
     """Return one row from the first supported trusted catalog layout."""
 
-    action_catalog: Any | None = None
-    for module_name in ("fms.action_catalog", "api.fms.action_catalog"):
-      try:
-        module = import_module(module_name)
-      except ModuleNotFoundError as exc:
-        parts = module_name.split(".")
-        candidate_or_parent = {
-          ".".join(parts[:index])
-          for index in range(1, len(parts) + 1)
-        }
-        if exc.name not in candidate_or_parent:
-          raise
-        continue
-      action_catalog = module.ACTION_CATALOG
-      break
-    if action_catalog is None:
-      raise TrustedToolPlanError(
-        "trusted FMS action catalog is unavailable in every supported layout"
-      )
-    matches = [
-      action
-      for action in action_catalog
-      if action.local_tool_name == tool_name
-    ]
-    if len(matches) > 1:
-      raise TrustedToolPlanError(
-        f"action catalog contains duplicate local tool {tool_name!r}"
-      )
-    return None if not matches else matches[0]
+    try:
+      return trusted_catalog_action(tool_name, import_module_fn=import_module)
+    except ApprovalConstraintError as exc:
+      raise TrustedToolPlanError(str(exc)) from exc
 
   @staticmethod
   def _catalog_planning_identity(tool_name: str) -> str | None:
@@ -331,8 +313,15 @@ class ToolDispatcher:
   def _planned_handler_hooks(
     tool_name: str,
     handler: LocalToolHandler,
+    *,
+    catalog_action: Any = _CATALOG_ACTION_UNSET,
   ) -> tuple[str, Callable[..., Any], Callable[..., Any]] | None:
-    required_identity = ToolDispatcher._catalog_planning_identity(tool_name)
+    action = (
+      ToolDispatcher._catalog_action(tool_name)
+      if catalog_action is _CATALOG_ACTION_UNSET
+      else catalog_action
+    )
+    required_identity = None if action is None else action.planning_identity
     identity_marker = getattr(handler, "PLANNING_IDENTITY", None)
     planner = getattr(handler, "plan_change", None)
     executor = getattr(handler, "execute_prepared_change", None)
@@ -608,7 +597,19 @@ class ToolDispatcher:
             }
           tool_ctx.durable_business_model_payload = durable.prepared_payload
       try:
-        planned_hooks = self._planned_handler_hooks(tool_name, local_handler)
+        catalog_action = self._catalog_action(tool_name)
+        if constraint_for_catalog_action(catalog_action) == "fresh_human_owner":
+          return None, {
+            "code": "owner_control_route_required",
+            "message": (
+              "Exact promotion requires the authenticated owner control-plane route."
+            ),
+          }
+        planned_hooks = self._planned_handler_hooks(
+          tool_name,
+          local_handler,
+          catalog_action=catalog_action,
+        )
         if planned_hooks is not None:
           trusted_plan, planned_executor = await self._plan_local_write(
             planned_hooks,
@@ -618,7 +619,7 @@ class ToolDispatcher:
           )
       except PlannedWritePlanningRejected as exc:
         return exc.tool_result()
-      except TrustedToolPlanError as exc:
+      except (ApprovalConstraintError, TrustedToolPlanError) as exc:
         log.error("Invalid exact-plan contract for %s: %s", tool_name, exc)
         return None, {
           "code": "planned_write_contract_invalid",
@@ -870,10 +871,7 @@ class ToolDispatcher:
               PreparedBusinessModelLifecycle.AUTHORIZED,
               PreparedBusinessModelLifecycle.CONSUMED,
             }:
-              if resume_approval_request.state not in {
-                "approved",
-                "auto_approved",
-              }:
+              if not approval_is_executable(resume_approval_request):
                 raise TrustedToolPlanError(
                   "durable FMS BusinessModel plan lost approved lineage"
                 )
@@ -1342,10 +1340,7 @@ class ToolDispatcher:
             "code": "planned_write_trusted_plan_lost",
             "message": f"Tool '{tool_name}' lost its trusted exact-write authorization.",
           }
-        if getattr(approval_request_record, "state", None) not in {
-          "approved",
-          "auto_approved",
-        }:
+        if not approval_is_executable(approval_request_record):
           return None, {
             "code": "planned_write_authorization_state_invalid",
             "message": f"Tool '{tool_name}' does not have an executable approval state.",

@@ -7,7 +7,13 @@ from typing import Any, Mapping
 
 from fastapi.encoders import jsonable_encoder
 
-from .approval_policy import ApprovalVote, PersistentGrant, new_approval_id, utc_now
+from .approval_policy import (
+  ApprovalVote,
+  PersistentGrant,
+  approval_is_executable,
+  new_approval_id,
+  utc_now,
+)
 from .approval_store import PersistentGrantCancellationFenced
 from .session import GatewaySession
 
@@ -257,6 +263,28 @@ async def _record_vote_and_unblock_locked(
       },
     )
 
+  if approved and request_record.approval_constraint == "legacy_unknown":
+    raise ApprovalActionError(
+      409,
+      {
+        "error": "Approval constraint is unknown; replan and reauthorize",
+        "approval_id": str(approval_id),
+      },
+    )
+  if approved and request_record.approval_constraint == "fresh_human_owner":
+    if (
+      decider_id != request_record.required_owner_user_id
+      or decider_role != "owner"
+    ):
+      raise ApprovalActionError(
+        403,
+        {
+          "error": "Exact promotion requires approval by its frozen owner",
+          "approval_id": str(approval_id),
+        },
+      )
+    allow_tool_type = False
+
   if approved and not policy.role_authorized_for_class(
     decider_role=decider_role,
     tool_class=request_record.tool_class,
@@ -280,7 +308,16 @@ async def _record_vote_and_unblock_locked(
     decided_at=utc_now(),
     external_callback_id=None,
   )
-  request_record = await store.record_vote(str(approval_id), vote)
+  try:
+    request_record = await store.record_vote(str(approval_id), vote)
+  except ValueError as exc:
+    raise ApprovalActionError(
+      409,
+      {
+        "error": "Approval constraint rejected this decision",
+        "approval_id": str(approval_id),
+      },
+    ) from exc
   if _cancellation_requested(pending_entry):
     return {
       "status": "cancellation_pending",
@@ -304,12 +341,17 @@ async def _record_vote_and_unblock_locked(
       "status": "cancellation_pending",
       "approval": _approval_request_to_dict(request_record),
     }
-  if request_record.state == "approved" and allow_tool_type and request_record.persistent_grant_scope:
+  if (
+    request_record.state == "approved"
+    and request_record.approval_constraint == "standard"
+    and allow_tool_type
+    and request_record.persistent_grant_scope
+  ):
     try:
       await store.create_persistent_grant(
         PersistentGrant(
           grant_id=new_approval_id(),
-          user_id=target_session.user_id,
+          user_id=request_record.user_id,
           tool_name=request_record.tool_name,
           scope_hint=request_record.persistent_grant_scope,
           args_predicate=request_record.args_predicate,
@@ -341,10 +383,14 @@ async def _record_vote_and_unblock_locked(
       "approval": _approval_request_to_dict(request_record),
     }
   pending_entry["status"] = "approval_received"
+  executable = approval_is_executable(request_record)
   await approval_queue.put(
     {
-      "approved": request_record.state == "approved",
-      "allow_tool_type": allow_tool_type,
+      "approved": executable,
+      "allow_tool_type": (
+        request_record.approval_constraint == "standard"
+        and allow_tool_type
+      ),
       "approval_id": str(approval_id),
       "denied_by": effective_denied_by,
     }
@@ -352,8 +398,8 @@ async def _record_vote_and_unblock_locked(
   log.info(
     "Tool approval: %s | approved=%s allow_tool_type=%s approval_id=%s",
     pending_entry.get("tool_name", "?"),
-    request_record.state == "approved",
-    allow_tool_type,
+    executable,
+    allow_tool_type and request_record.approval_constraint == "standard",
     approval_id,
   )
   return {"approval": _approval_request_to_dict(request_record)}

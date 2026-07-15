@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Request
@@ -10,6 +11,7 @@ from agent_gateway.session import AuthManager
 
 from .batches import _read_only_registry_for_user, _registry_for_user
 from .runs import _require_bearer_session, _require_control_session
+from .runs_helpers import _session_owner_user_id
 
 
 _ALLOWED_MERGE_FIELDS = frozenset({
@@ -658,7 +660,8 @@ async def _authorize_owner_merge_plan(
     verify_reviewed_change_structure_v1,
   )
 
-  user_id = str(getattr(session, "user_id", "") or "").strip()
+  user_id = _session_owner_user_id(session)
+  required_owner_user_id: str | None = None
   try:
     trusted_plan.verify_integrity()
     binding = trusted_plan.identity
@@ -669,9 +672,13 @@ async def _authorize_owner_merge_plan(
       "normalized_tool_semantics"
     )
     review_identity = binding.base_vector.value().get("diligence_review")
+    if isinstance(review_identity, dict):
+      frozen_owner = review_identity.get("owner_user_id")
+      if isinstance(frozen_owner, str) and frozen_owner == frozen_owner.strip():
+        required_owner_user_id = frozen_owner or None
     if (
-      not isinstance(review_identity, dict)
-      or review_identity.get("owner_user_id") != user_id
+      required_owner_user_id is None
+      or required_owner_user_id != user_id
       or canonical_json_bytes(bound_semantics)
       != canonical_json_bytes(merge_input)
     ):
@@ -711,6 +718,12 @@ async def _authorize_owner_merge_plan(
       run_context=run_context,
       reason="Authenticated owner confirmed exact diligence PR promotion",
       approval_identity=trusted_plan.approval_identity(),
+      approval_constraint="fresh_human_owner",
+      required_owner_user_id=required_owner_user_id,
+    )
+    candidate = replace(
+      candidate,
+      authorization_mode="OWNER_CONTROL_PLANE",
     )
     approval, _created = await store.create_or_get_by_tool_call_id(candidate)
 
@@ -721,6 +734,9 @@ async def _authorize_owner_merge_plan(
       or approval.user_id != user_id
       or approval.args_hash != args_hash
       or approval.parent_approval_id is not None
+      or approval.approval_constraint != "fresh_human_owner"
+      or approval.required_owner_user_id != required_owner_user_id
+      or approval.authorization_mode != "OWNER_CONTROL_PLANE"
     )
     if invariant_mismatch:
       return None, {

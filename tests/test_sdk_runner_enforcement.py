@@ -20,7 +20,7 @@ if str(API_DIR) not in sys.path:
   sys.path.insert(0, str(API_DIR))
 
 from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog, SessionStore  # noqa: E402
-from agent_gateway import policy_imports  # noqa: E402
+from agent_gateway import policy_imports, sdk_runner_approval  # noqa: E402
 from agent_gateway.approval_policy import ApprovalDecision as PolicyApprovalDecision, ApprovalRequest, ApprovalRequestPayload, RunContext  # noqa: E402
 from agent_gateway.approval_store import SQLiteApprovalStore  # noqa: E402
 from agent_gateway.approvals import _record_vote_and_unblock  # noqa: E402
@@ -210,6 +210,89 @@ def test_sdk_runner_stale_prefixed_mcp_tool_policy_import_drift_fails_loud(
         None,
       )
     )
+
+
+@pytest.mark.parametrize(
+  "tool_name",
+  [
+    "merge_diligence_pr",
+    "mcp__portfolio-proposals-local__merge_diligence_pr",
+  ],
+)
+@pytest.mark.parametrize("lifecycle_configured", [False, True])
+def test_sdk_runner_promotion_saga_requires_owner_control_route_before_approval(
+  monkeypatch: pytest.MonkeyPatch,
+  tool_name: str,
+  lifecycle_configured: bool,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  calls: list[str] = []
+
+  class Store:
+    async def create(self, _request: ApprovalRequest) -> ApprovalRequest:
+      calls.append("store")
+      raise AssertionError("promotion must be refused before approval persistence")
+
+  class Policy:
+    async def decide(self, **_kwargs: Any) -> PolicyApprovalDecision:
+      calls.append("policy")
+      return PolicyApprovalDecision(
+        outcome="auto_approve",
+        reason="custom policy attempted automatic promotion",
+      )
+
+  runner = _make_runner()
+  if lifecycle_configured:
+    runner._session = SimpleNamespace(
+      session_id="sess-sdk-enforce",
+      user_id="alice",
+      channel="web",
+      role="owner",
+      pending_tools={},
+      approval_queues={},
+    )
+    runner._approval_store = Store()
+    runner._approval_policy = Policy()
+
+  denied = _run(
+    runner._can_use_tool_callback(
+      tool_name,
+      {"pr_id": "dpr-1", "confirm_merge": True},
+      None,
+    )
+  )
+
+  assert denied.behavior == "deny"
+  assert "[owner_control_route_required]" in denied.message
+  assert "authenticated owner control-plane route" in denied.message.lower()
+  assert calls == []
+
+
+def test_sdk_runner_catalog_constraint_failure_denies_before_lifecycle(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+
+  def unavailable_constraint(_tool_name: str) -> str:
+    raise RuntimeError("catalog dependency failed")
+
+  monkeypatch.setattr(
+    sdk_runner_approval,
+    "constraint_for_catalog_tool",
+    unavailable_constraint,
+  )
+  runner = _make_runner()
+
+  denied = _run(
+    runner._can_use_tool_callback(
+      "get_portfolio_summary",
+      {},
+      None,
+    )
+  )
+
+  assert denied.behavior == "deny"
+  assert "[approval_constraint_unavailable]" in denied.message
 
 
 def test_sdk_runner_relay_policy_denial_uses_machine_readable_message(

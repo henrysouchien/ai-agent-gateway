@@ -184,6 +184,7 @@ def _approval_record(
     decision=state if state in {"approved", "denied", "expired"} else None,  # type: ignore[arg-type]
     required_decider_count=required_decider_count,
     eligible_decider_count=eligible_decider_count,
+    approval_constraint="standard",
     persistent_grant_scope=persistent_grant_scope,
     policy_id="test-policy",
     policy_version="1",
@@ -307,6 +308,7 @@ def _install_autonomous_pending_approval(
     blast_radius_summary="state_write:memory_write",
     state="pending_user",
     requested_at=utc_now(),
+    approval_constraint="standard",
     persistent_grant_scope="state_write:memory_write",
     policy_id="test-policy",
     policy_version="1",

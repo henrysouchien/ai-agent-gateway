@@ -1,8 +1,13 @@
+# ruff: noqa: E402
+
 import asyncio
 import sys
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -98,6 +103,34 @@ def _policy(*, store: SQLiteApprovalStore | None = None) -> DelegationApprovalPo
   return DelegationApprovalPolicy(base=SingleUserApprovalPolicy(store=store))
 
 
+async def _create_approved_grant_source(
+  store: SQLiteApprovalStore,
+  *,
+  approval_id: str,
+  tool_name: str,
+  scope_hint: str,
+) -> None:
+  source = replace(
+    build_approval_request(
+      tool_call_id=f"source-{approval_id}",
+      tool_name=tool_name,
+      tool_class="external_write",
+      tool_args_redacted={},
+      args_hash=f"hash-{approval_id}",
+      run_context=_run_context(),
+    ),
+    approval_id=approval_id,
+    approval_chain_id=approval_id,
+    state="approved",
+    decision="approved",
+    decided_at=utc_now(),
+    decider_id="alice",
+    decider_role="owner",
+    persistent_grant_scope=scope_hint,
+  )
+  await store.create(source)
+
+
 def test_no_delegation_passthrough_matches_base_for_state_write() -> None:
   async def _case() -> None:
     base = SingleUserApprovalPolicy()
@@ -129,6 +162,40 @@ def test_delegated_state_write_in_ceiling_auto_approves_within_window() -> None:
   _run(_case())
 
 
+@pytest.mark.parametrize(
+  ("approval_constraint", "required_owner_user_id", "expected_outcome"),
+  [
+    ("fresh_human_owner", "alice", "request_user_approval"),
+    ("legacy_unknown", None, "auto_deny"),
+  ],
+)
+def test_delegation_never_auto_approves_nonstandard_constraint(
+  approval_constraint: str,
+  required_owner_user_id: str | None,
+  expected_outcome: str,
+) -> None:
+  async def _case() -> None:
+    delegation = _grant(tool_class_ceiling=frozenset({"state_write"}))
+    run_context = _run_context(delegation=delegation)
+    request, payload = _request_and_payload(run_context=run_context)
+    request = replace(
+      request,
+      approval_constraint=approval_constraint,
+      required_owner_user_id=required_owner_user_id,
+    )
+
+    decision = await _policy().decide(
+      payload=payload,
+      request=request,
+      run_context=run_context,
+    )
+
+    assert decision.outcome == expected_outcome
+    assert decision.allow_persistent_grant is False
+
+  _run(_case())
+
+
 def test_delegated_state_write_not_in_ceiling_requests_user_approval() -> None:
   async def _case() -> None:
     delegation = _grant(tool_class_ceiling=frozenset({"read"}))
@@ -148,6 +215,12 @@ def test_delegated_external_write_ignores_matching_persistent_grant(tmp_path: Pa
     store = _store(tmp_path)
     base = SingleUserApprovalPolicy(store=store)
     policy = DelegationApprovalPolicy(base=base)
+    await _create_approved_grant_source(
+      store,
+      approval_id="prior-approval",
+      tool_name="execute_trade",
+      scope_hint="external_write:execute_trade:AAPL",
+    )
     await store.create_persistent_grant(
       PersistentGrant(
         grant_id="persistent-grant-1",
@@ -203,6 +276,12 @@ def test_resolve_policy_wraps_default_and_blocks_delegated_external_write_persis
     store = _store(tmp_path)
     policy = resolve_policy(store=store)
     assert isinstance(policy, DelegationApprovalPolicy)
+    await _create_approved_grant_source(
+      store,
+      approval_id="prior-approval",
+      tool_name="execute_trade",
+      scope_hint="external_write:execute_trade:AAPL",
+    )
     await store.create_persistent_grant(
       PersistentGrant(
         grant_id="persistent-grant-1",

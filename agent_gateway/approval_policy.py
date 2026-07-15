@@ -26,6 +26,11 @@ ToolClass = Literal[
 ]
 
 ApprovalIdentitySource = Literal["change_set", "reviewed_change_binding"]
+ApprovalConstraint = Literal[
+  "standard",
+  "fresh_human_owner",
+  "legacy_unknown",
+]
 AuthorizationMode = Literal[
   "HUMAN",
   "AUTO_ALLOW",
@@ -141,6 +146,10 @@ class ApprovalPolicyError(RuntimeError):
   The original exception message and raw tool arguments are deliberately not
   included because SDK and SSE paths stringify callback failures.
   """
+
+
+class ApprovalConstraintError(ValueError):
+  """A durable approval constraint is missing, invalid, or cannot authorize."""
 
 
 class ApprovalRequestPayload:
@@ -277,6 +286,8 @@ class ApprovalRequest:
   skill: str | None = None
   notification_policy: ApprovalNotificationPolicy = "auto"
   notification: dict[str, Any] | None = None
+  approval_constraint: ApprovalConstraint = "legacy_unknown"
+  required_owner_user_id: str | None = None
   identity_source: ApprovalIdentitySource | None = None
   change_set_id: str | None = None
   change_hash: str | None = None
@@ -289,6 +300,26 @@ class ApprovalRequest:
   cache_reference: str | None = None
 
   def __post_init__(self) -> None:
+    if self.approval_constraint not in {
+      "standard",
+      "fresh_human_owner",
+      "legacy_unknown",
+    }:
+      raise ApprovalConstraintError("unsupported approval_constraint")
+    if self.approval_constraint == "fresh_human_owner":
+      owner_user_id = self.required_owner_user_id
+      if (
+        not isinstance(owner_user_id, str)
+        or not owner_user_id
+        or owner_user_id != owner_user_id.strip()
+      ):
+        raise ApprovalConstraintError(
+          "fresh_human_owner approval requires a canonical owner identity"
+        )
+    elif self.required_owner_user_id is not None:
+      raise ApprovalConstraintError(
+        "required_owner_user_id requires fresh_human_owner approval"
+      )
     if self.authorization_mode not in {
       "HUMAN",
       "AUTO_ALLOW",
@@ -475,6 +506,8 @@ def build_approval_request(
   reason: str | None = None,
   state: ApprovalState = "created",
   approval_identity: Mapping[str, Any] | None = None,
+  approval_constraint: ApprovalConstraint = "standard",
+  required_owner_user_id: str | None = None,
 ) -> ApprovalRequest:
   identity = dict(approval_identity or {})
   allowed_identity_fields = {
@@ -521,6 +554,8 @@ def build_approval_request(
     tool_schema_version=run_context.tool_schema_version,
     mcp_server_version=run_context.mcp_server_version,
     policy_bundle_hash=run_context.policy_bundle_hash,
+    approval_constraint=approval_constraint,
+    required_owner_user_id=required_owner_user_id,
     identity_source=identity.get("identity_source"),
     change_set_id=identity.get("change_set_id"),
     change_hash=identity.get("change_hash"),
@@ -533,7 +568,64 @@ def build_approval_request(
   )
 
 
+def constrain_approval_decision(
+  request: ApprovalRequest,
+  decision: ApprovalDecision,
+) -> ApprovalDecision:
+  """Apply the durable constraint before policy output can affect lifecycle state."""
+
+  if request.approval_constraint == "standard":
+    return decision
+  if request.approval_constraint == "legacy_unknown":
+    return replace(
+      decision,
+      outcome="auto_deny",
+      reason=(
+        "Approval constraint is unknown; replan and obtain a fresh approval"
+      ),
+      allow_persistent_grant=False,
+      persistent_grant_scope_hint=None,
+      grant_reference=None,
+      modified_tool_args=None,
+    )
+  if decision.outcome == "auto_deny":
+    return replace(
+      decision,
+      allow_persistent_grant=False,
+      persistent_grant_scope_hint=None,
+      grant_reference=None,
+    )
+  return replace(
+    decision,
+    outcome="request_user_approval",
+    reason="Exact promotion requires a fresh decision by its frozen owner",
+    route_target=None,
+    route_target_type="pending_tools",
+    allow_persistent_grant=False,
+    persistent_grant_scope_hint=None,
+    grant_reference=None,
+    modified_tool_args=None,
+  )
+
+
+def approval_is_executable(request: ApprovalRequest) -> bool:
+  """Return whether the durable request can authorize its exact mutation."""
+
+  if request.approval_constraint == "standard":
+    return request.state in {"approved", "auto_approved"}
+  if request.approval_constraint == "legacy_unknown":
+    return False
+  return (
+    request.state == "approved"
+    and request.decision == "approved"
+    and request.authorization_mode in {"HUMAN", "OWNER_CONTROL_PLANE"}
+    and request.decider_role == "owner"
+    and request.decider_id == request.required_owner_user_id
+  )
+
+
 def apply_decision_to_request(request: ApprovalRequest, decision: ApprovalDecision) -> ApprovalRequest:
+  decision = constrain_approval_decision(request, decision)
   authorization_mode: AuthorizationMode = request.authorization_mode
   grant_reference = request.grant_reference
   if decision.grant_reference is not None:

@@ -1,8 +1,20 @@
 # Changelog
 
-## Unreleased (post-0.15.8)
+## Unreleased (post-0.15.9)
 
 _No unreleased changes recorded yet._
+
+## 0.15.9 (2026-07-15)
+
+### Fixed
+
+- Required a fresh approval from the exact human owner for promotion-saga
+  actions, preserving the approval constraint and reviewed-change identity
+  through persistence, reopen, replacement, and lifecycle transitions.
+- Prevented delegated or persistent grants, auto-approval, mismatched owners,
+  and non-owner roles from satisfying owner-only promotion approval.
+- Derived approval constraints from the trusted FMS action catalog and failed
+  closed for unavailable, duplicate, or unsupported catalog definitions.
 
 ## 0.15.8 (2026-07-15)
 

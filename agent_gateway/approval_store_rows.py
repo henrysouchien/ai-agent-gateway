@@ -129,6 +129,8 @@ def request_to_row(request: ApprovalRequest) -> dict[str, Any]:
     "tool_schema_version": request.tool_schema_version,
     "mcp_server_version": request.mcp_server_version,
     "notification_policy": request.notification_policy,
+    "approval_constraint": request.approval_constraint,
+    "required_owner_user_id": request.required_owner_user_id,
     "identity_source": request.identity_source,
     "change_set_id": request.change_set_id,
     "change_hash": request.change_hash,
@@ -195,6 +197,16 @@ def row_to_request(row: sqlite3.Row) -> ApprovalRequest:
     tool_schema_version=row["tool_schema_version"],
     mcp_server_version=row["mcp_server_version"],
     notification_policy=row["notification_policy"] if "notification_policy" in columns else "auto",
+    approval_constraint=(
+      row["approval_constraint"]
+      if "approval_constraint" in columns and row["approval_constraint"] is not None
+      else "legacy_unknown"
+    ),
+    required_owner_user_id=(
+      row["required_owner_user_id"]
+      if "required_owner_user_id" in columns
+      else None
+    ),
     identity_source=row["identity_source"] if "identity_source" in columns else None,
     change_set_id=row["change_set_id"] if "change_set_id" in columns else None,
     change_hash=row["change_hash"] if "change_hash" in columns else None,

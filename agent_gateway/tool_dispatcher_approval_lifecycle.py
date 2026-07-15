@@ -10,12 +10,15 @@ from typing import Any, Mapping
 
 from . import approval_settings
 from .approval_policy import (
+  ApprovalConstraint,
   ApprovalDecision as PolicyApprovalDecision,
   ApprovalRequest as PolicyApprovalRequest,
   RunContext,
   apply_decision_to_request,
+  approval_is_executable,
   build_approval_request,
   call_policy_safely,
+  constrain_approval_decision,
   sha256_args,
   utc_now,
 )
@@ -38,6 +41,8 @@ async def run_approval_lifecycle(
   qualifier: str,
   reason: str,
   allow_persistent: bool,
+  approval_constraint: ApprovalConstraint = "standard",
+  required_owner_user_id: str | None = None,
   approval_identity: Mapping[str, Any] | None = None,
   prepared_authorization_payload: bytes | None = None,
   prepared_business_model_change: Mapping[str, Any] | None = None,
@@ -86,6 +91,8 @@ async def _run_approval_lifecycle_impl(
   qualifier: str,
   reason: str,
   allow_persistent: bool,
+  approval_constraint: ApprovalConstraint = "standard",
+  required_owner_user_id: str | None = None,
   approval_identity: Mapping[str, Any] | None = None,
   prepared_authorization_payload: bytes | None = None,
   prepared_business_model_change: Mapping[str, Any] | None = None,
@@ -131,6 +138,8 @@ async def _run_approval_lifecycle_impl(
     "args_hash": args_hash,
     "run_context": run_context,
     "reason": reason or None,
+    "approval_constraint": approval_constraint,
+    "required_owner_user_id": required_owner_user_id,
   }
   if approval_identity is not None:
     build_request_kwargs["approval_identity"] = approval_identity
@@ -139,6 +148,21 @@ async def _run_approval_lifecycle_impl(
     if resume_approval_request is not None
     else build_approval_request_fn(**build_request_kwargs)
   )
+  if resume_approval_request is not None and (
+    request.approval_constraint != approval_constraint
+    or request.required_owner_user_id != required_owner_user_id
+  ):
+    raise RuntimeError(
+      "prepared approval constraint changed; replan and reauthorize"
+    )
+  if request.approval_constraint == "legacy_unknown":
+    session_cache_approved = False
+    automatic_approval_reason = None
+    allow_persistent = False
+  elif request.approval_constraint == "fresh_human_owner":
+    session_cache_approved = False
+    automatic_approval_reason = None
+    allow_persistent = False
   if batch_admission is not None:
     batch_admission.bind_request(request=request, store=store)
   if hasattr(request, "__dataclass_fields__"):
@@ -289,6 +313,7 @@ async def _run_approval_lifecycle_impl(
     del raw_args
 
   decision = effective_trade_approval_decision_fn(tool_name, request.tool_args_redacted, decision)
+  decision = constrain_approval_decision(request, decision)
   request = apply_decision_to_request_fn(request, decision)
   await store.update_request(request)
   final_tool_input = decision.modified_tool_args if decision.modified_tool_args is not None else tool_input
@@ -393,7 +418,7 @@ async def _run_approval_lifecycle_impl(
     decision,
     nonce=nonce,
     resolved_qualifier=qualifier,
-    allow_persistent=allow_persistent,
+    allow_persistent=(allow_persistent and request.approval_constraint == "standard"),
     timeout_seconds=approval_queue_timeout_seconds_fn(decision.expiry_seconds),
     batch_admission=batch_admission,
   )
@@ -402,9 +427,14 @@ async def _run_approval_lifecycle_impl(
   latest = await store.get(request.approval_id)
   if latest is not None:
     request = latest
+  executable = approval_is_executable(request)
   return {
-    "approved": bool(approval.get("approved")),
-    "allow_tool_type": bool(approval.get("allow_tool_type")),
+    "approved": executable,
+    "allow_tool_type": (
+      executable
+      and request.approval_constraint == "standard"
+      and bool(approval.get("allow_tool_type"))
+    ),
     "denied_by": approval.get("denied_by"),
     "request": request,
     "tool_input": final_tool_input,

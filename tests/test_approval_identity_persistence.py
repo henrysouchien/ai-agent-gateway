@@ -12,7 +12,12 @@ from typing import Any
 import pytest
 
 from agent_gateway.approval_audit import AuditBuildError, build_audit_entry
-from agent_gateway.approval_policy import ApprovalRequest
+from agent_gateway.approval_policy import (
+  ApprovalConstraint,
+  ApprovalRequest,
+  ApprovalVote,
+  PersistentGrant,
+)
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.audit_writer import JSONLAuditWriter
 
@@ -42,6 +47,11 @@ _IDENTITY_FIELDS = (
   "reviewed_change_binding_digest",
   "review_reference",
   "execution_semantics_digest",
+)
+
+_APPROVAL_CONSTRAINT_FIELDS = (
+  "approval_constraint",
+  "required_owner_user_id",
 )
 
 
@@ -86,6 +96,8 @@ def _request(
   *,
   approval_id: str,
   identity_source: str | None = None,
+  approval_constraint: ApprovalConstraint = "standard",
+  required_owner_user_id: str | None = None,
 ) -> ApprovalRequest:
   identity: dict[str, Any]
   if identity_source == "change_set":
@@ -142,12 +154,21 @@ def _request(
     policy_id="test-policy",
     policy_version="1",
     policy_bundle_hash="test-policy-bundle",
+    approval_constraint=approval_constraint,
+    required_owner_user_id=required_owner_user_id,
     **identity,
   )
 
 
 def _identity_snapshot(request: ApprovalRequest) -> dict[str, Any]:
   return {field: getattr(request, field) for field in _IDENTITY_FIELDS}
+
+
+def _approval_constraint_snapshot(request: ApprovalRequest) -> dict[str, Any]:
+  return {
+    field: getattr(request, field)
+    for field in _APPROVAL_CONSTRAINT_FIELDS
+  }
 
 
 @pytest.mark.parametrize("identity_source", ["change_set", "reviewed_change_binding"])
@@ -196,6 +217,282 @@ def test_identity_round_trips_and_survives_store_reopen(
   after_restart = _run(reopened_again.get(request.approval_id))
   assert after_restart is not None
   assert _identity_snapshot(after_restart) == expected
+
+
+@pytest.mark.parametrize(
+  ("approval_constraint", "required_owner_user_id"),
+  [
+    ("standard", None),
+    ("fresh_human_owner", "owner-user-417"),
+    ("legacy_unknown", None),
+  ],
+)
+def test_approval_constraint_round_trips_and_survives_store_reopen(
+  tmp_path: Path,
+  approval_constraint: ApprovalConstraint,
+  required_owner_user_id: str | None,
+) -> None:
+  path = tmp_path / "approval-constraint.sqlite3"
+  request = _request(
+    approval_id=f"approval-{approval_constraint}",
+    approval_constraint=approval_constraint,
+    required_owner_user_id=required_owner_user_id,
+  )
+  expected = _approval_constraint_snapshot(request)
+
+  first_store = SQLiteApprovalStore(path)
+  _run(first_store.create(request))
+  assert _approval_constraint_snapshot(
+    _run(first_store.get_by_tool_call_id(request.tool_call_id))
+  ) == expected
+
+  reopened = SQLiteApprovalStore(path)
+  loaded = _run(reopened.get(request.approval_id))
+  assert loaded is not None
+  assert _approval_constraint_snapshot(loaded) == expected
+
+
+@pytest.mark.parametrize(
+  ("approval_constraint", "required_owner_user_id"),
+  [
+    ("standard", None),
+    ("fresh_human_owner", "different-owner"),
+    ("legacy_unknown", None),
+  ],
+)
+def test_tool_call_reuse_cannot_change_approval_constraint(
+  tmp_path: Path,
+  approval_constraint: ApprovalConstraint,
+  required_owner_user_id: str | None,
+) -> None:
+  store = SQLiteApprovalStore(tmp_path / "constraint-reuse.sqlite3")
+  original = _request(
+    approval_id="approval-original-owner",
+    approval_constraint="fresh_human_owner",
+    required_owner_user_id="owner-user-417",
+  )
+  _run(store.create_or_get_by_tool_call_id(original))
+  replacement = replace(
+    original,
+    approval_id="approval-replacement-owner",
+    approval_chain_id="approval-replacement-owner",
+    approval_constraint=approval_constraint,
+    required_owner_user_id=required_owner_user_id,
+  )
+
+  with pytest.raises(ValueError, match="approval constraint"):
+    _run(store.create_or_get_by_tool_call_id(replacement))
+
+  assert _run(store.get_by_tool_call_id(original.tool_call_id)) == original
+
+
+@pytest.mark.parametrize(
+  ("approval_constraint", "required_owner_user_id", "state", "decider_id", "decider_role"),
+  [
+    ("legacy_unknown", None, "approved", "owner-user-417", "owner"),
+    ("legacy_unknown", None, "auto_approved", None, None),
+    ("fresh_human_owner", "owner-user-417", "auto_approved", "owner-user-417", "owner"),
+    ("fresh_human_owner", "owner-user-417", "approved", "different-owner", "owner"),
+    ("fresh_human_owner", "owner-user-417", "approved", "owner-user-417", "reviewer"),
+  ],
+)
+def test_store_refuses_positive_transition_that_violates_approval_constraint(
+  tmp_path: Path,
+  approval_constraint: ApprovalConstraint,
+  required_owner_user_id: str | None,
+  state: str,
+  decider_id: str | None,
+  decider_role: str | None,
+) -> None:
+  path = tmp_path / "positive-transition.sqlite3"
+  store = SQLiteApprovalStore(path)
+  request = _request(
+    approval_id=f"approval-{approval_constraint}-{state}",
+    approval_constraint=approval_constraint,
+    required_owner_user_id=required_owner_user_id,
+  )
+  _run(store.create(request))
+
+  with pytest.raises(ValueError, match="approval constraint"):
+    _run(
+      store.transition_state(
+        request.approval_id,
+        state,  # type: ignore[arg-type]
+        expected_state_version=0,
+        decider_id=decider_id,
+        decider_role=decider_role,
+        decision=state,
+      )
+    )
+
+  loaded = _run(SQLiteApprovalStore(path).get(request.approval_id))
+  assert loaded is not None
+  assert loaded.state == "pending_user"
+  assert loaded.state_version == 0
+  assert loaded.decision is None
+
+
+def test_fresh_human_owner_vote_requires_exact_owner_identity_and_role(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "owner-vote.sqlite3"
+  store = SQLiteApprovalStore(path)
+  request = _request(
+    approval_id="approval-owner-vote",
+    approval_constraint="fresh_human_owner",
+    required_owner_user_id="owner-user-417",
+  )
+  _run(store.create(request))
+
+  def vote(*, vote_id: str, decider_id: str, decider_role: str) -> ApprovalVote:
+    return ApprovalVote(
+      vote_id=vote_id,
+      approval_id=request.approval_id,
+      decider_id=decider_id,
+      decider_role=decider_role,
+      decision="approved",
+      decision_reason="reviewed",
+      decided_at=datetime(2026, 7, 14, 12, 5, tzinfo=UTC),
+    )
+
+  with pytest.raises(ValueError, match="approval constraint"):
+    _run(
+      store.record_vote(
+        request.approval_id,
+        vote(
+          vote_id="vote-wrong-owner",
+          decider_id="different-owner",
+          decider_role="owner",
+        ),
+      )
+    )
+  with pytest.raises(ValueError, match="approval constraint"):
+    _run(
+      store.record_vote(
+        request.approval_id,
+        vote(
+          vote_id="vote-wrong-role",
+          decider_id="owner-user-417",
+          decider_role="reviewer",
+        ),
+      )
+    )
+
+  still_pending = _run(SQLiteApprovalStore(path).get(request.approval_id))
+  assert still_pending is not None
+  assert still_pending.state == "pending_user"
+  assert still_pending.votes_received_count == 0
+  with sqlite3.connect(path) as conn:
+    assert conn.execute(
+      "SELECT COUNT(*) FROM approval_votes WHERE approval_id = ?",
+      (request.approval_id,),
+    ).fetchone()[0] == 0
+
+  approved = _run(
+    store.record_vote(
+      request.approval_id,
+      vote(
+        vote_id="vote-exact-owner",
+        decider_id="owner-user-417",
+        decider_role="owner",
+      ),
+    )
+  )
+  assert approved.state == "approved"
+  assert approved.decider_id == "owner-user-417"
+  assert approved.decider_role == "owner"
+  assert approved.votes_received_count == 1
+
+
+@pytest.mark.parametrize(
+  ("approval_constraint", "required_owner_user_id"),
+  [
+    ("fresh_human_owner", "owner-user-417"),
+    ("legacy_unknown", None),
+  ],
+)
+def test_persistent_grant_mint_refuses_nonstandard_source_approval(
+  tmp_path: Path,
+  approval_constraint: ApprovalConstraint,
+  required_owner_user_id: str | None,
+) -> None:
+  path = tmp_path / "grant-backstop.sqlite3"
+  store = SQLiteApprovalStore(path)
+  request = _request(
+    approval_id=f"approval-grant-{approval_constraint}",
+    approval_constraint=approval_constraint,
+    required_owner_user_id=required_owner_user_id,
+  )
+  _run(store.create(request))
+  # Seed a historical terminal row directly so this assertion isolates the
+  # grant-mint backstop from the positive-transition backstop above.
+  with sqlite3.connect(path) as conn:
+    conn.execute(
+      """
+      UPDATE approval_requests
+      SET state = 'approved', decision = 'approved', decided_at = ?,
+          decider_id = ?, decider_role = 'owner'
+      WHERE approval_id = ?
+      """,
+      (
+        "2026-07-14T12:05:00+00:00",
+        required_owner_user_id or "legacy-owner",
+        request.approval_id,
+      ),
+    )
+  grant = PersistentGrant(
+    grant_id=f"grant-{approval_constraint}",
+    user_id=request.user_id,
+    tool_name=request.tool_name,
+    scope_hint="test-scope",
+    args_predicate=None,
+    granted_at=datetime(2026, 7, 14, 12, 6, tzinfo=UTC),
+    expires_at=None,
+    revoked_at=None,
+    granted_via_approval_id=request.approval_id,
+    policy_id=request.policy_id,
+  )
+
+  with pytest.raises(ValueError, match="approval constraint"):
+    _run(store.create_persistent_grant(grant))
+
+  assert _run(
+    store.find_persistent_grant(
+      user_id=grant.user_id,
+      tool_name=grant.tool_name,
+      scope_hint=grant.scope_hint,
+    )
+  ) is None
+
+
+def test_persistent_grant_mint_allows_standard_source_approval(
+  tmp_path: Path,
+) -> None:
+  store = SQLiteApprovalStore(tmp_path / "standard-grant.sqlite3")
+  request = replace(
+    _request(approval_id="approval-standard-grant"),
+    state="approved",
+    decided_at=datetime(2026, 7, 14, 12, 5, tzinfo=UTC),
+    decider_id="reviewer-1",
+    decider_role="reviewer",
+    decision="approved",
+    persistent_grant_scope="test-scope",
+  )
+  _run(store.create(request))
+  grant = PersistentGrant(
+    grant_id="grant-standard",
+    user_id=request.user_id,
+    tool_name=request.tool_name,
+    scope_hint="test-scope",
+    args_predicate=None,
+    granted_at=datetime(2026, 7, 14, 12, 6, tzinfo=UTC),
+    expires_at=None,
+    revoked_at=None,
+    granted_via_approval_id=request.approval_id,
+    policy_id=request.policy_id,
+  )
+
+  assert _run(store.create_persistent_grant(grant)) == grant
 
 
 def test_tool_call_get_or_create_is_atomic_across_store_instances(
@@ -252,11 +549,17 @@ def test_old_schema_migrates_existing_row_with_null_identity(tmp_path: Path) -> 
     "reviewed_change_binding_digest",
     "review_reference_json",
     "execution_semantics_digest",
+    "approval_constraint",
+    "required_owner_user_id",
   } <= columns
 
   loaded = _run(store.get("legacy-before-migration"))
   assert loaded is not None
   assert _identity_snapshot(loaded) == dict.fromkeys(_IDENTITY_FIELDS)
+  assert _approval_constraint_snapshot(loaded) == {
+    "approval_constraint": "legacy_unknown",
+    "required_owner_user_id": None,
+  }
 
 
 def test_legacy_insert_and_update_sql_preserve_new_identity_columns(tmp_path: Path) -> None:
@@ -288,6 +591,10 @@ def test_legacy_insert_and_update_sql_preserve_new_identity_columns(tmp_path: Pa
   legacy_insert = _run(reopened.get("inserted-by-prior-binary"))
   assert legacy_insert is not None
   assert _identity_snapshot(legacy_insert) == dict.fromkeys(_IDENTITY_FIELDS)
+  assert _approval_constraint_snapshot(legacy_insert) == {
+    "approval_constraint": "legacy_unknown",
+    "required_owner_user_id": None,
+  }
 
 
 @pytest.mark.parametrize(
@@ -466,6 +773,52 @@ def test_update_request_rejects_coherent_identity_replacement(
   loaded = _run(SQLiteApprovalStore(path).get(request.approval_id))
   assert loaded is not None
   assert _identity_snapshot(loaded) == expected
+
+
+def test_update_request_rejects_coherent_approval_constraint_replacement(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "immutable-approval-constraint.sqlite3"
+  store = SQLiteApprovalStore(path)
+  request = _request(
+    approval_id="approval-constraint-immutable",
+    approval_constraint="fresh_human_owner",
+    required_owner_user_id="owner-user-417",
+  )
+  expected = _approval_constraint_snapshot(request)
+  _run(store.create(request))
+
+  for changed in (
+    replace(request, required_owner_user_id="different-owner"),
+    replace(
+      request,
+      approval_constraint="standard",
+      required_owner_user_id=None,
+    ),
+  ):
+    with pytest.raises(ValueError, match="immutable"):
+      _run(store.update_request(changed))
+
+  loaded = _run(SQLiteApprovalStore(path).get(request.approval_id))
+  assert loaded is not None
+  assert _approval_constraint_snapshot(loaded) == expected
+
+
+def test_corrupt_persisted_approval_constraint_fails_closed(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "corrupt-approval-constraint.sqlite3"
+  store = SQLiteApprovalStore(path)
+  request = _request(approval_id="approval-corrupt-constraint")
+  _run(store.create(request))
+  with pytest.raises(sqlite3.IntegrityError, match="approval_constraint"):
+    with sqlite3.connect(path) as conn:
+      conn.execute(
+        "UPDATE approval_requests SET approval_constraint = ? WHERE approval_id = ?",
+        ("future_untrusted_value", request.approval_id),
+      )
+
+  assert _run(store.get(request.approval_id)) == request
 
 
 def test_update_request_allows_nonidentity_changes_and_preserves_identity(

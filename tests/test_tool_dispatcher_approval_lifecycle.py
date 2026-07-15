@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -24,6 +25,7 @@ from agent_gateway.approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
   PersistentGrant,
   RunContext,
+  build_approval_request,
   utc_now,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
@@ -1275,6 +1277,25 @@ def test_planned_dispatch_persistent_grant_still_creates_bound_row(
     policy=policy,
   )
   scope_hint = f"{dispatcher._resolve_tool_class('planned')}:planned"
+  prior_approval = replace(
+    build_approval_request(
+      tool_call_id="prior-call",
+      tool_name="planned",
+      tool_class="state_write",
+      tool_args_redacted={},
+      args_hash="prior-args",
+      run_context=RunContext(user_id="alice", request_id="prior-request"),
+    ),
+    approval_id="prior-approval",
+    approval_chain_id="prior-approval",
+    state="approved",
+    decision="approved",
+    decided_at=utc_now(),
+    decider_id="alice",
+    decider_role="owner",
+    persistent_grant_scope=scope_hint,
+  )
+  asyncio.run(store.create(prior_approval))
   asyncio.run(
     store.create_persistent_grant(
       PersistentGrant(
@@ -1672,6 +1693,71 @@ def test_loaded_catalog_true_miss_preserves_generic_local_handler(
 
 
 @pytest.mark.parametrize(
+  "approval_path",
+  ["session_cache", "headless", "custom_auto", "no_lifecycle"],
+)
+def test_promotion_saga_generic_dispatch_requires_owner_control_route_before_approval_paths(
+  tmp_path: Path,
+  approval_path: str,
+) -> None:
+  calls: list[str] = []
+
+  async def handler(*_args: Any, **_kwargs: Any):
+    calls.append("handler")
+    return {"status": "unexpected"}, None
+
+  class Store(SQLiteApprovalStore):
+    async def create(self, request):
+      calls.append("store")
+      return await super().create(request)
+
+  class Policy:
+    policy_id = "promotion-test"
+    policy_version = "1"
+    policy_bundle_hash = "promotion-test-bundle"
+
+    async def decide(self, **_kwargs: Any):
+      calls.append("policy")
+      return PolicyApprovalDecision(
+        outcome="auto_approve",
+        reason="custom policy attempted automatic promotion",
+      )
+
+    async def on_resolve(self, **_kwargs: Any):
+      calls.append("resolve")
+
+  dispatcher_kwargs: dict[str, Any] = {
+    "mcp_client": _NullMcp(),
+    "local_tool_handlers": {"merge_diligence_pr": handler},
+    "needs_approval": lambda *_args: approval_path != "no_lifecycle",
+  }
+  if approval_path != "no_lifecycle":
+    dispatcher_kwargs.update(
+      session=_planned_session(),
+      store=Store(tmp_path / "approvals.sqlite3"),
+      policy=Policy(),
+    )
+  if approval_path == "session_cache":
+    dispatcher_kwargs["approved_tool_types"] = {"merge_diligence_pr"}
+  if approval_path == "headless":
+    dispatcher_kwargs["should_avoid_permission_prompts"] = True
+
+  dispatcher = ToolDispatcher(**dispatcher_kwargs)
+  result, error = asyncio.run(
+    dispatcher.dispatch(
+      "call-promotion",
+      "merge_diligence_pr",
+      {"pr_id": "dpr-1", "confirm_merge": True},
+    )
+  )
+
+  assert result is None
+  assert error["code"] == "owner_control_route_required"
+  assert "authenticated owner control-plane route" in error["message"].lower()
+  assert calls == []
+
+
+@pytest.mark.parametrize(
   "declared",
   [
     frozenset({"identity", "planner"}),
@@ -1916,3 +2002,85 @@ def test_local_handler_receives_context_when_event_logging_is_disabled() -> None
   assert result == {"ok": True}
   assert seen["ctx"] is not None
   assert seen["ctx"].event_log is None
+
+
+@pytest.mark.parametrize(
+  ("session_cache_approved", "automatic_approval_reason"),
+  [
+    (True, None),
+    (False, "headless hook allowed"),
+    (False, None),
+  ],
+)
+def test_fresh_owner_lifecycle_blocks_every_automatic_source(
+  tmp_path: Path,
+  session_cache_approved: bool,
+  automatic_approval_reason: str | None,
+) -> None:
+  class AutoPolicy:
+    policy_id = "auto-policy"
+    policy_version = "1"
+
+    def __init__(self) -> None:
+      self.decide_calls = 0
+      self.resolved: list[str] = []
+
+    async def decide(self, **_kwargs: Any) -> PolicyApprovalDecision:
+      self.decide_calls += 1
+      return PolicyApprovalDecision(
+        outcome="auto_approve",
+        reason="custom automatic policy",
+        allow_persistent_grant=True,
+        persistent_grant_scope_hint="state_write:merge_diligence_pr",
+        grant_reference="grant-should-not-survive",
+      )
+
+    async def on_resolve(self, *, request: Any) -> None:
+      self.resolved.append(request.approval_id)
+
+  async def fail_if_prompted(*_args: Any, **_kwargs: Any) -> None:
+    raise AssertionError("headless fresh-owner lifecycle must not prompt")
+
+  store = SQLiteApprovalStore(tmp_path / "fresh-owner.sqlite3")
+  policy = AutoPolicy()
+  result = asyncio.run(
+    lifecycle_helpers.run_approval_lifecycle(
+      store=store,
+      policy=policy,
+      session=SimpleNamespace(),
+      tool_call_id="promotion-call",
+      tool_name="merge_diligence_pr",
+      tool_input={"confirm_merge": True},
+      qualifier="",
+      reason="promotion",
+      allow_persistent=True,
+      approval_constraint="fresh_human_owner",
+      required_owner_user_id="owner-1",
+      session_cache_approved=session_cache_approved,
+      automatic_approval_reason=automatic_approval_reason,
+      deny_user_prompt=True,
+      resolve_run_context_fn=lambda: RunContext(
+        user_id="owner-1",
+        request_id="request-1",
+        decider_role="owner",
+      ),
+      current_skill_fn=lambda: None,
+      redact_for_approval_request_fn=lambda *_args: ({}, "args-hash"),
+      resolve_tool_class_fn=lambda _tool_name: "state_write",
+      effective_trade_approval_decision_fn=lambda _name, _args, decision: decision,
+      await_user_approval_via_pending_tools_fn=fail_if_prompted,
+      approval_queue_timeout_seconds_fn=lambda _expiry: 1.0,
+    )
+  )
+
+  request = result["request"]
+  assert result["approved"] is False
+  assert result["allow_tool_type"] is False
+  assert request.state == "auto_denied"
+  assert request.authorization_mode == "HUMAN"
+  assert request.grant_reference is None
+  assert request.persistent_grant_scope is None
+  assert request.approval_constraint == "fresh_human_owner"
+  assert request.required_owner_user_id == "owner-1"
+  assert policy.decide_calls == 1
+  assert policy.resolved == [request.approval_id]

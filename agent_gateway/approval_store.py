@@ -126,6 +126,7 @@ class ApprovalRequestStore(Protocol):
     tool_name: str,
     scope_hint: str,
     now: datetime | None = None,
+    approval_constraint: str = "standard",
   ) -> PersistentGrant | None: ...
   async def revoke_persistent_grant(self, grant_id: str, *, revoked_at: datetime | None = None) -> None: ...
   async def revoke_persistent_grants_for_approval(
@@ -250,6 +251,9 @@ class SQLiteApprovalStore:
           mcp_server_version TEXT,
           skill TEXT,
           notification_policy TEXT NOT NULL DEFAULT 'auto',
+          approval_constraint TEXT NOT NULL DEFAULT 'legacy_unknown'
+            CHECK (approval_constraint IN ('standard', 'fresh_human_owner', 'legacy_unknown')),
+          required_owner_user_id TEXT,
           identity_source TEXT,
           change_set_id TEXT,
           change_hash TEXT,
@@ -259,7 +263,15 @@ class SQLiteApprovalStore:
           execution_semantics_digest TEXT,
           authorization_mode TEXT NOT NULL DEFAULT 'HUMAN',
           grant_reference TEXT,
-          cache_reference TEXT
+          cache_reference TEXT,
+          CHECK (
+            (approval_constraint = 'fresh_human_owner'
+              AND required_owner_user_id IS NOT NULL
+              AND length(trim(required_owner_user_id)) > 0)
+            OR
+            (approval_constraint IN ('standard', 'legacy_unknown')
+              AND required_owner_user_id IS NULL)
+          )
         );
         CREATE INDEX IF NOT EXISTS idx_approval_requests_tool_call_id
           ON approval_requests(tool_call_id);
@@ -350,6 +362,12 @@ class SQLiteApprovalStore:
       if "notification_policy" not in columns:
         conn.execute("ALTER TABLE approval_requests ADD COLUMN notification_policy TEXT NOT NULL DEFAULT 'auto'")
       identity_columns = {
+        "approval_constraint": (
+          "TEXT NOT NULL DEFAULT 'legacy_unknown' "
+          "CHECK (approval_constraint IN "
+          "('standard', 'fresh_human_owner', 'legacy_unknown'))"
+        ),
+        "required_owner_user_id": "TEXT",
         "identity_source": "TEXT",
         "change_set_id": "TEXT",
         "change_hash": "TEXT",
@@ -387,7 +405,8 @@ class SQLiteApprovalStore:
             external_callback_id, policy_id, policy_version, policy_bundle_hash,
             persistent_grant_scope, tenant_id, model_id, model_version,
             system_prompt_hash, tool_schema_version, mcp_server_version, skill,
-            notification_policy, identity_source, change_set_id, change_hash,
+            notification_policy, approval_constraint, required_owner_user_id,
+            identity_source, change_set_id, change_hash,
             base_vector_hash, reviewed_change_binding_digest,
             review_reference_json, execution_semantics_digest,
             authorization_mode, grant_reference, cache_reference
@@ -402,7 +421,8 @@ class SQLiteApprovalStore:
             :external_callback_id, :policy_id, :policy_version, :policy_bundle_hash,
             :persistent_grant_scope, :tenant_id, :model_id, :model_version,
             :system_prompt_hash, :tool_schema_version, :mcp_server_version, :skill,
-            :notification_policy, :identity_source, :change_set_id, :change_hash,
+            :notification_policy, :approval_constraint, :required_owner_user_id,
+            :identity_source, :change_set_id, :change_hash,
             :base_vector_hash, :reviewed_change_binding_digest,
             :review_reference_json, :execution_semantics_digest,
             :authorization_mode, :grant_reference, :cache_reference
@@ -469,6 +489,13 @@ class SQLiteApprovalStore:
           created = True
         else:
           stored = self._row_to_request_with_projection(row)
+          if (
+            stored.approval_constraint != request.approval_constraint
+            or stored.required_owner_user_id != request.required_owner_user_id
+          ):
+            raise ValueError(
+              "approval constraint conflicts with existing tool-call identity"
+            )
         conn.commit()
     if created:
       await self._emit("request_created", stored)
@@ -510,6 +537,10 @@ class SQLiteApprovalStore:
               stored_request.tool_name != request.tool_name
               or stored_request.args_hash != request.args_hash
               or stored_request.user_id != request.user_id
+              or stored_request.approval_constraint
+              != request.approval_constraint
+              or stored_request.required_owner_user_id
+              != request.required_owner_user_id
             ):
               raise _prepared_bm.PreparedBusinessModelError(
                 "approval tool-call identity conflicts with prepared BusinessModel intent"
@@ -573,6 +604,8 @@ class SQLiteApprovalStore:
           )
         current = self._row_to_request(current_row)
         identity_fields = (
+          "approval_constraint",
+          "required_owner_user_id",
           "identity_source",
           "change_set_id",
           "change_hash",
@@ -644,6 +677,15 @@ class SQLiteApprovalStore:
         current = self._row_to_request(current_row)
         if expected_state_version is not None and current.state_version != expected_state_version:
           raise RuntimeError("approval request state_version changed")
+        if state in {"approved", "auto_approved"}:
+          if current.approval_constraint == "legacy_unknown":
+            raise ValueError(
+              "approval constraint is unknown; replan and reauthorize"
+            )
+          if current.approval_constraint == "fresh_human_owner":
+            raise ValueError(
+              "fresh owner approval constraint can only be approved by an owner vote"
+            )
         decided_at = utc_now() if state in TERMINAL_STATES else current.decided_at
         terminal_decision = decision
         if terminal_decision is None and state in {"approved", "denied", "auto_approved", "auto_denied", "expired"}:
@@ -949,6 +991,8 @@ class SQLiteApprovalStore:
     return updated, transitioned, True
 
   async def record_vote(self, approval_id: str, vote: ApprovalVote) -> ApprovalRequest:
+    if vote.approval_id != approval_id:
+      raise ValueError("approval vote identity does not match request")
     emitted_vote = False
     terminal_event: str | None = None
     async with self._lock:
@@ -961,6 +1005,23 @@ class SQLiteApprovalStore:
         if current_row is None:
           raise KeyError(f"approval request not found: {approval_id}")
         current = self._row_to_request(current_row)
+        if vote.decision == "approved":
+          if current.approval_constraint == "legacy_unknown":
+            raise ValueError(
+              "approval constraint is unknown; replan and reauthorize"
+            )
+          if current.approval_constraint == "fresh_human_owner" and (
+            current.state not in {"created", "pending_user"}
+            or current.authorization_mode not in {
+              "HUMAN",
+              "OWNER_CONTROL_PLANE",
+            }
+            or vote.decider_id != current.required_owner_user_id
+            or vote.decider_role != "owner"
+          ):
+            raise ValueError(
+              "fresh owner approval constraint requires its exact owner vote"
+            )
         if current.state in TERMINAL_STATES:
           conn.commit()
           return current
@@ -1062,6 +1123,24 @@ class SQLiteApprovalStore:
           raise PersistentGrantCancellationFenced(
             "persistent grant approval is fenced for cancellation"
           )
+        source_row = conn.execute(
+          "SELECT * FROM approval_requests WHERE approval_id = ?",
+          (grant.granted_via_approval_id,),
+        ).fetchone()
+        if source_row is None:
+          raise ValueError("approval constraint source for persistent grant is missing")
+        source = self._row_to_request(source_row)
+        if (
+          source.approval_constraint != "standard"
+          or source.state != "approved"
+          or source.decision != "approved"
+          or source.user_id != grant.user_id
+          or source.tool_name != grant.tool_name
+          or source.persistent_grant_scope != grant.scope_hint
+        ):
+          raise ValueError(
+            "approval constraint does not permit persistent grant minting"
+          )
         conn.execute(
           """
           INSERT INTO persistent_grants (
@@ -1097,7 +1176,10 @@ class SQLiteApprovalStore:
     tool_name: str,
     scope_hint: str,
     now: datetime | None = None,
+    approval_constraint: str = "standard",
   ) -> PersistentGrant | None:
+    if approval_constraint != "standard":
+      return None
     now_text = _dt_to_text(now or utc_now())
     async with self._lock:
       with self._connection() as conn:

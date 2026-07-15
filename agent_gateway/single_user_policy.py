@@ -37,6 +37,19 @@ class SingleUserApprovalPolicy:
     request: ApprovalRequest,
     run_context: RunContext,
   ) -> ApprovalDecision:
+    if request.approval_constraint == "legacy_unknown":
+      return ApprovalDecision(
+        outcome="auto_deny",
+        reason="Approval constraint is unknown; replan and obtain a fresh approval",
+        allow_persistent_grant=False,
+        policy_id=self.policy_id,
+        policy_version=self.policy_version,
+      )
+    if request.approval_constraint == "fresh_human_owner":
+      return self._request_user(
+        "Exact promotion requires a fresh decision by its frozen owner",
+        allow_persistent_grant=False,
+      )
     # Portfolio configuration and irreversible tools require a fresh user decision.
     if request.tool_class in {"portfolio_config", "irreversible"}:
       return self._request_user(
@@ -50,6 +63,7 @@ class SingleUserApprovalPolicy:
         user_id=request.user_id,
         tool_name=request.tool_name,
         scope_hint=scope_hint,
+        approval_constraint=request.approval_constraint,
       )
       if grant is not None:
         emitter = getattr(self._store, "audit_emitter", None)
@@ -127,6 +141,8 @@ class SingleUserApprovalPolicy:
 
   @staticmethod
   def _chain_trust_allows(*, request: ApprovalRequest, run_context: RunContext) -> bool:
+    if request.approval_constraint != "standard":
+      return False
     if not request.parent_approval_id:
       return False
     if request.tool_class in {"external_write", "portfolio_config", "irreversible"}:
@@ -173,6 +189,12 @@ class DelegationApprovalPolicy:
     request: ApprovalRequest,
     run_context: RunContext,
   ) -> ApprovalDecision:
+    if request.approval_constraint != "standard":
+      return await self._base.decide(
+        payload=payload,
+        request=request,
+        run_context=run_context,
+      )
     grant = run_context.delegation
     if grant is None:
       return await self._base.decide(payload=payload, request=request, run_context=run_context)

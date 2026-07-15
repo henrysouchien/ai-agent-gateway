@@ -6,6 +6,7 @@ import time
 from typing import Any, Callable
 
 from . import approval_settings
+from .approval_constraints import constraint_for_catalog_tool
 from .approval_policy import (
   ApprovalDecision as PolicyApprovalDecision,
   ApprovalRequest as PolicyApprovalRequest,
@@ -246,6 +247,23 @@ async def _can_use_tool_callback_impl(
         f"'{runtime_server}'; policy owner for '{policy_tool}' is '{policy_server}'"
       )
     )
+  policy_tool = policy_tool_name_fn(tool_name)
+  try:
+    approval_constraint = constraint_for_catalog_tool(policy_tool)
+  except Exception:
+    return deny_cls(
+      message=(
+        "[approval_constraint_unavailable] Trusted approval classification "
+        "is unavailable"
+      )
+    )
+  if approval_constraint == "fresh_human_owner":
+    return deny_cls(
+      message=(
+        "[owner_control_route_required] Exact promotion requires the "
+        "authenticated owner control-plane route"
+      )
+    )
   if not runner._approval_lifecycle_configured():
     return allow_cls()
   store = runner._approval_store
@@ -255,7 +273,6 @@ async def _can_use_tool_callback_impl(
   active_skill = current_skill_fn()
   if active_skill and run_context.skill is None:
     run_context = replace_fn(run_context, skill=active_skill)
-  policy_tool = policy_tool_name_fn(tool_name)
   redacted, args_hash = runner._redact_for_approval_request(tool_name, input_data)
   redacted = enrich_trade_approval_args_fn(policy_tool, redacted, event_log=runner._log)
   request = build_approval_request_fn(
@@ -265,6 +282,7 @@ async def _can_use_tool_callback_impl(
     tool_args_redacted=redacted,
     args_hash=args_hash,
     run_context=run_context,
+    approval_constraint=approval_constraint,
   )
   if batch_admission is not None:
     batch_admission.bind_request(request=request, store=store)
