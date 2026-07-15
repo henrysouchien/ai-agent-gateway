@@ -318,6 +318,7 @@ def test_autonomous_control_endpoints_spawn_read_logs_cancel_and_enforce_user_sc
         "context": "Review AAPL earnings",
         "ticker": "AAPL",
         "channel": "tui",
+        "max_budget_usd": 5.0,
       },
     )
     assert start.status_code == 200, start.text
@@ -392,6 +393,7 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
         "context": "Review AAPL earnings",
         "ticker": "AAPL",
         "channel": "tui",
+        "max_budget_usd": 5.0,
       },
     )
     assert start.status_code == 200, start.text
@@ -404,6 +406,8 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
     assert start_run["user_email"] == "henry@example.com"
     assert start_run["user_aliases"] == ["1", "henry", "henry@example.com"]
     assert start_run["identity_status"] == "gateway_user_key_mapping"
+    assert start_run["max_budget_usd"] == 5.0
+    assert start.json()["cmd"][start.json()["cmd"].index("--max-budget-usd") + 1] == "5.0"
     assert envs[0]["AGENT_API_CLAIM_USER_ID"] == "1"
     assert envs[0]["AUTONOMOUS_USER_ID"] == "1"
     assert envs[0]["AUTONOMOUS_RAW_USER_ID"] == "henry"
@@ -415,6 +419,7 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
     assert manifest["raw_user_id"] == "henry"
     assert manifest["user_slug"] == "henry"
     assert manifest["user_aliases"] == ["1", "henry", "henry@example.com"]
+    assert manifest["max_budget_usd"] == 5.0
 
     detail = client.get("/api/control/runs/bg_0", headers=_headers(henry_web))
     assert detail.status_code == 200
@@ -427,12 +432,14 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
     assert detail_run["user_email"] == "henry@example.com"
     assert detail_run["user_aliases"] == ["1", "henry", "henry@example.com"]
     assert detail_run["identity_status"] == "gateway_user_key_mapping"
+    assert detail_run["max_budget_usd"] == 5.0
     listed = client.get("/api/control/runs?kind=autonomous", headers=_headers(henry_web))
     assert listed.status_code == 200
     listed_run = listed.json()["runs"][0]
     assert listed_run["owner_user_id"] == "1"
     assert listed_run["raw_user_id"] == "henry"
     assert listed_run["identity_status"] == "gateway_user_key_mapping"
+    assert listed_run["max_budget_usd"] == 5.0
     assert client.get("/api/control/runs/bg_0", headers=_headers(alice)).status_code == 404
 
 
@@ -1071,6 +1078,7 @@ Run the resumable test skill.
         "context": "Original work packet",
         "ticker": "MSFT",
         "channel": "tui",
+        "max_budget_usd": 5.0,
       },
     )
     assert start.status_code == 200, start.text
@@ -1101,9 +1109,12 @@ Run the resumable test skill.
     assert payload["run"]["run_id"] == "bg_1"
     assert payload["run"]["resumed_from"] == "bg_0"
     assert payload["run"]["state"] == "running"
+    assert payload["run"]["max_budget_usd"] == 5.0
+    assert payload["cmd"][payload["cmd"].index("--max-budget-usd") + 1] == "5.0"
 
     assert original.resumed_as == ["bg_1"]
     resumed_record = app.state.subprocess_registry._tasks["bg_1"]
+    assert resumed_record.max_budget_usd == 5.0
     assert resumed_record.context is not None
     assert "Original work packet" in resumed_record.context
     assert "resume from the latest safe point" in resumed_record.context
@@ -1843,14 +1854,55 @@ def test_autonomous_dispatch_validation_error_returns_422_and_releases_slot(monk
     assert invalid.status_code == 422
     assert invalid.json()["detail"] == "mode='task' only accepts the task parameter"
 
+    invalid_budget = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "task",
+        "task": "summarize",
+        "max_budget_usd": 5.0,
+      },
+    )
+    assert invalid_budget.status_code == 422
+    assert invalid_budget.json()["detail"] == "max_budget_usd requires mode='skill'"
+
+    non_positive_budget = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "skill",
+        "skill": "earnings-review",
+        "max_budget_usd": 0,
+      },
+    )
+    assert non_positive_budget.status_code == 422
+
+    for coerced_budget in (True, "5"):
+      rejected_coercion = client.post(
+        "/api/control/runs",
+        headers=_headers(alice),
+        json={
+          "kind": "autonomous",
+          "profile": "analyst",
+          "mode": "skill",
+          "skill": "earnings-review",
+          "max_budget_usd": coerced_budget,
+        },
+      )
+      assert rejected_coercion.status_code == 422
+
     valid = client.post(
       "/api/control/runs",
       headers=_headers(alice),
       json={"kind": "autonomous", "profile": "analyst", "mode": "task", "task": "summarize"},
     )
     assert valid.status_code == 200, valid.text
-    assert valid.json()["run_id"] == "bg_1"
-    record = app.state.subprocess_registry._tasks["bg_1"]
+    assert valid.json()["run_id"] == "bg_2"
+    record = app.state.subprocess_registry._tasks["bg_2"]
     assert record.dev_mode is True
     assert record.cmd == [
       sys.executable,

@@ -5,6 +5,7 @@ import fcntl
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -173,6 +174,7 @@ class AutonomousTask:
   operator_inbox_path: Path | None
   approval_decisions_path: Path | None
   started_at: float
+  max_budget_usd: float | None = None
   state: str = "running"
   exit_code: int | None = None
   error: str | None = None
@@ -228,6 +230,13 @@ def _positive_int(value: Any) -> int | None:
       parsed = int(cleaned)
       return parsed if parsed > 0 else None
   return None
+
+
+def _positive_finite_float(value: Any) -> float | None:
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    return None
+  normalized = float(value)
+  return normalized if math.isfinite(normalized) and normalized > 0 else None
 
 
 def _normalize_identity_str(value: Any) -> str | None:
@@ -731,6 +740,7 @@ class AutonomousRegistryStateMixin:
       "ticker": record.ticker,
       "channel": record.channel,
       "dev_mode": record.dev_mode,
+      "max_budget_usd": record.max_budget_usd,
       "dispatch_scope": _normalize_dispatch_scope(record.dispatch_scope),
       "cmd": list(record.cmd),
       "log_path": str(record.log_path),
@@ -1019,6 +1029,7 @@ class AutonomousRegistryStateMixin:
         fallback=manifest_path.with_name(f"{task_id}.approval-decisions.jsonl"),
       ),
       started_at=float(started_at) if isinstance(started_at, (int, float)) else rehydrate_time,
+      max_budget_usd=_positive_finite_float(manifest.get("max_budget_usd")),
       state=raw_state,
       exit_code=int(exit_code) if isinstance(exit_code, int) else None,
       error=error,

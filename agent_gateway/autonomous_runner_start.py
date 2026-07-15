@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 from .autonomous_runner_claims import get_agent_api_claim_ttl_seconds, sign_user_claim
-from .autonomous_runner_commands import normalize_autonomous_profile
+from .autonomous_runner_commands import normalize_autonomous_profile, normalize_max_budget_usd
 from .artifact_paths import canonicalize_ticker
 from .autonomous_runner_state import (
   AutonomousTask,
@@ -177,6 +177,7 @@ class AutonomousRegistryStartMixin:
     skill: str | None = None,
     context: str | None = None,
     ticker: str | None = None,
+    max_budget_usd: float | None = None,
     channel: str | None = None,
     dev_mode: bool = False,
     dispatch_scope: dict[str, Any] | None = None,
@@ -211,6 +212,7 @@ class AutonomousRegistryStartMixin:
       normalized_dispatch_scope = _normalize_dispatch_scope(dispatch_scope)
       if dispatch_scope is not None and normalized_dispatch_scope is None:
         raise ValueError("dispatch_scope must be a redacted portfolio dispatch scope")
+      normalized_max_budget_usd = normalize_max_budget_usd(max_budget_usd)
       cmd = self._build_cmd(
         profile=profile,
         mode=mode,
@@ -219,6 +221,7 @@ class AutonomousRegistryStartMixin:
         context=context,
         ticker=ticker,
         dev_mode=dev_mode,
+        max_budget_usd=normalized_max_budget_usd,
       )
       normalized_mode = mode.strip().lower()
       effective_dev_mode = bool(dev_mode or normalized_mode == "task")
@@ -253,6 +256,7 @@ class AutonomousRegistryStartMixin:
         operator_inbox_path=operator_inbox_path,
         approval_decisions_path=approval_decisions_path,
         started_at=time_module.time(),
+        max_budget_usd=normalized_max_budget_usd,
         state="starting",
         log_handle=log_handle,
         slot_reserved=True,

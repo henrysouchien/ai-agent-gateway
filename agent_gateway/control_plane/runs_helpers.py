@@ -633,6 +633,7 @@ def _autonomous_run_from_task(record: AutonomousTask, *, skills_dir: Path | None
     started_at=_iso_from_unix(record.started_at),
     ended_at=_iso_from_unix(record.completed_at) if record.completed_at is not None else None,
     cost_usd=_events_cost_usd(events),
+    max_budget_usd=getattr(record, "max_budget_usd", None),
     skill_run_ids=_skill_run_ids(events),
     current_verdict=_current_verdict(events),
     staged_proposals=_staged_proposals(events),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable
 from typing import Any
@@ -8,6 +9,17 @@ from .fixture_gate import is_fixture_profile_name, is_fixture_skill_name, requir
 from .artifact_paths import canonicalize_ticker
 
 _AUTONOMOUS_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def normalize_max_budget_usd(value: float | None) -> float | None:
+  if value is None:
+    return None
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    raise ValueError("max_budget_usd must be a finite positive number")
+  normalized = float(value)
+  if not math.isfinite(normalized) or normalized <= 0:
+    raise ValueError("max_budget_usd must be a finite positive number")
+  return normalized
 
 
 def normalize_autonomous_profile(
@@ -36,6 +48,7 @@ def build_autonomous_cmd(
   context: str | None,
   ticker: str | None = None,
   dev_mode: bool = False,
+  max_budget_usd: float | None = None,
   normalize_autonomous_profile_func: Callable[[str], str] = normalize_autonomous_profile,
   is_fixture_profile_name_func: Callable[[str], bool] = is_fixture_profile_name,
   is_fixture_skill_name_func: Callable[[str], bool] = is_fixture_skill_name,
@@ -48,6 +61,9 @@ def build_autonomous_cmd(
   normalized_mode = mode.strip().lower()
   if normalized_mode not in {"once", "task", "skill"}:
     raise ValueError("mode must be once, task, or skill")
+  normalized_max_budget_usd = normalize_max_budget_usd(max_budget_usd)
+  if normalized_max_budget_usd is not None and normalized_mode != "skill":
+    raise ValueError("max_budget_usd requires mode='skill'")
 
   if dev_mode and normalized_mode == "task":
     raise ValueError("dev_mode is implicit for mode='task'; do not pass dev_mode=True")
@@ -78,6 +94,8 @@ def build_autonomous_cmd(
   if task:
     raise ValueError("mode='skill' does not accept task")
   cmd.extend(["--skill", skill.strip()])
+  if normalized_max_budget_usd is not None:
+    cmd.extend(["--max-budget-usd", str(normalized_max_budget_usd)])
   if ticker and ticker.strip():
     cmd.extend(["--ticker", canonicalize_ticker(ticker)])
   if context and context.strip():
@@ -88,5 +106,6 @@ def build_autonomous_cmd(
 __all__ = [
   "_AUTONOMOUS_PROFILE_NAME_RE",
   "build_autonomous_cmd",
+  "normalize_max_budget_usd",
   "normalize_autonomous_profile",
 ]

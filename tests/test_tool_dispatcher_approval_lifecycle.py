@@ -1752,6 +1752,48 @@ def test_planned_dispatch_headless_denial_still_creates_bound_row(tmp_path: Path
   assert asyncio.run(store.get(request.approval_id)) == request
 
 
+def test_planned_dispatch_headless_autonomous_allow_creates_bound_row(
+  tmp_path: Path,
+) -> None:
+  events: list[str] = []
+  resolved: list[Any] = []
+  handler, change_set, _prepared = _planned_handler(events=events)
+
+  class Policy:
+    async def decide(self, **_kwargs: Any):
+      raise AssertionError("autonomous allow must resolve before policy evaluation")
+
+    async def on_resolve(self, *, request):
+      resolved.append(request)
+
+  store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+  dispatcher = ToolDispatcher(
+    mcp_client=_NullMcp(),
+    local_tool_handlers={"planned": handler},
+    needs_approval=lambda *_args: False,
+    should_avoid_permission_prompts=True,
+    session=_planned_session(),
+    store=store,
+    policy=Policy(),
+  )
+
+  result, error = asyncio.run(
+    dispatcher.dispatch("call-autonomous", "planned", {"x": 1}, call_index=3)
+  )
+
+  assert error is None
+  assert result["ok"] is True
+  assert events == ["plan", "execute"]
+  assert len(resolved) == 1
+  request = resolved[0]
+  assert request.state == "auto_approved"
+  assert request.change_set_id == change_set.change_set_id
+  assert request.decision_reason == (
+    "Autonomous tool policy authorized the exact planned identity"
+  )
+  assert asyncio.run(store.get(request.approval_id)) == request
+
+
 def test_planned_dispatch_timeout_preserves_bound_row_and_skips_executor(
   tmp_path: Path,
 ) -> None:

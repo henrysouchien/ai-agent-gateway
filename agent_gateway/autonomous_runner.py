@@ -104,6 +104,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     context: str | None,
     ticker: str | None = None,
     dev_mode: bool = False,
+    max_budget_usd: float | None = None,
   ) -> list[str]:
     return _runner_commands.build_autonomous_cmd(
       python_executable=self._python,
@@ -114,6 +115,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       context=context,
       ticker=ticker,
       dev_mode=dev_mode,
+      max_budget_usd=max_budget_usd,
       normalize_autonomous_profile_func=normalize_autonomous_profile,
       is_fixture_profile_name_func=is_fixture_profile_name,
       is_fixture_skill_name_func=is_fixture_skill_name,

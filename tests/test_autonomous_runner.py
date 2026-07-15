@@ -325,6 +325,7 @@ def test_autonomous_runner_command_helper_preserves_parent_override_seams(monkey
     context=" context ",
     ticker="msft",
     dev_mode=True,
+    max_budget_usd=5.0,
   )
 
   assert cmd == [
@@ -336,6 +337,8 @@ def test_autonomous_runner_command_helper_preserves_parent_override_seams(monkey
     "--dev",
     "--skill",
     "patched-fixture",
+    "--max-budget-usd",
+    "5.0",
     "--ticker",
     "MSFT",
     "--context",
@@ -347,6 +350,44 @@ def test_autonomous_runner_command_helper_preserves_parent_override_seams(monkey
     "fixture-skill:patched-fixture",
     "guard:fixture skill dispatch:ValueError",
   ]
+
+
+@pytest.mark.parametrize("max_budget_usd", [True, 0, -1, float("inf"), float("nan"), "5"])
+def test_autonomous_runner_rejects_invalid_max_budget(max_budget_usd, tmp_path) -> None:
+  registry = _registry(tmp_path)
+
+  with pytest.raises(ValueError, match="max_budget_usd must be a finite positive number"):
+    registry._build_cmd(
+      profile="analyst",
+      mode="skill",
+      task=None,
+      skill="risk.scan",
+      context=None,
+      max_budget_usd=max_budget_usd,
+    )
+
+
+@pytest.mark.parametrize(
+  ("mode", "task", "skill"),
+  [("once", None, None), ("task", "summarize", None)],
+)
+def test_autonomous_runner_rejects_max_budget_outside_skill_mode(
+  mode,
+  task,
+  skill,
+  tmp_path,
+) -> None:
+  registry = _registry(tmp_path)
+
+  with pytest.raises(ValueError, match="max_budget_usd requires mode='skill'"):
+    registry._build_cmd(
+      profile="analyst",
+      mode=mode,
+      task=task,
+      skill=skill,
+      context=None,
+      max_budget_usd=5.0,
+    )
 
 
 def test_autonomous_runner_claim_helper_uses_parent_aliases(monkeypatch) -> None:
@@ -665,6 +706,7 @@ def test_autonomous_registry_rehydrates_manifest_with_event_history(tmp_path) ->
     control_run_id="run-3",
     resumed_from="run-2",
     resumed_as=["run-4"],
+    max_budget_usd=4.5,
   )
   (tmp_path / "bg_3.events.jsonl").write_text(
     "\n".join(
@@ -692,6 +734,7 @@ def test_autonomous_registry_rehydrates_manifest_with_event_history(tmp_path) ->
   assert record.state == "completed"
   assert record.exit_code == 0
   assert record.completed_at == 125.0
+  assert record.max_budget_usd == 4.5
   assert record.proc is None
   assert record.reaper_task is None
   assert record.events_tail_task is None
@@ -736,11 +779,21 @@ def test_autonomous_registry_rehydrates_v1_slug_manifest_to_canonical_owner(monk
   assert record.risk_user_id == 1
   assert record.user_aliases == ["1", "henry", "henry@example.com"]
   assert record.identity_status == "gateway_user_key_mapping"
+  assert record.max_budget_usd is None
   upgraded_manifest = _read_manifest(tmp_path, "bg_4")
   assert upgraded_manifest["manifest_version"] == 2
   assert upgraded_manifest["owner_user_id"] == "1"
   assert upgraded_manifest["user_id"] == "1"
   assert upgraded_manifest["raw_user_id"] == "henry"
+
+
+@pytest.mark.parametrize("max_budget_usd", [True, 0, -1, float("inf"), float("nan"), "5"])
+def test_autonomous_registry_drops_invalid_manifest_max_budget(tmp_path, max_budget_usd) -> None:
+  _write_manifest(tmp_path, max_budget_usd=max_budget_usd)
+
+  registry = _registry(tmp_path)
+
+  assert registry._tasks["bg_0"].max_budget_usd is None
 
 
 def test_autonomous_registry_rehydrates_budget_exceeded_as_budget_limited(tmp_path) -> None:
@@ -1198,6 +1251,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       user_id=USER_ID,
       user_email=None,
       resumed_from="prior-run",
+      max_budget_usd=5.0,
     )
     try:
       manifest = _read_manifest(tmp_path)
@@ -1221,6 +1275,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "ticker",
         "channel",
         "dev_mode",
+        "max_budget_usd",
         "dispatch_scope",
         "cmd",
         "log_path",
@@ -1257,9 +1312,11 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       assert manifest["ticker"] == "MSFT"
       assert manifest["channel"] == "tui"
       assert manifest["dev_mode"] is True
+      assert manifest["max_budget_usd"] == 5.0
       assert manifest["dispatch_scope"] is None
       assert manifest["cmd"][:5] == ["python3", "-m", "agent.autonomous", "--profile", "analyst"]
       assert "--dev" in manifest["cmd"]
+      assert manifest["cmd"][manifest["cmd"].index("--max-budget-usd") + 1] == "5.0"
       assert manifest["log_path"] == str(tmp_path / "bg_0.log")
       assert manifest["events_path"] == str(tmp_path / "bg_0.events.jsonl")
       assert manifest["operator_inbox_path"] == str(tmp_path / "bg_0.operator-messages.jsonl")

@@ -1,8 +1,22 @@
 # Changelog
 
-## Unreleased (post-0.15.12)
+## Unreleased (post-0.15.13)
 
 _No unreleased changes recorded yet._
+
+## 0.15.13 (2026-07-15)
+
+### Added
+
+- Added finite positive, skill-only autonomous budget overrides across the
+  control API and agents MCP, including spawned-command receipts, durable
+  manifest persistence, status projection, rehydration, and resume.
+
+### Fixed
+
+- Armed direct autonomous CLI runs with the canonical durable approval store
+  and allowed unattended dev runs to persist and execute policy-authorized
+  exact plans while retaining fail-closed behavior for approval-gated tools.
 
 ## 0.15.12 (2026-07-15)
 

@@ -750,7 +750,9 @@ class ToolDispatcher:
               else "Approval required in headless context"
             )
         else:
-          deny_user_prompt = True
+          automatic_approval_reason = (
+            "Autonomous tool policy authorized the exact planned identity"
+          )
 
       try:
         prepared_authorization_payload: bytes | None = None

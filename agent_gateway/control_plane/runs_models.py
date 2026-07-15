@@ -189,6 +189,7 @@ class AutonomousRunResponse(BaseModel):
   started_at: str
   ended_at: str | None
   cost_usd: float | None
+  max_budget_usd: float | None = None
   skill_run_ids: list[str]
   current_verdict: VerdictSummaryResponse | None
   staged_proposals: list[StagedProposalResponse] = Field(default_factory=list)
@@ -233,7 +234,17 @@ class AutonomousDispatchRequest(BaseModel):
   context: str | None = None
   channel: str | None = None
   dev_mode: bool = False
+  max_budget_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
   dispatch_scope: DispatchScope | None = None
+
+  @field_validator("max_budget_usd", mode="before")
+  @classmethod
+  def _reject_coerced_max_budget(cls, value: Any) -> Any:
+    if value is None:
+      return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+      raise ValueError("max_budget_usd must be a finite positive number")
+    return value
 
 
 ControlRunDispatchRequest = Annotated[
