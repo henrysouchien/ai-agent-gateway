@@ -23,6 +23,13 @@ from agent_gateway.commercial_claims import (  # noqa: E402
   CommercialClaimVerifier,
   CommercialContextState,
 )
+from agent_gateway.commercial_authority_cache import (  # noqa: E402
+  CommercialAuthoritySnapshot,
+  CommercialAuthorityStateCache,
+)
+from agent_gateway.commercial_authority_subscriber import (  # noqa: E402
+  CommercialAuthoritySubscriber,
+)
 
 
 NOW = 1_780_000_000
@@ -89,6 +96,38 @@ def _trust(public_pem: bytes, **changes) -> CommercialClaimTrustSnapshot:
   }
   facts.update(changes)
   return CommercialClaimTrustSnapshot(**facts)
+
+
+def test_pushed_event_changes_irreversible_verifier_decision(tmp_path) -> None:
+  import asyncio
+
+  private, public = _keypair()
+  cache = CommercialAuthorityStateCache(lambda context_id: CommercialAuthoritySnapshot(
+    context_id=context_id, active=True, entitlement_revision=42,
+    commercial_account_id=7, token_id=None,
+  ))
+  verifier = CommercialClaimVerifier(_trust(
+    public, resolve_context_state=cache.resolve_context_state,
+  ))
+  claim = verifier.verify_for_work_start(_token(private), now=NOW + 1)
+  verifier.recheck_verified_for_irreversible_submission(claim, now=NOW + 1)
+
+  class Client:
+    def fetch(self, cursor):
+      return {"events": [{
+        "sequence_id": 1, "environment": "prod", "kind": "context",
+        "commercial_account_id": 7, "entitlement_revision": 43,
+        "context_id": str(CONTEXT_ID), "token_id": None,
+        "occurred_at": "2026-07-12T12:00:00Z",
+      }], "next_sequence": 1, "high_water_sequence": 1}
+
+  subscriber = CommercialAuthoritySubscriber(
+    client=Client(), cache=cache, cursor_path=tmp_path / "cursor.json",
+  )
+  asyncio.run(subscriber.catch_up())
+  assert subscriber.cache is cache
+  with pytest.raises(CommercialClaimError, match="execution_context_revoked"):
+    verifier.recheck_verified_for_irreversible_submission(claim, now=NOW + 1)
 
 
 def test_verifier_accepts_valid_offline_claim_and_overlapping_keys() -> None:
@@ -214,3 +253,29 @@ def test_irreversible_submission_requires_current_live_context() -> None:
     ),
   )).verify_for_irreversible_submission(token, now=NOW + 1)
   assert current.context_id == UUID(str(CONTEXT_ID))
+
+
+def test_token_free_irreversible_recheck_uses_current_live_context() -> None:
+  private, public = _keypair()
+  claim = CommercialClaimVerifier(_trust(public)).verify_for_work_start(
+    _token(private), now=NOW + 1
+  )
+  verifier = CommercialClaimVerifier(_trust(
+    public,
+    resolve_context_state=lambda _: CommercialContextState(
+      active=True, entitlement_revision=42
+    ),
+  ))
+
+  assert verifier.recheck_verified_for_irreversible_submission(
+    claim, now=NOW + 2
+  ) is None
+
+  stale = CommercialClaimVerifier(_trust(
+    public,
+    resolve_context_state=lambda _: CommercialContextState(
+      active=True, entitlement_revision=43
+    ),
+  ))
+  with pytest.raises(CommercialClaimError, match="entitlement_revision_stale"):
+    stale.recheck_verified_for_irreversible_submission(claim, now=NOW + 2)

@@ -1,8 +1,19 @@
 import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any
 
-from agent_gateway import AgentRunner, AgentSDKConfig, AgentSDKRunner, EventLog, ModelInfo, ModelProvider, ToolDispatcher
+from agent_gateway import (
+  AgentRunner,
+  AgentSDKConfig,
+  AgentSDKRunner,
+  EventLog,
+  McpClientManager,
+  ModelInfo,
+  ModelProvider,
+  ToolDispatcher,
+  ToolResultContext,
+)
 from agent_gateway.providers import StreamEvent
 from agent_gateway.transcript import _tool_result_blocks_from_event
 
@@ -115,6 +126,41 @@ def _dispatcher(event_log: EventLog, handlers: dict[str, Any]) -> ToolDispatcher
   )
 
 
+def _trusted_market_data_manager() -> McpClientManager:
+  manager = McpClientManager(
+    config_path=None,
+    allowed_servers={"fmp-mcp", "market-data-mcp"},
+    logical_server_routes={"market-data-mcp": "fmp-mcp"},
+    logical_tool_aliases={"market-data-mcp": {"fetch_financials": "fmp_fetch"}},
+    provider_ids_by_server={"fmp-mcp": "fmp"},
+  )
+  manager._servers = {
+    "fmp-mcp": SimpleNamespace(
+      name="fmp-mcp",
+      session=object(),
+      exit_contexts=[],
+      tool_definitions=[_tool_def("fmp_fetch")],
+      tool_names={"fmp_fetch"},
+      tool_prefix="",
+      config=None,
+    )
+  }
+  manager._apply_collision_filtering(
+    policy_server_for_tool=lambda name: "market-data-mcp" if name == "fetch_financials" else "fmp-mcp"
+  )
+
+  async def call_tool_once(**_kwargs: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+      isError=False,
+      structuredContent={"status": "success", "provider_id": "edgar"},
+      content=None,
+    )
+
+  manager._call_tool_once = call_tool_once  # type: ignore[method-assign]
+  manager._translate_provider_symbol = lambda _name, payload: payload  # type: ignore[method-assign]
+  return manager
+
+
 async def _ok_handler(_tool_input: dict[str, Any], *, call_index: int = 0, tool_ctx: Any = None):
   _ = call_index, tool_ctx
   return {"status": "success"}, None
@@ -167,6 +213,46 @@ def test_event_only_blocks_stay_in_sse_but_not_normal_tool_next_turn() -> None:
   model_content = _model_bound_tool_result_content(provider)
   assert [block["type"] for block in model_content] == ["tool_result", "text"]
   assert all(block.get("type") != "source_envelope" for block in model_content)
+
+
+def test_runner_context_uses_trusted_router_provider_not_payload_claim() -> None:
+  event_log = EventLog()
+  mcp_client = _trusted_market_data_manager()
+  contexts: list[ToolResultContext] = []
+  provider = _RecordingProvider([
+    _tool_use_turn([("tool_1", "fetch_financials", {"symbol": "PCTY"})]),
+    _end_turn(),
+  ])
+
+  async def record_context(ctx: ToolResultContext) -> list[dict[str, Any]]:
+    contexts.append(ctx)
+    return []
+
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=ToolDispatcher(
+      mcp_client=mcp_client,
+      local_tool_handlers={},
+      event_log=event_log,
+      session_id="sess-provider-identity",
+    ),
+    session_id="sess-provider-identity",
+    provider=provider,
+    auth_config={"api_key": "k", "model": "stub-model"},
+    mcp_client=mcp_client,
+    get_tool_definitions=mcp_client.get_tool_definitions,
+    on_tool_result=record_context,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "go"}], system_prompt="x", max_turns=2))
+
+  assert len(contexts) == 1
+  assert contexts[0].server == "market-data-mcp"
+  assert contexts[0].provider_id == "fmp"
+  assert contexts[0].result == {"status": "success", "provider_id": "edgar"}
 
 
 def test_event_only_blocks_are_filtered_from_batched_run_agent_next_turn() -> None:

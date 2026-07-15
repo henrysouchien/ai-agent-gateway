@@ -36,6 +36,8 @@ def test_codex_provider_helper_exports_are_parent_aliases() -> None:
     "JWT_CLAIM_PATH",
     "DEFAULT_INSTRUCTIONS",
     "_BETA_HEADER",
+    "_CODEX_ORIGINATOR",
+    "_CODEX_USER_AGENT",
     "_RETRYABLE_STATUSES",
     "_RETRYABLE_RE",
     "_CODEX_RESPONSE_STATUSES",
@@ -109,6 +111,27 @@ def test_extract_account_id_reads_chatgpt_claim() -> None:
 def test_extract_account_id_rejects_invalid_token() -> None:
   with pytest.raises(ValueError, match="Failed to extract accountId"):
     _extract_account_id("not-a-jwt")
+
+
+def test_build_headers_uses_current_codex_subscription_identity() -> None:
+  headers = codex_helpers._build_headers(None, None, "acct_123", "token")
+
+  assert headers["originator"] == "codex_cli_rs"
+  assert headers["User-Agent"] == "codex_cli_rs/0.144.0"
+  assert headers["chatgpt-account-id"] == "acct_123"
+  assert headers["OpenAI-Beta"] == "responses=experimental"
+
+
+def test_build_headers_allows_explicit_identity_override() -> None:
+  headers = codex_helpers._build_headers(
+    {"originator": "configured", "User-Agent": "configured/1"},
+    {"originator": "request", "User-Agent": "request/2"},
+    "acct_123",
+    "token",
+  )
+
+  assert headers["originator"] == "request"
+  assert headers["User-Agent"] == "request/2"
 
 
 def test_codex_has_active_credential_accepts_auth_token() -> None:

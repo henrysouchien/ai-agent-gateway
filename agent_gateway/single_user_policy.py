@@ -60,6 +60,7 @@ class SingleUserApprovalPolicy:
           outcome="auto_approve",
           reason="Persistent approval grant matched",
           persistent_grant_scope_hint=scope_hint,
+          grant_reference=grant.grant_id,
           policy_id=self.policy_id,
           policy_version=self.policy_version,
         )

@@ -13,6 +13,7 @@ from .runner_budget import (
   budget_exceeded_state as budget_exceeded_state,
   budget_reason_suffix as budget_reason_suffix,
 )
+from .thinking import canonical_effort_config
 
 
 def normalized_run_config(
@@ -21,14 +22,13 @@ def normalized_run_config(
   default_model: str,
   model_override: str | None,
 ) -> Dict[str, Any]:
-  config = dict(auth_config)
+  config = canonical_effort_config(auth_config)
   config.update({
     "auth_mode": str(config.get("auth_mode", "api")).strip().lower(),
     "api_key": str(config.get("api_key", "")),
     "auth_token": str(config.get("auth_token", "")),
     "model": str(config.get("model") or default_model),
     "max_tokens": int(config.get("max_tokens", 16000)),
-    "thinking": bool(config.get("thinking", True)),
   })
   if model_override:
     config["model"] = model_override
@@ -680,6 +680,7 @@ class ToolResultContext:
   session_id: str
   server: str | None
   result_entry: Dict[str, Any] | None
+  provider_id: str | None = None
   skill_run_id: str | None = None
   workspace_dir: str | None = None
   registry_scope: RegistryScope | None = None

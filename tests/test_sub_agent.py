@@ -15,6 +15,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.skills import SkillLoader, SkillProfile, SkillStateStore
+from agent_gateway.commercial_work_start import CommercialWorkStartContext
 from agent_gateway import EventLog
 from agent_gateway.html_artifact_store import read_html_artifact_content, read_html_artifact_sidecar
 from agent_gateway.session import GatewaySession
@@ -604,6 +605,69 @@ def test_make_run_agent_handler_loads_skill_profile_and_filters_tools(tmp_path: 
   assert "emit_html_artifact" in dispatcher._local
   assert dispatcher._needs_approval("keep_tool", {}, "") is False
   assert dispatcher._session_id == runner._full_session_id
+
+
+def test_run_agent_rejects_commercial_provider_mismatch_before_spawn(tmp_path: Path) -> None:
+  runner = _StubRunner()
+  resolver_calls: list[str] = []
+  work_start = CommercialWorkStartContext(
+    claim=object(),
+    authorization=type("Authorization", (), {"provider": "anthropic"})(),
+    consumption=object(),
+  )
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(tmp_path / "skills"),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+    default_model="gpt-test",
+    provider_resolver=lambda provider: resolver_calls.append(provider) or type(
+      "ResolvedProvider",
+      (),
+      {"allowed_models": {"gpt-test"}, "default_model": "gpt-test", "provider": object()},
+    )(),
+    commercial_work_start=work_start,
+  )
+
+  result, error = _run(
+    handler({"task": "Analyze filings", "provider": "openai"})
+  )
+
+  assert result is None
+  assert error["code"] == "commercial_child_provider_mismatch"
+  assert resolver_calls == []
+  assert runner.calls == []
+
+
+def test_run_agent_threads_commercial_controls_to_child_dispatcher(tmp_path: Path) -> None:
+  runner = _StubRunner()
+  work_start = CommercialWorkStartContext(
+    claim=object(),
+    authorization=type("Authorization", (), {"provider": "anthropic"})(),
+    consumption=object(),
+  )
+  irreversible_recheck = object()
+  mcp_servers = frozenset({"portfolio-trades-mcp"})
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(tmp_path / "skills"),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+    default_model="claude-sonnet-4-6",
+    allowed_models={"claude-sonnet-4-6"},
+    commercial_work_start=work_start,
+    commercial_irreversible_recheck=irreversible_recheck,
+    commercial_mcp_servers=mcp_servers,
+  )
+
+  result, error = _run(handler({"task": "Analyze filings"}))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  dispatcher = runner.calls[0]["dispatcher"]
+  assert dispatcher._commercial_work_start is work_start
+  assert dispatcher._commercial_irreversible_recheck is irreversible_recheck
+  assert dispatcher._commercial_mcp_servers is mcp_servers
 
 
 def test_make_run_agent_handler_child_dispatcher_validates_local_tool_schema(tmp_path: Path) -> None:

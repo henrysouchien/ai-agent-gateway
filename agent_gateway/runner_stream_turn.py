@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .auth import ProviderCredentialFailure
 from .providers import ModelInfo, ThinkingLevel
+from .thinking import EffortResolution, parse_effort
 from .runner_introspection import format_exc as _format_exc
 from .runner_limits import (
   effective_compaction_trigger as _effective_compaction_trigger,
@@ -60,6 +61,7 @@ class RunnerStreamTurnMixin:
     config: Dict[str, Any],
     model_info: ModelInfo,
     max_tokens: int,
+    effort_resolution: EffortResolution | None = None,
     current_messages: List[Dict[str, Any]] | None = None,
   ) -> float:
     observed_thinking = _runner_module_attr(
@@ -74,6 +76,7 @@ class RunnerStreamTurnMixin:
       config=config,
       model_info=model_info,
       max_tokens=max_tokens,
+      effort_resolution=effort_resolution,
       observed_thinking=observed_thinking,
       stream_stall_timeout_default=_runner_attr(self, "STREAM_STALL_TIMEOUT", STREAM_STALL_TIMEOUT),
       stream_thinking_stall_timeout_default=_runner_attr(
@@ -120,11 +123,23 @@ class RunnerStreamTurnMixin:
 
     last_progress_at = time_module.monotonic()
     guard_reason: tuple[str, str] | None = None
+    requested_effort = parse_effort(config.get("effort")) or ThinkingLevel.HIGH
+    effort_resolution = self._provider.resolve_effort(
+      requested=requested_effort,
+      model=config["model"],
+      model_info=model_info,
+      max_tokens=max_tokens,
+      auth_mode=config.get("auth_mode"),
+      base_url=config.get("base_url") or config.get("baseURL"),
+      compat=config.get("compat"),
+    )
+    self._effort_resolution = effort_resolution
     _effective_stall_timeout = self._effective_stream_stall_timeout(
       config=config,
       model_info=model_info,
       max_tokens=max_tokens,
       current_messages=current_messages,
+      effort_resolution=effort_resolution,
     )
 
     def _make_params() -> Dict[str, Any]:
@@ -135,8 +150,11 @@ class RunnerStreamTurnMixin:
         system_prompt=system_prompt,
         tools=base_kwargs.get("tools") or [],
         max_tokens=max_tokens,
-        thinking_level=self._thinking_level(bool(config.get("thinking", True))),
+        thinking_level=requested_effort,
+        effort_resolution=effort_resolution,
         auth_mode=config["auth_mode"],
+        base_url=config.get("base_url") or config.get("baseURL"),
+        compat=config.get("compat"),
         compaction_trigger=_runner_attr(self, "_effective_compaction_trigger", _effective_compaction_trigger)(
           self._compaction_trigger,
           model_info,

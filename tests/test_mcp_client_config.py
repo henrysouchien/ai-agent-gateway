@@ -124,3 +124,37 @@ def test_config_helper_invalid_numeric_logs_warning() -> None:
     logger=_Logger(),
   ) == 4
   assert warnings == [("Ignoring invalid %s=%r; using %d", "MCP_STARTUP_CONCURRENCY", "invalid", 4)]
+
+
+def test_startup_concurrency_defaults_to_bounded_fanout() -> None:
+  assert mcp_client_config.startup_concurrency_limit(environ={}) == 4
+
+
+def test_startup_concurrency_preserves_explicit_override() -> None:
+  assert mcp_client_config.startup_concurrency_limit(
+    environ={"MCP_STARTUP_CONCURRENCY": "2"}
+  ) == 2
+
+
+def test_startup_concurrency_preserves_explicit_unbounded_escape_hatch() -> None:
+  assert mcp_client_config.startup_concurrency_limit(
+    environ={"MCP_STARTUP_CONCURRENCY": "0"}
+  ) == 0
+
+
+def test_startup_concurrency_rejects_invalid_or_negative_values() -> None:
+  for value in ("invalid", "-1"):
+    warnings = []
+
+    class _Logger:
+      @staticmethod
+      def warning(*args):
+        warnings.append(args)
+
+    assert mcp_client_config.startup_concurrency_limit(
+      environ={"MCP_STARTUP_CONCURRENCY": value},
+      logger=_Logger(),
+    ) == 4
+    assert warnings == [
+      ("Ignoring invalid %s=%r; using %d", "MCP_STARTUP_CONCURRENCY", value, 4)
+    ]

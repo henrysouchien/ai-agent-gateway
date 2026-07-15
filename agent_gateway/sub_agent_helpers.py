@@ -510,7 +510,7 @@ def make_run_agent_tool_def(skill_loader: SkillLoader | None = None) -> dict[str
         },
         "provider": {
           "type": "string",
-          "description": "Model provider to use (e.g. 'anthropic', 'openai'). Defaults to parent's provider.",
+          "description": "Model provider to use (e.g. 'anthropic', 'openai', 'codex', or 'xai'). Defaults to parent's provider.",
         },
         "background": {
           "type": "boolean",

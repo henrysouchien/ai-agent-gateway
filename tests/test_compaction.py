@@ -60,8 +60,8 @@ def test_analyst_session_summary_helpers_preserve_parent_api() -> None:
     "tail_token_budget",
   ]
   assert generate_analyst_session_summary is analyst_config.generate_analyst_session_summary
-  assert AnalystContextBuilder.__module__ == "api.agent.profiles.analyst"
-  assert generate_analyst_session_summary.__module__ == "api.agent.profiles.analyst"
+  assert AnalystContextBuilder.__module__ == "agent.profiles.analyst"
+  assert generate_analyst_session_summary.__module__ == "agent.profiles.analyst"
 
 
 def test_generate_analyst_session_summary_forwards_parent_provider_name(

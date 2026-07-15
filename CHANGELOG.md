@@ -1,8 +1,30 @@
 # Changelog
 
-## Unreleased (post-0.15.4)
+## Unreleased (post-0.15.8)
 
 _No unreleased changes recorded yet._
+
+## 0.15.8 (2026-07-15)
+
+### Fixed
+
+- Preserved semantic workflow outcomes independently from execution termination
+  and exposed both fields consistently through batch control responses.
+- Closed approval-cancellation admission races by fencing new producers,
+  aborting unpublished durable approvals, and cleaning notification,
+  projection, and persistent-grant residue before cancellation completes.
+- Kept exact-write BusinessModel authorization and recovery state intact through
+  the approval-admission wrapper, including resume and failed-precommit paths.
+- Made workflow budget reservations independent of profile import order by using
+  explicit skill caps and a fixed per-stage fallback.
+- Restored ambient import-time profile configuration after deterministic context
+  rendering so introspection cannot leak its pinned environment into the process.
+
+### Changed
+
+- Enforced one canonical `agent` package identity across source checkouts and
+  installed distributions, with lazy `agent.batch` exports and stricter guards
+  against executable `api.agent` compatibility aliases.
 
 ## 0.15.4 (2026-07-08)
 

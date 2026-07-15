@@ -286,7 +286,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         await subprocess_registry.shutdown()
       batch_task_registry = getattr(app.state, "batch_task_registry", None)
       if batch_task_registry is not None:
-        await batch_task_registry.shutdown()
+        await batch_task_registry.shutdown(app_state=app.state)
       user_event_bus = getattr(app.state, "user_event_bus", None)
       if user_event_bus is not None:
         await user_event_bus.shutdown()
@@ -669,6 +669,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       context=dict(body.context or {}),
       metadata=dict(body.metadata or {}),
       model=body.model,
+      effort=body.effort,
       commercial_work_start=commercial_work_start,
       commercial_dispatch_owner=commercial_dispatch_owner,
     )

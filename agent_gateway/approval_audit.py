@@ -10,7 +10,16 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Callable, Literal
 
-from .approval_policy import ApprovalRequest, ApprovalVote, PersistentGrant, ToolClass, canonical_json, decision_latency_ms, utc_now
+from .approval_policy import (
+  ApprovalRequest,
+  ApprovalVote,
+  PersistentGrant,
+  ToolClass,
+  canonical_json,
+  decision_latency_ms,
+  revalidate_approval_request,
+  utc_now,
+)
 from .skill_context import current_skill
 from .tool_redaction import redact_tool_input as default_redact_tool_input
 
@@ -77,6 +86,13 @@ class ApprovalAuditEntry:
   system_prompt_hash: str | None
   tool_schema_version: str | None
   mcp_server_version: str | None
+  identity_source: str | None = None
+  change_set_id: str | None = None
+  change_hash: str | None = None
+  base_vector_hash: str | None = None
+  reviewed_change_binding_digest: str | None = None
+  review_reference: dict[str, Any] | None = None
+  execution_semantics_digest: str | None = None
   tenant_id: str | None = None
   retention_class: Literal["dev", "operational", "compliance"] = "operational"
   legal_hold: bool = False
@@ -122,6 +138,7 @@ def build_audit_entry(
   tool_args_redacted: dict[str, Any] | None = None
   caught: BaseException | None = None
   try:
+    request = revalidate_approval_request(request)
     if _alias:
       args_copy = dict(_alias)
       digest = hmac.new(
@@ -205,6 +222,13 @@ def build_audit_entry(
     system_prompt_hash=request.system_prompt_hash,
     tool_schema_version=request.tool_schema_version,
     mcp_server_version=request.mcp_server_version,
+    identity_source=request.identity_source,
+    change_set_id=request.change_set_id,
+    change_hash=request.change_hash,
+    base_vector_hash=request.base_vector_hash,
+    reviewed_change_binding_digest=request.reviewed_change_binding_digest,
+    review_reference=copy.deepcopy(request.review_reference),
+    execution_semantics_digest=request.execution_semantics_digest,
     tenant_id=request.tenant_id,
     retention_class=retention_class,
     legal_hold=legal_hold,

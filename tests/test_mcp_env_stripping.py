@@ -7,8 +7,8 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-import agent_gateway.mcp_client as mcp_client_module
-from agent_gateway.mcp_client import McpClientManager, _build_mcp_env
+import agent_gateway.mcp_client as mcp_client_module  # noqa: E402
+from agent_gateway.mcp_client import McpClientManager, _build_mcp_env  # noqa: E402
 
 
 def _run(coro):
@@ -24,8 +24,14 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
       "HOME": "/tmp/home",
       "LANG": "en_US.UTF-8",
       "PYTHONPATH": "/workspace/lib",
+      "PYTHONNOUSERSITE": "1",
       "OPENAI_API_KEY": "openai-secret",
       "ANTHROPIC_API_KEY": "anthropic-secret",
+      "XAI_API_KEY": "xai-secret",
+      "XAI_AUTH_TOKEN": "xai-oauth-secret",
+      "XAI_REFRESH_TOKEN": "xai-refresh-secret",
+      "XAI_TOKEN_EXPIRES_AT": "1234567890",
+      "CLAUDE_CODE_OAUTH_TOKEN": "claude-setup-token-secret",
       "GOOGLE_API_KEY": "google-secret",
       "AWS_SECRET_ACCESS_KEY": "aws-secret",
       "UNRELATED_VAR": "drop-me",
@@ -38,10 +44,15 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
     "PATH": "/usr/bin:/bin",
     "HOME": "/tmp/home",
     "LANG": "en_US.UTF-8",
-    "PYTHONPATH": "/workspace/lib",
+    "PYTHONNOUSERSITE": "1",
   }
   assert "ANTHROPIC_API_KEY" not in env
   assert "OPENAI_API_KEY" not in env
+  assert "XAI_API_KEY" not in env
+  assert "XAI_AUTH_TOKEN" not in env
+  assert "XAI_REFRESH_TOKEN" not in env
+  assert "XAI_TOKEN_EXPIRES_AT" not in env
+  assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
 
 
 def test_build_mcp_env_adds_explicit_server_env_and_overrides_allowlist(monkeypatch) -> None:
@@ -68,7 +79,7 @@ def test_build_mcp_env_adds_explicit_server_env_and_overrides_allowlist(monkeypa
   assert env["ANTHROPIC_API_KEY"] == "explicit-anthropic"
   assert env["PATH"] == "/custom/bin"
   assert env["HOME"] == "/tmp/home"
-  assert env["PYTHONPATH"] == "/workspace/lib"
+  assert "PYTHONPATH" not in env
   assert env["EXTRA_FLAG"] == "enabled"
   assert "OPENAI_API_KEY" not in env
   assert "IGNORED_NONE" not in env

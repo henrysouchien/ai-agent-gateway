@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from pydantic_core import PydanticCustomError
 
 from .auth import CredentialsRefreshResolver, CredentialsResolver
+from .thinking import parse_effort
 from .commercial_work_start import (
   COMMERCIAL_CLAIM_HEADER,
   COMMERCIAL_WORK_AUTHORIZATION_HEADER,
@@ -215,6 +216,7 @@ class ChatRequest(BaseModel):
   context: Dict[str, Any] = Field(default_factory=dict)
   metadata: Dict[str, Any] = Field(default_factory=dict)
   model: Optional[str] = None
+  effort: Optional[str] = None
   drain_trailing: bool = False
   _commercial_work_start: "CommercialWorkStartContext | None" = PrivateAttr(
     default=None
@@ -224,6 +226,15 @@ class ChatRequest(BaseModel):
   @classmethod
   def _reject_commercial_bearer_material(cls, value: Any) -> Any:
     _assert_no_commercial_bearer_material(value)
+    return value
+
+  @model_validator(mode="before")
+  @classmethod
+  def _normalize_effort(cls, value: Any) -> Any:
+    if isinstance(value, dict) and "effort" in value and value.get("effort") is not None:
+      normalized = dict(value)
+      normalized["effort"] = parse_effort(value.get("effort")).value
+      return normalized
     return value
 
   @property
@@ -272,6 +283,7 @@ class ChatTurnInputs:
   context: dict[str, Any] | None
   metadata: dict[str, Any] | None
   model: str | None
+  effort: str | None = None
   commercial_work_start: "CommercialWorkStartContext | None" = field(
     default=None,
     repr=False,

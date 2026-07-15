@@ -3,6 +3,28 @@ from __future__ import annotations
 from .base import ModelInfo, ThinkingLevel
 
 _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
+  *[
+    (
+      (model_id,),
+      ModelInfo(
+        id=model_id,
+        provider="codex",
+        context_window=1_050_000,
+        max_output_tokens=128_000,
+        supports_thinking=True,
+        supports_vision=True,
+        input_cost_per_mtok=input_cost,
+        output_cost_per_mtok=output_cost,
+        cache_read_cost_per_mtok=cache_cost,
+      ),
+    )
+    for model_id, input_cost, output_cost, cache_cost in (
+      ("gpt-5.6-sol", 5.00, 30.00, 0.50),
+      ("gpt-5.6-terra", 2.50, 15.00, 0.25),
+      ("gpt-5.6-luna", 1.00, 6.00, 0.10),
+      ("gpt-5.6", 5.00, 30.00, 0.50),
+    )
+  ],
   (
     ("gpt-5.5",),
     ModelInfo(
@@ -22,7 +44,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
     ModelInfo(
       id="gpt-5.1",
       provider="codex",
-      context_window=272_000,
+      context_window=1_050_000,
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
@@ -130,6 +152,30 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
     ),
   ),
 ]
+
+_EFFORT_VALUES_BY_MODEL = {
+  "gpt-5.6": ("none", "low", "medium", "high", "xhigh", "max"),
+  "gpt-5.6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
+  "gpt-5.6-terra": ("none", "low", "medium", "high", "xhigh", "max"),
+  "gpt-5.6-luna": ("none", "low", "medium", "high", "xhigh", "max"),
+  "gpt-5.5": ("none", "low", "medium", "high", "xhigh"),
+  "gpt-5.4": ("none", "low", "medium", "high", "xhigh"),
+  "gpt-5.3-codex": ("low", "medium", "high", "xhigh"),
+  "gpt-5.3-codex-spark": ("low", "medium", "high", "xhigh"),
+  "gpt-5.2": ("low", "medium", "high"),
+  "gpt-5.2-codex": ("low", "medium", "high"),
+  "gpt-5.1": ("none", "low", "medium", "high"),
+  "gpt-5.1-codex-max": ("none", "low", "medium", "high", "xhigh"),
+  "gpt-5.1-codex-mini": ("medium", "high"),
+}
+for _tags, _info in _MODEL_INFO_BY_TAG:
+  _values = _EFFORT_VALUES_BY_MODEL[_info.id]
+  _info.compat = {
+    "supportsReasoningEffort": True,
+    "reasoningEffortValues": _values,
+    "reasoningEffortDefault": "none" if _info.id in {"gpt-5.4", "gpt-5.1"} else "medium",
+    "omitEqualsNone": False,
+  }
 
 
 def _model_matches_tag(model_id: str, tag: str) -> bool:

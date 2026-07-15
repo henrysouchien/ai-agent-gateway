@@ -18,7 +18,7 @@ from .approval_notifications import (
   build_env_telegram_approval_notification_sender,
 )
 from .approval_resolver import resolve_policy
-from .approval_store import SQLiteApprovalStore
+from .approval_store import SQLiteApprovalStore, resolve_approval_db_path
 from .audit_resolver import resolve_audit_writer
 from .auth import CredentialRefreshRequest, CredentialsResolver, ProviderCredentialFailure
 from .event_adapter import adapt_event
@@ -513,6 +513,7 @@ async def _dispatch_chat_turn_body(
     context=context,
     metadata=request_metadata,
     model=inputs.model,
+    effort=inputs.effort,
   )
   request._bind_commercial_work_start(inputs.commercial_work_start)
 
@@ -799,6 +800,7 @@ def _init_approval_subsystem(app: FastAPI, config: GatewayServerConfig) -> None:
     tool_input_redactor=config.tool_input_redactor,
   )
   store = SQLiteApprovalStore(
+    path=resolve_approval_db_path(),
     audit_emitter=audit_emitter,
     notification_destination_resolver=build_env_approval_notification_destination_resolver(),
     notification_sender=build_env_telegram_approval_notification_sender(),

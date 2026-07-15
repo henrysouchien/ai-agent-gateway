@@ -22,7 +22,7 @@ import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_agent
 from agent_gateway.auth import AuthConfig, ResolverResult
 from agent_gateway._provider_utils import _resolve_provider
-from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProvider
+from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProvider, XAIProvider
 from agent_gateway.server import ChatRequest
 
 DEFAULT_ANTHROPIC_MODEL = get_canonical_default_model("anthropic")
@@ -38,6 +38,7 @@ def _clear_credential_env(monkeypatch: pytest.MonkeyPatch):
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
   monkeypatch.delenv("ANTHROPIC_AUTH_MODE", raising=False)
   monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+  monkeypatch.delenv("XAI_API_KEY", raising=False)
 
 
 def _build_runtime(app, *, request_model: str | None = None):
@@ -345,7 +346,7 @@ def test_create_agent_openai_provider_string_uses_openai_defaults() -> None:
   config = app.state.gateway_config
   assert isinstance(config.default_provider, OpenAIProvider)
   assert config.auth_config == {
-    "model": "gpt-4o",
+    "model": "gpt-5.6-terra",
     "max_tokens": 16000,
   }
   assert config.allowed_models == set()
@@ -357,7 +358,21 @@ def test_create_agent_codex_provider_string_uses_codex_defaults() -> None:
   config = app.state.gateway_config
   assert isinstance(config.default_provider, CodexProvider)
   assert config.auth_config == {
-    "model": "gpt-5.4",
+    "model": "gpt-5.6-terra",
+    "max_tokens": 16000,
+  }
+  assert config.allowed_models == set()
+
+
+def test_create_agent_xai_provider_string_uses_xai_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
+  app = create_agent("test", provider="xai")
+
+  config = app.state.gateway_config
+  assert isinstance(config.default_provider, XAIProvider)
+  assert config.default_provider.has_active_credential(config.auth_config)
+  assert config.auth_config == {
+    "model": "grok-4.5",
     "max_tokens": 16000,
   }
   assert config.allowed_models == set()
@@ -395,7 +410,7 @@ def test_create_agent_openai_does_not_eagerly_read_env_api_key(monkeypatch: pyte
   monkeypatch.setenv("OPENAI_API_KEY", "env-openai-key")
   app = create_agent("test", provider="openai")
   assert app.state.gateway_config.auth_config == {
-    "model": "gpt-4o",
+    "model": "gpt-5.6-terra",
     "max_tokens": 16000,
   }
 
@@ -415,7 +430,7 @@ def test_create_agent_openai_uses_explicit_api_key_and_provider_config() -> None
     "auth_mode": "api",
     "api_key": "sk-openai",
     "auth_token": "",
-    "model": "gpt-4o",
+    "model": "gpt-5.6-terra",
     "max_tokens": 16000,
     "base_url": "https://custom.example/v1",
     "compat": {"streaming": True},
@@ -433,7 +448,7 @@ def test_create_agent_openai_uses_explicit_auth_token() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "oat-xxx",
-    "model": "gpt-4o",
+    "model": "gpt-5.6-terra",
     "max_tokens": 16000,
   }
 
@@ -449,7 +464,7 @@ def test_create_agent_codex_uses_explicit_auth_token() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "oat-codex",
-    "model": "gpt-5.4",
+    "model": "gpt-5.6-terra",
     "max_tokens": 16000,
   }
 
@@ -468,7 +483,7 @@ def test_resolve_provider_openai_auth_config_with_oauth() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "tok",
-    "model": "gpt-4o",
+    "model": "gpt-5.6-terra",
     "max_tokens": 16000,
   }
 
@@ -487,7 +502,7 @@ def test_resolve_provider_openai_auth_config_infers_mode() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "tok",
-    "model": "gpt-4o",
+    "model": "gpt-5.6-terra",
     "max_tokens": 16000,
   }
 
@@ -506,7 +521,7 @@ def test_resolve_provider_openai_auth_config_plain_passthrough() -> None:
     "auth_mode": "api",
     "api_key": "sk-x",
     "auth_token": "",
-    "model": "gpt-4o",
+    "model": "gpt-5.6-terra",
     "max_tokens": 16000,
   }
 
@@ -525,7 +540,7 @@ def test_resolve_provider_codex_auth_config_with_oauth() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "tok",
-    "model": "gpt-5.4",
+    "model": "gpt-5.6-terra",
     "max_tokens": 16000,
   }
 

@@ -24,6 +24,7 @@ from .session import AuthManager, GatewaySession
 from .skills import SkillLoader, SkillStateStore
 from .task_registry import CoordinatorConfig
 from .tool_dispatcher import LocalToolHandler, ToolDispatcher
+from .thinking import parse_effort
 
 log = logging.getLogger("agent_gateway.easy")
 
@@ -123,6 +124,8 @@ def create_agent(
   commercial_usage_shipper: Any | None = None,
   commercial_usage_reconciliation_shipper: Any | None = None,
   commercial_work_start_gate: CommercialWorkStartGate | None = None,
+  commercial_mcp_servers: frozenset[str] | None = None,
+  commercial_authority_subscriber: Any | None = None,
 ) -> FastAPI:
   """Create a ready-to-run FastAPI gateway backed by a `ModelProvider`.
 
@@ -139,14 +142,15 @@ def create_agent(
 
   By default it uses Anthropic, but you can switch to the built-in OpenAI
   adapter with `provider="openai"`, the ChatGPT Codex backend with
-  `provider="codex"`, or pass a `ModelProvider` instance directly. Use
+  `provider="codex"`, xAI Grok with `provider="xai"`, or pass a
+  `ModelProvider` instance directly. Use
   `create_gateway_app()` when you need channel-specific runtimes, approval
   rules for arbitrary tools, or direct control over runner construction.
 
   Args:
     system_prompt: Prompt string, or a list of `(text, should_cache)` blocks for
       providers that support prompt caching.
-    provider: Provider name (`"anthropic"`, `"codex"`, or `"openai"`) or a
+    provider: Provider name (`"anthropic"`, `"codex"`, `"openai"`, or `"xai"`) or a
       `ModelProvider` instance.
     model: Default model for incoming chat requests. When omitted, string
       providers use their provider-specific default model. Required when you
@@ -156,7 +160,7 @@ def create_agent(
     api_key: Provider API key. Anthropic falls back to `ANTHROPIC_API_KEY`;
       other providers read their own env vars internally when supported.
     auth_token: OAuth bearer token. Anthropic falls back to
-      `ANTHROPIC_AUTH_TOKEN`; `provider="openai"` and `provider="codex"` use
+      `ANTHROPIC_AUTH_TOKEN`; `provider="openai"`, `provider="codex"`, and `provider="xai"` use
       it as bearer auth.
     rates_file: Optional JSON rate-table override used for Anthropic provider
       construction. When omitted, the helper uses env/default resolution.
@@ -256,6 +260,33 @@ def create_agent(
     )
     ```
   """
+  if (
+    commercial_work_start_gate is not None
+    and commercial_work_start_gate.enabled
+    and not commercial_mcp_servers
+  ):
+    raise ValueError(
+      "enabled commercial work start requires trusted commercial MCP servers"
+    )
+  if (
+    commercial_work_start_gate is not None
+    and commercial_work_start_gate.enabled
+    and commercial_authority_subscriber is None
+  ):
+    raise ValueError(
+      "enabled commercial work start requires authority invalidation subscriber"
+    )
+  if (
+    commercial_work_start_gate is not None
+    and commercial_work_start_gate.enabled
+    and commercial_authority_subscriber is not None
+    and not commercial_work_start_gate.uses_context_resolver(
+      commercial_authority_subscriber.cache.resolve_context_state
+    )
+  ):
+    raise ValueError(
+      "commercial authority subscriber must protect the work-start gate cache"
+    )
   skill_state_store = SkillStateStore(skill_state_file) if skill_state_file is not None else None
   if credentials_resolver is None:
     provider_instance, _provider_name, auth_config = _resolve_provider(
@@ -304,6 +335,8 @@ def create_agent(
   shipper_stop = asyncio.Event()
   shipper_task: list[asyncio.Task | None] = [None]
   reconciliation_shipper_task: list[asyncio.Task | None] = [None]
+  authority_stop = asyncio.Event()
+  authority_task: list[asyncio.Task | None] = [None]
 
   def _report_shipper_exit(task: asyncio.Task) -> None:
     if task.cancelled():
@@ -463,14 +496,27 @@ def create_agent(
         approval_key_qualifier=approval_qualifier,
         session_cache_denied_tools=session_cache_denied_tools,
         get_tool_definitions=_get_tool_defs,
+        commercial_work_start=request.commercial_work_start,
+        commercial_irreversible_recheck=(
+          commercial_work_start_gate.recheck_irreversible
+          if commercial_work_start_gate is not None
+          else None
+        ),
+        commercial_mcp_servers=commercial_mcp_servers,
       )
+      runner_auth_config = dict(session.auth_config or auth_config)
+      if request.effort is not None:
+        requested_effort = parse_effort(request.effort)
+        runner_auth_config.pop("thinking", None)
+        runner_auth_config["effort"] = requested_effort.value
+        runner_auth_config["thinking_enabled_requested"] = requested_effort.value != "none"
       runner = AgentRunner(
         event_log=event_log,
         dispatcher=dispatcher,
         session_id=session_id,
         started_at=resolved_started_at,
         provider=provider_instance,
-        auth_config=session.auth_config or auth_config,
+        auth_config=runner_auth_config,
         mcp_client=mcp_client,
         get_tool_definitions=_get_tool_defs,
         per_turn_timeout=per_turn_timeout,
@@ -502,6 +548,13 @@ def create_agent(
     )
 
   async def _combined_startup() -> None:
+    if commercial_authority_subscriber is not None and authority_task[0] is None:
+      authority_stop.clear()
+      await commercial_authority_subscriber.catch_up()
+      authority_task[0] = asyncio.create_task(
+        commercial_authority_subscriber.run_forever(authority_stop),
+        name="commercial-authority-subscriber",
+      )
     if mcp_client is not None:
       await mcp_client.startup()
     if on_startup is not None:
@@ -529,6 +582,10 @@ def create_agent(
       )
 
   async def _combined_shutdown() -> None:
+    if authority_task[0] is not None:
+      authority_stop.set()
+      await authority_task[0]
+      authority_task[0] = None
     if shipper_task[0] is not None:
       shipper_stop.set()
       try:

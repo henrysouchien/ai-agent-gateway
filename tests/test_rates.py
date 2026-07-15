@@ -50,7 +50,7 @@ def test_load_rate_table_none_loads_bundled_default() -> None:
   table = load_rate_table(None)
 
   assert table.version
-  assert table.source == "https://docs.anthropic.com/pricing"
+  assert table.source == "https://platform.claude.com/docs/en/about-claude/models/overview"
   assert table.providers["anthropic"]
 
 
@@ -103,7 +103,7 @@ def test_lookup_fable_returns_bundled_model_rates() -> None:
   assert rates.output_cost_per_mtok == 50.0
   assert rates.cache_read_cost_per_mtok == 1.0
   assert rates.cache_write_cost_per_mtok == 12.5
-  assert rates.max_tokens == 32_000
+  assert rates.max_tokens == 128_000
   assert rates.context_window == 1_000_000
 
 

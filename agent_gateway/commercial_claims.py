@@ -176,6 +176,37 @@ class CommercialClaimVerifier:
       token, now=now, require_live_context=True
     )
 
+  def recheck_verified_for_irreversible_submission(
+    self,
+    claim: VerifiedCommercialClaim,
+    *,
+    now: int | None = None,
+  ) -> None:
+    """Freshly recheck token-free verified authority before a provider mutation."""
+    current = int(time.time()) if now is None else now
+    if type(current) is not int:
+      raise CommercialClaimError("invalid_verification_time")
+    if current < claim.issued_at or current >= claim.expires_at:
+      raise CommercialClaimError("start_authority_expired")
+    current_terms_revision = self._trust.current_agreement_terms_revision(
+      claim.agreement_id
+    )
+    if current_terms_revision is None:
+      raise CommercialClaimError("unknown_agreement")
+    if current_terms_revision != claim.agreement_terms_revision:
+      raise CommercialClaimError("agreement_terms_stale")
+    resolver = self._trust.resolve_context_state
+    if resolver is None:
+      raise CommercialClaimError("live_context_check_unavailable")
+    state = resolver(claim.context_id)
+    if not state.active:
+      raise CommercialClaimError("execution_context_revoked")
+    if state.entitlement_revision != claim.entitlement_revision:
+      raise CommercialClaimError("entitlement_revision_stale")
+
+  def uses_context_resolver(self, resolver: Callable) -> bool:
+    return self._trust.resolve_context_state == resolver
+
   @staticmethod
   def _validate_compact_token(token: str) -> None:
     if type(token) is not str:

@@ -24,6 +24,10 @@ from agent_gateway import policy_imports  # noqa: E402
 from agent_gateway.approval_policy import ApprovalDecision as PolicyApprovalDecision, ApprovalRequest, ApprovalRequestPayload, RunContext  # noqa: E402
 from agent_gateway.approval_store import SQLiteApprovalStore  # noqa: E402
 from agent_gateway.approvals import _record_vote_and_unblock  # noqa: E402
+from agent_gateway.batch_approval_projection import (  # noqa: E402
+  BatchApprovalProjectionRegistry,
+  BatchApprovalScope,
+)
 from agent_gateway.providers.agent_sdk import SDK_PINNED_VERSION  # noqa: E402
 from agent_gateway.runner import _ACTIVE_SKILL_DENY_RESULT_KEY, _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY  # noqa: E402
 from agent_gateway.skill_context import clear_current_skill, current_skill, set_current_skill  # noqa: E402
@@ -299,6 +303,172 @@ def test_sdk_runner_relay_policy_denial_uses_machine_readable_message(
     assert "taskpane composer" in denied.message
 
   _run(_case())
+
+
+def test_sdk_batch_admission_cancel_before_pending_publish_aborts_durable_row(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+
+  class _Policy:
+    policy_bundle_hash = "sdk-batch-admission-policy"
+
+    def __init__(self) -> None:
+      self.request: ApprovalRequest | None = None
+
+    async def decide(
+      self,
+      *,
+      payload: ApprovalRequestPayload,
+      request: ApprovalRequest,
+      run_context: RunContext,
+    ) -> PolicyApprovalDecision:
+      _ = payload, run_context
+      self.request = request
+      return PolicyApprovalDecision(
+        outcome="request_user_approval",
+        reason="Tool requires approval",
+        route_target_type="pending_tools",
+        expiry_seconds=600,
+      )
+
+    async def on_resolve(self, *, request: ApprovalRequest) -> None:
+      _ = request
+
+  async def _case() -> None:
+    store = SQLiteApprovalStore(tmp_path / "sdk-batch-admission.sqlite3")
+    policy = _Policy()
+    registry = BatchApprovalProjectionRegistry()
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
+    )
+    session.channel = "tui"
+    scope = BatchApprovalScope(
+      batch_id=77,
+      owner_user_id="alice",
+      channel="tui",
+      store=store,
+      policy=policy,
+      registry=registry,
+    )
+    scope.register_session(session)
+    session.batch_approval_scope = scope
+    runner = AgentSDKRunner(
+      event_log=EventLog(),
+      session_id=session.session_id,
+      sdk_config=AgentSDKConfig(
+        api_key="k",
+        model="claude-sonnet-4-6",
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      ),
+      system_prompt="test",
+      session=session,
+      store=store,
+      policy=policy,
+      run_context=RunContext(
+        user_id="alice",
+        request_id="batch_77",
+        run_id="batch_77",
+        session_id=session.session_id,
+        channel="tui",
+      ),
+    )
+    pending_committed = asyncio.Event()
+
+    async def pause_before_pending_publish(
+      request: ApprovalRequest,
+      decision: PolicyApprovalDecision,
+      *,
+      nonce: str,
+      batch_admission: Any | None = None,
+    ) -> None:
+      _ = request, decision, nonce, batch_admission
+      pending_committed.set()
+      await asyncio.Event().wait()
+
+    runner._await_user_approval_via_pending_tools = pause_before_pending_publish  # type: ignore[method-assign]
+    callback_task = asyncio.create_task(
+      runner._can_use_tool_callback("file_write", {"path": "x"}, None)
+    )
+    await pending_committed.wait()
+    callback_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await callback_task
+
+    assert policy.request is not None
+    stored = await store.get(policy.request.approval_id)
+    assert stored is not None
+    assert stored.state == "denied"
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+    assert registry.projections_for_batch(owner_user_id="alice", batch_id=77) == []
+    assert registry._admission_gates[("alice", 77)].active == 0
+
+  _run(_case())
+
+
+def test_sdk_runner_policy_modified_input_behavior_is_unchanged(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  modified = {"path": "normalized"}
+  resolved: list[ApprovalRequest] = []
+
+  class _Policy:
+    policy_bundle_hash = "test-policy"
+
+    async def decide(
+      self,
+      *,
+      payload: ApprovalRequestPayload,
+      request: ApprovalRequest,
+      run_context: RunContext,
+    ):
+      _ = request, run_context
+      assert payload.tool_args == {"path": "raw"}
+      return PolicyApprovalDecision(
+        outcome="auto_approve",
+        reason="normalized input",
+        modified_tool_args=modified,
+      )
+
+    async def on_resolve(self, *, request: ApprovalRequest) -> None:
+      resolved.append(request)
+
+  store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+  session = SessionStore(ttl=3600).create_session(
+    api_key_hash="hash",
+    user_id="alice",
+  )
+  runner = AgentSDKRunner(
+    event_log=EventLog(),
+    session_id=session.session_id,
+    sdk_config=AgentSDKConfig(
+      api_key="k",
+      model="claude-sonnet-4-6",
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    ),
+    system_prompt="test",
+    session=session,
+    store=store,
+    policy=_Policy(),
+  )
+  original = {"path": "raw"}
+
+  allowed = _run(runner._can_use_tool_callback("file_write", original, None))
+
+  assert allowed.behavior == "allow"
+  assert allowed.updated_input == modified
+  assert original == {"path": "raw"}
+  assert len(resolved) == 1
+  assert resolved[0].state == "auto_approved"
 
 
 def test_sdk_runner_trade_approval_record_includes_preview_summary(

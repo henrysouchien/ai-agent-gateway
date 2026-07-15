@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
+import importlib
 import json
+import math
+import re
 import time
 import traceback
 import uuid
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Mapping, Protocol
 
 
 ToolClass = Literal[
@@ -20,6 +24,19 @@ ToolClass = Literal[
   "portfolio_config",
   "irreversible",
 ]
+
+ApprovalIdentitySource = Literal["change_set", "reviewed_change_binding"]
+AuthorizationMode = Literal[
+  "HUMAN",
+  "AUTO_ALLOW",
+  "CACHE_HIT",
+  "PERSISTENT_GRANT",
+  "OWNER_CONTROL_PLANE",
+]
+
+_SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_REVIEWED_CHANGE_ID_RE = re.compile(r"^reviewed-change:v1:[0-9a-f]{64}$")
 
 ApprovalNotificationPolicy = Literal["auto", "interrupt", "skip"]
 
@@ -54,6 +71,64 @@ def new_approval_id() -> str:
 
 def canonical_json(value: Any) -> str:
   return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def canonical_json_strict(value: Any) -> str:
+  _require_plain_json(value)
+  return json.dumps(
+    value,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=True,
+    allow_nan=False,
+  )
+
+
+def _require_plain_json(value: Any) -> None:
+  if value is None or isinstance(value, str | bool | int):
+    return
+  if isinstance(value, float):
+    if not math.isfinite(value):
+      raise ValueError("non-finite JSON number")
+    return
+  if isinstance(value, list):
+    for item in value:
+      _require_plain_json(item)
+    return
+  if isinstance(value, dict):
+    for key, item in value.items():
+      if not isinstance(key, str):
+        raise TypeError("JSON object keys must be strings")
+      _require_plain_json(item)
+    return
+  raise TypeError(f"unsupported JSON value: {type(value).__name__}")
+
+
+def _reviewed_change_contract() -> Any:
+  """Load the monorepo's dependency-light identity owner on exact-plan paths."""
+
+  errors: list[ModuleNotFoundError] = []
+  for module_name in (
+    "research.reviewed_change_binding",
+    "api.research.reviewed_change_binding",
+  ):
+    try:
+      return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+      if exc.name not in {module_name, module_name.split(".")[0]}:
+        raise
+      errors.append(exc)
+  raise ValueError(
+    "reviewed change identity contract is unavailable"
+  ) from errors[-1]
+
+
+def _normalize_review_reference(value: dict[str, Any]) -> dict[str, Any]:
+  contract = _reviewed_change_contract()
+  try:
+    return contract.ReviewReference.from_dict(value).to_dict()
+  except contract.ReviewedChangeBindingError as exc:
+    raise ValueError("review_reference must use the typed review contract") from exc
 
 
 def sha256_args(value: Any) -> str:
@@ -202,6 +277,107 @@ class ApprovalRequest:
   skill: str | None = None
   notification_policy: ApprovalNotificationPolicy = "auto"
   notification: dict[str, Any] | None = None
+  identity_source: ApprovalIdentitySource | None = None
+  change_set_id: str | None = None
+  change_hash: str | None = None
+  base_vector_hash: str | None = None
+  reviewed_change_binding_digest: str | None = None
+  review_reference: dict[str, Any] | None = None
+  execution_semantics_digest: str | None = None
+  authorization_mode: AuthorizationMode = "HUMAN"
+  grant_reference: str | None = None
+  cache_reference: str | None = None
+
+  def __post_init__(self) -> None:
+    if self.authorization_mode not in {
+      "HUMAN",
+      "AUTO_ALLOW",
+      "CACHE_HIT",
+      "PERSISTENT_GRANT",
+      "OWNER_CONTROL_PLANE",
+    }:
+      raise ValueError("unsupported authorization_mode")
+    if self.authorization_mode == "CACHE_HIT" and not self.cache_reference:
+      raise ValueError("cache-hit approval requires cache_reference")
+    if self.authorization_mode == "PERSISTENT_GRANT" and not self.grant_reference:
+      raise ValueError("persistent-grant approval requires grant_reference")
+    if self.authorization_mode != "CACHE_HIT" and self.cache_reference is not None:
+      raise ValueError("cache_reference requires CACHE_HIT authorization_mode")
+    if self.authorization_mode != "PERSISTENT_GRANT" and self.grant_reference is not None:
+      raise ValueError("grant_reference requires PERSISTENT_GRANT authorization_mode")
+    identity_values = (
+      self.change_set_id,
+      self.change_hash,
+      self.base_vector_hash,
+      self.reviewed_change_binding_digest,
+      self.review_reference,
+      self.execution_semantics_digest,
+    )
+    if self.identity_source is None:
+      if any(value is not None for value in identity_values):
+        raise ValueError("approval identity fields require identity_source")
+      return
+    if self.identity_source not in {"change_set", "reviewed_change_binding"}:
+      raise ValueError("unsupported approval identity_source")
+    if self.review_reference is not None:
+      if not isinstance(self.review_reference, dict):
+        raise ValueError("review_reference must be an object")
+      try:
+        canonical_json_strict(self.review_reference)
+      except (TypeError, ValueError) as exc:
+        raise ValueError("review_reference must contain strict JSON values") from exc
+      self.review_reference = _normalize_review_reference(self.review_reference)
+    if self.identity_source == "change_set":
+      for label, value in (
+        ("change_set_id", self.change_set_id),
+        ("change_hash", self.change_hash),
+        ("base_vector_hash", self.base_vector_hash),
+      ):
+        if not isinstance(value, str) or _HEX_DIGEST_RE.fullmatch(value) is None:
+          raise ValueError(f"{label} must be a lowercase sha256 hex digest")
+      if self.reviewed_change_binding_digest is not None:
+        raise ValueError("change_set identity cannot carry a reviewed binding digest")
+      if self.execution_semantics_digest is not None:
+        raise ValueError("change_set identity cannot carry execution semantics digest")
+      return
+    for label, value in (
+      ("change_hash", self.change_hash),
+      ("base_vector_hash", self.base_vector_hash),
+    ):
+      if not isinstance(value, str) or _SHA256_DIGEST_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a canonical sha256 digest")
+    if (
+      not isinstance(self.change_set_id, str)
+      or _REVIEWED_CHANGE_ID_RE.fullmatch(self.change_set_id) is None
+    ):
+      raise ValueError("reviewed binding identity requires a canonical change_set_id")
+    for label, value in (
+      ("reviewed_change_binding_digest", self.reviewed_change_binding_digest),
+      ("execution_semantics_digest", self.execution_semantics_digest),
+    ):
+      if not isinstance(value, str) or _SHA256_DIGEST_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a canonical sha256 digest")
+    contract = _reviewed_change_contract()
+    try:
+      contract.verify_reviewed_change_identity_v1(
+        reviewed_change_binding_digest=self.reviewed_change_binding_digest,
+        change_set_id=self.change_set_id,
+        change_hash=self.change_hash,
+        base_vector_hash=self.base_vector_hash,
+        execution_semantics_digest=self.execution_semantics_digest,
+      )
+    except contract.ReviewedChangeBindingError as exc:
+      raise ValueError(
+        "reviewed binding identity fields are not canonically linked"
+      ) from exc
+
+
+def revalidate_approval_request(request: ApprovalRequest) -> ApprovalRequest:
+  """Return a freshly validated copy before persistence or audit emission."""
+
+  if not isinstance(request, ApprovalRequest):
+    raise TypeError("request must be an ApprovalRequest")
+  return replace(request)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -222,6 +398,7 @@ class ApprovalDecision:
   notification_policy: ApprovalNotificationPolicy = "auto"
   policy_id: str = "single-user"
   policy_version: str = "1"
+  grant_reference: str | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -297,7 +474,23 @@ def build_approval_request(
   run_context: RunContext,
   reason: str | None = None,
   state: ApprovalState = "created",
+  approval_identity: Mapping[str, Any] | None = None,
 ) -> ApprovalRequest:
+  identity = dict(approval_identity or {})
+  allowed_identity_fields = {
+    "identity_source",
+    "change_set_id",
+    "change_hash",
+    "base_vector_hash",
+    "reviewed_change_binding_digest",
+    "review_reference",
+    "execution_semantics_digest",
+  }
+  unexpected = set(identity).difference(allowed_identity_fields)
+  if unexpected:
+    raise ValueError(
+      f"unsupported approval identity fields: {sorted(unexpected)!r}"
+    )
   approval_id = new_approval_id()
   parent_id = run_context.parent_approval_id
   return ApprovalRequest(
@@ -328,10 +521,26 @@ def build_approval_request(
     tool_schema_version=run_context.tool_schema_version,
     mcp_server_version=run_context.mcp_server_version,
     policy_bundle_hash=run_context.policy_bundle_hash,
+    identity_source=identity.get("identity_source"),
+    change_set_id=identity.get("change_set_id"),
+    change_hash=identity.get("change_hash"),
+    base_vector_hash=identity.get("base_vector_hash"),
+    reviewed_change_binding_digest=identity.get(
+      "reviewed_change_binding_digest"
+    ),
+    review_reference=copy.deepcopy(identity.get("review_reference")),
+    execution_semantics_digest=identity.get("execution_semantics_digest"),
   )
 
 
 def apply_decision_to_request(request: ApprovalRequest, decision: ApprovalDecision) -> ApprovalRequest:
+  authorization_mode: AuthorizationMode = request.authorization_mode
+  grant_reference = request.grant_reference
+  if decision.grant_reference is not None:
+    authorization_mode = "PERSISTENT_GRANT"
+    grant_reference = decision.grant_reference
+  elif decision.outcome == "auto_approve" and authorization_mode == "HUMAN":
+    authorization_mode = "AUTO_ALLOW"
   return replace(
     request,
     required_decider_count=max(1, int(decision.required_decider_count or 1)),
@@ -345,6 +554,8 @@ def apply_decision_to_request(request: ApprovalRequest, decision: ApprovalDecisi
     route_target_type=decision.route_target_type,
     reason=decision.reason,
     notification_policy=decision.notification_policy,
+    authorization_mode=authorization_mode,
+    grant_reference=grant_reference,
   )
 
 
@@ -383,6 +594,9 @@ async def call_policy_safely(
     del payload
     del _alias
 
+  if isinstance(caught, asyncio.CancelledError):
+    del caught
+    raise asyncio.CancelledError from None
   if caught is not None:
     del caught
   raise ApprovalPolicyError(

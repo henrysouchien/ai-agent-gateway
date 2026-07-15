@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import logging
 import os
 import time
+from importlib import import_module
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, TYPE_CHECKING
 
 from . import approval_settings
@@ -37,9 +40,12 @@ from .tool_dispatcher_helpers import (
   InterceptResult as InterceptResult,
   LocalToolHandler as LocalToolHandler,
   NeedsApprovalCallback as NeedsApprovalCallback,
+  PlannedWritePlanningRejected as PlannedWritePlanningRejected,
   RELAY_POLICY_DENIED_MESSAGE as RELAY_POLICY_DENIED_MESSAGE,
   RELAY_POLICY_DENIED_SUB_CODE as RELAY_POLICY_DENIED_SUB_CODE,
   ToolExecutionContext as ToolExecutionContext,
+  TrustedToolPlan as TrustedToolPlan,
+  TrustedToolPlanError as TrustedToolPlanError,
   ToolInterceptor as ToolInterceptor,
   ToolResult as ToolResult,
   TransportApprovalRequest as TransportApprovalRequest,
@@ -141,6 +147,9 @@ class ToolDispatcher:
     allowed_mcp_tools_by_server: Mapping[str, Set[str]] | None = None,
     mcp_scope_context: str = "skill",
     describe_mcp_scope_block: Callable[[str | None, str], str | None] | None = None,
+    commercial_work_start: Any | None = None,
+    commercial_irreversible_recheck: Callable[[Any], None] | None = None,
+    commercial_mcp_servers: frozenset[str] | None = None,
   ) -> None:
     self._mcp = mcp_client
     self._local = local_tool_handlers or {}
@@ -170,6 +179,9 @@ class ToolDispatcher:
     self._get_tool_definitions = get_tool_definitions
     self._mcp_scope_context = mcp_scope_context
     self._describe_mcp_scope_block = describe_mcp_scope_block
+    self._commercial_work_start = commercial_work_start
+    self._commercial_irreversible_recheck = commercial_irreversible_recheck
+    self._commercial_mcp_servers = commercial_mcp_servers or frozenset()
     self._mcp_accepts_abort_event = self._callable_accepts_kw(getattr(self._mcp, "call_tool", None), "abort_event")
     if allowed_mcp_tools_by_server is None:
       self._allowed_mcp_tools_by_server = None
@@ -274,6 +286,208 @@ class ToolDispatcher:
       describe_scope_block=self._describe_mcp_scope_block,
     )
 
+  @staticmethod
+  def _catalog_action(tool_name: str) -> Any | None:
+    """Return one row from the first supported trusted catalog layout."""
+
+    action_catalog: Any | None = None
+    for module_name in ("fms.action_catalog", "api.fms.action_catalog"):
+      try:
+        module = import_module(module_name)
+      except ModuleNotFoundError as exc:
+        parts = module_name.split(".")
+        candidate_or_parent = {
+          ".".join(parts[:index])
+          for index in range(1, len(parts) + 1)
+        }
+        if exc.name not in candidate_or_parent:
+          raise
+        continue
+      action_catalog = module.ACTION_CATALOG
+      break
+    if action_catalog is None:
+      raise TrustedToolPlanError(
+        "trusted FMS action catalog is unavailable in every supported layout"
+      )
+    matches = [
+      action
+      for action in action_catalog
+      if action.local_tool_name == tool_name
+    ]
+    if len(matches) > 1:
+      raise TrustedToolPlanError(
+        f"action catalog contains duplicate local tool {tool_name!r}"
+      )
+    return None if not matches else matches[0]
+
+  @staticmethod
+  def _catalog_planning_identity(tool_name: str) -> str | None:
+    """Read the one authoritative action catalog; never infer from a handler."""
+
+    action = ToolDispatcher._catalog_action(tool_name)
+    return None if action is None else action.planning_identity
+
+  @staticmethod
+  def _planned_handler_hooks(
+    tool_name: str,
+    handler: LocalToolHandler,
+  ) -> tuple[str, Callable[..., Any], Callable[..., Any]] | None:
+    required_identity = ToolDispatcher._catalog_planning_identity(tool_name)
+    identity_marker = getattr(handler, "PLANNING_IDENTITY", None)
+    planner = getattr(handler, "plan_change", None)
+    executor = getattr(handler, "execute_prepared_change", None)
+    declared = (
+      identity_marker is not None,
+      callable(planner),
+      callable(executor),
+    )
+    if not any(declared):
+      if required_identity is not None:
+        raise TrustedToolPlanError(
+          f"catalogued exact-write tool {tool_name!r} lost its planning hooks"
+        )
+      return None
+    if not all(declared):
+      raise TrustedToolPlanError(
+        "planned local handler must declare identity, planner, and exact executor"
+      )
+    if identity_marker not in {"change_set", "reviewed_change_binding"}:
+      raise TrustedToolPlanError(
+        f"unsupported planning identity: {identity_marker!r}"
+      )
+    if required_identity is not None and identity_marker != required_identity:
+      raise TrustedToolPlanError(
+        f"handler planning identity for {tool_name!r} differs from ACTION_CATALOG"
+      )
+    return str(identity_marker), planner, executor
+
+  @staticmethod
+  async def _plan_local_write(
+    hooks: tuple[str, Callable[..., Any], Callable[..., Any]],
+    tool_input: Dict[str, Any],
+    *,
+    call_index: int,
+    tool_ctx: ToolExecutionContext,
+  ) -> tuple[TrustedToolPlan, Callable[..., Any]]:
+    identity_source, planner, executor = hooks
+    planned = planner(tool_input, call_index=call_index, tool_ctx=tool_ctx)
+    if inspect.isawaitable(planned):
+      planned = await planned
+    if type(planned) is not tuple or len(planned) != 2:
+      raise TrustedToolPlanError(
+        "planned local handler must return exactly (identity, prepared_payload)"
+      )
+    identity, prepared = planned
+    trusted_plan = TrustedToolPlan.create(
+      identity_source=identity_source,
+      identity=identity,
+      prepared=prepared,
+    )
+    tool_ctx.trusted_plan = trusted_plan
+    return trusted_plan, executor
+
+  @staticmethod
+  def _prepared_business_model_authorization(
+    tool_name: str,
+    trusted_plan: TrustedToolPlan,
+  ) -> dict[str, Any] | None:
+    if tool_name != "fms_persist_business_model":
+      return None
+    gateway_prepared = trusted_plan.prepared
+    outer_prepared = getattr(gateway_prepared, "prepared", None)
+    completion = getattr(outer_prepared, "completion", None)
+    finalizer = getattr(completion, "finalizer", None)
+    prepared_accept = getattr(finalizer, "prepared_accept", None)
+    serializer = getattr(prepared_accept, "to_canonical_bytes", None)
+    if not callable(serializer):
+      raise TrustedToolPlanError(
+        "business-model exact plan lost its immutable accept payload"
+      )
+    prepared_bytes = serializer()
+    if not isinstance(prepared_bytes, bytes):
+      raise TrustedToolPlanError("business-model prepared payload is not bytes")
+    return {
+      "caller_kind": prepared_accept.caller_kind,
+      "user_scope": prepared_accept.user_scope,
+      "idempotency_locator": prepared_accept.idempotency_locator,
+      "intent_digest": prepared_accept.intent_digest,
+      "prepared_payload": prepared_bytes,
+      "prepared_payload_digest": hashlib.sha256(prepared_bytes).hexdigest(),
+      "change_set_id": trusted_plan.change_set_id,
+      "change_hash": trusted_plan.change_hash,
+      "base_vector_hash": trusted_plan.base_vector_hash,
+    }
+
+  def _plan_raw_patch_mcp_write(
+    self,
+    tool_input: Dict[str, Any],
+    *,
+    tool_ctx: ToolExecutionContext,
+  ) -> TrustedToolPlan:
+    """Plan the shipped raw MCP write locally before any approval is created."""
+
+    from research.patch_engine import prepare_raw_patch_apply
+    from research.repository import get_repository_factory
+    from research.route_deps import route_workspace_dir
+
+    run_context = self._resolve_run_context()
+    user_id = str(run_context.user_id or "").strip()
+    if not user_id:
+      raise TrustedToolPlanError("raw patch planning requires a trusted user")
+    research_file_id = tool_input.get("research_file_id")
+    if isinstance(research_file_id, bool) or not isinstance(research_file_id, int):
+      raise TrustedToolPlanError("raw patch planning requires research_file_id")
+    raw_ops = tool_input.get("ops")
+    if not isinstance(raw_ops, list):
+      raise TrustedToolPlanError("raw patch planning requires an ops list")
+    workspace_dir = route_workspace_dir(user_id, tool_input.get("workspace_dir"))
+    repo = get_repository_factory().get(user_id)
+    prepared = prepare_raw_patch_apply(
+      repo,
+      research_file_id,
+      {"ops": raw_ops},
+      skill_run_id=tool_input.get("skill_run_id"),
+      workspace_dir=workspace_dir,
+      allow_business_overview_replacement=(
+        tool_input.get("allow_business_overview_replacement") is True
+      ),
+    )
+    trusted_plan = TrustedToolPlan.create(
+      identity_source="reviewed_change_binding",
+      identity=prepared.binding,
+      prepared=prepared,
+    )
+    tool_ctx.trusted_plan = trusted_plan
+    return trusted_plan
+
+  def _new_tool_execution_context(
+    self,
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    qualifier: str,
+    abort_event: asyncio.Event | None,
+    skill_run_id: str | None,
+    step_id: str | None,
+    workspace_dir: str | None,
+    batch_id: int | str | None,
+  ) -> ToolExecutionContext:
+    run_context = self._resolve_run_context()
+    return ToolExecutionContext(
+      tool_call_id=tool_call_id,
+      tool_name=tool_name,
+      event_log=self._event_log,
+      resolved_qualifier=qualifier,
+      abort_event=abort_event,
+      skill_run_id=skill_run_id,
+      step_id=step_id,
+      workspace_dir=workspace_dir,
+      batch_id=batch_id,
+      request_id=run_context.request_id,
+      run_id=run_context.run_id,
+      user_id=run_context.user_id,
+    )
+
   async def dispatch(
     self,
     tool_call_id: str,
@@ -283,6 +497,7 @@ class ToolDispatcher:
     call_index: int = 0,
     abort_event: asyncio.Event | None = None,
     skill_run_id: str | None = None,
+    step_id: str | None = None,
     workspace_dir: str | None = None,
     batch_id: int | str | None = None,
     capture_readable_resource_snapshot: bool = False,
@@ -334,12 +549,135 @@ class ToolDispatcher:
       except Exception:
         qualifier = ""
 
+    local_handler = self._local.get(tool_name)
+    resolved_step_id = str(step_id or "").strip() or (
+      f"skill-step:{str(skill_run_id).strip()}"
+      if str(skill_run_id or "").strip()
+      else None
+    )
+    tool_ctx: ToolExecutionContext | None = None
+    trusted_plan: TrustedToolPlan | None = None
+    planned_executor: Callable[..., Any] | None = None
+    prepared_business_model_record: Any | None = None
+    if local_handler is not None:
+      tool_ctx = self._new_tool_execution_context(
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        qualifier=qualifier,
+        abort_event=abort_event,
+        skill_run_id=skill_run_id,
+        step_id=resolved_step_id,
+        workspace_dir=workspace_dir,
+        batch_id=batch_id,
+      )
+      if (
+        tool_name == "fms_persist_business_model"
+        and self._approval_store is not None
+        and str(skill_run_id or "").strip()
+      ):
+        from .prepared_business_model_store import PreparedBusinessModelLifecycle
+
+        run_context = self._resolve_run_context()
+        user_scope = str(run_context.user_id or "").strip()
+        if not user_scope:
+          return None, {
+            "code": "planned_write_authorization_unavailable",
+            "message": "BusinessModel exact planning requires a trusted user scope.",
+          }
+        durable = await self._approval_store.get_prepared_business_model_change(
+          caller_kind="fms_persist",
+          user_scope=user_scope,
+          idempotency_locator=str(skill_run_id).strip(),
+        )
+        if durable is not None:
+          if durable.lifecycle is PreparedBusinessModelLifecycle.SUPERSEDED_PRECOMMIT:
+            return None, {
+              "code": "planned_write_replan_and_reauthorize_required",
+              "message": (
+                "This BusinessModel skill-run already failed before commit; "
+                "retry with a new skill_run_id."
+              ),
+            }
+          if durable.lifecycle in {
+            PreparedBusinessModelLifecycle.DENIED,
+            PreparedBusinessModelLifecycle.EXPIRED,
+          }:
+            return None, {
+              "code": "planned_write_authorization_state_invalid",
+              "message": "The durable BusinessModel plan is terminal and cannot execute.",
+            }
+          tool_ctx.durable_business_model_payload = durable.prepared_payload
+      try:
+        planned_hooks = self._planned_handler_hooks(tool_name, local_handler)
+        if planned_hooks is not None:
+          trusted_plan, planned_executor = await self._plan_local_write(
+            planned_hooks,
+            tool_input,
+            call_index=call_index,
+            tool_ctx=tool_ctx,
+          )
+      except PlannedWritePlanningRejected as exc:
+        return exc.tool_result()
+      except TrustedToolPlanError as exc:
+        log.error("Invalid exact-plan contract for %s: %s", tool_name, exc)
+        return None, {
+          "code": "planned_write_contract_invalid",
+          "message": f"Tool '{tool_name}' has an invalid exact-write planning contract.",
+        }
+      except Exception:
+        log.exception("Exact-write planning failed for %s", tool_name)
+        return None, {
+          "code": "planned_write_planning_failed",
+          "message": f"Tool '{tool_name}' could not produce a trusted exact-write plan.",
+        }
+    elif (
+      tool_name == "apply_patch_ops"
+      and self._mcp.is_mcp_tool(tool_name)
+      and "authorization_ref" not in tool_input
+      and tool_input.get("dry_run") is not True
+    ):
+      tool_ctx = self._new_tool_execution_context(
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        qualifier=qualifier,
+        abort_event=abort_event,
+        skill_run_id=skill_run_id,
+        step_id=resolved_step_id,
+        workspace_dir=workspace_dir,
+        batch_id=batch_id,
+      )
+      try:
+        trusted_plan = self._plan_raw_patch_mcp_write(
+          tool_input,
+          tool_ctx=tool_ctx,
+        )
+      except TrustedToolPlanError as exc:
+        log.error("Invalid raw MCP exact-plan contract: %s", exc)
+        return None, {
+          "code": "planned_write_contract_invalid",
+          "message": "Tool 'apply_patch_ops' has an invalid exact-write plan.",
+        }
+      except Exception:
+        log.exception("Exact-write planning failed for apply_patch_ops")
+        return None, {
+          "code": "planned_write_planning_failed",
+          "message": "Tool 'apply_patch_ops' could not produce a trusted exact-write plan.",
+        }
+
     static_needs_approval = self._should_request_approval(tool_name, tool_input, qualifier)
+    if tool_name == "apply_patch_ops" and (
+      "authorization_ref" in tool_input or tool_input.get("dry_run") is True
+    ):
+      # The opaque reference is revalidated and claimed by the write service;
+      # a retry must not mint a second generic approval around it.
+      static_needs_approval = False
     dynamic_ask = ir.pending_ask is not None
     final_tool_input = tool_input
     approval_request_record: PolicyApprovalRequest | None = None
 
     if (
+      trusted_plan is None
+      and
       not static_needs_approval
       and not dynamic_ask
       and self._tool_was_cache_hit(tool_name, qualifier)
@@ -352,7 +690,432 @@ class ToolDispatcher:
         allow_tool_type_applied=False,
       )
 
-    if static_needs_approval or dynamic_ask:
+    if trusted_plan is not None:
+      if not self._approval_lifecycle_configured():
+        code = (
+          "planned_write_callback_transport_unsupported"
+          if self._request_approval is not None
+          else "planned_write_authorization_unavailable"
+        )
+        return None, {
+          "code": code,
+          "message": (
+            f"Tool '{tool_name}' requires a durable approval store for its exact-write plan."
+          ),
+        }
+
+      allow_persistent = not dynamic_ask
+      approval_reason = ir.pending_ask.message if ir.pending_ask is not None else ""
+      cache_approved = (
+        not static_needs_approval
+        and not dynamic_ask
+        and self._tool_was_cache_hit(tool_name, qualifier)
+      )
+      automatic_approval_reason: str | None = None
+      automatic_denial_reason: str | None = None
+      deny_user_prompt = False
+
+      if self._should_avoid_permission_prompts and not cache_approved:
+        if static_needs_approval:
+          automatic_denial_reason = (
+            ir.pending_ask.message
+            if ir.pending_ask is not None
+            else f"Tool '{tool_name}' requires static approval in headless context"
+          )
+        elif dynamic_ask:
+          hook_result = "deny"
+          if self._on_headless_ask is not None and ir.pending_ask is not None:
+            headless_ctx = InterceptContext(
+              tool_call_id=tool_call_id,
+              tool_name=tool_name,
+              tool_input=tool_input,
+              session_id=self._session_id,
+            )
+            try:
+              raw = self._on_headless_ask(headless_ctx, ir.pending_ask)
+              if inspect.isawaitable(raw):
+                raw = await raw
+              hook_result = raw if raw in ("allow", "deny") else "deny"
+            except Exception as exc:
+              log.warning("Headless ask hook failed: %s — auto-denying", exc)
+          if hook_result == "allow":
+            automatic_approval_reason = (
+              "Headless approval hook authorized the exact planned identity"
+            )
+          else:
+            automatic_denial_reason = (
+              ir.pending_ask.message
+              if ir.pending_ask is not None
+              else "Approval required in headless context"
+            )
+        else:
+          deny_user_prompt = True
+
+      try:
+        prepared_authorization_payload: bytes | None = None
+        prepared_business_model_change = self._prepared_business_model_authorization(
+          tool_name,
+          trusted_plan,
+        )
+        resume_approval_request = None
+        skip_approval_lifecycle = False
+        if prepared_business_model_change is not None:
+          from .prepared_business_model_store import PreparedBusinessModelLifecycle
+
+          prepared_business_model_record = await self._approval_store.get_prepared_business_model_change(
+            caller_kind=str(prepared_business_model_change["caller_kind"]),
+            user_scope=str(prepared_business_model_change["user_scope"]),
+            idempotency_locator=str(
+              prepared_business_model_change["idempotency_locator"]
+            ),
+          )
+          if prepared_business_model_record is not None:
+            supplied_intent = str(prepared_business_model_change["intent_digest"])
+            immutable_matches = (
+              prepared_business_model_record.intent_digest == supplied_intent
+              and prepared_business_model_record.prepared_payload
+              == prepared_business_model_change["prepared_payload"]
+              and prepared_business_model_record.change_set_id
+              == str(prepared_business_model_change["change_set_id"])
+              and prepared_business_model_record.change_hash
+              == str(prepared_business_model_change["change_hash"])
+              and prepared_business_model_record.base_vector_hash
+              == str(prepared_business_model_change["base_vector_hash"])
+              and prepared_business_model_record.prepared_payload_digest
+              == str(prepared_business_model_change["prepared_payload_digest"])
+            )
+            if (
+              prepared_business_model_record.lifecycle
+              is PreparedBusinessModelLifecycle.SUPERSEDED_PRECOMMIT
+            ):
+              if prepared_business_model_record.intent_digest != supplied_intent:
+                raise TrustedToolPlanError(
+                  "FMS skill-run locator conflicts with its terminal intent"
+                )
+              return None, {
+                "code": "planned_write_replan_and_reauthorize_required",
+                "message": (
+                  "This BusinessModel skill-run already failed before commit; "
+                  "retry with a new skill_run_id."
+                ),
+              }
+            if prepared_business_model_record.lifecycle in {
+              PreparedBusinessModelLifecycle.DENIED,
+              PreparedBusinessModelLifecycle.EXPIRED,
+            }:
+              return None, {
+                "code": "planned_write_authorization_state_invalid",
+                "message": "The durable BusinessModel plan is terminal and cannot execute.",
+              }
+            if not immutable_matches:
+              raise TrustedToolPlanError(
+                "FMS skill-run locator conflicts with its prepared BusinessModel plan"
+              )
+            resume_approval_request = await self._approval_store.get(
+              prepared_business_model_record.approval_id
+            )
+            if resume_approval_request is None:
+              raise TrustedToolPlanError(
+                "durable FMS BusinessModel plan lost its approval request"
+              )
+            if (
+              prepared_business_model_record.lifecycle
+              is PreparedBusinessModelLifecycle.PENDING
+            ):
+              approval_state = str(resume_approval_request.state)
+              if approval_state in {"approved", "auto_approved"}:
+                prepared_business_model_record = await self._approval_store.transition_prepared_business_model_change(
+                  caller_kind=prepared_business_model_record.caller_kind,
+                  user_scope=prepared_business_model_record.user_scope,
+                  idempotency_locator=prepared_business_model_record.idempotency_locator,
+                  expected=PreparedBusinessModelLifecycle.PENDING,
+                  target=PreparedBusinessModelLifecycle.AUTHORIZED,
+                  approval_id=prepared_business_model_record.approval_id,
+                  approval_chain_id=prepared_business_model_record.approval_chain_id,
+                )
+                skip_approval_lifecycle = True
+              elif approval_state in {"denied", "auto_denied"}:
+                await self._approval_store.transition_prepared_business_model_change(
+                  caller_kind=prepared_business_model_record.caller_kind,
+                  user_scope=prepared_business_model_record.user_scope,
+                  idempotency_locator=prepared_business_model_record.idempotency_locator,
+                  expected=PreparedBusinessModelLifecycle.PENDING,
+                  target=PreparedBusinessModelLifecycle.DENIED,
+                  approval_id=prepared_business_model_record.approval_id,
+                  approval_chain_id=prepared_business_model_record.approval_chain_id,
+                )
+                return None, {
+                  "code": "planned_write_authorization_state_invalid",
+                  "message": "The original BusinessModel approval was denied.",
+                }
+              elif approval_state == "expired":
+                await self._approval_store.transition_prepared_business_model_change(
+                  caller_kind=prepared_business_model_record.caller_kind,
+                  user_scope=prepared_business_model_record.user_scope,
+                  idempotency_locator=prepared_business_model_record.idempotency_locator,
+                  expected=PreparedBusinessModelLifecycle.PENDING,
+                  target=PreparedBusinessModelLifecycle.EXPIRED,
+                  approval_id=prepared_business_model_record.approval_id,
+                  approval_chain_id=prepared_business_model_record.approval_chain_id,
+                )
+                return None, {
+                  "code": "planned_write_authorization_state_invalid",
+                  "message": "The original BusinessModel approval expired.",
+                }
+              elif approval_state not in {"created", "pending_user", "routed_external"}:
+                raise TrustedToolPlanError(
+                  "durable FMS BusinessModel plan has an unknown approval state"
+                )
+            if prepared_business_model_record.lifecycle in {
+              PreparedBusinessModelLifecycle.AUTHORIZED,
+              PreparedBusinessModelLifecycle.CONSUMED,
+            }:
+              if resume_approval_request.state not in {
+                "approved",
+                "auto_approved",
+              }:
+                raise TrustedToolPlanError(
+                  "durable FMS BusinessModel plan lost approved lineage"
+                )
+              skip_approval_lifecycle = True
+        approval_args_redacted: dict[str, Any] | None = None
+        approval_args_hash: str | None = None
+        if (
+          tool_name == "apply_patch_ops"
+          and trusted_plan.identity_source == "reviewed_change_binding"
+        ):
+          from research.patch_engine import raw_patch_authorization_args
+
+          serializer = getattr(trusted_plan.prepared, "to_canonical_bytes", None)
+          if not callable(serializer):
+            raise TrustedToolPlanError(
+              "raw patch plan cannot serialize its prepared authorization bytes"
+            )
+          prepared_authorization_payload = serializer()
+          if not isinstance(prepared_authorization_payload, bytes):
+            raise TrustedToolPlanError(
+              "raw patch prepared authorization payload is not immutable bytes"
+            )
+          approval_args_redacted = raw_patch_authorization_args(
+            trusted_plan.prepared
+          )
+          approval_args_hash = sha256_args(approval_args_redacted)
+        lifecycle = (
+          {
+            "approved": True,
+            "allow_tool_type": False,
+            "request": resume_approval_request,
+            "tool_input": tool_input,
+            "decision_source": "prepared_business_model_resume",
+          }
+          if skip_approval_lifecycle
+          else await self._run_approval_lifecycle(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            qualifier=qualifier,
+            reason=approval_reason,
+            allow_persistent=allow_persistent,
+            approval_identity=trusted_plan.approval_identity(),
+            prepared_authorization_payload=prepared_authorization_payload,
+            prepared_business_model_change=prepared_business_model_change,
+            resume_approval_request=resume_approval_request,
+            approval_args_redacted=approval_args_redacted,
+            approval_args_hash=approval_args_hash,
+            session_cache_approved=cache_approved,
+            automatic_approval_reason=automatic_approval_reason,
+            automatic_denial_reason=automatic_denial_reason,
+            deny_user_prompt=deny_user_prompt,
+          )
+        )
+      except Exception:
+        log.exception("Durable exact-write authorization failed for %s", tool_name)
+        return None, {
+          "code": "planned_write_authorization_persistence_failed",
+          "message": (
+            f"Tool '{tool_name}' could not persist its exact-write authorization."
+          ),
+        }
+
+      approval_request_record = lifecycle.get("request")
+      if prepared_business_model_change is not None:
+        from .prepared_business_model_store import PreparedBusinessModelLifecycle
+
+        prepared_business_model_record = (
+          await self._approval_store.get_prepared_business_model_change(
+            caller_kind=str(prepared_business_model_change["caller_kind"]),
+            user_scope=str(prepared_business_model_change["user_scope"]),
+            idempotency_locator=str(
+              prepared_business_model_change["idempotency_locator"]
+            ),
+          )
+        )
+        if prepared_business_model_record is None:
+          raise TrustedToolPlanError(
+            "durable FMS BusinessModel plan disappeared after authorization"
+          )
+        if lifecycle.get("approved"):
+          if (
+            prepared_business_model_record.lifecycle
+            is PreparedBusinessModelLifecycle.PENDING
+          ):
+            prepared_business_model_record = await self._approval_store.transition_prepared_business_model_change(
+              caller_kind=prepared_business_model_record.caller_kind,
+              user_scope=prepared_business_model_record.user_scope,
+              idempotency_locator=prepared_business_model_record.idempotency_locator,
+              expected=PreparedBusinessModelLifecycle.PENDING,
+              target=PreparedBusinessModelLifecycle.AUTHORIZED,
+              approval_id=prepared_business_model_record.approval_id,
+              approval_chain_id=prepared_business_model_record.approval_chain_id,
+            )
+          elif (
+            prepared_business_model_record.lifecycle
+            is PreparedBusinessModelLifecycle.SUPERSEDED_PRECOMMIT
+          ):
+            return None, {
+              "code": "planned_write_replan_and_reauthorize_required",
+              "message": (
+                "This BusinessModel skill-run already failed before commit; "
+                "retry with a new skill_run_id."
+              ),
+            }
+          elif prepared_business_model_record.lifecycle in {
+            PreparedBusinessModelLifecycle.DENIED,
+            PreparedBusinessModelLifecycle.EXPIRED,
+          }:
+            return None, {
+              "code": "planned_write_authorization_state_invalid",
+              "message": "The durable BusinessModel plan is terminal and cannot execute.",
+            }
+          elif (
+            prepared_business_model_record.lifecycle
+            is PreparedBusinessModelLifecycle.AUTHORIZED
+            and prepared_business_model_record.approval_id
+            != getattr(approval_request_record, "approval_id", None)
+          ):
+            original_request = await self._approval_store.get(
+              prepared_business_model_record.approval_id
+            )
+            if original_request is None or original_request.state not in {
+              "approved",
+              "auto_approved",
+            }:
+              raise TrustedToolPlanError(
+                "authorized FMS BusinessModel plan lost its original approval"
+              )
+            approval_request_record = original_request
+            lifecycle["request"] = original_request
+        elif (
+          not lifecycle.get("timeout")
+          and prepared_business_model_record.lifecycle
+          is PreparedBusinessModelLifecycle.PENDING
+          and prepared_business_model_record.approval_id
+          == getattr(approval_request_record, "approval_id", None)
+        ):
+          prepared_business_model_record = await self._approval_store.transition_prepared_business_model_change(
+            caller_kind=prepared_business_model_record.caller_kind,
+            user_scope=prepared_business_model_record.user_scope,
+            idempotency_locator=prepared_business_model_record.idempotency_locator,
+            expected=PreparedBusinessModelLifecycle.PENDING,
+            target=PreparedBusinessModelLifecycle.DENIED,
+            approval_id=prepared_business_model_record.approval_id,
+            approval_chain_id=prepared_business_model_record.approval_chain_id,
+          )
+      try:
+        if approval_request_record is None:
+          raise TrustedToolPlanError("approval lifecycle returned no durable request")
+        trusted_plan.verify_approval_request(approval_request_record)
+      except TrustedToolPlanError as exc:
+        log.error("Unbound exact-write approval for %s: %s", tool_name, exc)
+        return None, {
+          "code": "planned_write_authorization_identity_invalid",
+          "message": f"Tool '{tool_name}' approval did not bind the exact planned identity.",
+        }
+
+      tool_ctx.approval_id = approval_request_record.approval_id
+      tool_ctx.approval_chain_id = approval_request_record.approval_chain_id
+      if lifecycle.get("policy_modified_tool_args"):
+        self._emit_approval_decided(
+          tool_call_id,
+          tool_name,
+          outcome="approved",
+          decision_source="planned_write_reinvocation_required",
+          allow_tool_type_applied=False,
+        )
+        await self._emit_execution_audit(
+          approval_request_record,
+          tool_input,
+          outcome="reinvocation_required",
+          error_summary="Policy returned modified arguments for an exact planned write",
+        )
+        return None, {
+          "code": "planned_write_reinvocation_required",
+          "message": (
+            f"Tool '{tool_name}' arguments changed during authorization; "
+            "submit a new invocation so the exact change can be replanned."
+          ),
+        }
+      if lifecycle.get("timeout"):
+        self._emit_approval_decided(
+          tool_call_id,
+          tool_name,
+          outcome="timeout",
+          decision_source="approval_timeout",
+          allow_tool_type_applied=False,
+        )
+        return None, {
+          "code": "approval_timeout",
+          "message": "User did not respond within timeout",
+        }
+      if not lifecycle.get("approved"):
+        decision_source, error_dict = resolve_denied_provenance(
+          lifecycle.get("denied_by")
+        )
+        if lifecycle.get("decision_source") == "headless_auto_deny":
+          error_dict = {
+            "code": "headless_auto_deny",
+            "message": f"Tool '{tool_name}' blocked in headless context.",
+          }
+        self._emit_approval_decided(
+          tool_call_id,
+          tool_name,
+          outcome="denied",
+          decision_source=lifecycle.get("decision_source") or decision_source,
+          allow_tool_type_applied=False,
+        )
+        return None, error_dict
+
+      final_tool_input = lifecycle.get("tool_input", tool_input)
+      if tool_name == "apply_patch_ops" and planned_executor is None:
+        from .raw_patch_authorization_store import encode_reference
+
+        final_tool_input = {
+          **tool_input,
+          "authorization_ref": encode_reference(tool_call_id),
+        }
+      will_install = (
+        bool(lifecycle.get("allow_tool_type"))
+        and allow_persistent
+        and tool_name not in self._session_cache_denied
+      )
+      self._emit_approval_decided(
+        tool_call_id,
+        tool_name,
+        outcome="approved",
+        decision_source=(
+          lifecycle.get("decision_source")
+          or (
+            "delegated_auto_approved"
+            if getattr(approval_request_record, "state", None) == "auto_approved"
+            else "user_approved"
+          )
+        ),
+        allow_tool_type_applied=will_install,
+      )
+      if will_install:
+        self._approved_tool_types.add(self._qualified_key(tool_name, qualifier))
+
+    elif static_needs_approval or dynamic_ask:
       if self._should_avoid_permission_prompts:
         if static_needs_approval:
           reason_text = (
@@ -533,35 +1296,97 @@ class ToolDispatcher:
 
     result: Optional[Any]
     error: Optional[Dict[str, Any]]
-    if tool_name in self._local:
+    if self._resolve_tool_class(tool_name) == "irreversible":
+      if self._commercial_work_start is not None:
+        recheck = self._commercial_irreversible_recheck
+        if recheck is None:
+          return None, {
+            "code": "commercial_irreversible_authority_unavailable",
+            "message": "Fresh commercial authority is unavailable.",
+          }
+        try:
+          recheck(self._commercial_work_start)
+        except Exception:
+          return None, {
+            "code": "commercial_irreversible_authority_invalid",
+            "message": "Fresh commercial authority is invalid or expired.",
+          }
+    if local_handler is not None:
       input_schema_error = self._validate_local_tool_input(tool_call_id, tool_name, final_tool_input)
       if input_schema_error is not None:
         return None, input_schema_error
 
-      tool_ctx = None
-      if self._event_log is not None:
-        run_context = self._resolve_run_context()
-        tool_ctx = ToolExecutionContext(
-          tool_call_id=tool_call_id,
-          tool_name=tool_name,
-          event_log=self._event_log,
-          resolved_qualifier=qualifier,
-          abort_event=abort_event,
-          skill_run_id=skill_run_id,
-          workspace_dir=workspace_dir,
-          batch_id=batch_id,
-          request_id=run_context.request_id,
-          run_id=run_context.run_id,
-        )
+      if tool_ctx is None:
+        raise AssertionError("local tool execution context was not created")
       local_kwargs: dict[str, Any] = {
         "call_index": call_index,
         "tool_ctx": tool_ctx,
       }
-      if capture_readable_resource_snapshot:
-        local_kwargs["capture_readable_resource_snapshot"] = True
-      result, error = await self._local[tool_name](final_tool_input, **local_kwargs)
+      if trusted_plan is not None:
+        if (
+          planned_executor is None
+          or tool_ctx.trusted_plan is not trusted_plan
+          or approval_request_record is None
+          or not tool_ctx.approval_id
+          or not tool_ctx.approval_chain_id
+        ):
+          return None, {
+            "code": "planned_write_trusted_plan_lost",
+            "message": f"Tool '{tool_name}' lost its trusted exact-write authorization.",
+          }
+        try:
+          trusted_plan.verify_approval_request(approval_request_record)
+        except TrustedToolPlanError as exc:
+          log.error("Exact-write authorization drift for %s: %s", tool_name, exc)
+          return None, {
+            "code": "planned_write_trusted_plan_lost",
+            "message": f"Tool '{tool_name}' lost its trusted exact-write authorization.",
+          }
+        if getattr(approval_request_record, "state", None) not in {
+          "approved",
+          "auto_approved",
+        }:
+          return None, {
+            "code": "planned_write_authorization_state_invalid",
+            "message": f"Tool '{tool_name}' does not have an executable approval state.",
+          }
+        exact_kwargs = {
+          "authorized_identity": trusted_plan.identity,
+          "approval_id": tool_ctx.approval_id,
+          "approval_chain_id": tool_ctx.approval_chain_id,
+          **local_kwargs,
+        }
+        executor_parameters = inspect.signature(planned_executor).parameters
+        if "approval_request" in executor_parameters or any(
+          parameter.kind is inspect.Parameter.VAR_KEYWORD
+          for parameter in executor_parameters.values()
+        ):
+          exact_kwargs["approval_request"] = approval_request_record
+        exact_result = planned_executor(
+          trusted_plan.prepared,
+          **exact_kwargs,
+        )
+        if inspect.isawaitable(exact_result):
+          exact_result = await exact_result
+        if type(exact_result) is not tuple or len(exact_result) != 2:
+          raise TrustedToolPlanError(
+            "exact planned-write executor must return a ToolResult pair"
+          )
+        result, error = exact_result
+      else:
+        if capture_readable_resource_snapshot:
+          local_kwargs["capture_readable_resource_snapshot"] = True
+        result, error = await local_handler(final_tool_input, **local_kwargs)
     elif self._mcp.is_mcp_tool(tool_name):
       server = self._mcp.get_server_for_tool(tool_name)
+      if (
+        self._commercial_work_start is not None
+        and server not in self._commercial_mcp_servers
+      ):
+        return None, {
+          "code": "commercial_mcp_destination_denied",
+          "message": "Commercial work cannot be dispatched to this MCP destination.",
+        }
       if server and callable(getattr(self._mcp, "is_per_user_server", None)) and self._mcp.is_per_user_server(server):
         resolved_risk_user_id = self._mcp_identity_overrides.get(server, self._risk_user_id)
         result, error = await self._call_mcp_tool(
@@ -601,6 +1426,107 @@ class ToolDispatcher:
       result = dict(result)
       result["_interceptor_warnings"] = ir.warnings
 
+    if (
+      prepared_business_model_record is not None
+      and prepared_business_model_record.lifecycle.value == "AUTHORIZED"
+      and isinstance(result, dict)
+      and isinstance(result.get("receipt"), dict)
+    ):
+      from .prepared_business_model_store import PreparedBusinessModelLifecycle
+
+      receipt_payload = dict(result["receipt"])
+      receipt_bytes = json.dumps(
+        receipt_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+      ).encode("utf-8")
+      receipt_status = str(receipt_payload.get("status") or "")
+      if receipt_status == "FAILED_PRECOMMIT":
+        error_data = result.get("error")
+        error_data = error_data.get("data") if isinstance(error_data, dict) else None
+        restoration = (
+          error_data.get("restore")
+          if isinstance(error_data, dict) and isinstance(error_data.get("restore"), dict)
+          else None
+        )
+        file_restoration = (
+          restoration.get("file")
+          if isinstance(restoration, dict)
+          and isinstance(restoration.get("file"), dict)
+          else None
+        )
+        exact_restoration_proved = (
+          isinstance(file_restoration, dict)
+          and file_restoration.get("restored") is True
+          and isinstance(file_restoration.get("target"), str)
+          and bool(str(file_restoration.get("target")).strip())
+          and isinstance(file_restoration.get("base_digest"), str)
+          and len(str(file_restoration.get("base_digest"))) == 64
+          and all(
+            char in "0123456789abcdef"
+            for char in str(file_restoration.get("base_digest"))
+          )
+        )
+        if not exact_restoration_proved:
+          result = None
+          error = {
+            "code": "planned_write_recovery_evidence_missing",
+            "message": (
+              "BusinessModel precommit failure did not prove exact restoration; "
+              "the skill-run remains non-terminal for operator recovery."
+            ),
+          }
+        else:
+          restoration_bytes = json.dumps(
+            restoration,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+          ).encode("utf-8")
+          prepared_business_model_record = await self._approval_store.transition_prepared_business_model_change(
+            caller_kind=prepared_business_model_record.caller_kind,
+            user_scope=prepared_business_model_record.user_scope,
+            idempotency_locator=prepared_business_model_record.idempotency_locator,
+            expected=PreparedBusinessModelLifecycle.AUTHORIZED,
+            target=PreparedBusinessModelLifecycle.SUPERSEDED_PRECOMMIT,
+            approval_id=prepared_business_model_record.approval_id,
+            approval_chain_id=prepared_business_model_record.approval_chain_id,
+            execution_receipt=receipt_bytes,
+            restoration_digest=hashlib.sha256(restoration_bytes).hexdigest(),
+          )
+      elif receipt_status in {
+        "COMMITTED",
+        "COMMITTED_OUTBOX_FAILED",
+        "COMMITTED_UNVERIFIED",
+        "PARTIAL",
+        "REPLAYED",
+      }:
+        child_refs = receipt_payload.get("child_refs")
+        checkpoint_id = next(
+          (
+            str(ref.get("value"))
+            for ref in child_refs
+            if isinstance(ref, dict) and ref.get("kind") == "accept_checkpoint_id"
+          ),
+          None,
+        ) if isinstance(child_refs, list) else None
+        if checkpoint_id is not None:
+          prepared_business_model_record = await self._approval_store.transition_prepared_business_model_change(
+            caller_kind=prepared_business_model_record.caller_kind,
+            user_scope=prepared_business_model_record.user_scope,
+            idempotency_locator=prepared_business_model_record.idempotency_locator,
+            expected=PreparedBusinessModelLifecycle.AUTHORIZED,
+            target=PreparedBusinessModelLifecycle.CONSUMED,
+            approval_id=prepared_business_model_record.approval_id,
+            approval_chain_id=prepared_business_model_record.approval_chain_id,
+            execution_receipt=receipt_bytes,
+            checkpoint_id=checkpoint_id,
+            consumed_at=utc_now().isoformat(),
+          )
+
     await self._emit_execution_audit(
       approval_request_record,
       final_tool_input,
@@ -633,6 +1559,16 @@ class ToolDispatcher:
     qualifier: str,
     reason: str,
     allow_persistent: bool,
+    approval_identity: Mapping[str, Any] | None = None,
+    prepared_authorization_payload: bytes | None = None,
+    prepared_business_model_change: Mapping[str, Any] | None = None,
+    resume_approval_request: PolicyApprovalRequest | None = None,
+    approval_args_redacted: dict[str, Any] | None = None,
+    approval_args_hash: str | None = None,
+    session_cache_approved: bool = False,
+    automatic_approval_reason: str | None = None,
+    automatic_denial_reason: str | None = None,
+    deny_user_prompt: bool = False,
   ) -> dict[str, Any]:
     return await _approval_lifecycle_helpers.run_approval_lifecycle(
       store=self._approval_store,
@@ -644,6 +1580,16 @@ class ToolDispatcher:
       qualifier=qualifier,
       reason=reason,
       allow_persistent=allow_persistent,
+      approval_identity=approval_identity,
+      prepared_authorization_payload=prepared_authorization_payload,
+      prepared_business_model_change=prepared_business_model_change,
+      resume_approval_request=resume_approval_request,
+      approval_args_redacted=approval_args_redacted,
+      approval_args_hash=approval_args_hash,
+      session_cache_approved=session_cache_approved,
+      automatic_approval_reason=automatic_approval_reason,
+      automatic_denial_reason=automatic_denial_reason,
+      deny_user_prompt=deny_user_prompt,
       resolve_run_context_fn=self._resolve_run_context,
       current_skill_fn=current_skill,
       redact_for_approval_request_fn=self._redact_for_approval_request,
@@ -662,6 +1608,7 @@ class ToolDispatcher:
     resolved_qualifier: str,
     allow_persistent: bool,
     timeout_seconds: float,
+    batch_admission: Any | None = None,
   ) -> dict[str, Any] | None:
     return await _approval_lifecycle_helpers.await_user_approval_via_pending_tools(
       session=self._session,
@@ -674,6 +1621,7 @@ class ToolDispatcher:
       allow_persistent=allow_persistent,
       timeout_seconds=timeout_seconds,
       log=log,
+      batch_admission=batch_admission,
     )
 
   def _resolve_run_context(self) -> RunContext:
@@ -858,8 +1806,27 @@ class ToolDispatcher:
     user_id: str | int | None = None,
   ) -> ToolResult:
     kwargs: Dict[str, Any] = {}
-    if meta is not None:
-      kwargs["meta"] = meta
+    effective_meta = dict(meta or {})
+    commercial = self._commercial_work_start
+    server = self._mcp.get_server_for_tool(tool_name)
+    if commercial is not None and server in self._commercial_mcp_servers:
+      claim = commercial.claim
+      authorization = commercial.authorization
+      effective_meta["hank_commercial"] = {
+        "tool_name": tool_name,
+        "execution_context_id": str(claim.context_id),
+        "work_authorization_id": str(authorization.authorization_id),
+        "workflow_run_id": str(authorization.workflow_run_id),
+        "entitlement_revision": claim.entitlement_revision,
+        "request_id": authorization.request_id,
+        "session_id": authorization.session_id,
+        "operation": authorization.operation,
+        "capability_id": authorization.capability_id,
+        "provider": authorization.provider,
+        "billing_mode": authorization.billing_mode,
+      }
+    if effective_meta:
+      kwargs["meta"] = effective_meta
     if abort_event is not None and self._mcp_accepts_abort_event:
       kwargs["abort_event"] = abort_event
     if user_id is not None:

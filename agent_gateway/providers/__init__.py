@@ -4,6 +4,7 @@ from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingL
 from .codex import CodexProvider
 from .fixture import FixtureProvider
 from .openai import OpenAIProvider
+from .xai import XAIProvider
 
 __all__ = [
   "AgentSDKConfig",
@@ -14,6 +15,7 @@ __all__ = [
   "ModelInfo",
   "ModelProvider",
   "OpenAIProvider",
+  "XAIProvider",
   "StreamEvent",
   "ThinkingLevel",
   "truncate_to_last_compaction",

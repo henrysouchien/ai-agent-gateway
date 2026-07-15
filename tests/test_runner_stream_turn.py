@@ -66,6 +66,7 @@ def test_stream_turn_helpers_resolve_parent_module_aliases(monkeypatch) -> None:
     "observed_thinking": False,
     "stream_stall_timeout_default": 12.0,
     "stream_thinking_stall_timeout_default": 34.0,
+    "effort_resolution": None,
   }
   assert calls["guard"] == (("stall", "quiet"), 1, 3)
 

@@ -414,6 +414,12 @@ class RunnerToolExecutionMixin:
         )
     tool_t0 = time_module.time()
     server = self._mcp_client.get_server_for_tool(tool_name) if self._mcp_client is not None else None
+    get_provider_id = (
+      getattr(self._mcp_client, "get_provider_id_for_tool", None)
+      if self._mcp_client is not None
+      else None
+    )
+    provider_id = get_provider_id(tool_name) if callable(get_provider_id) else None
     display = _runner_attr(self, "resolve_display", resolve_display)(tool_name, redacted_tool_input)
     tool_start_event = _runner_attr(self, "_build_tool_call_start_event", _build_tool_call_start_event)(
       tool_call_id=tool_id,
@@ -683,6 +689,7 @@ class RunnerToolExecutionMixin:
         session_id=self._full_session_id,
         server=server,
         result_entry=result_entry,
+        provider_id=provider_id,
         skill_run_id=self._skill_run_id,
         workspace_dir=self._workspace_dir,
         batch_id=getattr(self, "_batch_id", None),

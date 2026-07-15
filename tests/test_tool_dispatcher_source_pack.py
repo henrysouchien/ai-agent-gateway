@@ -151,6 +151,9 @@ def test_capture_filing_source_pack_adapts_and_stores_pack(monkeypatch) -> None:
 
 def test_call_mcp_tool_captures_get_filing_evidence_source_pack(monkeypatch) -> None:
   class FakeMcp:
+    def get_server_for_tool(self, _tool_name):
+      return "edgar-parser-mcp"
+
     async def call_tool(self, tool_name, tool_input, **_kwargs):
       return {"source_pack": _planner_payload()}, None
 

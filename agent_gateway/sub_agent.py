@@ -9,6 +9,10 @@ from typing import Any, Awaitable, Callable
 
 from .autonomous_output import extract_state_update
 from ._provider_utils import _get_allowed_models_for_provider_name, sub_agent_default_model
+from .commercial_work_start import (
+  CommercialWorkStartError,
+  require_commercial_child_provider,
+)
 from .event_log import EventLog
 from .runner import _derive_sub_agent_id
 from .session import GatewaySession
@@ -127,6 +131,9 @@ def make_run_agent_handler(
   skill_state_store: SkillStateStore | None = None,
   coordinator_config: CoordinatorConfig | None = None,
   approval_key_qualifier: Callable[[str, dict[str, Any]], str] | None = None,
+  commercial_work_start: Any | None = None,
+  commercial_irreversible_recheck: Callable[[Any], None] | None = None,
+  commercial_mcp_servers: frozenset[str] | None = None,
 ):
   """Build the local handler used by the `run_agent` tool.
 
@@ -193,6 +200,17 @@ def make_run_agent_handler(
     profile_provider = getattr(profile, "provider", None) if profile is not None else None
     if profile_provider:
       raw_provider = raw_provider or profile_provider
+    requested_provider = raw_provider or (
+      effective_coordinator.default_worker_provider
+      if effective_coordinator is not None
+      else None
+    ) or getattr(
+      getattr(commercial_work_start, "authorization", None), "provider", None
+    )
+    try:
+      require_commercial_child_provider(commercial_work_start, requested_provider)
+    except CommercialWorkStartError as exc:
+      return None, {"code": exc.code, "message": str(exc)}
     model_resolution, model_error = resolve_sub_agent_model(
       raw_provider=raw_provider,
       raw_model=raw_model,
@@ -209,6 +227,13 @@ def make_run_agent_handler(
     assert model_resolution is not None
     resolved = model_resolution.resolved_provider
     effective_model = model_resolution.model
+    selected_provider = model_resolution.provider_name or getattr(
+      getattr(commercial_work_start, "authorization", None), "provider", None
+    )
+    try:
+      require_commercial_child_provider(commercial_work_start, selected_provider)
+    except CommercialWorkStartError as exc:
+      return None, {"code": exc.code, "message": str(exc)}
 
     if profile is not None:
       skill_prompt = resolve_blocks(profile.system_prompt, skill_loader.skills_dir / "_blocks")
@@ -362,6 +387,12 @@ def make_run_agent_handler(
           else None
         ),
       ),
+      **({"commercial_work_start": commercial_work_start} if commercial_work_start is not None else {}),
+      **(
+        {"commercial_irreversible_recheck": commercial_irreversible_recheck}
+        if commercial_irreversible_recheck is not None else {}
+      ),
+      **({"commercial_mcp_servers": commercial_mcp_servers} if commercial_mcp_servers is not None else {}),
     )
 
     async def _dispatch_sub_agent(_background_input: dict[str, Any], **background_kwargs: Any):
@@ -396,6 +427,8 @@ def make_run_agent_handler(
         timeout=effective_timeout,
         client_timeout=90,
         max_tokens=effective_max_tokens,
+        effort=getattr(profile, "effort", None) if profile is not None else None,
+        thinking=getattr(profile, "thinking", None) if profile is not None else None,
         call_index=background_call_index,
         parent_turn_id=parent_turn_id,
         task_entry=task_entry,
@@ -469,6 +502,9 @@ def make_resume_handler(
   provider_resolver: ProviderResolver | None = None,
   coordinator_config: CoordinatorConfig | None = None,
   mutation_mode_exclusions_applier: MutationModeExclusionsApplier | None = None,
+  commercial_work_start: Any | None = None,
+  commercial_irreversible_recheck: Callable[[Any], None] | None = None,
+  commercial_mcp_servers: frozenset[str] | None = None,
 ):
   if excluded_tools_resolver is None:
     raise ValueError("make_resume_handler requires excluded_tools_resolver")
@@ -554,6 +590,17 @@ def make_resume_handler(
     profile_provider = getattr(profile, "provider", None)
     if profile_provider:
       raw_provider = raw_provider or profile_provider
+    requested_provider = raw_provider or (
+      effective_coordinator.default_worker_provider
+      if effective_coordinator is not None
+      else None
+    ) or getattr(
+      getattr(commercial_work_start, "authorization", None), "provider", None
+    )
+    try:
+      require_commercial_child_provider(commercial_work_start, requested_provider)
+    except CommercialWorkStartError as exc:
+      return None, {"code": exc.code, "message": str(exc)}
     raw_model = tool_input.get("model")
     if raw_model is not None and not isinstance(raw_model, str):
       return None, {"code": "invalid_input", "message": "model must be a string"}
@@ -575,6 +622,13 @@ def make_resume_handler(
     resolved = model_resolution.resolved_provider
     effective_provider_name = model_resolution.provider_name
     effective_model = model_resolution.model
+    selected_provider = effective_provider_name or getattr(
+      getattr(commercial_work_start, "authorization", None), "provider", None
+    )
+    try:
+      require_commercial_child_provider(commercial_work_start, selected_provider)
+    except CommercialWorkStartError as exc:
+      return None, {"code": exc.code, "message": str(exc)}
 
     skill_prompt = resolve_blocks(profile.system_prompt, skill_loader.skills_dir / "_blocks")
     system_prompt = _SKILL_SYSTEM_PROMPT_TEMPLATE.format(
@@ -697,6 +751,12 @@ def make_resume_handler(
         excluded_tools=child_excluded,
         extra_tool_definitions=_artifact_emit_tool_definitions(set(sub_local)),
       ),
+      **({"commercial_work_start": commercial_work_start} if commercial_work_start is not None else {}),
+      **(
+        {"commercial_irreversible_recheck": commercial_irreversible_recheck}
+        if commercial_irreversible_recheck is not None else {}
+      ),
+      **({"commercial_mcp_servers": commercial_mcp_servers} if commercial_mcp_servers is not None else {}),
     )
 
     async def _dispatch_resume(_background_input: dict[str, Any], **background_kwargs: Any):
@@ -733,6 +793,8 @@ def make_resume_handler(
         timeout=effective_timeout,
         client_timeout=90,
         max_tokens=effective_max_tokens,
+        effort=getattr(profile, "effort", None),
+        thinking=getattr(profile, "thinking", None),
         call_index=background_call_index,
         parent_turn_id=parent_turn_id,
         task_entry=task_entry,

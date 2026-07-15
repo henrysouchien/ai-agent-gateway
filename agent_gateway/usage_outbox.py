@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import stat
 from typing import Any, Iterable, Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -498,25 +499,75 @@ class CommercialUsageOutbox:
       ))
       for version in (1, 2)
     }
-    self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    self._prepare_private_parent()
+    self._harden_storage_files()
     self._migrate()
+    self._harden_storage_files()
+
+  def _prepare_private_parent(self) -> None:
+    self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-      os.chmod(self.path, 0o600)
-    except OSError:
-      pass
+      value = self.path.parent.lstat()
+    except OSError as exc:
+      raise CommercialUsageOutboxError(
+        "commercial outbox storage directory is unavailable"
+      ) from exc
+    if (
+      not stat.S_ISDIR(value.st_mode)
+      or value.st_uid != os.geteuid()
+      or stat.S_IMODE(value.st_mode) & 0o077
+    ):
+      raise CommercialUsageOutboxError(
+        "commercial outbox storage directory must be owner-private"
+      )
+
+  def _harden_storage_files(self) -> None:
+    for path in (
+      self.path,
+      Path(f"{self.path}-wal"),
+      Path(f"{self.path}-shm"),
+    ):
+      try:
+        value = path.lstat()
+      except FileNotFoundError:
+        continue
+      except OSError as exc:
+        raise CommercialUsageOutboxError(
+          "commercial outbox storage metadata is unavailable"
+        ) from exc
+      if (
+        not stat.S_ISREG(value.st_mode)
+        or value.st_uid != os.geteuid()
+        or value.st_nlink != 1
+      ):
+        raise CommercialUsageOutboxError(
+          "commercial outbox storage file identity is invalid"
+        )
+      try:
+        os.chmod(path, 0o600)
+      except OSError as exc:
+        raise CommercialUsageOutboxError(
+          "commercial outbox storage file cannot be made private"
+        ) from exc
 
   def _connect(self) -> sqlite3.Connection:
+    self._harden_storage_files()
     connection = sqlite3.connect(
       self.path,
       timeout=self._busy_timeout_ms / 1_000,
       isolation_level=None,
     )
-    connection.row_factory = sqlite3.Row
-    connection.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute(f"PRAGMA synchronous={self._synchronous}")
-    return connection
+    try:
+      connection.row_factory = sqlite3.Row
+      connection.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
+      connection.execute("PRAGMA foreign_keys=ON")
+      connection.execute("PRAGMA journal_mode=WAL")
+      connection.execute(f"PRAGMA synchronous={self._synchronous}")
+      self._harden_storage_files()
+      return connection
+    except BaseException:
+      connection.close()
+      raise
 
   def _migrate(self) -> None:
     with self._connect() as connection:

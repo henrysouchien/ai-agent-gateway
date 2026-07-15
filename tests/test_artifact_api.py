@@ -119,6 +119,12 @@ def test_artifact_index_returns_latest_and_recent_history_per_skill(
       "artifact_id": "2026-05-20T121500.000-run-c",
       "ticker": "PCTY",
       "skill": "critical-factors",
+      "title": "Critical factor refresh",
+      "created_at": "2026-05-20T12:15:00Z",
+      "contract_name": "CriticalFactorsArtifact",
+      "verdict": {
+        "one_line_summary": "Two factors now dominate the downside case.",
+      },
       "research_file_id": 42,
       "control_run_id": "bg_critical_factors",
       "origin_kind": "product",
@@ -144,6 +150,10 @@ def test_artifact_index_returns_latest_and_recent_history_per_skill(
       "visibility": "default",
       "origin_ref": None,
       "classification_source": "sidecar",
+      "title": "Critical factor refresh",
+      "conclusion": "Two factors now dominate the downside case.",
+      "created_at": "2026-05-20T12:15:00Z",
+      "contract_name": "CriticalFactorsArtifact",
     },
     {
       "skill": "earnings-scenarios",

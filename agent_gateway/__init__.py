@@ -98,6 +98,7 @@ from .providers import (
   OpenAIProvider,
   StreamEvent,
   ThinkingLevel,
+  XAIProvider,
 )
 from .memory import EmbeddingProvider, MarkdownSyncManager, MemoryStore
 from .mcp_client import McpClientManager
@@ -120,6 +121,7 @@ from .sdk_runner import AgentSDKRunner
 from .session import AuthManager, GatewaySession, SessionStore
 from .session_event_history import SessionEventHistory
 from .skills import DataRequirement, SkillLoader, SkillProfile, SkillStateStore, parse_skill_file
+from .thinking import EffortResolution, parse_effort, resolve_effort_pair
 from .sub_agent import (
   make_get_background_result_handler,
   make_get_background_result_tool_def,
@@ -250,6 +252,7 @@ __all__ = [
   "DockerBackend",
   "EventLog",
   "EventLogEntry",
+  "EffortResolution",
   "FixtureProvider",
   "GatewaySession",
   "GatewayServerConfig",
@@ -271,8 +274,11 @@ __all__ = [
   "NotificationQueue",
   "OpenAIProvider",
   "OutputRingBuffer",
+  "XAIProvider",
   "PACKAGE_NAME",
   "ProviderCredentialFailure",
+  "parse_effort",
+  "resolve_effort_pair",
   "ProviderResolver",
   "QueryCursor",
   "RELAY_POLICY_DENIED_MESSAGE",

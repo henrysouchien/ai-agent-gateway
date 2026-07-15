@@ -33,9 +33,13 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   "search_filing_text": _spec("Searching {ticker} filings", "query", "form"),
   "filings_search": _spec("Searching filings", "ticker", "query"),
   "filings_read": _spec("Reading filing excerpts", "ticker", "form"),
-  # FMP / market data.
-  "fmp_fetch": _spec("Pulling market data", "ticker", "statement", "period"),
-  "fmp_profile": _spec("Pulling {ticker} profile", "symbol", "ticker"),
+  # Market data.
+  "check_market_cap": _spec("Checking {ticker} market cap", "symbol", "ticker"),
+  "describe_market_data_endpoint": _spec("Describing market data endpoint", "endpoint"),
+  "fetch_company_profile": _spec("Pulling {ticker} profile", "symbol", "ticker"),
+  "fetch_financials": _spec("Pulling market data", "ticker", "statement", "period"),
+  "list_market_data_endpoints": _spec("Listing market data endpoints", "category"),
+  "search_companies": _spec("Searching companies", "query"),
   "get_news": _spec("Pulling news", "ticker", "query"),
   "get_market_context": _spec("Pulling market context", "ticker", "query"),
   "get_economic_data": _spec("Pulling economic data", "symbol", "query"),

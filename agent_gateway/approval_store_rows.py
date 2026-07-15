@@ -35,6 +35,52 @@ def json_loads(value: str | None) -> Any:
   return json.loads(value)
 
 
+def identity_json_dumps(value: Any) -> str:
+  return json.dumps(
+    value,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=True,
+    allow_nan=False,
+  )
+
+
+def _identity_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+  value: dict[str, Any] = {}
+  for key, item in pairs:
+    if key in value:
+      raise ValueError("review_reference_json contains a duplicate object key")
+    value[key] = item
+  return value
+
+
+def _reject_identity_json_constant(value: str) -> None:
+  raise ValueError(
+    f"review_reference_json must contain strict JSON values, got {value}"
+  )
+
+
+def identity_json_loads(value: str | None) -> Any:
+  if value is None:
+    return None
+  if not isinstance(value, str):
+    raise ValueError("review_reference_json must be canonical JSON text")
+  decoded = json.loads(
+    value,
+    object_pairs_hook=_identity_json_object,
+    parse_constant=_reject_identity_json_constant,
+  )
+  try:
+    canonical = identity_json_dumps(decoded)
+  except (TypeError, ValueError) as exc:
+    raise ValueError(
+      "review_reference_json must contain strict JSON values"
+    ) from exc
+  if value != canonical:
+    raise ValueError("review_reference_json must use canonical identity JSON encoding")
+  return decoded
+
+
 def request_to_row(request: ApprovalRequest) -> dict[str, Any]:
   return {
     "approval_id": request.approval_id,
@@ -83,20 +129,35 @@ def request_to_row(request: ApprovalRequest) -> dict[str, Any]:
     "tool_schema_version": request.tool_schema_version,
     "mcp_server_version": request.mcp_server_version,
     "notification_policy": request.notification_policy,
+    "identity_source": request.identity_source,
+    "change_set_id": request.change_set_id,
+    "change_hash": request.change_hash,
+    "base_vector_hash": request.base_vector_hash,
+    "reviewed_change_binding_digest": request.reviewed_change_binding_digest,
+    "review_reference_json": (
+      identity_json_dumps(request.review_reference)
+      if request.review_reference is not None
+      else None
+    ),
+    "execution_semantics_digest": request.execution_semantics_digest,
+    "authorization_mode": request.authorization_mode,
+    "grant_reference": request.grant_reference,
+    "cache_reference": request.cache_reference,
   }
 
 
 def row_to_request(row: sqlite3.Row) -> ApprovalRequest:
+  columns = set(row.keys())
   return ApprovalRequest(
     approval_id=str(row["approval_id"]),
     tool_call_id=str(row["tool_call_id"]),
     parent_approval_id=row["parent_approval_id"],
     approval_chain_id=str(row["approval_chain_id"]),
-    delegation_id=row["delegation_id"] if "delegation_id" in row.keys() else None,
+    delegation_id=row["delegation_id"] if "delegation_id" in columns else None,
     request_id=str(row["request_id"]),
     session_id=row["session_id"],
     run_id=row["run_id"],
-    skill=row["skill"] if "skill" in row.keys() else None,
+    skill=row["skill"] if "skill" in columns else None,
     user_id=str(row["user_id"]),
     profile=str(row["profile"]),
     channel=str(row["channel"]),
@@ -133,7 +194,35 @@ def row_to_request(row: sqlite3.Row) -> ApprovalRequest:
     system_prompt_hash=row["system_prompt_hash"],
     tool_schema_version=row["tool_schema_version"],
     mcp_server_version=row["mcp_server_version"],
-    notification_policy=row["notification_policy"] if "notification_policy" in row.keys() else "auto",
+    notification_policy=row["notification_policy"] if "notification_policy" in columns else "auto",
+    identity_source=row["identity_source"] if "identity_source" in columns else None,
+    change_set_id=row["change_set_id"] if "change_set_id" in columns else None,
+    change_hash=row["change_hash"] if "change_hash" in columns else None,
+    base_vector_hash=row["base_vector_hash"] if "base_vector_hash" in columns else None,
+    reviewed_change_binding_digest=(
+      row["reviewed_change_binding_digest"]
+      if "reviewed_change_binding_digest" in columns
+      else None
+    ),
+    review_reference=(
+      identity_json_loads(row["review_reference_json"])
+      if "review_reference_json" in columns
+      else None
+    ),
+    execution_semantics_digest=(
+      row["execution_semantics_digest"]
+      if "execution_semantics_digest" in columns
+      else None
+    ),
+    authorization_mode=(
+      row["authorization_mode"] if "authorization_mode" in columns else "HUMAN"
+    ),
+    grant_reference=(
+      row["grant_reference"] if "grant_reference" in columns else None
+    ),
+    cache_reference=(
+      row["cache_reference"] if "cache_reference" in columns else None
+    ),
   )
 
 
@@ -178,6 +267,8 @@ __all__ = [
   "dt_from_text",
   "dt_to_text",
   "json_dumps",
+  "identity_json_dumps",
+  "identity_json_loads",
   "json_loads",
   "request_to_row",
   "row_to_delegation_grant",

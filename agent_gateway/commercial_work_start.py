@@ -66,6 +66,35 @@ class CommercialWorkStartContext:
 CommercialWorkStartFactsResolver = Callable[
   [Any, Any, str | None], CommercialWorkStartFacts
 ]
+CommercialWorkStartPreflight = Callable[[PendingCommercialWorkStart], None]
+
+
+def require_commercial_child_provider(
+  work_start: CommercialWorkStartContext | None,
+  provider: str | None,
+) -> None:
+  """Bind delegated provider work to the root authorization before dispatch."""
+  if work_start is None:
+    return
+  if not isinstance(work_start, CommercialWorkStartContext):
+    raise CommercialWorkStartError(
+      "commercial_child_authority_invalid",
+      "Commercial child authority is invalid.",
+      status_code=503,
+    )
+  resolved_provider = str(provider or "").strip().lower()
+  if not resolved_provider:
+    raise CommercialWorkStartError(
+      "commercial_child_provider_unavailable",
+      "Commercial child provider is unavailable.",
+      status_code=503,
+    )
+  if resolved_provider != work_start.authorization.provider:
+    raise CommercialWorkStartError(
+      "commercial_child_provider_mismatch",
+      "Commercial child provider differs from authorized work.",
+      status_code=403,
+    )
 
 
 class CommercialWorkStartGate:
@@ -79,12 +108,14 @@ class CommercialWorkStartGate:
     authorization_verifier: WorkAuthorizationVerifier | None = None,
     consumption_store: WorkAuthorizationConsumptionStore | None = None,
     facts_resolver: CommercialWorkStartFactsResolver | None = None,
+    pre_consume: CommercialWorkStartPreflight | None = None,
   ) -> None:
     self.enabled = enabled
     self._claim_verifier = claim_verifier
     self._authorization_verifier = authorization_verifier
     self._consumption_store = consumption_store
     self._facts_resolver = facts_resolver
+    self._pre_consume = pre_consume
     self._binding = object()
     if enabled and any(
       dependency is None
@@ -195,6 +226,15 @@ class CommercialWorkStartGate:
         "Commercial work-start consumption is unavailable.",
         status_code=503,
       )
+    if self._pre_consume is not None:
+      try:
+        self._pre_consume(pending)
+      except Exception as exc:
+        raise CommercialWorkStartError(
+          "commercial_work_start_unavailable",
+          "Commercial work-start durability preflight failed.",
+          status_code=503,
+        ) from exc
     try:
       record = store.attach_once(pending.authorization)
     except WorkAuthorizationAlreadyAttached as exc:
@@ -221,6 +261,29 @@ class CommercialWorkStartGate:
       consumption=record,
     )
 
+  def recheck_irreversible(self, context: CommercialWorkStartContext) -> None:
+    """Fail closed on current context/entitlement drift after user approval."""
+    verifier = self._claim_verifier
+    if not self.enabled or verifier is None:
+      raise CommercialWorkStartError(
+        "commercial_irreversible_authority_unavailable",
+        "Fresh commercial authority is unavailable.",
+        status_code=503,
+      )
+    try:
+      verifier.recheck_verified_for_irreversible_submission(context.claim)
+    except CommercialClaimError as exc:
+      raise CommercialWorkStartError(
+        "commercial_irreversible_authority_invalid",
+        "Fresh commercial authority is invalid or expired.",
+        status_code=403,
+      ) from exc
+
+  def uses_context_resolver(self, resolver: Callable) -> bool:
+    """Return whether live checks use this exact authority resolver."""
+    verifier = self._claim_verifier
+    return bool(verifier is not None and verifier.uses_context_resolver(resolver))
+
 
 __all__ = [
   "COMMERCIAL_CLAIM_HEADER",
@@ -229,6 +292,8 @@ __all__ = [
   "CommercialWorkStartError",
   "CommercialWorkStartFacts",
   "CommercialWorkStartFactsResolver",
+  "CommercialWorkStartPreflight",
   "CommercialWorkStartGate",
   "PendingCommercialWorkStart",
+  "require_commercial_child_provider",
 ]

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -12,6 +11,7 @@ import yaml
 from agent_gateway import cli as agent_cli
 from agent_gateway import project
 from agent_gateway.project import AgentProjectError
+from agent_gateway.providers import xai_oauth
 
 
 def test_agent_init_writes_working_project(tmp_path: Path) -> None:
@@ -186,6 +186,50 @@ def test_agent_run_invokes_uvicorn_with_env_config(
   ]
   assert os.environ[project.PROJECT_CONFIG_ENV] == "previous.yaml"
   assert "http://0.0.0.0:8123/gateway" in stdout.getvalue()
+
+
+def test_agent_xai_auth_login_status_and_logout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+  store = tmp_path / "oauth.json"
+
+  async def fake_login(*, config, on_verification, client=None):
+    device = xai_oauth.XAIDeviceCode(
+      "device-secret",
+      "ABCD-1234",
+      "https://accounts.x.ai/oauth2/device",
+      None,
+      900,
+      5,
+    )
+    await on_verification(device)
+    record = {
+      "access_token": "access-1",
+      "refresh_token": "refresh-1",
+      "expires_at": 4_000_000_000,
+      "scope": xai_oauth.DEFAULT_XAI_OAUTH_SCOPE,
+      "issuer": xai_oauth.DEFAULT_XAI_OAUTH_ISSUER,
+      "client_id": xai_oauth.DEFAULT_XAI_OAUTH_CLIENT_ID,
+    }
+    xai_oauth.save_xai_token_record(Path(config["auth_store_path"]), record)
+    return record, Path(config["auth_store_path"])
+
+  monkeypatch.setattr(xai_oauth, "login_xai_device_code", fake_login)
+  stdout = io.StringIO()
+  assert agent_cli.main(
+    ["auth", "login", "xai", "--no-browser", "--store", str(store)], stdout=stdout
+  ) == 0
+  output = stdout.getvalue()
+  assert "ABCD-1234" in output
+  assert "device-secret" not in output
+  assert "login complete" in output
+
+  status = io.StringIO()
+  assert agent_cli.main(["auth", "status", "xai", "--store", str(store)], stdout=status) == 0
+  assert "active" in status.getvalue()
+  assert "permissions=0600" in status.getvalue()
+
+  logout = io.StringIO()
+  assert agent_cli.main(["auth", "logout", "xai", "--store", str(store)], stdout=logout) == 0
+  assert not store.exists()
 
 
 def test_project_config_rejects_unknown_keys(tmp_path: Path) -> None:

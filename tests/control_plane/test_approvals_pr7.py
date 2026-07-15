@@ -4,6 +4,8 @@ import asyncio
 import json
 import time
 import uuid
+from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -19,6 +21,7 @@ from agent_gateway.approval_policy import (
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.audit_writer import JSONLAuditWriter
+from agent_gateway.control_plane import approvals as approvals_module
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 
 
@@ -326,6 +329,122 @@ def _install_autonomous_pending_approval(
   return request_record
 
 
+def _install_batch_pending_approval(
+  *,
+  app,
+  store: SQLiteApprovalStore,
+  batch_id: int,
+  owner_user_id: str,
+  channel: str = "tui",
+  request_id_override: str | None = None,
+  expires_at=None,
+) -> tuple[ApprovalRequest, asyncio.Queue]:
+  run_id = f"batch_{batch_id}"
+  session_id = f"batch-stage-{batch_id}-{owner_user_id}"
+  tool_call_id = f"tool-batch-{batch_id}-{owner_user_id}"
+  approval_id = f"approval-batch-{batch_id}-{owner_user_id}"
+  request_record = replace(
+    _approval_record(
+      chat_payload={"session_id": session_id},
+      tool_call_id=tool_call_id,
+      approval_id=approval_id,
+      user_id=owner_user_id,
+      channel=channel,
+    ),
+    request_id=request_id_override or run_id,
+    run_id=run_id,
+    profile="analyst",
+    expires_at=expires_at,
+  )
+  _run(store.create(request_record))
+  queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+  batch_session = SimpleNamespace(
+    session_id=session_id,
+    user_id=owner_user_id,
+    user_email=None,
+    channel=channel,
+    role="owner",
+    approval_store=store,
+    approval_policy=app.state.gateway_approval_policy,
+    pending_tools={
+      tool_call_id: {
+        "approval_id": approval_id,
+        "nonce": f"nonce-{approval_id}",
+        "status": "approval_pending",
+        "tool_name": request_record.tool_name,
+        "tool_input": dict(request_record.tool_args_redacted),
+        "resolved_qualifier": "external_write:execute_trade:AAPL",
+        "reason": request_record.reason,
+        "allow_persistent_approval": False,
+      }
+    },
+    approval_queues={tool_call_id: queue},
+  )
+  app.state.batch_task_registry.approval_projections.register_session(
+    batch_id=batch_id,
+    owner_user_id=owner_user_id,
+    channel=channel,
+    session=batch_session,
+  )
+  return request_record, queue
+
+
+def _install_pinned_batch_pending_approval(
+  *,
+  app,
+  durable_store: SQLiteApprovalStore,
+  projection_policy: _NoopPolicy,
+  batch_id: int,
+  approval_id: str,
+  session_store: SQLiteApprovalStore | None = None,
+  session_policy: _NoopPolicy | None = None,
+  reason: str = "projection-only approval",
+) -> tuple[ApprovalRequest, asyncio.Queue]:
+  run_id = f"batch_{batch_id}"
+  session_id = f"batch-stage-{approval_id}"
+  tool_call_id = f"tool-{approval_id}"
+  request_record = replace(
+    _approval_record(
+      chat_payload={"session_id": session_id},
+      tool_call_id=tool_call_id,
+      approval_id=approval_id,
+      user_id="alice",
+      channel="tui",
+      tool_class="state_write",
+    ),
+    request_id=run_id,
+    run_id=run_id,
+    profile="analyst",
+    reason=reason,
+  )
+  _run(durable_store.create(request_record))
+  queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+  batch_session = SimpleNamespace(
+    session_id=session_id,
+    user_id="alice",
+    channel="tui",
+    approval_store=session_store or durable_store,
+    approval_policy=session_policy or projection_policy,
+    pending_tools={
+      tool_call_id: {
+        "approval_id": approval_id,
+        "nonce": f"nonce-{approval_id}",
+        "status": "approval_pending",
+      }
+    },
+    approval_queues={tool_call_id: queue},
+  )
+  app.state.batch_task_registry.approval_projections.register_session(
+    batch_id=batch_id,
+    owner_user_id="alice",
+    channel="tui",
+    session=batch_session,
+    store=durable_store,
+    policy=projection_policy,
+  )
+  return request_record, queue
+
+
 def test_control_approval_list_resolve_unblocks_queue_persists_grant_and_audits(tmp_path) -> None:
   app, store, policy, writer = _make_app(tmp_path)
   with TestClient(app) as client:
@@ -544,6 +663,201 @@ def test_control_approval_list_resolve_routes_approval_pending_autonomous_decisi
         "decided_at": decisions[0]["decided_at"],
       }
     ]
+
+
+def test_batch_approval_list_and_vote_use_canonical_owner_and_exact_durable_join(
+  tmp_path,
+  monkeypatch,
+) -> None:
+  monkeypatch.setattr(
+    approvals_module,
+    "_session_owner_user_id",
+    lambda _session: "1",
+  )
+  app, store, policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control_payload = _control_session(client, "henry")
+    approval, queue = _install_batch_pending_approval(
+      app=app,
+      store=store,
+      batch_id=59,
+      owner_user_id="1",
+    )
+
+    listed = client.get("/api/control/approvals", headers=_headers(control_payload))
+    assert listed.status_code == 200, listed.text
+    assert [item["approval_id"] for item in listed.json()["approvals"]] == [
+      approval.approval_id
+    ]
+    assert listed.json()["approvals"][0]["run_id"] == "batch_59"
+
+    response = client.post(
+      f"/api/control/runs/batch_59/approvals/{approval.approval_id}",
+      headers=_headers(control_payload),
+      json={"approved": True, "reason": "reviewed batch write"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["approval"]["state"] == "approved"
+    assert policy.resolved == [approval.approval_id]
+    assert queue.get_nowait() == {
+      "approved": True,
+      "allow_tool_type": False,
+      "approval_id": approval.approval_id,
+      "denied_by": None,
+    }
+
+
+def test_batch_approval_endpoints_pin_projection_store_and_policy_across_same_id_abc(
+  tmp_path,
+) -> None:
+  app_policy = _NoopPolicy()
+  session_policy = _NoopPolicy()
+  projection_policy = _NoopPolicy()
+  app, app_store, _, _writer = _make_app(tmp_path, app_policy)
+  session_store = SQLiteApprovalStore(tmp_path / "session-approvals.sqlite3")
+  projection_store = SQLiteApprovalStore(tmp_path / "projection-approvals.sqlite3")
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    approval, queue = _install_pinned_batch_pending_approval(
+      app=app,
+      durable_store=projection_store,
+      projection_policy=projection_policy,
+      batch_id=71,
+      approval_id="approval-same-id-abc",
+      session_store=session_store,
+      session_policy=session_policy,
+      reason="projection-C",
+    )
+    _run(app_store.create(replace(approval, reason="application-A")))
+    _run(session_store.create(replace(approval, reason="session-B")))
+
+    listed = client.get("/api/control/approvals", headers=_headers(control))
+    assert listed.status_code == 200, listed.text
+    assert [item["approval_id"] for item in listed.json()["approvals"]] == [
+      approval.approval_id
+    ]
+    assert listed.json()["approvals"][0]["reason"] == "projection-C"
+    response = client.post(
+      f"/api/control/runs/batch_71/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={"approved": True, "reason": "pin C"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert _run(app_store.get(approval.approval_id)).state == "pending_user"
+    assert _run(session_store.get(approval.approval_id)).state == "pending_user"
+    assert _run(projection_store.get(approval.approval_id)).state == "approved"
+    assert app_policy.resolved == []
+    assert session_policy.resolved == []
+    assert projection_policy.resolved == [approval.approval_id]
+    assert app_policy.authorization_checks == []
+    assert session_policy.authorization_checks == []
+    assert projection_policy.authorization_checks == [("owner", "state_write")]
+    assert queue.get_nowait()["approved"] is True
+
+
+def test_batch_approval_projection_only_store_is_listed_and_resolved(tmp_path) -> None:
+  app, app_store, app_policy, _writer = _make_app(tmp_path)
+  projection_store = SQLiteApprovalStore(tmp_path / "projection-only.sqlite3")
+  projection_policy = _NoopPolicy()
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    approval, queue = _install_pinned_batch_pending_approval(
+      app=app,
+      durable_store=projection_store,
+      projection_policy=projection_policy,
+      batch_id=72,
+      approval_id="approval-projection-only",
+      session_store=app_store,
+      session_policy=app_policy,
+    )
+
+    assert _run(app_store.get(approval.approval_id)) is None
+    listed = client.get("/api/control/approvals", headers=_headers(control))
+    assert listed.status_code == 200, listed.text
+    assert [item["approval_id"] for item in listed.json()["approvals"]] == [
+      approval.approval_id
+    ]
+    response = client.post(
+      f"/api/control/runs/batch_72/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={"approved": False, "reason": "projection only"},
+    )
+    assert response.status_code == 200, response.text
+    assert _run(projection_store.get(approval.approval_id)).state == "denied"
+    assert _run(app_store.get(approval.approval_id)) is None
+    assert projection_policy.resolved == [approval.approval_id]
+    assert app_policy.resolved == []
+    assert queue.get_nowait()["approved"] is False
+
+
+def test_batch_approval_rejects_cross_user_channel_run_and_durable_identity_mismatch(tmp_path) -> None:
+  app, store, _policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+    bob = _control_session(client, "bob")
+    web_alice = _control_session(client, "alice", channel="web")
+    approval, queue = _install_batch_pending_approval(
+      app=app,
+      store=store,
+      batch_id=60,
+      owner_user_id="alice",
+    )
+
+    for session_payload, run_id in (
+      (bob, "batch_60"),
+      (web_alice, "batch_60"),
+      (alice, "batch_61"),
+    ):
+      response = client.post(
+        f"/api/control/runs/{run_id}/approvals/{approval.approval_id}",
+        headers=_headers(session_payload),
+        json={"approved": True},
+      )
+      assert response.status_code == 404
+    assert queue.empty()
+
+    mismatched, mismatch_queue = _install_batch_pending_approval(
+      app=app,
+      store=store,
+      batch_id=62,
+      owner_user_id="alice",
+      request_id_override="batch_999",
+    )
+    assert [item["approval_id"] for item in client.get(
+      "/api/control/approvals",
+      headers=_headers(alice),
+    ).json()["approvals"]] == [approval.approval_id]
+    response = client.post(
+      f"/api/control/runs/batch_62/approvals/{mismatched.approval_id}",
+      headers=_headers(alice),
+      json={"approved": True},
+    )
+    assert response.status_code == 404
+    assert queue.empty()
+    assert mismatch_queue.empty()
+
+
+def test_batch_approval_expiry_wins_over_late_vote(tmp_path) -> None:
+  app, store, _policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+    approval, queue = _install_batch_pending_approval(
+      app=app,
+      store=store,
+      batch_id=61,
+      owner_user_id="alice",
+      expires_at=utc_now(),
+    )
+    assert _run(store.expire_pending()) == 1
+    response = client.post(
+      f"/api/control/runs/batch_61/approvals/{approval.approval_id}",
+      headers=_headers(alice),
+      json={"approved": True},
+    )
+    assert response.status_code == 410
+    assert _run(store.get(approval.approval_id)).state == "expired"
+    assert queue.empty()
 
 
 def test_cancel_autonomous_run_denies_pending_approval_and_clears_queue(

@@ -1475,7 +1475,8 @@ def test_merge_refreshed_auth_config_preserves_runtime_controls_and_normalizes()
     "auth_token": "123",
     "model": "claude-sonnet-4-6",
     "max_tokens": 256,
-    "thinking": False,
+    "effort": "none",
+    "thinking_enabled_requested": False,
   }
 
 
@@ -1525,7 +1526,8 @@ def test_runner_apply_refreshed_auth_config_updates_request_and_runner_config() 
     "auth_token": "tok",
     "model": "claude-sonnet-4-6",
     "max_tokens": 256,
-    "thinking": False,
+    "effort": "none",
+    "thinking_enabled_requested": False,
     "billing_mode": "byok",
     "rate_table_version": "unknown",
   }

@@ -266,6 +266,7 @@ async def build_hook_additional_context(
   duration_ms = int((parent_time.time() - pending.started_at) * 1000) if pending is not None else 0
   result_entry = runner._make_result_entry(tool_call_id, result, error)
   server_for_tool = _compat("_server_for_tool", _sdk_runner_helpers.server_for_tool)
+  provider_id_for_tool = getattr(runner, "_provider_id_for_tool", None)
   extra_blocks = await runner._call_on_tool_result(
     ToolResultContext(
       tool_name=tool_name,
@@ -277,6 +278,7 @@ async def build_hook_additional_context(
       session_id=runner._session_id,
       server=server_for_tool(tool_name),
       result_entry=result_entry,
+      provider_id=(provider_id_for_tool(tool_name) if callable(provider_id_for_tool) else None),
       skill_run_id=runner._skill_run_id,
       workspace_dir=runner._workspace_dir,
       batch_id=getattr(runner, "_batch_id", None),

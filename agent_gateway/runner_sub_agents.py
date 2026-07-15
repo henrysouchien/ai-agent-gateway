@@ -12,6 +12,7 @@ from .runner_session_lifecycle import _runner_attr
 from .runner_state import ChildCostAccumulator, user_turn_message as _user_turn_message
 from .task_registry import ParentMessage, TaskEntry, make_progress_tracker
 from .tool_dispatcher import ToolDispatcher
+from .thinking import resolve_effort_pair
 
 
 log = logging.getLogger("agent_gateway.runner")
@@ -38,6 +39,8 @@ class RunnerSubAgentMixin:
     parent_turn_id: str | None = None,
     task_entry: TaskEntry | None = None,
     max_budget_usd: float | None = None,
+    effort: str | None = None,
+    thinking: bool | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
   ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
     """Run a focused sub-agent task and return its summarized result.
@@ -62,7 +65,12 @@ class RunnerSubAgentMixin:
         return None, {"code": "invalid_input", "message": "auth_config required when overriding provider"}
       effective_auth = dict(auth_config)
     else:
-      effective_auth = getattr(sub_session, "auth_config", None) or self._auth_config
+      effective_auth = dict(getattr(sub_session, "auth_config", None) or self._auth_config)
+    requested_effort = resolve_effort_pair(effort=effort, thinking=thinking)
+    if requested_effort is not None:
+      effective_auth.pop("thinking", None)
+      effective_auth["effort"] = requested_effort.value
+      effective_auth["thinking_enabled_requested"] = requested_effort.value != "none"
 
     derive_sub_agent_id = _runner_attr(self, "_derive_sub_agent_id", _derive_sub_agent_id)
     sub_session_id = str(getattr(sub_session, "session_id", "") or derive_sub_agent_id(self._full_session_id, call_index))
@@ -208,6 +216,8 @@ class RunnerSubAgentMixin:
     parent_turn_id: str | None = None,
     task_entry: TaskEntry | None = None,
     max_budget_usd: float | None = None,
+    effort: str | None = None,
+    thinking: bool | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
   ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
     if task_entry is not None:
@@ -227,7 +237,12 @@ class RunnerSubAgentMixin:
         return None, {"code": "invalid_input", "message": "auth_config required when overriding provider"}
       effective_auth = dict(auth_config)
     else:
-      effective_auth = getattr(sub_session, "auth_config", None) or self._auth_config
+      effective_auth = dict(getattr(sub_session, "auth_config", None) or self._auth_config)
+    requested_effort = resolve_effort_pair(effort=effort, thinking=thinking)
+    if requested_effort is not None:
+      effective_auth.pop("thinking", None)
+      effective_auth["effort"] = requested_effort.value
+      effective_auth["thinking_enabled_requested"] = requested_effort.value != "none"
 
     derive_sub_agent_id = _runner_attr(self, "_derive_sub_agent_id", _derive_sub_agent_id)
     sub_session_id = str(getattr(sub_session, "session_id", "") or derive_sub_agent_id(self._full_session_id, call_index))

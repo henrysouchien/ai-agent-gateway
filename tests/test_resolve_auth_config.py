@@ -329,7 +329,9 @@ def test_resolve_auth_config_sets_model_max_tokens_and_thinking_when_passed() ->
 
   assert resolved["model"] == "claude-test"
   assert resolved["max_tokens"] == 123
-  assert resolved["thinking"] is True
+  assert resolved["effort"] == "high"
+  assert resolved["thinking_enabled_requested"] is True
+  assert "thinking" not in resolved
 
 
 def test_resolve_auth_config_does_not_inject_model_defaults() -> None:

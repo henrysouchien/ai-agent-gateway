@@ -10,6 +10,7 @@ import yaml
 
 from .fixture_gate import fixture_provider_available, is_fixture_skill_name, require_fixture_provider_available
 from ._io import _atomic_write_json, _read_json_object
+from .thinking import resolve_effort_pair
 
 log = logging.getLogger("agent_gateway.skills")
 _FRONTMATTER_DELIMITER = "---"
@@ -78,6 +79,7 @@ class SkillProfile:
   # contract (test_skill_profile_positional_construction_compat pins the order
   # through mutation_mode); inserting a field mid-struct shifts later fields and
   # breaks positional callers.
+  effort: str | None = None
   provider: str | None = None
   data_requirements: tuple[DataRequirement, ...] = ()
   max_structured_reads: int | None = None
@@ -460,6 +462,7 @@ def parse_skill_file(path: Path) -> SkillProfile:
   raw_max_budget_usd = metadata.pop("max_budget_usd", None)
   raw_max_tokens = metadata.pop("max_tokens", None)
   raw_thinking = metadata.pop("thinking", None)
+  raw_effort = metadata.pop("effort", None)
   raw_max_retries = metadata.pop("max_retries", None)
   raw_initial_message = metadata.pop("initial_message", None)
   raw_delivery_label = metadata.pop("delivery_label", None)
@@ -505,6 +508,8 @@ def parse_skill_file(path: Path) -> SkillProfile:
     if raw_thinking is None
     else _coerce_optional_bool(raw_thinking, field_name="thinking", path=path)
   )
+  coerced_effort_level = resolve_effort_pair(effort=raw_effort, thinking=coerced_thinking)
+  coerced_effort = coerced_effort_level.value if coerced_effort_level is not None else None
   coerced_max_retries = _coerce_optional_int(
     raw_max_retries,
     field_name="max_retries",
@@ -566,6 +571,7 @@ def parse_skill_file(path: Path) -> SkillProfile:
     ("state_dir", coerced_state_dir),
     ("max_budget_usd", coerced_max_budget_usd),
     ("thinking", coerced_thinking),
+    ("effort", coerced_effort),
     ("max_retries", coerced_max_retries),
     ("initial_message", coerced_initial_message),
     ("delivery_label", coerced_delivery_label),
@@ -611,6 +617,7 @@ def parse_skill_file(path: Path) -> SkillProfile:
     tool_packs_enabled=coerced_tool_packs_enabled,
     state_class=coerced_state_class,
     mutation_mode=_clean_string(raw_mutation_mode),
+    effort=coerced_effort,
     provider=_clean_string(raw_provider),
     data_requirements=coerced_data_requirements,
     max_structured_reads=coerced_max_structured_reads,

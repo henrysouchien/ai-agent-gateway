@@ -145,6 +145,7 @@ def test_sdk_runner_context_hook_resolves_parent_aliases(monkeypatch: pytest.Mon
     return [{"type": "text", "text": f"{ctx.server}:{ctx.duration_ms}"}]
 
   runner._on_tool_result = on_tool_result
+  runner._provider_id_for_tool = lambda tool_name: "fmp" if tool_name == "tool" else None
   runner._pending_tool_calls["tool-1"] = sdk_runner.ToolCallInfo(
     tool_call_id="tool-1",
     tool_name="tool",
@@ -165,6 +166,7 @@ def test_sdk_runner_context_hook_resolves_parent_aliases(monkeypatch: pytest.Mon
   )
 
   assert contexts[0].server == "patched-server"
+  assert contexts[0].provider_id == "fmp"
   assert contexts[0].duration_ms == 2500
   assert additional_context == "patched-server:2500"
 

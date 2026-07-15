@@ -383,6 +383,74 @@ def test_apply_collision_filtering_enriches_industry_peer_comparison_symbol_guid
   assert "use symbol" in props["symbol"]["description"]
 
 
+def test_apply_collision_filtering_enriches_gsheets_canonical_argument_guidance() -> None:
+  logger = _CaptureLogger()
+  tool_properties = {
+    "gsheets_list_tabs": ["spreadsheet"],
+    "gsheets_read_range": [
+      "spreadsheet",
+      "range",
+      "value_render_option",
+      "date_time_render_option",
+    ],
+    "gsheets_write_range": ["spreadsheet", "range", "values"],
+    "gsheets_append_rows": ["spreadsheet", "range", "values"],
+    "gsheets_clear_range": ["spreadsheet", "range"],
+    "gsheets_recalculate_range": ["spreadsheet", "range"],
+    "gsheets_create_spreadsheet": ["title"],
+    "gsheets_copy_spreadsheet": ["spreadsheet", "title", "tabs"],
+    "gsheets_search_spreadsheets": ["query", "limit"],
+  }
+  servers = {
+    "gsheets-mcp": SimpleNamespace(
+      tool_prefix="",
+      tool_definitions=[
+        {
+          "name": tool_name,
+          "description": f"Original description for {tool_name}.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              property_name: {"type": "string", "description": "Original property description."}
+              for property_name in property_names
+            },
+          },
+        }
+        for tool_name, property_names in tool_properties.items()
+      ],
+      tool_names=set(),
+    ),
+  }
+
+  result = apply_collision_filtering(
+    servers=servers,
+    builtin_tool_names=set(),
+    strip_input_fields=set(),
+    logger=logger,
+  )
+
+  by_name = {tool["name"]: tool for tool in result.tool_definitions}
+  assert set(by_name) == set(tool_properties)
+  for tool_name, tool in by_name.items():
+    assert tool["description"].startswith(f"Original description for {tool_name}.")
+    for prop in tool["input_schema"]["properties"].values():
+      assert prop["description"] == "Original property description."
+
+  assert "returned normalized spreadsheet" in by_name["gsheets_list_tabs"]["description"]
+  assert "Reuse the returned spreadsheet and range" in by_name["gsheets_read_range"]["description"]
+  assert "do not blindly replay it" in by_name["gsheets_write_range"]["description"]
+  assert "Append is non-idempotent" in by_name["gsheets_append_rows"]["description"]
+  assert "Creation is non-idempotent" in by_name["gsheets_create_spreadsheet"]["description"]
+  assert "destination recovery details" in by_name["gsheets_copy_spreadsheet"]["description"]
+  assert "local mode only" in by_name["gsheets_search_spreadsheets"]["description"]
+  assert "read the target range" in by_name["gsheets_clear_range"]["description"]
+  assert "formula restoration" in by_name["gsheets_recalculate_range"]["description"]
+
+  rendered = "\n".join(tool["description"] for tool in by_name.values())
+  for legacy_term in ("cell_range", "spreadsheet_id", "gsheet_id", "new_title"):
+    assert legacy_term not in rendered
+
+
 def test_apply_collision_filtering_enriches_filing_document_event_and_transcript_guidance() -> None:
   logger = _CaptureLogger()
   servers = {
@@ -600,6 +668,117 @@ def test_policy_owner_mismatch_hides_residual_runtime_tool(monkeypatch) -> None:
   assert logger.errors
 
 
+def test_strict_runtime_tool_set_hides_unclassified_gsheets_tools(monkeypatch) -> None:
+  logger = _CaptureLogger()
+  monkeypatch.setattr(mcp_client_module, "log", logger)
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "gsheets-mcp": _ServerState(
+      name="gsheets-mcp",
+      session=object(),
+      exit_contexts=[],
+      tool_definitions=[
+        {"name": "gsheets_read_range", "description": "broker read", "input_schema": {}},
+        {"name": "gsheets_search_spreadsheets", "description": "local only", "input_schema": {}},
+        {"name": "gsheet_read_range", "description": "removed legacy name", "input_schema": {}},
+      ],
+      tool_names={"gsheets_read_range", "gsheets_search_spreadsheets", "gsheet_read_range"},
+    ),
+  }
+
+  manager._apply_collision_filtering()
+
+  assert [tool["name"] for tool in manager.get_tool_definitions()] == ["gsheets_read_range"]
+  assert manager.get_server_for_tool("gsheets_read_range") == "gsheets-mcp"
+  assert manager.get_server_for_tool("gsheets_search_spreadsheets") is None
+  assert manager.get_server_for_tool("gsheet_read_range") is None
+  assert manager._servers["gsheets-mcp"].tool_names == {"gsheets_read_range"}
+  diagnostic = manager.get_startup_diagnostics()["gsheets-mcp"]
+  assert diagnostic["category"] == "strict_runtime_tool_set_mismatch"
+  assert "gsheets_search_spreadsheets->unclassified" in diagnostic["message"]
+  assert "gsheet_read_range->unclassified" in diagnostic["message"]
+
+
+def test_gsheets_closed_world_survives_shared_policy_import_failure(monkeypatch) -> None:
+  logger = _CaptureLogger()
+  monkeypatch.setattr(mcp_client_module, "log", logger)
+  monkeypatch.setattr(
+    mcp_client_module,
+    "load_server_policy_helpers",
+    lambda: (None, None, None),
+  )
+  monkeypatch.setattr(mcp_client_module, "load_server_policy_module", lambda: None)
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "gsheets-mcp": _ServerState(
+      name="gsheets-mcp",
+      session=object(),
+      exit_contexts=[],
+      tool_definitions=[
+        {"name": "gsheets_read_range", "description": "broker read", "input_schema": {}},
+        {"name": "gsheets_search_spreadsheets", "description": "local only", "input_schema": {}},
+        {"name": "gsheet_read_range", "description": "removed legacy name", "input_schema": {}},
+      ],
+      tool_names={"gsheets_read_range", "gsheets_search_spreadsheets", "gsheet_read_range"},
+    ),
+  }
+
+  manager._apply_collision_filtering()
+
+  assert [tool["name"] for tool in manager.get_tool_definitions()] == ["gsheets_read_range"]
+  assert manager.get_server_for_tool("gsheets_read_range") == "gsheets-mcp"
+  assert manager.get_server_for_tool("gsheets_search_spreadsheets") is None
+  assert manager.get_server_for_tool("gsheet_read_range") is None
+  diagnostic = manager.get_startup_diagnostics()["gsheets-mcp"]
+  assert diagnostic["category"] == "strict_runtime_tool_set_mismatch"
+  assert any("built-in Google Sheets cutover policy" in str(entry[0]) for entry in logger.warnings)
+
+
+def test_gsheets_read_classification_survives_shared_policy_import_failure(monkeypatch) -> None:
+  monkeypatch.setattr(
+    mcp_client_module,
+    "load_server_policy_helpers",
+    lambda: (None, None, None),
+  )
+  manager = McpClientManager(config_path=None)
+  manager._servers = {
+    "gsheets-mcp": _ServerState(
+      name="gsheets-mcp",
+      session=object(),
+      exit_contexts=[object()],
+      tool_definitions=[],
+      tool_names={"gsheets_read_range"},
+      config={"type": "stdio", "command": "gsheets-mcp"},
+    ),
+  }
+  manager._tool_to_server = {"gsheets_read_range": "gsheets-mcp"}
+  reconnects = []
+
+  async def time_out(**_kwargs):
+    raise asyncio.TimeoutError("timeout with upstream detail")
+
+  async def reconnect_only_for_future(**kwargs):
+    reconnects.append(kwargs["original_name"])
+    return True
+
+  manager._call_tool_once = time_out
+  manager._reconnect_stdio_server_for_future = reconnect_only_for_future
+
+  result, error = _run(manager.call_tool("gsheets_read_range", {}))
+
+  assert result is None
+  assert error["sub_code"] == "sheets_transport_error"
+  assert error["data"]["error"]["outcome"] == {
+    "state": "unchanged",
+    "phase": "dispatch",
+    "mutation_may_have_occurred": False,
+  }
+  assert error["data"]["error"]["retry"]["safe"] is True
+  assert error["data"]["error"]["retry"]["automatic"] is False
+  assert "upstream detail" not in str(error)
+  assert reconnects == ["gsheets_read_range"]
+
+
 def test_policy_owner_invariant_falls_back_to_api_import(monkeypatch) -> None:
   logger = _CaptureLogger()
   monkeypatch.setattr(mcp_client_module, "log", logger)
@@ -727,7 +906,7 @@ def test_provider_symbol_translation_allows_scalar_symbol_and_ticker_keys(monkey
   _install_source_html_resolver(monkeypatch, _brk_resolver)
   manager = McpClientManager(config_path=None)
 
-  assert manager._translate_provider_symbol("fmp_fetch", {"symbol": "BRKB"}) == {"symbol": "BRK-B"}
+  assert manager._translate_provider_symbol("fetch_financials", {"symbol": "BRKB"}) == {"symbol": "BRK-B"}
   assert manager._translate_provider_symbol("get_filings", {"ticker": "BRKB"}) == {"ticker": "BRK-B"}
 
 
@@ -760,16 +939,16 @@ def test_provider_symbol_translation_uses_original_name_for_prefixed_tool(monkey
       return SimpleNamespace(isError=False, structuredContent={"ok": True}, content=None)
 
   session = _Session()
-  manager._tool_to_server = {"safe_fmp_fetch": "fmp-mcp"}
-  manager._prefixed_to_original = {"safe_fmp_fetch": "fmp_fetch"}
-  manager._servers = {"fmp-mcp": SimpleNamespace(session=session)}
+  manager._tool_to_server = {"safe_get_filings": "edgar-parser-mcp"}
+  manager._prefixed_to_original = {"safe_get_filings": "get_filings"}
+  manager._servers = {"edgar-parser-mcp": SimpleNamespace(session=session)}
 
-  result, error = _run(manager.call_tool("safe_fmp_fetch", {"symbol": "BRKB"}))
+  result, error = _run(manager.call_tool("safe_get_filings", {"ticker": "BRKB"}))
 
   assert error is None
   assert result == {"ok": True}
-  assert session.calls[0]["name"] == "fmp_fetch"
-  assert session.calls[0]["tool_input"] == {"symbol": "BRK-B"}
+  assert session.calls[0]["name"] == "get_filings"
+  assert session.calls[0]["tool_input"] == {"ticker": "BRK-B"}
 
 
 def test_provider_symbol_translation_fmp_profile_dual_key_atomicity(monkeypatch) -> None:
@@ -777,12 +956,12 @@ def test_provider_symbol_translation_fmp_profile_dual_key_atomicity(monkeypatch)
   manager = McpClientManager(config_path=None)
 
   assert manager._translate_provider_symbol(
-    "fmp_profile",
+    "fetch_company_profile",
     {"symbol": "BRKB", "ticker": "BRK-B"},
   ) == {"symbol": "BRK-B", "ticker": "BRK-B"}
 
   conflicting = {"symbol": "BRKB", "ticker": "AAPL"}
-  assert manager._translate_provider_symbol("fmp_profile", conflicting) == conflicting
+  assert manager._translate_provider_symbol("fetch_company_profile", conflicting) == conflicting
 
 
 def test_provider_symbol_translation_comma_tokens(monkeypatch) -> None:
@@ -829,9 +1008,12 @@ def test_provider_symbol_translation_excludes_list_nested_and_secondary_fields(m
 
 def test_provider_symbol_translation_copy_not_mutate_and_retry_reuses_effective_input(monkeypatch) -> None:
   _install_source_html_resolver(monkeypatch, _brk_resolver)
-  manager = McpClientManager(config_path=None)
-  manager._tool_to_server = {"fmp_fetch": "fmp-mcp"}
-  manager._prefixed_to_original = {"fmp_fetch": "fmp_fetch"}
+  manager = McpClientManager(
+    config_path=None,
+    logical_server_routes={"market-data-mcp": "fmp-mcp"},
+  )
+  manager._tool_to_server = {"fetch_financials": "market-data-mcp"}
+  manager._dispatch_to_original = {"fetch_financials": "fmp_fetch"}
   manager._servers = {"fmp-mcp": SimpleNamespace(session=object())}
   original_input = {"symbol": "BRKB", "other": {"nested": True}}
   seen_inputs = []
@@ -847,7 +1029,7 @@ def test_provider_symbol_translation_copy_not_mutate_and_retry_reuses_effective_
   manager._call_tool_once = fake_call_tool_once
   manager._retry_stdio_tool_call_after_reconnect = fake_retry_stdio_tool_call_after_reconnect
 
-  result, error = _run(manager.call_tool("fmp_fetch", original_input))
+  result, error = _run(manager.call_tool("fetch_financials", original_input))
 
   assert error is None
   assert result == {"ok": True}
@@ -869,7 +1051,7 @@ def test_provider_symbol_translation_import_failure_returns_original(monkeypatch
 
   monkeypatch.setattr(builtins, "__import__", fail_research_source_html_import)
 
-  assert manager._translate_provider_symbol("fmp_fetch", payload) is payload
+  assert manager._translate_provider_symbol("fetch_financials", payload) is payload
 
 
 def test_provider_symbol_translation_resolver_error_returns_original(monkeypatch) -> None:
@@ -880,4 +1062,131 @@ def test_provider_symbol_translation_resolver_error_returns_original(monkeypatch
   manager = McpClientManager(config_path=None)
   payload = {"symbol": "BRKB"}
 
-  assert manager._translate_provider_symbol("fmp_fetch", payload) is payload
+  assert manager._translate_provider_symbol("fetch_financials", payload) is payload
+
+
+def test_generic_stdio_sheets_mutation_transport_loss_reconnects_without_replay() -> None:
+  manager = McpClientManager(config_path=None)
+  server = _ServerState(
+    name="gsheets-mcp",
+    session=object(),
+    exit_contexts=[object()],
+    tool_definitions=[],
+    tool_names={"gsheets_write_range"},
+    config={"type": "stdio", "command": "gsheets-mcp"},
+  )
+  manager._servers = {"gsheets-mcp": server}
+  manager._tool_to_server = {"gsheets_write_range": "gsheets-mcp"}
+  dispatches = []
+  reconnects = []
+
+  async def fail_once(**kwargs):
+    dispatches.append(kwargs["original_name"])
+    raise EOFError("lost transport with upstream detail")
+
+  async def reconnect_only_for_future(**kwargs):
+    reconnects.append(kwargs["original_name"])
+    return True
+
+  async def forbidden_replay(**_kwargs):
+    raise AssertionError("Sheets mutations must not use generic reconnect replay")
+
+  manager._call_tool_once = fail_once
+  manager._reconnect_stdio_server_for_future = reconnect_only_for_future
+  manager._retry_stdio_tool_call_after_reconnect = forbidden_replay
+
+  result, error = _run(manager.call_tool(
+    "gsheets_write_range",
+    {"spreadsheet": "sheet", "range": "Data!A1", "values": [[1]]},
+  ))
+
+  assert result is None
+  assert error["sub_code"] == "mutation_outcome_uncertain"
+  assert error["data"]["error"]["outcome"] == {
+    "state": "uncertain",
+    "phase": "dispatch",
+    "mutation_may_have_occurred": True,
+  }
+  assert error["data"]["error"]["retry"]["safe"] is False
+  assert error["data"]["error"]["retry"]["automatic"] is False
+  assert "upstream detail" not in str(error)
+  assert dispatches == ["gsheets_write_range"]
+  assert reconnects == ["gsheets_write_range"]
+
+
+def test_generic_stdio_sheets_mutation_timeout_reconnects_without_replay() -> None:
+  manager = McpClientManager(config_path=None)
+  server = _ServerState(
+    name="gsheets-mcp",
+    session=object(),
+    exit_contexts=[object()],
+    tool_definitions=[],
+    tool_names={"gsheets_append_rows"},
+    config={"type": "stdio", "command": "gsheets-mcp"},
+  )
+  manager._servers = {"gsheets-mcp": server}
+  manager._tool_to_server = {"gsheets_append_rows": "gsheets-mcp"}
+  dispatches = []
+  reconnects = []
+
+  async def time_out(**kwargs):
+    dispatches.append(kwargs["original_name"])
+    raise asyncio.TimeoutError("timeout with upstream detail")
+
+  async def reconnect_only_for_future(**kwargs):
+    reconnects.append(kwargs["original_name"])
+    return True
+
+  async def forbidden_replay(**_kwargs):
+    raise AssertionError("Sheets mutations must not replay after a timeout")
+
+  manager._call_tool_once = time_out
+  manager._reconnect_stdio_server_for_future = reconnect_only_for_future
+  manager._retry_stdio_tool_call_after_reconnect = forbidden_replay
+
+  result, error = _run(manager.call_tool(
+    "gsheets_append_rows",
+    {"spreadsheet": "sheet", "range": "Data!A1", "values": [[1]]},
+  ))
+
+  assert result is None
+  assert error["sub_code"] == "mutation_outcome_uncertain"
+  assert error["data"]["error"]["outcome"] == {
+    "state": "uncertain",
+    "phase": "dispatch",
+    "mutation_may_have_occurred": True,
+  }
+  assert error["data"]["error"]["retry"]["safe"] is False
+  assert error["data"]["error"]["retry"]["automatic"] is False
+  assert "upstream detail" not in str(error)
+  assert dispatches == ["gsheets_append_rows"]
+  assert reconnects == ["gsheets_append_rows"]
+
+
+def test_sheets_requires_direct_structured_result_but_other_servers_keep_json_fallback() -> None:
+  text_result = SimpleNamespace(
+    isError=False,
+    structuredContent=None,
+    content=[SimpleNamespace(text='{"status":"ok","value":1}')],
+  )
+
+  sheets = McpClientManager(config_path=None)
+  sheets._servers = {"gsheets-mcp": SimpleNamespace(session=object(), config={"type": "stdio"})}
+  sheets._tool_to_server = {"gsheets_read_range": "gsheets-mcp"}
+  sheets._call_tool_once = lambda **_: asyncio.sleep(0, result=text_result)
+
+  sheets_result, sheets_error = _run(sheets.call_tool("gsheets_read_range", {}))
+
+  assert sheets_result is None
+  assert sheets_error["sub_code"] == "invalid_sheets_result_contract"
+  assert sheets_error["data"]["error"]["outcome"]["state"] == "unchanged"
+
+  other = McpClientManager(config_path=None)
+  other._servers = {"other-mcp": SimpleNamespace(session=object(), config={"type": "stdio"})}
+  other._tool_to_server = {"other_read": "other-mcp"}
+  other._call_tool_once = lambda **_: asyncio.sleep(0, result=text_result)
+
+  other_result, other_error = _run(other.call_tool("other_read", {}))
+
+  assert other_error is None
+  assert other_result == {"status": "ok", "value": 1}

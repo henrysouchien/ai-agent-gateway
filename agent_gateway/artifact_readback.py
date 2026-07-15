@@ -1,8 +1,7 @@
 """Synthesize artifact-surface events for stored-artifact readbacks.
 
-Lives in agent_gateway so both tool loops can share it: the SDK runner
-(runner_tool_execution) that serves the interactive channels, and the direct-API
-loop in api/agent/shared/tool_handlers/chat_streaming.py.
+Lives in agent_gateway so the runner tool-execution path can synthesize the same
+artifact surface event shape used by fresh skill runs.
 """
 
 from __future__ import annotations

@@ -89,8 +89,14 @@ async def startup_manager(
         )
       effective_allowed_servers = set(effective_allowed_servers) & requested_servers
 
+  transport_allowed_servers = (
+    manager._transport_server_names(effective_allowed_servers)
+    if effective_allowed_servers is not None
+    else None
+  )
+
   if not mcp_servers:
-    missing_config_targets = effective_allowed_servers if requested_servers is not None else set()
+    missing_config_targets = transport_allowed_servers if requested_servers is not None else set()
     for server_name in sorted(missing_config_targets or set()):
       manager._set_startup_diagnostic(
         server_name,
@@ -103,8 +109,8 @@ async def startup_manager(
 
   mcp_servers = manager._canonicalize_server_configs(mcp_servers)
 
-  if requested_servers is not None and effective_allowed_servers is not None:
-    for server_name in sorted(effective_allowed_servers - set(mcp_servers)):
+  if requested_servers is not None and transport_allowed_servers is not None:
+    for server_name in sorted(transport_allowed_servers - set(mcp_servers)):
       manager._set_startup_diagnostic(
         server_name,
         category="config_missing",
@@ -114,7 +120,7 @@ async def startup_manager(
 
   connect_jobs: list[tuple[str, dict[str, Any]]] = []
   for server_name, server_config in mcp_servers.items():
-    if effective_allowed_servers is not None and server_name not in effective_allowed_servers:
+    if transport_allowed_servers is not None and server_name not in transport_allowed_servers:
       continue
     if not isinstance(server_config, dict):
       logger.warning("Skipping MCP server %s: invalid config", server_name)

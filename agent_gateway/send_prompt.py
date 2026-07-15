@@ -9,6 +9,7 @@ from ._provider_utils import resolve_auth_config
 from .multi_user.billing import UsageEvent, normalize_identity
 from .providers.anthropic import AnthropicProvider
 from .providers.base import ThinkingLevel
+from .thinking import parse_effort
 from .commercial_usage import CommercialUsageProducer
 
 
@@ -29,7 +30,8 @@ async def send_prompt(
   user_id: str,
   system_prompt: str | list[tuple[str, bool]] | None = None,
   max_tokens: int = 4096,
-  thinking: bool = False,
+  thinking: bool | None = None,
+  effort: str | ThinkingLevel | None = None,
   auth_config: dict[str, Any] | None = None,
   client_timeout: float = 180.0,
   session_id: str | None = None,
@@ -76,12 +78,23 @@ async def send_prompt(
     auth_config=auth_config,
     model=model,
     max_tokens=max_tokens,
-    thinking=thinking,
+    effort=effort,
+    thinking=(False if effort is None and thinking is None and not any(k in (auth_config or {}) for k in ("effort", "thinking")) else thinking),
   )
   if not provider.has_active_credential(config):
     raise RuntimeError("No Anthropic credentials found")
 
-  thinking_level = ThinkingLevel.HIGH if thinking else ThinkingLevel.NONE
+  thinking_level = parse_effort(config.get("effort")) or ThinkingLevel.NONE
+  effort_resolution = None
+  if hasattr(provider, "get_model_info") and hasattr(provider, "resolve_effort"):
+    model_info = provider.get_model_info(model)
+    effort_resolution = provider.resolve_effort(
+      requested=thinking_level,
+      model=model,
+      model_info=model_info,
+      max_tokens=max_tokens,
+      auth_mode=config.get("auth_mode"),
+    )
   client: Any = None
   text_parts: list[str] = []
   input_tokens = 0
@@ -135,6 +148,7 @@ async def send_prompt(
       tools=[],
       max_tokens=max_tokens,
       thinking_level=thinking_level,
+      **({"effort_resolution": effort_resolution} if effort_resolution is not None else {}),
       auth_mode=config["auth_mode"],
     )
 

@@ -7,7 +7,7 @@ from typing import Any, Awaitable, Callable, Literal, Mapping
 from .fixture_gate import fixture_provider_available
 
 
-_VALID_PROVIDERS = {"anthropic", "openai", "codex"}
+_VALID_PROVIDERS = {"anthropic", "openai", "codex", "xai"}
 _VALID_BILLING_MODES = {"byok", "metered"}
 CredentialFailureKind = Literal["rate_limit", "billing", "auth"]
 
@@ -23,7 +23,7 @@ def _valid_providers() -> set[str]:
 class AuthConfig:
   """Typed wrapper over the existing auth_config dict shape."""
 
-  provider: Literal["anthropic", "openai", "codex", "fixture"]
+  provider: Literal["anthropic", "openai", "codex", "xai", "fixture"]
   billing_mode: Literal["byok", "metered"]
   model: str | None
   max_tokens: int | None

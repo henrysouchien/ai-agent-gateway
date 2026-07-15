@@ -17,6 +17,10 @@ from .approval_policy import (
   utc_now,
 )
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
+from .batch_approval_projection import (
+  abort_unpublished_batch_approval_admission,
+  acquire_batch_approval_admission,
+)
 from .policy_imports import resolve_server_policy_tool_class
 
 
@@ -104,6 +108,7 @@ async def await_user_approval_via_pending_tools(
   time_fn: Callable[[], float] = time.time,
   queue_factory: Callable[..., Any] = asyncio.Queue,
   wait_for_fn: Callable[..., Any] = asyncio.wait_for,
+  batch_admission: Any | None = None,
 ) -> dict[str, Any] | None:
   if session is None:
     return None
@@ -117,6 +122,13 @@ async def await_user_approval_via_pending_tools(
     "resolved_qualifier": "",
   }
   session.approval_queues[request.tool_call_id] = approval_queue
+  if batch_admission is not None:
+    try:
+      batch_admission.publish_pending()
+    except BaseException:
+      session.pending_tools.pop(request.tool_call_id, None)
+      session.approval_queues.pop(request.tool_call_id, None)
+      raise
   approval_event = {
     "type": "tool_approval_request",
     "tool_call_id": request.tool_call_id,
@@ -182,6 +194,43 @@ async def can_use_tool_callback(
   relay_policy_denied_sub_code: str,
   relay_policy_denied_message: str,
 ) -> Any:
+  arguments = dict(locals())
+  batch_admission = acquire_batch_approval_admission(runner._session)
+  arguments["batch_admission"] = batch_admission
+  try:
+    return await _can_use_tool_callback_impl(**arguments)
+  except BaseException:
+    if batch_admission is not None and not batch_admission.published:
+      await abort_unpublished_batch_approval_admission(batch_admission)
+    raise
+  finally:
+    if batch_admission is not None:
+      batch_admission.release()
+
+
+async def _can_use_tool_callback_impl(
+  runner: Any,
+  tool_name: str,
+  input_data: dict[str, Any],
+  _context: Any,
+  *,
+  policy_owner_mismatch_fn: Callable[[str], tuple[str, str, str] | None],
+  policy_tool_name_fn: Callable[[str], str],
+  current_skill_fn: Callable[[], str | None],
+  replace_fn: Callable[..., Any],
+  enrich_trade_approval_args_fn: Callable[..., dict[str, Any]] = enrich_trade_approval_args,
+  build_approval_request_fn: Callable[..., PolicyApprovalRequest] = build_approval_request,
+  call_policy_safely_fn: Callable[..., Any] = call_policy_safely,
+  apply_decision_to_request_fn: Callable[..., PolicyApprovalRequest] = apply_decision_to_request,
+  effective_trade_approval_expiry_seconds_fn: Callable[..., float | int | None] = effective_trade_approval_expiry_seconds,
+  approval_wait_seconds_fn: Callable[[], float] = approval_settings.approval_wait_seconds,
+  utc_now_fn: Callable[[], Any] = utc_now,
+  uuid_hex_fn: Callable[[], str],
+  os_urandom_fn: Callable[[int], bytes],
+  relay_policy_denied_sub_code: str,
+  relay_policy_denied_message: str,
+  batch_admission: Any | None = None,
+) -> Any:
   import claude_agent_sdk
 
   allow_cls = getattr(claude_agent_sdk, "PermissionResultAllow")
@@ -217,6 +266,8 @@ async def can_use_tool_callback(
     args_hash=args_hash,
     run_context=run_context,
   )
+  if batch_admission is not None:
+    batch_admission.bind_request(request=request, store=store)
   await store.create(request)
   raw_args = dict(input_data)
   try:
@@ -264,7 +315,12 @@ async def can_use_tool_callback(
     expires_at=utc_now_fn() + timedelta(seconds=decision.expiry_seconds or 600),
     expected_state_version=request.state_version,
   )
-  approval = await runner._await_user_approval_via_pending_tools(request, decision, nonce=os_urandom_fn(8).hex())
+  approval = await runner._await_user_approval_via_pending_tools(
+    request,
+    decision,
+    nonce=os_urandom_fn(8).hex(),
+    batch_admission=batch_admission,
+  )
   if approval and approval.get("approved"):
     if decision.modified_tool_args is not None:
       return allow_cls(updated_input=decision.modified_tool_args)

@@ -26,7 +26,44 @@ def _base_compat(*, supports_reasoning_effort: bool) -> dict[str, Any]:
   }
 
 
+def _reasoning_compat(values: tuple[str, ...], default: str, *, omit_equals_none: bool = False) -> dict[str, Any]:
+  compat = _base_compat(supports_reasoning_effort=True)
+  compat.update({
+    "reasoningEffortValues": values,
+    "reasoningEffortDefault": default,
+    "omitEqualsNone": omit_equals_none,
+  })
+  return compat
+
+
+_GPT56_VALUES = ("none", "low", "medium", "high", "xhigh", "max")
+_GPT55_VALUES = ("none", "low", "medium", "high", "xhigh")
+
+
 _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
+  *[
+    (
+      (model_id,),
+      ModelInfo(
+        id=model_id,
+        provider="openai",
+        context_window=1_050_000,
+        max_output_tokens=128_000,
+        supports_thinking=True,
+        supports_vision=True,
+        input_cost_per_mtok=input_cost,
+        output_cost_per_mtok=output_cost,
+        cache_read_cost_per_mtok=cache_cost,
+        compat=_reasoning_compat(_GPT56_VALUES, "medium"),
+      ),
+    )
+    for model_id, input_cost, output_cost, cache_cost in (
+      ("gpt-5.6-sol", 5.00, 30.00, 0.50),
+      ("gpt-5.6-terra", 2.50, 15.00, 0.25),
+      ("gpt-5.6-luna", 1.00, 6.00, 0.10),
+      ("gpt-5.6", 5.00, 30.00, 0.50),
+    )
+  ],
   (
     ("gpt-5.5",),
     ModelInfo(
@@ -39,7 +76,22 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       input_cost_per_mtok=5.00,
       output_cost_per_mtok=30.00,
       cache_read_cost_per_mtok=0.50,
-      compat=_base_compat(supports_reasoning_effort=True),
+      compat=_reasoning_compat(_GPT55_VALUES, "medium"),
+    ),
+  ),
+  (
+    ("gpt-5.4",),
+    ModelInfo(
+      id="gpt-5.4",
+      provider="openai",
+      context_window=1_050_000,
+      max_output_tokens=128_000,
+      supports_thinking=True,
+      supports_vision=True,
+      input_cost_per_mtok=2.50,
+      output_cost_per_mtok=15.00,
+      cache_read_cost_per_mtok=0.25,
+      compat=_reasoning_compat(_GPT55_VALUES, "none"),
     ),
   ),
   (
@@ -84,7 +136,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       input_cost_per_mtok=1.10,
       output_cost_per_mtok=4.40,
       cache_read_cost_per_mtok=0.55,
-      compat=_base_compat(supports_reasoning_effort=True),
+      compat=_reasoning_compat(("low", "medium", "high"), "medium"),
     ),
   ),
   (
@@ -99,7 +151,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       input_cost_per_mtok=1.10,
       output_cost_per_mtok=4.40,
       cache_read_cost_per_mtok=0.55,
-      compat=_base_compat(supports_reasoning_effort=True),
+      compat=_reasoning_compat(("low", "medium", "high"), "medium"),
     ),
   ),
   (
@@ -114,7 +166,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       input_cost_per_mtok=15.00,
       output_cost_per_mtok=60.00,
       cache_read_cost_per_mtok=7.50,
-      compat=_base_compat(supports_reasoning_effort=True),
+      compat=_reasoning_compat(("low", "medium", "high"), "medium"),
     ),
   ),
 ]

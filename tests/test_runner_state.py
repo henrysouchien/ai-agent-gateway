@@ -41,7 +41,7 @@ def test_normalized_run_config_coerces_fields_and_preserves_extra_keys() -> None
     "auth_token": None,
     "model": "",
     "max_tokens": "2048",
-    "thinking": "",
+    "thinking": "false",
     "base_url": "https://example.test",
   }
 
@@ -57,7 +57,8 @@ def test_normalized_run_config_coerces_fields_and_preserves_extra_keys() -> None
     "auth_token": "None",
     "model": "default-model",
     "max_tokens": 2048,
-    "thinking": False,
+    "effort": "none",
+    "thinking_enabled_requested": False,
     "base_url": "https://example.test",
   }
   assert auth_config["auth_mode"] == " OAuth "
@@ -77,7 +78,8 @@ def test_normalized_run_config_uses_defaults_for_missing_fields() -> None:
     "auth_token": "",
     "model": "provider-default",
     "max_tokens": 16000,
-    "thinking": True,
+    "effort": "high",
+    "thinking_enabled_requested": True,
   }
 
 
@@ -89,7 +91,8 @@ def test_normalized_run_config_model_override_wins() -> None:
   )
 
   assert config["model"] == "override-model"
-  assert config["thinking"] is True
+  assert config["effort"] == "none"
+  assert config["thinking_enabled_requested"] is False
 
 
 def test_assistant_turn_message_shapes_conversation_entry_and_copies_content() -> None:

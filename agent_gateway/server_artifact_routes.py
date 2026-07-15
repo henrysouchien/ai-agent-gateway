@@ -7,6 +7,37 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 
+def _first_text_field(payload: Mapping[str, Any], *keys: str) -> str | None:
+  for key in keys:
+    value = payload.get(key)
+    if isinstance(value, str) and value.strip():
+      return value.strip()
+  return None
+
+
+def _artifact_picker_copy(payload: Mapping[str, Any]) -> dict[str, str]:
+  verdict = payload.get("verdict")
+  verdict_fields = verdict if isinstance(verdict, Mapping) else {}
+  values = {
+    "title": _first_text_field(payload, "title", "label"),
+    "conclusion": (
+      _first_text_field(payload, "conclusion", "judgment", "summary", "decision", "rationale")
+      or _first_text_field(
+        verdict_fields,
+        "one_line_summary",
+        "conclusion",
+        "judgment",
+        "summary",
+        "decision",
+        "rationale",
+      )
+    ),
+    "created_at": _first_text_field(payload, "created_at", "createdAt", "ts"),
+    "contract_name": _first_text_field(payload, "contract_name", "contractName"),
+  }
+  return {key: value for key, value in values.items() if value is not None}
+
+
 def artifact_latest_response(
   parent: Mapping[str, Any],
   request: Request,
@@ -92,6 +123,7 @@ def artifact_index_response(parent: Mapping[str, Any], request: Request, ticker:
       "visibility": latest_payload.get("visibility"),
       "origin_ref": latest_payload.get("origin_ref"),
       "classification_source": latest_payload.get("classification_source"),
+      **_artifact_picker_copy(latest_payload),
     })
   return JSONResponse(content=decorated)
 

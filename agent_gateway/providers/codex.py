@@ -8,11 +8,14 @@ from weakref import WeakKeyDictionary
 import httpx
 
 from .base import ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
+from ..thinking import EffortResolution, clamp_effort
 from .codex_helpers import (
   DEFAULT_CODEX_BASE_URL as DEFAULT_CODEX_BASE_URL,
   JWT_CLAIM_PATH as JWT_CLAIM_PATH,
   DEFAULT_INSTRUCTIONS as DEFAULT_INSTRUCTIONS,
   _BETA_HEADER as _BETA_HEADER,
+  _CODEX_ORIGINATOR as _CODEX_ORIGINATOR,
+  _CODEX_USER_AGENT as _CODEX_USER_AGENT,
   _RETRYABLE_STATUSES as _RETRYABLE_STATUSES,
   _RETRYABLE_RE as _RETRYABLE_RE,
   _CODEX_RESPONSE_STATUSES as _CODEX_RESPONSE_STATUSES,
@@ -95,7 +98,7 @@ class CodexProvider(ModelProvider):
     model_id = str(model or "").strip()
     if not model_id:
       raise ValueError("Model is required")
-    for tags, info in _MODEL_INFO_BY_TAG:
+    for tags, info in sorted(_MODEL_INFO_BY_TAG, key=lambda row: max(map(len, row[0])), reverse=True):
       if any(_model_matches_tag(model_id, tag) for tag in tags):
         return replace(info, id=model_id)
     if "gpt-5" in model_id:
@@ -106,6 +109,12 @@ class CodexProvider(ModelProvider):
         max_output_tokens=128_000,
         supports_thinking=True,
         supports_vision=True,
+        compat={
+          "supportsReasoningEffort": True,
+          "reasoningEffortValues": ("low", "medium", "high"),
+          "reasoningEffortDefault": "medium",
+          "omitEqualsNone": False,
+        },
       )
     return ModelInfo(id=model_id, provider=self.name)
 
@@ -153,14 +162,46 @@ class CodexProvider(ModelProvider):
     if tools:
       params["tools"] = _convert_tools(tools, strict=None)
 
-    reasoning_effort = _map_reasoning_effort(thinking_level)
-    if model_info.supports_thinking and reasoning_effort is not None:
+    effort_resolution = kwargs.get("effort_resolution")
+    if not isinstance(effort_resolution, EffortResolution):
+      effort_resolution = self.resolve_effort(
+        requested=thinking_level,
+        model=model,
+        model_info=model_info,
+        max_tokens=max_tokens,
+      )
+    reasoning_fragment = effort_resolution.payload_fragments.get("reasoning")
+    if isinstance(reasoning_fragment, dict):
       params["reasoning"] = {
-        "effort": _clamp_reasoning_effort(model, reasoning_effort),
         "summary": str(kwargs.get("reasoning_summary") or "auto"),
+        **reasoning_fragment,
       }
 
     return params
+
+  def resolve_effort(
+    self,
+    *,
+    requested: ThinkingLevel,
+    model: str,
+    model_info: ModelInfo,
+    max_tokens: int,
+    **request_context: Any,
+  ) -> EffortResolution:
+    del model, max_tokens, request_context
+    if not model_info.supports_thinking:
+      return EffortResolution(requested, ThinkingLevel.NONE, False, {})
+    compat = dict(model_info.compat or {})
+    raw_values = tuple(compat.get("reasoningEffortValues") or ("low", "medium", "high"))
+    supported = tuple(ThinkingLevel(str(value)) for value in raw_values)
+    normalized = ThinkingLevel.LOW if requested == ThinkingLevel.MINIMAL and ThinkingLevel.MINIMAL not in supported else requested
+    effective = clamp_effort(normalized, supported)
+    return EffortResolution(
+      requested,
+      effective,
+      effective != ThinkingLevel.NONE,
+      {"reasoning": {"effort": effective.value}},
+    )
 
   def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
     tool_call_id_map: dict[str, str] = {}

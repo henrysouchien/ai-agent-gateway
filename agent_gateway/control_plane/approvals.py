@@ -15,7 +15,13 @@ from agent_gateway.approvals import (
   _record_vote_and_unblock,
 )
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
+from agent_gateway.batch_approval_projection import (
+  ApprovalProjection,
+  approval_record_matches_projection,
+)
 from agent_gateway.session import AuthManager, GatewaySession
+
+from .runs_helpers import _session_owner_user_id
 
 
 class ControlApprovalDecisionRequest(BaseModel):
@@ -239,32 +245,110 @@ async def _approval_records_for_autonomous_task(store: Any, record: AutonomousTa
   return approvals
 
 
+def _batch_projection_for_user(
+  batch_task_registry: Any,
+  *,
+  run_id: str,
+  approval_id: str,
+  owner_user_id: str,
+  channel: str | None,
+) -> ApprovalProjection | None:
+  projections = getattr(batch_task_registry, "approval_projections", None)
+  if projections is None:
+    return None
+  return projections.find_projection(
+    run_id=run_id,
+    approval_id=approval_id,
+    owner_user_id=owner_user_id,
+    channel=channel,
+  )
+
+
+async def _validated_batch_projection(
+  projection: ApprovalProjection | None,
+) -> tuple[ApprovalProjection, Any] | None:
+  if projection is None or projection.store is None or projection.policy is None:
+    return None
+  request_record = await projection.store.get(projection.approval_id)
+  if request_record is None or not approval_record_matches_projection(
+    request_record,
+    projection,
+  ):
+    return None
+  return projection, request_record
+
+
+async def _approval_records_for_batches(
+  batch_task_registry: Any,
+  *,
+  owner_user_id: str,
+  channel: str | None,
+) -> list[dict[str, Any]]:
+  projections = getattr(batch_task_registry, "approval_projections", None)
+  if projections is None:
+    return []
+  approvals: list[dict[str, Any]] = []
+  for projection in projections.projections_for_owner(
+    owner_user_id=owner_user_id,
+    channel=channel,
+  ):
+    validated = await _validated_batch_projection(projection)
+    if validated is None:
+      continue
+    _, request_record = validated
+    if request_record.state != "pending_user":
+      continue
+    approval = _approval_request_to_dict(request_record)
+    approval["session_id"] = projection.run_id
+    approval["run_id"] = projection.run_id
+    approval["batch_id"] = projection.batch_id
+    approval["stage_run_seq"] = projection.stage_run_seq
+    approvals.append(approval)
+  return approvals
+
+
 async def _visible_pending_approval_for_run(
   *,
   auth: AuthManager,
-  store: Any,
+  store: Any | None,
   autonomous_registry: AutonomousRegistry | None,
   run_id: str,
   approval_id: str,
   authenticated: GatewaySession,
-) -> Any | None:
+  batch_task_registry: Any = None,
+) -> tuple[Any, Any] | None:
   target_session = _target_chat_session_for_user(auth, run_id, authenticated.user_id, authenticated.channel)
-  if target_session is not None:
+  if target_session is not None and store is not None:
     pending = _find_pending_approval(target_session, approval_id)
     if pending is not None:
-      return await store.get(approval_id)
+      request_record = await store.get(approval_id)
+      return (store, request_record) if request_record is not None else None
 
-  delegated_target = await _delegated_pending_approval_for_user(
-    auth,
-    store,
-    run_id,
-    approval_id,
-    authenticated.user_id,
-    authenticated.channel,
-    {},
+  if store is not None:
+    delegated_target = await _delegated_pending_approval_for_user(
+      auth,
+      store,
+      run_id,
+      approval_id,
+      authenticated.user_id,
+      authenticated.channel,
+      {},
+    )
+    if delegated_target is not None:
+      request_record = await store.get(approval_id)
+      return (store, request_record) if request_record is not None else None
+
+  batch_projection = _batch_projection_for_user(
+    batch_task_registry,
+    run_id=run_id,
+    approval_id=approval_id,
+    owner_user_id=_session_owner_user_id(authenticated),
+    channel=authenticated.channel,
   )
-  if delegated_target is not None:
-    return await store.get(approval_id)
+  validated = await _validated_batch_projection(batch_projection)
+  if validated is not None:
+    projection, request_record = validated
+    return projection.store, request_record
 
   record = _autonomous_record_for_user(
     autonomous_registry,
@@ -278,7 +362,10 @@ async def _visible_pending_approval_for_run(
     return None
   if _autonomous_pending_event(record, approval_id) is None:
     return None
-  return await store.get(approval_id)
+  if store is None:
+    return None
+  request_record = await store.get(approval_id)
+  return (store, request_record) if request_record is not None else None
 
 
 def _approval_retry_state_error(request_record: Any, approval_id: str) -> JSONResponse | None:
@@ -312,32 +399,40 @@ def build_approvals_router(
     _require_control_session(authenticated)
     auth.session_store.cleanup_expired()
     store = getattr(request.app.state, "gateway_approval_store", None)
-    if store is None:
-      return _json_error(503, "Approval subsystem unavailable")
 
     approvals: list[dict[str, Any]] = []
     delegation_grant_cache: dict[str, Any | None] = {}
-    for session in auth.session_store.sessions.values():
-      if session.kind != "chat" or session.user_id != authenticated.user_id:
-        continue
-      if _channel_matches(session.channel, authenticated.channel):
-        approvals.extend(await _approval_records_for_session(store, session))
-        continue
-      approvals.extend(
-        await _approval_records_for_session(
-          store,
-          session,
-          delegated_to_user_id=authenticated.user_id,
-          delegation_grant_cache=delegation_grant_cache,
+    if store is not None:
+      for session in auth.session_store.sessions.values():
+        if session.kind != "chat" or session.user_id != authenticated.user_id:
+          continue
+        if _channel_matches(session.channel, authenticated.channel):
+          approvals.extend(await _approval_records_for_session(store, session))
+          continue
+        approvals.extend(
+          await _approval_records_for_session(
+            store,
+            session,
+            delegated_to_user_id=authenticated.user_id,
+            delegation_grant_cache=delegation_grant_cache,
+          )
         )
-      )
-    if autonomous_registry is not None:
+    if store is not None and autonomous_registry is not None:
       for record in autonomous_registry._tasks.values():
         if record.user_id != authenticated.user_id:
           continue
         if not _channel_matches(record.channel, authenticated.channel):
           continue
         approvals.extend(await _approval_records_for_autonomous_task(store, record))
+    approvals.extend(
+      await _approval_records_for_batches(
+        getattr(request.app.state, "batch_task_registry", None),
+        owner_user_id=_session_owner_user_id(authenticated),
+        channel=authenticated.channel,
+      )
+    )
+    if store is None and not approvals:
+      return _json_error(503, "Approval subsystem unavailable")
     return JSONResponse({"approvals": approvals})
 
   @router.post("/runs/{run_id}/approvals/{approval_id}/notifications/retry")
@@ -345,25 +440,26 @@ def build_approvals_router(
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     store = getattr(request.app.state, "gateway_approval_store", None)
-    if store is None:
-      return _json_error(503, "Approval subsystem unavailable")
-
-    request_record = await _visible_pending_approval_for_run(
+    visible = await _visible_pending_approval_for_run(
       auth=auth,
       store=store,
       autonomous_registry=autonomous_registry,
       run_id=run_id,
       approval_id=approval_id,
       authenticated=authenticated,
+      batch_task_registry=getattr(request.app.state, "batch_task_registry", None),
     )
-    if request_record is None:
+    if visible is None:
+      if store is None:
+        return _json_error(503, "Approval subsystem unavailable")
       return _json_error(404, "Run approval not found")
+    authoritative_store, request_record = visible
 
     state_error = _approval_retry_state_error(request_record, approval_id)
     if state_error is not None:
       return state_error
 
-    retry_failed = getattr(store, "retry_failed_approval_notifications", None)
+    retry_failed = getattr(authoritative_store, "retry_failed_approval_notifications", None)
     if retry_failed is None:
       return _json_error(503, "Approval notification retry unavailable")
     retry_result = await retry_failed(approval_id)
@@ -373,7 +469,7 @@ def build_approvals_router(
     queueable = requeued > 0 or notification_state == "pending"
     delivery_scheduled = False
     if queueable:
-      schedule_delivery = getattr(store, "schedule_approval_notification_delivery", None)
+      schedule_delivery = getattr(authoritative_store, "schedule_approval_notification_delivery", None)
       if schedule_delivery is not None:
         delivery_scheduled = bool(schedule_delivery())
     return JSONResponse(
@@ -396,6 +492,20 @@ def build_approvals_router(
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     target_session = _target_chat_session_for_user(auth, run_id, authenticated.user_id, authenticated.channel)
+    batch_request_record = None
+    batch_projection = None
+    if target_session is None:
+      projection = _batch_projection_for_user(
+        getattr(request.app.state, "batch_task_registry", None),
+        run_id=run_id,
+        approval_id=approval_id,
+        owner_user_id=_session_owner_user_id(authenticated),
+        channel=authenticated.channel,
+      )
+      validated = await _validated_batch_projection(projection)
+      if validated is not None:
+        batch_projection, batch_request_record = validated
+        target_session = batch_projection.session
     delegated_pending: tuple[str, dict[str, Any]] | None = None
     if target_session is None:
       store = getattr(request.app.state, "gateway_approval_store", None)
@@ -503,6 +613,14 @@ def build_approvals_router(
     else:
       tool_call_id, pending_entry = delegated_pending
 
+    if batch_request_record is not None:
+      if batch_request_record.state == "expired":
+        return _json_error(410, "Approval request expired")
+      if batch_request_record.state in TERMINAL_APPROVAL_STATES:
+        return _json_error(409, "Approval request already resolved")
+      if batch_request_record.state != "pending_user":
+        return _json_error(409, "Invalid approval request state for approval submission")
+
     try:
       result = await _record_vote_and_unblock(
         target_session=target_session,
@@ -515,6 +633,25 @@ def build_approvals_router(
         allow_tool_type=payload.allow_tool_type,
         reason=payload.reason,
         app_state=request.app.state,
+        authoritative_store=(
+          batch_projection.store if batch_projection is not None else None
+        ),
+        authoritative_policy=(
+          batch_projection.policy if batch_projection is not None else None
+        ),
+        authoritative_identity=(
+          {
+            "approval_id": batch_projection.approval_id,
+            "tool_call_id": batch_projection.tool_call_id,
+            "user_id": batch_projection.owner_user_id,
+            "request_id": batch_projection.run_id,
+            "run_id": batch_projection.run_id,
+            "session_id": batch_projection.session_id,
+            "channel": batch_projection.channel,
+          }
+          if batch_projection is not None
+          else None
+        ),
       )
     except ApprovalActionError as exc:
       return JSONResponse(exc.payload, status_code=exc.status_code)

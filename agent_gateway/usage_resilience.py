@@ -33,6 +33,10 @@ class CommercialUsageCircuitSnapshot:
   reason: str | None
   tripped_at: str | None
   byok_allowed_until: str | None
+  last_reset_at: str | None = None
+  last_reset_operator_id: str | None = None
+  last_reset_evidence_id: str | None = None
+  last_reset_prior_tripped_at: str | None = None
 
 
 class CommercialUsageCircuitBreaker:
@@ -82,13 +86,48 @@ class CommercialUsageCircuitBreaker:
         normalized,
         tripped_at,
         byok_until,
+        existing.last_reset_at,
+        existing.last_reset_operator_id,
+        existing.last_reset_evidence_id,
+        existing.last_reset_prior_tripped_at,
       ))
       return not existing.tripped
 
-  def reset(self) -> None:
-    """Operator-controlled reset after durable recovery/reconciliation."""
+  def _reset_with_evidence(
+    self,
+    *,
+    expected_tripped_at: str,
+    operator_id: str,
+    reconciliation_evidence_id: str,
+  ) -> CommercialUsageCircuitSnapshot:
+    """Atomically reset the current incident and retain its operator evidence."""
+    normalized_operator = str(operator_id or "").strip()
+    normalized_evidence = str(reconciliation_evidence_id or "").strip()
+    if not expected_tripped_at or not normalized_operator or not normalized_evidence:
+      raise ValueError("commercial usage circuit reset evidence is required")
+    if len(normalized_operator) > 128 or len(normalized_evidence) > 256:
+      raise ValueError("commercial usage circuit reset evidence is too long")
     with self._locked():
-      self._write_unlocked(CommercialUsageCircuitSnapshot(False, None, None, None))
+      existing = self._read_unlocked()
+      if not existing.tripped:
+        raise CommercialUsageCircuitOpen("commercial usage circuit is not tripped")
+      if existing.tripped_at != expected_tripped_at:
+        raise CommercialUsageCircuitOpen(
+          "commercial usage circuit incident changed before reset"
+        )
+      reset_at = self._time_text(self._now().astimezone(timezone.utc))
+      reset = CommercialUsageCircuitSnapshot(
+        False,
+        None,
+        None,
+        None,
+        reset_at,
+        normalized_operator,
+        normalized_evidence,
+        existing.tripped_at,
+      )
+      self._write_unlocked(reset)
+      return reset
 
   def assert_work_allowed(
     self,
@@ -120,6 +159,10 @@ class CommercialUsageCircuitBreaker:
         reason=document.get("reason"),
         tripped_at=document.get("tripped_at"),
         byok_allowed_until=document.get("byok_allowed_until"),
+        last_reset_at=document.get("last_reset_at"),
+        last_reset_operator_id=document.get("last_reset_operator_id"),
+        last_reset_evidence_id=document.get("last_reset_evidence_id"),
+        last_reset_prior_tripped_at=document.get("last_reset_prior_tripped_at"),
       )
       if document.get("version") != 1 or type(snapshot.tripped) is not bool:
         raise ValueError("invalid circuit state")
@@ -129,6 +172,16 @@ class CommercialUsageCircuitBreaker:
         or not isinstance(snapshot.byok_allowed_until, str)
       ):
         raise ValueError("invalid tripped circuit state")
+      reset_values = (
+        snapshot.last_reset_at,
+        snapshot.last_reset_operator_id,
+        snapshot.last_reset_evidence_id,
+        snapshot.last_reset_prior_tripped_at,
+      )
+      if any(value is not None for value in reset_values) and not all(
+        isinstance(value, str) and value for value in reset_values
+      ):
+        raise ValueError("invalid circuit reset evidence")
       return snapshot
     except Exception:
       return CommercialUsageCircuitSnapshot(
@@ -253,11 +306,14 @@ class CommercialUsageEmergencySpool:
 
   def pending_batches(self) -> int:
     with self._locked():
-      if not self.path.exists():
-        return 0
-      file_id, header_end, data = self._read_or_initialize()
-      cursor = self._read_cursor(file_id=file_id, header_end=header_end, file_size=len(data))
-      return len(self._parse_frames(data, cursor, require_complete=True))
+      return self._pending_batches_unlocked()
+
+  def _pending_batches_unlocked(self) -> int:
+    if not self.path.exists():
+      return 0
+    file_id, header_end, data = self._read_or_initialize()
+    cursor = self._read_cursor(file_id=file_id, header_end=header_end, file_size=len(data))
+    return len(self._parse_frames(data, cursor, require_complete=True))
 
   def _locked(self):
     spool = self
@@ -521,6 +577,46 @@ class ResilientCommercialUsageSink:
   def replay_emergency(self, *, limit: int | None = None) -> int:
     return self._spool.replay_into(self._outbox, limit=limit)
 
+  def reset_after_recovery(
+    self,
+    *,
+    expected_tripped_at: str,
+    operator_id: str,
+    reconciliation_evidence_id: str,
+    max_backlog_count: int,
+  ) -> CommercialUsageCircuitSnapshot:
+    """Reset only after healthy primary durability and a drained emergency spool."""
+    if max_backlog_count < 0:
+      raise ValueError("commercial usage reset backlog threshold must be non-negative")
+    health = self._outbox.health()
+    if not bool(health.get("ok")):
+      raise CommercialUsageCircuitOpen(
+        "commercial usage outbox is unhealthy; circuit reset refused"
+      )
+    if int(health.get("backlog_count", 0)) > max_backlog_count:
+      raise CommercialUsageCircuitOpen(
+        "commercial usage outbox backlog exceeds reset threshold"
+      )
+    if int(health.get("reconciliation_shipment_backlog_count", 0)) > max_backlog_count:
+      raise CommercialUsageCircuitOpen(
+        "commercial usage reconciliation backlog exceeds reset threshold"
+      )
+    with self._spool._locked():
+      if self._spool._pending_batches_unlocked() != 0:
+        raise CommercialUsageCircuitOpen(
+          "commercial usage emergency spool replay is pending"
+        )
+      spool_bytes = self._spool.path.stat().st_size if self._spool.path.exists() else 0
+      if int(health.get("storage_bytes", 0)) + spool_bytes >= self._max_storage_bytes:
+        raise CommercialUsageCircuitOpen(
+          "commercial usage durability storage remains above high-water"
+        )
+      return self._breaker._reset_with_evidence(
+        expected_tripped_at=expected_tripped_at,
+        operator_id=operator_id,
+        reconciliation_evidence_id=reconciliation_evidence_id,
+      )
+
   def _notify(self, code: str, error: Exception | None, batch_size: int) -> None:
     if self._alert is None:
       return
@@ -598,4 +694,19 @@ class CommercialUsageDurability:
       enabled=enabled,
       reconciliation_tracker=reconciliation_tracker,
       on_reconciliation=on_reconciliation,
+    )
+
+  def reset_after_recovery(
+    self,
+    *,
+    expected_tripped_at: str,
+    operator_id: str,
+    reconciliation_evidence_id: str,
+    max_backlog_count: int,
+  ) -> CommercialUsageCircuitSnapshot:
+    return self.sink.reset_after_recovery(
+      expected_tripped_at=expected_tripped_at,
+      operator_id=operator_id,
+      reconciliation_evidence_id=reconciliation_evidence_id,
+      max_backlog_count=max_backlog_count,
     )

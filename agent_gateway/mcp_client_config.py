@@ -13,7 +13,7 @@ STREAMABLE_HTTP_TYPES = {"streamable-http", "streamable_http", "http", "streamab
 SUPPORTED_SERVER_TYPES = {"stdio"} | STREAMABLE_HTTP_TYPES
 DEFAULT_ENV_ALLOWLIST = {
   "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "USER",
-  "PYTHONPATH", "NODE_PATH", "VIRTUAL_ENV",
+  "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE", "NODE_PATH", "VIRTUAL_ENV",
 }
 MCP_STDIO_CONNECT_RETRIES_ENV = "MCP_STDIO_CONNECT_RETRIES"
 MCP_STDIO_CONNECT_BACKOFF_ENV = "MCP_STDIO_CONNECT_BACKOFF_S"
@@ -22,6 +22,7 @@ MCP_STARTUP_CONCURRENCY_ENV = "MCP_STARTUP_CONCURRENCY"
 MCP_STDIO_CONNECT_RETRIES_DEFAULT = 3
 MCP_STDIO_CONNECT_BACKOFF_DEFAULT = 0.4
 MCP_STDIO_CONNECT_STABILIZE_DEFAULT = 0.5
+MCP_STARTUP_CONCURRENCY_DEFAULT = 4
 MCP_STDIO_RETRYABLE_EXCEPTION_NAMES = {
   "BrokenPipeError",
   "BrokenResourceError",
@@ -186,12 +187,24 @@ def startup_concurrency_limit(
   environ: Mapping[str, str] | None = None,
   logger: Any | None = None,
 ) -> int:
-  return env_nonnegative_int(
-    MCP_STARTUP_CONCURRENCY_ENV,
-    0,
-    environ=environ,
-    logger=logger,
-  )
+  env = os.environ if environ is None else environ
+  raw = env.get(MCP_STARTUP_CONCURRENCY_ENV)
+  if raw is None or not raw.strip():
+    return MCP_STARTUP_CONCURRENCY_DEFAULT
+  try:
+    value = int(raw)
+  except ValueError:
+    value = -1
+  if value < 0:
+    if logger is not None:
+      logger.warning(
+        "Ignoring invalid %s=%r; using %d",
+        MCP_STARTUP_CONCURRENCY_ENV,
+        raw,
+        MCP_STARTUP_CONCURRENCY_DEFAULT,
+      )
+    return MCP_STARTUP_CONCURRENCY_DEFAULT
+  return value
 
 
 def iter_exception_tree(exc: BaseException):
@@ -238,6 +251,7 @@ __all__ = [
   "DEFAULT_ENV_ALLOWLIST",
   "ENV_REF_RE",
   "MCP_STARTUP_CONCURRENCY_ENV",
+  "MCP_STARTUP_CONCURRENCY_DEFAULT",
   "MCP_STDIO_CONNECT_BACKOFF_DEFAULT",
   "MCP_STDIO_CONNECT_BACKOFF_ENV",
   "MCP_STDIO_CONNECT_RETRIES_DEFAULT",

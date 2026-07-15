@@ -228,6 +228,9 @@ Defaults applied when the runner spawns sub-agents through `run_agent`.
 ### `ToolResultContext`
 
 Payload passed to `on_tool_result` hooks after a tool completes.
+For routed MCP tools, `provider_id` carries the gateway router's trusted
+adapter selection; it is never sourced from provider-returned payload content.
+Legacy or unrouted results leave the field unset.
 
 Useful when you want to:
 

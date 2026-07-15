@@ -8,6 +8,33 @@ from typing import Any
 
 from .base import ModelInfo
 
+
+def _adaptive_compat(
+  *,
+  disable: str,
+  omitted: str,
+  default_effort: str,
+  values: tuple[str, ...],
+) -> dict[str, Any]:
+  return {
+    "thinking_disable": disable,
+    "thinking_default_when_omitted": omitted,
+    "thinking_default_effort": default_effort,
+    "effort_values": values,
+    "supports_output_config_effort": True,
+  }
+
+
+_EFFORT_5 = ("low", "medium", "high", "xhigh", "max")
+_EFFORT_46 = ("low", "medium", "high", "max")
+_BUDGET_COMPAT = {
+  "thinking_disable": "omit",
+  "thinking_default_when_omitted": "off",
+  "thinking_default_effort": "none",
+  "effort_values": (),
+  "supports_output_config_effort": False,
+}
+
 _OAUTH_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 _OAUTH_BETA_SLUGS = [
   "claude-code-20250219",
@@ -34,13 +61,30 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       id="claude-fable-5",
       provider="anthropic",
       context_window=1_000_000,
-      max_output_tokens=32_000,
+      max_output_tokens=128_000,
       supports_thinking=True,
       thinking_mode="adaptive",
       input_cost_per_mtok=10.00,
       output_cost_per_mtok=50.00,
       cache_read_cost_per_mtok=1.00,
       cache_write_cost_per_mtok=12.50,
+      compat=_adaptive_compat(disable="unsupported", omitted="on", default_effort="high", values=_EFFORT_5),
+    ),
+  ),
+  (
+    ("claude-mythos-5",),
+    ModelInfo(
+      id="claude-mythos-5",
+      provider="anthropic",
+      context_window=1_000_000,
+      max_output_tokens=128_000,
+      supports_thinking=True,
+      thinking_mode="adaptive",
+      input_cost_per_mtok=10.00,
+      output_cost_per_mtok=50.00,
+      cache_read_cost_per_mtok=1.00,
+      cache_write_cost_per_mtok=12.50,
+      compat=_adaptive_compat(disable="unsupported", omitted="on", default_effort="high", values=_EFFORT_5),
     ),
   ),
   (
@@ -56,6 +100,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       output_cost_per_mtok=25.00,
       cache_read_cost_per_mtok=0.50,
       cache_write_cost_per_mtok=6.25,
+      compat=_adaptive_compat(disable="omit", omitted="off", default_effort="none", values=_EFFORT_5),
     ),
   ),
   (
@@ -71,6 +116,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       output_cost_per_mtok=25.00,
       cache_read_cost_per_mtok=0.50,
       cache_write_cost_per_mtok=6.25,
+      compat=_adaptive_compat(disable="omit", omitted="off", default_effort="none", values=_EFFORT_5),
     ),
   ),
   (
@@ -78,13 +124,15 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
     ModelInfo(
       id="claude-sonnet-5",
       provider="anthropic",
-      max_output_tokens=64_000,
+      context_window=1_000_000,
+      max_output_tokens=128_000,
       supports_thinking=True,
       thinking_mode="adaptive",
       input_cost_per_mtok=3.00,
       output_cost_per_mtok=15.00,
       cache_read_cost_per_mtok=0.30,
       cache_write_cost_per_mtok=3.75,
+      compat=_adaptive_compat(disable="disabled", omitted="on", default_effort="high", values=_EFFORT_5),
     ),
   ),
   (
@@ -99,6 +147,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       output_cost_per_mtok=15.00,
       cache_read_cost_per_mtok=0.30,
       cache_write_cost_per_mtok=3.75,
+      compat=_adaptive_compat(disable="omit", omitted="off", default_effort="none", values=_EFFORT_46),
     ),
   ),
   (
@@ -112,6 +161,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       output_cost_per_mtok=15.00,
       cache_read_cost_per_mtok=0.30,
       cache_write_cost_per_mtok=3.75,
+      compat=_adaptive_compat(disable="omit", omitted="off", default_effort="none", values=_EFFORT_46),
     ),
   ),
   (
@@ -126,6 +176,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       output_cost_per_mtok=15.00,
       cache_read_cost_per_mtok=0.30,
       cache_write_cost_per_mtok=3.75,
+      compat=dict(_BUDGET_COMPAT),
     ),
   ),
   (
@@ -139,6 +190,13 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       output_cost_per_mtok=5.00,
       cache_read_cost_per_mtok=0.10,
       cache_write_cost_per_mtok=1.25,
+      compat={
+        "thinking_disable": "unsupported",
+        "thinking_default_when_omitted": "off",
+        "thinking_default_effort": "none",
+        "effort_values": (),
+        "supports_output_config_effort": False,
+      },
     ),
   ),
   (
@@ -152,6 +210,13 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       output_cost_per_mtok=15.00,
       cache_read_cost_per_mtok=0.30,
       cache_write_cost_per_mtok=3.75,
+      compat={
+        "thinking_disable": "unsupported",
+        "thinking_default_when_omitted": "off",
+        "thinking_default_effort": "none",
+        "effort_values": (),
+        "supports_output_config_effort": False,
+      },
     ),
   ),
 ]
@@ -174,6 +239,7 @@ def _model_info_for_model(model_id: str) -> ModelInfo:
     output_cost_per_mtok=15.00,
     cache_read_cost_per_mtok=0.30,
     cache_write_cost_per_mtok=3.75,
+    compat=_adaptive_compat(disable="omit", omitted="off", default_effort="none", values=_EFFORT_46),
   )
 
 

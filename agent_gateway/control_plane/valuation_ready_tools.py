@@ -8,6 +8,7 @@ from agent_gateway.skill_context import current_skill
 from agent_gateway.artifact_paths import canonicalize_ticker
 
 from . import batches
+from .runs_helpers import _session_owner_user_id
 
 VALUATION_READY_SKILL = "valuation-ready"
 VALUATION_READY_TEMPLATE = "valuation-ready"
@@ -191,8 +192,9 @@ def _make_dispatch_handler(*, app_state: Any, session: Any) -> ToolHandler:
       payload = await batches.dispatch_batch_in_process(
         spec,
         app_state=app_state,
-        user_id=str(getattr(session, "user_id", "") or ""),
+        user_id=_session_owner_user_id(session),
         user_email=getattr(session, "user_email", None),
+        channel=getattr(session, "channel", None),
       )
     except batches._active_batch_error_type() as exc:
       return None, {"code": "active_batch_conflict", "message": str(exc)}
@@ -231,7 +233,7 @@ def _make_read_handler(*, session: Any) -> ToolHandler:
     try:
       return batches.read_batch_for_user(
         batch_id,
-        user_id=str(getattr(session, "user_id", "") or ""),
+        user_id=_session_owner_user_id(session),
         top_n=top_n,
       ), None
     except HTTPException as exc:

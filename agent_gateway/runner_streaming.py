@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable
 
 from .providers import ModelInfo, ThinkingLevel
+from .thinking import EffortResolution
 
 STREAM_STALL_TIMEOUT = 60  # max seconds between stream progress events before watchdog cancels
 STREAM_THINKING_STALL_TIMEOUT = 300  # extended-thinking turns can be quiet before first visible output
@@ -18,16 +19,23 @@ def effective_stream_stall_timeout(
   config: Dict[str, Any],
   model_info: ModelInfo,
   max_tokens: int,
+  effort_resolution: EffortResolution | None = None,
   observed_thinking: bool = False,
   stream_stall_timeout_default: float = STREAM_STALL_TIMEOUT,
   stream_thinking_stall_timeout_default: float = STREAM_THINKING_STALL_TIMEOUT,
 ) -> float:
   if stream_stall_timeout is not None:
     return float(stream_stall_timeout)
-  if (
-    (bool(config.get("thinking", True)) or observed_thinking)
+  legacy_effective = (
+    effort_resolution is None
+    and bool(config.get("thinking", str(config.get("effort", "high")) != "none"))
     and max_tokens >= 2048
     and model_info.supports_thinking
+  )
+  if (
+    (effort_resolution is not None and effort_resolution.thinking_enabled_effective)
+    or legacy_effective
+    or observed_thinking
   ):
     return float(stream_thinking_stall_timeout_default)
   return float(stream_stall_timeout_default)

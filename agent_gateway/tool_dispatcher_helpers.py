@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 from collections.abc import Sequence as AbcSequence
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Sequence, Tuple
 
 from . import approval_settings
 from .event_log import EventLog
@@ -21,6 +22,166 @@ ToolResult = Tuple[Optional[Any], Optional[Dict[str, Any]]]
 NeedsApprovalCallback = Callable[[str, Dict[str, Any], str], bool]
 ApprovalKeyQualifier = Callable[[str, Dict[str, Any]], str]
 ToolResult.__doc__ = "Standard tool return type: `(result, error)`."
+
+PlanningIdentity = Literal["change_set", "reviewed_change_binding"]
+
+
+class TrustedToolPlanError(RuntimeError):
+  """Raised when a local planning hook violates the exact-plan contract."""
+
+
+class PlannedWritePlanningRejected(RuntimeError):
+  """Carry one trusted handler rejection through planning without losing guidance."""
+
+  def __init__(self, *, result: Any | None = None, error: Dict[str, Any] | None = None):
+    if (result is None) == (error is None):
+      raise ValueError("planned-write rejection requires exactly one result or error")
+    super().__init__("planned-write preparation rejected the requested input")
+    self.result = result
+    self.error = error
+
+  def tool_result(self) -> ToolResult:
+    return self.result, self.error
+
+
+def _planning_contract_module_for_identity(
+  identity: object,
+  *module_names: str,
+) -> Any:
+  module_name = type(identity).__module__
+  if module_name not in module_names:
+    raise TrustedToolPlanError("planned-write identity came from an unsupported owner")
+  try:
+    return importlib.import_module(module_name)
+  except ModuleNotFoundError as exc:
+    if exc.name not in {module_name, module_name.split(".")[0]}:
+      raise
+    raise TrustedToolPlanError(
+      "planned-write identity contract is unavailable"
+    ) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedToolPlan:
+  """Opaque trusted carrier for one exact local-tool plan.
+
+  The identity and executable payload never enter model-controlled tool input.
+  Exact type, digest, and payload linkage are revalidated on construction.
+  """
+
+  identity_source: PlanningIdentity
+  identity: object = field(repr=False)
+  prepared: object = field(repr=False)
+  change_set_id: str
+  change_hash: str
+  base_vector_hash: str
+  reviewed_change_binding_digest: str | None = None
+  review_reference: dict[str, Any] | None = None
+  execution_semantics_digest: str | None = None
+
+  @classmethod
+  def create(
+    cls,
+    *,
+    identity_source: str,
+    identity: object,
+    prepared: object,
+  ) -> "TrustedToolPlan":
+    if identity_source == "change_set":
+      contract = _planning_contract_module_for_identity(
+        identity,
+        "fms.core.change_set",
+        "api.fms.core.change_set",
+      )
+      if type(identity) is not contract.ChangeSet:
+        raise TrustedToolPlanError("change_set planner returned the wrong identity type")
+      identity.verify_identity()
+      if getattr(prepared, "change_set", None) is not identity:
+        raise TrustedToolPlanError("prepared FMS payload is not linked to the exact ChangeSet")
+      return cls(
+        identity_source="change_set",
+        identity=identity,
+        prepared=prepared,
+        change_set_id=identity.change_set_id,
+        change_hash=identity.change_hash,
+        base_vector_hash=contract.compute_base_vector_hash(identity.base_vector),
+      )
+    if identity_source == "reviewed_change_binding":
+      contract = _planning_contract_module_for_identity(
+        identity,
+        "research.reviewed_change_binding",
+        "api.research.reviewed_change_binding",
+      )
+      if type(identity) is not contract.ReviewedChangeBinding:
+        raise TrustedToolPlanError(
+          "reviewed_change_binding planner returned the wrong identity type"
+        )
+      identity.verify_identity()
+      if getattr(prepared, "binding", None) is not identity:
+        raise TrustedToolPlanError(
+          "prepared reviewed-change payload is not linked to the exact binding"
+        )
+      review_reference = (
+        None
+        if identity.review_reference is None
+        else identity.review_reference.to_dict()
+      )
+      return cls(
+        identity_source="reviewed_change_binding",
+        identity=identity,
+        prepared=prepared,
+        change_set_id=identity.change_set_id,
+        change_hash=identity.change_hash,
+        base_vector_hash=identity.base_vector_hash,
+        reviewed_change_binding_digest=identity.reviewed_change_binding_digest,
+        review_reference=review_reference,
+        execution_semantics_digest=identity.execution_semantics_digest,
+      )
+    raise TrustedToolPlanError(f"unsupported planning identity: {identity_source!r}")
+
+  def approval_identity(self) -> dict[str, Any]:
+    """Return the canonical additive approval-row identity mapping."""
+
+    self.verify_integrity()
+
+    return {
+      "identity_source": self.identity_source,
+      "change_set_id": self.change_set_id,
+      "change_hash": self.change_hash,
+      "base_vector_hash": self.base_vector_hash,
+      "reviewed_change_binding_digest": self.reviewed_change_binding_digest,
+      "review_reference": (
+        None if self.review_reference is None else dict(self.review_reference)
+      ),
+      "execution_semantics_digest": self.execution_semantics_digest,
+    }
+
+  def verify_integrity(self) -> None:
+    """Reject identity drift, prepared-payload substitution, or carrier mutation."""
+
+    rebuilt = type(self).create(
+      identity_source=self.identity_source,
+      identity=self.identity,
+      prepared=self.prepared,
+    )
+    comparable_fields = (
+      "change_set_id",
+      "change_hash",
+      "base_vector_hash",
+      "reviewed_change_binding_digest",
+      "review_reference",
+      "execution_semantics_digest",
+    )
+    if any(getattr(self, field_name) != getattr(rebuilt, field_name) for field_name in comparable_fields):
+      raise TrustedToolPlanError("trusted planned-write identity carrier was mutated")
+
+  def verify_approval_request(self, request: object) -> None:
+    """Require the durable row to remain bound to this exact planned identity."""
+
+    expected = self.approval_identity()
+    actual = {field_name: getattr(request, field_name, None) for field_name in expected}
+    if actual != expected:
+      raise TrustedToolPlanError("approval row is not bound to the exact trusted plan")
 
 
 def _approval_queue_timeout_seconds(expiry_seconds: float | int | None) -> float:
@@ -442,18 +603,25 @@ class ToolExecutionContext:
 
   tool_call_id: str
   tool_name: str
-  event_log: EventLog
+  event_log: EventLog | None
   resolved_qualifier: str = ""
   abort_event: asyncio.Event | None = None
   skill_run_id: str | None = None
+  step_id: str | None = None
   workspace_dir: str | None = None
   batch_id: int | str | None = None
   request_id: str | None = None
   run_id: str | None = None
+  user_id: str | None = None
+  approval_id: str | None = None
+  approval_chain_id: str | None = None
+  durable_business_model_payload: bytes | None = field(default=None, repr=False)
+  trusted_plan: TrustedToolPlan | None = field(default=None, repr=False)
 
   def emit(self, event: Dict[str, Any]) -> None:
     """Append a custom event to the active event log."""
-    self.event_log.append(event)
+    if self.event_log is not None:
+      self.event_log.append(event)
 
   @property
   def aborted(self) -> bool:

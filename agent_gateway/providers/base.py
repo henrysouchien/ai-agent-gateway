@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 import re
 from typing import Any, AsyncIterator, Literal
 
 from ..auth import ProviderCredentialFailure
+from ..thinking import EffortResolution, ThinkingLevel
 
 
 _STATUS_CODE_RE = re.compile(r"\b(400|401|403|404|429|5\d\d)\b")
@@ -29,17 +29,6 @@ _RATE_LIMIT_PATTERNS = (
   re.compile(r"\brate(?:\s+limit(?:ed|ing)?|\s+limited)\b", re.IGNORECASE),
   re.compile(r"\btoo many requests\b", re.IGNORECASE),
 )
-
-class ThinkingLevel(str, Enum):
-  """Provider-agnostic reasoning intensity hint."""
-
-  NONE = "none"
-  MINIMAL = "minimal"
-  LOW = "low"
-  MEDIUM = "medium"
-  HIGH = "high"
-  MAX = "max"
-
 
 ThinkingMode = Literal["adaptive", "budget", "none"]
 
@@ -315,6 +304,24 @@ class ModelProvider:
     **kwargs: Any,
   ) -> dict[str, Any]:
     raise NotImplementedError
+
+  def resolve_effort(
+    self,
+    *,
+    requested: ThinkingLevel,
+    model: str,
+    model_info: ModelInfo,
+    max_tokens: int,
+    **request_context: Any,
+  ) -> EffortResolution:
+    del model, max_tokens, request_context
+    effective = requested if model_info.supports_thinking else ThinkingLevel.NONE
+    return EffortResolution(
+      requested=requested,
+      effective=effective,
+      thinking_enabled_effective=effective != ThinkingLevel.NONE,
+      payload_fragments={},
+    )
 
   def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
     return list(messages)

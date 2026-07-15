@@ -6,7 +6,7 @@ import os
 import time
 from datetime import timedelta
 from dataclasses import replace
-from typing import Any
+from typing import Any, Mapping
 
 from . import approval_settings
 from .approval_policy import (
@@ -20,6 +20,10 @@ from .approval_policy import (
   utc_now,
 )
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
+from .batch_approval_projection import (
+  abort_unpublished_batch_approval_admission,
+  acquire_batch_approval_admission,
+)
 from .policy_imports import resolve_server_policy_tool_class
 
 
@@ -34,6 +38,16 @@ async def run_approval_lifecycle(
   qualifier: str,
   reason: str,
   allow_persistent: bool,
+  approval_identity: Mapping[str, Any] | None = None,
+  prepared_authorization_payload: bytes | None = None,
+  prepared_business_model_change: Mapping[str, Any] | None = None,
+  resume_approval_request: PolicyApprovalRequest | None = None,
+  approval_args_redacted: dict[str, Any] | None = None,
+  approval_args_hash: str | None = None,
+  session_cache_approved: bool = False,
+  automatic_approval_reason: str | None = None,
+  automatic_denial_reason: str | None = None,
+  deny_user_prompt: bool = False,
   resolve_run_context_fn: Any,
   current_skill_fn: Any,
   redact_for_approval_request_fn: Any,
@@ -47,23 +61,225 @@ async def run_approval_lifecycle(
   utc_now_fn: Any = utc_now,
   os_urandom_fn: Any = os.urandom,
 ) -> dict[str, Any]:
+  arguments = dict(locals())
+  batch_admission = acquire_batch_approval_admission(session)
+  arguments["batch_admission"] = batch_admission
+  try:
+    return await _run_approval_lifecycle_impl(**arguments)
+  except BaseException:
+    if batch_admission is not None and not batch_admission.published:
+      await abort_unpublished_batch_approval_admission(batch_admission)
+    raise
+  finally:
+    if batch_admission is not None:
+      batch_admission.release()
+
+
+async def _run_approval_lifecycle_impl(
+  *,
+  store: Any | None,
+  policy: Any | None,
+  session: Any | None,
+  tool_call_id: str,
+  tool_name: str,
+  tool_input: dict[str, Any],
+  qualifier: str,
+  reason: str,
+  allow_persistent: bool,
+  approval_identity: Mapping[str, Any] | None = None,
+  prepared_authorization_payload: bytes | None = None,
+  prepared_business_model_change: Mapping[str, Any] | None = None,
+  resume_approval_request: PolicyApprovalRequest | None = None,
+  approval_args_redacted: dict[str, Any] | None = None,
+  approval_args_hash: str | None = None,
+  session_cache_approved: bool = False,
+  automatic_approval_reason: str | None = None,
+  automatic_denial_reason: str | None = None,
+  deny_user_prompt: bool = False,
+  resolve_run_context_fn: Any,
+  current_skill_fn: Any,
+  redact_for_approval_request_fn: Any,
+  resolve_tool_class_fn: Any,
+  effective_trade_approval_decision_fn: Any,
+  await_user_approval_via_pending_tools_fn: Any,
+  approval_queue_timeout_seconds_fn: Any,
+  build_approval_request_fn: Any = build_approval_request,
+  call_policy_safely_fn: Any = call_policy_safely,
+  apply_decision_to_request_fn: Any = apply_decision_to_request,
+  utc_now_fn: Any = utc_now,
+  os_urandom_fn: Any = os.urandom,
+  batch_admission: Any | None = None,
+) -> dict[str, Any]:
   if store is None or policy is None:
     raise RuntimeError("approval lifecycle is not configured")
   run_context = resolve_run_context_fn()
   active_skill = current_skill_fn()
   if active_skill and run_context.skill is None:
     run_context = replace(run_context, skill=active_skill)
-  redacted, args_hash = redact_for_approval_request_fn(tool_name, tool_input)
-  request = build_approval_request_fn(
-    tool_call_id=tool_call_id,
-    tool_name=tool_name,
-    tool_class=resolve_tool_class_fn(tool_name),
-    tool_args_redacted=redacted,
-    args_hash=args_hash,
-    run_context=run_context,
-    reason=reason or None,
+  if (approval_args_redacted is None) is not (approval_args_hash is None):
+    raise ValueError("approval argument override requires redacted args and hash")
+  if approval_args_hash is None:
+    redacted, args_hash = redact_for_approval_request_fn(tool_name, tool_input)
+  else:
+    redacted = dict(approval_args_redacted or {})
+    args_hash = approval_args_hash
+  build_request_kwargs = {
+    "tool_call_id": tool_call_id,
+    "tool_name": tool_name,
+    "tool_class": resolve_tool_class_fn(tool_name),
+    "tool_args_redacted": redacted,
+    "args_hash": args_hash,
+    "run_context": run_context,
+    "reason": reason or None,
+  }
+  if approval_identity is not None:
+    build_request_kwargs["approval_identity"] = approval_identity
+  request = (
+    resume_approval_request
+    if resume_approval_request is not None
+    else build_approval_request_fn(**build_request_kwargs)
   )
-  await store.create(request)
+  if batch_admission is not None:
+    batch_admission.bind_request(request=request, store=store)
+  if hasattr(request, "__dataclass_fields__"):
+    policy_id = (
+      getattr(policy, "policy_id", None)
+      or getattr(request, "policy_id", None)
+      or "single-user"
+    )
+    policy_version = (
+      getattr(policy, "policy_version", None)
+      or getattr(request, "policy_version", None)
+      or "1"
+    )
+    request = replace(
+      request,
+      policy_id=str(policy_id),
+      policy_version=str(policy_version),
+    )
+    if session_cache_approved:
+      request = replace(
+        request,
+        authorization_mode="CACHE_HIT",
+        cache_reference=f"session-cache:{tool_name}:{qualifier}",
+      )
+    elif automatic_approval_reason is not None:
+      request = replace(request, authorization_mode="AUTO_ALLOW")
+  if resume_approval_request is not None:
+    if prepared_business_model_change is None:
+      raise RuntimeError("prepared approval resume requires its BusinessModel identity")
+  elif prepared_business_model_change is not None:
+    from .prepared_business_model_store import (
+      PreparedBusinessModelChange,
+      PreparedBusinessModelLifecycle,
+    )
+
+    if request.expires_at is None:
+      request = replace(request, expires_at=request.requested_at + timedelta(minutes=15))
+    prepared_bytes = prepared_business_model_change["prepared_payload"]
+    if not isinstance(prepared_bytes, bytes):
+      raise RuntimeError("prepared BusinessModel authorization payload must be bytes")
+    existing = await store.get_prepared_business_model_change(
+      caller_kind=str(prepared_business_model_change["caller_kind"]),
+      user_scope=str(prepared_business_model_change["user_scope"]),
+      idempotency_locator=str(prepared_business_model_change["idempotency_locator"]),
+    )
+    if existing is None:
+      request, existing, _ = await store.create_or_get_with_prepared_business_model_change(
+        request,
+        PreparedBusinessModelChange(
+          schema_version="prepared-business-model-change.v1",
+          caller_kind=str(prepared_business_model_change["caller_kind"]),
+          user_scope=str(prepared_business_model_change["user_scope"]),
+          idempotency_locator=str(prepared_business_model_change["idempotency_locator"]),
+          intent_digest=str(prepared_business_model_change["intent_digest"]),
+          prepared_payload=prepared_bytes,
+          change_set_id=str(prepared_business_model_change["change_set_id"]),
+          change_hash=str(prepared_business_model_change["change_hash"]),
+          base_vector_hash=str(prepared_business_model_change["base_vector_hash"]),
+          prepared_payload_digest=str(prepared_business_model_change["prepared_payload_digest"]),
+          lifecycle=PreparedBusinessModelLifecycle.PENDING,
+          created_at=request.requested_at.isoformat(),
+          expires_at=(request.expires_at.isoformat() if request.expires_at is not None else None),
+          approval_id=request.approval_id,
+          approval_chain_id=request.approval_chain_id,
+        ),
+      )
+    else:
+      supplied_intent = str(prepared_business_model_change["intent_digest"])
+      terminal_non_executable = existing.lifecycle in {
+        PreparedBusinessModelLifecycle.DENIED,
+        PreparedBusinessModelLifecycle.EXPIRED,
+        PreparedBusinessModelLifecycle.SUPERSEDED_PRECOMMIT,
+      }
+      immutable_matches = (
+        existing.prepared_payload == prepared_bytes
+        and existing.change_set_id == str(prepared_business_model_change["change_set_id"])
+        and existing.change_hash == str(prepared_business_model_change["change_hash"])
+        and existing.base_vector_hash == str(prepared_business_model_change["base_vector_hash"])
+        and existing.prepared_payload_digest
+        == str(prepared_business_model_change["prepared_payload_digest"])
+      )
+      if existing.intent_digest != supplied_intent or (
+        not terminal_non_executable and not immutable_matches
+      ):
+        raise RuntimeError("FMS skill-run locator conflicts with its prepared BusinessModel intent")
+      await store.create(request)
+  elif prepared_authorization_payload is None:
+    await store.create(request)
+  else:
+    create_bound = getattr(store, "create_raw_patch_authorization", None)
+    if not callable(create_bound):
+      raise RuntimeError("approval store cannot persist prepared authorization bytes")
+    await create_bound(
+      request,
+      prepared_payload=prepared_authorization_payload,
+    )
+
+  if session_cache_approved or automatic_approval_reason is not None:
+    decision_reason = (
+      automatic_approval_reason
+      or "Session approval cache matched exact planned identity"
+    )
+    decision_source = (
+      "headless_hook_approved"
+      if automatic_approval_reason is not None
+      else "session_cache_approved"
+    )
+    request = await store.transition_state(
+      request.approval_id,
+      "auto_approved",
+      expected_state_version=request.state_version,
+      decider_id=run_context.user_id,
+      decider_role=run_context.decider_role,
+      decision_reason=decision_reason,
+    )
+    await policy.on_resolve(request=request)
+    return {
+      "approved": True,
+      "allow_tool_type": False,
+      "request": request,
+      "tool_input": tool_input,
+      "decision_source": decision_source,
+    }
+
+  if automatic_denial_reason is not None:
+    request = await store.transition_state(
+      request.approval_id,
+      "auto_denied",
+      expected_state_version=request.state_version,
+      decider_id=run_context.user_id,
+      decider_role=run_context.decider_role,
+      decision_reason=automatic_denial_reason,
+    )
+    await policy.on_resolve(request=request)
+    return {
+      "approved": False,
+      "allow_tool_type": False,
+      "request": request,
+      "denied_by": "headless_policy",
+      "decision_source": "headless_auto_deny",
+    }
 
   raw_args = dict(tool_input)
   try:
@@ -76,12 +292,16 @@ async def run_approval_lifecycle(
   request = apply_decision_to_request_fn(request, decision)
   await store.update_request(request)
   final_tool_input = decision.modified_tool_args if decision.modified_tool_args is not None else tool_input
+  policy_modified_tool_args = decision.modified_tool_args is not None
 
   if decision.outcome == "auto_approve":
     request = await store.transition_state(
       request.approval_id,
       "auto_approved",
       expected_state_version=request.state_version,
+      decider_id=run_context.user_id,
+      decider_role=run_context.decider_role,
+      decision_reason=decision.reason,
     )
     await policy.on_resolve(request=request)
     return {
@@ -89,6 +309,7 @@ async def run_approval_lifecycle(
       "allow_tool_type": False,
       "request": request,
       "tool_input": final_tool_input,
+      "policy_modified_tool_args": policy_modified_tool_args,
     }
 
   if decision.outcome == "auto_deny":
@@ -96,9 +317,17 @@ async def run_approval_lifecycle(
       request.approval_id,
       "auto_denied",
       expected_state_version=request.state_version,
+      decider_id=run_context.user_id,
+      decider_role=run_context.decider_role,
+      decision_reason=decision.reason,
     )
     await policy.on_resolve(request=request)
-    return {"approved": False, "allow_tool_type": False, "request": request}
+    return {
+      "approved": False,
+      "allow_tool_type": False,
+      "request": request,
+      "policy_modified_tool_args": policy_modified_tool_args,
+    }
 
   if decision.outcome == "route_external":
     expires_at = utc_now_fn() + timedelta(seconds=decision.expiry_seconds or 600)
@@ -110,7 +339,32 @@ async def run_approval_lifecycle(
       expires_at=expires_at,
       expected_state_version=request.state_version,
     )
-    return {"approved": False, "allow_tool_type": False, "request": request, "timeout": True}
+    return {
+      "approved": False,
+      "allow_tool_type": False,
+      "request": request,
+      "timeout": True,
+      "policy_modified_tool_args": policy_modified_tool_args,
+    }
+
+  if deny_user_prompt:
+    request = await store.transition_state(
+      request.approval_id,
+      "auto_denied",
+      expected_state_version=request.state_version,
+      decider_id=run_context.user_id,
+      decider_role=run_context.decider_role,
+      decision_reason="Headless context cannot collect required user approval",
+    )
+    await policy.on_resolve(request=request)
+    return {
+      "approved": False,
+      "allow_tool_type": False,
+      "request": request,
+      "denied_by": "headless_policy",
+      "decision_source": "headless_auto_deny",
+      "policy_modified_tool_args": policy_modified_tool_args,
+    }
 
   expires_at = utc_now_fn() + timedelta(seconds=decision.expiry_seconds or 600)
   request = await store.transition_state(
@@ -141,6 +395,7 @@ async def run_approval_lifecycle(
     resolved_qualifier=qualifier,
     allow_persistent=allow_persistent,
     timeout_seconds=approval_queue_timeout_seconds_fn(decision.expiry_seconds),
+    batch_admission=batch_admission,
   )
   if approval is None:
     return {"approved": False, "allow_tool_type": False, "request": request, "timeout": True}
@@ -153,6 +408,7 @@ async def run_approval_lifecycle(
     "denied_by": approval.get("denied_by"),
     "request": request,
     "tool_input": final_tool_input,
+    "policy_modified_tool_args": policy_modified_tool_args,
   }
 
 
@@ -168,6 +424,7 @@ async def await_user_approval_via_pending_tools(
   allow_persistent: bool,
   timeout_seconds: float,
   log: logging.Logger,
+  batch_admission: Any | None = None,
 ) -> dict[str, Any] | None:
   if session is None:
     return None
@@ -181,6 +438,13 @@ async def await_user_approval_via_pending_tools(
     "resolved_qualifier": resolved_qualifier,
   }
   session.approval_queues[request.tool_call_id] = approval_queue
+  if batch_admission is not None:
+    try:
+      batch_admission.publish_pending()
+    except BaseException:
+      session.pending_tools.pop(request.tool_call_id, None)
+      session.approval_queues.pop(request.tool_call_id, None)
+      raise
 
   approval_event = {
     "type": "tool_approval_request",

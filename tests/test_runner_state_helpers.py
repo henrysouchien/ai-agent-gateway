@@ -50,7 +50,26 @@ def test_tool_result_context_defaults_are_optional() -> None:
 
   assert ctx.skill_run_id is None
   assert ctx.workspace_dir is None
+  assert ctx.provider_id is None
   assert ctx.tool_input == {"symbol": "MSFT"}
+
+
+def test_tool_result_context_carries_trusted_routing_provider() -> None:
+  ctx = ToolResultContext(
+    tool_name="fetch_financials",
+    tool_input={"symbol": "MSFT"},
+    result={"provider_id": "spoofed"},
+    error=None,
+    duration_ms=12,
+    tool_call_id="call-2",
+    session_id="session-1",
+    server="market-data-mcp",
+    result_entry=None,
+    provider_id="fmp",
+  )
+
+  assert ctx.provider_id == "fmp"
+  assert ctx.result == {"provider_id": "spoofed"}
 
 
 def test_stream_turn_result_uses_independent_collections() -> None:

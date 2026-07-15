@@ -193,9 +193,10 @@ def test_runner_preserves_extra_auth_config_keys_for_provider_create_client() ->
     "auth_mode": "api",
     "api_key": "k",
     "auth_token": "",
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-5",
     "max_tokens": 16000,
-    "thinking": True,
+    "effort": "high",
+    "thinking_enabled_requested": True,
     "base_url": "https://custom.example/v1",
     "compat": {"streaming": True},
   }

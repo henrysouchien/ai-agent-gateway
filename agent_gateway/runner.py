@@ -389,6 +389,7 @@ class AgentRunner(
     self._workspace_dir = str(workspace_dir) if workspace_dir is not None else None
     self._batch_id = str(batch_id).strip() if batch_id is not None and str(batch_id).strip() else None
     self._auth_config = dict(auth_config or {})
+    self._effort_resolution = None
     self._client_timeout = client_timeout
     self._max_tokens_override = max_tokens_override
     self._per_turn_timeout = per_turn_timeout
@@ -534,6 +535,18 @@ class AgentRunner(
   @property
   def _background_tasks(self) -> Dict[str, TaskEntry]:
     return self._task_registry._tasks
+
+  @property
+  def effort_introspection(self) -> dict[str, Any] | None:
+    """Requested/effective effort for the latest turn, without vendor fragments."""
+    resolution = self._effort_resolution
+    if resolution is None:
+      return None
+    return {
+      "requested": resolution.requested.value,
+      "effective": resolution.effective.value,
+      "thinking_enabled_effective": resolution.thinking_enabled_effective,
+    }
 
   @staticmethod
   def _normalize_context_surfaces(surfaces: list[dict[str, Any]] | None) -> list[dict[str, Any]]:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import platform
 import re
 import time
 from dataclasses import dataclass
@@ -22,6 +21,12 @@ DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 JWT_CLAIM_PATH = "https://api.openai.com/auth"
 DEFAULT_INSTRUCTIONS = "Follow the user's instructions."
 _BETA_HEADER = "responses=experimental"
+# ChatGPT's Codex model router keys subscription availability to the recognized
+# Codex client identity. GPT-5.6 Luna, in particular, is hidden from the legacy
+# `pi` identity even when the OAuth account is entitled to it. 0.144.0 is the
+# documented minimum Codex client version for GPT-5.6.
+_CODEX_ORIGINATOR = "codex_cli_rs"
+_CODEX_USER_AGENT = "codex_cli_rs/0.144.0"
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _RETRYABLE_RE = re.compile(
   r"rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused",
@@ -277,8 +282,8 @@ def _build_headers(
   headers["Authorization"] = f"Bearer {token}"
   headers["chatgpt-account-id"] = account_id
   headers["OpenAI-Beta"] = _BETA_HEADER
-  headers["originator"] = "pi"
-  headers["User-Agent"] = f"pi ({platform.system().lower()} {platform.release()}; {platform.machine()})"
+  headers["originator"] = _CODEX_ORIGINATOR
+  headers["User-Agent"] = _CODEX_USER_AGENT
   headers["accept"] = "text/event-stream"
   headers["content-type"] = "application/json"
   for key, value in (additional_headers or {}).items():

@@ -8,6 +8,7 @@ from dataclasses import replace
 from typing import Any, AsyncIterator, Dict
 
 from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
+from ..thinking import EffortResolution, clamp_effort
 from .openai_helpers import (
   _MAX_TOOL_ID_LEN as _MAX_TOOL_ID_LEN,
   _MODEL_INFO_BY_TAG as _MODEL_INFO_BY_TAG,
@@ -95,7 +96,7 @@ class OpenAIProvider(ModelProvider):
     model_id = str(model or "").strip()
     if not model_id:
       raise ValueError("Model is required")
-    for tags, info in _MODEL_INFO_BY_TAG:
+    for tags, info in sorted(_MODEL_INFO_BY_TAG, key=lambda row: max(map(len, row[0])), reverse=True):
       if any(_model_matches_tag(model_id, tag) for tag in tags):
         return replace(info, id=model_id)
     if "gpt-5" in model_id:
@@ -351,13 +352,53 @@ class OpenAIProvider(ModelProvider):
     elif _contains_tool_history(normalized_messages):
       params["tools"] = []
 
-    reasoning_effort = _map_reasoning_effort(thinking_level)
-    if model_info.supports_thinking and reasoning_effort and compat.get("supportsReasoningEffort", False):
-      params["reasoning_effort"] = compat.get("reasoningEffortMap", {}).get(reasoning_effort, reasoning_effort)
-    elif compat.get("thinkingFormat") in {"zai", "qwen"} and model_info.supports_thinking:
-      params["enable_thinking"] = thinking_level != ThinkingLevel.NONE
+    effort_resolution = kwargs.get("effort_resolution")
+    if not isinstance(effort_resolution, EffortResolution):
+      effort_resolution = self.resolve_effort(
+        requested=thinking_level,
+        model=model,
+        model_info=model_info,
+        max_tokens=max_tokens,
+        base_url=kwargs.get("base_url"),
+        compat=kwargs.get("compat"),
+      )
+    params.update(effort_resolution.payload_fragments)
 
     return params
+
+  def resolve_effort(
+    self,
+    *,
+    requested: ThinkingLevel,
+    model: str,
+    model_info: ModelInfo,
+    max_tokens: int,
+    **request_context: Any,
+  ) -> EffortResolution:
+    del model, max_tokens
+    compat = self._resolved_compat(
+      model_info,
+      base_url=request_context.get("base_url"),
+      compat_override=request_context.get("compat"),
+    )
+    if not model_info.supports_thinking:
+      return EffortResolution(requested, ThinkingLevel.NONE, False, {})
+    if compat.get("thinkingFormat") in {"zai", "qwen"}:
+      effective = requested
+      return EffortResolution(
+        requested,
+        effective,
+        effective != ThinkingLevel.NONE,
+        {"enable_thinking": effective != ThinkingLevel.NONE},
+      )
+    if not compat.get("supportsReasoningEffort", False):
+      return EffortResolution(requested, ThinkingLevel.NONE, False, {})
+    raw_values = tuple(compat.get("reasoningEffortValues") or ("low", "medium", "high"))
+    supported = tuple(ThinkingLevel(str(value)) for value in raw_values)
+    normalized = ThinkingLevel.LOW if requested == ThinkingLevel.MINIMAL and ThinkingLevel.MINIMAL not in supported else requested
+    effective = clamp_effort(normalized, supported)
+    mapped = dict(compat.get("reasoningEffortMap") or {}).get(effective.value, effective.value)
+    return EffortResolution(requested, effective, effective != ThinkingLevel.NONE, {"reasoning_effort": mapped})
 
   def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
     tool_id_map: dict[str, str] = {}

@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 import os
+import secrets
 import sqlite3
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, Protocol
 
 from . import approval_store_rows as _rows
+from . import prepared_business_model_store as _prepared_bm
+from . import raw_patch_authorization_store as _raw_patch_auth
 from .approval_notifications import (
   ApprovalNotificationDestinationResolver,
   ApprovalNotificationSender,
@@ -24,11 +27,31 @@ from .approval_policy import (
   ApprovalVote,
   DelegationGrant,
   PersistentGrant,
+  revalidate_approval_request,
   utc_now,
 )
 
 
 TERMINAL_STATES = frozenset({"auto_approved", "auto_denied", "approved", "denied", "expired"})
+APPROVAL_DB_PATH_ENV = "GATEWAY_APPROVAL_DB_PATH"
+DEFAULT_APPROVAL_DB_PATH = Path("data/gateway/approvals.sqlite3")
+
+
+class PersistentGrantCancellationFenced(RuntimeError):
+  """A grant cannot become visible after its approval entered cancellation."""
+
+
+def resolve_approval_db_path(
+  *,
+  env_get: Any = os.getenv,
+) -> Path:
+  configured = str(env_get(APPROVAL_DB_PATH_ENV, "") or "").strip()
+  if not configured:
+    return DEFAULT_APPROVAL_DB_PATH
+  path = Path(configured).expanduser()
+  if not path.is_absolute():
+    raise ValueError(f"{APPROVAL_DB_PATH_ENV} must be an absolute path")
+  return path.resolve(strict=False)
 
 
 _dt_to_text = _rows.dt_to_text
@@ -39,6 +62,10 @@ _json_loads = _rows.json_loads
 
 class ApprovalRequestStore(Protocol):
   async def create(self, request: ApprovalRequest) -> ApprovalRequest: ...
+  async def create_or_get_by_tool_call_id(
+    self,
+    request: ApprovalRequest,
+  ) -> tuple[ApprovalRequest, bool]: ...
   async def get(self, approval_id: str) -> ApprovalRequest | None: ...
   async def get_by_tool_call_id(self, tool_call_id: str) -> ApprovalRequest | None: ...
   async def update_request(self, request: ApprovalRequest) -> ApprovalRequest: ...
@@ -56,6 +83,40 @@ class ApprovalRequestStore(Protocol):
     decision: str | None = None,
     decision_reason: str | None = None,
   ) -> ApprovalRequest: ...
+  async def force_deny_pending(
+    self,
+    approval_id: str,
+    *,
+    decider_id: str,
+    decider_role: str | None = None,
+    decision_reason: str | None = None,
+  ) -> tuple[ApprovalRequest, bool]: ...
+  async def terminalize_pending_for_cancellation(
+    self,
+    approval_id: str,
+    *,
+    expected_tool_call_id: str,
+    expected_user_id: str,
+    expected_request_id: str,
+    expected_run_id: str,
+    expected_session_id: str,
+    expected_channel: str | None,
+    decider_id: str | None = None,
+    decider_role: str | None = None,
+    decision_reason: str,
+  ) -> tuple[ApprovalRequest, bool, bool]: ...
+  async def abort_unpublished_approval(
+    self,
+    approval_id: str,
+    *,
+    expected_tool_call_id: str,
+    expected_user_id: str,
+    expected_request_id: str,
+    expected_run_id: str,
+    expected_session_id: str,
+    expected_channel: str | None,
+    decision_reason: str,
+  ) -> tuple[ApprovalRequest, bool, bool]: ...
   async def record_vote(self, approval_id: str, vote: ApprovalVote) -> ApprovalRequest: ...
   async def create_persistent_grant(self, grant: PersistentGrant) -> PersistentGrant: ...
   async def find_persistent_grant(
@@ -67,6 +128,23 @@ class ApprovalRequestStore(Protocol):
     now: datetime | None = None,
   ) -> PersistentGrant | None: ...
   async def revoke_persistent_grant(self, grant_id: str, *, revoked_at: datetime | None = None) -> None: ...
+  async def revoke_persistent_grants_for_approval(
+    self,
+    approval_id: str,
+    *,
+    revoked_at: datetime | None = None,
+  ) -> int: ...
+  async def fence_persistent_grants_for_cancellation(
+    self,
+    approval_id: str,
+    *,
+    expected_tool_call_id: str,
+    expected_user_id: str,
+    expected_request_id: str,
+    expected_run_id: str,
+    expected_session_id: str,
+    expected_channel: str | None,
+  ) -> tuple[ApprovalRequest, bool]: ...
   async def create_delegation_grant(self, grant: DelegationGrant) -> DelegationGrant: ...
   async def get_delegation_grant(self, delegation_id: str) -> DelegationGrant | None: ...
   async def claim_delegation_grant(
@@ -86,7 +164,7 @@ class SQLiteApprovalStore:
 
   def __init__(
     self,
-    path: str | os.PathLike[str] = "data/gateway/approvals.sqlite3",
+    path: str | os.PathLike[str] = DEFAULT_APPROVAL_DB_PATH,
     *,
     audit_emitter: Any | None = None,
     notification_destination_resolver: ApprovalNotificationDestinationResolver | None = None,
@@ -171,7 +249,17 @@ class SQLiteApprovalStore:
           tool_schema_version TEXT,
           mcp_server_version TEXT,
           skill TEXT,
-          notification_policy TEXT NOT NULL DEFAULT 'auto'
+          notification_policy TEXT NOT NULL DEFAULT 'auto',
+          identity_source TEXT,
+          change_set_id TEXT,
+          change_hash TEXT,
+          base_vector_hash TEXT,
+          reviewed_change_binding_digest TEXT,
+          review_reference_json TEXT,
+          execution_semantics_digest TEXT,
+          authorization_mode TEXT NOT NULL DEFAULT 'HUMAN',
+          grant_reference TEXT,
+          cache_reference TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_approval_requests_tool_call_id
           ON approval_requests(tool_call_id);
@@ -207,6 +295,12 @@ class SQLiteApprovalStore:
         );
         CREATE INDEX IF NOT EXISTS idx_persistent_grants_lookup
           ON persistent_grants(user_id, tool_name, scope_hint, revoked_at, expires_at);
+
+        CREATE TABLE IF NOT EXISTS persistent_grant_cancellation_fences (
+          approval_id TEXT PRIMARY KEY
+            REFERENCES approval_requests(approval_id) ON DELETE CASCADE,
+          fenced_at TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS delegation_grants (
           delegation_id TEXT PRIMARY KEY,
@@ -255,13 +349,33 @@ class SQLiteApprovalStore:
         conn.execute("ALTER TABLE approval_requests ADD COLUMN delegation_id TEXT")
       if "notification_policy" not in columns:
         conn.execute("ALTER TABLE approval_requests ADD COLUMN notification_policy TEXT NOT NULL DEFAULT 'auto'")
+      identity_columns = {
+        "identity_source": "TEXT",
+        "change_set_id": "TEXT",
+        "change_hash": "TEXT",
+        "base_vector_hash": "TEXT",
+        "reviewed_change_binding_digest": "TEXT",
+        "review_reference_json": "TEXT",
+        "execution_semantics_digest": "TEXT",
+        "authorization_mode": "TEXT NOT NULL DEFAULT 'HUMAN'",
+        "grant_reference": "TEXT",
+        "cache_reference": "TEXT",
+      }
+      for column_name, column_type in identity_columns.items():
+        if column_name not in columns:
+          conn.execute(
+            f"ALTER TABLE approval_requests ADD COLUMN {column_name} {column_type}"
+          )
+      _prepared_bm.ensure_schema(conn)
+      _raw_patch_auth.ensure_schema(conn)
 
-  async def create(self, request: ApprovalRequest) -> ApprovalRequest:
-    async with self._lock:
-      with self._connection() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-          """
+  def _insert_request(
+    self,
+    conn: sqlite3.Connection,
+    request: ApprovalRequest,
+  ) -> None:
+    conn.execute(
+      """
           INSERT INTO approval_requests (
             approval_id, tool_call_id, parent_approval_id, approval_chain_id,
             delegation_id, request_id, session_id, run_id, user_id, profile, channel,
@@ -273,7 +387,10 @@ class SQLiteApprovalStore:
             external_callback_id, policy_id, policy_version, policy_bundle_hash,
             persistent_grant_scope, tenant_id, model_id, model_version,
             system_prompt_hash, tool_schema_version, mcp_server_version, skill,
-            notification_policy
+            notification_policy, identity_source, change_set_id, change_hash,
+            base_vector_hash, reviewed_change_binding_digest,
+            review_reference_json, execution_semantics_digest,
+            authorization_mode, grant_reference, cache_reference
           ) VALUES (
             :approval_id, :tool_call_id, :parent_approval_id, :approval_chain_id,
             :delegation_id, :request_id, :session_id, :run_id, :user_id, :profile, :channel,
@@ -285,14 +402,140 @@ class SQLiteApprovalStore:
             :external_callback_id, :policy_id, :policy_version, :policy_bundle_hash,
             :persistent_grant_scope, :tenant_id, :model_id, :model_version,
             :system_prompt_hash, :tool_schema_version, :mcp_server_version, :skill,
-            :notification_policy
+            :notification_policy, :identity_source, :change_set_id, :change_hash,
+            :base_vector_hash, :reviewed_change_binding_digest,
+            :review_reference_json, :execution_semantics_digest,
+            :authorization_mode, :grant_reference, :cache_reference
           )
-          """,
-          self._request_to_row(request),
+      """,
+      self._request_to_row(request),
+    )
+
+  async def create(self, request: ApprovalRequest) -> ApprovalRequest:
+    request = revalidate_approval_request(request)
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        self._insert_request(conn, request)
+        conn.commit()
+    await self._emit("request_created", request)
+    return request
+
+  async def create_raw_patch_authorization(
+    self,
+    request: ApprovalRequest,
+    *,
+    prepared_payload: bytes,
+  ) -> ApprovalRequest:
+    """Atomically create an approval and bind its exact reviewed patch bytes."""
+
+    request = revalidate_approval_request(request)
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        self._insert_request(conn, request)
+        _raw_patch_auth.bind_prepared(
+          conn,
+          approval_id=request.approval_id,
+          prepared_payload=prepared_payload,
         )
         conn.commit()
     await self._emit("request_created", request)
     return request
+
+  async def create_or_get_by_tool_call_id(
+    self,
+    request: ApprovalRequest,
+  ) -> tuple[ApprovalRequest, bool]:
+    """Atomically reuse one durable request across processes and store instances."""
+
+    request = revalidate_approval_request(request)
+    created = False
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+          """
+          SELECT * FROM approval_requests
+          WHERE tool_call_id = ?
+          ORDER BY requested_at DESC
+          LIMIT 1
+          """,
+          (request.tool_call_id,),
+        ).fetchone()
+        if row is None:
+          self._insert_request(conn, request)
+          stored = request
+          created = True
+        else:
+          stored = self._row_to_request_with_projection(row)
+        conn.commit()
+    if created:
+      await self._emit("request_created", stored)
+    return stored, created
+
+  async def create_or_get_with_prepared_business_model_change(
+    self,
+    request: ApprovalRequest,
+    record: _prepared_bm.PreparedBusinessModelChange,
+  ) -> tuple[
+    ApprovalRequest,
+    _prepared_bm.PreparedBusinessModelChange,
+    bool,
+  ]:
+    """Atomically bind one approval request to its immutable prepared plan."""
+
+    request = revalidate_approval_request(request)
+    created = False
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+          row = conn.execute(
+            """
+            SELECT * FROM approval_requests
+            WHERE tool_call_id = ?
+            ORDER BY requested_at DESC
+            LIMIT 1
+            """,
+            (request.tool_call_id,),
+          ).fetchone()
+          if row is None:
+            self._insert_request(conn, request)
+            stored_request = request
+            created = True
+          else:
+            stored_request = self._row_to_request_with_projection(row)
+            if (
+              stored_request.tool_name != request.tool_name
+              or stored_request.args_hash != request.args_hash
+              or stored_request.user_id != request.user_id
+            ):
+              raise _prepared_bm.PreparedBusinessModelError(
+                "approval tool-call identity conflicts with prepared BusinessModel intent"
+              )
+          normalized_record = replace(
+            record,
+            created_at=stored_request.requested_at.astimezone(UTC).isoformat(),
+            expires_at=(
+              stored_request.expires_at.astimezone(UTC).isoformat()
+              if stored_request.expires_at is not None
+              else None
+            ),
+            approval_id=stored_request.approval_id,
+            approval_chain_id=stored_request.approval_chain_id,
+          )
+          stored_record, _ = _prepared_bm.insert_or_verify(
+            conn,
+            normalized_record,
+          )
+          conn.commit()
+        except BaseException:
+          conn.rollback()
+          raise
+    if created:
+      await self._emit("request_created", stored_request)
+    return stored_request, stored_record, created
 
   async def get(self, approval_id: str) -> ApprovalRequest | None:
     with self._connection() as conn:
@@ -311,9 +554,38 @@ class SQLiteApprovalStore:
     return self._row_to_request_with_projection(row) if row is not None else None
 
   async def update_request(self, request: ApprovalRequest) -> ApprovalRequest:
+    request = revalidate_approval_request(request)
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        current_row = conn.execute(
+          "SELECT * FROM approval_requests WHERE approval_id = ?",
+          (request.approval_id,),
+        ).fetchone()
+        if current_row is None:
+          raise KeyError(f"approval request not found: {request.approval_id}")
+        if _raw_patch_auth.get_claim(
+          conn,
+          approval_id=request.approval_id,
+        ) is not None:
+          raise _raw_patch_auth.RawPatchAuthorizationError(
+            "claimed raw patch approval cannot be modified"
+          )
+        current = self._row_to_request(current_row)
+        identity_fields = (
+          "identity_source",
+          "change_set_id",
+          "change_hash",
+          "base_vector_hash",
+          "reviewed_change_binding_digest",
+          "review_reference",
+          "execution_semantics_digest",
+        )
+        if any(
+          getattr(current, field_name) != getattr(request, field_name)
+          for field_name in identity_fields
+        ):
+          raise ValueError("approval request identity is immutable")
         conn.execute(
           """
           UPDATE approval_requests SET
@@ -331,7 +603,10 @@ class SQLiteApprovalStore:
             policy_version = :policy_version,
             policy_bundle_hash = :policy_bundle_hash,
             persistent_grant_scope = :persistent_grant_scope,
-            notification_policy = :notification_policy
+            notification_policy = :notification_policy,
+            authorization_mode = :authorization_mode,
+            grant_reference = :grant_reference,
+            cache_reference = :cache_reference
           WHERE approval_id = :approval_id
           """,
           self._request_to_row(request),
@@ -362,6 +637,10 @@ class SQLiteApprovalStore:
         ).fetchone()
         if current_row is None:
           raise KeyError(f"approval request not found: {approval_id}")
+        if _raw_patch_auth.get_claim(conn, approval_id=approval_id) is not None:
+          raise _raw_patch_auth.RawPatchAuthorizationError(
+            "claimed raw patch approval cannot transition"
+          )
         current = self._row_to_request(current_row)
         if expected_state_version is not None and current.state_version != expected_state_version:
           raise RuntimeError("approval request state_version changed")
@@ -402,6 +681,272 @@ class SQLiteApprovalStore:
         conn.commit()
     await self._emit(self._event_type_for_state(updated.state), updated)
     return updated
+
+  async def force_deny_pending(
+    self,
+    approval_id: str,
+    *,
+    decider_id: str,
+    decider_role: str | None = None,
+    decision_reason: str | None = None,
+  ) -> tuple[ApprovalRequest, bool]:
+    """Atomically deny a still-pending request for terminal runtime teardown.
+
+    This is deliberately distinct from a vote: cancelling the runtime that owns
+    an approval must close the durable request regardless of its quorum size.
+    A terminal decision that wins the store lock is never overwritten.
+    """
+    transitioned = False
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current_row = conn.execute(
+          "SELECT * FROM approval_requests WHERE approval_id = ?",
+          (approval_id,),
+        ).fetchone()
+        if current_row is None:
+          raise KeyError(f"approval request not found: {approval_id}")
+        current = self._row_to_request(current_row)
+        if current.state in TERMINAL_STATES:
+          conn.commit()
+          return current, False
+        if current.state != "pending_user":
+          raise RuntimeError(
+            f"approval request is not pending_user: {approval_id} ({current.state})"
+          )
+        if _raw_patch_auth.get_claim(conn, approval_id=approval_id) is not None:
+          raise _raw_patch_auth.RawPatchAuthorizationError(
+            "claimed raw patch approval cannot transition"
+          )
+        updated = replace(
+          current,
+          state="denied",
+          state_version=current.state_version + 1,
+          decided_at=utc_now(),
+          decider_id=decider_id,
+          decider_role=decider_role,
+          decision="denied",
+          decision_reason=decision_reason,
+        )
+        conn.execute(
+          """
+          UPDATE approval_requests SET
+            state = :state,
+            state_version = :state_version,
+            decided_at = :decided_at,
+            decider_id = :decider_id,
+            decider_role = :decider_role,
+            decision = :decision,
+            decision_reason = :decision_reason
+          WHERE approval_id = :approval_id
+          """,
+          self._request_to_row(updated),
+        )
+        conn.commit()
+        transitioned = True
+    if transitioned:
+      await self._emit(self._event_type_for_state(updated.state), updated)
+    return updated, transitioned
+
+  async def terminalize_pending_for_cancellation(
+    self,
+    approval_id: str,
+    *,
+    expected_tool_call_id: str,
+    expected_user_id: str,
+    expected_request_id: str,
+    expected_run_id: str,
+    expected_session_id: str,
+    expected_channel: str | None,
+    decider_id: str | None = None,
+    decider_role: str | None = None,
+    decision_reason: str,
+  ) -> tuple[ApprovalRequest, bool, bool]:
+    """Atomically deny a still-pending approval without quorum semantics.
+
+    Cancellation is a lifecycle boundary, not an approval vote. Serializing
+    the full durable-identity join, pending-state check, and terminal transition
+    in one SQLite write transaction prevents cross-run mutation and release
+    after the owning run has begun teardown.
+    """
+
+    transitioned = False
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current_row = conn.execute(
+          "SELECT * FROM approval_requests WHERE approval_id = ?",
+          (approval_id,),
+        ).fetchone()
+        if current_row is None:
+          conn.rollback()
+          raise KeyError(f"approval request not found: {approval_id}")
+        current = self._row_to_request(current_row)
+        normalized_expected_channel = str(expected_channel or "").strip().lower()
+        identity_matches = all((
+          current.tool_call_id == expected_tool_call_id,
+          current.user_id == expected_user_id,
+          current.request_id == expected_request_id,
+          current.run_id == expected_run_id,
+          current.session_id == expected_session_id,
+          str(current.channel or "").strip().lower() == normalized_expected_channel,
+        ))
+        if not identity_matches:
+          conn.commit()
+          return current, False, False
+        if current.state != "pending_user":
+          conn.commit()
+          return current, False, True
+        if _raw_patch_auth.get_claim(conn, approval_id=approval_id) is not None:
+          conn.rollback()
+          raise _raw_patch_auth.RawPatchAuthorizationError(
+            "claimed raw patch approval cannot be cancelled"
+          )
+        updated = replace(
+          current,
+          state="denied",
+          state_version=current.state_version + 1,
+          decided_at=utc_now(),
+          decider_id=decider_id if decider_id is not None else current.decider_id,
+          decider_role=decider_role if decider_role is not None else current.decider_role,
+          decision="denied",
+          decision_reason=decision_reason,
+        )
+        cursor = conn.execute(
+          """
+          UPDATE approval_requests SET
+            state = :state,
+            state_version = :state_version,
+            decided_at = :decided_at,
+            decider_id = :decider_id,
+            decider_role = :decider_role,
+            decision = :decision,
+            decision_reason = :decision_reason
+          WHERE approval_id = :approval_id
+            AND state = 'pending_user'
+            AND state_version = :expected_state_version
+            AND tool_call_id = :expected_tool_call_id
+            AND user_id = :expected_user_id
+            AND request_id = :expected_request_id
+            AND run_id = :expected_run_id
+            AND session_id = :expected_session_id
+            AND LOWER(TRIM(channel)) = :expected_channel
+          """,
+          {
+            **self._request_to_row(updated),
+            "expected_state_version": current.state_version,
+            "expected_tool_call_id": expected_tool_call_id,
+            "expected_user_id": expected_user_id,
+            "expected_request_id": expected_request_id,
+            "expected_run_id": expected_run_id,
+            "expected_session_id": expected_session_id,
+            "expected_channel": normalized_expected_channel,
+          },
+        )
+        if cursor.rowcount != 1:
+          conn.rollback()
+          raise RuntimeError("approval cancellation compare-and-set failed")
+        conn.commit()
+        transitioned = True
+    if transitioned:
+      await self._emit("denied", updated)
+    return updated, transitioned, True
+
+  async def abort_unpublished_approval(
+    self,
+    approval_id: str,
+    *,
+    expected_tool_call_id: str,
+    expected_user_id: str,
+    expected_request_id: str,
+    expected_run_id: str,
+    expected_session_id: str,
+    expected_channel: str | None,
+    decision_reason: str,
+  ) -> tuple[ApprovalRequest, bool, bool]:
+    """Deny an admitted request that unwound before live publication."""
+    transitioned = False
+    revoked_grant_rows: list[sqlite3.Row] = []
+    now = utc_now()
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current_row = conn.execute(
+          "SELECT * FROM approval_requests WHERE approval_id = ?",
+          (approval_id,),
+        ).fetchone()
+        if current_row is None:
+          conn.commit()
+          raise KeyError(f"approval request not found: {approval_id}")
+        current = self._row_to_request(current_row)
+        normalized_expected_channel = str(expected_channel or "").strip().lower()
+        identity_matches = all((
+          current.tool_call_id == expected_tool_call_id,
+          current.user_id == expected_user_id,
+          current.request_id == expected_request_id,
+          current.run_id == expected_run_id,
+          current.session_id == expected_session_id,
+          str(current.channel or "").strip().lower() == normalized_expected_channel,
+        ))
+        if not identity_matches:
+          conn.commit()
+          return current, False, False
+        if _raw_patch_auth.get_claim(conn, approval_id=approval_id) is not None:
+          conn.rollback()
+          raise _raw_patch_auth.RawPatchAuthorizationError(
+            "claimed raw patch approval cannot be aborted"
+          )
+        updated = current
+        if current.state not in TERMINAL_STATES:
+          updated = replace(
+            current,
+            state="denied",
+            state_version=current.state_version + 1,
+            decided_at=now,
+            decision="denied",
+            decision_reason=decision_reason,
+          )
+          conn.execute(
+            """
+            UPDATE approval_requests SET
+              state = :state,
+              state_version = :state_version,
+              decided_at = :decided_at,
+              decision = :decision,
+              decision_reason = :decision_reason
+            WHERE approval_id = :approval_id
+            """,
+            self._request_to_row(updated),
+          )
+          transitioned = True
+        revoked_grant_rows = conn.execute(
+          """
+          SELECT * FROM persistent_grants
+          WHERE granted_via_approval_id = ? AND revoked_at IS NULL
+          """,
+          (approval_id,),
+        ).fetchall()
+        conn.execute(
+          """
+          UPDATE persistent_grants SET revoked_at = ?
+          WHERE granted_via_approval_id = ? AND revoked_at IS NULL
+          """,
+          (_dt_to_text(now), approval_id),
+        )
+        conn.execute(
+          "DELETE FROM approval_notification_outbox WHERE approval_id = ?",
+          (approval_id,),
+        )
+        conn.commit()
+    if transitioned:
+      await self._emit("denied", updated)
+    for row in revoked_grant_rows:
+      await self._emit_grant(
+        "persistent_grant_revoked",
+        replace(self._row_to_grant(row), revoked_at=now),
+        request=updated,
+      )
+    return updated, transitioned, True
 
   async def record_vote(self, approval_id: str, vote: ApprovalVote) -> ApprovalRequest:
     emitted_vote = False
@@ -505,6 +1050,18 @@ class SQLiteApprovalStore:
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        cancellation_fence = conn.execute(
+          """
+          SELECT 1 FROM persistent_grant_cancellation_fences
+          WHERE approval_id = ?
+          """,
+          (grant.granted_via_approval_id,),
+        ).fetchone()
+        if cancellation_fence is not None:
+          conn.rollback()
+          raise PersistentGrantCancellationFenced(
+            "persistent grant approval is fenced for cancellation"
+          )
         conn.execute(
           """
           INSERT INTO persistent_grants (
@@ -542,20 +1099,25 @@ class SQLiteApprovalStore:
     now: datetime | None = None,
   ) -> PersistentGrant | None:
     now_text = _dt_to_text(now or utc_now())
-    with self._connection() as conn:
-      row = conn.execute(
-        """
-        SELECT * FROM persistent_grants
-        WHERE user_id = ?
-          AND tool_name = ?
-          AND scope_hint = ?
-          AND revoked_at IS NULL
-          AND (expires_at IS NULL OR expires_at > ?)
-        ORDER BY granted_at DESC
-        LIMIT 1
-        """,
-        (user_id, tool_name, scope_hint, now_text),
-      ).fetchone()
+    async with self._lock:
+      with self._connection() as conn:
+        row = conn.execute(
+          """
+          SELECT grants.* FROM persistent_grants AS grants
+          WHERE grants.user_id = ?
+            AND grants.tool_name = ?
+            AND grants.scope_hint = ?
+            AND grants.revoked_at IS NULL
+            AND (grants.expires_at IS NULL OR grants.expires_at > ?)
+            AND NOT EXISTS (
+              SELECT 1 FROM persistent_grant_cancellation_fences AS fences
+              WHERE fences.approval_id = grants.granted_via_approval_id
+            )
+          ORDER BY grants.granted_at DESC
+          LIMIT 1
+          """,
+          (user_id, tool_name, scope_hint, now_text),
+        ).fetchone()
     return self._row_to_grant(row) if row is not None else None
 
   async def revoke_persistent_grant(self, grant_id: str, *, revoked_at: datetime | None = None) -> None:
@@ -579,6 +1141,118 @@ class SQLiteApprovalStore:
         grant,
         request=await self.get(grant.granted_via_approval_id),
       )
+
+  async def revoke_persistent_grants_for_approval(
+    self,
+    approval_id: str,
+    *,
+    revoked_at: datetime | None = None,
+  ) -> int:
+    """Atomically revoke every active grant produced by one approval."""
+    when = revoked_at or utc_now()
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+          """
+          SELECT * FROM persistent_grants
+          WHERE granted_via_approval_id = ? AND revoked_at IS NULL
+          """,
+          (approval_id,),
+        ).fetchall()
+        conn.execute(
+          """
+          UPDATE persistent_grants SET revoked_at = ?
+          WHERE granted_via_approval_id = ? AND revoked_at IS NULL
+          """,
+          (_dt_to_text(when), approval_id),
+        )
+        conn.commit()
+    request = await self.get(approval_id)
+    for row in rows:
+      grant = replace(self._row_to_grant(row), revoked_at=when)
+      await self._emit_grant(
+        "persistent_grant_revoked",
+        grant,
+        request=request,
+      )
+    return len(rows)
+
+  async def fence_persistent_grants_for_cancellation(
+    self,
+    approval_id: str,
+    *,
+    expected_tool_call_id: str,
+    expected_user_id: str,
+    expected_request_id: str,
+    expected_run_id: str,
+    expected_session_id: str,
+    expected_channel: str | None,
+  ) -> tuple[ApprovalRequest, bool]:
+    """Hide and revoke grants at the durable cancellation boundary."""
+    now = utc_now()
+    revoked_grant_rows: list[sqlite3.Row] = []
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current_row = conn.execute(
+          "SELECT * FROM approval_requests WHERE approval_id = ?",
+          (approval_id,),
+        ).fetchone()
+        if current_row is None:
+          conn.rollback()
+          raise KeyError(f"approval request not found: {approval_id}")
+        current = self._row_to_request(current_row)
+        normalized_expected_channel = str(expected_channel or "").strip().lower()
+        identity_matches = all((
+          current.tool_call_id == expected_tool_call_id,
+          current.user_id == expected_user_id,
+          current.request_id == expected_request_id,
+          current.run_id == expected_run_id,
+          current.session_id == expected_session_id,
+          str(current.channel or "").strip().lower() == normalized_expected_channel,
+        ))
+        if not identity_matches:
+          conn.commit()
+          return current, False
+        conn.execute(
+          """
+          INSERT OR IGNORE INTO persistent_grant_cancellation_fences (
+            approval_id, fenced_at
+          ) VALUES (?, ?)
+          """,
+          (approval_id, _dt_to_text(now)),
+        )
+        revoked_grant_rows = conn.execute(
+          """
+          SELECT * FROM persistent_grants
+          WHERE granted_via_approval_id = ? AND revoked_at IS NULL
+          """,
+          (approval_id,),
+        ).fetchall()
+        conn.execute(
+          """
+          UPDATE persistent_grants SET revoked_at = ?
+          WHERE granted_via_approval_id = ? AND revoked_at IS NULL
+          """,
+          (_dt_to_text(now), approval_id),
+        )
+        conn.commit()
+    for row in revoked_grant_rows:
+      grant = replace(self._row_to_grant(row), revoked_at=now)
+      try:
+        await self._emit_grant(
+          "persistent_grant_revoked",
+          grant,
+          request=current,
+        )
+      except asyncio.CancelledError:
+        await self._emit_grant(
+          "persistent_grant_revoked",
+          grant,
+          request=current,
+        )
+    return current, True
 
   async def create_delegation_grant(self, grant: DelegationGrant) -> DelegationGrant:
     async with self._lock:
@@ -1049,6 +1723,383 @@ class SQLiteApprovalStore:
     if sent_values:
       projection["last_sent_at"] = sent_values[-1]
     return projection
+
+  async def insert_or_verify_prepared_business_model_change(
+    self,
+    record: _prepared_bm.PreparedBusinessModelChange,
+  ) -> tuple[_prepared_bm.PreparedBusinessModelChange, bool]:
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        result = _prepared_bm.insert_or_verify(conn, record)
+        conn.commit()
+        return result
+
+  async def get_prepared_business_model_change(
+    self,
+    *,
+    caller_kind: str,
+    user_scope: str,
+    idempotency_locator: str,
+  ) -> _prepared_bm.PreparedBusinessModelChange | None:
+    async with self._lock:
+      with self._connection() as conn:
+        return _prepared_bm.get(
+          conn,
+          caller_kind=caller_kind,
+          user_scope=user_scope,
+          idempotency_locator=idempotency_locator,
+        )
+
+  async def transition_prepared_business_model_change(
+    self,
+    *,
+    caller_kind: str,
+    user_scope: str,
+    idempotency_locator: str,
+    expected: _prepared_bm.PreparedBusinessModelLifecycle,
+    target: _prepared_bm.PreparedBusinessModelLifecycle,
+    approval_id: str | None = None,
+    approval_chain_id: str | None = None,
+    execution_receipt: bytes | None = None,
+    restoration_digest: str | None = None,
+    checkpoint_id: str | None = None,
+    consumed_at: str | None = None,
+  ) -> _prepared_bm.PreparedBusinessModelChange:
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        record = _prepared_bm.transition(
+          conn,
+          caller_kind=caller_kind,
+          user_scope=user_scope,
+          idempotency_locator=idempotency_locator,
+          expected=expected,
+          target=target,
+          approval_id=approval_id,
+          approval_chain_id=approval_chain_id,
+          execution_receipt=execution_receipt,
+          restoration_digest=restoration_digest,
+          checkpoint_id=checkpoint_id,
+          consumed_at=consumed_at,
+        )
+        conn.commit()
+        return record
+
+  async def expire_prepared_business_model_changes(self, *, now: str) -> int:
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        count = _prepared_bm.expire_pending(conn, now=now)
+        conn.commit()
+        return count
+
+  async def resolve_raw_patch_authorization_reference(
+    self,
+    reference: str,
+  ) -> ApprovalRequest | None:
+    """Resolve the opaque route reference without accepting raw approval IDs."""
+
+    tool_call_id = _raw_patch_auth.decode_reference(reference)
+    return await self.get_by_tool_call_id(tool_call_id)
+
+  async def consume_raw_patch_authorization(
+    self,
+    *,
+    approval_id: str,
+    approval_chain_id: str,
+    authorization_mode: str,
+    grant_reference: str | None,
+    cache_reference: str | None,
+    user_id: str,
+    tool_name: str,
+    args_hash: str,
+    change_set_id: str,
+    change_hash: str,
+    base_vector_hash: str,
+    reviewed_change_binding_digest: str,
+    execution_semantics_digest: str,
+    prepared_payload_digest: str,
+    claim_token: str,
+    receipt: bytes,
+  ) -> tuple[_raw_patch_auth.RawPatchAuthorizationConsumption, bool]:
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        self._validate_raw_patch_authorization_locked(
+          conn,
+          approval_id=approval_id,
+          approval_chain_id=approval_chain_id,
+          authorization_mode=authorization_mode,
+          grant_reference=grant_reference,
+          cache_reference=cache_reference,
+          user_id=user_id,
+          tool_name=tool_name,
+          args_hash=args_hash,
+          change_set_id=change_set_id,
+          change_hash=change_hash,
+          base_vector_hash=base_vector_hash,
+          reviewed_change_binding_digest=reviewed_change_binding_digest,
+          execution_semantics_digest=execution_semantics_digest,
+          prepared_payload_digest=prepared_payload_digest,
+          require_unexpired=False,
+        )
+        claim = _raw_patch_auth.get_claim(conn, approval_id=approval_id)
+        if (
+          claim is None
+          or claim.claim_token != claim_token
+          or claim.change_set_id != change_set_id
+          or claim.change_hash != change_hash
+          or claim.prepared_payload_digest != prepared_payload_digest
+        ):
+          raise _raw_patch_auth.RawPatchAuthorizationError(
+            "raw patch authorization claim changed before consumption"
+          )
+        result = _raw_patch_auth.consume(
+          conn,
+          approval_id=approval_id,
+          change_set_id=change_set_id,
+          change_hash=change_hash,
+          receipt=receipt,
+        )
+        _raw_patch_auth.finalize_claim(
+          conn,
+          approval_id=approval_id,
+          claim_token=claim_token,
+        )
+        conn.commit()
+        return result
+
+  async def claim_raw_patch_authorization(
+    self,
+    *,
+    approval_id: str,
+    approval_chain_id: str,
+    authorization_mode: str,
+    grant_reference: str | None,
+    cache_reference: str | None,
+    user_id: str,
+    tool_name: str,
+    args_hash: str,
+    change_set_id: str,
+    change_hash: str,
+    base_vector_hash: str,
+    reviewed_change_binding_digest: str,
+    execution_semantics_digest: str,
+    prepared_payload_digest: str,
+  ) -> _raw_patch_auth.RawPatchAuthorizationClaim:
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        self._validate_raw_patch_authorization_locked(
+          conn,
+          approval_id=approval_id,
+          approval_chain_id=approval_chain_id,
+          authorization_mode=authorization_mode,
+          grant_reference=grant_reference,
+          cache_reference=cache_reference,
+          user_id=user_id,
+          tool_name=tool_name,
+          args_hash=args_hash,
+          change_set_id=change_set_id,
+          change_hash=change_hash,
+          base_vector_hash=base_vector_hash,
+          reviewed_change_binding_digest=reviewed_change_binding_digest,
+          execution_semantics_digest=execution_semantics_digest,
+          prepared_payload_digest=prepared_payload_digest,
+          require_unexpired=True,
+        )
+        claim, _created = _raw_patch_auth.claim(
+          conn,
+          approval_id=approval_id,
+          claim_token=secrets.token_urlsafe(32),
+          change_set_id=change_set_id,
+          change_hash=change_hash,
+          prepared_payload_digest=prepared_payload_digest,
+        )
+        conn.commit()
+        return claim
+
+  async def release_raw_patch_authorization_claim(
+    self,
+    *,
+    approval_id: str,
+    approval_chain_id: str,
+    authorization_mode: str,
+    grant_reference: str | None,
+    cache_reference: str | None,
+    user_id: str,
+    tool_name: str,
+    args_hash: str,
+    change_set_id: str,
+    change_hash: str,
+    base_vector_hash: str,
+    reviewed_change_binding_digest: str,
+    execution_semantics_digest: str,
+    prepared_payload_digest: str,
+    claim_token: str,
+  ) -> None:
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        self._validate_raw_patch_authorization_locked(
+          conn,
+          approval_id=approval_id,
+          approval_chain_id=approval_chain_id,
+          authorization_mode=authorization_mode,
+          grant_reference=grant_reference,
+          cache_reference=cache_reference,
+          user_id=user_id,
+          tool_name=tool_name,
+          args_hash=args_hash,
+          change_set_id=change_set_id,
+          change_hash=change_hash,
+          base_vector_hash=base_vector_hash,
+          reviewed_change_binding_digest=reviewed_change_binding_digest,
+          execution_semantics_digest=execution_semantics_digest,
+          prepared_payload_digest=prepared_payload_digest,
+          require_unexpired=False,
+        )
+        _raw_patch_auth.release_claim(
+          conn,
+          approval_id=approval_id,
+          claim_token=claim_token,
+        )
+        conn.commit()
+
+  async def heartbeat_raw_patch_authorization_claim(
+    self,
+    *,
+    approval_id: str,
+    claim_token: str,
+    lease_seconds: float = 120.0,
+  ) -> _raw_patch_auth.RawPatchAuthorizationClaim:
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        claim = _raw_patch_auth.heartbeat_claim(
+          conn,
+          approval_id=approval_id,
+          claim_token=claim_token,
+          lease_seconds=lease_seconds,
+        )
+        conn.commit()
+        return claim
+
+  def _validate_raw_patch_authorization_locked(
+    self,
+    conn: sqlite3.Connection,
+    *,
+    approval_id: str,
+    approval_chain_id: str,
+    authorization_mode: str,
+    grant_reference: str | None,
+    cache_reference: str | None,
+    user_id: str,
+    tool_name: str,
+    args_hash: str,
+    change_set_id: str,
+    change_hash: str,
+    base_vector_hash: str,
+    reviewed_change_binding_digest: str,
+    execution_semantics_digest: str,
+    prepared_payload_digest: str,
+    require_unexpired: bool,
+  ) -> None:
+    row = conn.execute(
+      "SELECT * FROM approval_requests WHERE approval_id = ?",
+      (approval_id,),
+    ).fetchone()
+    if row is None:
+      raise KeyError(f"approval request not found: {approval_id}")
+    request = self._row_to_request(row)
+    expected = {
+      "approval_chain_id": approval_chain_id,
+      "authorization_mode": authorization_mode,
+      "grant_reference": grant_reference,
+      "cache_reference": cache_reference,
+      "user_id": user_id,
+      "tool_name": tool_name,
+      "tool_class": "state_write",
+      "args_hash": args_hash,
+      "identity_source": "reviewed_change_binding",
+      "change_set_id": change_set_id,
+      "change_hash": change_hash,
+      "base_vector_hash": base_vector_hash,
+      "reviewed_change_binding_digest": reviewed_change_binding_digest,
+      "execution_semantics_digest": execution_semantics_digest,
+    }
+    if any(
+      getattr(request, field_name) != expected_value
+      for field_name, expected_value in expected.items()
+    ):
+      raise _raw_patch_auth.RawPatchAuthorizationError(
+        "approval identity changed before raw patch execution"
+      )
+    if (
+      request.state not in {"approved", "auto_approved"}
+      or request.decision != request.state
+    ):
+      raise _raw_patch_auth.RawPatchAuthorizationError(
+        "approval outcome is not executable for raw patch execution"
+      )
+    if (
+      require_unexpired
+      and request.expires_at is not None
+      and request.expires_at <= datetime.now(UTC)
+    ):
+      raise _raw_patch_auth.RawPatchAuthorizationError(
+        "approval expired before raw patch execution"
+      )
+    prepared = _raw_patch_auth.get_prepared(conn, approval_id=approval_id)
+    if (
+      prepared is None
+      or prepared.prepared_payload_digest != prepared_payload_digest
+    ):
+      raise _raw_patch_auth.RawPatchAuthorizationError(
+        "prepared patch identity changed before raw patch execution"
+      )
+
+  async def bind_raw_patch_prepared_authorization(
+    self,
+    *,
+    approval_id: str,
+    prepared_payload: bytes,
+  ) -> tuple[_raw_patch_auth.RawPatchPreparedAuthorization, bool]:
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+          "SELECT approval_id FROM approval_requests WHERE approval_id = ?",
+          (approval_id,),
+        ).fetchone()
+        if row is None:
+          raise KeyError(f"approval request not found: {approval_id}")
+        result = _raw_patch_auth.bind_prepared(
+          conn,
+          approval_id=approval_id,
+          prepared_payload=prepared_payload,
+        )
+        conn.commit()
+        return result
+
+  async def get_raw_patch_prepared_authorization(
+    self,
+    *,
+    approval_id: str,
+  ) -> _raw_patch_auth.RawPatchPreparedAuthorization | None:
+    async with self._lock:
+      with self._connection() as conn:
+        return _raw_patch_auth.get_prepared(conn, approval_id=approval_id)
+
+  async def get_raw_patch_authorization_consumption(
+    self,
+    *,
+    approval_id: str,
+  ) -> _raw_patch_auth.RawPatchAuthorizationConsumption | None:
+    async with self._lock:
+      with self._connection() as conn:
+        return _raw_patch_auth.get(conn, approval_id=approval_id)
 
   @staticmethod
   def _request_to_row(request: ApprovalRequest) -> dict[str, Any]:

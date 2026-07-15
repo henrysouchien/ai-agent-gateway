@@ -123,6 +123,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     on_late_usage_event: Callable[..., Any] | None = None,
     on_tool_result: Callable[..., Any] | None = None,
     on_tool_timing: Callable[..., Any] | None = None,
+    provider_id_for_tool: Callable[[str], str | None] | None = None,
     _parent_aggregator: _UsageAggregator | None = None,
     session: Any | None = None,
     store: Any | None = None,
@@ -156,6 +157,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     self._on_late_usage_event = on_late_usage_event
     self._on_tool_result = on_tool_result
     self._on_tool_timing = on_tool_timing
+    self._provider_id_for_tool = provider_id_for_tool
     self._on_tool_timing_accepts_user_id = _detect_user_id_param(on_tool_timing)
     self._on_tool_timing_accepts_context_surfaces = _detect_keyword_param(on_tool_timing, "context_surfaces")
     self._on_tool_timing_accepts_tool_call_id = _detect_keyword_param(on_tool_timing, "tool_call_id")
@@ -495,6 +497,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     decision: PolicyApprovalDecision,
     *,
     nonce: str,
+    batch_admission: Any | None = None,
   ) -> dict[str, Any] | None:
     return await _sdk_runner_approval.await_user_approval_via_pending_tools(
       session=self._session,
@@ -506,6 +509,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
       timeout_seconds=_approval_queue_timeout_seconds(decision.expiry_seconds),
       log=log,
       time_fn=time.time,
+      batch_admission=batch_admission,
     )
 
   async def _can_use_tool_callback(self, tool_name: str, input_data: dict[str, Any], _context: Any) -> Any:

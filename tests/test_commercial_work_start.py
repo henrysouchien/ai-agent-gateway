@@ -19,6 +19,8 @@ from agent_gateway.commercial_work_start import (
   CommercialWorkStartError,
   CommercialWorkStartFacts,
   CommercialWorkStartGate,
+  CommercialWorkStartContext,
+  require_commercial_child_provider,
 )
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.work_authorization_consumption import (
@@ -77,7 +79,7 @@ class _ConsumptionStore:
     return self.record
 
 
-def _gate(order: list[str]):
+def _gate(order: list[str], *, pre_consume=None):
   claim = SimpleNamespace(name="verified-claim")
   authorization = SimpleNamespace(name="verified-authorization")
   record = SimpleNamespace(name="consumption-record")
@@ -103,6 +105,7 @@ def _gate(order: list[str]):
     authorization_verifier=authorization_verifier,
     consumption_store=store,
     facts_resolver=facts_resolver,
+    pre_consume=pre_consume,
   )
   return gate, claim_verifier, authorization_verifier, store
 
@@ -182,6 +185,49 @@ def test_gate_verifies_exact_facts_then_consumes_without_retaining_tokens() -> N
   assert WORK_TOKEN not in repr(pending)
   assert CLAIM_TOKEN not in repr(context)
   assert WORK_TOKEN not in repr(context)
+
+
+def test_gate_runs_durability_preflight_before_consuming_authority() -> None:
+  order: list[str] = []
+
+  def unavailable(_pending):
+    order.append("preflight")
+    raise RuntimeError("circuit open")
+
+  gate, _, _, store = _gate(order, pre_consume=unavailable)
+  session, request, headers = _request_facts()
+
+  pending = gate.verify_request(
+    headers, session=session, request=request, channel="mcp"
+  )
+  with pytest.raises(CommercialWorkStartError) as raised:
+    gate.consume(pending)
+
+  assert raised.value.code == "commercial_work_start_unavailable"
+  assert raised.value.status_code == 503
+  assert store.attached == []
+  assert order == [
+    "resolve_facts", "verify_claim", "verify_authorization", "preflight",
+  ]
+
+
+def test_child_provider_must_match_verified_root_authority() -> None:
+  work_start = CommercialWorkStartContext(
+    claim=SimpleNamespace(),
+    authorization=SimpleNamespace(provider="anthropic"),
+    consumption=SimpleNamespace(),
+  )
+
+  require_commercial_child_provider(work_start, "anthropic")
+  with pytest.raises(CommercialWorkStartError) as mismatch:
+    require_commercial_child_provider(work_start, "openai")
+  assert mismatch.value.code == "commercial_child_provider_mismatch"
+  assert mismatch.value.status_code == 403
+
+  with pytest.raises(CommercialWorkStartError) as invalid:
+    require_commercial_child_provider(SimpleNamespace(), "anthropic")
+  assert invalid.value.code == "commercial_child_authority_invalid"
+  assert invalid.value.status_code == 503
 
 
 def test_gate_maps_invalid_replay_conflict_and_storage_failure_to_no_start() -> None:

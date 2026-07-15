@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
+import stat
 
 import pytest
 
@@ -19,6 +20,37 @@ from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTrac
 
 
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def _mode(path: Path) -> int:
+  return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_outbox_requires_an_owner_private_storage_directory(tmp_path) -> None:
+  storage = tmp_path / "broad-storage"
+  storage.mkdir(mode=0o755)
+
+  with pytest.raises(CommercialUsageOutboxError, match="owner-private"):
+    CommercialUsageOutbox(storage / "usage.sqlite3")
+
+
+def test_outbox_hardens_sqlite_main_wal_and_shm_files(tmp_path) -> None:
+  outbox = CommercialUsageOutbox(tmp_path / "private-storage" / "usage.sqlite3")
+
+  connection = outbox._connect()
+  try:
+    connection.execute("BEGIN IMMEDIATE")
+    paths = (
+      outbox.path,
+      Path(f"{outbox.path}-wal"),
+      Path(f"{outbox.path}-shm"),
+    )
+    assert all(path.is_file() for path in paths)
+    assert {_mode(path) for path in paths} == {0o600}
+  finally:
+    connection.close()
+
+  assert _mode(outbox.path.parent) == 0o700
 
 
 def test_reconciliation_v2_schema_is_declared_as_package_data() -> None:

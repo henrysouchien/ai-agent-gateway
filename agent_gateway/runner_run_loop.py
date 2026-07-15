@@ -262,14 +262,7 @@ class RunnerRunLoopMixin:
       base_kwargs: Dict[str, Any] = {
         "tools": cached_tools,
       }
-      if config["thinking"] and max_tokens >= 2048 and model_info.supports_thinking:
-        logger.info("[%s] Thinking enabled | max_tokens=%d", self._sid, max_tokens)
-      elif not config["thinking"]:
-        logger.info("[%s] Thinking disabled | thinking=false", self._sid)
-      elif max_tokens < 2048:
-        logger.info("[%s] Thinking disabled | max_tokens=%d too low (need >=2048)", self._sid, max_tokens)
-      else:
-        logger.info("[%s] Thinking disabled | model=%s not supported", self._sid, config["model"])
+      logger.info("[%s] Effort requested | effort=%s", self._sid, config["effort"])
 
       effective_compaction_trigger = effective_compaction_trigger_fn(self._compaction_trigger, model_info)
       if effective_compaction_trigger is not None:

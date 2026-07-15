@@ -25,6 +25,55 @@ pip install "ai-agent-gateway[openai]"
 export OPENAI_API_KEY="your-openai-api-key"
 ```
 
+The public OpenAI API does not use ChatGPT subscription OAuth. For ChatGPT
+subscription authentication, use `provider="codex"` and run
+`agent auth login codex`. The command preserves an existing Codex login and
+does nothing when one is active. On a logged-out machine, enroll transactionally
+with `agent auth login codex --profile <name> --email <exact-email>`; this delegates
+to `cx enroll` so CAAM can protect and restore vaulted credentials. The gateway
+then reads Codex's managed credential store directly.
+
+### Claude subscription OAuth
+
+Create a separate, one-year inference token for new gateway sessions:
+
+```bash
+agent auth login anthropic
+export ANTHROPIC_AUTH_MODE=oauth
+export AGENT_PROVIDER=anthropic
+```
+
+The command delegates authorization to Anthropic's official `claude setup-token`
+flow, then stores the resulting token under `$USER_DATA_DIR/anthropic/oauth.json`
+(or `~/.agent_gateway/anthropic/oauth.json`) with mode `0600`. It does not read,
+replace, or log out Claude Code's saved login. Existing `ANTHROPIC_AUTH_TOKEN`
+environment values take precedence, so running sessions and explicit operator
+credentials are unaffected. Use `agent auth status anthropic` and
+`agent auth logout anthropic` to manage only the gateway-owned token.
+
+### xAI Grok
+
+Use an xAI developer API key:
+
+```bash
+export AGENT_PROVIDER=xai
+export XAI_AUTH_MODE=api
+export XAI_API_KEY="your-xai-api-key"
+export XAI_MODEL=grok-4.5
+```
+
+Or sign in with an eligible Grok subscription using the remote-friendly device flow:
+
+```bash
+agent auth login xai
+unset XAI_AUTH_MODE  # auto-detect the persisted refreshable token
+export AGENT_PROVIDER=xai
+```
+
+OAuth tokens are stored under `$USER_DATA_DIR/xai/oauth.json` (or
+`~/.agent_gateway/xai/oauth.json` when `USER_DATA_DIR` is unset) with mode `0600`.
+Use `agent auth status xai` or `agent auth logout xai` to inspect or remove the login.
+
 Scaffold and run a project:
 
 ```bash

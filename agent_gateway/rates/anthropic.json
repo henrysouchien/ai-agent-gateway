@@ -1,6 +1,6 @@
 {
-  "version": "2026-04-08",
-  "source": "https://docs.anthropic.com/pricing",
+  "version": "2026-07-12",
+  "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
   "providers": {
     "anthropic": {
       "models": {
@@ -10,7 +10,25 @@
           "output_cost_per_mtok": 50.0,
           "cache_read_cost_per_mtok": 1.0,
           "cache_write_cost_per_mtok": 12.5,
-          "max_tokens": 32000,
+          "max_tokens": 128000,
+          "context_window": 1000000
+        },
+        "claude-mythos-5": {
+          "display_name": "Claude Mythos 5",
+          "input_cost_per_mtok": 10.0,
+          "output_cost_per_mtok": 50.0,
+          "cache_read_cost_per_mtok": 1.0,
+          "cache_write_cost_per_mtok": 12.5,
+          "max_tokens": 128000,
+          "context_window": 1000000
+        },
+        "claude-sonnet-5": {
+          "display_name": "Claude Sonnet 5",
+          "input_cost_per_mtok": 3.0,
+          "output_cost_per_mtok": 15.0,
+          "cache_read_cost_per_mtok": 0.3,
+          "cache_write_cost_per_mtok": 3.75,
+          "max_tokens": 128000,
           "context_window": 1000000
         },
         "claude-opus-4-8": {

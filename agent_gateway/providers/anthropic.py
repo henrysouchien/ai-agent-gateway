@@ -10,6 +10,7 @@ from typing import Any, AsyncIterator, Dict
 from ..rate_limit import get_global_token_bucket
 from ..rates import RateTable, UnknownModelError, load_rate_table
 from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
+from ..thinking import EffortResolution, clamp_effort
 from .anthropic_helpers import (
   _COMMON_BETA_SLUGS as _COMMON_BETA_SLUGS,
   _COMPACTION_BETA_SLUG as _COMPACTION_BETA_SLUG,
@@ -236,10 +237,16 @@ class AnthropicProvider(ModelProvider):
     if system_blocks:
       params["system"] = system_blocks
 
-    if thinking_level != ThinkingLevel.NONE and max_tokens >= 2048:
-      thinking_param = _thinking_param(model_info, max_tokens)
-      if thinking_param is not None:
-        params["thinking"] = thinking_param
+    effort_resolution = kwargs.get("effort_resolution")
+    if not isinstance(effort_resolution, EffortResolution):
+      effort_resolution = self.resolve_effort(
+        requested=thinking_level,
+        model=model,
+        model_info=model_info,
+        max_tokens=max_tokens,
+        auth_mode=auth_mode,
+      )
+    params.update(effort_resolution.payload_fragments)
 
     compaction_trigger = kwargs.get("compaction_trigger")
     if compaction_trigger is not None:
@@ -254,6 +261,57 @@ class AnthropicProvider(ModelProvider):
       params["context_management"] = {"edits": [compact_edit]}
 
     return params
+
+  def resolve_effort(
+    self,
+    *,
+    requested: ThinkingLevel,
+    model: str,
+    model_info: ModelInfo,
+    max_tokens: int,
+    **request_context: Any,
+  ) -> EffortResolution:
+    del model, request_context
+    if not model_info.supports_thinking or model_info.thinking_mode == "none":
+      return EffortResolution(requested, ThinkingLevel.NONE, False, {})
+
+    compat = dict(model_info.compat or {})
+    if model_info.thinking_mode == "budget":
+      if requested == ThinkingLevel.NONE:
+        return EffortResolution(requested, ThinkingLevel.NONE, False, {})
+      thinking = _thinking_param(model_info, max_tokens)
+      return EffortResolution(
+        requested,
+        ThinkingLevel.HIGH if thinking is not None else ThinkingLevel.NONE,
+        thinking is not None,
+        {"thinking": thinking} if thinking is not None else {},
+      )
+
+    disable = str(compat.get("thinking_disable", "omit"))
+    default_effort = ThinkingLevel(str(compat.get("thinking_default_effort", "none")))
+    omitted_on = str(compat.get("thinking_default_when_omitted", "off")) == "on"
+    supported = tuple(ThinkingLevel(str(value)) for value in compat.get("effort_values", ()))
+
+    if requested == ThinkingLevel.NONE:
+      if disable == "disabled":
+        return EffortResolution(requested, ThinkingLevel.NONE, False, {"thinking": {"type": "disabled"}})
+      if disable == "unsupported":
+        return EffortResolution(requested, default_effort, True, {})
+      return EffortResolution(requested, ThinkingLevel.NONE, False, {})
+
+    normalized = ThinkingLevel.LOW if requested == ThinkingLevel.MINIMAL else requested
+    effective = clamp_effort(normalized, supported) if supported else ThinkingLevel.NONE
+    if max_tokens < 2048:
+      return EffortResolution(
+        requested,
+        default_effort if omitted_on else ThinkingLevel.NONE,
+        omitted_on,
+        {},
+      )
+    fragments: dict[str, Any] = {"thinking": {"type": "adaptive"}}
+    if compat.get("supports_output_config_effort") and effective != ThinkingLevel.NONE:
+      fragments["output_config"] = {"effort": effective.value}
+    return EffortResolution(requested, effective, effective != ThinkingLevel.NONE, fragments)
 
   def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
     tool_id_map: dict[str, str] = {}

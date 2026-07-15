@@ -121,7 +121,8 @@ def test_merge_refreshed_auth_config_preserves_runtime_controls() -> None:
     "auth_token": "",
     "model": "chosen-model",
     "max_tokens": 4096,
-    "thinking": False,
+    "effort": "none",
+    "thinking_enabled_requested": False,
     "billing_mode": "metered",
     "rate_table_version": "2026-04-08",
   }

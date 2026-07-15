@@ -156,7 +156,8 @@ def test_spawn_sub_agent_provider_override_uses_provided_provider_and_auth_confi
       "auth_token": "",
       "model": "gpt-4o-mini",
       "max_tokens": 16000,
-      "thinking": True,
+      "effort": "high",
+      "thinking_enabled_requested": True,
     }
   ]
 
@@ -210,7 +211,8 @@ def test_spawn_sub_agent_without_provider_uses_parent_provider_and_existing_auth
       "auth_token": "",
       "model": "claude-opus-4-6",
       "max_tokens": 16000,
-      "thinking": True,
+      "effort": "high",
+      "thinking_enabled_requested": True,
     }
   ]
 

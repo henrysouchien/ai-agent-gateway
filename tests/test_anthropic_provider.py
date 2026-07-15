@@ -113,7 +113,7 @@ def test_fable_model_info_uses_bundled_rates_and_adaptive_thinking() -> None:
   info = provider.get_model_info("claude-fable-5")
 
   assert info.context_window == 1_000_000
-  assert info.max_output_tokens == 32_000
+  assert info.max_output_tokens == 128_000
   assert info.input_cost_per_mtok == 10.0
   assert info.output_cost_per_mtok == 50.0
   assert info.cache_read_cost_per_mtok == 1.0

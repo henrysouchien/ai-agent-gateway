@@ -75,7 +75,11 @@ def test_circuit_state_is_process_shared_and_byok_grace_is_bounded(tmp_path) -> 
   sibling.assert_work_allowed("byok", now=NOW + timedelta(seconds=30))
   with pytest.raises(CommercialUsageCircuitOpen):
     sibling.assert_work_allowed("byok", now=NOW + timedelta(seconds=30, microseconds=1))
-  sibling.reset()
+  sibling._reset_with_evidence(
+    expected_tripped_at=sibling.snapshot.tripped_at or "",
+    operator_id="test-operator",
+    reconciliation_evidence_id="test:reconciliation:clean",
+  )
   first.assert_work_allowed("metered", now=NOW)
 
 
@@ -300,7 +304,7 @@ def test_outbox_health_failure_trips_shared_breaker_and_alerts(tmp_path) -> None
   assert alerts == ["commercial_usage.outbox_health_failed"]
 
 
-def test_replay_must_drain_emergency_spool_before_operator_reset_allows_work(tmp_path) -> None:
+def test_replay_must_drain_emergency_spool_before_guarded_reset_allows_work(tmp_path) -> None:
   durable = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
 
   class FlakyOutbox:
@@ -322,12 +326,22 @@ def test_replay_must_drain_emergency_spool_before_operator_reset_allows_work(tmp
     max_backlog=100, max_storage_bytes=1_000_000,
   )
   sink([_payload("evt_001")])
-  breaker.reset()
+  incident_at = breaker.snapshot.tripped_at or ""
   with pytest.raises(CommercialUsageCircuitOpen, match="replay is pending"):
-    sink.assert_work_allowed("metered")
+    sink.reset_after_recovery(
+      expected_tripped_at=incident_at,
+      operator_id="test-operator",
+      reconciliation_evidence_id="test:reconciliation:clean",
+      max_backlog_count=1,
+    )
 
   primary.failed = False
   assert sink.replay_emergency() == 1
-  breaker.reset()
-  sink.assert_work_allowed("metered")
   assert durable.get("evt_001") is not None
+  sink.reset_after_recovery(
+    expected_tripped_at=incident_at,
+    operator_id="test-operator",
+    reconciliation_evidence_id="test:reconciliation:clean",
+    max_backlog_count=1,
+  )
+  sink.assert_work_allowed("metered")
