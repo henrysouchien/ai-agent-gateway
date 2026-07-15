@@ -1,8 +1,17 @@
 # Changelog
 
-## Unreleased (post-0.15.10)
+## Unreleased (post-0.15.11)
 
 _No unreleased changes recorded yet._
+
+## 0.15.11 (2026-07-15)
+
+### Fixed
+
+- Kept durable planned-write approval waits outside the runner's generic tool
+  timeout so the approval lifecycle owns expiry and returns an
+  approval-specific outcome instead of cancelling exact-write execution as a
+  generic `tool_timeout`.
 
 ## 0.15.10 (2026-07-15)
 

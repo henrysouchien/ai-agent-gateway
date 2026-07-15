@@ -586,6 +586,21 @@ def _planned_session() -> SimpleNamespace:
   )
 
 
+def test_requires_approval_includes_durable_planned_write_wait() -> None:
+  handler, _change_set, _prepared = _planned_handler(events=[])
+  dispatcher = ToolDispatcher(
+    mcp_client=_NullMcp(),
+    local_tool_handlers={"planned_tool": handler},
+    needs_approval=lambda *_args: False,
+    approved_tool_types=set(),
+    session=_planned_session(),
+    store=object(),
+    policy=object(),
+  )
+
+  assert dispatcher.requires_approval("planned_tool", {"x": 1}) is True
+
+
 _DEFAULT_BUSINESS_MODEL_RESTORE = object()
 
 

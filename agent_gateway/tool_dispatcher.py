@@ -1572,7 +1572,13 @@ class ToolDispatcher:
     return result, error
 
   def requires_approval(self, tool_name: str, tool_input: Dict[str, Any]) -> bool:
-    """Return True if dispatching this tool would block on user approval."""
+    """Return True when dispatch may enter an approval-owned wait.
+
+    Exact-write handlers enter the durable approval lifecycle after planning
+    even when their static tool policy is already allowed. The runner must not
+    wrap that lifecycle in its generic tool timeout; the approval lifecycle has
+    its own expiry and returns an approval-specific result.
+    """
     if self._request_approval is None and not self._approval_lifecycle_configured():
       return False
     qualifier = ""
@@ -1581,7 +1587,31 @@ class ToolDispatcher:
         qualifier = self._approval_key_qualifier(tool_name, tool_input) or ""
       except Exception:
         qualifier = ""
-    return self._should_request_approval(tool_name, tool_input, qualifier)
+    if self._should_request_approval(tool_name, tool_input, qualifier):
+      return True
+    if not self._approval_lifecycle_configured():
+      return False
+
+    try:
+      action = self._catalog_action(tool_name)
+    except TrustedToolPlanError:
+      # Dispatch will return the precise invalid-contract error. Keep the
+      # generic timeout from masking that approval-bound planning path.
+      return True
+    if action is not None and action.planning_identity is not None:
+      return True
+
+    local_handler = self._local.get(tool_name)
+    if local_handler is None:
+      return False
+    try:
+      return self._planned_handler_hooks(
+        tool_name,
+        local_handler,
+        catalog_action=action,
+      ) is not None
+    except TrustedToolPlanError:
+      return True
 
   def _approval_lifecycle_configured(self) -> bool:
     return self._approval_store is not None and self._approval_policy is not None and self._session is not None
