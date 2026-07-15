@@ -320,6 +320,7 @@ class AgentRunner(
     *,
     provider: ModelProvider,
     auth_config: Dict[str, Any] | None = None,
+    allow_stub_response: bool = True,
     client_timeout: float | None = None,
     max_tokens_override: int | None = None,
     per_turn_timeout: float | None = None,
@@ -389,6 +390,7 @@ class AgentRunner(
     self._workspace_dir = str(workspace_dir) if workspace_dir is not None else None
     self._batch_id = str(batch_id).strip() if batch_id is not None and str(batch_id).strip() else None
     self._auth_config = dict(auth_config or {})
+    self._allow_stub_response = bool(allow_stub_response)
     self._effort_resolution = None
     self._client_timeout = client_timeout
     self._max_tokens_override = max_tokens_override

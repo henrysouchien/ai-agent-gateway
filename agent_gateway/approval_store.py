@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from enum import StrEnum
+import hashlib
+import logging
 import os
 import secrets
 import sqlite3
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, Protocol
@@ -35,10 +38,68 @@ from .approval_policy import (
 TERMINAL_STATES = frozenset({"auto_approved", "auto_denied", "approved", "denied", "expired"})
 APPROVAL_DB_PATH_ENV = "GATEWAY_APPROVAL_DB_PATH"
 DEFAULT_APPROVAL_DB_PATH = Path("data/gateway/approvals.sqlite3")
+log = logging.getLogger("agent_gateway.approval_store")
 
 
 class PersistentGrantCancellationFenced(RuntimeError):
   """A grant cannot become visible after its approval entered cancellation."""
+
+
+class PreparedReconciliationConflict(StrEnum):
+  MISSING_APPROVAL = "missing_approval"
+  UNKNOWN_APPROVAL_STATE = "unknown_approval_state"
+  LINEAGE_CONFLICT = "lineage_conflict"
+  CAS_CONFLICT = "cas_conflict"
+
+
+@dataclass(frozen=True)
+class PreparedReconciliationCursor:
+  caller_kind: str
+  user_scope: str
+  idempotency_locator: str
+
+  @property
+  def log_token(self) -> str:
+    identity = "\0".join(
+      (self.caller_kind, self.user_scope, self.idempotency_locator)
+    ).encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class PreparedReconciliationResult:
+  scanned: int = 0
+  authorized: int = 0
+  denied: int = 0
+  expired: int = 0
+  missing_approval: int = 0
+  unknown_approval_state: int = 0
+  lineage_conflict: int = 0
+  cas_conflict: int = 0
+  cursor: PreparedReconciliationCursor | None = None
+  wrapped: bool = False
+
+  @property
+  def conflict_count(self) -> int:
+    return (
+      self.missing_approval
+      + self.unknown_approval_state
+      + self.lineage_conflict
+      + self.cas_conflict
+    )
+
+
+@dataclass(frozen=True)
+class TargetedPreparedReconciliationResult:
+  record: _prepared_bm.PreparedBusinessModelChange | None
+  transitioned: bool = False
+  conflict: PreparedReconciliationConflict | None = None
+
+
+@dataclass(frozen=True)
+class ApprovalMaintenanceResult:
+  approvals_expired: int
+  prepared: PreparedReconciliationResult
 
 
 def resolve_approval_db_path(
@@ -158,6 +219,21 @@ class ApprovalRequestStore(Protocol):
   ) -> DelegationGrant | None: ...
   async def revoke_delegation_grant(self, delegation_id: str, *, revoked_at: datetime | None = None) -> None: ...
   async def expire_pending(self, *, now: datetime | None = None) -> int: ...
+  async def maintain_pending(
+    self,
+    *,
+    now: datetime | None = None,
+    prepared_cursor: PreparedReconciliationCursor | None = None,
+    prepared_page_size: int = 100,
+  ) -> ApprovalMaintenanceResult: ...
+  async def reconcile_prepared_business_model_change(
+    self,
+    *,
+    caller_kind: str,
+    user_scope: str,
+    idempotency_locator: str,
+    now: datetime | None = None,
+  ) -> TargetedPreparedReconciliationResult: ...
 
 
 class SQLiteApprovalStore:
@@ -1433,46 +1509,334 @@ class SQLiteApprovalStore:
         )
         conn.commit()
 
+  def _expire_pending_requests_in_transaction(
+    self,
+    conn: sqlite3.Connection,
+    *,
+    now: datetime,
+  ) -> list[ApprovalRequest]:
+    rows = conn.execute(
+      """
+      SELECT * FROM approval_requests
+      WHERE state IN ('pending_user', 'routed_external')
+        AND expires_at IS NOT NULL
+        AND expires_at <= ?
+      """,
+      (_dt_to_text(now),),
+    ).fetchall()
+    expired: list[ApprovalRequest] = []
+    for row in rows:
+      current = self._row_to_request(row)
+      updated = replace(
+        current,
+        state="expired",
+        state_version=current.state_version + 1,
+        decided_at=now,
+        decision="expired",
+      )
+      cursor = conn.execute(
+        """
+        UPDATE approval_requests SET
+          state = :state,
+          state_version = :state_version,
+          decided_at = :decided_at,
+          decision = :decision
+        WHERE approval_id = :approval_id
+          AND state IN ('pending_user', 'routed_external')
+          AND state_version = :expected_state_version
+        """,
+        {
+          **self._request_to_row(updated),
+          "expected_state_version": current.state_version,
+        },
+      )
+      if cursor.rowcount == 1:
+        expired.append(updated)
+    return expired
+
+  @staticmethod
+  def _prepared_cursor_for_record(
+    record: _prepared_bm.PreparedBusinessModelChange,
+  ) -> PreparedReconciliationCursor:
+    return PreparedReconciliationCursor(
+      caller_kind=record.caller_kind,
+      user_scope=record.user_scope,
+      idempotency_locator=record.idempotency_locator,
+    )
+
+  @staticmethod
+  def _pending_prepared_page(
+    conn: sqlite3.Connection,
+    *,
+    cursor: PreparedReconciliationCursor | None,
+    page_size: int,
+  ) -> list[sqlite3.Row]:
+    if cursor is None:
+      return conn.execute(
+        """
+        SELECT * FROM prepared_business_model_change
+        WHERE lifecycle = 'PENDING'
+        ORDER BY caller_kind, user_scope, idempotency_locator
+        LIMIT ?
+        """,
+        (page_size,),
+      ).fetchall()
+    return conn.execute(
+      """
+      SELECT * FROM prepared_business_model_change
+      WHERE lifecycle = 'PENDING'
+        AND (
+          caller_kind > ?
+          OR (caller_kind = ? AND user_scope > ?)
+          OR (
+            caller_kind = ? AND user_scope = ?
+            AND idempotency_locator > ?
+          )
+        )
+      ORDER BY caller_kind, user_scope, idempotency_locator
+      LIMIT ?
+      """,
+      (
+        cursor.caller_kind,
+        cursor.caller_kind,
+        cursor.user_scope,
+        cursor.caller_kind,
+        cursor.user_scope,
+        cursor.idempotency_locator,
+        page_size,
+      ),
+    ).fetchall()
+
+  @staticmethod
+  def _reconcile_prepared_record_in_transaction(
+    conn: sqlite3.Connection,
+    *,
+    record: _prepared_bm.PreparedBusinessModelChange,
+    now: datetime,
+  ) -> TargetedPreparedReconciliationResult:
+    if record.lifecycle is not _prepared_bm.PreparedBusinessModelLifecycle.PENDING:
+      return TargetedPreparedReconciliationResult(record=record)
+
+    if record.expires_at is not None:
+      expires_at = _prepared_bm._parse_timestamp(record.expires_at, "expires_at")
+      if expires_at <= now.astimezone(UTC):
+        try:
+          expired = _prepared_bm.transition(
+            conn,
+            caller_kind=record.caller_kind,
+            user_scope=record.user_scope,
+            idempotency_locator=record.idempotency_locator,
+            expected=_prepared_bm.PreparedBusinessModelLifecycle.PENDING,
+            target=_prepared_bm.PreparedBusinessModelLifecycle.EXPIRED,
+            approval_id=record.approval_id,
+            approval_chain_id=record.approval_chain_id,
+          )
+        except _prepared_bm.PreparedBusinessModelError:
+          current = _prepared_bm.get(
+            conn,
+            caller_kind=record.caller_kind,
+            user_scope=record.user_scope,
+            idempotency_locator=record.idempotency_locator,
+          )
+          return TargetedPreparedReconciliationResult(
+            record=current,
+            conflict=PreparedReconciliationConflict.CAS_CONFLICT,
+          )
+        return TargetedPreparedReconciliationResult(
+          record=expired,
+          transitioned=True,
+        )
+
+    approval_row = conn.execute(
+      "SELECT approval_id, approval_chain_id, state FROM approval_requests WHERE approval_id = ?",
+      (record.approval_id,),
+    ).fetchone()
+    if approval_row is None:
+      return TargetedPreparedReconciliationResult(
+        record=record,
+        conflict=PreparedReconciliationConflict.MISSING_APPROVAL,
+      )
+    if str(approval_row["approval_chain_id"]) != record.approval_chain_id:
+      return TargetedPreparedReconciliationResult(
+        record=record,
+        conflict=PreparedReconciliationConflict.LINEAGE_CONFLICT,
+      )
+
+    approval_state = str(approval_row["state"])
+    target = {
+      "approved": _prepared_bm.PreparedBusinessModelLifecycle.AUTHORIZED,
+      "auto_approved": _prepared_bm.PreparedBusinessModelLifecycle.AUTHORIZED,
+      "denied": _prepared_bm.PreparedBusinessModelLifecycle.DENIED,
+      "auto_denied": _prepared_bm.PreparedBusinessModelLifecycle.DENIED,
+      "cancelled": _prepared_bm.PreparedBusinessModelLifecycle.DENIED,
+      "expired": _prepared_bm.PreparedBusinessModelLifecycle.EXPIRED,
+    }.get(approval_state)
+    if target is None:
+      if approval_state in {"created", "pending_user", "routed_external"}:
+        return TargetedPreparedReconciliationResult(record=record)
+      return TargetedPreparedReconciliationResult(
+        record=record,
+        conflict=PreparedReconciliationConflict.UNKNOWN_APPROVAL_STATE,
+      )
+    try:
+      reconciled = _prepared_bm.transition(
+        conn,
+        caller_kind=record.caller_kind,
+        user_scope=record.user_scope,
+        idempotency_locator=record.idempotency_locator,
+        expected=_prepared_bm.PreparedBusinessModelLifecycle.PENDING,
+        target=target,
+        approval_id=record.approval_id,
+        approval_chain_id=record.approval_chain_id,
+      )
+    except _prepared_bm.PreparedBusinessModelError:
+      current = _prepared_bm.get(
+        conn,
+        caller_kind=record.caller_kind,
+        user_scope=record.user_scope,
+        idempotency_locator=record.idempotency_locator,
+      )
+      return TargetedPreparedReconciliationResult(
+        record=current,
+        conflict=PreparedReconciliationConflict.CAS_CONFLICT,
+      )
+    return TargetedPreparedReconciliationResult(
+      record=reconciled,
+      transitioned=True,
+    )
+
+  def _reconcile_prepared_page_in_transaction(
+    self,
+    conn: sqlite3.Connection,
+    *,
+    now: datetime,
+    cursor: PreparedReconciliationCursor | None,
+    page_size: int,
+  ) -> PreparedReconciliationResult:
+    if type(page_size) is not int or not 1 <= page_size <= 1000:
+      raise ValueError("prepared reconciliation page_size must be between 1 and 1000")
+    if cursor is not None and type(cursor) is not PreparedReconciliationCursor:
+      raise TypeError("prepared reconciliation cursor must be typed")
+
+    wrapped = False
+    rows = self._pending_prepared_page(
+      conn,
+      cursor=cursor,
+      page_size=page_size,
+    )
+    if not rows and cursor is not None:
+      wrapped = True
+      rows = self._pending_prepared_page(
+        conn,
+        cursor=None,
+        page_size=page_size,
+      )
+
+    counts = {
+      "authorized": 0,
+      "denied": 0,
+      "expired": 0,
+      "missing_approval": 0,
+      "unknown_approval_state": 0,
+      "lineage_conflict": 0,
+      "cas_conflict": 0,
+    }
+    next_cursor: PreparedReconciliationCursor | None = None
+    for row in rows:
+      record = _prepared_bm._from_row(row)
+      next_cursor = self._prepared_cursor_for_record(record)
+      item = self._reconcile_prepared_record_in_transaction(
+        conn,
+        record=record,
+        now=now,
+      )
+      if item.conflict is not None:
+        counts[item.conflict.value] += 1
+      elif item.transitioned and item.record is not None:
+        if item.record.lifecycle is _prepared_bm.PreparedBusinessModelLifecycle.AUTHORIZED:
+          counts["authorized"] += 1
+        elif item.record.lifecycle is _prepared_bm.PreparedBusinessModelLifecycle.DENIED:
+          counts["denied"] += 1
+        elif item.record.lifecycle is _prepared_bm.PreparedBusinessModelLifecycle.EXPIRED:
+          counts["expired"] += 1
+    return PreparedReconciliationResult(
+      scanned=len(rows),
+      cursor=next_cursor,
+      wrapped=wrapped,
+      **counts,
+    )
+
   async def expire_pending(self, *, now: datetime | None = None) -> int:
     now_value = now or utc_now()
-    expired: list[ApprovalRequest] = []
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute(
-          """
-          SELECT * FROM approval_requests
-          WHERE state IN ('pending_user', 'routed_external')
-            AND expires_at IS NOT NULL
-            AND expires_at <= ?
-          """,
-          (_dt_to_text(now_value),),
-        ).fetchall()
-        for row in rows:
-          current = self._row_to_request(row)
-          updated = replace(
-            current,
-            state="expired",
-            state_version=current.state_version + 1,
-            decided_at=now_value,
-            decision="expired",
-          )
-          conn.execute(
-            """
-            UPDATE approval_requests SET
-              state = :state,
-              state_version = :state_version,
-              decided_at = :decided_at,
-              decision = :decision
-            WHERE approval_id = :approval_id
-            """,
-            self._request_to_row(updated),
-          )
-          expired.append(updated)
+        expired = self._expire_pending_requests_in_transaction(
+          conn,
+          now=now_value,
+        )
         conn.commit()
     for request in expired:
       await self._emit("expired", request)
     return len(expired)
+
+  async def maintain_pending(
+    self,
+    *,
+    now: datetime | None = None,
+    prepared_cursor: PreparedReconciliationCursor | None = None,
+    prepared_page_size: int = 100,
+  ) -> ApprovalMaintenanceResult:
+    now_value = now or utc_now()
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        expired = self._expire_pending_requests_in_transaction(
+          conn,
+          now=now_value,
+        )
+        prepared = self._reconcile_prepared_page_in_transaction(
+          conn,
+          now=now_value,
+          cursor=prepared_cursor,
+          page_size=prepared_page_size,
+        )
+        conn.commit()
+    for request in expired:
+      await self._emit("expired", request)
+    return ApprovalMaintenanceResult(
+      approvals_expired=len(expired),
+      prepared=prepared,
+    )
+
+  async def reconcile_prepared_business_model_change(
+    self,
+    *,
+    caller_kind: str,
+    user_scope: str,
+    idempotency_locator: str,
+    now: datetime | None = None,
+  ) -> TargetedPreparedReconciliationResult:
+    now_value = now or utc_now()
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        record = _prepared_bm.get(
+          conn,
+          caller_kind=caller_kind,
+          user_scope=user_scope,
+          idempotency_locator=idempotency_locator,
+        )
+        if record is None:
+          conn.commit()
+          return TargetedPreparedReconciliationResult(record=None)
+        result = self._reconcile_prepared_record_in_transaction(
+          conn,
+          record=record,
+          now=now_value,
+        )
+        conn.commit()
+        return result
 
   async def enqueue_pending_approval_notification(self, request: ApprovalRequest) -> dict[str, Any] | None:
     if request.state != "pending_user":
@@ -2201,6 +2565,32 @@ class SQLiteApprovalStore:
 
 
 async def expire_pending_loop(store: ApprovalRequestStore, *, interval_seconds: float = 30.0) -> None:
+  prepared_cursor: PreparedReconciliationCursor | None = None
   while True:
     await asyncio.sleep(interval_seconds)
-    await store.expire_pending()
+    maintain = getattr(store, "maintain_pending", None)
+    if not callable(maintain):
+      await store.expire_pending()
+      continue
+    result = await maintain(prepared_cursor=prepared_cursor)
+    prepared_cursor = result.prepared.cursor
+    fields = {
+      "approvals_expired": result.approvals_expired,
+      "prepared_scanned": result.prepared.scanned,
+      "prepared_authorized": result.prepared.authorized,
+      "prepared_denied": result.prepared.denied,
+      "prepared_expired": result.prepared.expired,
+      "prepared_cursor": (
+        result.prepared.cursor.log_token
+        if result.prepared.cursor is not None
+        else None
+      ),
+      "prepared_cursor_wrapped": result.prepared.wrapped,
+      "prepared_missing_approval": result.prepared.missing_approval,
+      "prepared_unknown_approval_state": result.prepared.unknown_approval_state,
+      "prepared_lineage_conflict": result.prepared.lineage_conflict,
+      "prepared_cas_conflict": result.prepared.cas_conflict,
+    }
+    log.info("approval maintenance completed", extra=fields)
+    if result.prepared.conflict_count:
+      log.warning("prepared BusinessModel reconciliation conflicts", extra=fields)

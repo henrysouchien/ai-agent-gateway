@@ -8,6 +8,7 @@ from agent_gateway.skill_context import current_skill
 from agent_gateway.artifact_paths import canonicalize_ticker
 
 from . import batches
+from .corpus_readiness import CorpusReadinessGateError
 from .runs_helpers import _session_owner_user_id
 
 VALUATION_READY_SKILL = "valuation-ready"
@@ -37,8 +38,18 @@ VALUATION_READY_BATCH_DISPATCH_TOOL_DEF: dict[str, Any] = {
         "description": "Optional max concurrent ticker runs. Single-ticker dispatch defaults to 1.",
         "minimum": 1,
       },
+      "required_filings": {
+        "type": "array",
+        "description": "Exact SEC filing fiscal periods required before spend (YYYY-Q1..Q4 or YYYY-FY).",
+        "items": {"type": "string", "pattern": "^[0-9]{4}-(?:Q[1-4]|FY)$"},
+      },
+      "required_transcripts": {
+        "type": "array",
+        "description": "Exact earnings transcript fiscal periods required before spend (YYYY-Q1..Q4 or YYYY-FY).",
+        "items": {"type": "string", "pattern": "^[0-9]{4}-(?:Q[1-4]|FY)$"},
+      },
     },
-    "required": ["ticker"],
+    "required": ["ticker", "required_filings", "required_transcripts"],
     "additionalProperties": False,
   },
 }
@@ -176,6 +187,11 @@ def _dispatch_spec(tool_input: dict[str, Any]) -> tuple[dict[str, Any] | None, d
     "pipeline_template": VALUATION_READY_TEMPLATE,
     "budget_usd": budget_usd,
     "max_concurrency": max_concurrency,
+    "corpus_requirements": [{
+      "ticker": ticker,
+      "required_filings": (tool_input or {}).get("required_filings"),
+      "required_transcripts": (tool_input or {}).get("required_transcripts"),
+    }],
   }, None
 
 
@@ -194,11 +210,20 @@ def _make_dispatch_handler(*, app_state: Any, session: Any) -> ToolHandler:
         app_state=app_state,
         user_id=_session_owner_user_id(session),
         user_email=getattr(session, "user_email", None),
+        auth_config=(
+          dict(getattr(session, "auth_config", None) or {})
+          if getattr(session, "auth_config", None) is not None
+          else None
+        ),
         channel=getattr(session, "channel", None),
       )
     except batches._active_batch_error_type() as exc:
       return None, {"code": "active_batch_conflict", "message": str(exc)}
+    except CorpusReadinessGateError as exc:
+      return None, exc.to_payload()
     except ValueError as exc:
+      if str(exc) == "authenticated batch credential unavailable":
+        return None, {"code": "credential_unavailable", "message": str(exc)}
       return None, {"code": "invalid_batch_spec", "message": str(exc)}
     except Exception as exc:
       return None, {"code": "batch_dispatch_failed", "message": str(exc)}

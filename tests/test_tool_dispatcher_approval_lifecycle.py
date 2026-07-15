@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sys
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -839,18 +840,29 @@ def test_fms_business_model_missing_restoration_proof_does_not_supersede(
 
 
 @pytest.mark.parametrize(
-  ("resolved_state", "expected_lifecycle", "expect_execution"),
+  (
+    "resolved_state",
+    "prepared_ttl_elapsed",
+    "concurrent_sweep",
+    "expected_lifecycle",
+    "expect_execution",
+  ),
   [
-    ("approved", PreparedBusinessModelLifecycle.CONSUMED, True),
-    ("auto_approved", PreparedBusinessModelLifecycle.CONSUMED, True),
-    ("denied", PreparedBusinessModelLifecycle.DENIED, False),
-    ("auto_denied", PreparedBusinessModelLifecycle.DENIED, False),
-    ("expired", PreparedBusinessModelLifecycle.EXPIRED, False),
+    ("approved", False, False, PreparedBusinessModelLifecycle.CONSUMED, True),
+    ("approved", False, True, PreparedBusinessModelLifecycle.CONSUMED, True),
+    ("auto_approved", False, False, PreparedBusinessModelLifecycle.CONSUMED, True),
+    ("denied", False, False, PreparedBusinessModelLifecycle.DENIED, False),
+    ("auto_denied", False, False, PreparedBusinessModelLifecycle.DENIED, False),
+    ("cancelled", False, False, PreparedBusinessModelLifecycle.DENIED, False),
+    ("expired", False, False, PreparedBusinessModelLifecycle.EXPIRED, False),
+    ("approved", True, False, PreparedBusinessModelLifecycle.EXPIRED, False),
   ],
 )
 def test_fms_business_model_pending_record_reconciles_original_approval(
   tmp_path: Path,
   resolved_state: str,
+  prepared_ttl_elapsed: bool,
+  concurrent_sweep: bool,
   expected_lifecycle: PreparedBusinessModelLifecycle,
   expect_execution: bool,
 ) -> None:
@@ -918,6 +930,21 @@ def test_fms_business_model_pending_record_reconciles_original_approval(
   original_approval_id = pending.approval_id
   original = asyncio.run(store.get(original_approval_id))
   assert original is not None
+  if prepared_ttl_elapsed:
+    with store._connection() as conn:
+      conn.execute(
+        """
+        UPDATE prepared_business_model_change
+        SET expires_at = ?
+        WHERE caller_kind = ? AND user_scope = ? AND idempotency_locator = ?
+        """,
+        (
+          (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+          pending.caller_kind,
+          pending.user_scope,
+          pending.idempotency_locator,
+        ),
+      )
   asyncio.run(
     store.transition_state(
       original_approval_id,
@@ -926,14 +953,23 @@ def test_fms_business_model_pending_record_reconciles_original_approval(
     )
   )
 
-  result, error = asyncio.run(
-    dispatcher.dispatch(
+  async def retry_with_optional_sweep():
+    retry = dispatcher.dispatch(
       "call-phase6-resume",
       "fms_persist_business_model",
       {"judgment": {"ticker": "TEST"}},
       skill_run_id="skill-run-phase6",
     )
-  )
+    if not concurrent_sweep:
+      return await retry
+    independent_store = SQLiteApprovalStore(store.path)
+    retry_result, _maintenance = await asyncio.gather(
+      retry,
+      independent_store.maintain_pending(),
+    )
+    return retry_result
+
+  result, error = asyncio.run(retry_with_optional_sweep())
 
   if expect_execution:
     assert error is None
@@ -1322,7 +1358,10 @@ def test_planned_dispatch_persistent_grant_still_creates_bound_row(
   assert events == ["plan", "execute"]
   request = asyncio.run(store.get(result["approval_id"]))
   assert request is not None
+  assert request.approval_id != prior_approval.approval_id
   assert request.state == "auto_approved"
+  assert request.authorization_mode == "PERSISTENT_GRANT"
+  assert request.grant_reference == "grant-planned"
   assert request.identity_source == "change_set"
   assert request.change_set_id == change_set.change_set_id
   assert request.change_hash == change_set.change_hash

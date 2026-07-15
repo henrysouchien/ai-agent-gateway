@@ -226,14 +226,29 @@ class RunnerRunLoopMixin:
       )
 
       if not self._provider.has_active_credential(config):
-        await self._emit_stub_response(messages)
+        if getattr(self, "_allow_stub_response", True):
+          await self._emit_stub_response(messages)
+          return
+        provider_name = str(getattr(self._provider, "name", "unknown") or "unknown")
+        message = (
+          "Provider startup failed: no active credential configured "
+          f"for provider={provider_name}."
+        )
+        logger.error("[%s] %s", self._sid, message)
+        await self._emit_error_event(message)
         return
 
       try:
         client = self._provider.create_client(config, timeout=self._client_timeout)
         self._set_client(client)
       except Exception:
-        await self._emit_stub_response(messages)
+        if getattr(self, "_allow_stub_response", True):
+          await self._emit_stub_response(messages)
+          return
+        provider_name = str(getattr(self._provider, "name", "unknown") or "unknown")
+        message = f"Provider startup failed: could not create client for provider={provider_name}."
+        logger.exception("[%s] %s", self._sid, message)
+        await self._emit_error_event(message)
         return
 
       try:

@@ -176,6 +176,27 @@ from .server_chat_helpers import (  # noqa: F401
 ) = _server_streaming.bind_streaming_helpers(lambda: globals())
 
 
+def _find_route_endpoint_by_name(routes: list[Any], route_name: str) -> Any:
+  """Resolve an endpoint across eager and FastAPI 0.139 lazy router trees."""
+  pending = list(routes)
+  visited: set[int] = set()
+  while pending:
+    route = pending.pop()
+    route_id = id(route)
+    if route_id in visited:
+      continue
+    visited.add(route_id)
+    if getattr(route, "name", None) == route_name:
+      endpoint = getattr(route, "endpoint", None)
+      if endpoint is not None:
+        return endpoint
+    original_router = getattr(route, "original_router", None)
+    nested_routes = getattr(original_router, "routes", None)
+    if nested_routes is not None:
+      pending.extend(nested_routes)
+  raise LookupError(f"Gateway route endpoint not found: {route_name}")
+
+
 def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   """Create a FastAPI gateway application from explicit runtime configuration.
 
@@ -863,11 +884,13 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   )
   app.state.gateway_chat_init = chat_init
   app.state.gateway_chat_stream = chat_stream
-  app.state.gateway_control_session = next(
-    route.endpoint for route in app.routes if getattr(route, "path", None) == f"{control_prefix}/session"
+  app.state.gateway_control_session = _find_route_endpoint_by_name(
+    app.routes,
+    "control_session",
   )
-  app.state.gateway_control_health = next(
-    route.endpoint for route in app.routes if getattr(route, "path", None) == f"{control_prefix}/health"
+  app.state.gateway_control_health = _find_route_endpoint_by_name(
+    app.routes,
+    "control_health",
   )
   app.state.gateway_artifact_latest = artifact_latest
   app.state.gateway_artifact_by_id = artifact_by_id

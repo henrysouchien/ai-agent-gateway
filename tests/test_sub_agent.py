@@ -814,6 +814,34 @@ def test_make_run_agent_handler_uses_anonymous_defaults_for_blank_agent(
   assert call["timeout"] == 42.0
 
 
+def test_make_run_agent_handler_supports_anonymous_prompt_and_progress_hook(
+  tmp_path: Path,
+) -> None:
+  runner = _StubRunner()
+  observed: list[tuple[dict[str, Any], str, int]] = []
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=SkillLoader(tmp_path / "skills"),
+    mcp_client=_StubMcpClient(),
+    local_tool_handlers={},
+    anonymous_system_prompt_template="Focused helper for {date}.",
+    on_sub_event=lambda event, session_id, call_index: observed.append(
+      (event, session_id, call_index)
+    ),
+  )
+
+  result, error = _run(handler({"task": "Quick question"}, call_index=4))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  call = runner.calls[0]
+  assert call["system_prompt"] == f"Focused helper for {datetime.date.today().isoformat()}."
+  event = {"type": "tool_call_start", "tool_name": "lookup"}
+  call["on_sub_event"](event, "child-session")
+  assert observed == [(event, "child-session", 4)]
+  assert [entry.event for entry in call["dispatcher"]._event_log.entries] == [event]
+
+
 def test_make_run_agent_handler_does_not_advertise_artifact_stub_for_generic_agent(
   tmp_path: Path,
 ) -> None:

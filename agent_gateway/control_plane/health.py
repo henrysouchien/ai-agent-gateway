@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import Any
+
 from fastapi import APIRouter, Request
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
@@ -17,13 +20,28 @@ class ControlHealthResponse(BaseModel):
 def _control_route_entries(request: Request, route_prefix: str) -> list[str]:
   control_prefix = f"{route_prefix.rstrip('/')}/control" if route_prefix else "/control"
   entries: list[str] = []
-  for route in request.app.routes:
-    if not isinstance(route, APIRoute):
-      continue
-    if route.path != control_prefix and not route.path.startswith(f"{control_prefix}/"):
+
+  def iter_api_routes(
+    routes: Iterable[Any],
+    prefix: str = "",
+  ) -> Iterable[tuple[APIRoute, str]]:
+    for route in routes:
+      if isinstance(route, APIRoute):
+        yield route, f"{prefix}{route.path}"
+        continue
+      original_router = getattr(route, "original_router", None)
+      nested_routes = getattr(original_router, "routes", None)
+      if nested_routes is None:
+        continue
+      include_context = getattr(route, "include_context", None)
+      nested_prefix = str(getattr(include_context, "prefix", "") or "")
+      yield from iter_api_routes(nested_routes, f"{prefix}{nested_prefix}")
+
+  for route, path in iter_api_routes(request.app.routes):
+    if path != control_prefix and not path.startswith(f"{control_prefix}/"):
       continue
     methods = sorted(method for method in route.methods if method not in {"HEAD", "OPTIONS"})
-    entries.extend(f"{method} {route.path}" for method in methods)
+    entries.extend(f"{method} {path}" for method in methods)
   return sorted(entries)
 
 

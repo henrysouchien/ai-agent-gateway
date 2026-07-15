@@ -179,6 +179,29 @@ Important nuance:
 - `create_agent()` only installs built-in approval behavior for `code_execute`, and only when the resolved backend is unsandboxed subprocess execution.
 - If you want approval for arbitrary tools, use `create_gateway_app()` and construct `ToolDispatcher` with your own `needs_approval` callback. Example: [`../examples/06-tool-approval/`](../examples/06-tool-approval/)
 
+### Persistent grants and per-call authorization
+
+A persistent grant is eligibility to mint authorization for a new invocation; it is not itself executable authority. The default policy looks up an active grant by exact `user_id`, tool name, and derived scope hint. A finite `expires_at` and revocation close that lookup. When a grant matches, the gateway still creates a new durable approval request for the invocation and records `authorization_mode=PERSISTENT_GRANT` plus the source grant ID in `grant_reference`.
+
+The per-call row binds the current actor, tool, redacted argument projection and argument hash, policy identity, and request context. For exact-planned tools, the row also binds the current plan/change identity; the trusted carrier separately proves that identity is linked to the prepared payload. The dispatcher revalidates the row against the carrier immediately before execution. For FMS ChangeSet writes, the effect interpreter rechecks the live base before the first effect. A grant therefore never authorizes reuse of a prior plan or bypasses the current validation owned by an exact executor.
+
+Current grant matching has two deliberate facts and one known limitation:
+
+- The default scope hint includes the tool class, tool name, and the first available `ticker`, `symbol`, `portfolio_id`, or `account_id`. The reminted approval and execution authorization carry the current tenant context, but the persistent-grant lookup key itself is not tenant-keyed.
+- `args_predicate` is persisted on a grant, but `SingleUserApprovalPolicy` does not currently evaluate it during persistent-grant lookup. It is stored metadata, not an active authorization boundary in the default policy. Tightening this would change which existing grants are accepted and requires a separately reviewed compatibility and policy decision.
+- Revocation is linearized by the active-grant lookup. A revocation committed before that query prevents the match. Once lookup has returned a grant, a later revocation prevents future matches but does not retract the per-call decision already in progress.
+
+Grant lifetime and invocation lifetime are separate:
+
+| Record | Current time semantics |
+| --- | --- |
+| Persistent grant | `expires_at=NULL` means indefinite until revoked. Ordinary grant creation currently writes `NULL`; a finite timestamp, when supplied, is enforced at lookup. |
+| Default human prompt | The policy requests 600 seconds. The lifecycle may reduce the effective window, notably to stay within a trade preview's lifetime, and stores the resulting expiry on the pending row. |
+| Prepared BusinessModel approval | A missing per-call expiry is replaced with a 15-minute expiry before the prepared row is stored. |
+| Generic grant-reminted approval | May retain `expires_at=NULL`. That means no approval-row time deadline; argument/identity, exact-plan, proposal TTL, and live-base checks still apply where those contracts exist. |
+
+Adding a default TTL to grants or all reminted approvals would be a product-policy, migration, and client-UI change. It is not implied by the current schema and must not be introduced as a documentation-only hardening change. `grant_reference` provides durable approval/execution lineage to the source grant; not every projected audit-event JSON currently includes that field.
+
 ## Sessions And Auth
 
 Sessions are first-class runtime state.

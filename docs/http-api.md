@@ -1036,6 +1036,8 @@ When a tool needs approval:
 
 If `allow_tool_type=true`, the server stores that approval in `session.approved_tool_types` for the rest of the session. For code execution, the qualifier usually resolves to `docker` or `subprocess`, so approval can be scoped to a specific backend.
 
+When the configured policy permits it, the same approval can also mint a durable persistent grant. A later grant match still creates a new per-call approval/authorization record; clients must not treat the grant ID as executable authority or assume it reuses an earlier plan. Grant and per-call expiry, revocation-race, scope, and current predicate limitations are documented in [Persistent grants and per-call authorization](architecture.md#persistent-grants-and-per-call-authorization). The API does not currently let a client select a default grant TTL.
+
 ## Notes For Frontend Clients
 
 - Treat `stream_complete`, `error`, and `stream_error` as terminal events.

@@ -124,6 +124,8 @@ def make_run_agent_handler(
   default_timeout: float | None = DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
   default_max_tokens: int = 64000,
   allowed_models: set[str] | None = None,
+  anonymous_system_prompt_template: str = _DEFAULT_SYSTEM_PROMPT_TEMPLATE,
+  on_sub_event: Callable[[dict[str, Any], str, int], None] | None = None,
   on_before_background: Callable[[str | None], None] | None = None,
   on_background_complete: Callable[[Any], Awaitable[None]] | None = None,
   provider_resolver: ProviderResolver | None = None,
@@ -139,7 +141,9 @@ def make_run_agent_handler(
 
   The returned handler validates input, optionally resolves a named skill,
   constructs a constrained sub-agent dispatcher, and delegates execution to
-  `AgentRunner.spawn_sub_agent()`.
+  `AgentRunner.spawn_sub_agent()`. Anonymous agents may use a caller-supplied
+  prompt template, and callers may observe child events without replacing the
+  gateway's internal event log.
   """
   effective_allowed_models = allowed_models if allowed_models is not None else _get_allowed_models_for_provider_name("anthropic")
   effective_coordinator = coordinator_config if coordinator_config is not None and coordinator_config.enabled else None
@@ -252,7 +256,7 @@ def make_run_agent_handler(
       effective_timeout = profile.timeout if profile.timeout is not None else default_timeout
       effective_max_tokens = profile.max_tokens if profile.max_tokens is not None else default_max_tokens
     else:
-      system_prompt = _DEFAULT_SYSTEM_PROMPT_TEMPLATE.format(
+      system_prompt = anonymous_system_prompt_template.format(
         date=datetime.date.today().isoformat(),
       )
       effective_max_turns = default_max_turns
@@ -398,6 +402,16 @@ def make_run_agent_handler(
     async def _dispatch_sub_agent(_background_input: dict[str, Any], **background_kwargs: Any):
       background_call_index = int(background_kwargs.get("call_index", call_index) or 0)
       task_entry = background_kwargs.get("task_entry")
+
+      def _record_sub_event(event: dict[str, Any], session_id: str) -> None:
+        sub_log.append(event)
+        if on_sub_event is None:
+          return
+        try:
+          on_sub_event(event, session_id, background_call_index)
+        except Exception:
+          log.warning("External sub-agent event callback failed", exc_info=True)
+
       sub_session = None
       if parent_session is not None:
         sub_session = GatewaySession(
@@ -432,7 +446,7 @@ def make_run_agent_handler(
         call_index=background_call_index,
         parent_turn_id=parent_turn_id,
         task_entry=task_entry,
-        on_sub_event=lambda event, _sid: sub_log.append(event),
+        on_sub_event=_record_sub_event,
       )
 
     if background:

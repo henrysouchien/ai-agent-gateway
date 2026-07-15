@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import inspect
+import json
 import sys
 import threading
 import time
@@ -55,6 +56,29 @@ class FakeActiveBatchError(RuntimeError):
   def __init__(self, batch_id: int) -> None:
     self.batch_id = batch_id
     super().__init__(f"active batch already exists: {batch_id}")
+
+
+class ReadyCorpusMcpClient:
+  def __init__(self, *, ready: bool = True) -> None:
+    self.ready = ready
+    self.calls: list[tuple[str, dict[str, Any]]] = []
+
+  def get_server_for_tool(self, name: str) -> str | None:
+    return "research-corpus-mcp" if name == "check_corpus_readiness" else None
+
+  async def call_tool(self, name: str, tool_input: dict[str, Any]):
+    self.calls.append((name, dict(tool_input)))
+    return {
+      "status": "success",
+      **tool_input,
+      "ready": self.ready,
+      "found_filings": list(tool_input["required_filings"]) if self.ready else [],
+      "found_transcripts": list(tool_input["required_transcripts"]) if self.ready else [],
+      "missing_filings": [] if self.ready else list(tool_input["required_filings"]),
+      "missing_transcripts": [] if self.ready else list(tool_input["required_transcripts"]),
+      "unavailable_filings": [],
+      "unavailable_transcripts": [],
+    }, None
 
 
 class FakeBatchController:
@@ -153,7 +177,7 @@ class FakeBatchController:
       await result
 
 
-def _make_app():
+def _make_app(*, mcp_client: Any = None):
   async def _build_chat_runtime(*, session, request, channel, auth_manager):
     _ = session, request, channel, auth_manager
     return ChatRuntime(system_prompt="test", build_runner=lambda *_args: None)
@@ -165,6 +189,7 @@ def _make_app():
       auth_config={"model": "test-model"},
       allowed_models=set(),
       build_chat_runtime=_build_chat_runtime,
+      mcp_client=mcp_client,
     )
   )
 
@@ -443,11 +468,46 @@ def test_batch_detail_includes_diligence_prs(tmp_path: Path) -> None:
   registry.close()
 
 
+def test_retry_spec_narrows_persisted_corpus_requirements_to_failed_tickers() -> None:
+  prior = {
+    "spec_json": json.dumps({
+      "source": "explicit_ticker",
+      "universe": ["MSFT", "ADI"],
+      "pipeline_template": "valuation-ready",
+      "corpus_requirements": [
+        {
+          "ticker": "MSFT",
+          "required_filings": ["2025-FY"],
+          "required_transcripts": ["2026-Q2"],
+        },
+        {
+          "ticker": "ADI",
+          "required_filings": ["2025-FY"],
+          "required_transcripts": ["2026-Q3"],
+        },
+      ],
+    })
+  }
+
+  retry = batches_module._retry_spec(prior, ["ADI"])
+
+  assert retry["universe"] == ["ADI"]
+  assert retry["corpus_requirements"] == [{
+    "ticker": "ADI",
+    "required_filings": ["2025-FY"],
+    "required_transcripts": ["2026-Q3"],
+  }]
+
+
 def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
   fake_batch_control: FakeBatchController,
 ) -> None:
   async def run_case() -> None:
-    app_state = SimpleNamespace(user_event_bus=None)
+    mcp_client = ReadyCorpusMcpClient()
+    app_state = SimpleNamespace(
+      user_event_bus=None,
+      gateway_config=SimpleNamespace(mcp_client=mcp_client),
+    )
     session = SimpleNamespace(
       user_id="alice",
       owner_user_id="1",
@@ -458,16 +518,27 @@ def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
     bundle = make_valuation_ready_skill_tool_bundle(app_state=app_state, session=session)
     dispatch = bundle["handlers"]["valuation_ready_batch_dispatch"]
     read = bundle["handlers"]["valuation_ready_batch_read"]
+    dispatch_schema = bundle["tool_definitions"][0]["input_schema"]
+    assert dispatch_schema["required"] == [
+      "ticker",
+      "required_filings",
+      "required_transcripts",
+    ]
 
     token = set_current_skill("valuation-ready")
     try:
-      result, error = await dispatch({"ticker": "adi"})
+      result, error = await dispatch({
+        "ticker": "adi",
+        "required_filings": ["2025-FY", "2026-Q2"],
+        "required_transcripts": ["2026-Q1", "2026-Q2"],
+      })
       assert error is None
       assert result["status"] == "running"
       assert result["source"] == "explicit_ticker"
       assert result["pipeline_template"] == "valuation-ready"
       assert result["ticker"] == "ADI"
       assert result["max_concurrency"] == 1
+      assert result["corpus_readiness"]["status"] == "ready"
       batch_id = int(result["batch_id"])
       task_registry = getattr(app_state, "batch_task_registry")
       task = task_registry.get(owner_user_id="1", batch_id=batch_id)
@@ -484,6 +555,11 @@ def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
   assert fake_batch_control.acquire_calls[0]["spec"]["source"] == "explicit_ticker"
   assert fake_batch_control.acquire_calls[0]["spec"]["pipeline_template"] == "valuation-ready"
   assert fake_batch_control.acquire_calls[0]["spec"]["universe"] == ["ADI"]
+  assert fake_batch_control.acquire_calls[0]["spec"]["corpus_requirements"] == [{
+    "ticker": "ADI",
+    "required_filings": ["2025-FY", "2026-Q2"],
+    "required_transcripts": ["2026-Q1", "2026-Q2"],
+  }]
   assert fake_batch_control.run_calls[0]["spec"] == fake_batch_control.acquire_calls[0]["spec"]
   assert fake_batch_control.run_calls[0]["identity"] == ("1", "alice@example.com")
 
@@ -512,7 +588,11 @@ def test_gateway_local_valuation_ready_dispatch_propagates_session_channel(
     token = set_current_skill("valuation-ready")
     try:
       result, error = await bundle["handlers"]["valuation_ready_batch_dispatch"](
-        {"ticker": "PCTY"}
+        {
+          "ticker": "PCTY",
+          "required_filings": ["2025-FY"],
+          "required_transcripts": ["2026-Q2"],
+        }
       )
       assert error is None
       assert result["batch_id"] == 7
@@ -522,6 +602,43 @@ def test_gateway_local_valuation_ready_dispatch_propagates_session_channel(
   _run(run_case())
   assert captured["user_id"] == "1"
   assert captured["channel"] == "telegram"
+
+
+def test_gateway_local_valuation_ready_dispatch_blocks_before_batch_admission_on_corpus_gap(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  async def run_case() -> None:
+    mcp_client = ReadyCorpusMcpClient(ready=False)
+    app_state = SimpleNamespace(
+      user_event_bus=None,
+      gateway_config=SimpleNamespace(mcp_client=mcp_client),
+    )
+    session = SimpleNamespace(
+      user_id="alice",
+      owner_user_id="1",
+      risk_user_id=1,
+      user_email="alice@example.com",
+      channel="tui",
+    )
+    bundle = make_valuation_ready_skill_tool_bundle(app_state=app_state, session=session)
+
+    token = set_current_skill("valuation-ready")
+    try:
+      result, error = await bundle["handlers"]["valuation_ready_batch_dispatch"]({
+        "ticker": "PCTY",
+        "required_filings": ["2025-FY"],
+        "required_transcripts": ["2026-Q2"],
+      })
+    finally:
+      reset_current_skill(token)
+
+    assert result is None
+    assert error["code"] == "corpus_not_ready"
+    assert error["details"]["readiness"]["missing_transcripts"] == ["2026-Q2"]
+
+  _run(run_case())
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
 
 
 def test_gateway_local_valuation_ready_dispatch_refuses_unsupported_runtime(
@@ -555,6 +672,34 @@ def test_control_batches_active_batch_conflict_maps_to_409(fake_batch_control: F
 
   assert response.status_code == 409
   assert "active batch already exists" in response.json()["detail"]
+
+
+def test_control_batches_corpus_gap_maps_to_409_before_batch_admission(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  app = _make_app(mcp_client=ReadyCorpusMcpClient(ready=False))
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    response = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json={
+        "source": "explicit_ticker",
+        "universe": ["PCTY"],
+        "pipeline_template": "valuation-ready",
+        "budget_usd": 25.0,
+        "corpus_requirements": [{
+          "ticker": "PCTY",
+          "required_filings": ["2025-FY"],
+          "required_transcripts": ["2026-Q2"],
+        }],
+      },
+    )
+
+  assert response.status_code == 409
+  assert response.json()["detail"]["code"] == "corpus_not_ready"
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
 
 
 def test_control_batches_workflows_catalog(fake_batch_control: FakeBatchController) -> None:

@@ -24,8 +24,14 @@ from agent_gateway.batch_approval_projection import (
   bind_batch_approval_scope,
 )
 from agent_gateway.fixture_gate import fixture_provider_available, fixture_unavailable_message
+from agent_gateway.runtime_auth_context import bind_authenticated_runtime_auth_config
 from agent_gateway.session import AuthManager
 
+from .corpus_readiness import (
+  CORPUS_REQUIREMENTS_FIELD,
+  CorpusReadinessGateError,
+  require_corpus_readiness,
+)
 from .runs import _require_bearer_session, _require_control_session, _session_owner_user_id
 
 _BATCH_CONTROLLER_MODULE_NAMES = frozenset({"agent", "agent.batch", "agent.batch.controller"})
@@ -477,16 +483,23 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
 
 
 async def _dispatch_batch_for_authenticated(request: Request, payload: dict[str, Any], authenticated: Any) -> dict[str, Any]:
+  auth_config = _authenticated_batch_auth_config(authenticated)
+  gateway_config = getattr(request.app.state, "gateway_config", None)
+  if getattr(gateway_config, "credentials_resolver", None) is not None and not _has_active_credential(auth_config):
+    raise HTTPException(status_code=503, detail="authenticated batch credential unavailable")
   try:
     return await dispatch_batch_in_process(
       payload,
       app_state=request.app.state,
       user_id=_session_owner_user_id(authenticated),
       user_email=authenticated.user_email,
+      auth_config=auth_config,
       channel=getattr(authenticated, "channel", None),
     )
   except _active_batch_error_type() as exc:
     raise HTTPException(status_code=409, detail=str(exc)) from exc
+  except CorpusReadinessGateError as exc:
+    raise HTTPException(status_code=exc.status_code, detail=exc.to_payload()) from exc
   except RuntimeError as exc:
     raise HTTPException(status_code=409, detail=str(exc)) from exc
   except ValueError as exc:
@@ -499,10 +512,19 @@ async def dispatch_batch_in_process(
   app_state: Any,
   user_id: str,
   user_email: str | None = None,
+  auth_config: dict[str, Any] | None = None,
   channel: str | None = None,
 ) -> dict[str, Any]:
   if not isinstance(payload, dict):
     raise ValueError("batch spec must be an object")
+  if auth_config is not None:
+    auth_config = dict(auth_config)
+    if not _has_active_credential(auth_config):
+      raise ValueError("authenticated batch credential unavailable")
+  payload, corpus_readiness = await require_corpus_readiness(
+    payload,
+    app_state=app_state,
+  )
   registry = _registry_for_user(user_id)
   try:
     task_registry = _task_registry_for_state(app_state)
@@ -529,20 +551,11 @@ async def dispatch_batch_in_process(
       if approval_store is not None and approval_policy is not None
       else None
     )
-    if scope is None:
-      task = asyncio.create_task(
-        _controller().run_acquired_batch(
-          batch_id,
-          payload,
-          registry=registry,
-          _identity=(user_id, user_email),
-          _on_finalize=lambda event: _publish_batch_terminal_event(app_state, event),
-        )
-      )
-    else:
-      # asyncio tasks copy their creation context. Bind only for construction so
-      # nested stages inherit this batch's routing scope without process globals.
-      with bind_batch_approval_scope(scope):
+    # asyncio tasks copy their creation context. Bind only while creating the
+    # batch task so credentials stay in memory, isolated from sibling batches,
+    # and never enter the persisted spec/registry/event payloads.
+    with bind_authenticated_runtime_auth_config(auth_config):
+      if scope is None:
         task = asyncio.create_task(
           _controller().run_acquired_batch(
             batch_id,
@@ -552,13 +565,29 @@ async def dispatch_batch_in_process(
             _on_finalize=lambda event: _publish_batch_terminal_event(app_state, event),
           )
         )
+      else:
+        # asyncio tasks copy their creation context. Bind only for construction so
+        # nested stages inherit this batch's routing scope without process globals.
+        with bind_batch_approval_scope(scope):
+          task = asyncio.create_task(
+            _controller().run_acquired_batch(
+              batch_id,
+              payload,
+              registry=registry,
+              _identity=(user_id, user_email),
+              _on_finalize=lambda event: _publish_batch_terminal_event(app_state, event),
+            )
+          )
     task_registry.start(
       owner_user_id=user_id,
       batch_id=batch_id,
       task=task,
       registry=registry,
     )
-    return {"batch_id": batch_id, "status": "running"}
+    response: dict[str, Any] = {"batch_id": batch_id, "status": "running"}
+    if corpus_readiness is not None:
+      response["corpus_readiness"] = corpus_readiness
+    return response
   except Exception:
     registry.close()
     raise
@@ -864,6 +893,34 @@ async def _authorize_batch_projection_for_user_cancellation(
     )
 
 
+def _authenticated_batch_auth_config(authenticated: Any) -> dict[str, Any] | None:
+  auth_config = getattr(authenticated, "auth_config", None)
+  if auth_config is None:
+    return None
+  to_dict = getattr(auth_config, "to_dict", None)
+  if callable(to_dict):
+    auth_config = to_dict()
+  if not isinstance(auth_config, dict):
+    raise HTTPException(status_code=503, detail="authenticated batch credential unavailable")
+  return dict(auth_config)
+
+
+def _has_active_credential(auth_config: dict[str, Any] | None) -> bool:
+  if not auth_config:
+    return False
+  if str(auth_config.get("provider") or "").strip().lower() == "fixture":
+    return True
+  auth_mode = str(auth_config.get("auth_mode") or "").strip().lower()
+  if auth_mode == "oauth":
+    return bool(str(auth_config.get("auth_token") or "").strip())
+  if auth_mode == "api":
+    return bool(str(auth_config.get("api_key") or "").strip())
+  return bool(
+    str(auth_config.get("auth_token") or "").strip()
+    or str(auth_config.get("api_key") or "").strip()
+  )
+
+
 def read_batch_for_user(batch_id: int, *, user_id: str, top_n: int = 10) -> dict[str, Any]:
   registry = _registry_for_user(user_id)
   try:
@@ -881,8 +938,22 @@ def _retry_spec(batch_row: dict[str, Any], tickers: list[str]) -> dict[str, Any]
   if not isinstance(spec, dict):
     raise HTTPException(status_code=422, detail="prior batch spec is not an object")
   spec = dict(spec)
-  spec["universe"] = tickers
+  _set_retry_universe(spec, tickers)
   return spec
+
+
+def _set_retry_universe(spec: dict[str, Any], tickers: list[str]) -> None:
+  spec["universe"] = list(tickers)
+  requirements = spec.get(CORPUS_REQUIREMENTS_FIELD)
+  if not isinstance(requirements, list):
+    return
+  retry_tickers = {str(ticker or "").strip().upper() for ticker in tickers}
+  spec[CORPUS_REQUIREMENTS_FIELD] = [
+    dict(requirement)
+    for requirement in requirements
+    if isinstance(requirement, dict)
+    and str(requirement.get("ticker") or "").strip().upper() in retry_tickers
+  ]
 
 
 def _require_batch_owner(registry: Any, batch_id: int, user_id: str) -> dict[str, Any]:
@@ -938,7 +1009,7 @@ def _force_rerun_retry_spec(batch: dict[str, Any], *, ticker: str) -> dict[str, 
   if not isinstance(spec, dict):
     spec = {}
   retry_spec = dict(spec)
-  retry_spec["universe"] = [ticker] if ticker else []
+  _set_retry_universe(retry_spec, [ticker] if ticker else [])
   gates = retry_spec.get("gates") if isinstance(retry_spec.get("gates"), dict) else {}
   retry_spec["gates"] = {**gates, "force_rerun_existing": True}
   retry_spec["force_rerun_existing"] = True

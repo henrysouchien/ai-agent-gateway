@@ -1,8 +1,33 @@
 # Changelog
 
-## Unreleased (post-0.15.9)
+## Unreleased (post-0.15.10)
 
 _No unreleased changes recorded yet._
+
+## 0.15.10 (2026-07-15)
+
+### Added
+
+- Added a fail-closed, pre-spend corpus readiness gate for valuation-ready
+  batch admission, retry, and force-rerun flows. Callers declare exact filing
+  and transcript periods for every ticker; successful dispatches include the
+  readiness proof, while invalid, incomplete, unavailable, and not-ready
+  checks return typed errors before a batch run is acquired.
+- Added optional sub-agent event observation and caller-supplied anonymous
+  system-prompt templates without replacing the gateway's durable event log.
+
+### Fixed
+
+- Bound each authenticated batch dispatch's provider credentials to its own
+  async task tree, rejected cross-provider fallback, and failed closed when a
+  configured credential resolver cannot supply the dispatching user's
+  credential.
+- Surfaced missing provider credentials as explicit runner errors instead of
+  silent stub turns, resolved control-plane routes across lazy nested routers,
+  and preserved application state during batch-registry shutdown.
+- Reconciled pending prepared BusinessModel changes with their exact approval
+  lifecycle before retry and maintenance, including TTL precedence, lineage
+  checks, and compare-and-swap conflict handling.
 
 ## 0.15.9 (2026-07-15)
 

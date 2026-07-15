@@ -761,7 +761,36 @@ class ToolDispatcher:
         resume_approval_request = None
         skip_approval_lifecycle = False
         if prepared_business_model_change is not None:
+          from .approval_store import PreparedReconciliationConflict
           from .prepared_business_model_store import PreparedBusinessModelLifecycle
+
+          async def reconcile_pending_business_model_record(record: Any) -> Any:
+            reconciliation = await self._approval_store.reconcile_prepared_business_model_change(
+              caller_kind=record.caller_kind,
+              user_scope=record.user_scope,
+              idempotency_locator=record.idempotency_locator,
+            )
+            if reconciliation.conflict is PreparedReconciliationConflict.MISSING_APPROVAL:
+              raise TrustedToolPlanError(
+                "durable FMS BusinessModel plan lost its approval request"
+              )
+            if reconciliation.conflict is PreparedReconciliationConflict.LINEAGE_CONFLICT:
+              raise TrustedToolPlanError(
+                "durable FMS BusinessModel plan conflicts with its approval lineage"
+              )
+            if reconciliation.conflict is PreparedReconciliationConflict.UNKNOWN_APPROVAL_STATE:
+              raise TrustedToolPlanError(
+                "durable FMS BusinessModel plan has an unknown approval state"
+              )
+            if reconciliation.conflict is PreparedReconciliationConflict.CAS_CONFLICT:
+              raise TrustedToolPlanError(
+                "durable FMS BusinessModel plan reconciliation compare-and-swap lost"
+              )
+            if reconciliation.record is None:
+              raise TrustedToolPlanError(
+                "durable FMS BusinessModel plan disappeared during reconciliation"
+              )
+            return reconciliation.record
 
           prepared_business_model_record = await self._approval_store.get_prepared_business_model_change(
             caller_kind=str(prepared_business_model_change["caller_kind"]),
@@ -812,6 +841,28 @@ class ToolDispatcher:
               raise TrustedToolPlanError(
                 "FMS skill-run locator conflicts with its prepared BusinessModel plan"
               )
+            if (
+              prepared_business_model_record.lifecycle
+              is PreparedBusinessModelLifecycle.PENDING
+            ):
+              prepared_business_model_record = (
+                await reconcile_pending_business_model_record(
+                  prepared_business_model_record
+                )
+              )
+              if prepared_business_model_record.lifecycle in {
+                PreparedBusinessModelLifecycle.DENIED,
+                PreparedBusinessModelLifecycle.EXPIRED,
+              }:
+                return None, {
+                  "code": "planned_write_authorization_state_invalid",
+                  "message": (
+                    "The original BusinessModel approval was denied."
+                    if prepared_business_model_record.lifecycle
+                    is PreparedBusinessModelLifecycle.DENIED
+                    else "The durable BusinessModel plan expired."
+                  ),
+                }
             resume_approval_request = await self._approval_store.get(
               prepared_business_model_record.approval_id
             )
@@ -822,50 +873,40 @@ class ToolDispatcher:
             if (
               prepared_business_model_record.lifecycle
               is PreparedBusinessModelLifecycle.PENDING
+              and str(resume_approval_request.state)
+              in {
+                "approved",
+                "auto_approved",
+                "denied",
+                "auto_denied",
+                "cancelled",
+                "expired",
+              }
             ):
-              approval_state = str(resume_approval_request.state)
-              if approval_state in {"approved", "auto_approved"}:
-                prepared_business_model_record = await self._approval_store.transition_prepared_business_model_change(
-                  caller_kind=prepared_business_model_record.caller_kind,
-                  user_scope=prepared_business_model_record.user_scope,
-                  idempotency_locator=prepared_business_model_record.idempotency_locator,
-                  expected=PreparedBusinessModelLifecycle.PENDING,
-                  target=PreparedBusinessModelLifecycle.AUTHORIZED,
-                  approval_id=prepared_business_model_record.approval_id,
-                  approval_chain_id=prepared_business_model_record.approval_chain_id,
+              prepared_business_model_record = (
+                await reconcile_pending_business_model_record(
+                  prepared_business_model_record
                 )
-                skip_approval_lifecycle = True
-              elif approval_state in {"denied", "auto_denied"}:
-                await self._approval_store.transition_prepared_business_model_change(
-                  caller_kind=prepared_business_model_record.caller_kind,
-                  user_scope=prepared_business_model_record.user_scope,
-                  idempotency_locator=prepared_business_model_record.idempotency_locator,
-                  expected=PreparedBusinessModelLifecycle.PENDING,
-                  target=PreparedBusinessModelLifecycle.DENIED,
-                  approval_id=prepared_business_model_record.approval_id,
-                  approval_chain_id=prepared_business_model_record.approval_chain_id,
-                )
+              )
+              if prepared_business_model_record.lifecycle in {
+                PreparedBusinessModelLifecycle.DENIED,
+                PreparedBusinessModelLifecycle.EXPIRED,
+              }:
                 return None, {
                   "code": "planned_write_authorization_state_invalid",
-                  "message": "The original BusinessModel approval was denied.",
+                  "message": (
+                    "The original BusinessModel approval was denied."
+                    if prepared_business_model_record.lifecycle
+                    is PreparedBusinessModelLifecycle.DENIED
+                    else "The durable BusinessModel plan expired."
+                  ),
                 }
-              elif approval_state == "expired":
-                await self._approval_store.transition_prepared_business_model_change(
-                  caller_kind=prepared_business_model_record.caller_kind,
-                  user_scope=prepared_business_model_record.user_scope,
-                  idempotency_locator=prepared_business_model_record.idempotency_locator,
-                  expected=PreparedBusinessModelLifecycle.PENDING,
-                  target=PreparedBusinessModelLifecycle.EXPIRED,
-                  approval_id=prepared_business_model_record.approval_id,
-                  approval_chain_id=prepared_business_model_record.approval_chain_id,
-                )
-                return None, {
-                  "code": "planned_write_authorization_state_invalid",
-                  "message": "The original BusinessModel approval expired.",
-                }
-              elif approval_state not in {"created", "pending_user", "routed_external"}:
+              resume_approval_request = await self._approval_store.get(
+                prepared_business_model_record.approval_id
+              )
+              if resume_approval_request is None:
                 raise TrustedToolPlanError(
-                  "durable FMS BusinessModel plan has an unknown approval state"
+                  "durable FMS BusinessModel plan lost its approval request"
                 )
             if prepared_business_model_record.lifecycle in {
               PreparedBusinessModelLifecycle.AUTHORIZED,

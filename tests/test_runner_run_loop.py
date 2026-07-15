@@ -37,7 +37,11 @@ class _NoCredentialProvider:
     return False
 
 
-def _make_no_credential_runner(provider: _NoCredentialProvider) -> AgentRunner:
+def _make_no_credential_runner(
+  provider: _NoCredentialProvider,
+  *,
+  allow_stub_response: bool = True,
+) -> AgentRunner:
   event_log = EventLog()
   dispatcher = ToolDispatcher(
     mcp_client=_NullMcpClient(),
@@ -51,6 +55,7 @@ def _make_no_credential_runner(provider: _NoCredentialProvider) -> AgentRunner:
     session_id="sess_run_loop",
     provider=provider,
     auth_config={"api_key": "k"},
+    allow_stub_response=allow_stub_response,
     get_tool_definitions=lambda: [],
     user_id="alice",
     billing_mode="byok",
@@ -88,7 +93,19 @@ class _CredentialProvider:
     return CostEstimate()
 
 
-def _make_credential_runner(provider: _CredentialProvider | None = None) -> AgentRunner:
+class _ClientCreationFailureProvider(_CredentialProvider):
+  name = "broken-provider"
+
+  def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
+    _ = config, timeout
+    raise RuntimeError("sensitive client construction detail")
+
+
+def _make_credential_runner(
+  provider: _CredentialProvider | None = None,
+  *,
+  allow_stub_response: bool = True,
+) -> AgentRunner:
   event_log = EventLog()
   dispatcher = ToolDispatcher(
     mcp_client=_NullMcpClient(),
@@ -102,6 +119,7 @@ def _make_credential_runner(provider: _CredentialProvider | None = None) -> Agen
     session_id="sess_run_loop",
     provider=provider or _CredentialProvider(),
     auth_config={"api_key": "k", "model": "stub-model"},
+    allow_stub_response=allow_stub_response,
     get_tool_definitions=lambda: [],
     user_id="alice",
     billing_mode="byok",
@@ -162,6 +180,51 @@ def test_run_loop_resolves_compatibility_aliases_from_runner_module(monkeypatch)
   assert calls["model_override"] == "request-model"
   assert provider.seen_config == {"model": "parent-normalized-model", "thinking": False}
   assert calls["stub_messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_run_loop_missing_credential_fails_closed_when_stub_disabled(monkeypatch) -> None:
+  runner = _make_no_credential_runner(
+    _NoCredentialProvider(),
+    allow_stub_response=False,
+  )
+
+  async def fail_stub(_messages: list[dict[str, Any]]) -> None:
+    raise AssertionError("stub response must not run")
+
+  monkeypatch.setattr(runner, "_emit_stub_response", fail_stub)
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "private prompt"}]))
+
+  events = [entry.event for entry in runner._log.entries]
+  assert [event for event in events if event.get("type") == "error"] == [{
+    "type": "error",
+    "error": "Provider startup failed: no active credential configured for provider=patched-provider.",
+  }]
+  assert not any(event.get("type") in {"text_delta", "stream_complete"} for event in events)
+  assert "private prompt" not in str(events)
+
+
+def test_run_loop_client_creation_fails_closed_when_stub_disabled(monkeypatch) -> None:
+  runner = _make_credential_runner(
+    _ClientCreationFailureProvider(),
+    allow_stub_response=False,
+  )
+
+  async def fail_stub(_messages: list[dict[str, Any]]) -> None:
+    raise AssertionError("stub response must not run")
+
+  monkeypatch.setattr(runner, "_emit_stub_response", fail_stub)
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "private prompt"}]))
+
+  events = [entry.event for entry in runner._log.entries]
+  assert [event for event in events if event.get("type") == "error"] == [{
+    "type": "error",
+    "error": "Provider startup failed: could not create client for provider=broken-provider.",
+  }]
+  assert not any(event.get("type") in {"text_delta", "stream_complete"} for event in events)
+  assert "private prompt" not in str(events)
+  assert "sensitive client construction detail" not in str(events)
 
 
 def test_run_loop_stops_after_tool_results_when_runner_requests_it(monkeypatch) -> None:
