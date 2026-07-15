@@ -37,6 +37,7 @@ from .approval_policy import (
 
 TERMINAL_STATES = frozenset({"auto_approved", "auto_denied", "approved", "denied", "expired"})
 APPROVAL_DB_PATH_ENV = "GATEWAY_APPROVAL_DB_PATH"
+USER_DATA_DIR_ENV = "USER_DATA_DIR"
 DEFAULT_APPROVAL_DB_PATH = Path("data/gateway/approvals.sqlite3")
 log = logging.getLogger("agent_gateway.approval_store")
 
@@ -107,12 +108,19 @@ def resolve_approval_db_path(
   env_get: Any = os.getenv,
 ) -> Path:
   configured = str(env_get(APPROVAL_DB_PATH_ENV, "") or "").strip()
-  if not configured:
+  if configured:
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+      raise ValueError(f"{APPROVAL_DB_PATH_ENV} must be an absolute path")
+    return path.resolve(strict=False)
+
+  user_data_dir = str(env_get(USER_DATA_DIR_ENV, "") or "").strip()
+  if not user_data_dir:
     return DEFAULT_APPROVAL_DB_PATH
-  path = Path(configured).expanduser()
+  path = Path(user_data_dir).expanduser()
   if not path.is_absolute():
-    raise ValueError(f"{APPROVAL_DB_PATH_ENV} must be an absolute path")
-  return path.resolve(strict=False)
+    raise ValueError(f"{USER_DATA_DIR_ENV} must be an absolute path")
+  return (path / "gateway" / "approvals.sqlite3").resolve(strict=False)
 
 
 _dt_to_text = _rows.dt_to_text

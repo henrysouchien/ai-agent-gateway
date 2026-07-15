@@ -77,6 +77,9 @@ class SkillResultCapturedEvent:
   duration_s: float | None
   error: str | None
   warnings: list[str]
+  approval_outcome: str | None = None
+  approval_id: str | None = None
+  approval_tool_name: str | None = None
   type: Literal["skill_result_captured"] = field(default="skill_result_captured", init=False)
 
 
@@ -339,6 +342,9 @@ def event_from_dict(payload: dict[str, Any]) -> TypedEvent:
       duration_s=_optional_float(payload.get("duration_s")),
       error=_optional_str(payload.get("error")),
       warnings=_string_list(payload.get("warnings")),
+      approval_outcome=_optional_str(payload.get("approval_outcome")),
+      approval_id=_optional_str(payload.get("approval_id")),
+      approval_tool_name=_optional_str(payload.get("approval_tool_name")),
     )
   if event_type == "artifact_ready":
     return ArtifactReadyEvent(

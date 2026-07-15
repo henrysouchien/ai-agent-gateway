@@ -81,6 +81,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     self._seq = self._initial_task_seq()
     self._slot_lock = asyncio.Lock()
     self._reserved_slots = 0
+    self._cleanup_uncommitted_spill_starts()
     self._apply_run_file_retention()
     self.rehydrate()
 

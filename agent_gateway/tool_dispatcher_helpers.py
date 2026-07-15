@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import logging
 from collections.abc import Sequence as AbcSequence
 from dataclasses import dataclass, field
@@ -42,6 +43,162 @@ class PlannedWritePlanningRejected(RuntimeError):
 
   def tool_result(self) -> ToolResult:
     return self.result, self.error
+
+
+_MODEL_STATE_STORE_IDS = frozenset({
+  "projection_override",
+  "valuation_override",
+  "workbook",
+})
+
+
+def _enum_value(value: Any) -> Any:
+  raw = getattr(value, "value", value)
+  return raw if isinstance(raw, (str, int, float, bool)) or raw is None else str(raw)
+
+
+def _effect_review_row(effect: Any) -> dict[str, Any]:
+  payload = effect.payload
+  row: dict[str, Any] = {
+    "effect_id": effect.effect_id,
+    "kind": _enum_value(effect.kind),
+    "criticality": _enum_value(effect.criticality),
+    "depends_on": list(effect.depends_on),
+  }
+  for field_name in (
+    "store_id",
+    "target_key",
+    "research_file_id",
+    "ticker",
+    "proposal_id",
+    "queue",
+    "transaction_key",
+    "target_path",
+    "promotion_id",
+    "base_hash",
+    "target_hash",
+    "expected_content_digest",
+    "op_hash",
+  ):
+    value = getattr(payload, field_name, None)
+    if value is not None:
+      row[field_name] = _enum_value(value)
+  semantic_intent = getattr(payload, "semantic_intent", None)
+  if semantic_intent is not None:
+    row["semantic_intent_digest"] = getattr(
+      semantic_intent,
+      "content_digest",
+      None,
+    )
+  content = getattr(payload, "content", None)
+  if content is not None:
+    row["content_digest"] = getattr(content, "content_digest", None)
+  return row
+
+
+def _workbook_write_review(
+  contract: Any,
+  effect: Any,
+  *,
+  snapshot_store_ids: frozenset[str],
+) -> dict[str, Any]:
+  payload = effect.payload
+  if type(payload) is not contract.StoreWritePayload:
+    raise TrustedToolPlanError("workbook write effect has the wrong payload type")
+  content = payload.content
+  if type(content) is not contract.InlinePayload:
+    raise TrustedToolPlanError(
+      "workbook write approval requires inline exact execution payload"
+    )
+  try:
+    execution = json.loads(content.content.decode("utf-8"))
+  except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    raise TrustedToolPlanError(
+      "workbook write approval payload is not valid JSON"
+    ) from exc
+  if not isinstance(execution, dict):
+    raise TrustedToolPlanError("workbook write approval payload must be an object")
+  operations = execution.get("operations")
+  if not isinstance(operations, list) or not all(
+    isinstance(operation, dict) for operation in operations
+  ):
+    raise TrustedToolPlanError(
+      "workbook write approval payload lacks exact operations"
+    )
+  mutation_execution = dict(execution)
+  expected_readback = mutation_execution.pop("expected_readback", None)
+  return {
+    "effect_id": effect.effect_id,
+    "target_key": payload.target_key,
+    "base_hash": payload.base_hash,
+    "target_hash": payload.target_hash,
+    "precommit_snapshot_present": payload.store_id in snapshot_store_ids,
+    "operation_count": len(operations),
+    "execution": mutation_execution,
+    "execution_payload_digest": content.content_digest,
+    "expected_readback_digest": (
+      contract.CanonicalPayload.from_value(expected_readback).content_digest
+      if expected_readback is not None
+      else None
+    ),
+  }
+
+
+def _model_writer_undo_review(
+  contract: Any,
+  change_set: Any,
+  *,
+  snapshot_store_ids: frozenset[str],
+  model_write_store_ids: frozenset[str],
+) -> dict[str, Any]:
+  scope = "workbook_and_projection_state"
+  if not model_write_store_ids:
+    return {
+      "scope": scope,
+      "status": "not_required",
+      "reason": "plan_has_no_workbook_or_projection_state_write",
+    }
+
+  persist_runner_module = f"{contract.__name__.rsplit('.', 1)[0]}.persist_runner"
+  try:
+    persist_runner = importlib.import_module(persist_runner_module)
+  except ModuleNotFoundError as exc:
+    if exc.name not in {
+      persist_runner_module,
+      persist_runner_module.split(".")[0],
+    }:
+      raise
+    raise TrustedToolPlanError(
+      "durable Undo capability contract is unavailable"
+    ) from exc
+  durable_subcommands = getattr(
+    persist_runner,
+    "_DURABLE_UNDO_SUBCOMMANDS",
+    None,
+  )
+  if not isinstance(durable_subcommands, frozenset):
+    raise TrustedToolPlanError("durable Undo capability contract is invalid")
+
+  missing_snapshots = sorted(model_write_store_ids.difference(snapshot_store_ids))
+  subcommand = str(change_set.intent.subcommand)
+  if subcommand in durable_subcommands and not missing_snapshots:
+    return {
+      "scope": scope,
+      "status": "durable_token_after_commit",
+      "tool_name": "fms_undo_model_writer_commit",
+      "issued_when": "authorized_commit_succeeds",
+      "covers_store_ids": sorted(model_write_store_ids),
+    }
+  return {
+    "scope": scope,
+    "status": "not_available_for_this_subcommand",
+    "reason": (
+      "precommit_snapshot_missing"
+      if missing_snapshots
+      else "subcommand_does_not_issue_durable_undo"
+    ),
+    "missing_snapshot_store_ids": missing_snapshots,
+  }
 
 
 def _planning_contract_module_for_identity(
@@ -154,6 +311,76 @@ class TrustedToolPlan:
         None if self.review_reference is None else dict(self.review_reference)
       ),
       "execution_semantics_digest": self.execution_semantics_digest,
+    }
+
+  def approval_review(self) -> dict[str, Any]:
+    """Return a safe operator review derived from the exact executable plan."""
+
+    self.verify_integrity()
+    if self.identity_source != "change_set":
+      raise TrustedToolPlanError(
+        "planned-change approval review requires a ChangeSet identity"
+      )
+    contract = _planning_contract_module_for_identity(
+      self.identity,
+      "fms.core.change_set",
+      "api.fms.core.change_set",
+    )
+    change_set = self.identity
+    snapshot_store_ids = frozenset(
+      str(effect.payload.store_id)
+      for effect in change_set.effects
+      if type(effect.payload) is contract.SnapshotPayload
+    )
+    model_write_store_ids = frozenset(
+      str(effect.payload.store_id)
+      for effect in change_set.effects
+      if (
+        type(effect.payload) is contract.StoreWritePayload
+        and str(effect.payload.store_id) in _MODEL_STATE_STORE_IDS
+      )
+    )
+    workbook_writes = [
+      _workbook_write_review(
+        contract,
+        effect,
+        snapshot_store_ids=snapshot_store_ids,
+      )
+      for effect in change_set.effects
+      if (
+        type(effect.payload) is contract.StoreWritePayload
+        and str(effect.payload.store_id) == "workbook"
+      )
+    ]
+    return {
+      "schema_version": "planned-change-review.v1",
+      "change_set_id": change_set.change_set_id,
+      "change_hash": change_set.change_hash,
+      "intent": {"subcommand": change_set.intent.subcommand},
+      "target": {
+        "ticker": change_set.target.ticker,
+        "research_file_id": change_set.target.research_file_id,
+        "workspace": change_set.target.workspace,
+        "scope": _enum_value(change_set.target.scope),
+      },
+      "commit_strategy": _enum_value(change_set.commit_strategy),
+      "effects": [
+        _effect_review_row(effect) for effect in change_set.effects
+      ],
+      "precommit_snapshot_store_ids": sorted(snapshot_store_ids),
+      "workbook": {
+        "will_write": bool(workbook_writes),
+        "operation_count": sum(
+          int(write["operation_count"]) for write in workbook_writes
+        ),
+        "writes": workbook_writes,
+      },
+      "undo": _model_writer_undo_review(
+        contract,
+        change_set,
+        snapshot_store_ids=snapshot_store_ids,
+        model_write_store_ids=model_write_store_ids,
+      ),
     }
 
   def verify_integrity(self) -> None:

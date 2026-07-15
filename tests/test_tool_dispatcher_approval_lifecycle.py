@@ -50,12 +50,18 @@ from api.fms.core.change_set import (
   EffectSpec,
   InlinePayload,
   IntentRef,
+  JournaledCasPlan,
   ProducerRef,
   ReviewKind,
   ReviewRequirement,
+  SnapshotPayload,
+  StoreTarget,
+  StoreWritePayload,
   TargetRef,
   TargetScope,
+  compute_legacy_journal_base_vector_hash,
 )
+from schema.cas import journal_content_id
 
 
 class _NullMcp:
@@ -291,6 +297,29 @@ async def _wait_for_queue(session: SimpleNamespace, tool_call_id: str) -> asynci
   raise AssertionError("approval queue was not registered")
 
 
+def test_projected_batch_approval_waits_through_its_advertised_expiry() -> None:
+  calls: list[float | int | None] = []
+
+  def globally_capped(expiry_seconds: float | int | None) -> float:
+    calls.append(expiry_seconds)
+    return 270.0
+
+  assert lifecycle_helpers._approval_wait_timeout_seconds(
+    600,
+    batch_admission=object(),
+    approval_queue_timeout_seconds_fn=globally_capped,
+  ) == 600.0
+  assert calls == []
+
+
+def test_non_batch_approval_keeps_global_wait_ceiling() -> None:
+  assert lifecycle_helpers._approval_wait_timeout_seconds(
+    600,
+    batch_admission=None,
+    approval_queue_timeout_seconds_fn=lambda _expiry: 270.0,
+  ) == 270.0
+
+
 def test_pending_tool_helper_registers_event_waits_and_cleans_up() -> None:
   async def scenario() -> None:
     session_log = _SessionLog()
@@ -331,6 +360,78 @@ def test_pending_tool_helper_registers_event_waits_and_cleans_up() -> None:
     assert session.approval_queues == {}
 
   asyncio.run(scenario())
+
+
+def test_projected_pending_tool_binds_stage_identity_to_projection_and_event() -> None:
+  async def scenario() -> None:
+    session_log = _SessionLog()
+    session = SimpleNamespace(
+      pending_tools={},
+      approval_queues={},
+      agent_session_log=session_log,
+      batch_stage_run_seq=3,
+    )
+    event_log = EventLog()
+    request = _request()
+
+    class Admission:
+      def publish_pending(self) -> None:
+        session.approval_queues[request.tool_call_id].put_nowait({"approved": False})
+
+    result = await lifecycle_helpers.await_user_approval_via_pending_tools(
+      session=session,
+      approval_store=None,
+      event_log=event_log,
+      request=request,
+      decision=_decision(),
+      nonce="nonce-1",
+      resolved_qualifier="qual-1",
+      allow_persistent=False,
+      timeout_seconds=5,
+      log=logging.getLogger("test"),
+      batch_admission=Admission(),
+    )
+
+    assert result == {"approved": False}
+    assert event_log.entries[0].event["stage_run_seq"] == 3
+    assert session_log.events[0]["stage_run_seq"] == 3
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+
+  asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage_run_seq", [None, 0, -1, True, "3"])
+def test_projected_pending_tool_rejects_invalid_stage_identity(
+  stage_run_seq: object,
+) -> None:
+  session = SimpleNamespace(
+    pending_tools={},
+    approval_queues={},
+    batch_stage_run_seq=stage_run_seq,
+  )
+
+  with pytest.raises(
+    ValueError,
+    match="stage_run_seq must be a positive integer",
+  ):
+    asyncio.run(
+      lifecycle_helpers.await_user_approval_via_pending_tools(
+        session=session,
+        approval_store=None,
+        event_log=None,
+        request=_request(),
+        decision=_decision(),
+        nonce="nonce-1",
+        resolved_qualifier="",
+        allow_persistent=False,
+        timeout_seconds=5,
+        log=logging.getLogger("test"),
+        batch_admission=object(),
+      )
+    )
+  assert session.pending_tools == {}
+  assert session.approval_queues == {}
 
 
 def test_pending_tool_helper_expires_store_request_on_timeout() -> None:
@@ -519,6 +620,220 @@ def _planned_change_set() -> ChangeSet:
     CommitStrategy.ARTIFACT_ONLY,
     ArtifactOnlyPlan(artifact_path),
   )
+
+
+def _planned_workbook_change_set(
+  subcommand: str = "persist_dcf_relative_valuation",
+) -> ChangeSet:
+  base_hash = f"{'a' * 64}:engine-v1"
+  target_hash = f"{'b' * 64}:engine-v1"
+  projection_base_hash = "c" * 64
+  projection_target_hash = "d" * 64
+  operations = [
+    {
+      "type": "set_value",
+      "item_id": "tpl.a.unit_economics.gross_margin",
+      "values": {"2027": 0.42, "2028": 0.43},
+    }
+  ]
+  effect_rows = [
+    EffectSpec(
+      "snapshot-workbook",
+      EffectKind.SNAPSHOT_WORKBOOK,
+      EffectCriticality.REQUIRED,
+      (),
+      SnapshotPayload(
+        "workbook",
+        "models/PCTY.xlsx",
+        base_hash,
+        InlinePayload(
+          "v1",
+          "application/json",
+          CanonicalPayload.from_value({"target": "models/PCTY.xlsx"}).content,
+        ),
+      ),
+    ),
+    EffectSpec(
+      "write-workbook",
+      EffectKind.WRITE_WORKBOOK_BUNDLE,
+      EffectCriticality.REQUIRED,
+      ("snapshot-workbook",),
+      StoreWritePayload(
+        "workbook",
+        "models/PCTY.xlsx",
+        base_hash,
+        target_hash,
+        CanonicalPayload.from_value({"target_hash": target_hash}),
+        InlinePayload(
+          "v1",
+          "application/json",
+          CanonicalPayload.from_value(
+            {
+              "operations": operations,
+              "expected_readback": {"gross_margin": {"2027": 0.42}},
+              "force_overwrite": True,
+            }
+          ).content,
+        ),
+      ),
+    ),
+  ]
+  base_vector = [BaseRevision("workbook", "models/PCTY.xlsx", base_hash)]
+  target_hashes = {"workbook": target_hash}
+  target_keys = ["models/PCTY.xlsx"]
+  forecast_mode = None
+  if subcommand == "persist_forecast_assumptions":
+    projection_key = "overrides/PCTY.json"
+    forecast_mode = "main_write"
+    effect_rows.extend(
+      [
+        EffectSpec(
+          "snapshot-projection",
+          EffectKind.SNAPSHOT_OVERRIDES,
+          EffectCriticality.REQUIRED,
+          (),
+          SnapshotPayload(
+            "projection_override",
+            projection_key,
+            projection_base_hash,
+            InlinePayload(
+              "v1",
+              "application/json",
+              CanonicalPayload.from_value({"target": projection_key}).content,
+            ),
+          ),
+        ),
+        EffectSpec(
+          "write-projection",
+          EffectKind.WRITE_OVERRIDE_JSON,
+          EffectCriticality.REQUIRED,
+          ("snapshot-projection",),
+          StoreWritePayload(
+            "projection_override",
+            projection_key,
+            projection_base_hash,
+            projection_target_hash,
+            CanonicalPayload.from_value({"ticker": "PCTY"}),
+            InlinePayload(
+              "v1",
+              "application/json",
+              CanonicalPayload.from_value({"ticker": "PCTY", "drivers": {}}).content,
+            ),
+          ),
+        ),
+      ]
+    )
+    base_vector.append(
+      BaseRevision("projection_override", projection_key, projection_base_hash)
+    )
+    target_hashes["projection_override"] = projection_target_hash
+    target_keys.insert(0, projection_key)
+  effects = tuple(effect_rows)
+  target_keys_tuple = tuple(target_keys)
+  store_targets = tuple(
+    StoreTarget(store_id, target_hashes[store_id])
+    for store_id in sorted(target_hashes)
+  )
+  strategy_plan = JournaledCasPlan(
+    content_id=journal_content_id(
+      subcommand,
+      target_store_hashes=target_hashes,
+      target_keys=target_keys_tuple,
+      forecast_mode=forecast_mode,
+    ),
+    legacy_base_vector_hash=compute_legacy_journal_base_vector_hash(effects),
+    subcommand=subcommand,
+    target_store_hashes=store_targets,
+    target_keys=target_keys_tuple,
+    forecast_mode=forecast_mode,
+  )
+  return ChangeSet(
+    "v1",
+    "",
+    "",
+    ProducerRef("dcf-relative-valuation", "research_producer", "alice", "run-1"),
+    TargetRef("PCTY", 7, "workspace/PCTY", TargetScope.WORKSPACE),
+    tuple(sorted(base_vector, key=lambda base: base.store_id)),
+    IntentRef(
+      subcommand,
+      CanonicalPayload.from_value({"ticker": "PCTY"}),
+    ),
+    DomainResultRef(
+      "dcf_relative_valuation",
+      "v1",
+      InlinePayload(
+        "v1",
+        "application/json",
+        CanonicalPayload.from_value({"ok": True}).content,
+      ),
+    ),
+    effects,
+    (),
+    ReviewRequirement(ReviewKind.NONE, None),
+    CommitStrategy.JOURNALED_CAS,
+    strategy_plan,
+  )
+
+
+def test_trusted_plan_approval_review_exposes_exact_workbook_change_and_undo() -> None:
+  change_set = _planned_workbook_change_set()
+  trusted_plan = dispatcher_module.TrustedToolPlan.create(
+    identity_source="change_set",
+    identity=change_set,
+    prepared=SimpleNamespace(change_set=change_set),
+  )
+
+  review = trusted_plan.approval_review()
+
+  assert review["schema_version"] == "planned-change-review.v1"
+  assert review["change_set_id"] == change_set.change_set_id
+  assert review["target"] == {
+    "ticker": "PCTY",
+    "research_file_id": 7,
+    "workspace": "workspace/PCTY",
+    "scope": "workspace",
+  }
+  assert review["commit_strategy"] == "JOURNALED_CAS"
+  assert review["precommit_snapshot_store_ids"] == ["workbook"]
+  assert review["workbook"]["will_write"] is True
+  assert review["workbook"]["operation_count"] == 1
+  write = review["workbook"]["writes"][0]
+  assert write["precommit_snapshot_present"] is True
+  assert write["execution"] == {
+    "operations": [
+      {
+        "item_id": "tpl.a.unit_economics.gross_margin",
+        "type": "set_value",
+        "values": {"2027": 0.42, "2028": 0.43},
+      }
+    ],
+    "force_overwrite": True,
+  }
+  assert write["expected_readback_digest"]
+  assert review["undo"] == {
+    "scope": "workbook_and_projection_state",
+    "status": "durable_token_after_commit",
+    "tool_name": "fms_undo_model_writer_commit",
+    "issued_when": "authorized_commit_succeeds",
+    "covers_store_ids": ["workbook"],
+  }
+
+
+def test_trusted_plan_approval_review_exposes_forecast_assumptions_undo() -> None:
+  change_set = _planned_workbook_change_set("persist_forecast_assumptions")
+  trusted_plan = dispatcher_module.TrustedToolPlan.create(
+    identity_source="change_set",
+    identity=change_set,
+    prepared=SimpleNamespace(change_set=change_set),
+  )
+
+  assert trusted_plan.approval_review()["undo"] == {
+    "scope": "workbook_and_projection_state",
+    "status": "durable_token_after_commit",
+    "tool_name": "fms_undo_model_writer_commit",
+    "issued_when": "authorized_commit_succeeds",
+    "covers_store_ids": ["projection_override", "workbook"],
+  }
 
 
 def _planned_handler(
@@ -1038,6 +1353,7 @@ def test_batch_admission_cancel_between_pending_commit_and_publish_cleans_all_re
       user_id="alice",
       channel="tui",
       role="owner",
+      batch_stage_run_seq=3,
       pending_tools={},
       approval_queues={},
     )
@@ -1156,6 +1472,7 @@ def test_batch_admission_requires_cleanup_store_contract(
       user_id="alice",
       channel="tui",
       role="owner",
+      batch_stage_run_seq=3,
       pending_tools={},
       approval_queues={},
     )
@@ -1228,6 +1545,19 @@ def test_planned_dispatch_persists_identity_and_executes_exact_objects(
       events.append("policy")
       assert request.identity_source == "change_set"
       assert request.change_set_id == change_set.change_set_id
+      review = request.tool_args_redacted["planned_change"]
+      assert review["change_set_id"] == change_set.change_set_id
+      assert review["commit_strategy"] == "ARTIFACT_ONLY"
+      assert review["workbook"] == {
+        "will_write": False,
+        "operation_count": 0,
+        "writes": [],
+      }
+      assert review["undo"] == {
+        "scope": "workbook_and_projection_state",
+        "status": "not_required",
+        "reason": "plan_has_no_workbook_or_projection_state_write",
+      }
       return PolicyApprovalDecision(outcome="auto_approve", reason="exact plan approved")
 
     async def on_resolve(self, *, request):

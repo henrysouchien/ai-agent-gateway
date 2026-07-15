@@ -335,7 +335,7 @@ def test_runner_preserves_tool_result_utility_delegates(tmp_path: Path) -> None:
     content='{"ok": true}',
   )
   assert filename == "lookup_tool-1.json"
-  assert Path(spill_abspath).read_text(encoding="utf-8") == '{"ok": true}'
+  assert json.loads(Path(spill_abspath).read_text(encoding="utf-8")) == {"ok": True}
 
 
 def test_annotate_result_collects_policy_low_match_and_subagent_warnings() -> None:
@@ -465,7 +465,7 @@ def test_compact_model_tool_result_entry_helper_spills_live_entry_and_logs(tmp_p
 
   spill_files = list(tmp_path.iterdir())
   assert len(spill_files) == 1
-  assert spill_files[0].read_text(encoding="utf-8") == content
+  assert json.loads(spill_files[0].read_text(encoding="utf-8")) == json.loads(content)
   live_payload = json.loads(live_entry["content"])
   durable_payload = json.loads(durable_entry["content"])
   assert live_payload["spill_file"] == spill_files[0].name
@@ -485,7 +485,7 @@ def test_compact_spills_live_entry_and_keeps_durable_pointer_free(tmp_path: Path
 
   spill_files = list(tmp_path.iterdir())
   assert len(spill_files) == 1
-  assert spill_files[0].read_text(encoding="utf-8") == content
+  assert json.loads(spill_files[0].read_text(encoding="utf-8")) == json.loads(content)
   live_payload = json.loads(live_entry["content"])
   durable_payload = json.loads(durable_entry["content"])
   assert live_payload["spill_file"] == spill_files[0].name
@@ -550,7 +550,7 @@ def test_compact_spills_payload_with_falsy_error_field_but_not_truthy(tmp_path: 
   )
   spill_files = list(tmp_path.iterdir())
   assert len(spill_files) == 1
-  assert spill_files[0].read_text(encoding="utf-8") == null_error
+  assert json.loads(spill_files[0].read_text(encoding="utf-8")) == json.loads(null_error)
   assert json.loads(live_entry["content"])["spill_file"] == spill_files[0].name
   assert "spill_file" not in json.loads(durable_entry["content"])
 
@@ -600,7 +600,7 @@ def test_spill_filename_is_sanitized_and_stays_inside_work_dir(tmp_path: Path) -
   assert ":" not in filename
   assert spill_path.name == filename
   assert spill_path.resolve().parent == tmp_path.resolve()
-  assert spill_path.read_text(encoding="utf-8") == content
+  assert json.loads(spill_path.read_text(encoding="utf-8")) == json.loads(content)
 
 
 def test_missing_tool_use_id_uses_uuid_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -631,7 +631,7 @@ def test_existing_spill_file_retries_with_uuid_suffix(tmp_path: Path, monkeypatc
   filename = json.loads(live_entry["content"])["spill_file"]
   assert filename == "lookup_tool-1_12345678.json"
   assert (tmp_path / "lookup_tool-1.json").read_text(encoding="utf-8") == "old"
-  assert (tmp_path / filename).read_text(encoding="utf-8") == content
+  assert json.loads((tmp_path / filename).read_text(encoding="utf-8")) == json.loads(content)
 
 
 def test_code_execution_ensure_work_dir_is_idempotent_and_concurrency_safe(
@@ -707,7 +707,7 @@ def test_runner_spills_large_tool_result_and_code_execute_reads_bare_filename(tm
     work_dir = Path(session.code_execution_work_dir or "")
     spill_files = [path for path in work_dir.iterdir() if path.name.startswith("big_data_tool-1")]
     assert len(spill_files) == 1
-    assert spill_files[0].read_text(encoding="utf-8") == expected_content
+    assert json.loads(spill_files[0].read_text(encoding="utf-8")) == json.loads(expected_content)
 
     live_blocks = _model_bound_tool_result_blocks(provider)
     live_payload = json.loads(live_blocks[0]["content"])
@@ -816,10 +816,10 @@ def test_run_agent_sub_runner_spills_into_parent_work_dir_and_code_execute_can_r
     assert provider.last_spill_file is not None
     spill_path = work_dir / provider.last_spill_file
     assert spill_path.exists()
-    assert spill_path.read_text(encoding="utf-8") == json.dumps(
-      {"status": "success", "payload": payload},
-      default=str,
-    )
+    assert json.loads(spill_path.read_text(encoding="utf-8")) == {
+      "status": "success",
+      "payload": payload,
+    }
     run_agent_event = next(
       entry.event
       for entry in event_log.entries

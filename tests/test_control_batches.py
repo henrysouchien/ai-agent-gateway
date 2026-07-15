@@ -242,6 +242,7 @@ def _install_batch_pending_approval(
   durable_owner_user_id: str | None = None,
   tool_class: str = "state_write",
   persistent_grant_scope: str | None = None,
+  stage_run_seq: int = 3,
 ) -> tuple[ApprovalRequest, asyncio.Queue, SimpleNamespace]:
   suffix = uuid.uuid4().hex
   approval_id = f"approval-batch-{suffix}"
@@ -285,6 +286,7 @@ def _install_batch_pending_approval(
         "approval_id": approval_id,
         "nonce": "cancel-nonce",
         "status": "approval_pending",
+        "stage_run_seq": stage_run_seq,
       }
     },
     approval_queues={tool_call_id: queue},
@@ -872,6 +874,7 @@ def test_http_batch_cancel_cancels_hanging_admitted_producer_before_drain(
       user_id="alice",
       channel="tui",
       role="owner",
+      batch_stage_run_seq=3,
       pending_tools={},
       approval_queues={},
     )
@@ -1005,6 +1008,7 @@ def test_http_batch_cancel_authorizes_bound_durable_request_before_publication(
       user_id="alice",
       channel="tui",
       role="invite",
+      batch_stage_run_seq=3,
       pending_tools={},
       approval_queues={},
     )
@@ -1239,6 +1243,7 @@ def test_http_batch_cancel_retains_transient_projection_published_during_preflig
       user_id="alice",
       channel="tui",
       role="owner",
+      batch_stage_run_seq=3,
       pending_tools={},
       approval_queues={},
     )
@@ -1340,6 +1345,38 @@ def test_control_batches_cancel_denies_pending_approval_before_task_teardown(
       owner_user_id="alice",
       channel="tui",
     ) == []
+
+
+def test_control_approval_list_exposes_exact_batch_stage_identity(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  fake_batch_control.wait_for_cancel = True
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    response = client.post("/api/control/batches", headers=headers, json=_batch_spec())
+    batch_id = int(response.json()["batch_id"])
+    request_record, _queue, _batch_session = _install_batch_pending_approval(
+      app=app,
+      batch_id=batch_id,
+      stage_run_seq=3,
+    )
+
+    listed = client.get("/api/control/approvals", headers=headers)
+
+    assert listed.status_code == 200, listed.text
+    approval = next(
+      item
+      for item in listed.json()["approvals"]
+      if item["approval_id"] == request_record.approval_id
+    )
+    assert approval["batch_id"] == batch_id
+    assert approval["run_id"] == f"batch_{batch_id}"
+    assert approval["stage_run_seq"] == 3
+
+    cancelled = client.delete(f"/api/control/batches/{batch_id}", headers=headers)
+    assert cancelled.status_code == 200, cancelled.text
+
 
 def test_control_batches_cancel_quarantines_projection_without_mutating_other_owner(
   fake_batch_control: FakeBatchController,
@@ -2784,6 +2821,7 @@ def test_batch_shutdown_cancels_hanging_admitted_producer_before_drain(
       user_id="alice",
       channel="tui",
       role="owner",
+      batch_stage_run_seq=3,
       pending_tools={},
       approval_queues={},
     )

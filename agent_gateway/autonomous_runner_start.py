@@ -142,7 +142,6 @@ class AutonomousRegistryStartMixin:
     log_handle: Any | None,
   ) -> None:
     self._tasks.pop(task_id, None)
-    self._delete_task_manifest(task_id)
     await self._terminate_unowned_process(record)
     if log_handle is not None:
       log_handle.close()
@@ -154,6 +153,12 @@ class AutonomousRegistryStartMixin:
       await self._release_slot(record)
     else:
       await self._release_slot()
+    if record is not None and record.tool_result_spill_dir is not None:
+      self._remove_registered_tool_result_spill_dir(
+        task_id,
+        record.tool_result_spill_dir,
+      )
+    self._delete_task_manifest(task_id)
 
   async def start(
     self,
@@ -248,6 +253,7 @@ class AutonomousRegistryStartMixin:
         operator_inbox_path=operator_inbox_path,
         approval_decisions_path=approval_decisions_path,
         started_at=time_module.time(),
+        state="starting",
         log_handle=log_handle,
         slot_reserved=True,
         event_lines=[],
@@ -260,11 +266,20 @@ class AutonomousRegistryStartMixin:
         resumed_from=resumed_from.strip() if isinstance(resumed_from, str) and resumed_from.strip() else None,
         schedule_id=schedule_id.strip() if isinstance(schedule_id, str) and schedule_id.strip() else None,
         schedule_name=schedule_name.strip() if isinstance(schedule_name, str) and schedule_name.strip() else None,
+        tool_result_spill_dir=self._expected_tool_result_spill_dir(task_id),
       )
       self._attach_manifest_tracking(record)
       self._tasks[task_id] = record
       asyncio_module = _asyncio_module()
       record.events_tail_task = asyncio_module.create_task(self._tail_events_file(task_id))
+
+      if not self._write_task_manifest(record, checked=True):
+        record.tool_result_spill_dir = None
+      else:
+        try:
+          record.tool_result_spill_dir.mkdir(mode=0o700)
+        except Exception as exc:
+          raise RuntimeError(f"autonomous spill directory setup failed: {exc}") from exc
 
       os_module = _runtime_attr("os", os)
       env = dict(os_module.environ)
@@ -294,6 +309,8 @@ class AutonomousRegistryStartMixin:
       env["AGENT_AUTONOMOUS_EVENTS_PATH"] = str(events_path)
       env["AGENT_AUTONOMOUS_OPERATOR_INBOX_PATH"] = str(operator_inbox_path)
       env["AGENT_AUTONOMOUS_APPROVAL_DECISIONS_PATH"] = str(approval_decisions_path)
+      if record.tool_result_spill_dir is not None:
+        env["AGENT_AUTONOMOUS_TOOL_RESULT_SPILL_DIR"] = str(record.tool_result_spill_dir)
       env["AGENT_AUTONOMOUS_GATEWAY_SESSION_ID"] = (
         f"agent-control:{control_run_id}:{int(record.started_at)}"
       )
@@ -319,10 +336,12 @@ class AutonomousRegistryStartMixin:
       )
 
       assert record is not None
+      record.state = "running"
+      if not self._write_task_manifest(record, checked=True):
+        raise RuntimeError("failed to commit running autonomous task manifest")
       record.reaper_task = asyncio_module.create_task(self._reap(task_id))
       await self._publish_run_state(record, "running")
       ownership_transferred = True
-      self._write_task_manifest(record)
       return self._start_payload(record)
     except OSError as exc:
       raise RuntimeError(f"spawn failed: {exc}") from exc

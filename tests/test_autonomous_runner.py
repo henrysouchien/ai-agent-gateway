@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -923,6 +924,140 @@ def test_autonomous_run_retention_prunes_only_old_completed_unlinked_run_groups(
   assert cursor == {"next_seq": 100}
 
 
+def test_starting_manifest_cleanup_removes_dead_child_spill_before_rehydrate(tmp_path) -> None:
+  spill_dir = tmp_path / "bg_12.tool_result_spill"
+  spill_dir.mkdir()
+  (spill_dir / "partial.index.json").write_text("partial", encoding="utf-8")
+  _write_manifest(
+    tmp_path,
+    "bg_12",
+    state="starting",
+    exit_code=None,
+    completed_at=None,
+    tool_result_spill_dir=str(spill_dir),
+  )
+
+  registry = _registry(tmp_path)
+
+  assert not spill_dir.exists()
+  assert registry._tasks["bg_12"].state == "interrupted"
+  assert _read_manifest(tmp_path, "bg_12")["state"] == "interrupted"
+
+
+def test_starting_manifest_cleanup_skips_surviving_child_lease_then_retries(tmp_path) -> None:
+  spill_dir = tmp_path / "bg_13.tool_result_spill"
+  spill_dir.mkdir()
+  _write_manifest(
+    tmp_path,
+    "bg_13",
+    state="starting",
+    exit_code=None,
+    completed_at=None,
+    tool_result_spill_dir=str(spill_dir),
+  )
+  lease_path = spill_dir / ".lease"
+  fd = os.open(lease_path, os.O_RDWR | os.O_CREAT, 0o600)
+  fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+  try:
+    while_live = _registry(tmp_path)
+    assert spill_dir.is_dir()
+    assert "bg_13" not in while_live._tasks
+    assert _read_manifest(tmp_path, "bg_13")["state"] == "starting"
+  finally:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+  after_exit = _registry(tmp_path)
+  assert not spill_dir.exists()
+  assert after_exit._tasks["bg_13"].state == "interrupted"
+
+
+def test_run_retention_removes_registered_spill_before_manifest(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner
+
+  now = 1_000_000.0
+  old = now - (8 * 86400)
+  monkeypatch.setenv("AGENT_AUTONOMOUS_RUN_RETENTION_DAYS", "7")
+  monkeypatch.setattr(autonomous_runner.time, "time", lambda: now)
+  spill_dir = tmp_path / "bg_14.tool_result_spill"
+  spill_dir.mkdir()
+  (spill_dir / "committed.json").write_text("{}", encoding="utf-8")
+  _write_manifest(
+    tmp_path,
+    "bg_14",
+    state="completed",
+    completed_at=old,
+    tool_result_spill_dir=str(spill_dir),
+  )
+  _write_run_files(tmp_path, "bg_14")
+
+  registry = _registry(tmp_path)
+
+  assert not spill_dir.exists()
+  assert not _run_files_exist(tmp_path, "bg_14")
+  assert "bg_14" not in registry._tasks
+
+
+def test_run_retention_never_traverses_symlinked_registered_spill(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner
+
+  now = 1_000_000.0
+  old = now - (8 * 86400)
+  monkeypatch.setenv("AGENT_AUTONOMOUS_RUN_RETENTION_DAYS", "7")
+  monkeypatch.setattr(autonomous_runner.time, "time", lambda: now)
+  outside = tmp_path / "outside"
+  outside.mkdir()
+  evidence = outside / "keep.txt"
+  evidence.write_text("keep", encoding="utf-8")
+  linked = tmp_path / "bg_15.tool_result_spill"
+  linked.symlink_to(outside, target_is_directory=True)
+  _write_manifest(
+    tmp_path,
+    "bg_15",
+    state="completed",
+    completed_at=old,
+    tool_result_spill_dir=str(linked),
+  )
+  _write_run_files(tmp_path, "bg_15")
+
+  _registry(tmp_path)
+
+  assert evidence.read_text(encoding="utf-8") == "keep"
+  assert linked.is_symlink()
+
+
+def test_spill_cleanup_detects_directory_replacement_after_lease(
+  tmp_path,
+) -> None:
+  registry = _registry(tmp_path)
+  spill_dir = tmp_path / "bg_16.tool_result_spill"
+  spill_dir.mkdir()
+  outside = tmp_path / "outside-replacement"
+  outside.mkdir()
+  evidence = outside / "keep.txt"
+  evidence.write_text("keep", encoding="utf-8")
+  original_acquire = registry._acquire_tool_result_spill_cleanup_lease
+
+  def replace_after_acquire(path: Path):
+    lease = original_acquire(path)
+    assert lease is not None
+    path.rename(tmp_path / "moved.tool_result_spill")
+    path.symlink_to(outside, target_is_directory=True)
+    return lease
+
+  registry._acquire_tool_result_spill_cleanup_lease = replace_after_acquire  # type: ignore[method-assign]
+
+  assert registry._remove_registered_tool_result_spill_dir("bg_16", spill_dir) is False
+  assert evidence.read_text(encoding="utf-8") == "keep"
+  assert spill_dir.is_symlink()
+
+
 def test_autonomous_run_retention_sequence_cursor_prevents_reuse_after_prune(
   monkeypatch,
   tmp_path,
@@ -1035,13 +1170,16 @@ def test_record_and_publish_seeds_rehydrated_events_before_new_publish(tmp_path)
   }
 
 
-def test_autonomous_manifest_written_post_spawn_with_full_field_set(monkeypatch, tmp_path) -> None:
+def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypatch, tmp_path) -> None:
   async def _case() -> None:
     from agent_gateway import autonomous_runner
 
     async def fake_exec(*args, **kwargs):
-      _ = args, kwargs
-      assert not _manifest_path(tmp_path).exists()
+      _ = args
+      starting = _read_manifest(tmp_path)
+      assert starting["state"] == "starting"
+      assert Path(starting["tool_result_spill_dir"]).is_dir()
+      assert kwargs["env"]["AGENT_AUTONOMOUS_TOOL_RESULT_SPILL_DIR"] == starting["tool_result_spill_dir"]
       return SlowFakeProcess()
 
     monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
@@ -1098,6 +1236,7 @@ def test_autonomous_manifest_written_post_spawn_with_full_field_set(monkeypatch,
         "resumed_as",
         "schedule_id",
         "schedule_name",
+        "tool_result_spill_dir",
       }
       assert manifest["manifest_version"] == 2
       assert manifest["task_id"] == payload["task_id"] == "bg_0"
@@ -1134,6 +1273,7 @@ def test_autonomous_manifest_written_post_spawn_with_full_field_set(monkeypatch,
       assert manifest["resumed_as"] == []
       assert manifest["schedule_id"] is None
       assert manifest["schedule_name"] is None
+      assert manifest["tool_result_spill_dir"] == str(tmp_path / "bg_0.tool_result_spill")
       assert "proc" not in manifest
       assert "reaper_task" not in manifest
       assert "events_tail_task" not in manifest
@@ -1202,6 +1342,103 @@ def test_autonomous_manifest_removed_when_spawn_fails(monkeypatch, tmp_path) -> 
   assert registry._reserved_slots == 0
   assert not _manifest_path(tmp_path).exists()
   assert list(tmp_path.glob("*.task.json")) == []
+  assert not (tmp_path / "bg_0.tool_result_spill").exists()
+
+
+def test_autonomous_initial_manifest_failure_disables_spill_but_still_starts(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  async def _case() -> None:
+    from agent_gateway import autonomous_runner
+
+    captured_env: dict[str, str] = {}
+
+    async def fake_exec(*args, **kwargs):
+      _ = args
+      captured_env.update(kwargs["env"])
+      assert "AGENT_AUTONOMOUS_TOOL_RESULT_SPILL_DIR" not in kwargs["env"]
+      assert not (tmp_path / "bg_0.tool_result_spill").exists()
+      return SlowFakeProcess()
+
+    monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+    registry = _registry(tmp_path)
+    original_write = registry._write_task_manifest
+    calls = 0
+
+    def fail_initial_once(record, *, checked: bool = False):
+      nonlocal calls
+      calls += 1
+      if calls == 1:
+        assert checked is True
+        return False
+      return original_write(record, checked=checked)
+
+    registry._write_task_manifest = fail_initial_once  # type: ignore[method-assign]
+    payload = await registry.start(
+      profile="analyst",
+      mode="task",
+      task="summarize",
+      user_id=USER_ID,
+      user_email=USER_EMAIL,
+    )
+    try:
+      manifest = _read_manifest(tmp_path)
+      assert manifest["state"] == "running"
+      assert manifest["tool_result_spill_dir"] is None
+      assert "AGENT_AUTONOMOUS_TOOL_RESULT_SPILL_DIR" not in captured_env
+    finally:
+      await registry.cancel(payload["task_id"])
+      await registry.shutdown(grace_sec=0.1)
+
+  asyncio.run(_case())
+
+
+def test_autonomous_post_spawn_manifest_failure_terminates_child_and_cleans_spill(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  async def _case() -> None:
+    from agent_gateway import autonomous_runner
+
+    process = SlowFakeProcess()
+
+    async def fake_exec(*args, **kwargs):
+      _ = args, kwargs
+      assert (tmp_path / "bg_0.tool_result_spill").is_dir()
+      return process
+
+    monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+    registry = _registry(tmp_path)
+    original_write = registry._write_task_manifest
+    calls = 0
+
+    def fail_running_commit(record, *, checked: bool = False):
+      nonlocal calls
+      calls += 1
+      if calls == 2:
+        assert checked is True
+        return False
+      return original_write(record, checked=checked)
+
+    registry._write_task_manifest = fail_running_commit  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="commit running autonomous task manifest"):
+      await registry.start(
+        profile="analyst",
+        mode="task",
+        task="summarize",
+        user_id=USER_ID,
+        user_email=USER_EMAIL,
+      )
+
+    assert process.returncode == -15
+    assert not (tmp_path / "bg_0.tool_result_spill").exists()
+    assert not _manifest_path(tmp_path).exists()
+    assert registry._tasks == {}
+
+  asyncio.run(_case())
 
 
 @pytest.mark.parametrize(
@@ -1404,7 +1641,7 @@ def test_autonomous_manifest_updates_on_resume_linkage_append(monkeypatch, tmp_p
   asyncio.run(_case())
 
 
-def test_autonomous_manifest_write_failures_do_not_block_transitions(
+def test_autonomous_post_spawn_manifest_commit_failure_aborts_unowned_child(
   monkeypatch,
   tmp_path,
   caplog,
@@ -1425,17 +1662,17 @@ def test_autonomous_manifest_write_failures_do_not_block_transitions(
     monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
     registry = _registry(tmp_path)
     with caplog.at_level(logging.WARNING, logger="agent_gateway.autonomous_runner"):
-      payload = await registry.start(
-        profile="analyst",
-        mode="task",
-        task="summarize",
-        user_id=USER_ID,
-        user_email=USER_EMAIL,
-      )
-      status = await registry.cancel(payload["task_id"])
-      await registry.shutdown(grace_sec=0.1)
+      with pytest.raises(RuntimeError, match="commit running autonomous task manifest"):
+        await registry.start(
+          profile="analyst",
+          mode="task",
+          task="summarize",
+          user_id=USER_ID,
+          user_email=USER_EMAIL,
+        )
 
-    assert status["state"] == "killed"
+    assert registry._tasks == {}
+    assert registry._reserved_slots == 0
     assert not _manifest_path(tmp_path).exists()
     assert "Failed to write autonomous task manifest for bg_0" in caplog.text
 

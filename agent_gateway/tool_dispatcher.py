@@ -939,6 +939,14 @@ class ToolDispatcher:
             trusted_plan.prepared
           )
           approval_args_hash = sha256_args(approval_args_redacted)
+        elif trusted_plan.identity_source == "change_set":
+          approval_args_redacted, approval_args_hash = (
+            self._redact_for_approval_request(tool_name, tool_input)
+          )
+          approval_args_redacted = {
+            **approval_args_redacted,
+            "planned_change": trusted_plan.approval_review(),
+          }
         lifecycle = (
           {
             "approved": True,

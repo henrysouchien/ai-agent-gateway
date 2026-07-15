@@ -428,6 +428,7 @@ def test_sdk_batch_admission_cancel_before_pending_publish_aborts_durable_row(
       user_id="alice",
     )
     session.channel = "tui"
+    session.batch_stage_run_seq = 3
     scope = BatchApprovalScope(
       batch_id=77,
       owner_user_id="alice",
@@ -492,6 +493,91 @@ def test_sdk_batch_admission_cancel_before_pending_publish_aborts_durable_row(
     assert registry._admission_gates[("alice", 77)].active == 0
 
   _run(_case())
+
+
+def test_sdk_projected_pending_tool_binds_stage_identity_to_projection_and_event() -> None:
+  async def _case() -> None:
+    events: list[dict[str, Any]] = []
+    request = SimpleNamespace(
+      approval_id="approval-sdk-batch",
+      tool_call_id="tool-sdk-batch",
+      tool_name="file_write",
+      tool_args_redacted={"path": "model.xlsx"},
+    )
+    session = SimpleNamespace(
+      pending_tools={},
+      approval_queues={},
+      batch_stage_run_seq=3,
+    )
+
+    class _Admission:
+      def publish_pending(self) -> None:
+        pending = session.pending_tools[request.tool_call_id]
+        assert pending["stage_run_seq"] == 3
+        session.approval_queues[request.tool_call_id].put_nowait(
+          {"approved": False}
+        )
+
+    result = await sdk_runner_approval.await_user_approval_via_pending_tools(
+      session=session,
+      approval_store=None,
+      request=request,
+      decision=SimpleNamespace(
+        reason="review required",
+        allow_persistent_grant=False,
+      ),
+      nonce="nonce-sdk-batch",
+      append_event_fn=events.append,
+      timeout_seconds=5,
+      log=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
+      batch_admission=_Admission(),
+    )
+
+    assert result == {"approved": False}
+    assert events[0]["stage_run_seq"] == 3
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+
+  _run(_case())
+
+
+@pytest.mark.parametrize("stage_run_seq", [None, 0, -1, True, "3"])
+def test_sdk_projected_pending_tool_rejects_invalid_stage_identity(
+  stage_run_seq: object,
+) -> None:
+  session = SimpleNamespace(
+    pending_tools={},
+    approval_queues={},
+    batch_stage_run_seq=stage_run_seq,
+  )
+
+  with pytest.raises(
+    ValueError,
+    match="stage_run_seq must be a positive integer",
+  ):
+    _run(
+      sdk_runner_approval.await_user_approval_via_pending_tools(
+        session=session,
+        approval_store=None,
+        request=SimpleNamespace(
+          approval_id="approval-sdk-batch",
+          tool_call_id="tool-sdk-batch",
+          tool_name="file_write",
+          tool_args_redacted={},
+        ),
+        decision=SimpleNamespace(
+          reason="review required",
+          allow_persistent_grant=False,
+        ),
+        nonce="nonce-sdk-batch",
+        append_event_fn=lambda _event: None,
+        timeout_seconds=5,
+        log=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
+        batch_admission=object(),
+      )
+    )
+  assert session.pending_tools == {}
+  assert session.approval_queues == {}
 
 
 def test_sdk_runner_policy_modified_input_behavior_is_unchanged(

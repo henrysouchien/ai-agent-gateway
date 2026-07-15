@@ -26,8 +26,31 @@ from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich
 from .batch_approval_projection import (
   abort_unpublished_batch_approval_admission,
   acquire_batch_approval_admission,
+  require_batch_stage_run_seq,
 )
 from .policy_imports import resolve_server_policy_tool_class
+
+
+def _approval_wait_timeout_seconds(
+  expiry_seconds: float | int | None,
+  *,
+  batch_admission: Any | None,
+  approval_queue_timeout_seconds_fn: Any,
+) -> float:
+  """Keep projected batch waits aligned with their advertised durable expiry.
+
+  The ordinary queue timeout remains capped by the global approval-wait setting,
+  which deliberately protects short-lived trade previews. A projected in-process
+  batch approval already has a policy-bounded durable expiry and no independent
+  process bridge, so ending its queue wait earlier strands the live stage while
+  the control API still advertises a pending request. Trade approvals remain safe
+  because ``effective_trade_approval_decision`` first caps their own expiry to the
+  preview lifetime.
+  """
+
+  if batch_admission is None:
+    return float(approval_queue_timeout_seconds_fn(expiry_seconds))
+  return float(expiry_seconds or 600)
 
 
 async def run_approval_lifecycle(
@@ -419,7 +442,11 @@ async def _run_approval_lifecycle_impl(
     nonce=nonce,
     resolved_qualifier=qualifier,
     allow_persistent=(allow_persistent and request.approval_constraint == "standard"),
-    timeout_seconds=approval_queue_timeout_seconds_fn(decision.expiry_seconds),
+    timeout_seconds=_approval_wait_timeout_seconds(
+      decision.expiry_seconds,
+      batch_admission=batch_admission,
+      approval_queue_timeout_seconds_fn=approval_queue_timeout_seconds_fn,
+    ),
     batch_admission=batch_admission,
   )
   if approval is None:
@@ -459,7 +486,7 @@ async def await_user_approval_via_pending_tools(
   if session is None:
     return None
   approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
-  session.pending_tools[request.tool_call_id] = {
+  pending_entry = {
     "approval_id": request.approval_id,
     "nonce": nonce,
     "requested_at": int(time.time()),
@@ -467,6 +494,9 @@ async def await_user_approval_via_pending_tools(
     "tool_name": request.tool_name,
     "resolved_qualifier": resolved_qualifier,
   }
+  if batch_admission is not None:
+    pending_entry["stage_run_seq"] = require_batch_stage_run_seq(session)
+  session.pending_tools[request.tool_call_id] = pending_entry
   session.approval_queues[request.tool_call_id] = approval_queue
   if batch_admission is not None:
     try:
@@ -488,6 +518,8 @@ async def await_user_approval_via_pending_tools(
     "allow_persistent_approval": allow_persistent and decision.allow_persistent_grant,
     "ts": time.time(),
   }
+  if batch_admission is not None:
+    approval_event["stage_run_seq"] = pending_entry["stage_run_seq"]
   if event_log is not None:
     event_log.append(approval_event)
   session_log = getattr(session, "agent_session_log", None)

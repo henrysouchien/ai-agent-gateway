@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import uuid
 from typing import Any, Callable, Dict
 
+from .tool_result_spill import (
+  SPILL_LANE_CODE_EXECUTE,
+  SPILL_LANE_FILE_TOOLS,
+  SpillPublication,
+  SpillSink,
+  normalize_spill_sink,
+  write_spill_set,
+)
 from .tool_result_semantics import status_error_has_detail
 
 MODEL_TOOL_RESULT_MAX_CHARS = 60_000
@@ -131,30 +138,17 @@ def write_tool_result_spill(
   content: str,
   uuid_factory=None,
 ) -> tuple[str, str]:
-  if uuid_factory is None:
-    uuid_factory = uuid.uuid4
-  raw = f"{tool_name}_{tool_use_id or uuid_factory().hex}"
-  safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw)[:120]
-  try:
-    json.loads(content)
-    ext = "json"
-  except Exception:
-    ext = "txt"
-
-  filename = f"{safe}.{ext}"
-  for attempt in range(2):
-    if attempt:
-      filename = f"{safe}_{uuid_factory().hex[:8]}.{ext}"
-    spill_abspath = os.path.join(work_dir, filename)
-    try:
-      with open(spill_abspath, "x", encoding="utf-8") as handle:
-        handle.write(content)
-      return filename, spill_abspath
-    except FileExistsError:
-      if attempt == 0:
-        continue
-      raise
-  raise FileExistsError(filename)
+  sink = normalize_spill_sink(lambda: work_dir)
+  assert sink is not None
+  publication = write_spill_set(
+    sink=sink,
+    tool_name=tool_name,
+    tool_use_id=tool_use_id,
+    content=content,
+    model_max_chars=model_tool_result_max_chars(),
+    uuid_factory=uuid_factory or uuid.uuid4,
+  )
+  return publication.filename, publication.abspath
 
 
 def truncate_model_tool_result_content(
@@ -164,6 +158,8 @@ def truncate_model_tool_result_content(
   max_chars: int,
   spill_filename: str | None = None,
   spill_abspath: str | None = None,
+  spill_hint: str | None = None,
+  spill_summary: dict[str, Any] | None = None,
 ) -> tuple[str, bool]:
   if max_chars <= 0 or len(content) <= max_chars:
     return content, False
@@ -188,13 +184,9 @@ def truncate_model_tool_result_content(
   if spill_filename is not None:
     payload["spill_file"] = spill_filename
     payload["spill_abspath"] = spill_abspath
-    payload["spill_hint"] = (
-      "The FULL, untruncated result was written to this file in your code_execute "
-      "working directory. Read it there instead of relying on this preview - e.g. "
-      f"in code_execute: `import pandas as pd; df = pd.read_json('{spill_filename}')` "
-      f"(or `json.load(open('{spill_filename}'))`). In run_bash/file_read, use the "
-      "absolute path (spill_abspath) instead of the bare name."
-    )
+    payload["spill_hint"] = spill_hint or _legacy_spill_hint(spill_filename)
+    if spill_summary:
+      payload["spill_summary"] = spill_summary
   if isinstance(parsed, dict):
     payload["top_level_keys"] = list(parsed.keys())[:50]
     scalar_fields = scalar_preview_fields(parsed)
@@ -226,17 +218,64 @@ def truncate_model_tool_result_content(
   if spill_filename is not None:
     fallback_payload["spill_file"] = spill_filename
     fallback_payload["spill_abspath"] = spill_abspath
-    fallback_payload["spill_hint"] = (
+    fallback_payload["spill_hint"] = spill_hint or (
       "The FULL, untruncated result was written to this file in your code_execute working directory."
     )
+    if spill_summary:
+      fallback_payload["spill_summary"] = spill_summary
   return json.dumps(fallback_payload, default=str), True
+
+
+def _legacy_spill_hint(spill_filename: str) -> str:
+  return (
+    "The FULL, untruncated result was written to this file in your code_execute "
+    "working directory. Read it there instead of relying on this preview - e.g. "
+    f"in code_execute: `import pandas as pd; df = pd.read_json('{spill_filename}')` "
+    f"(or `json.load(open('{spill_filename}'))`). In run_bash/file_read, use the "
+    "absolute path (spill_abspath) instead of the bare name."
+  )
+
+
+def _publication_summary(publication: SpillPublication) -> dict[str, Any]:
+  return {
+    "member_count": publication.member_count,
+    "total_chars": publication.total_chars,
+    "largest_members": list(publication.largest_members),
+  }
+
+
+def _spill_hint(publication: SpillPublication, sink: SpillSink) -> str:
+  if publication.lane == SPILL_LANE_CODE_EXECUTE:
+    return _legacy_spill_hint(publication.filename)
+  if publication.lane == SPILL_LANE_FILE_TOOLS:
+    operations: list[str] = []
+    if sink.capabilities.file_read:
+      operations.append(
+        "page with `file_read(file_path=spill_abspath, offset=0, limit=3)` "
+        "(`limit=1` for `.chunks.txt` members)"
+      )
+    if sink.capabilities.file_grep:
+      operations.append(
+        "search an exact member with `file_grep(pattern=..., path=..., max_results=1, context_lines=1)`"
+      )
+    action = "; ".join(operations)
+    return (
+      "The full result is committed as the spill set described by this manifest. "
+      f"Use the manifest's bounded member list to {action}. Do not read a whole large file in one call; "
+      "that result will be truncated again."
+    )
+  return (
+    "The full result was retained as a run-scoped audit spill, but this run has no file/code reader. "
+    "Narrow or paginate the original tool call; an operator can inspect the audit artifact if needed."
+  )
 
 
 def compact_model_tool_result_entry(
   result_entry: Dict[str, Any],
   *,
   tool_name: str,
-  spill_dir_provider: Callable[[], str] | None,
+  spill_sink: Callable[[], str] | SpillSink | None = None,
+  spill_dir_provider: Callable[[], str] | SpillSink | None = None,
   log_session_id: str,
   logger: Any,
   uuid_factory: Callable[[], Any] | None = None,
@@ -258,26 +297,35 @@ def compact_model_tool_result_entry(
   plain_compacted_entry["content"] = plain_compacted_content
   live_entry = plain_compacted_entry
   durable_entry = plain_compacted_entry
+  if spill_sink is not None and spill_dir_provider is not None:
+    raise ValueError("pass spill_sink or spill_dir_provider, not both")
+  configured_sink = normalize_spill_sink(spill_sink if spill_sink is not None else spill_dir_provider)
   if (
-    spill_dir_provider is not None
+    configured_sink is not None
     and spill_truncated_tool_results_enabled()
     and not is_error_tool_result_entry(result_entry, content)
   ):
     try:
-      work_dir = spill_dir_provider()
-      filename, spill_abspath = write_tool_result_spill(
-        work_dir=work_dir,
+      publication = write_spill_set(
+        sink=configured_sink,
         tool_name=tool_name,
         tool_use_id=result_entry.get("tool_use_id"),
         content=content,
-        uuid_factory=uuid_factory,
+        model_max_chars=max_chars,
+        uuid_factory=uuid_factory or uuid.uuid4,
       )
       live_compacted_content, _ = truncate_model_tool_result_content(
         content,
         tool_name=tool_name,
         max_chars=max_chars,
-        spill_filename=filename,
-        spill_abspath=spill_abspath,
+        spill_filename=publication.filename,
+        spill_abspath=publication.abspath,
+        spill_hint=_spill_hint(publication, configured_sink),
+        spill_summary=(
+          _publication_summary(publication)
+          if publication.lane == SPILL_LANE_FILE_TOOLS
+          else None
+        ),
       )
       live_entry = dict(result_entry)
       live_entry["content"] = live_compacted_content

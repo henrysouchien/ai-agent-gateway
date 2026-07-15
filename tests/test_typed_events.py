@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import json
 import sys
 from pathlib import Path
@@ -157,6 +159,9 @@ def test_skill_result_captured_event_round_trip() -> None:
     duration_s=7.25,
     error=None,
     warnings=["source coverage limited"],
+    approval_outcome="approval_timeout",
+    approval_id="approval-forecast-1",
+    approval_tool_name="fms_persist_forecast_assumptions",
   )
 
   payload = event_to_dict(event)
@@ -164,6 +169,8 @@ def test_skill_result_captured_event_round_trip() -> None:
   assert payload["type"] == "skill_result_captured"
   assert "skill_result_captured" in TYPED_EVENT_TYPES
   assert "skill_result_captured" in RUN_SCOPED_EVENT_TYPES
+  assert payload["approval_outcome"] == "approval_timeout"
+  assert payload["approval_id"] == "approval-forecast-1"
   assert event_from_dict(payload) == event
 
 

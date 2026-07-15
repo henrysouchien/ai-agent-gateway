@@ -11,6 +11,7 @@ from agent_gateway.batch_approval_projection import (
   approval_record_matches_projection,
   bind_batch_approval_scope,
   current_batch_approval_scope,
+  require_batch_stage_run_seq,
 )
 
 
@@ -31,6 +32,48 @@ def _install_pending(session: SimpleNamespace, approval_id: str = "approval-1") 
     "status": "approval_pending",
     "stage_run_seq": 3,
   }
+
+
+def test_batch_stage_run_seq_requires_exact_positive_integer() -> None:
+  assert require_batch_stage_run_seq(
+    SimpleNamespace(batch_stage_run_seq=3)
+  ) == 3
+
+
+@pytest.mark.parametrize("stage_run_seq", [None, 0, -1, True, "3"])
+def test_batch_stage_run_seq_rejects_missing_or_invalid_identity(
+  stage_run_seq: object,
+) -> None:
+  with pytest.raises(
+    ValueError,
+    match="stage_run_seq must be a positive integer",
+  ):
+    require_batch_stage_run_seq(
+      SimpleNamespace(batch_stage_run_seq=stage_run_seq)
+    )
+
+
+@pytest.mark.parametrize("stage_run_seq", [0, -1, True, "3"])
+def test_projection_rejects_present_invalid_stage_identity(
+  stage_run_seq: object,
+) -> None:
+  registry = BatchApprovalProjectionRegistry()
+  session = _session()
+  _install_pending(session)
+  session.pending_tools["tool-1"]["stage_run_seq"] = stage_run_seq
+
+  with pytest.raises(
+    ValueError,
+    match="stage_run_seq must be a positive integer",
+  ):
+    registry.register_session(
+      batch_id=59,
+      owner_user_id="1",
+      channel="tui",
+      session=session,
+    )
+  assert registry._carriers == {}
+  assert registry._projections == {}
 
 
 def test_projection_is_exact_owner_channel_run_and_identity_scoped() -> None:

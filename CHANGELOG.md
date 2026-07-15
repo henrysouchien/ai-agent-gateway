@@ -1,8 +1,30 @@
 # Changelog
 
-## Unreleased (post-0.15.11)
+## Unreleased (post-0.15.12)
 
 _No unreleased changes recorded yet._
+
+## 0.15.12 (2026-07-15)
+
+### Added
+
+- Added autonomous, run-scoped recovery for oversized tool results. Capability-
+  aware spill sets provide bounded `file_read`/`file_grep` projections for
+  multiline and single-line payloads, while per-run budgets, no-clobber atomic
+  publication, registry manifests, cross-process leases, and retention give
+  artifact-backed and direct launches explicit lifecycle owners.
+- Added approval presentation metadata that exposes exact planned changes and
+  available Undo actions without changing the authoritative approval payload.
+
+### Fixed
+
+- Bound batch approvals to validated positive stage-run identity across SDK
+  pending entries, session logs, projections, and control-plane resolution.
+- Honored each approval's advertised expiry throughout the batch lifecycle and
+  preserved terminal expiry and cancellation outcomes in typed events.
+- Anchored the default approval database below the configured gateway user-data
+  root so durable write state participates in the authoritative snapshot and
+  migration boundary.
 
 ## 0.15.11 (2026-07-15)
 

@@ -21,6 +21,7 @@ from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich
 from .batch_approval_projection import (
   abort_unpublished_batch_approval_admission,
   acquire_batch_approval_admission,
+  require_batch_stage_run_seq,
 )
 from .policy_imports import resolve_server_policy_tool_class
 
@@ -114,7 +115,7 @@ async def await_user_approval_via_pending_tools(
   if session is None:
     return None
   approval_queue: asyncio.Queue = queue_factory(maxsize=1)
-  session.pending_tools[request.tool_call_id] = {
+  pending_entry = {
     "approval_id": request.approval_id,
     "nonce": nonce,
     "requested_at": int(time_fn()),
@@ -122,6 +123,9 @@ async def await_user_approval_via_pending_tools(
     "tool_name": request.tool_name,
     "resolved_qualifier": "",
   }
+  if batch_admission is not None:
+    pending_entry["stage_run_seq"] = require_batch_stage_run_seq(session)
+  session.pending_tools[request.tool_call_id] = pending_entry
   session.approval_queues[request.tool_call_id] = approval_queue
   if batch_admission is not None:
     try:
@@ -142,6 +146,8 @@ async def await_user_approval_via_pending_tools(
     "allow_persistent_approval": decision.allow_persistent_grant,
     "ts": time_fn(),
   }
+  if batch_admission is not None:
+    approval_event["stage_run_seq"] = pending_entry["stage_run_seq"]
   append_event_fn(approval_event)
   session_log = getattr(session, "agent_session_log", None)
   if session_log is not None:

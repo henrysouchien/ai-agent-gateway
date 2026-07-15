@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import importlib
 import json
 import logging
 import os
 import re
 import secrets
+import shutil
+import stat
 import sys
 import time
 from collections import deque
@@ -45,6 +48,41 @@ def _runtime_module() -> Any:
     if module is not None:
       return module
   return sys.modules[__name__]
+
+
+@dataclass
+class _SpillCleanupLease:
+  directory: Path
+  fd: int
+  directory_fd: int
+
+  def is_current(self) -> bool:
+    try:
+      held_directory = os.fstat(self.directory_fd)
+      visible_directory = os.lstat(self.directory)
+      held_lease = os.fstat(self.fd)
+      visible_lease = os.stat(".lease", dir_fd=self.directory_fd, follow_symlinks=False)
+    except OSError:
+      return False
+    return (
+      stat.S_ISDIR(held_directory.st_mode)
+      and stat.S_ISDIR(visible_directory.st_mode)
+      and (held_directory.st_dev, held_directory.st_ino)
+      == (visible_directory.st_dev, visible_directory.st_ino)
+      and stat.S_ISREG(held_lease.st_mode)
+      and stat.S_ISREG(visible_lease.st_mode)
+      and (held_lease.st_dev, held_lease.st_ino) == (visible_lease.st_dev, visible_lease.st_ino)
+    )
+
+  def close(self) -> None:
+    try:
+      fcntl.flock(self.fd, fcntl.LOCK_UN)
+    except OSError:
+      pass
+    try:
+      os.close(self.fd)
+    finally:
+      os.close(self.directory_fd)
 
 
 def _runtime_attr(name: str, default: Any) -> Any:
@@ -158,6 +196,7 @@ class AutonomousTask:
   resumed_as: list[str] = field(default_factory=list)
   schedule_id: str | None = None
   schedule_name: str | None = None
+  tool_result_spill_dir: Path | None = None
 
   def __post_init__(self) -> None:
     if self.owner_user_id is None:
@@ -435,6 +474,145 @@ class AutonomousRegistryStateMixin:
         paths.add(path)
     return sorted(paths, key=lambda path: path.name)
 
+  def _expected_tool_result_spill_dir(self, task_id: str) -> Path:
+    return self._log_dir.expanduser().resolve() / f"{task_id}.tool_result_spill"
+
+  def _registered_tool_result_spill_dir(
+    self,
+    task_id: str,
+    raw_path: Any,
+    *,
+    require_exists: bool,
+  ) -> Path | None:
+    if not isinstance(raw_path, (str, Path)) or not str(raw_path).strip():
+      return None
+    path = Path(raw_path).expanduser()
+    expected = self._expected_tool_result_spill_dir(task_id)
+    try:
+      if not path.is_absolute() or path != expected or path.resolve(strict=False) != expected:
+        return None
+      if require_exists:
+        info = path.lstat()
+        if path.is_symlink() or not stat.S_ISDIR(info.st_mode):
+          return None
+    except OSError:
+      return None
+    return path
+
+  def _acquire_tool_result_spill_cleanup_lease(
+    self,
+    spill_dir: Path,
+  ) -> _SpillCleanupLease | None:
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+      directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+      directory_flags |= os.O_NOFOLLOW
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+      flags |= os.O_NOFOLLOW
+    directory_fd: int | None = None
+    fd: int | None = None
+    try:
+      directory_fd = os.open(spill_dir, directory_flags)
+      held_directory = os.fstat(directory_fd)
+      visible_directory = os.lstat(spill_dir)
+      if (
+        not stat.S_ISDIR(held_directory.st_mode)
+        or not stat.S_ISDIR(visible_directory.st_mode)
+        or (held_directory.st_dev, held_directory.st_ino)
+        != (visible_directory.st_dev, visible_directory.st_ino)
+      ):
+        raise OSError("spill directory identity mismatch")
+      fd = os.open(".lease", flags, 0o600, dir_fd=directory_fd)
+      fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      held = os.fstat(fd)
+      visible = os.stat(".lease", dir_fd=directory_fd, follow_symlinks=False)
+      if (
+        not stat.S_ISREG(held.st_mode)
+        or not stat.S_ISREG(visible.st_mode)
+        or (held.st_dev, held.st_ino) != (visible.st_dev, visible.st_ino)
+      ):
+        raise OSError("spill lease identity mismatch")
+      lease = _SpillCleanupLease(
+        directory=spill_dir,
+        fd=fd,
+        directory_fd=directory_fd,
+      )
+      if not lease.is_current():
+        raise OSError("spill cleanup directory was replaced")
+      return lease
+    except OSError:
+      if fd is not None:
+        try:
+          os.close(fd)
+        except OSError:
+          pass
+      if directory_fd is not None:
+        try:
+          os.close(directory_fd)
+        except OSError:
+          pass
+      return None
+
+  def _remove_registered_tool_result_spill_dir(
+    self,
+    task_id: str,
+    raw_path: Any,
+    *,
+    require_starting_manifest: bool = False,
+  ) -> bool:
+    spill_dir = self._registered_tool_result_spill_dir(
+      task_id,
+      raw_path,
+      require_exists=True,
+    )
+    if spill_dir is None:
+      return not Path(str(raw_path or "")).exists()
+    lease = self._acquire_tool_result_spill_cleanup_lease(spill_dir)
+    if lease is None:
+      return False
+    try:
+      if require_starting_manifest:
+        try:
+          manifest = json.loads(self._manifest_path(task_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+          return False
+        if not isinstance(manifest, dict) or manifest.get("state") != "starting":
+          return False
+      if not lease.is_current():
+        return False
+      shutil.rmtree(spill_dir)
+      return True
+    except OSError:
+      _LOGGER.warning("Failed to remove autonomous tool-result spill dir: %s", spill_dir, exc_info=True)
+      return False
+    finally:
+      lease.close()
+
+  def _cleanup_uncommitted_spill_starts(self) -> None:
+    self._spill_start_cleanup_skipped: set[str] = set()
+    for manifest_path in self._manifest_paths():
+      try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+      except (OSError, json.JSONDecodeError):
+        continue
+      if not isinstance(manifest, dict) or manifest.get("state") != "starting":
+        continue
+      task_id = self._coerce_manifest_str(manifest, "task_id")
+      if not task_id or _runtime_attr("_AUTONOMOUS_TASK_ID_RE", _AUTONOMOUS_TASK_ID_RE).fullmatch(task_id) is None:
+        continue
+      raw_path = manifest.get("tool_result_spill_dir")
+      spill_dir = self._registered_tool_result_spill_dir(task_id, raw_path, require_exists=False)
+      if spill_dir is None or not spill_dir.exists():
+        continue
+      if not self._remove_registered_tool_result_spill_dir(
+        task_id,
+        raw_path,
+        require_starting_manifest=True,
+      ):
+        self._spill_start_cleanup_skipped.add(task_id)
+
   def _is_log_dir_child(self, path: Path) -> bool:
     try:
       log_dir = self._log_dir.resolve()
@@ -497,6 +675,15 @@ class AutonomousRegistryStateMixin:
       task_id = self._coerce_manifest_str(manifest, "task_id")
       if not task_id or _runtime_attr("_AUTONOMOUS_TASK_ID_RE", _AUTONOMOUS_TASK_ID_RE).fullmatch(task_id) is None:
         continue
+      spill_path = manifest.get("tool_result_spill_dir")
+      registered_spill = self._registered_tool_result_spill_dir(
+        task_id,
+        spill_path,
+        require_exists=False,
+      )
+      if registered_spill is not None and registered_spill.exists():
+        if not self._remove_registered_tool_result_spill_dir(task_id, spill_path):
+          continue
       deleted_any = False
       for path in self._run_file_group_paths(task_id, manifest_path, manifest):
         try:
@@ -563,6 +750,9 @@ class AutonomousRegistryStateMixin:
       "resumed_as": list(record.resumed_as),
       "schedule_id": record.schedule_id,
       "schedule_name": record.schedule_name,
+      "tool_result_spill_dir": (
+        str(record.tool_result_spill_dir) if record.tool_result_spill_dir is not None else None
+      ),
     }
 
   def _attach_manifest_tracking(self, record: AutonomousTask) -> None:
@@ -573,7 +763,7 @@ class AutonomousRegistryStateMixin:
       lambda: self._write_task_manifest(record),
     )
 
-  def _write_task_manifest(self, record: AutonomousTask) -> None:
+  def _write_task_manifest(self, record: AutonomousTask, *, checked: bool = False) -> bool:
     manifest_path = self._manifest_path(record.task_id)
     tmp_path = manifest_path.with_name(f"{manifest_path.name}.{secrets.token_hex(8)}.tmp")
     try:
@@ -583,6 +773,7 @@ class AutonomousRegistryStateMixin:
         encoding="utf-8",
       )
       _os_replace(tmp_path, manifest_path)
+      return True
     except Exception:
       try:
         tmp_path.unlink()
@@ -593,6 +784,9 @@ class AutonomousRegistryStateMixin:
         record.task_id,
         exc_info=True,
       )
+      if checked:
+        return False
+      return False
 
   def _delete_task_manifest(self, task_id: str) -> None:
     try:
@@ -845,6 +1039,11 @@ class AutonomousRegistryStateMixin:
       resumed_as=[str(item) for item in resumed_as] if isinstance(resumed_as, list) else [],
       schedule_id=self._coerce_manifest_str(manifest, "schedule_id"),
       schedule_name=self._coerce_manifest_str(manifest, "schedule_name"),
+      tool_result_spill_dir=self._registered_tool_result_spill_dir(
+        task_id,
+        manifest.get("tool_result_spill_dir"),
+        require_exists=False,
+      ),
     )
     self._attach_manifest_tracking(record)
     if (
@@ -865,6 +1064,9 @@ class AutonomousRegistryStateMixin:
         continue
       if not isinstance(manifest, dict):
         _LOGGER.warning("Skipping malformed autonomous task manifest: %s", manifest_path)
+        continue
+      task_id = self._coerce_manifest_str(manifest, "task_id")
+      if task_id and task_id in getattr(self, "_spill_start_cleanup_skipped", set()):
         continue
 
       record = self._task_from_manifest(

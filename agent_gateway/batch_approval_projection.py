@@ -12,6 +12,13 @@ def normalize_approval_channel(value: str | None) -> str | None:
   return normalized or None
 
 
+def require_batch_stage_run_seq(session: Any) -> int:
+  stage_run_seq = getattr(session, "batch_stage_run_seq", None)
+  if type(stage_run_seq) is not int or stage_run_seq < 1:
+    raise ValueError("batch approval stage_run_seq must be a positive integer")
+  return stage_run_seq
+
+
 @dataclass(frozen=True)
 class ApprovalProjection:
   approval_id: str
@@ -719,10 +726,13 @@ class BatchApprovalProjectionRegistry:
         continue
       live_ids.add(approval_id)
       stage_run_seq = pending.get("stage_run_seq")
-      try:
-        normalized_stage_run_seq = int(stage_run_seq) if stage_run_seq is not None else None
-      except (TypeError, ValueError):
-        raise ValueError("batch approval stage_run_seq must be an integer") from None
+      if stage_run_seq is not None and (
+        type(stage_run_seq) is not int or stage_run_seq < 1
+      ):
+        raise ValueError(
+          "batch approval stage_run_seq must be a positive integer"
+        )
+      normalized_stage_run_seq = stage_run_seq
       projection = ApprovalProjection(
         approval_id=approval_id,
         batch_id=carrier.batch_id,
@@ -857,4 +867,5 @@ __all__ = [
   "bind_batch_approval_scope",
   "current_batch_approval_scope",
   "normalize_approval_channel",
+  "require_batch_stage_run_seq",
 ]

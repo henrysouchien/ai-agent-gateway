@@ -241,6 +241,7 @@ from .tool_result_semantics import (
   classify_semantic_tool_error,  # noqa: F401 - compatibility alias
   is_semantic_tool_error as _is_soft_error,
 )
+from .tool_result_spill import SpillSink, normalize_spill_sink
 
 
 kill_background_tasks = _kill_background_tasks
@@ -364,7 +365,7 @@ class AgentRunner(
     shutdown_signal_provider: ShutdownSignalProvider | None = None,
     started_at: float | None = None,
     emit_session_recap: bool = True,
-    code_execution_spill_dir_provider: Callable[[], str] | None = None,
+    code_execution_spill_dir_provider: Callable[[], str] | SpillSink | None = None,
     skill_run_id: str | None = None,
     workspace_dir: str | Path | None = None,
     batch_id: int | str | None = None,
@@ -380,7 +381,7 @@ class AgentRunner(
 
     self._log = event_log
     self._dispatcher = dispatcher
-    self._spill_dir_provider = code_execution_spill_dir_provider
+    self._spill_dir_provider = normalize_spill_sink(code_execution_spill_dir_provider)
     self._provider = provider
     self._full_session_id = session_id or "no-session"
     self._sid = self._full_session_id[:12]
@@ -617,7 +618,7 @@ class AgentRunner(
     return _compact_model_tool_result_entry(
       result_entry,
       tool_name=tool_name,
-      spill_dir_provider=self._spill_dir_provider,
+      spill_sink=self._spill_dir_provider,
       log_session_id=self._sid,
       logger=log,
       uuid_factory=uuid.uuid4,
