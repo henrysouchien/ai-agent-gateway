@@ -33,7 +33,6 @@ from .runner_usage import (
   apply_usage_update as _apply_usage_update,
   usage_delta_state as _usage_delta_state,
 )
-from .ui_blocks import UIBlocksStreamFilter, sanitize_ui_blocks_content_blocks, sanitize_ui_blocks_text
 
 
 log = logging.getLogger("agent_gateway.runner")
@@ -172,7 +171,6 @@ class RunnerStreamTurnMixin:
     async def _consume_stream(params: Dict[str, Any], result: StreamTurnResult) -> None:
       nonlocal last_progress_at
       first_turn = turn_count == 1
-      ui_blocks_filter = UIBlocksStreamFilter() if self._channel == "web" else None
       logger.debug("[%s] Turn %d stream open", self._sid, turn_count)
 
       async for event in self._provider.stream(client, params):
@@ -235,10 +233,9 @@ class RunnerStreamTurnMixin:
           if result.first_token_t is None:
             result.first_token_t = time_module.time()
           text = str(event.text or "")
-          visible_text = ui_blocks_filter.feed(text) if ui_blocks_filter is not None else text
           if not suppress_tool_turn_text:
-            if visible_text:
-              self._append({"type": "text_delta", "text": visible_text})
+            if text:
+              self._append({"type": "text_delta", "text": text})
           result.full_text += text
           continue
 
@@ -293,13 +290,6 @@ class RunnerStreamTurnMixin:
 
         if event_type == "message_end":
           result.stop_reason = event.stop_reason or None
-
-      if ui_blocks_filter is not None:
-        visible_text = ui_blocks_filter.finish()
-        if visible_text and not suppress_tool_turn_text:
-          self._append({"type": "text_delta", "text": visible_text})
-        result.full_text = sanitize_ui_blocks_text(result.full_text)
-        result.content_blocks = sanitize_ui_blocks_content_blocks(result.content_blocks)
 
       logger.debug("[%s] Turn %d stream end", self._sid, turn_count)
 

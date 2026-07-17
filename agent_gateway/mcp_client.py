@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Sequence, Set, Tuple
 
 from . import mcp_client_catalog as _catalog_helpers
 from . import mcp_client_connections as _connection_helpers
@@ -427,6 +427,7 @@ class McpClientManager:
     logical_server_routes: Dict[str, str] | None = None,
     logical_tool_aliases: Dict[str, Dict[str, str]] | None = None,
     provider_ids_by_server: Dict[str, str] | None = None,
+    server_env_passthrough: Mapping[str, Set[str]] | None = None,
     startup_timeout: int = 15,
     default_tool_timeout: int = 30,
     strip_input_fields: set[str] | None = None,
@@ -454,6 +455,10 @@ class McpClientManager:
       self._canonical_server_name(server_name): str(provider_id).strip()
       for server_name, provider_id in dict(provider_ids_by_server or {}).items()
       if str(provider_id).strip()
+    }
+    self._server_env_passthrough = {
+      self._canonical_server_name(server_name): {str(env_name) for env_name in env_names}
+      for server_name, env_names in dict(server_env_passthrough or {}).items()
     }
     self._logical_tool_definitions: Dict[str, List[Dict[str, Any]]] = {}
     self._dispatch_to_original: Dict[str, str] = {}

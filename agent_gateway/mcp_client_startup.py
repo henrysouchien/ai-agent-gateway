@@ -1,6 +1,32 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
+
+
+def apply_server_env_passthrough(
+  mcp_servers: dict[str, Any],
+  passthrough: Mapping[str, set[str]],
+  *,
+  environ: Mapping[str, str],
+) -> dict[str, Any]:
+  """Overlay explicit parent-env references for selected stdio servers."""
+  resolved = {
+    name: dict(config) if isinstance(config, dict) else config
+    for name, config in mcp_servers.items()
+  }
+  for server_name, env_names in passthrough.items():
+    config = resolved.get(server_name)
+    if not isinstance(config, dict):
+      continue
+    configured_env = config.get("env")
+    server_env = dict(configured_env) if isinstance(configured_env, dict) else {}
+    for env_name in env_names:
+      if env_name in environ:
+        server_env[env_name] = f"${{{env_name}}}"
+      else:
+        server_env.pop(env_name, None)
+    config["env"] = server_env
+  return resolved
 
 
 def canonicalize_server_configs(
@@ -108,6 +134,11 @@ async def startup_manager(
     return
 
   mcp_servers = manager._canonicalize_server_configs(mcp_servers)
+  mcp_servers = apply_server_env_passthrough(
+    mcp_servers,
+    manager._server_env_passthrough,
+    environ=manager._connection_runtime().environ,
+  )
 
   if requested_servers is not None and transport_allowed_servers is not None:
     for server_name in sorted(transport_allowed_servers - set(mcp_servers)):
@@ -155,6 +186,7 @@ async def startup_manager(
 
 
 __all__ = [
+  "apply_server_env_passthrough",
   "canonicalize_server_configs",
   "startup_manager",
 ]

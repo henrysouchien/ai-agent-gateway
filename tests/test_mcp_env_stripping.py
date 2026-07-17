@@ -1,6 +1,9 @@
 import asyncio
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
@@ -91,6 +94,92 @@ def test_build_mcp_env_expands_single_env_ref(monkeypatch) -> None:
   env = _build_mcp_env({"FMP_API_KEY": "${FMP_API_KEY}"})
 
   assert env["FMP_API_KEY"] == "secret"
+
+
+@pytest.mark.parametrize(
+  "env_name",
+  ["FMP_API_KEY", "GMAIL_TOKEN_PATH", "GMAIL_CREDENTIALS_PATH"],
+)
+def test_server_env_passthrough_uses_parent_value_without_literal(
+  tmp_path, monkeypatch, env_name
+) -> None:
+  config_path = tmp_path / "mcp.json"
+  config_path.write_text(
+    json.dumps(
+      {
+        "mcpServers": {
+          "jobs-mcp": {
+            "command": "jobs-server",
+            "env": {env_name: "must-not-reach-child"},
+          },
+          "idea-workbench-mcp": {"command": "workbench-server", "env": {}},
+        }
+      }
+    ),
+    encoding="utf-8",
+  )
+  monkeypatch.setattr(mcp_client_module, "MCP_IMPORT_ERROR", None)
+  monkeypatch.setattr(mcp_client_module.os, "environ", {env_name: "parent-secret"})
+
+  manager = McpClientManager(
+    config_path=config_path,
+    server_env_passthrough={"jobs-mcp": {env_name}},
+  )
+  captured: dict[str, dict[str, object]] = {}
+
+  async def _capture(name, config):
+    captured[name] = config
+    return None
+
+  manager._connect_or_warn = _capture
+  _run(manager.startup())
+
+  jobs_spec = captured["jobs-mcp"]["env"]
+  assert jobs_spec == {env_name: f"${{{env_name}}}"}
+  assert _build_mcp_env(jobs_spec)[env_name] == "parent-secret"
+  assert captured["idea-workbench-mcp"]["env"] == {}
+  assert "must-not-reach-child" not in json.dumps(captured)
+
+
+@pytest.mark.parametrize(
+  "env_name",
+  ["FMP_API_KEY", "GMAIL_TOKEN_PATH", "GMAIL_CREDENTIALS_PATH"],
+)
+def test_server_env_passthrough_omits_key_absent_from_parent(
+  tmp_path, monkeypatch, env_name
+) -> None:
+  config_path = tmp_path / "mcp.json"
+  config_path.write_text(
+    json.dumps(
+      {
+        "mcpServers": {
+          "jobs-mcp": {
+            "command": "jobs-server",
+            "env": {env_name: "must-not-reach-child"},
+          }
+        }
+      }
+    ),
+    encoding="utf-8",
+  )
+  monkeypatch.setattr(mcp_client_module, "MCP_IMPORT_ERROR", None)
+  monkeypatch.setattr(mcp_client_module.os, "environ", {})
+
+  manager = McpClientManager(
+    config_path=config_path,
+    server_env_passthrough={"jobs-mcp": {env_name}},
+  )
+  captured: dict[str, object] = {}
+
+  async def _capture(_name, config):
+    captured.update(config)
+    return None
+
+  manager._connect_or_warn = _capture
+  _run(manager.startup())
+
+  assert captured["env"] == {}
+  assert "must-not-reach-child" not in json.dumps(captured)
 
 
 def test_build_mcp_env_expands_multiple_env_refs(monkeypatch) -> None:
