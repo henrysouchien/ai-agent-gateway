@@ -1,0 +1,17 @@
+{
+  "name": "positive-primitive-gradient-progress",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "gradient-progress",
+        "props": {
+          "label": "Risk budget",
+          "value": 64
+        }
+      }
+    ]
+  }
+}

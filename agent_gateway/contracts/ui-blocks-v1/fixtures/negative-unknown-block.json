@@ -1,0 +1,15 @@
+{
+  "name": "negative-unknown-block",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "unknown-card",
+        "props": {}
+      }
+    ]
+  },
+  "expected_code": "unknown_block"
+}

@@ -41,6 +41,7 @@ agent_gateway = [
   "rates/*.json",
   "dashboard_artifact/*.json",
   "contracts/claim-contract-v1/*.json",
+  "contracts/ui-blocks-v1/**/*.json",
   "contracts/usage-reconciliation-v1/*.json",
   "contracts/usage-reconciliation-v2/*.json",
 ]

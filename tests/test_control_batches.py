@@ -348,6 +348,7 @@ def test_control_batches_dispatch_list_and_get(fake_batch_control: FakeBatchCont
         "execution_termination": None,
       }
     ]
+    assert detail["proposals"] == []
     assert detail["diligence_prs"] == []
 
     list_response = client.get("/api/control/batches", headers=headers)
@@ -718,9 +719,9 @@ def test_control_batches_workflows_catalog(fake_batch_control: FakeBatchControll
   assert workflows["valuation-ready"]["pipeline_template"] == "valuation-ready"
   assert workflows["valuation-ready"]["source_pipeline_template"] == "compounder"
   assert workflows["valuation-ready"]["default_max_concurrency"] == 2
-  assert workflows["full-diligence"]["reservation_budget_usd_per_name"] == 49.0
-  assert workflows["full-diligence"]["suggested_budget_usd_per_name"] == 49.0
-  assert workflows["valuation-ready"]["reservation_budget_usd_per_name"] == 25.0
+  assert workflows["full-diligence"]["reservation_budget_usd_per_name"] == 59.0
+  assert workflows["full-diligence"]["suggested_budget_usd_per_name"] == 59.0
+  assert workflows["valuation-ready"]["reservation_budget_usd_per_name"] == 30.0
   assert (
     workflows["full-diligence"]["budget_model"]["admission_formula"]
     == "spent_usd + in_flight_reserved_usd + next_stage_reserved_usd <= budget_usd"
@@ -785,6 +786,28 @@ def test_fixture_batch_seeds_registry_without_controller(
     }
     assert [row["ticker"] for row in payload["verdict_matrix"]] == ["MSFT", "AAPL", "TSLA"]
     assert payload["candidates"][0]["proposal_id"] == "fixture-proposal-msft"
+    assert payload["proposals"] == [
+      {
+        "ticker": "MSFT",
+        "source_skill": "business-quality-assessment",
+        "proposal_id": "fixture-proposal-msft",
+        "proposal_expires_at": payload["candidates"][0]["proposal_expires_at"],
+        "artifact_id": "fixture-artifact-msft",
+        "artifact_ref": "fixtures/batches/msft-quality.json",
+        "lifecycle": "staged",
+        "source_run_seq": 1,
+        "source_status": "completed",
+        "apply_run_seq": None,
+        "apply_status": None,
+        "apply_result_status": None,
+        "apply_error": None,
+        "undo": {
+          "status": "not_issued",
+          "undo_token_id": None,
+          "undo_expires_at": None,
+        },
+      }
+    ]
     assert payload["diligence_prs"] == []
     assert payload["failures"] == [
       {

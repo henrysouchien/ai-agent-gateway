@@ -1,0 +1,14 @@
+{
+  "digest": "sha256:b8291d9644995448a8d330d40e900fb1a7f930770d933be823d360bf4ef5ba2d",
+  "contract_version": 1,
+  "source_commit": "aa475000ef777e1925db19d5021cf5272cdae1b7",
+  "source_paths": [
+    "frontend/packages/chassis/src/contract/ui-blocks/contract.json",
+    "frontend/packages/chassis/src/contract/ui-blocks/data-sources.json",
+    "frontend/packages/chassis/src/contract/ui-blocks/fallback-projections.json",
+    "frontend/packages/chassis/src/contract/ui-blocks/layout-rules.json",
+    "frontend/packages/chassis/src/contract/ui-blocks/primitive-blocks.json",
+    "frontend/packages/chassis/src/contract/ui-blocks/sdk-blocks.json",
+    "frontend/packages/chassis/src/contract/ui-blocks/views.json"
+  ]
+}

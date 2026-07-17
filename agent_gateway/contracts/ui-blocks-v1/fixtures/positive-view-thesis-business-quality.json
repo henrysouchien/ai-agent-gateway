@@ -1,0 +1,16 @@
+{
+  "name": "positive-view-thesis-business-quality",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "view": "thesis.business_quality_card",
+        "scope": {
+          "ticker": "AAPL"
+        }
+      }
+    ]
+  }
+}

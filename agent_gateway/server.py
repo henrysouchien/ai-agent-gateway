@@ -26,6 +26,7 @@ from .artifact_paths import (
   letter_docx_path_for_request as letter_docx_path_for_request,
   reject_unsafe_path as reject_unsafe_path,
   ticker_artifact_paths_for_request as ticker_artifact_paths_for_request,
+  user_workspace_root as user_workspace_root,
 )
 from .auth import (
   ChannelMismatchError,
@@ -49,6 +50,8 @@ from .approval_store import SQLiteApprovalStore, expire_pending_loop  # noqa: F4
 from .package_info import package_health
 from .providers import StreamEvent
 from .session import AuthManager, GatewaySession, SessionStore, StreamSubscriber
+from .ui_blocks_metrics import snapshot as ui_blocks_metrics_snapshot
+from .ui_blocks_store import read_ui_blocks_payload as read_ui_blocks_payload
 
 from . import server_chat_helpers as _server_chat_helpers  # noqa: F401 - dynamic streaming deps alias
 from . import server_chat_control_routes as _server_chat_control_routes
@@ -288,6 +291,24 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       )
     )
     approval_expire_task = asyncio.create_task(expire_pending_loop(app.state.gateway_approval_store))
+    retention_task: asyncio.Task[Any] | None = None
+
+    async def _retention_loop() -> None:
+      sweeper = config.retention_sweeper
+      if sweeper is None:
+        return
+      interval = max(60.0, float(getattr(sweeper, "interval_seconds", 6 * 3600)))
+      while True:
+        try:
+          await asyncio.to_thread(sweeper.sweep)
+        except asyncio.CancelledError:
+          raise
+        except Exception:
+          log.warning("durable-artifact retention sweep refused or failed", exc_info=True)
+        await asyncio.sleep(interval)
+
+    if config.retention_sweeper is not None:
+      retention_task = asyncio.create_task(_retention_loop())
     startup_complete = False
     try:
       await _maybe_await(config.on_startup)
@@ -313,7 +334,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         await user_event_bus.shutdown()
       cleanup_task.cancel()
       approval_expire_task.cancel()
-      await asyncio.gather(cleanup_task, approval_expire_task, return_exceptions=True)
+      if retention_task is not None:
+        retention_task.cancel()
+      await asyncio.gather(
+        cleanup_task,
+        approval_expire_task,
+        *([retention_task] if retention_task is not None else []),
+        return_exceptions=True,
+      )
 
   app = FastAPI(lifespan=lifespan)
 
@@ -691,6 +719,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       metadata=dict(body.metadata or {}),
       model=body.model,
       effort=body.effort,
+      ui_blocks_contract=body.ui_blocks_contract,
       commercial_work_start=commercial_work_start,
       commercial_dispatch_owner=commercial_dispatch_owner,
     )
@@ -824,6 +853,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   async def artifact_index(request: Request, ticker: str) -> JSONResponse:
     return _server_artifact_routes.artifact_index_response(globals(), request, ticker)
 
+  @router.get("/ui-blocks/{ui_blocks_id}")
+  async def ui_blocks_by_id(request: Request, ui_blocks_id: str) -> JSONResponse:
+    return _server_artifact_routes.ui_blocks_by_id_response(globals(), request, ui_blocks_id)
+
   @router.get("/letters/{ticker}/{artifact_id}")
   async def letter_by_id(request: Request, ticker: str, artifact_id: str) -> FileResponse:
     return _server_artifact_routes.letter_by_id_response(globals(), request, ticker, artifact_id)
@@ -857,7 +890,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
   @router.get("/health")
   async def health() -> JSONResponse:
-    return JSONResponse({"status": "ok", "package": package_health()})
+    return JSONResponse({
+      "status": "ok",
+      "package": package_health(),
+      "counters": ui_blocks_metrics_snapshot(),
+    })
 
   from .control_plane.dashboard_artifacts import build_dashboard_artifacts_router
   from .control_plane.html_artifacts import build_html_artifacts_router

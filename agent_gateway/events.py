@@ -100,6 +100,20 @@ class ArtifactReadyEvent:
 
 
 @dataclass(frozen=True)
+class UiBlocksReadyEvent:
+  session_id: str
+  skill_run_id: str | None
+  turn_key: str
+  emission_index: int
+  ui_blocks_id: str
+  manifest_digest: str
+  payload: dict[str, Any]
+  text_fallback: str
+  ts: float
+  type: Literal["ui_blocks_ready"] = field(default="ui_blocks_ready", init=False)
+
+
+@dataclass(frozen=True)
 class ArtifactUpdatedEvent:
   skill_run_id: RunId
   ticker: str
@@ -264,6 +278,7 @@ TypedEvent = Union[
   SkillRunStartedEvent,
   SkillResultCapturedEvent,
   ArtifactReadyEvent,
+  UiBlocksReadyEvent,
   ArtifactUpdatedEvent,
   TypedRecommendationsExtractedEvent,
   AggregateReadyEvent,
@@ -279,6 +294,7 @@ TYPED_EVENT_TYPES = frozenset(
     "skill_run_started",
     "skill_result_captured",
     "artifact_ready",
+    "ui_blocks_ready",
     "artifact_updated",
     "typed_recommendations_extracted",
     "aggregate_ready",
@@ -295,6 +311,7 @@ RUN_SCOPED_EVENT_TYPES = frozenset(
     "skill_run_started",
     "skill_result_captured",
     "artifact_ready",
+    "ui_blocks_ready",
     "artifact_updated",
     "aggregate_ready",
     "artifact_failed",
@@ -359,6 +376,21 @@ def event_from_dict(payload: dict[str, Any]) -> TypedEvent:
       ts=float(payload["ts"]),
       scope=str(payload.get("scope", "ticker")),  # type: ignore[arg-type]
       portfolio_id=_optional_str(payload.get("portfolio_id")),
+    )
+  if event_type == "ui_blocks_ready":
+    ui_payload = payload.get("payload")
+    if not isinstance(ui_payload, dict):
+      raise ValueError("ui_blocks_ready.payload must be a mapping")
+    return UiBlocksReadyEvent(
+      session_id=str(payload["session_id"]),
+      skill_run_id=_optional_str(payload.get("skill_run_id")),
+      turn_key=str(payload["turn_key"]),
+      emission_index=int(payload["emission_index"]),
+      ui_blocks_id=str(payload["ui_blocks_id"]),
+      manifest_digest=str(payload["manifest_digest"]),
+      payload=dict(ui_payload),
+      text_fallback=str(payload["text_fallback"]),
+      ts=float(payload["ts"]),
     )
   if event_type == "artifact_updated":
     partial_view_model = payload.get("partial_view_model", {})
@@ -702,6 +734,7 @@ __all__ = [
   "ToolApprovalDecidedEvent",
   "ToolApprovalRequestEvent",
   "TypedRecommendationsExtractedEvent",
+  "UiBlocksReadyEvent",
   "event_from_dict",
   "event_to_dict",
 ]

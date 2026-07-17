@@ -1,0 +1,14 @@
+{
+  "name": "positive-view-overview-performance-attribution",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "view": "overview.performance_attribution",
+        "scope": {}
+      }
+    ]
+  }
+}

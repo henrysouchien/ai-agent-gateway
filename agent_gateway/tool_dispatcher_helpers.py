@@ -6,10 +6,13 @@ import json
 import logging
 from collections.abc import Sequence as AbcSequence
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from . import approval_settings
 from .event_log import EventLog
+
+if TYPE_CHECKING:
+  from .ui_blocks_run import UiBlocksRunContext
 
 RELAY_POLICY_DENIED_SUB_CODE = "relay_policy_denied"
 RELAY_POLICY_DENIED_MESSAGE = (
@@ -840,6 +843,7 @@ class ToolExecutionContext:
   request_id: str | None = None
   run_id: str | None = None
   user_id: str | None = None
+  ui_blocks_run: "UiBlocksRunContext | None" = field(default=None, repr=False)
   approval_id: str | None = None
   approval_chain_id: str | None = None
   durable_business_model_payload: bytes | None = field(default=None, repr=False)

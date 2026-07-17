@@ -1,0 +1,17 @@
+{
+  "name": "positive-primitive-stat-pair",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "stat-pair",
+        "props": {
+          "label": "Volatility",
+          "value": 12.4
+        }
+      }
+    ]
+  }
+}

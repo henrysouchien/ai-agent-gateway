@@ -1,0 +1,44 @@
+{
+  "name": "positive-composed-scenario",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "sdk:metric-grid",
+        "props": {
+          "source": "risk-score",
+          "fields": [
+            "overall_risk_score",
+            "risk_category"
+          ]
+        }
+      },
+      {
+        "view": "overview.concentration",
+        "scope": {}
+      },
+      {
+        "block": "sdk:chart-panel",
+        "props": {
+          "source": "factor-analysis",
+          "field": "factor_exposures",
+          "xKey": "factor",
+          "yKeys": [
+            "exposure"
+          ],
+          "chartType": "bar"
+        }
+      },
+      {
+        "block": "insight-banner",
+        "props": {
+          "title": "Concentration is the primary risk driver."
+        }
+      }
+    ],
+    "lead_text": "Your portfolio risk is manageable but concentrated.",
+    "tail_text": "Consider reducing the largest sector exposure."
+  }
+}

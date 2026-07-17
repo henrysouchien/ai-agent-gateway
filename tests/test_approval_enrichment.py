@@ -66,6 +66,45 @@ def test_trade_approval_args_include_matching_preview_summary() -> None:
   assert summary["validation"] == {"is_valid": True, "warnings": ["concentration check"]}
 
 
+def test_proposal_apply_approval_declares_model_writer_undo_retirement() -> None:
+  token_id = f"undo_{'a' * 32}"
+
+  enriched = enrich_trade_approval_args(
+    "apply_patch_proposal",
+    {
+      "proposal_id": "proposal-dcf",
+      "confirm_apply": True,
+      "source_model_writer_undo_token_id": token_id,
+      "source_model_writer_undo_expires_at": 1_800_000_000.0,
+      "source_model_writer_undo_effect": "retired_after_apply",
+    },
+  )
+
+  assert token_id in enriched["consequence"]
+  assert "permanently retires" in enriched["consequence"]
+  assert enriched["approval_summary"] == {
+    "proposal_id": "proposal-dcf",
+    "model_writer_undo": {
+      "status": "will_be_retired_by_apply",
+      "undo_token_id": token_id,
+      "undo_expires_at": 1_800_000_000.0,
+    },
+    "operator_choice": (
+      "Approve to promote the Thesis proposal, or deny and use "
+      "fms_undo_model_writer_commit before the receipt expires."
+    ),
+  }
+
+
+def test_proposal_apply_approval_does_not_invent_undo_retirement() -> None:
+  payload = {
+    "proposal_id": "proposal-final-review",
+    "confirm_apply": True,
+  }
+
+  assert enrich_trade_approval_args("apply_patch_proposal", payload) == payload
+
+
 def test_trade_approval_args_do_not_cross_preview_ids() -> None:
   log = EventLog()
   _append_preview(log, preview_id="pv-other")

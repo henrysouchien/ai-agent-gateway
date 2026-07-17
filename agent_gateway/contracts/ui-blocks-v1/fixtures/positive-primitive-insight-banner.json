@@ -1,0 +1,17 @@
+{
+  "name": "positive-primitive-insight-banner",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "insight-banner",
+        "props": {
+          "title": "Diversification opportunity",
+          "subtitle": "Technology is concentrated."
+        }
+      }
+    ]
+  }
+}

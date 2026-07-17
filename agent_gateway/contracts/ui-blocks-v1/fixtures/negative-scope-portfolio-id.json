@@ -1,0 +1,17 @@
+{
+  "name": "negative-scope-portfolio-id",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "view": "overview.concentration",
+        "scope": {
+          "portfolio_id": "portfolio-1"
+        }
+      }
+    ]
+  },
+  "expected_code": "scope_forbidden_field"
+}

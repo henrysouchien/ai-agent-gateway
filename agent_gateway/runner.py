@@ -15,6 +15,7 @@ from ._provider_utils import _get_default_model_for_provider  # noqa: F401 - com
 from .agent_session_log import AgentSessionLog
 from .auth import ProviderCredentialFailure
 from .context_builder import SessionContextBuilder
+from .context_capture import ContextCapture
 from .event_log import EventLog
 from .mcp_client import McpClientManager
 from .multi_user.billing import (
@@ -370,6 +371,7 @@ class AgentRunner(
     workspace_dir: str | Path | None = None,
     batch_id: int | str | None = None,
     context_surfaces: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
+    context_capture: ContextCapture | None = None,
     commercial_usage_producer: Any | None = None,
   ) -> None:
     if max_budget_usd is not None and max_budget_usd <= 0:
@@ -416,6 +418,8 @@ class AgentRunner(
     self._on_tool_timing_accepts_request_id = _detect_keyword_param(on_tool_timing, "request_id")
     self._context_surfaces_provider = context_surfaces if callable(context_surfaces) else None
     self._context_surfaces_static = self._normalize_context_surfaces(None if callable(context_surfaces) else context_surfaces)
+    self._context_capture = context_capture
+    self._last_context_manifest_digest: str | None = None
     self._request_id = str(request_id or uuid.uuid4())
     self._parent_turn_id = parent_turn_id
     self._usage_user_id, self._rate_table_version, self._billing_mode, self._channel = normalize_identity(

@@ -140,7 +140,7 @@ def test_resume_context_rehydrates_from_manifest_and_evidence_files(tmp_path: Pa
   assert "bg_10 durable completed tool result" in context
 
 
-def test_retention_keeps_resume_evidence_set_together(monkeypatch, tmp_path: Path) -> None:
+def test_registry_boot_keeps_resume_evidence_for_central_retention(monkeypatch, tmp_path: Path) -> None:
   from agent_gateway import autonomous_runner
 
   now = 1_000_000.0
@@ -157,4 +157,5 @@ def test_retention_keeps_resume_evidence_set_together(monkeypatch, tmp_path: Pat
 
   assert _all_resume_evidence_exists(tmp_path, "bg_20")
   assert "bg_20" in registry._tasks
-  assert not any(tmp_path.glob("bg_21.*"))
+  assert _all_resume_evidence_exists(tmp_path, "bg_21")
+  assert "bg_21" in registry._tasks

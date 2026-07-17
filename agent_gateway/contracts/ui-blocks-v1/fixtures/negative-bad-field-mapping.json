@@ -1,0 +1,25 @@
+{
+  "name": "negative-bad-field-mapping",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "sdk:source-table",
+        "props": {
+          "source": "positions",
+          "field": "holdings",
+          "columns": [
+            {
+              "key": "not_a_member",
+              "label": "Bad"
+            }
+          ],
+          "rowKey": "ticker"
+        }
+      }
+    ]
+  },
+  "expected_code": "field_mapping_invalid"
+}

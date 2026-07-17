@@ -28,8 +28,6 @@ from .autonomous_runner_state import (
   _REHYDRATE_EVENTS_TAIL_LINES as _REHYDRATE_EVENTS_TAIL_LINES,
   _REHYDRATED_ACTIVE_STATES,
   _REHYDRATION_INTERRUPTED_ERROR as _REHYDRATION_INTERRUPTED_ERROR,
-  _RUN_RETENTION_DAYS_ENV as _RUN_RETENTION_DAYS_ENV,
-  _RUN_RETENTION_SECONDS_PER_DAY as _RUN_RETENTION_SECONDS_PER_DAY,
   _RUN_SEQUENCE_CURSOR_FILE as _RUN_SEQUENCE_CURSOR_FILE,
   _TASK_MANIFEST_VERSION as _TASK_MANIFEST_VERSION,
   _TERMINAL_AUTONOMOUS_STATES,
@@ -43,6 +41,7 @@ from .autonomous_runner_start import (
   _SPAWN_CLEANUP_GRACE_SEC as _SPAWN_CLEANUP_GRACE_SEC,
   AutonomousRegistryStartMixin,
 )
+from .autonomous_run_lock import AutonomousRunMutationLock
 
 _STATUS_TAIL_LINES = 40
 _AUTONOMOUS_PROFILE_NAME_RE = _runner_commands._AUTONOMOUS_PROFILE_NAME_RE
@@ -78,11 +77,11 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       Path(approval_db_path).expanduser().resolve() if approval_db_path is not None else None
     )
     self._tasks: dict[str, AutonomousTask] = {}
+    self.run_mutation_lock = AutonomousRunMutationLock(self._log_dir)
     self._seq = self._initial_task_seq()
     self._slot_lock = asyncio.Lock()
     self._reserved_slots = 0
     self._cleanup_uncommitted_spill_starts()
-    self._apply_run_file_retention()
     self.rehydrate()
 
   def set_user_event_bus(self, user_event_bus: Any | None) -> None:

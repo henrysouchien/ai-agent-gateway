@@ -1,0 +1,20 @@
+{
+  "name": "positive-sdk-flag-banner",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "sdk:flag-banner",
+        "props": {
+          "source": "risk-score",
+          "severityFilter": [
+            "warning"
+          ],
+          "maxItems": 3
+        }
+      }
+    ]
+  }
+}

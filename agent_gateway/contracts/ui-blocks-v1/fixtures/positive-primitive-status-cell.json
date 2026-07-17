@@ -1,0 +1,17 @@
+{
+  "name": "positive-primitive-status-cell",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "status-cell",
+        "props": {
+          "label": "Stress test",
+          "value": "Pass"
+        }
+      }
+    ]
+  }
+}

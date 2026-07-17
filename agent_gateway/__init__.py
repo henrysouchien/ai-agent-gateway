@@ -21,6 +21,17 @@ from .autonomous import (
 )
 from ._provider_utils import resolve_auth_config, sub_agent_default_model
 from .agent_session_log import AgentSessionLog, AgentSessionRef, LogEntry, QueryCursor, resolve_agent_session_id
+from .retention import (
+  FileAgeAdapter,
+  KeepForeverAdapter,
+  RetentionAdapter,
+  RetentionCatalog,
+  RetentionCatalogEntry,
+  RetentionPolicy,
+  RetentionSweepContext,
+  RetentionSweepReport,
+  RetentionSweeper,
+)
 from .auth import (
   AuthConfig,
   AuthExpiredError,
@@ -198,6 +209,15 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+  "FileAgeAdapter",
+  "KeepForeverAdapter",
+  "RetentionAdapter",
+  "RetentionCatalog",
+  "RetentionCatalogEntry",
+  "RetentionPolicy",
+  "RetentionSweepContext",
+  "RetentionSweepReport",
+  "RetentionSweeper",
   "AgentSDKConfig",
   "AgentRunner",
   "AgentSDKRunner",

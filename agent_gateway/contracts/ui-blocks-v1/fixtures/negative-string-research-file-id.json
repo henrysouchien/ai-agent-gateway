@@ -1,0 +1,18 @@
+{
+  "name": "negative-string-research-file-id",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "view": "thesis.quantifying_risk_card",
+        "scope": {
+          "ticker": "AAPL",
+          "research_file_id": "101"
+        }
+      }
+    ]
+  },
+  "expected_code": "scope_invalid_type"
+}

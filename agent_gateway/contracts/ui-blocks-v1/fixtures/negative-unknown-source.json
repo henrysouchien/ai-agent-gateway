@@ -1,0 +1,20 @@
+{
+  "name": "negative-unknown-source",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "sdk:metric-grid",
+        "props": {
+          "source": "unknown-source",
+          "fields": [
+            "value"
+          ]
+        }
+      }
+    ]
+  },
+  "expected_code": "unknown_source"
+}

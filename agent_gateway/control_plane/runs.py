@@ -413,7 +413,7 @@ def build_runs_router(
     record = _autonomous_task_for_user(registry, control_run_id, owner_user_id)
     _require_autonomous_channel(record, authenticated.channel)
 
-    async with record.resume_lock:
+    async with record.resume_lock, registry.run_mutation_lock:
       if not _autonomous_task_resumable(record, skills_root):
         raise HTTPException(status_code=409, detail="Autonomous run is not resumable")
 

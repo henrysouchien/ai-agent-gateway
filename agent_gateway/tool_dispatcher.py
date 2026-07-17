@@ -475,6 +475,7 @@ class ToolDispatcher:
       request_id=run_context.request_id,
       run_id=run_context.run_id,
       user_id=run_context.user_id,
+      ui_blocks_run=run_context.ui_blocks_run,
     )
 
   async def dispatch(

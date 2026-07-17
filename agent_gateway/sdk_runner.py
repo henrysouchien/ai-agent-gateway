@@ -22,6 +22,7 @@ from .approval_policy import (
 from . import approval_settings
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
 from .event_log import EventLog
+from .context_capture import ContextCapture, build_context_manifest_event, canonical_manifest_digest
 from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator, normalize_identity
 from .policy_imports import resolve_server_policy_tool_class
 from .product_config import gateway_product_id
@@ -135,6 +136,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     started_at: float | None = None,
     emit_session_recap: bool = True,
     context_surfaces: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
+    context_capture: ContextCapture | None = None,
     commercial_usage_producer: Any | None = None,
   ) -> None:
     self._log = event_log
@@ -164,6 +166,9 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     self._on_tool_timing_accepts_request_id = _detect_keyword_param(on_tool_timing, "request_id")
     self._context_surfaces_provider = context_surfaces if callable(context_surfaces) else None
     self._context_surfaces_static = self._normalize_context_surfaces(None if callable(context_surfaces) else context_surfaces)
+    self._context_capture = context_capture
+    self._last_context_manifest_digest: str | None = None
+    self._context_manifest_invocation = 0
     self._pending_tool_calls: Dict[str, ToolCallInfo] = {}
     self._active_tool_use: _ActiveToolUse | None = None
     self._active_skill_deny: set[str] = set()
@@ -692,6 +697,28 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     prompt_text = self._build_prompt(messages)
     prompt = _PromptMessages(prompt_text)
     effective_system_prompt = _join_system_prompt(system_prompt or self._system_prompt)
+    self._context_manifest_invocation += 1
+    if self._context_capture is not None:
+      surfaces = self._context_surface_records()
+      try:
+        system_prompt_hash = await asyncio.to_thread(
+          self._context_capture.persist,
+          surfaces=surfaces,
+          rendered_system_prompt=effective_system_prompt or None,
+        )
+        digest = canonical_manifest_digest(surfaces, system_prompt_hash)
+        if digest != self._last_context_manifest_digest:
+          self._append(build_context_manifest_event(
+            surfaces=surfaces,
+            system_prompt_hash=system_prompt_hash,
+            session_id=self._session_id,
+            request_id=self._request_id,
+            turn=None,
+            invocation=self._context_manifest_invocation,
+          ))
+          self._last_context_manifest_digest = digest
+      except Exception as exc:
+        log.warning("[%s] context capture failed; manifest suppressed: %s", self._sid, exc)
     effective_model = str(model_override or self._sdk_config.model or self._effective_model).strip()
     if effective_model:
       self._effective_model = effective_model

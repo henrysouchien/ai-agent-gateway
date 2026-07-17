@@ -1,0 +1,1552 @@
+{
+  "contract": {
+    "contract_version": 1,
+    "compatible_digests": {},
+    "caps": {
+      "canonical_submitted_payload_bytes": 32768,
+      "blocks_per_payload": 24,
+      "layout_children": 12,
+      "layout_depth": 3,
+      "lead_text_chars": 2000,
+      "tail_text_chars": 2000,
+      "fallback_output_chars": 8000,
+      "data_table_fallback_rows": 20
+    }
+  },
+  "primitive_blocks": {
+    "metric-card": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "value"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "change": {
+          "type": "string",
+          "minLength": 1
+        },
+        "changeType": {
+          "enum": [
+            "positive",
+            "negative",
+            "warning",
+            "neutral"
+          ]
+        },
+        "colorScheme": {
+          "enum": [
+            "emerald",
+            "blue",
+            "purple",
+            "amber",
+            "red",
+            "indigo",
+            "neutral"
+          ]
+        },
+        "icon": {
+          "enum": [
+            "Shield",
+            "TrendingUp",
+            "TrendingDown",
+            "AlertTriangle",
+            "BarChart3",
+            "Target",
+            "DollarSign",
+            "Percent",
+            "Activity",
+            "PieChart",
+            "ArrowUpDown",
+            "Eye",
+            "Search",
+            "Info",
+            "CheckCircle",
+            "XCircle",
+            "Clock",
+            "Zap",
+            "Layers",
+            "Scale"
+          ]
+        },
+        "sparklineData": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "stat-pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "value"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "type": [
+            "string",
+            "number"
+          ]
+        },
+        "valueColor": {
+          "enum": [
+            "positive",
+            "negative",
+            "warning",
+            "neutral",
+            "muted"
+          ]
+        },
+        "bold": {
+          "type": "boolean"
+        },
+        "size": {
+          "enum": [
+            "sm",
+            "md",
+            "lg"
+          ]
+        }
+      }
+    },
+    "status-cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "value"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "icon": {
+          "$ref": "primitive-blocks.json#/metric-card/properties/icon"
+        },
+        "colorScheme": {
+          "$ref": "primitive-blocks.json#/metric-card/properties/colorScheme"
+        }
+      }
+    },
+    "insight-banner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "subtitle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "icon": {
+          "$ref": "primitive-blocks.json#/metric-card/properties/icon"
+        },
+        "colorScheme": {
+          "$ref": "primitive-blocks.json#/metric-card/properties/colorScheme"
+        }
+      }
+    },
+    "gradient-progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value"
+      ],
+      "properties": {
+        "value": {
+          "type": "number"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "colorScheme": {
+          "$ref": "primitive-blocks.json#/metric-card/properties/colorScheme"
+        },
+        "autoColor": {
+          "type": "boolean"
+        },
+        "size": {
+          "enum": [
+            "sm",
+            "md",
+            "lg"
+          ]
+        }
+      }
+    },
+    "section-header": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "subtitle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "icon": {
+          "$ref": "primitive-blocks.json#/metric-card/properties/icon"
+        },
+        "colorScheme": {
+          "$ref": "primitive-blocks.json#/metric-card/properties/colorScheme"
+        },
+        "size": {
+          "enum": [
+            "sm",
+            "md",
+            "lg"
+          ]
+        }
+      }
+    },
+    "data-table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "columns",
+        "data",
+        "rowKey"
+      ],
+      "properties": {
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "key",
+              "label"
+            ],
+            "properties": {
+              "key": {
+                "type": "string",
+                "minLength": 1
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "align": {
+                "enum": [
+                  "left",
+                  "center",
+                  "right"
+                ]
+              },
+              "format": {
+                "enum": [
+                  "text",
+                  "number",
+                  "currency",
+                  "percent",
+                  "badge"
+                ]
+              }
+            }
+          }
+        },
+        "data": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "rowKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "emptyMessage": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "sparkline-chart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "data"
+      ],
+      "properties": {
+        "data": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
+        "colorScheme": {
+          "$ref": "primitive-blocks.json#/metric-card/properties/colorScheme"
+        },
+        "showFill": {
+          "type": "boolean"
+        },
+        "showDots": {
+          "type": "boolean"
+        },
+        "height": {
+          "type": "number"
+        }
+      }
+    }
+  },
+  "layout_rules": {
+    "layouts": [
+      "grid",
+      "stack",
+      "row"
+    ],
+    "top_level": {
+      "min_children": 1,
+      "max_children": 12,
+      "allowed_children": [
+        "primitive",
+        "layout",
+        "sdk"
+      ]
+    },
+    "nested": {
+      "min_children": 1,
+      "max_children": 12,
+      "allowed_children": [
+        "primitive",
+        "sdk"
+      ]
+    },
+    "max_depth": 3,
+    "views_top_level_only": true
+  },
+  "sdk_blocks": {
+    "sdk:metric-grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "fields"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "data-sources.json#/$defs/agent_visible_id"
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "key"
+                ],
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "label": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "format": {
+                    "enum": [
+                      "text",
+                      "number",
+                      "currency",
+                      "percent",
+                      "date",
+                      "compact"
+                    ]
+                  },
+                  "colorScheme": {
+                    "enum": [
+                      "emerald",
+                      "blue",
+                      "purple",
+                      "amber",
+                      "red",
+                      "indigo",
+                      "neutral"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "columns": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "params": {
+          "type": "object"
+        }
+      },
+      "field_mapping": {
+        "fields": "source output members"
+      }
+    },
+    "sdk:source-table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "field",
+        "columns",
+        "rowKey"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "data-sources.json#/$defs/agent_visible_id"
+        },
+        "field": {
+          "type": "string",
+          "minLength": 1
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "key",
+              "label"
+            ],
+            "properties": {
+              "key": {
+                "type": "string",
+                "minLength": 1
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "format": {
+                "enum": [
+                  "text",
+                  "number",
+                  "currency",
+                  "percent",
+                  "badge",
+                  "date",
+                  "compact"
+                ]
+              },
+              "align": {
+                "enum": [
+                  "left",
+                  "center",
+                  "right"
+                ]
+              },
+              "sortable": {
+                "type": "boolean"
+              },
+              "tooltip": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "rowKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "emptyMessage": {
+          "type": "string",
+          "minLength": 1
+        },
+        "params": {
+          "type": "object"
+        }
+      },
+      "field_mapping": {
+        "field": "array source member",
+        "columns": "declared item schema members",
+        "rowKey": "declared item schema member"
+      }
+    },
+    "sdk:chart-panel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "field",
+        "xKey",
+        "yKeys"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "data-sources.json#/$defs/agent_visible_id"
+        },
+        "field": {
+          "type": "string",
+          "minLength": 1
+        },
+        "chartType": {
+          "enum": [
+            "line",
+            "bar",
+            "area"
+          ]
+        },
+        "xKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "yKeys": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "seriesLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "legend": {
+          "type": "boolean"
+        },
+        "dateGranularity": {
+          "enum": [
+            "intraday",
+            "daily",
+            "monthly",
+            "yearly"
+          ]
+        },
+        "yFormat": {
+          "enum": [
+            "currency",
+            "percent",
+            "number"
+          ]
+        },
+        "params": {
+          "type": "object"
+        }
+      },
+      "field_mapping": {
+        "field": "array source member",
+        "xKey": "declared item schema member",
+        "yKeys": "declared item schema members"
+      }
+    },
+    "sdk:flag-banner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "data-sources.json#/$defs/agent_visible_id"
+        },
+        "severityFilter": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "error",
+              "warning",
+              "info"
+            ]
+          }
+        },
+        "maxItems": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "params": {
+          "type": "object"
+        }
+      }
+    }
+  },
+  "data_sources": {
+    "$defs": {
+      "agent_visible_id": {
+        "enum": [
+          "positions",
+          "risk-score",
+          "risk-analysis",
+          "performance",
+          "factor-analysis",
+          "portfolio-summary"
+        ]
+      }
+    },
+    "sources": {
+      "positions": {
+        "status": "agent-visible",
+        "label": "Portfolio Positions",
+        "params": {
+          "portfolioId": {
+            "type": "string",
+            "required": false,
+            "description": "Portfolio identifier override. Defaults to the active portfolio."
+          }
+        },
+        "fields": {
+          "holdings": {
+            "type": "array",
+            "description": "Current portfolio holdings.",
+            "items": {
+              "ticker": {
+                "type": "string"
+              },
+              "shares": {
+                "type": "number"
+              },
+              "market_value": {
+                "type": "number"
+              },
+              "security_name": {
+                "type": "string"
+              }
+            }
+          },
+          "totalPortfolioValue": {
+            "type": "number",
+            "description": "Total portfolio market value."
+          },
+          "statementDate": {
+            "type": "date",
+            "description": "Statement or snapshot date for holdings."
+          },
+          "accountType": {
+            "type": "string",
+            "description": "Account type associated with the portfolio."
+          }
+        }
+      },
+      "risk-score": {
+        "status": "agent-visible",
+        "label": "Portfolio Risk Score",
+        "params": {
+          "portfolioId": {
+            "type": "string",
+            "required": false,
+            "description": "Portfolio identifier override. Defaults to the active portfolio."
+          }
+        },
+        "fields": {
+          "overall_risk_score": {
+            "type": "number",
+            "description": "Overall risk score from 0 to 100; higher is better."
+          },
+          "component_scores": {
+            "type": "array",
+            "description": "Risk score breakdown by component.",
+            "items": {
+              "name": {
+                "type": "string"
+              },
+              "score": {
+                "type": "number"
+              },
+              "maxScore": {
+                "type": "number"
+              }
+            }
+          },
+          "risk_category": {
+            "type": "string",
+            "description": "Risk category label."
+          },
+          "recommendations": {
+            "type": "array",
+            "description": "Risk mitigation recommendations.",
+            "items": {
+              "$value": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "risk-analysis": {
+        "status": "agent-visible",
+        "label": "Portfolio Risk Analysis",
+        "params": {
+          "portfolioId": {
+            "type": "string",
+            "required": false,
+            "description": "Portfolio identifier override. Defaults to the active portfolio."
+          },
+          "performancePeriod": {
+            "type": "string",
+            "required": false,
+            "default": "1M",
+            "description": "Performance lookback period (for example: 1M, 3M, 1Y)."
+          }
+        },
+        "fields": {
+          "portfolio_summary": {
+            "type": "object",
+            "description": "Portfolio-level summary metrics."
+          },
+          "risk_metrics": {
+            "type": "object",
+            "description": "Aggregate portfolio risk metrics."
+          },
+          "variance_decomposition": {
+            "type": "object",
+            "description": "Factor vs idiosyncratic variance split."
+          },
+          "factor_exposures": {
+            "type": "object",
+            "description": "Portfolio factor exposure breakdown."
+          },
+          "correlation_matrix": {
+            "type": "object",
+            "description": "Correlation matrix between assets."
+          }
+        }
+      },
+      "performance": {
+        "status": "agent-visible",
+        "label": "Portfolio Performance",
+        "params": {
+          "portfolioId": {
+            "type": "string",
+            "required": false,
+            "description": "Portfolio identifier override. Defaults to the active portfolio."
+          },
+          "benchmarkTicker": {
+            "type": "string",
+            "required": false,
+            "description": "Benchmark ticker override for performance comparison."
+          },
+          "includeAttribution": {
+            "type": "boolean",
+            "required": false,
+            "default": true,
+            "description": "Whether to include full attribution tables in the performance payload."
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "hypothetical",
+              "realized"
+            ],
+            "required": false,
+            "default": "auto",
+            "description": "Performance mode override."
+          }
+        },
+        "fields": {
+          "period": {
+            "type": "object",
+            "description": "Analysis period metadata."
+          },
+          "returns": {
+            "type": "object",
+            "description": "Return metrics."
+          },
+          "risk": {
+            "type": "object",
+            "description": "Risk metrics for the period."
+          },
+          "performanceTimeSeries": {
+            "type": "array",
+            "description": "Performance time-series points.",
+            "items": {
+              "date": {
+                "type": "string"
+              },
+              "portfolioValue": {
+                "type": "number"
+              },
+              "benchmarkValue": {
+                "type": "number"
+              },
+              "portfolioCumReturn": {
+                "type": "number"
+              },
+              "benchmarkCumReturn": {
+                "type": "number"
+              },
+              "activeReturn": {
+                "type": "number"
+              },
+              "rollingSharpe": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "rollingVol": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "drawdown": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      },
+      "factor-analysis": {
+        "status": "agent-visible",
+        "label": "Factor Analysis",
+        "params": {
+          "portfolioId": {
+            "type": "string",
+            "required": false,
+            "description": "Portfolio identifier override. Defaults to the active portfolio."
+          }
+        },
+        "presets": {
+          "factor-analysis-chart": {
+            "block": "sdk:chart-panel",
+            "field": "factor_exposures",
+            "xKey": "factor",
+            "yKeys": [
+              "exposure"
+            ],
+            "chartType": "bar"
+          }
+        },
+        "fields": {
+          "factor_exposures": {
+            "type": "object",
+            "description": "Portfolio factor exposure values."
+          },
+          "weighted_factor_var": {
+            "type": "object",
+            "description": "Factor variance contributions."
+          },
+          "variance_decomposition": {
+            "type": "object",
+            "description": "Variance decomposition by factor classes."
+          }
+        }
+      },
+      "portfolio-summary": {
+        "status": "agent-visible",
+        "label": "Portfolio Summary",
+        "params": {
+          "portfolioId": {
+            "type": "string",
+            "required": false,
+            "description": "Portfolio identifier override. Defaults to the active portfolio."
+          },
+          "includeEnrichment": {
+            "type": "boolean",
+            "required": false,
+            "default": true,
+            "description": "Whether to asynchronously enrich the summary with risk and performance data."
+          }
+        },
+        "fields": {
+          "summary": {
+            "type": "object",
+            "description": "Aggregated portfolio summary metrics."
+          },
+          "holdings": {
+            "type": "array",
+            "description": "Simplified holdings for overview display.",
+            "items": {
+              "id": {
+                "type": "string"
+              },
+              "ticker": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "value": {
+                "type": "number"
+              },
+              "shares": {
+                "type": "number"
+              },
+              "isProxy": {
+                "type": "boolean"
+              },
+              "weight": {
+                "type": "number"
+              },
+              "type": {
+                "type": "string",
+                "optional": true
+              },
+              "totalReturn": {
+                "type": "number",
+                "optional": true
+              },
+              "factorBetas": {
+                "type": "object"
+              },
+              "riskContributionPct": {
+                "type": "number"
+              },
+              "beta": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "volatility": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "aiScore": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "alerts": {
+                "type": "number"
+              },
+              "alertDetails": {
+                "type": "array"
+              },
+              "trend": {
+                "type": "array"
+              },
+              "dayChangePercent": {
+                "type": "number",
+                "optional": true
+              }
+            }
+          }
+        }
+      },
+      "positions-enriched": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "leverage-capacity": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "risk-profile": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "trading-analysis": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "exit-signals": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "optimization": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "what-if": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "backtest": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "stress-test": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "hedging-recommendations": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "monte-carlo": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "stock-analysis": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "option-strategy": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "factor-recommendations": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "income-projection": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "tax-harvest": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "portfolio-news": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "events-calendar": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "strategy-templates": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "stock-search": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "peer-comparison": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "market-intelligence": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "smart-alerts": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "metric-insights": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "realized-performance": {
+        "status": "excluded",
+        "reason": "Not required by the v1 admitted views or checkpoint scenario."
+      },
+      "allocation": {
+        "status": "excluded",
+        "reason": "The admitted asset-allocation view consumes risk-analysis; this separate target-allocation source is not required in v1."
+      }
+    }
+  },
+  "views": {
+    "$defs": {
+      "portfolio_scope_input": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "portfolio_scope_resolved": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "portfolio_id"
+        ],
+        "properties": {
+          "portfolio_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "thesis_scope_optional_file": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ticker"
+        ],
+        "properties": {
+          "ticker": {
+            "type": "string",
+            "minLength": 1
+          },
+          "research_file_id": {
+            "type": "integer"
+          }
+        }
+      },
+      "thesis_scope_required_file": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ticker",
+          "research_file_id"
+        ],
+        "properties": {
+          "ticker": {
+            "type": "string",
+            "minLength": 1
+          },
+          "research_file_id": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "views": {
+      "overview.concentration": {
+        "status": "admitted",
+        "view_id": "overview.concentration",
+        "label": "Concentration",
+        "scope_input": {
+          "$ref": "#/$defs/portfolio_scope_input"
+        },
+        "scope_resolved": {
+          "$ref": "#/$defs/portfolio_scope_resolved"
+        },
+        "sources": [
+          {
+            "kind": "live-data",
+            "ref": "positions",
+            "freshness_policy": {
+              "mode": "request-time"
+            }
+          },
+          {
+            "kind": "live-data",
+            "ref": "portfolio-summary",
+            "freshness_policy": {
+              "mode": "request-time"
+            }
+          }
+        ]
+      },
+      "overview.composition.asset_allocation": {
+        "status": "admitted",
+        "view_id": "overview.composition.asset_allocation",
+        "label": "Asset Allocation",
+        "scope_input": {
+          "$ref": "#/$defs/portfolio_scope_input"
+        },
+        "scope_resolved": {
+          "$ref": "#/$defs/portfolio_scope_resolved"
+        },
+        "sources": [
+          {
+            "kind": "live-data",
+            "ref": "risk-analysis",
+            "freshness_policy": {
+              "mode": "request-time"
+            }
+          }
+        ]
+      },
+      "overview.performance_attribution": {
+        "status": "admitted",
+        "view_id": "overview.performance_attribution",
+        "label": "Performance Attribution",
+        "scope_input": {
+          "$ref": "#/$defs/portfolio_scope_input"
+        },
+        "scope_resolved": {
+          "$ref": "#/$defs/portfolio_scope_resolved"
+        },
+        "sources": [
+          {
+            "kind": "live-data",
+            "ref": "performance",
+            "freshness_policy": {
+              "mode": "request-time"
+            }
+          }
+        ]
+      },
+      "thesis.quantifying_risk_card": {
+        "status": "admitted",
+        "view_id": "thesis.quantifying_risk_card",
+        "label": "Quantifying Risk",
+        "scope_input": {
+          "$ref": "#/$defs/thesis_scope_required_file"
+        },
+        "scope_resolved": {
+          "$ref": "#/$defs/thesis_scope_required_file"
+        },
+        "sources": [
+          {
+            "kind": "thesis-state",
+            "ref": "thesis",
+            "freshness_policy": {
+              "mode": "latest-for-file"
+            }
+          },
+          {
+            "kind": "skill-artifact",
+            "ref": "quantifying-risk",
+            "freshness_policy": {
+              "mode": "latest-for-file",
+              "max_age_seconds": 86400
+            }
+          }
+        ],
+        "preflight": {
+          "skill": "quantifying-risk",
+          "scope": "ticker",
+          "artifact_id": null,
+          "visibility": "default",
+          "origin_kind": "all"
+        },
+        "negative_fixtures": [
+          {
+            "name": "missing-research-file-id",
+            "scope": {
+              "ticker": "AAPL"
+            },
+            "expected_code": "scope_missing_required_field"
+          }
+        ]
+      },
+      "thesis.identifying_risk_card": {
+        "status": "admitted",
+        "view_id": "thesis.identifying_risk_card",
+        "label": "Identifying Risk",
+        "scope_input": {
+          "$ref": "#/$defs/thesis_scope_optional_file"
+        },
+        "scope_resolved": {
+          "$ref": "#/$defs/thesis_scope_optional_file"
+        },
+        "sources": [
+          {
+            "kind": "thesis-state",
+            "ref": "thesis",
+            "freshness_policy": {
+              "mode": "latest-for-file-when-specified"
+            }
+          }
+        ],
+        "negative_fixtures": [
+          {
+            "name": "missing-ticker",
+            "scope": {},
+            "expected_code": "scope_missing_required_field"
+          }
+        ]
+      },
+      "thesis.critical_factors_card": {
+        "status": "admitted",
+        "view_id": "thesis.critical_factors_card",
+        "label": "Critical Factors",
+        "scope_input": {
+          "$ref": "#/$defs/thesis_scope_required_file"
+        },
+        "scope_resolved": {
+          "$ref": "#/$defs/thesis_scope_required_file"
+        },
+        "sources": [
+          {
+            "kind": "thesis-state",
+            "ref": "thesis",
+            "freshness_policy": {
+              "mode": "latest-for-file"
+            }
+          },
+          {
+            "kind": "skill-artifact",
+            "ref": "critical-factors",
+            "freshness_policy": {
+              "mode": "latest-for-file",
+              "max_age_seconds": 86400
+            }
+          }
+        ],
+        "preflight": {
+          "skill": "critical-factors",
+          "scope": "ticker",
+          "artifact_id": null,
+          "visibility": "default",
+          "origin_kind": "all"
+        },
+        "negative_fixtures": [
+          {
+            "name": "missing-research-file-id",
+            "scope": {
+              "ticker": "AAPL"
+            },
+            "expected_code": "scope_missing_required_field"
+          }
+        ]
+      },
+      "thesis.earnings_review_card": {
+        "status": "admitted",
+        "view_id": "thesis.earnings_review_card",
+        "label": "Earnings Review",
+        "scope_input": {
+          "$ref": "#/$defs/thesis_scope_required_file"
+        },
+        "scope_resolved": {
+          "$ref": "#/$defs/thesis_scope_required_file"
+        },
+        "sources": [
+          {
+            "kind": "thesis-state",
+            "ref": "thesis",
+            "freshness_policy": {
+              "mode": "latest-for-file"
+            }
+          },
+          {
+            "kind": "skill-artifact",
+            "ref": "earnings-review",
+            "freshness_policy": {
+              "mode": "latest-for-file",
+              "max_age_seconds": 86400
+            }
+          }
+        ],
+        "preflight": {
+          "skill": "earnings-review",
+          "scope": "ticker",
+          "artifact_id": null,
+          "visibility": "default",
+          "origin_kind": "all"
+        },
+        "negative_fixtures": [
+          {
+            "name": "missing-research-file-id",
+            "scope": {
+              "ticker": "AAPL"
+            },
+            "expected_code": "scope_missing_required_field"
+          }
+        ]
+      },
+      "thesis.business_quality_card": {
+        "status": "admitted",
+        "view_id": "thesis.business_quality_card",
+        "label": "Business Quality",
+        "scope_input": {
+          "$ref": "#/$defs/thesis_scope_optional_file"
+        },
+        "scope_resolved": {
+          "$ref": "#/$defs/thesis_scope_optional_file"
+        },
+        "sources": [
+          {
+            "kind": "thesis-state",
+            "ref": "thesis",
+            "freshness_policy": {
+              "mode": "latest-for-file-when-specified"
+            }
+          }
+        ],
+        "negative_fixtures": [
+          {
+            "name": "missing-ticker",
+            "scope": {},
+            "expected_code": "scope_missing_required_field"
+          }
+        ]
+      },
+      "overview.tax_opportunity": {
+        "status": "excluded",
+        "view_id": "overview.tax_opportunity",
+        "label": "Tax Opportunity",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "overview.composition.product_type": {
+        "status": "excluded",
+        "view_id": "overview.composition.product_type",
+        "label": "Product Type",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "overview.decision": {
+        "status": "excluded",
+        "view_id": "overview.decision",
+        "label": "Decision",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "overview.income_projection": {
+        "status": "excluded",
+        "view_id": "overview.income_projection",
+        "label": "Income Projection",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.articulation_card": {
+        "status": "excluded",
+        "view_id": "thesis.articulation_card",
+        "label": "Thesis Articulation",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.position_initiation_card": {
+        "status": "excluded",
+        "view_id": "thesis.position_initiation_card",
+        "label": "Position Initiation",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.build_model_card": {
+        "status": "excluded",
+        "view_id": "thesis.build_model_card",
+        "label": "Build Model",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.competitive_position_card": {
+        "status": "excluded",
+        "view_id": "thesis.competitive_position_card",
+        "label": "Competitive Position",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.comparative_analysis_card": {
+        "status": "excluded",
+        "view_id": "thesis.comparative_analysis_card",
+        "label": "Comparative Analysis",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.dcf_relative_valuation_card": {
+        "status": "excluded",
+        "view_id": "thesis.dcf_relative_valuation_card",
+        "label": "DCF / Relative Valuation",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.ownership_card": {
+        "status": "excluded",
+        "view_id": "thesis.ownership_card",
+        "label": "Ownership",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.catalysts_card": {
+        "status": "excluded",
+        "view_id": "thesis.catalysts_card",
+        "label": "Catalysts",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.financial_red_flags_card": {
+        "status": "excluded",
+        "view_id": "thesis.financial_red_flags_card",
+        "label": "Financial Red Flags",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.forecast_assumptions_card": {
+        "status": "excluded",
+        "view_id": "thesis.forecast_assumptions_card",
+        "label": "Forecast Assumptions",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.risk_review_card": {
+        "status": "excluded",
+        "view_id": "thesis.risk_review_card",
+        "label": "Risk Review",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.managing_risk_card": {
+        "status": "excluded",
+        "view_id": "thesis.managing_risk_card",
+        "label": "Managing Risk",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.consultation_summary": {
+        "status": "excluded",
+        "view_id": "thesis.consultation_summary",
+        "label": "Consultation Summary",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.review_card": {
+        "status": "excluded",
+        "view_id": "thesis.review_card",
+        "label": "Thesis Review",
+        "reason": "Deferred from the v1 admitted set."
+      },
+      "thesis.position_card_full": {
+        "status": "excluded",
+        "view_id": "thesis.position_card_full",
+        "label": "Position Card",
+        "reason": "Deferred hybrid-source hard case; requires thesis, two skill sidecars, and positions."
+      }
+    }
+  },
+  "fallback_projections": {
+    "algorithm": {
+      "order": [
+        "lead_text",
+        "blocks_depth_first",
+        "tail_text"
+      ],
+      "block_separator": "\n\n",
+      "layout_projection": "children_only",
+      "markdown_escape_characters": "\\`*_[]()#|<>",
+      "output_max_chars": 8000,
+      "truncation_suffix": "_( …truncated )_"
+    },
+    "projections": {
+      "metric-card": "**{label}:** {value}[ ({change})]",
+      "stat-pair": "**{label}:** {value}",
+      "status-cell": "{label}: {value}",
+      "insight-banner": "> **{title}**[ — {subtitle}]",
+      "section-header": "### {title}",
+      "gradient-progress": "{label|Progress}: {value}%",
+      "data-table": {
+        "format": "gfm",
+        "row_cap": 20,
+        "overflow": "_( +{remaining} more rows )_"
+      },
+      "sparkline-chart": "{label|Series}: {count} points, {min}–{max}",
+      "sdk:*": "_[live {block_short_name}: source {source}]_",
+      "view": "_[view: {manifest_label} ({scope_summary})]_"
+    }
+  },
+  "generated_mapping_presets": {
+    "factor-analysis-chart": {
+      "block": "sdk:chart-panel",
+      "field": "factor_exposures",
+      "xKey": "factor",
+      "yKeys": [
+        "exposure"
+      ],
+      "chartType": "bar",
+      "source": "factor-analysis"
+    }
+  }
+}

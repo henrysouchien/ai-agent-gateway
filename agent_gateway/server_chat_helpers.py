@@ -32,6 +32,12 @@ from . import server_chat_stream_core as _chat_stream_core
 from . import server_chat_transcripts as _chat_transcripts
 from .tool_dispatcher import ApprovalDecision, ApprovalRequest
 from .tool_redaction import get_audit_hmac_secret, redact_tool_input as default_redact_tool_input
+from .ui_blocks_run import (
+  UiBlocksRunContext,
+  UiBlocksRunRegistry,
+  activate_ui_blocks_run,
+  reset_ui_blocks_run,
+)
 from .server_artifact_helpers import _json_dumps, _model_to_dict
 from .server_models import (
   BuildChatRuntime,
@@ -514,8 +520,16 @@ async def _dispatch_chat_turn_body(
     metadata=request_metadata,
     model=inputs.model,
     effort=inputs.effort,
+    ui_blocks_contract=inputs.ui_blocks_contract,
   )
   request._bind_commercial_work_start(inputs.commercial_work_start)
+  ui_blocks_run = UiBlocksRunContext(
+    capability=request.ui_blocks_contract,
+    turn_key=uuid.uuid4().hex,
+    session_id=session.session_id,
+    registry=UiBlocksRunRegistry(),
+  )
+  request._bind_ui_blocks_run(ui_blocks_run)
 
   raw_channel = context.get("channel")
   claimed_channel = raw_channel.strip().lower() if isinstance(raw_channel, str) else None
@@ -693,24 +707,28 @@ async def _dispatch_chat_turn_body(
       channel=channel,
     )
 
-    runtime = await _call_build_chat_runtime(
-      build_chat_runtime,
-      session=session,
-      request=request,
-      channel=channel,
-      auth_manager=auth_manager,
-    )
-    session_auth_config = session.auth_config or config_auth_config
-    resolved_model = runtime.model_override or request.model or str(session_auth_config.get("model", "")).strip() or None
-    if resolved_model:
-      resolved_provider_name = str(getattr(runtime, "resolved_provider_name", "") or "").strip().lower()
-      if resolved_provider_name:
-        provider_allowed_models = _get_allowed_models_for_provider_name(resolved_provider_name)
-        if provider_allowed_models and resolved_model not in provider_allowed_models:
+    ui_blocks_token = activate_ui_blocks_run(ui_blocks_run)
+    try:
+      runtime = await _call_build_chat_runtime(
+        build_chat_runtime,
+        session=session,
+        request=request,
+        channel=channel,
+        auth_manager=auth_manager,
+      )
+      session_auth_config = session.auth_config or config_auth_config
+      resolved_model = runtime.model_override or request.model or str(session_auth_config.get("model", "")).strip() or None
+      if resolved_model:
+        resolved_provider_name = str(getattr(runtime, "resolved_provider_name", "") or "").strip().lower()
+        if resolved_provider_name:
+          provider_allowed_models = _get_allowed_models_for_provider_name(resolved_provider_name)
+          if provider_allowed_models and resolved_model not in provider_allowed_models:
+            raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
+        elif allowed_models and resolved_model not in allowed_models:
           raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
-      elif allowed_models and resolved_model not in allowed_models:
-        raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
-    runner = _build_runner_with_started_at(runtime.build_runner, event_log, sid, started_at)
+      runner = _build_runner_with_started_at(runtime.build_runner, event_log, sid, started_at)
+    finally:
+      reset_ui_blocks_run(ui_blocks_token)
     setattr(event_log, "_gateway_execution_location", runtime.execution_location)
     set_credential_refresher = getattr(runner, "set_credential_refresher", None)
     if callable(set_credential_refresher) and credentials_resolver is not None:

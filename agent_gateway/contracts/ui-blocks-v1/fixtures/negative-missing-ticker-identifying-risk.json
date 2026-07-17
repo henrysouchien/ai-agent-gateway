@@ -1,0 +1,15 @@
+{
+  "name": "negative-missing-ticker-identifying-risk",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "view": "thesis.identifying_risk_card",
+        "scope": {}
+      }
+    ]
+  },
+  "expected_code": "scope_missing_required_field"
+}

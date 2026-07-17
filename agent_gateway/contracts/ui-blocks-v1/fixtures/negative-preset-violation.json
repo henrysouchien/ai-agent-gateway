@@ -1,0 +1,23 @@
+{
+  "name": "negative-preset-violation",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "sdk:chart-panel",
+        "props": {
+          "source": "factor-analysis",
+          "field": "factor_exposures",
+          "xKey": "name",
+          "yKeys": [
+            "value"
+          ],
+          "chartType": "bar"
+        }
+      }
+    ]
+  },
+  "expected_code": "mapping_preset_invalid"
+}

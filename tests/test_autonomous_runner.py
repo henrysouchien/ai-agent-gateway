@@ -943,7 +943,7 @@ def test_autonomous_registry_skips_corrupt_unknown_and_legacy_runs(tmp_path, cap
   assert "Skipping autonomous manifest with unsupported version" in caplog.text
 
 
-def test_autonomous_run_retention_prunes_only_old_completed_unlinked_run_groups(
+def test_legacy_autonomous_run_retention_env_no_longer_prunes_on_registry_boot(
   monkeypatch,
   tmp_path,
 ) -> None:
@@ -966,15 +966,12 @@ def test_autonomous_run_retention_prunes_only_old_completed_unlinked_run_groups(
 
   registry = _registry(tmp_path)
 
-  assert not _run_files_exist(tmp_path, "bg_1")
-  assert not _run_files_exist(tmp_path, "bg_99")
-  for task_id in ("bg_2", "bg_3", "bg_4", "bg_5"):
+  for task_id in ("bg_1", "bg_2", "bg_3", "bg_4", "bg_5", "bg_99"):
     assert _run_files_exist(tmp_path, task_id)
-  assert set(registry._tasks) == {"bg_2", "bg_3", "bg_4", "bg_5"}
+  assert set(registry._tasks) == {"bg_1", "bg_2", "bg_3", "bg_4", "bg_5", "bg_99"}
   assert registry._tasks["bg_4"].state == "interrupted"
   assert registry._seq == 100
-  cursor = json.loads((tmp_path / ".autonomous-sequence.json").read_text(encoding="utf-8"))
-  assert cursor == {"next_seq": 100}
+  assert not (tmp_path / ".autonomous-sequence.json").exists()
 
 
 def test_starting_manifest_cleanup_removes_dead_child_spill_before_rehydrate(tmp_path) -> None:
@@ -1025,7 +1022,7 @@ def test_starting_manifest_cleanup_skips_surviving_child_lease_then_retries(tmp_
   assert after_exit._tasks["bg_13"].state == "interrupted"
 
 
-def test_run_retention_removes_registered_spill_before_manifest(
+def test_legacy_run_retention_env_leaves_registered_spill_for_central_sweeper(
   monkeypatch,
   tmp_path,
 ) -> None:
@@ -1049,9 +1046,9 @@ def test_run_retention_removes_registered_spill_before_manifest(
 
   registry = _registry(tmp_path)
 
-  assert not spill_dir.exists()
-  assert not _run_files_exist(tmp_path, "bg_14")
-  assert "bg_14" not in registry._tasks
+  assert spill_dir.exists()
+  assert _run_files_exist(tmp_path, "bg_14")
+  assert "bg_14" in registry._tasks
 
 
 def test_run_retention_never_traverses_symlinked_registered_spill(
@@ -1111,7 +1108,7 @@ def test_spill_cleanup_detects_directory_replacement_after_lease(
   assert spill_dir.is_symlink()
 
 
-def test_autonomous_run_retention_sequence_cursor_prevents_reuse_after_prune(
+def test_registry_sequence_scan_prevents_reuse_without_boot_retention(
   monkeypatch,
   tmp_path,
 ) -> None:
@@ -1126,13 +1123,13 @@ def test_autonomous_run_retention_sequence_cursor_prevents_reuse_after_prune(
 
   first = _registry(tmp_path)
   assert first._seq == 43
-  assert not _run_files_exist(tmp_path, "bg_42")
+  assert _run_files_exist(tmp_path, "bg_42")
 
   second = _registry(tmp_path)
   assert second._seq == 43
 
 
-def test_autonomous_run_retention_skips_prune_when_sequence_cursor_cannot_persist(
+def test_retired_boot_retention_does_not_attempt_sequence_cursor_persistence(
   monkeypatch,
   tmp_path,
   caplog,
@@ -1158,7 +1155,7 @@ def test_autonomous_run_retention_skips_prune_when_sequence_cursor_cannot_persis
   assert _run_files_exist(tmp_path, "bg_7")
   assert set(registry._tasks) == {"bg_7"}
   assert registry._seq == 8
-  assert "Failed to write autonomous run sequence cursor" in caplog.text
+  assert "Failed to write autonomous run sequence cursor" not in caplog.text
 
 
 def test_autonomous_run_retention_ignores_malformed_manifest_task_id(

@@ -1,0 +1,18 @@
+{
+  "name": "positive-primitive-metric-card",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "metric-card",
+        "props": {
+          "label": "Risk score",
+          "value": "82",
+          "change": "+4"
+        }
+      }
+    ]
+  }
+}

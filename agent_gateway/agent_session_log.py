@@ -376,16 +376,19 @@ class AgentSessionLog:
   def _clear_active_cache(self) -> None:
     self._active_offset_cache.clear()
 
-  def _configured_max_active_bytes(self) -> int | None:
+  def _configured_max_active_bytes(self) -> int:
     raw = os.getenv("AGENT_SESSION_LOG_MAX_ACTIVE_BYTES")
     if raw is None or str(raw).strip() == "":
-      return None
+      return 64 * 1024 * 1024
     try:
       value = int(raw)
     except ValueError:
-      log.warning("Ignoring invalid AGENT_SESSION_LOG_MAX_ACTIVE_BYTES=%r", raw)
-      return None
-    return value if value > 0 else None
+      log.warning("Invalid AGENT_SESSION_LOG_MAX_ACTIVE_BYTES=%r; using 64 MiB", raw)
+      return 64 * 1024 * 1024
+    if value <= 0:
+      log.warning("Non-positive AGENT_SESSION_LOG_MAX_ACTIVE_BYTES=%r; using 64 MiB", raw)
+      return 64 * 1024 * 1024
+    return value
 
   def _logical_stream_id(self) -> str:
     return _sidecar_helpers.logical_stream_id(self.path)

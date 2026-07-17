@@ -1,0 +1,29 @@
+{
+  "name": "positive-sdk-source-table",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "sdk:source-table",
+        "props": {
+          "source": "positions",
+          "field": "holdings",
+          "columns": [
+            {
+              "key": "ticker",
+              "label": "Ticker"
+            },
+            {
+              "key": "market_value",
+              "label": "Value",
+              "format": "currency"
+            }
+          ],
+          "rowKey": "ticker"
+        }
+      }
+    ]
+  }
+}

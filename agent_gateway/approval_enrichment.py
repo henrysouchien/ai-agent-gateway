@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import json
+import math
 from typing import Any, Mapping
 
 
@@ -55,10 +56,40 @@ def enrich_trade_approval_args(
   *,
   event_log: Any | None = None,
 ) -> dict[str, Any]:
-  """Attach prior preview economics to irreversible trade approval payloads."""
+  """Attach trusted decision evidence to irreversible approval payloads."""
 
   enriched = dict(approval_args or {})
   normalized_tool = _policy_tool_name(tool_name)
+  if normalized_tool == "apply_patch_proposal":
+    undo_token_id = _text(
+      enriched.get("source_model_writer_undo_token_id")
+    )
+    undo_effect = _text(enriched.get("source_model_writer_undo_effect"))
+    undo_expires_at = enriched.get("source_model_writer_undo_expires_at")
+    if (
+      undo_token_id
+      and undo_effect == "retired_after_apply"
+      and isinstance(undo_expires_at, (int, float))
+      and not isinstance(undo_expires_at, bool)
+      and math.isfinite(undo_expires_at)
+    ):
+      consequence = (
+        "Applying this proposal permanently retires the bound model-writer Undo "
+        f"receipt {undo_token_id}. Deny this apply to preserve the restore option."
+      )
+      enriched["consequence"] = consequence
+      enriched["approval_summary"] = {
+        "proposal_id": _text(enriched.get("proposal_id")),
+        "model_writer_undo": {
+          "status": "will_be_retired_by_apply",
+          "undo_token_id": undo_token_id,
+          "undo_expires_at": float(undo_expires_at),
+        },
+        "operator_choice": (
+          "Approve to promote the Thesis proposal, or deny and use "
+          "fms_undo_model_writer_commit before the receipt expires."
+        ),
+      }
   preview_tools = _TRADE_EXECUTE_TO_PREVIEW_TOOLS.get(normalized_tool)
   if not preview_tools:
     return enriched

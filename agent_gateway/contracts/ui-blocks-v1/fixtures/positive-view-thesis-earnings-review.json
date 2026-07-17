@@ -1,0 +1,17 @@
+{
+  "name": "positive-view-thesis-earnings-review",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "view": "thesis.earnings_review_card",
+        "scope": {
+          "ticker": "AAPL",
+          "research_file_id": 101
+        }
+      }
+    ]
+  }
+}

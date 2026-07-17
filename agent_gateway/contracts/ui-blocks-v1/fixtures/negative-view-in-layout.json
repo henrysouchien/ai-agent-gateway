@@ -1,0 +1,20 @@
+{
+  "name": "negative-view-in-layout",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "layout": "stack",
+        "children": [
+          {
+            "view": "overview.concentration",
+            "scope": {}
+          }
+        ]
+      }
+    ]
+  },
+  "expected_code": "view_in_layout"
+}

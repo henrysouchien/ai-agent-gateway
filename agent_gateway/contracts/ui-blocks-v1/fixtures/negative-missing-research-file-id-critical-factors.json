@@ -1,0 +1,17 @@
+{
+  "name": "negative-missing-research-file-id-critical-factors",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "view": "thesis.critical_factors_card",
+        "scope": {
+          "ticker": "AAPL"
+        }
+      }
+    ]
+  },
+  "expected_code": "scope_missing_required_field"
+}

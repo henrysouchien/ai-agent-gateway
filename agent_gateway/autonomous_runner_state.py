@@ -37,8 +37,6 @@ _REHYDRATE_EVENTS_SIZE_CAP_BYTES = 5 * 1024 * 1024
 _REHYDRATE_EVENTS_TAIL_LINES = 2000
 _TASK_MANIFEST_VERSION = 2
 _RUN_SEQUENCE_CURSOR_FILE = ".autonomous-sequence.json"
-_RUN_RETENTION_DAYS_ENV = "AGENT_AUTONOMOUS_RUN_RETENTION_DAYS"
-_RUN_RETENTION_SECONDS_PER_DAY = 86400.0
 _LOGGER = logging.getLogger("agent_gateway.autonomous_runner")
 _DISPATCH_SCOPE_KEYS = frozenset({"kind", "source", "portfolio_name", "portfolio_id", "display_name"})
 
@@ -456,33 +454,6 @@ class AutonomousRegistryStateMixin:
       _LOGGER.warning("Failed to write autonomous run sequence cursor: %s", path, exc_info=True)
       return False
 
-  def _configured_run_retention_days(self) -> float | None:
-    env_name = _runtime_attr("_RUN_RETENTION_DAYS_ENV", _RUN_RETENTION_DAYS_ENV)
-    raw = os.getenv(env_name, "").strip()
-    if not raw:
-      return None
-    try:
-      days = float(raw)
-    except ValueError:
-      _LOGGER.warning("Ignoring invalid %s=%r; expected positive day count", env_name, raw)
-      return None
-    return days if days > 0 else None
-
-  def _run_file_group_paths(self, task_id: str, manifest_path: Path, manifest: dict[str, Any]) -> list[Path]:
-    """Return the manifest plus every durable evidence file needed for resume."""
-
-    paths: set[Path] = set()
-    try:
-      paths.update(path for path in self._log_dir.glob(f"{task_id}.*") if path.is_file())
-    except OSError:
-      _LOGGER.warning("Failed to scan autonomous run files for retention: %s", task_id, exc_info=True)
-    paths.add(manifest_path)
-    for field_name in ("log_path", "events_path", "operator_inbox_path", "approval_decisions_path"):
-      path = self._path_from_manifest(manifest, field_name)
-      if path is not None and self._is_log_dir_child(path):
-        paths.add(path)
-    return sorted(paths, key=lambda path: path.name)
-
   def _expected_tool_result_spill_dir(self, task_id: str) -> Path:
     return self._log_dir.expanduser().resolve() / f"{task_id}.tool_result_spill"
 
@@ -629,90 +600,6 @@ class AutonomousRegistryStateMixin:
     except OSError:
       return False
     return resolved == log_dir or log_dir in resolved.parents
-
-  def _manifest_retention_timestamp(self, manifest_path: Path, manifest: dict[str, Any]) -> float | None:
-    for field_name in ("completed_at", "started_at"):
-      value = manifest.get(field_name)
-      if isinstance(value, (int, float)):
-        return float(value)
-    try:
-      return manifest_path.stat().st_mtime
-    except OSError:
-      return None
-
-  def _should_prune_run_manifest(
-    self,
-    manifest_path: Path,
-    manifest: dict[str, Any],
-    *,
-    cutoff_ts: float,
-  ) -> bool:
-    if manifest.get("manifest_version") not in {1, _runtime_attr("_TASK_MANIFEST_VERSION", _TASK_MANIFEST_VERSION)}:
-      return False
-    state = str(manifest.get("state") or "").strip().lower()
-    if state not in {"completed", "finished"}:
-      return False
-    if manifest.get("resumed_from"):
-      return False
-    resumed_as = manifest.get("resumed_as")
-    if isinstance(resumed_as, list) and resumed_as:
-      return False
-    completed_ts = self._manifest_retention_timestamp(manifest_path, manifest)
-    return completed_ts is not None and completed_ts < cutoff_ts
-
-  def _apply_run_file_retention(self) -> None:
-    retention_days = self._configured_run_retention_days()
-    if retention_days is None or not self._log_dir.exists():
-      return
-
-    cutoff_ts = _time_time() - (
-      retention_days * _runtime_attr("_RUN_RETENTION_SECONDS_PER_DAY", _RUN_RETENTION_SECONDS_PER_DAY)
-    )
-    pruned_runs = 0
-    pruned_files = 0
-    if not self._write_sequence_cursor():
-      return
-    for manifest_path in self._manifest_paths():
-      try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-      except (OSError, json.JSONDecodeError):
-        continue
-      if not isinstance(manifest, dict):
-        continue
-      if not self._should_prune_run_manifest(manifest_path, manifest, cutoff_ts=cutoff_ts):
-        continue
-      task_id = self._coerce_manifest_str(manifest, "task_id")
-      if not task_id or _runtime_attr("_AUTONOMOUS_TASK_ID_RE", _AUTONOMOUS_TASK_ID_RE).fullmatch(task_id) is None:
-        continue
-      spill_path = manifest.get("tool_result_spill_dir")
-      registered_spill = self._registered_tool_result_spill_dir(
-        task_id,
-        spill_path,
-        require_exists=False,
-      )
-      if registered_spill is not None and registered_spill.exists():
-        if not self._remove_registered_tool_result_spill_dir(task_id, spill_path):
-          continue
-      deleted_any = False
-      for path in self._run_file_group_paths(task_id, manifest_path, manifest):
-        try:
-          path.unlink()
-          pruned_files += 1
-          deleted_any = True
-        except FileNotFoundError:
-          pass
-        except OSError:
-          _LOGGER.warning("Failed to prune autonomous run file: %s", path, exc_info=True)
-      if deleted_any:
-        self._tasks.pop(task_id, None)
-        pruned_runs += 1
-    if pruned_runs:
-      _LOGGER.info(
-        "Pruned %d autonomous run(s), %d file(s), older than %.3g day(s)",
-        pruned_runs,
-        pruned_files,
-        retention_days,
-      )
 
   def _manifest_path(self, task_id: str) -> Path:
     return self._log_dir / f"{task_id}.task.json"

@@ -1,0 +1,16 @@
+{
+  "name": "positive-primitive-section-header",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "section-header",
+        "props": {
+          "title": "Portfolio risk"
+        }
+      }
+    ]
+  }
+}

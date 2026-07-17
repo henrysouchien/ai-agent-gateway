@@ -7,6 +7,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ._provider_utils import _get_default_model_for_provider
+from .context_capture import build_context_manifest_event, canonical_manifest_digest
 from .runner_limits import (
   CONTEXT_WARNING_PCT,
   effective_compaction_trigger as _effective_compaction_trigger,
@@ -449,6 +450,28 @@ class RunnerRunLoopMixin:
               break
           if parent_messages:
             current_messages.append(user_turn_message(format_parent_messages(parent_messages)))
+        if self._context_capture is not None:
+          surfaces = self._context_surface_records()
+          try:
+            system_prompt_hash = await asyncio.to_thread(
+              self._context_capture.persist,
+              surfaces=surfaces,
+              rendered_system_prompt=turn_system_prompt,
+            )
+            digest = canonical_manifest_digest(surfaces, system_prompt_hash)
+            if digest != self._last_context_manifest_digest:
+              manifest_event = build_context_manifest_event(
+                surfaces=surfaces,
+                system_prompt_hash=system_prompt_hash,
+                session_id=self._full_session_id,
+                request_id=self._request_id,
+                turn=turn_count,
+              )
+              await self._append_durable_event(manifest_event)
+              self._append(manifest_event)
+              self._last_context_manifest_digest = digest
+          except Exception as exc:
+            logger.warning("[%s] context capture failed; manifest suppressed: %s", self._sid, exc)
         turn_usage_before = dict(usage_totals)
         turn_result = await self._stream_turn(
           client=client,
@@ -656,13 +679,19 @@ class RunnerRunLoopMixin:
         if peeked_notification_count > 0:
           self._consume_notifications(max_count=peeked_notification_count)
 
-        if self._cost_accumulator is not None:
-          exceeded_state = budget_exceeded_state(self._cost_accumulator) or exceeded_state
-        if exceeded_state is not None:
-          await emit_budget_exceeded_stop(exceeded_state)
-          break
-
         stop_after_tool_results_reason = getattr(self, "_stop_after_tool_results_reason", None)
+        # A terminal FMS receipt is the completed product outcome for producer skills. The
+        # triggering model turn has already incurred its cost and the runner will not make
+        # another request, so preserve that terminal outcome instead of relabeling a staged,
+        # applied, or noop deliverable as budget_exceeded at this boundary. Other forced-stop
+        # reasons still yield to the budget guard.
+        if stop_after_tool_results_reason != "terminal_fms_result":
+          if self._cost_accumulator is not None:
+            exceeded_state = budget_exceeded_state(self._cost_accumulator) or exceeded_state
+          if exceeded_state is not None:
+            await emit_budget_exceeded_stop(exceeded_state)
+            break
+
         if stop_after_tool_results_reason:
           stop_after_tool_results_tool_name = getattr(self, "_stop_after_tool_results_tool_name", None)
           logger.info(

@@ -1,6 +1,8 @@
 import asyncio
 import sys
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -227,6 +229,81 @@ def test_run_loop_client_creation_fails_closed_when_stub_disabled(monkeypatch) -
   assert "sensitive client construction detail" not in str(events)
 
 
+def test_context_manifest_persists_before_stream_and_uses_both_regular_paths() -> None:
+  class Capture:
+    def __init__(self) -> None:
+      self.calls: list[dict[str, Any]] = []
+
+    def persist(self, **kwargs: Any) -> str:
+      self.calls.append({**kwargs, "thread": threading.get_ident()})
+      order.append("persist")
+      return "sha256:prompt"
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    capture = Capture()
+    runner._context_capture = capture
+    runner._context_surfaces_static = [{"surface_id": "tool:x", "content_hash": "sha256:x"}]
+    durable: list[dict[str, Any]] = []
+
+    async def append_durable(event: dict[str, Any]) -> None:
+      order.append("durable")
+      durable.append(dict(event))
+
+    async def stream_turn(**kwargs: Any):
+      order.append("stream")
+      assert kwargs["system_prompt"] == [("first", True), ("second", False)]
+      return object(), StreamTurnResult(
+        full_text="done",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+      )
+
+    runner._append_durable_event = append_durable  # type: ignore[method-assign]
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    main_thread = threading.get_ident()
+    await runner.run(
+      messages=[{"role": "user", "content": "hello"}],
+      system_prompt=[("first", True), ("second", False)],
+    )
+    manifests = [entry.event for entry in runner._log.entries if entry.event.get("type") == "context_manifest"]
+    assert order[:3] == ["persist", "durable", "stream"]
+    assert capture.calls[0]["rendered_system_prompt"] == [("first", True), ("second", False)]
+    assert capture.calls[0]["thread"] != main_thread
+    assert manifests == [event for event in durable if event.get("type") == "context_manifest"]
+    assert manifests[0]["turn"] == 1
+
+  order: list[str] = []
+  asyncio.run(case())
+
+
+def test_context_capture_failure_suppresses_manifest_and_turn_continues() -> None:
+  class Capture:
+    def persist(self, **_kwargs: Any) -> str:
+      raise RuntimeError("unresolved")
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    runner._context_capture = Capture()
+    streamed = False
+
+    async def stream_turn(**_kwargs: Any):
+      nonlocal streamed
+      streamed = True
+      return object(), StreamTurnResult(
+        full_text="done",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    await runner.run(messages=[{"role": "user", "content": "hello"}], system_prompt="system")
+    assert streamed
+    assert not any(entry.event.get("type") == "context_manifest" for entry in runner._log.entries)
+
+  asyncio.run(case())
+
+
 def test_run_loop_stops_after_tool_results_when_runner_requests_it(monkeypatch) -> None:
   async def _case() -> None:
     runner = _make_credential_runner()
@@ -283,5 +360,82 @@ def test_run_loop_stops_after_tool_results_when_runner_requests_it(monkeypatch) 
       if block.get("type") == "text"
     ]
     assert "unwanted final prose" not in assistant_text
+
+  asyncio.run(_case())
+
+
+def test_terminal_fms_result_wins_over_post_tool_budget_boundary(monkeypatch) -> None:
+  async def _case() -> None:
+    runner = _make_credential_runner()
+    stream_calls = {"count": 0}
+    exceeded_state = SimpleNamespace(
+      total_cost=2.6353,
+      budget=2.0,
+      reason="parent_budget",
+      reason_suffix="",
+    )
+    runner._cost_accumulator = object()
+    monkeypatch.setattr(
+      gateway_runner,
+      "_budget_cost_progress",
+      lambda *_args, **_kwargs: SimpleNamespace(
+        last_reported_cost=2.6353,
+        exceeded_state=exceeded_state,
+      ),
+    )
+    monkeypatch.setattr(
+      gateway_runner,
+      "_budget_exceeded_state",
+      lambda _accumulator: exceeded_state,
+    )
+
+    async def fake_stream_turn(**kwargs: Any):
+      _ = kwargs
+      stream_calls["count"] += 1
+      result = StreamTurnResult(
+        full_text="",
+        stop_reason="tool_use",
+        content_blocks=[
+          {
+            "type": "tool_use",
+            "id": "tool-1",
+            "name": "fms_propose_managing_risk",
+            "input": {"judgment": {"ticker": "PCTY"}},
+          }
+        ],
+      )
+      result.tool_uses = [
+        ("tool-1", "fms_propose_managing_risk", {"judgment": {"ticker": "PCTY"}})
+      ]
+      return object(), result
+
+    async def fake_execute_tool_use_loop(*args: Any, **kwargs: Any) -> ToolUseLoopResult:
+      _ = args, kwargs
+      runner._stop_after_tool_results_reason = "terminal_fms_result"
+      runner._stop_after_tool_results_tool_name = "fms_propose_managing_risk"
+      return ToolUseLoopResult(
+        tool_results_content=[
+          {
+            "type": "tool_result",
+            "tool_use_id": "tool-1",
+            "content": '{"status":"staged","proposal_id":"proposal-1"}',
+          }
+        ],
+        tools_used=["fms_propose_managing_risk"],
+      )
+
+    runner._stream_turn = fake_stream_turn  # type: ignore[method-assign]
+    monkeypatch.setattr(gateway_runner, "_execute_tool_use_loop", fake_execute_tool_use_loop)
+
+    await runner.run(messages=[{"role": "user", "content": "Run managing risk"}], system_prompt="x")
+
+    assert stream_calls["count"] == 1
+    events = [entry.event for entry in runner._log.entries]
+    assert events[-1]["type"] == "stream_complete"
+    assert not any(event.get("type") == "budget_exceeded" for event in events)
+    assert not any(
+      event.get("type") == "run_interrupted" and event.get("reason") == "budget_exceeded"
+      for event in events
+    )
 
   asyncio.run(_case())

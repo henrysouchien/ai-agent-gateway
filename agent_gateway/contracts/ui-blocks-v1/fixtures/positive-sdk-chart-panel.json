@@ -1,0 +1,22 @@
+{
+  "name": "positive-sdk-chart-panel",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "sdk:chart-panel",
+        "props": {
+          "source": "performance",
+          "field": "performanceTimeSeries",
+          "xKey": "date",
+          "yKeys": [
+            "portfolioCumReturn"
+          ],
+          "chartType": "line"
+        }
+      }
+    ]
+  }
+}

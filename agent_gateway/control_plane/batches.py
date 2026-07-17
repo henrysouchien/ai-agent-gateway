@@ -972,6 +972,7 @@ def _batch_detail_payload(registry: Any, batch_id: int, *, top_n: int) -> dict[s
     "batch": batch,
     "verdict_matrix": registry.get_batch_verdict_matrix(batch_id),
     "candidates": registry.get_batch_candidates(batch_id, top_n),
+    "proposals": registry.get_batch_proposals(batch_id),
     "failures": _annotate_batch_failures(registry.get_batch_failures(batch_id), batch=batch),
     "diligence_prs": _list_diligence_prs(registry, batch_id),
   }

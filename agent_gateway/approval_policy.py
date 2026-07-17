@@ -10,9 +10,11 @@ import re
 import time
 import traceback
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Literal, Mapping, Protocol
+
+from .ui_blocks_run import UiBlocksRunContext, current_ui_blocks_run
 
 
 ToolClass = Literal[
@@ -235,6 +237,10 @@ class RunContext:
   tool_schema_version: str | None = None
   mcp_server_version: str | None = None
   policy_bundle_hash: str = "unknown"
+  ui_blocks_run: UiBlocksRunContext | None = field(
+    default_factory=current_ui_blocks_run,
+    repr=False,
+  )
 
 
 @dataclass(kw_only=True)

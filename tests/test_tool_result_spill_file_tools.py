@@ -444,15 +444,18 @@ def test_partial_cleanup_never_unlinks_a_replaced_foreign_member(
   sink.budget.reserve(tmp_path, sink.lane, 0)
   original_publish = spill_module._publish_no_clobber
   first_path: Path | None = None
+  first_publication: Any = None
 
   def _replace_then_fail(root: Path, final_path: Path, data: bytes, *, uuid_factory: Any):
-    nonlocal first_path
+    nonlocal first_path, first_publication
     if first_path is None:
-      identity = original_publish(root, final_path, data, uuid_factory=uuid_factory)
+      first_publication = original_publish(root, final_path, data, uuid_factory=uuid_factory)
       first_path = final_path
-      return identity
+      return first_publication
     assert first_path is not None
     first_path.unlink()
+    pinned = spill_module.os.fstat(first_publication.guard_fd)
+    assert (pinned.st_dev, pinned.st_ino) == first_publication.identity
     first_path.write_text("foreign replacement", encoding="utf-8")
     raise OSError("injected failure after replacement")
 
@@ -470,6 +473,36 @@ def test_partial_cleanup_never_unlinks_a_replaced_foreign_member(
 
   assert first_path is not None
   assert first_path.read_text(encoding="utf-8") == "foreign replacement"
+  with pytest.raises(OSError):
+    spill_module.os.fstat(first_publication.guard_fd)
+  assert sink.budget.used_bytes == 0
+
+
+def test_publication_guard_failure_removes_the_linked_member(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  sink = _sink(tmp_path)
+  sink.budget.reserve(tmp_path, sink.lane, 0)
+  original_open = spill_module.os.open
+
+  def _fail_guard(path: Any, flags: int, *args: Any, **kwargs: Any):
+    if flags & spill_module.os.O_ACCMODE == spill_module.os.O_RDONLY:
+      raise OSError("injected guard failure")
+    return original_open(path, flags, *args, **kwargs)
+
+  monkeypatch.setattr(spill_module.os, "open", _fail_guard)
+
+  with pytest.raises(OSError, match="injected guard failure"):
+    write_spill_set(
+      sink=sink,
+      tool_name="lookup",
+      tool_use_id="guard-failure",
+      content=json.dumps({"markdown": "x" * 10_000}),
+      model_max_chars=60_000,
+    )
+
+  assert list(tmp_path.iterdir()) == []
   assert sink.budget.used_bytes == 0
 
 

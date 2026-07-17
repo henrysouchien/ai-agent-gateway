@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import time
@@ -20,6 +21,15 @@ from .autonomous_runner_state import (
 )
 
 _SPAWN_CLEANUP_GRACE_SEC = 1.0
+
+
+def _with_run_mutation_lock(func):
+  @functools.wraps(func)
+  async def guarded(self, *args, **kwargs):
+    async with self.run_mutation_lock:
+      return await func(self, *args, **kwargs)
+
+  return guarded
 
 
 def _asyncio_module() -> Any:
@@ -160,6 +170,7 @@ class AutonomousRegistryStartMixin:
       )
     self._delete_task_manifest(task_id)
 
+  @_with_run_mutation_lock
   async def start(
     self,
     *,

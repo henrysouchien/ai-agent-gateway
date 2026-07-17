@@ -1,0 +1,33 @@
+{
+  "name": "negative-depth-over-three",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "layout": "stack",
+        "children": [
+          {
+            "layout": "row",
+            "children": [
+              {
+                "layout": "grid",
+                "children": [
+                  {
+                    "block": "metric-card",
+                    "props": {
+                      "label": "Risk",
+                      "value": "High"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "expected_code": "layout_depth_exceeded"
+}

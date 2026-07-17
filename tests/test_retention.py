@@ -1,15 +1,35 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import multiprocessing
 import os
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.autonomous_run_lock import AutonomousRunMutationLock
+from agent_gateway.retention import (
+  FileAgeAdapter,
+  KeepForeverAdapter,
+  RetentionCatalog,
+  RetentionCatalogEntry,
+  RetentionLockBusy,
+  RetentionPolicy,
+  RetentionSafetyError,
+  RetentionSweeper,
+  resolve_contained_path,
+  resolve_safe_root,
+  sweep_lock,
+)
 from agent_gateway.server import _cleanup_old_transcripts
 
 
@@ -74,3 +94,157 @@ def test_transcript_retention_noops_without_directory_or_positive_horizon(tmp_pa
   assert _cleanup_old_transcripts(tmp_path / "missing", 7, now=1_000_000.0) == 0
   assert _cleanup_old_transcripts(tmp_path, 0, now=1_000_000.0) == 0
   assert transcript.exists()
+
+
+class _FailingAdapter:
+  def sweep(self, context):
+    raise RuntimeError("isolated failure")
+
+
+def test_policy_inversion_and_explicit_keep_forever(caplog: pytest.LogCaptureFixture) -> None:
+  with pytest.raises(TypeError):
+    RetentionPolicy()  # type: ignore[call-arg]
+  with caplog.at_level(logging.INFO):
+    policy = RetentionPolicy.keep_forever("legal ruling pending", "platform")
+    RetentionCatalogEntry("audit", policy, KeepForeverAdapter("audit"), (Path("/tmp/audit"),))
+  assert policy.is_keep_forever
+  assert "keep_forever registered" in caplog.text
+  assert "legal ruling pending" in caplog.text
+
+
+def test_triage_floor_registration_is_scoped() -> None:
+  short = RetentionPolicy("age", "platform", "short", max_age_days=2)
+  with pytest.raises(ValueError, match="72 hours"):
+    RetentionCatalogEntry("session", short, KeepForeverAdapter("session"), (Path("/tmp/session"),), triage_input=True)
+  RetentionCatalogEntry("unrelated", short, KeepForeverAdapter("unrelated"), (Path("/tmp/unrelated"),))
+  long = RetentionPolicy("age", "platform", "triage", max_age_days=30)
+  RetentionCatalogEntry("session", long, KeepForeverAdapter("session"), (Path("/tmp/session"),), triage_input=True)
+
+
+def test_safety_refuses_symlink_escape_and_broad_roots(tmp_path: Path) -> None:
+  root = tmp_path / "safe"
+  root.mkdir()
+  outside = tmp_path / "outside"
+  outside.write_text("x")
+  link = root / "link"
+  link.symlink_to(outside)
+  with pytest.raises(RetentionSafetyError):
+    resolve_contained_path(link, root)
+  with pytest.raises(RetentionSafetyError):
+    resolve_contained_path(outside, root)
+  with pytest.raises(RetentionSafetyError):
+    resolve_safe_root(Path("/"))
+  with pytest.raises(RetentionSafetyError):
+    resolve_safe_root(Path.home())
+  with pytest.raises(RetentionSafetyError):
+    resolve_safe_root(tmp_path, repo_root=tmp_path)
+
+
+def test_driver_isolates_failure_and_file_age_is_idempotent(tmp_path: Path) -> None:
+  state = tmp_path / "state"
+  root = tmp_path / "files"
+  state.mkdir()
+  root.mkdir()
+  old = root / "old.log"
+  old.write_bytes(b"old")
+  old_ts = time.time() - 40 * 86_400
+  os.utime(old, (old_ts, old_ts))
+  policy = RetentionPolicy("age", "platform", "test", max_age_days=30)
+  catalog = RetentionCatalog(
+    (
+      RetentionCatalogEntry("broken", policy, _FailingAdapter(), (root,)),
+      RetentionCatalogEntry("files", policy, FileAgeAdapter("files", root), (root,)),
+    ),
+    state,
+  )
+  reports = RetentionSweeper(catalog).sweep("dry_run", now=datetime.now(timezone.utc))
+  assert reports[0].errors == ("RuntimeError: isolated failure",)
+  assert reports[1].would_delete_count == 1
+  assert old.exists()
+  enforced = RetentionSweeper(catalog).sweep("enforce", now=datetime.now(timezone.utc))
+  assert enforced[1].deleted_count == 1
+  assert not old.exists()
+  repeated = RetentionSweeper(catalog).sweep("enforce", now=datetime.now(timezone.utc))
+  assert repeated[1].would_delete_count == 0
+
+
+def test_enforce_allowlist_uses_per_entry_effective_modes(tmp_path: Path) -> None:
+  state = tmp_path / "state"
+  root = tmp_path / "files"
+  state.mkdir()
+  root.mkdir()
+  old = root / "old.log"
+  old.write_text("old", encoding="utf-8")
+  stale = time.time() - 40 * 86_400
+  os.utime(old, (stale, stale))
+  policy = RetentionPolicy("age", "platform", "test", max_age_days=30)
+  catalog = RetentionCatalog(
+    (
+      RetentionCatalogEntry(
+        "pending",
+        policy,
+        FileAgeAdapter("pending", root),
+        (root,),
+      ),
+    ),
+    state,
+  )
+  pending = RetentionSweeper(catalog).sweep(
+    "enforce",
+    enforce_allowlist=frozenset(),
+  )[0]
+  assert pending.mode == "dry_run"
+  assert pending.deleted_count == 0
+  assert pending.details == ("pending migration re-acceptance",)
+  assert old.exists()
+  authorized = RetentionSweeper(catalog).sweep(
+    "enforce",
+    enforce_allowlist=frozenset({"pending"}),
+  )[0]
+  assert authorized.mode == "enforce"
+  assert authorized.deleted_count == 1
+  assert not old.exists()
+
+  old.write_text("old", encoding="utf-8")
+  os.utime(old, (stale, stale))
+  preserved = RetentionSweeper(catalog).sweep("enforce", enforce_allowlist=None)[0]
+  assert preserved.mode == "enforce"
+  assert preserved.deleted_count == 1
+
+
+def _hold_lock(path: str, ready: multiprocessing.Queue) -> None:
+  with sweep_lock(Path(path), blocking=True):
+    ready.put(True)
+    time.sleep(2)
+
+
+def test_cross_process_sweep_lock_prevents_double_sweep(tmp_path: Path) -> None:
+  ready: multiprocessing.Queue = multiprocessing.Queue()
+  process = multiprocessing.Process(target=_hold_lock, args=(str(tmp_path), ready))
+  process.start()
+  assert ready.get(timeout=5) is True
+  try:
+    with pytest.raises(RetentionLockBusy):
+      with sweep_lock(tmp_path):
+        pass
+  finally:
+    process.terminate()
+    process.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_run_mutation_lock_serializes_resume_publication_window(tmp_path: Path) -> None:
+  first = AutonomousRunMutationLock(tmp_path)
+  second = AutonomousRunMutationLock(tmp_path)
+  second_entered = asyncio.Event()
+
+  async def successor_and_backlink() -> None:
+    async with second:
+      second_entered.set()
+
+  async with first:
+    task = asyncio.create_task(successor_and_backlink())
+    await asyncio.sleep(0.05)
+    assert not second_entered.is_set()
+  await task
+  assert second_entered.is_set()

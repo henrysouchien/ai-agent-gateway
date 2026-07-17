@@ -1,0 +1,35 @@
+{
+  "name": "positive-multi-emission-message",
+  "expectation": "accept",
+  "payloads": [
+    {
+      "kind": "hank_ui_blocks.v1",
+      "contract_version": 1,
+      "blocks": [
+        {
+          "block": "section-header",
+          "props": {
+            "title": "Risk overview"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "hank_ui_blocks.v1",
+      "contract_version": 1,
+      "blocks": [
+        {
+          "block": "metric-card",
+          "props": {
+            "label": "Risk score",
+            "value": "82"
+          }
+        }
+      ]
+    }
+  ],
+  "expected_emission_order": [
+    0,
+    1
+  ]
+}

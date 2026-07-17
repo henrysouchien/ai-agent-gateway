@@ -20,6 +20,15 @@ import agent_gateway.agent_session_log_records as session_log_records
 from agent_gateway.agent_session_log import agent_session_logical_path_for_jsonl, slugify
 
 
+def test_session_rotation_unset_uses_64_mib_default(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.delenv("AGENT_SESSION_LOG_MAX_ACTIVE_BYTES", raising=False)
+  session_log = AgentSessionLog(tmp_path / "default-rotation.jsonl")
+  assert session_log._max_active_bytes == 64 * 1024 * 1024
+
+
 def _run(coro):
   return asyncio.run(coro)
 

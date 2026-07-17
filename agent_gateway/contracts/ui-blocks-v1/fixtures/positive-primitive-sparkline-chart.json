@@ -1,0 +1,21 @@
+{
+  "name": "positive-primitive-sparkline-chart",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "sparkline-chart",
+        "props": {
+          "data": [
+            10,
+            12,
+            11,
+            14
+          ]
+        }
+      }
+    ]
+  }
+}

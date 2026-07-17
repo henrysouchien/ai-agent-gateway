@@ -131,6 +131,135 @@ def register_skill_artifact_sidecar(
   )
 
 
+def register_ui_blocks_payload_sidecar(
+  *,
+  workspace_dir: Path,
+  user_id: str,
+  ui_blocks_id: str,
+  path: Path,
+  session_id: str,
+  turn_key: str,
+  emission_index: int,
+  ts: float,
+  manifest_digest: str,
+) -> None:
+  del manifest_digest  # The digest stays in the envelope; the index has no digest column.
+  effective_user_id = _effective_user_id(workspace_dir, user_id=user_id)
+  envelope_path = _ensure_under_workspace(path, workspace_dir)
+  envelope_ts = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+  _upsert_index_row(
+    workspace_dir=workspace_dir,
+    row={
+      "user_id": effective_user_id,
+      "artifact_kind": "ui_blocks",
+      "artifact_id": str(ui_blocks_id),
+      "artifact_ref": str(ui_blocks_id),
+      "payload_ref": _relative_to_workspace(workspace_dir, envelope_path),
+      "scope": None,
+      "scope_label": None,
+      "ticker": None,
+      "skill": None,
+      "contract_name": "hank_ui_blocks.v1",
+      "purpose": None,
+      "research_file_id": None,
+      "control_run_id": None,
+      "origin_kind": "chat",
+      "visibility": "default",
+      "origin_ref": _json_or_none({
+        "session_id": str(session_id),
+        "turn_key": str(turn_key),
+        "emission_index": int(emission_index),
+      }),
+      "classification_source": "ui_blocks_store",
+      "created_ts": envelope_ts,
+      "updated_ts": envelope_ts,
+      "sidecar_mtime_ns": envelope_path.stat().st_mtime_ns,
+      "content_hash": _sha256_file(envelope_path),
+      "index_version": INDEX_VERSION,
+    },
+  )
+
+
+def reconcile_ui_blocks_index(users_root: Path) -> None:
+  root = Path(users_root).resolve()
+  if not root.is_dir():
+    return
+  for user_dir in sorted(root.iterdir(), key=lambda item: item.name):
+    workspace = user_dir / "workspace"
+    if (
+      user_dir.is_symlink()
+      or workspace.is_symlink()
+      or not user_dir.is_dir()
+      or not workspace.is_dir()
+    ):
+      continue
+    user_id = user_dir.name
+    rows = list_artifact_sidecar_index_rows(
+      workspace_dir=workspace,
+      artifact_kind="ui_blocks",
+      user_id=user_id,
+    )
+    files_dir = workspace / "artifacts" / "_ui_blocks"
+    files = (
+      {
+        path.stem: path
+        for path in sorted(files_dir.glob("*.json"), key=lambda item: item.name)
+        if path.is_file() and not path.is_symlink()
+      }
+      if files_dir.is_dir()
+      else {}
+    )
+
+    for row in rows:
+      if str(row["artifact_ref"]) not in files:
+        _delete_index_row(
+          workspace_dir=workspace,
+          user_id=user_id,
+          artifact_kind="ui_blocks",
+          artifact_ref=str(row["artifact_ref"]),
+        )
+
+    rows_by_ref = {str(row["artifact_ref"]): row for row in rows}
+    for ui_blocks_id, path in files.items():
+      try:
+        envelope = _read_json_object(path)
+        if str(envelope.get("ui_blocks_id") or "") != ui_blocks_id:
+          raise ValueError("ui_blocks_id does not match filename")
+        session_id = str(envelope["session_id"])
+        turn_key = str(envelope["turn_key"])
+        emission_index = int(envelope["emission_index"])
+        ts = float(envelope["ts"])
+        manifest_digest = str(envelope["manifest_digest"])
+      except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        if ui_blocks_id in rows_by_ref:
+          mark_artifact_sidecar_index_row_stale(
+            workspace_dir=workspace,
+            artifact_kind="ui_blocks",
+            artifact_ref=ui_blocks_id,
+            error="corrupt_envelope",
+            user_id=user_id,
+          )
+        else:
+          _upsert_minimal_stale_ui_blocks_row(
+            workspace_dir=workspace,
+            user_id=user_id,
+            ui_blocks_id=ui_blocks_id,
+            path=path,
+          )
+        continue
+      register_ui_blocks_payload_sidecar(
+        workspace_dir=workspace,
+        user_id=user_id,
+        ui_blocks_id=ui_blocks_id,
+        path=path,
+        session_id=session_id,
+        turn_key=turn_key,
+        emission_index=emission_index,
+        ts=ts,
+        manifest_digest=manifest_digest,
+      )
+
+
 def artifact_sidecar_index_path(workspace_dir: Path) -> Path:
   return _ensure_under_workspace(Path(workspace_dir).resolve().joinpath(*_INDEX_RELATIVE_PATH), workspace_dir)
 
@@ -328,6 +457,79 @@ def _upsert_index_row(*, workspace_dir: Path, row: dict[str, Any]) -> None:
         last_error=NULL
       """,
       values,
+    )
+
+
+def _upsert_minimal_stale_ui_blocks_row(
+  *,
+  workspace_dir: Path,
+  user_id: str,
+  ui_blocks_id: str,
+  path: Path,
+) -> None:
+  db_path = artifact_sidecar_index_path(workspace_dir)
+  db_path.parent.mkdir(parents=True, exist_ok=True)
+  safe_path = _ensure_under_workspace(path, workspace_dir)
+  info = safe_path.stat()
+  mtime = datetime.fromtimestamp(info.st_mtime, tz=timezone.utc).isoformat()
+  columns = (
+    "user_id", "artifact_kind", "artifact_id", "artifact_ref", "payload_ref",
+    "scope", "scope_label", "ticker", "skill", "contract_name", "purpose",
+    "research_file_id", "control_run_id", "origin_kind", "visibility", "origin_ref",
+    "classification_source", "created_ts", "updated_ts", "sidecar_mtime_ns",
+    "content_hash", "index_version", "last_seen_ts", "stale_ts", "last_error",
+  )
+  row = {
+    "user_id": _effective_user_id(workspace_dir, user_id=user_id),
+    "artifact_kind": "ui_blocks",
+    "artifact_id": ui_blocks_id,
+    "artifact_ref": ui_blocks_id,
+    "payload_ref": _relative_to_workspace(workspace_dir, safe_path),
+    "created_ts": mtime,
+    "updated_ts": mtime,
+    "sidecar_mtime_ns": info.st_mtime_ns,
+    "content_hash": _sha256_file(safe_path),
+    "index_version": INDEX_VERSION,
+    "stale_ts": _now_ts(),
+    "last_error": "corrupt_envelope",
+  }
+  values = {column: row.get(column) for column in columns}
+  with sqlite3.connect(db_path) as conn:
+    _ensure_schema(conn)
+    conn.execute(
+      f"""
+      INSERT INTO artifact_sidecar_index ({', '.join(columns)})
+      VALUES ({', '.join(':' + column for column in columns)})
+      ON CONFLICT(user_id, artifact_kind, artifact_ref) DO UPDATE SET
+        artifact_id=excluded.artifact_id,
+        payload_ref=excluded.payload_ref,
+        created_ts=excluded.created_ts,
+        updated_ts=excluded.updated_ts,
+        sidecar_mtime_ns=excluded.sidecar_mtime_ns,
+        content_hash=excluded.content_hash,
+        index_version=excluded.index_version,
+        stale_ts=excluded.stale_ts,
+        last_error=excluded.last_error
+      """,
+      values,
+    )
+
+
+def _delete_index_row(
+  *,
+  workspace_dir: Path,
+  user_id: str,
+  artifact_kind: str,
+  artifact_ref: str,
+) -> None:
+  db_path = artifact_sidecar_index_path(workspace_dir)
+  if not db_path.is_file():
+    return
+  with sqlite3.connect(db_path) as conn:
+    _ensure_schema(conn)
+    conn.execute(
+      "DELETE FROM artifact_sidecar_index WHERE user_id=? AND artifact_kind=? AND artifact_ref=?",
+      (_effective_user_id(workspace_dir, user_id=user_id), artifact_kind, artifact_ref),
     )
 
 
@@ -550,4 +752,6 @@ __all__ = [
   "register_dashboard_artifact_sidecar",
   "register_html_artifact_sidecar",
   "register_skill_artifact_sidecar",
+  "register_ui_blocks_payload_sidecar",
+  "reconcile_ui_blocks_index",
 ]

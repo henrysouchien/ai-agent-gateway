@@ -1,0 +1,33 @@
+{
+  "name": "positive-primitive-data-table",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "data-table",
+        "props": {
+          "columns": [
+            {
+              "key": "ticker",
+              "label": "Ticker"
+            },
+            {
+              "key": "weight",
+              "label": "Weight",
+              "format": "percent"
+            }
+          ],
+          "data": [
+            {
+              "ticker": "AAPL",
+              "weight": 0.24
+            }
+          ],
+          "rowKey": "ticker"
+        }
+      }
+    ]
+  }
+}

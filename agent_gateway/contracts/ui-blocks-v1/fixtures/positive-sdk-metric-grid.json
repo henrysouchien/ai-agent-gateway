@@ -1,0 +1,24 @@
+{
+  "name": "positive-sdk-metric-grid",
+  "expectation": "accept",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "sdk:metric-grid",
+        "props": {
+          "source": "risk-score",
+          "fields": [
+            "overall_risk_score",
+            {
+              "key": "risk_category",
+              "label": "Category"
+            }
+          ],
+          "columns": 2
+        }
+      }
+    ]
+  }
+}

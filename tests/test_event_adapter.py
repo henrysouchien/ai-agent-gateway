@@ -12,7 +12,7 @@ from agent_gateway.event_adapter import (
 
 
 def test_v1_wire_projection_covers_every_v1_type() -> None:
-  assert len(V1_WIRE_EVENT_TYPES) == 37
+  assert len(V1_WIRE_EVENT_TYPES) == 38
   assert V1_WIRE_EVENT_TYPES
   assert set(V1_FIELD_PROJECTION) == set(V1_WIRE_EVENT_TYPES)
   assert all("type" in fields for fields in V1_FIELD_PROJECTION.values())
@@ -23,6 +23,23 @@ def test_v1_wire_projection_covers_every_v1_type() -> None:
   assert "blocked" not in V1_FIELD_PROJECTION
   assert "remediating" not in V1_WIRE_EVENT_TYPES
   assert "remediating" not in V1_FIELD_PROJECTION
+
+
+def test_ui_blocks_ready_projection_preserves_every_event_field() -> None:
+  event = {
+    "type": "ui_blocks_ready",
+    "product_id": "research-web",
+    "session_id": "sess-1",
+    "skill_run_id": None,
+    "turn_key": "turn-key",
+    "emission_index": 2,
+    "ui_blocks_id": "ub_deadbeefdeadbeef",
+    "manifest_digest": "sha256:" + "ab" * 32,
+    "payload": {"kind": "hank_ui_blocks.v1", "contract_version": 1, "blocks": []},
+    "text_fallback": "Fallback",
+    "ts": 123.5,
+  }
+  assert adapt_event(event, 1) == event
 
 
 def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
@@ -145,6 +162,18 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
       "ts": 1.0,
       "scope": "ticker",
       "portfolio_id": None,
+    },
+    {
+      "type": "ui_blocks_ready",
+      "session_id": "sess_1",
+      "skill_run_id": None,
+      "turn_key": "turn-key",
+      "emission_index": 0,
+      "ui_blocks_id": "ub_deadbeefdeadbeef",
+      "manifest_digest": "sha256:" + "ab" * 32,
+      "payload": {"kind": "hank_ui_blocks.v1", "contract_version": 1, "blocks": []},
+      "text_fallback": "Fallback",
+      "ts": 1.0,
     },
     {"type": "artifact_failed", "skill_run_id": "run-1", "ticker": "MSFT", "skill": "model-review", "error_code": "validation", "error_detail": "bad", "source_path": "source.md", "tool_call_id": "toolu_1", "ts": 1.0},
     {"type": "artifact_unavailable", "ticker": "MSFT", "skill": "model-review", "reason": "stale", "affordance": "rerun", "ts": 1.0},

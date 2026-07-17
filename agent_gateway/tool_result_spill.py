@@ -146,6 +146,17 @@ class _PreparedSet:
     return (*self.members, self.commit_member)
 
 
+@dataclass(frozen=True)
+class _PublishedMember:
+  device: int
+  inode: int
+  guard_fd: int
+
+  @property
+  def identity(self) -> tuple[int, int]:
+    return (self.device, self.inode)
+
+
 def normalize_spill_sink(value: Callable[[], str] | SpillSink | None) -> SpillSink | None:
   if value is None or isinstance(value, SpillSink):
     return value
@@ -196,12 +207,12 @@ def write_spill_set(
         f"spill run budget exceeded ({sink.budget.used_bytes} + {reserved_total} > {sink.budget.max_bytes})"
       )
 
-    linked: list[tuple[Path, int, tuple[int, int]]] = []
+    linked: list[tuple[Path, int, _PublishedMember]] = []
     try:
       for member in emitted:
         final_path = _contained_member_path(root, member.filename)
-        identity = _publish_no_clobber(root, final_path, member.data, uuid_factory=uuid_factory)
-        linked.append((final_path, len(member.data), identity))
+        published = _publish_no_clobber(root, final_path, member.data, uuid_factory=uuid_factory)
+        linked.append((final_path, len(member.data), published))
     except FileExistsError as exc:
       retained = _remove_attempt_members(linked)
       sink.budget.rollback(reserved_total - retained)
@@ -214,6 +225,7 @@ def write_spill_set(
       sink.budget.rollback(reserved_total - retained)
       raise
 
+    _release_attempt_guards(linked)
     if sink.after_commit is not None:
       sink.after_commit()
     pointer = prepared.commit_member or prepared.members[0]
@@ -676,13 +688,17 @@ def _publish_no_clobber(
   data: bytes,
   *,
   uuid_factory: Callable[[], Any],
-) -> tuple[int, int]:
+) -> _PublishedMember:
   _ = uuid_factory
   temp_path = _contained_member_path(root, f".{final_path.name}.{uuid.uuid4().hex}.tmp")
   flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
   if hasattr(os, "O_NOFOLLOW"):
     flags |= os.O_NOFOLLOW
   fd: int | None = None
+  guard_fd: int | None = None
+  guard_transferred = False
+  linked_final = False
+  temp_info: os.stat_result | None = None
   try:
     fd = os.open(temp_path, flags, 0o600)
     with os.fdopen(fd, "wb", closefd=True) as handle:
@@ -695,32 +711,64 @@ def _publish_no_clobber(
       raise SpillPublicationUnsupported("spill temp publication member is not a regular file")
     try:
       os.link(temp_path, final_path, follow_symlinks=False)
+      linked_final = True
     except OSError as exc:
       if exc.errno in {errno.EPERM, getattr(errno, "EOPNOTSUPP", errno.EPERM)}:
         raise SpillPublicationUnsupported("spill filesystem does not support no-clobber hard-link publication") from exc
       raise
-    return (temp_info.st_dev, temp_info.st_ino)
+    guard_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+      guard_flags |= os.O_NOFOLLOW
+    guard_fd = os.open(temp_path, guard_flags)
+    guard_info = os.fstat(guard_fd)
+    if (guard_info.st_dev, guard_info.st_ino) != (temp_info.st_dev, temp_info.st_ino):
+      raise SpillError("spill publication ownership guard changed unexpectedly")
+    published = _PublishedMember(
+      device=temp_info.st_dev,
+      inode=temp_info.st_ino,
+      guard_fd=guard_fd,
+    )
+    guard_transferred = True
+    return published
+  except Exception:
+    if linked_final and temp_info is not None:
+      try:
+        visible = final_path.lstat()
+        if (visible.st_dev, visible.st_ino) == (temp_info.st_dev, temp_info.st_ino):
+          final_path.unlink()
+      except FileNotFoundError:
+        pass
+    raise
   finally:
     if fd is not None:
       os.close(fd)
+    if guard_fd is not None and not guard_transferred:
+      os.close(guard_fd)
     try:
       temp_path.unlink()
     except FileNotFoundError:
       pass
 
 
-def _remove_attempt_members(linked: list[tuple[Path, int, tuple[int, int]]]) -> int:
+def _release_attempt_guards(linked: list[tuple[Path, int, _PublishedMember]]) -> None:
+  for _path, _size, published in linked:
+    os.close(published.guard_fd)
+
+
+def _remove_attempt_members(linked: list[tuple[Path, int, _PublishedMember]]) -> int:
   retained = 0
-  for path, size, identity in reversed(linked):
+  for path, size, published in reversed(linked):
     try:
       visible = path.lstat()
-      if (visible.st_dev, visible.st_ino) != identity:
+      if (visible.st_dev, visible.st_ino) != published.identity:
         continue
       path.unlink()
     except FileNotFoundError:
       pass
     except OSError:
       retained += size
+    finally:
+      os.close(published.guard_fd)
   return retained
 
 

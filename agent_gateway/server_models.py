@@ -19,6 +19,7 @@ from typing import (
   List,
   Mapping,
   Optional,
+  Protocol,
   Set,
   Tuple,
 )
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     CommercialWorkStartContext,
     CommercialWorkStartGate,
   )
+  from .ui_blocks_run import UiBlocksRunContext
 
 SystemPrompt = str | List[Tuple[str, bool]]
 ExecutionLocationResolver = Callable[[str], Optional[str]]
@@ -60,6 +62,12 @@ DispatchScopeValidator = Callable[
   [GatewaySession, dict[str, Any]],
   Awaitable[dict[str, Any] | None] | dict[str, Any] | None,
 ]
+
+
+class ScheduledRetentionSweeper(Protocol):
+  interval_seconds: float
+
+  def sweep(self) -> Any: ...
 
 _AGENT_API_CLAIM_AUDIENCE = "agent_api_v1"
 _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS = 60
@@ -202,6 +210,11 @@ class ChatMessage(BaseModel):
   content: str
 
 
+class UiBlocksContractPin(BaseModel):
+  contract_version: int = Field(strict=True)
+  manifest_digest: str = Field(strict=True)
+
+
 class ChatRequest(BaseModel):
   """Request body for `POST /chat`.
 
@@ -217,10 +230,12 @@ class ChatRequest(BaseModel):
   metadata: Dict[str, Any] = Field(default_factory=dict)
   model: Optional[str] = None
   effort: Optional[str] = None
+  ui_blocks_contract: UiBlocksContractPin | None = None
   drain_trailing: bool = False
   _commercial_work_start: "CommercialWorkStartContext | None" = PrivateAttr(
     default=None
   )
+  _ui_blocks_run: "UiBlocksRunContext | None" = PrivateAttr(default=None)
 
   @model_validator(mode="before")
   @classmethod
@@ -245,6 +260,13 @@ class ChatRequest(BaseModel):
     self, context: "CommercialWorkStartContext | None"
   ) -> None:
     self._commercial_work_start = context
+
+  @property
+  def ui_blocks_run(self) -> "UiBlocksRunContext | None":
+    return self._ui_blocks_run
+
+  def _bind_ui_blocks_run(self, context: "UiBlocksRunContext | None") -> None:
+    self._ui_blocks_run = context
 
 
 class ChatRecapRequest(BaseModel):
@@ -284,6 +306,7 @@ class ChatTurnInputs:
   metadata: dict[str, Any] | None
   model: str | None
   effort: str | None = None
+  ui_blocks_contract: UiBlocksContractPin | None = None
   commercial_work_start: "CommercialWorkStartContext | None" = field(
     default=None,
     repr=False,
@@ -505,6 +528,8 @@ class GatewayServerConfig:
     transcript_dir: Optional directory where request and event transcripts are
       written as JSONL files.
     transcript_retention_days: Number of days to retain chat transcript files.
+    retention_sweeper: Optional synchronous retention sweeper injected by an
+      application owner. Package consumers default to no sweep.
     control_skills_dir: Optional directory backing control-plane skill list/read
       endpoints. When omitted, the package uses `AGENT_GATEWAY_SKILLS_DIR` if
       set, otherwise an empty package-local directory.
@@ -559,6 +584,7 @@ class GatewayServerConfig:
   on_shutdown: Optional[Callable[..., Any]] = None
   transcript_dir: Optional[Path] = None
   transcript_retention_days: int = 7
+  retention_sweeper: ScheduledRetentionSweeper | None = None
   control_skills_dir: Optional[Path] = None
   audit_hmac_secret_resolver: Callable[[], bytes] = get_audit_hmac_secret
   audit_hmac_key_id_resolver: Callable[[], str] = get_audit_hmac_key_id

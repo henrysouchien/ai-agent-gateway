@@ -1,0 +1,15 @@
+{
+  "name": "negative-unknown-view",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "view": "overview.unknown",
+        "scope": {}
+      }
+    ]
+  },
+  "expected_code": "unknown_view"
+}

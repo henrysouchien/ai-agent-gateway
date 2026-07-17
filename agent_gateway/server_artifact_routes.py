@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import re
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -126,6 +127,29 @@ def artifact_index_response(parent: Mapping[str, Any], request: Request, ticker:
       **_artifact_picker_copy(latest_payload),
     })
   return JSONResponse(content=decorated)
+
+
+def ui_blocks_by_id_response(
+  parent: Mapping[str, Any],
+  request: Request,
+  ui_blocks_id: str,
+) -> JSONResponse:
+  user_id = parent["_artifact_auth_dependency"](request)
+  if re.fullmatch(r"ub_[0-9a-f]{16}", ui_blocks_id) is None:
+    raise HTTPException(status_code=400, detail="Invalid ui_blocks_id")
+  envelope = parent["read_ui_blocks_payload"](
+    parent["user_workspace_root"](user_id),
+    ui_blocks_id,
+  )
+  if envelope is None:
+    raise HTTPException(status_code=404, detail="UI blocks payload not found")
+  return JSONResponse(
+    content=envelope,
+    headers={
+      "Cache-Control": "private, max-age=0",
+      "X-Content-Type-Options": "nosniff",
+    },
+  )
 
 
 def letter_by_id_response(
