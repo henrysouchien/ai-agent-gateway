@@ -1,8 +1,17 @@
 # Changelog
 
-## Unreleased (post-0.16.0)
+## Unreleased (post-0.16.1)
 
 _No unreleased changes recorded yet._
+
+## 0.16.1 (2026-08-14)
+
+### Fixed
+
+- Preserved the tracked Canvas Kit authoring type bundle through the standalone
+  dist and public-repository sync paths, so installed wheels include the
+  component and formatter declarations required by `authoring_manifest()` and
+  Canvas typechecking. Other runtime `node_modules` trees remain excluded.
 
 ## 0.16.0 (2026-08-13)
 

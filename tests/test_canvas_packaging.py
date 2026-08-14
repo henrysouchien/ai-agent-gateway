@@ -20,6 +20,8 @@ def test_canvas_resources_resolve_from_installed_wheel(tmp_path: Path) -> None:
   required = {
     "agent_gateway/contracts/canvas-kit-v1/canvas_kit_manifest.v1.json",
     "agent_gateway/contracts/canvas-kit-v1/types/node_modules/@hank/canvas-kit/index.d.ts",
+    "agent_gateway/contracts/canvas-kit-v1/types/node_modules/@hank/canvas-kit/components/index.d.ts",
+    "agent_gateway/contracts/canvas-kit-v1/types/node_modules/@hank/canvas-kit/fmt.d.ts",
     "agent_gateway/canvas_build/.node-version",
     "agent_gateway/canvas_build/package.json",
     "agent_gateway/canvas_build/package-lock.json",
