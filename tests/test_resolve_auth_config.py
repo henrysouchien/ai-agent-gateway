@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import sys
 from pathlib import Path
 
@@ -10,7 +12,6 @@ if str(ROOT) not in sys.path:
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from api.credentials import get_default_model as get_canonical_default_model
 from agent_gateway import resolve_auth_config
 from agent_gateway._provider_utils import _resolve_provider
 
@@ -23,6 +24,9 @@ def _clear_anthropic_env(monkeypatch: pytest.MonkeyPatch):
   monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
   monkeypatch.delenv("ALLOWED_MODELS_ANTHROPIC", raising=False)
   monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+  monkeypatch.delenv("OPENAI_AUTH_TOKEN", raising=False)
+  monkeypatch.delenv("XAI_API_KEY", raising=False)
+  monkeypatch.delenv("XAI_AUTH_TOKEN", raising=False)
 
 
 def test_resolve_auth_config_explicit_api_key_arg() -> None:
@@ -233,14 +237,36 @@ def test_resolve_auth_config_openai_explicit_api_key_includes_auth_fields() -> N
   resolved = resolve_auth_config(
     provider="openai",
     api_key="sk-openai",
-    model="gpt-4o",
   )
 
   assert resolved == {
     "auth_mode": "api",
     "api_key": "sk-openai",
     "auth_token": "",
-    "model": "gpt-4o",
+  }
+
+
+@pytest.mark.parametrize(
+  ("provider", "env_name"),
+  [
+    ("openai", "OPENAI_API_KEY"),
+    ("xai", "XAI_API_KEY"),
+  ],
+)
+def test_resolve_auth_config_snapshots_non_anthropic_env_api_key(
+  monkeypatch: pytest.MonkeyPatch,
+  provider: str,
+  env_name: str,
+) -> None:
+  monkeypatch.setenv(env_name, "env-service-key")
+
+  resolved = resolve_auth_config(provider=provider)
+  monkeypatch.delenv(env_name)
+
+  assert resolved == {
+    "auth_mode": "api",
+    "api_key": "env-service-key",
+    "auth_token": "",
   }
 
 
@@ -319,19 +345,37 @@ def test_resolve_auth_config_openai_auth_config_infers_mode_from_token() -> None
   }
 
 
-def test_resolve_auth_config_sets_model_max_tokens_and_thinking_when_passed() -> None:
+def test_resolve_auth_config_sets_request_limit_without_selection() -> None:
   resolved = resolve_auth_config(
     api_key="sk-123",
-    model="claude-test",
     max_tokens=123,
-    thinking=True,
   )
 
-  assert resolved["model"] == "claude-test"
   assert resolved["max_tokens"] == 123
-  assert resolved["effort"] == "high"
-  assert resolved["thinking_enabled_requested"] is True
-  assert "thinking" not in resolved
+  assert {
+    "model",
+    "model_key",
+    "effort",
+    "thinking",
+    "thinking_enabled_requested",
+  }.isdisjoint(resolved)
+
+
+@pytest.mark.parametrize(
+  "field_name",
+  [
+    "model",
+    "model_key",
+    "effort",
+    "thinking",
+    "thinking_enabled_requested",
+  ],
+)
+def test_resolve_auth_config_rejects_selection_in_auth_config(
+  field_name: str,
+) -> None:
+  with pytest.raises(ValueError, match="not model-selection authority"):
+    resolve_auth_config(auth_config={field_name: "forbidden"})
 
 
 def test_resolve_auth_config_does_not_inject_model_defaults() -> None:
@@ -407,7 +451,9 @@ def test_resolve_provider_does_not_read_anthropic_auth_mode_env() -> None:
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
   monkeypatch.setenv("ANTHROPIC_AUTH_MODE", "oauth")
   try:
-    _provider, _provider_name, config = _resolve_provider("anthropic", None, None, None, None)
+    _provider, _provider_name, config = _resolve_provider(
+      "anthropic", "claude-opus-5", None, None, None
+    )
   finally:
     monkeypatch.undo()
 
@@ -416,20 +462,22 @@ def test_resolve_provider_does_not_read_anthropic_auth_mode_env() -> None:
   assert config["auth_token"] == ""
 
 
-def test_resolve_provider_model_free_auth_config_uses_canonical_default() -> None:
-  _provider, _provider_name, config = _resolve_provider(
-    "anthropic",
-    None,
-    None,
-    None,
-    None,
-    auth_config={"api_key": "cfg-key"},
-  )
+def test_resolve_provider_requires_bound_upstream_model() -> None:
+  with pytest.raises(
+    ValueError,
+    match="requires an upstream model from a CapabilityBind",
+  ):
+    _resolve_provider(
+      "anthropic",
+      None,
+      None,
+      None,
+      None,
+      auth_config={"api_key": "cfg-key"},
+    )
 
-  assert config["model"] == get_canonical_default_model("anthropic")
 
-
-def test_resolve_provider_preserves_explicit_model_via_post_processing() -> None:
+def test_resolve_provider_keeps_explicit_model_out_of_auth_material() -> None:
   _provider, _provider_name, config = _resolve_provider(
     "anthropic",
     "opus",
@@ -439,7 +487,7 @@ def test_resolve_provider_preserves_explicit_model_via_post_processing() -> None
     auth_config={"api_key": "cfg-key"},
   )
 
-  assert config["model"] == "opus"
+  assert "model" not in config
   assert config["auth_mode"] == "api"
   assert config["api_key"] == "cfg-key"
 
@@ -450,7 +498,7 @@ def test_resolve_provider_uses_auth_config_credentials_instead_of_env() -> None:
   try:
     _provider, _provider_name, config = _resolve_provider(
       "anthropic",
-      None,
+      "claude-opus-5",
       None,
       None,
       None,

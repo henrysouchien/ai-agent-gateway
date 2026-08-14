@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import fcntl
 import json
+import logging
+import math
 import os
 from pathlib import Path
 import stat
@@ -13,6 +17,8 @@ from urllib.parse import urlparse
 import httpx
 
 
+LOGGER = logging.getLogger(__name__)
+
 DEFAULT_XAI_OAUTH_ISSUER = "https://auth.x.ai"
 DEFAULT_XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 DEFAULT_XAI_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
@@ -22,6 +28,22 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 MIN_POLL_INTERVAL_SECONDS = 1.0
 SLOW_DOWN_INCREMENT_SECONDS = 5.0
 EXPIRY_MARGIN_SECONDS = 60
+_SAVE_ATTEMPTS = 3
+_SAVE_RETRY_DELAY_SECONDS = 0.01
+_GRACE_HARD_BUDGET_S = 5.0
+_MIN_RETRY_BUDGET_S = 1.0
+_PRESEND_EXC = (
+  httpx.ConnectError,
+  httpx.ConnectTimeout,
+  httpx.PoolTimeout,
+  httpx.UnsupportedProtocol,
+  httpx.ProxyError,
+)
+_STORE_REFRESH_CONSUMED: set[str] = set()
+_REAUTH_REQUIRED_MESSAGE = (
+  "xAI OAuth refresh did not complete previously; the refresh token may be invalidated — "
+  "run `python3 -m agent_gateway.cli auth login xai`."
+)
 
 
 @dataclass(frozen=True)
@@ -128,6 +150,59 @@ def save_xai_token_record(path: Path, record: Mapping[str, Any]) -> None:
     os.chmod(temp_path, 0o600)
     os.replace(temp_path, path)
     os.chmod(path, 0o600)
+    try:
+      directory_fd = os.open(path.parent, os.O_RDONLY)
+      try:
+        os.fsync(directory_fd)
+      finally:
+        os.close(directory_fd)
+    except OSError:
+      pass
+  finally:
+    try:
+      temp_path.unlink()
+    except FileNotFoundError:
+      pass
+
+
+def _save_token_record_durable(
+  path: Path,
+  record: Mapping[str, Any],
+  attempts: int = _SAVE_ATTEMPTS,
+) -> None:
+  for attempt in range(attempts):
+    try:
+      save_xai_token_record(path, record)
+      return
+    except OSError:
+      if attempt + 1 >= attempts:
+        raise
+      time.sleep(_SAVE_RETRY_DELAY_SECONDS * (attempt + 1))
+
+
+def _write_reauth_tombstone(path: Path) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+  try:
+    path.parent.chmod(0o700)
+  except OSError:
+    pass
+  temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+  flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+  fd = os.open(temp_path, flags, 0o600)
+  try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      json.dump({"reauth_required": True}, handle, indent=2, sort_keys=True)
+      handle.write("\n")
+      handle.flush()
+      os.fsync(handle.fileno())
+    os.chmod(temp_path, 0o600)
+    os.replace(temp_path, path)
+    os.chmod(path, 0o600)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+      os.fsync(directory_fd)
+    finally:
+      os.close(directory_fd)
   finally:
     try:
       temp_path.unlink()
@@ -139,6 +214,60 @@ def token_store_is_private(path: Path) -> bool:
   try:
     return stat.S_IMODE(path.stat().st_mode) == 0o600
   except OSError:
+    return False
+
+
+@asynccontextmanager
+async def _store_lock(store_path: Path):
+  canonical_store = Path(os.path.realpath(store_path.expanduser()))
+  canonical_store.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+  try:
+    canonical_store.parent.chmod(0o700)
+  except OSError:
+    pass
+  lock_path = Path(f"{canonical_store}.lock")
+  flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+  fd = os.open(lock_path, flags, 0o600)
+  acquired = False
+  try:
+    while True:
+      try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        acquired = True
+        break
+      except BlockingIOError:
+        await asyncio.sleep(0.05)
+    yield
+  finally:
+    if acquired:
+      fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
+def _record_is_valid(rec: Mapping[str, Any], settings: XAIOAuthSettings) -> bool:
+  try:
+    access_token = rec.get("access_token")
+    refresh_token = rec.get("refresh_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+      return False
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+      return False
+    expires_at = float(rec.get("expires_at"))
+    if not math.isfinite(expires_at) or expires_at <= 0:
+      return False
+    if rec.get("issuer") != settings.issuer or rec.get("client_id") != settings.client_id:
+      return False
+    token_endpoint = rec.get("token_endpoint")
+    if token_endpoint is not None:
+      if not isinstance(token_endpoint, str) or not token_endpoint.strip():
+        return False
+      _require_trusted_endpoint(
+        token_endpoint.strip(),
+        issuer=settings.issuer,
+        label="token endpoint",
+      )
+    return True
+  except Exception:
     return False
 
 
@@ -178,6 +307,13 @@ def token_needs_refresh(record: Mapping[str, Any], *, now: float | None = None) 
   except (TypeError, ValueError):
     return False
   return bool(expires_at and expires_at <= (time.time() if now is None else now) + EXPIRY_MARGIN_SECONDS)
+
+
+def xai_record_requires_reauth(record: Any) -> bool:
+  return bool(
+    isinstance(record, dict)
+    and (record.get("refresh_pending") or record.get("reauth_required"))
+  )
 
 
 async def discover_xai_oauth(client: httpx.AsyncClient, settings: XAIOAuthSettings) -> dict[str, str]:
@@ -277,7 +413,8 @@ async def login_xai_device_code(
         await result
     record = await poll_xai_device_token(oauth_client, settings, discovery["token_endpoint"], device)
     record["device_authorization_endpoint"] = discovery["device_authorization_endpoint"]
-    save_xai_token_record(settings.store_path, record)
+    async with _store_lock(settings.store_path):
+      save_xai_token_record(settings.store_path, record)
     return record, settings.store_path
   finally:
     if owns_client:
@@ -289,40 +426,179 @@ async def refresh_xai_oauth_token(
   *,
   settings: XAIOAuthSettings,
   client: httpx.AsyncClient | None = None,
+  force: bool = False,
 ) -> dict[str, Any]:
-  refresh_token = str(record.get("refresh_token") or "").strip()
-  if not refresh_token:
-    raise RuntimeError("xAI OAuth credential is missing refresh token; run `agent auth login xai`")
-  owns_client = client is None
-  oauth_client = client or httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+  # Run the whole lock-held read→POST→save as an explicit task. Shielding alone is NOT enough:
+  # asyncio.shield raises CancelledError in THIS coroutine immediately while the inner task runs
+  # detached, which would let the caller's `finally` (e.g. provider_summarize.py:144
+  # close_client) close the shared httpx client mid-POST and abort the save → R0 stays on disk →
+  # reuse. So on caller cancellation we keep THIS frame on the stack until the inner task is
+  # terminal (client stays open through save), THEN re-raise the cancellation.
+  task = asyncio.ensure_future(_locked_refresh(record, settings, client, force))
   try:
-    token_endpoint = str(record.get("token_endpoint") or "").strip()
-    if not token_endpoint:
-      token_endpoint = (await discover_xai_oauth(oauth_client, settings))["token_endpoint"]
-    _require_trusted_endpoint(token_endpoint, issuer=settings.issuer, label="token endpoint")
-    response = await oauth_client.post(
-      token_endpoint,
-      data={
-        "grant_type": "refresh_token",
-        "client_id": settings.client_id,
-        "refresh_token": refresh_token,
-      },
-      headers={"Accept": "application/json"},
-    )
-    payload = _response_object(response, "xAI OAuth refresh", allow_error=True)
-    if not response.is_success:
-      _raise_oauth_response_error(response, payload, "xAI OAuth refresh")
-    refreshed = _parse_token_response(payload, settings, token_endpoint, require_refresh=False)
-    if not refreshed.get("refresh_token"):
-      refreshed["refresh_token"] = refresh_token
-    for key in ("device_authorization_endpoint",):
-      if record.get(key):
-        refreshed[key] = record[key]
-    save_xai_token_record(settings.store_path, refreshed)
-    return refreshed
-  finally:
-    if owns_client:
-      await oauth_client.aclose()
+    return await asyncio.shield(task)
+  except asyncio.CancelledError:
+    # Caller cancelled. Keep THIS frame (and the shared client) alive until the inner refresh
+    # is terminal, so close_client cannot abort the POST/save. Loop swallows BOTH re-cancels
+    # and the inner task's own failure; we recover the real outcome after the loop.
+    while not task.done():
+      try:
+        await asyncio.shield(task)
+      except BaseException:               # re-cancel OR inner failure — keep waiting for done()
+        pass
+    # Terminal. Retrieve the outcome deterministically so it is never "never retrieved", and
+    # make a durable-save failure VISIBLE instead of masking it behind CancelledError.
+    if not task.cancelled():
+      inner_exc = task.exception()
+      if inner_exc is not None and not isinstance(inner_exc, asyncio.CancelledError):
+        LOGGER.error("xAI OAuth refresh failed during caller cancellation; token store may "
+                     "be stale (rotated token unsaved): %r", inner_exc)
+    raise                                   # honor the caller's cancellation deterministically
+  # Non-cancel path: a failed POST/save propagates as its own exception via the initial await.
+
+
+async def _locked_refresh(
+  record: Mapping[str, Any],
+  settings: XAIOAuthSettings,
+  client: httpx.AsyncClient | None,
+  force: bool,
+) -> dict[str, Any]:
+  async with _store_lock(settings.store_path):
+    canonical_path = os.path.realpath(settings.store_path.expanduser())
+    on_disk = load_xai_token_record(settings.store_path)
+    if on_disk is None:
+      if canonical_path in _STORE_REFRESH_CONSUMED or xai_record_requires_reauth(record):
+        raise RuntimeError(_REAUTH_REQUIRED_MESSAGE)
+      post_refresh = str(record.get("refresh_token") or "").strip()
+    elif xai_record_requires_reauth(on_disk):
+      raise RuntimeError(_REAUTH_REQUIRED_MESSAGE)
+    elif _record_is_valid(on_disk, settings):
+      if not force and not token_needs_refresh(on_disk):
+        return dict(on_disk)
+      post_refresh = str(on_disk["refresh_token"]).strip()
+    else:
+      raise RuntimeError(
+        "xAI OAuth store record is present but not valid for the current "
+        "issuer/client; run `python3 -m agent_gateway.cli auth login xai`"
+      )
+
+    if not post_refresh:
+      raise RuntimeError(
+        "xAI OAuth credential is missing refresh token; run "
+        "`python3 -m agent_gateway.cli auth login xai`"
+      )
+
+    source_record = on_disk if on_disk is not None else record
+    owns_client = client is None
+    oauth_client = client or httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+    try:
+      token_endpoint = str(
+        source_record.get("token_endpoint") or record.get("token_endpoint") or ""
+      ).strip()
+      if not token_endpoint:
+        token_endpoint = (await discover_xai_oauth(oauth_client, settings))["token_endpoint"]
+      _require_trusted_endpoint(token_endpoint, issuer=settings.issuer, label="token endpoint")
+      base_record = dict(source_record)
+      pending_record = {**base_record, "refresh_pending": True}
+      _save_token_record_durable(settings.store_path, pending_record)
+      was_present = canonical_path in _STORE_REFRESH_CONSUMED
+      _STORE_REFRESH_CONSUMED.add(canonical_path)
+      post_started_monotonic = time.monotonic()
+      try:
+        response = await oauth_client.post(
+          token_endpoint,
+          data={
+            "grant_type": "refresh_token",
+            "client_id": settings.client_id,
+            "refresh_token": post_refresh,
+          },
+          headers={"Accept": "application/json"},
+        )
+      except Exception as exc:
+        if isinstance(exc, _PRESEND_EXC):
+          cleared_record = dict(base_record)
+          cleared_record.pop("refresh_pending", None)
+          try:
+            _save_token_record_durable(settings.store_path, cleared_record)
+          except OSError:
+            LOGGER.exception("Unable to clear xAI OAuth refresh-pending marker after pre-send failure")
+          if not was_present:
+            _STORE_REFRESH_CONSUMED.remove(canonical_path)
+          raise
+
+        remaining = (
+          post_started_monotonic + _GRACE_HARD_BUDGET_S
+        ) - time.monotonic()
+        if remaining < _MIN_RETRY_BUDGET_S:
+          raise
+        retry_client = httpx.AsyncClient(
+          timeout=httpx.Timeout(remaining, connect=remaining)
+        )
+        try:
+          budget = (
+            post_started_monotonic + _GRACE_HARD_BUDGET_S
+          ) - time.monotonic()
+          if budget < _MIN_RETRY_BUDGET_S:
+            raise exc
+          retry_resp = await asyncio.wait_for(
+            retry_client.post(
+              token_endpoint,
+              data={
+                "grant_type": "refresh_token",
+                "client_id": settings.client_id,
+                "refresh_token": post_refresh,
+              },
+              headers={"Accept": "application/json"},
+            ),
+            timeout=budget,
+          )
+        except asyncio.TimeoutError:
+          raise
+        except asyncio.CancelledError:
+          raise
+        except Exception:
+          raise
+        finally:
+          try:
+            await retry_client.aclose()
+          except Exception:
+            pass
+        retry_payload = _response_object(
+          retry_resp,
+          "xAI OAuth refresh",
+          allow_error=True,
+        )
+        if not retry_resp.is_success:
+          _raise_oauth_response_error(
+            retry_resp,
+            retry_payload,
+            "xAI OAuth refresh",
+          )
+        refreshed = _parse_token_response(
+          retry_payload,
+          settings,
+          token_endpoint,
+          require_refresh=True,
+        )
+        for key in ("device_authorization_endpoint", "token_endpoint"):
+          value = source_record.get(key) or record.get(key)
+          if value:
+            refreshed[key] = value
+        _save_token_record_durable(settings.store_path, refreshed)
+        return refreshed
+      payload = _response_object(response, "xAI OAuth refresh", allow_error=True)
+      if not response.is_success:
+        _raise_oauth_response_error(response, payload, "xAI OAuth refresh")
+      refreshed = _parse_token_response(payload, settings, token_endpoint, require_refresh=True)
+      for key in ("device_authorization_endpoint", "token_endpoint"):
+        value = source_record.get(key) or record.get(key)
+        if value:
+          refreshed[key] = value
+      _save_token_record_durable(settings.store_path, refreshed)
+      return refreshed
+    finally:
+      if owns_client:
+        await oauth_client.aclose()
 
 
 def _parse_token_response(
@@ -413,4 +689,5 @@ __all__ = [
   "save_xai_token_record",
   "token_needs_refresh",
   "token_store_is_private",
+  "xai_record_requires_reauth",
 ]

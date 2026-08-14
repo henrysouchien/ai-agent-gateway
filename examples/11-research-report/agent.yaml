@@ -3,8 +3,6 @@ system_prompt: |
   You coordinate lightweight research reports from local source packs. First inspect the
   relevant files, then delegate source triage or drafting to the named skills when useful.
   Separate facts, uncertainties, and recommendations in the final answer.
-provider: anthropic
-model: null
 host: 127.0.0.1
 port: 8011
 api_prefix: /api

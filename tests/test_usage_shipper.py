@@ -34,6 +34,26 @@ NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
 SECRET = b"s" * 32
 
 
+def _capability_bind_receipt() -> dict[str, str]:
+  return {
+    "schema_version": "1.0",
+    "capability_id": "portfolio.review",
+    "model_key": "test.anthropic.claude-sonnet-test",
+    "provider": "anthropic",
+    "upstream_model": "claude-sonnet-test",
+    "adapter": "test.anthropic",
+    "protocol_profile": "test.reasoning",
+    "route": "test.in_process",
+    "effort": "none",
+    "credential_principal": "user",
+    "credential_ref": "test-user:anthropic",
+    "run_mode": "interactive",
+    "registry_revision": "test-usage-shipper.1",
+    "policy_revision": "test-usage-shipper.1",
+    "selection_source": "capability_default",
+  }
+
+
 def _payload(event_id: str) -> dict:
   payload = {
     "schema_version": 1, "source_product": "hank-agent-gateway",
@@ -78,6 +98,8 @@ def _record_reconciliation(
     cache_creation_tokens=0, cost=0.001, turns=1, channel="mcp",
     started_at=NOW.timestamp() - 60, ended_at=NOW.timestamp(),
     usage_event_count=1, usage_event_ids=(event_id,),
+    capability_bind=_capability_bind_receipt(),
+    provider_reported_model=None,
   )
   report, _ = outbox.record_reconciliation_report(tracker.compare(summary), recorded_at=NOW)
   return tracker, summary, report

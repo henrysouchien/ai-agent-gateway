@@ -43,6 +43,7 @@ _OAUTH_BETA_SLUGS = [
 ]
 _COMMON_BETA_SLUGS: list[str] = []
 _COMPACTION_BETA_SLUG = "compact-2026-01-12"
+_STRUCTURED_OUTPUTS_BETA_SLUG = "structured-outputs-2025-12-15"
 _TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 _MAX_TOOL_ID_LEN = 64
 _MAX_ERROR_DETAIL_LEN = 800
@@ -63,6 +64,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       context_window=1_000_000,
       max_output_tokens=128_000,
       supports_thinking=True,
+      supports_native_compaction=True,
       thinking_mode="adaptive",
       input_cost_per_mtok=10.00,
       output_cost_per_mtok=50.00,
@@ -79,6 +81,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       context_window=1_000_000,
       max_output_tokens=128_000,
       supports_thinking=True,
+      supports_native_compaction=True,
       thinking_mode="adaptive",
       input_cost_per_mtok=10.00,
       output_cost_per_mtok=50.00,
@@ -88,13 +91,36 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
     ),
   ),
   (
+    ("claude-opus-5",),
+    ModelInfo(
+      id="claude-opus-5",
+      provider="anthropic",
+      context_window=1_000_000,
+      max_output_tokens=128_000,
+      supports_thinking=True,
+      supports_native_compaction=True,
+      thinking_mode="adaptive",
+      input_cost_per_mtok=5.00,
+      output_cost_per_mtok=25.00,
+      cache_read_cost_per_mtok=0.50,
+      cache_write_cost_per_mtok=6.25,
+      # Thinking is ON when the param is omitted, so disabling must be EXPLICIT
+      # ("disabled"), unlike Opus 4.8/4.7 which use "omit". Explicit disable is accepted
+      # only at effort <= high (disabled + xhigh = 400, verified live 2026-07-24);
+      # resolve_effort only emits output_config.effort on the thinking-ON branch, so the
+      # forbidden pair is unreachable. Same compat shape as claude-sonnet-5.
+      compat=_adaptive_compat(disable="disabled", omitted="on", default_effort="high", values=_EFFORT_5),
+    ),
+  ),
+  (
     ("claude-opus-4-8",),
     ModelInfo(
       id="claude-opus-4-8",
       provider="anthropic",
       context_window=1_000_000,
-      max_output_tokens=32_000,
+      max_output_tokens=128_000,  # official models page (audited 2026-07-21); 32k was a carried-over Opus 4.1 value
       supports_thinking=True,
+      supports_native_compaction=True,
       thinking_mode="adaptive",
       input_cost_per_mtok=5.00,
       output_cost_per_mtok=25.00,
@@ -111,6 +137,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       context_window=1_000_000,
       max_output_tokens=32_000,
       supports_thinking=True,
+      supports_native_compaction=True,
       thinking_mode="adaptive",
       input_cost_per_mtok=5.00,
       output_cost_per_mtok=25.00,
@@ -127,6 +154,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       context_window=1_000_000,
       max_output_tokens=128_000,
       supports_thinking=True,
+      supports_native_compaction=True,
       thinking_mode="adaptive",
       input_cost_per_mtok=3.00,
       output_cost_per_mtok=15.00,
@@ -142,6 +170,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       provider="anthropic",
       max_output_tokens=64_000,
       supports_thinking=True,
+      supports_native_compaction=True,
       thinking_mode="adaptive",
       input_cost_per_mtok=3.00,
       output_cost_per_mtok=15.00,
@@ -156,6 +185,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       id="claude-opus-4-6",
       provider="anthropic",
       supports_thinking=True,
+      supports_native_compaction=True,
       thinking_mode="adaptive",
       input_cost_per_mtok=3.00,
       output_cost_per_mtok=15.00,
@@ -223,7 +253,11 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
 
 
 def _model_matches_tag(model_id: str, tag: str) -> bool:
-  return model_id == tag or tag in model_id or model_id.startswith(f"{tag}-")
+  return (
+    model_id == tag
+    or model_id.startswith(f"{tag}-")
+    or model_id.startswith(f"{tag}.")
+  )
 
 
 def _model_info_for_model(model_id: str) -> ModelInfo:

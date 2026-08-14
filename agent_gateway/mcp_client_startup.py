@@ -21,9 +21,9 @@ def apply_server_env_passthrough(
     configured_env = config.get("env")
     server_env = dict(configured_env) if isinstance(configured_env, dict) else {}
     for env_name in env_names:
-      if env_name in environ:
+      if environ.get(env_name):
         server_env[env_name] = f"${{{env_name}}}"
-      else:
+      elif server_env.get(env_name) == f"${{{env_name}}}":
         server_env.pop(env_name, None)
     config["env"] = server_env
   return resolved
@@ -174,7 +174,19 @@ async def startup_manager(
       )
       continue
 
-    connect_jobs.append((server_name, server_config))
+    try:
+      prepared_config = manager._prepare_server_config_for_startup(server_config)
+    except ValueError as exc:
+      logger.warning("Skipping MCP server %s: invalid per-user config", server_name)
+      manager._set_startup_diagnostic(
+        server_name,
+        category="invalid_config",
+        message=str(exc),
+        retryable=False,
+      )
+      continue
+
+    connect_jobs.append((server_name, prepared_config))
 
   if connect_jobs:
     for state in await manager._connect_startup_servers(connect_jobs):

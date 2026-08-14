@@ -13,7 +13,7 @@ from typing import Any, Awaitable, Callable, Sequence
 import httpx
 
 from ._io import _atomic_write_json, _read_json_object
-from ._provider_utils import _allowed_models_for_provider, _get_default_model_for_provider, _resolve_provider
+from .agent_session_log import AgentSessionLog, slugify
 from .autonomous_excel_dispatch import make_autonomous_message_excel_agent_handler
 from .autonomous_output import (
   RunOutput as RunOutput,
@@ -29,14 +29,24 @@ from .autonomous_output import (
   run_output_exit_code as _run_output_exit_code,
   run_output_outcome as _run_output_outcome,
 )
+from .capability_execution import (
+  BoundCapabilityExecution,
+  CapabilityExecutionResolver,
+)
 from .event_log import EventLog
 from .excel_dispatch import make_message_excel_agent_tool_def
 from .mcp_client import McpClientManager
 from .multi_user.billing import SessionUsageSummary, UsageEvent
-from .providers import ModelProvider
+from .openai_history_fence import (
+  OPENAI_SESSION_EPOCH_ENV,
+  scope_provider_session_id,
+)
+from .approval_policy import RunContext
 from .runner import AgentRunner, ToolResultContext
 from .runner_session_lifecycle import WriterLeaseAlreadyHeldError
+from .skill_lifecycle import drain_owned_lifecycle_task
 from .skills import SkillLoader
+from .session import GatewaySession
 from .sub_agent import (
   make_get_background_result_handler,
   make_get_background_result_tool_def,
@@ -45,6 +55,7 @@ from .sub_agent import (
   make_run_agent_handler,
   make_run_agent_tool_def,
 )
+from .agent_result_content import make_get_agent_result_content_tool_def
 from .task_registry import CoordinatorConfig
 from .tool_dispatcher import LocalToolHandler, ToolDispatcher, ToolInterceptor
 
@@ -52,9 +63,118 @@ from .tool_dispatcher import LocalToolHandler, ToolDispatcher, ToolInterceptor
 log = logging.getLogger("agent_gateway.autonomous")
 _RUN_SESSION_FORCE_CLOSE_SECONDS = 2.0
 _RUN_SESSION_CANCEL_DRAIN_SECONDS = 5.0
+_SESSION_LOG_BASE_DIR_ENV = "AGENT_SESSION_LOG_BASE_DIR"
 _API_AUTONOMOUS_MCP_CONFIG_MODULE_NAMES = frozenset(
   {"api", "api.agent", "api.agent.autonomous", "api.agent.autonomous.mcp_config"}
 )
+
+
+def _trusted_autonomous_mcp_policy(
+  *,
+  mcp_servers: dict[str, dict[str, Any]] | None,
+  mcp_config_path: str | Path | None,
+  trusted_allowed_servers: set[str] | None,
+  trusted_server_aliases: dict[str, str] | None,
+) -> tuple[set[str] | None, dict[str, str]]:
+  """Validate launcher-owned MCP admission policy before any server can start."""
+
+  if not mcp_servers and not mcp_config_path:
+    return None, {}
+  if trusted_allowed_servers is None:
+    raise ValueError(
+      "run_autonomous requires trusted_mcp_allowed_servers when MCP "
+      "configuration is supplied"
+    )
+
+  aliases = dict(trusted_server_aliases or {})
+  for alias, canonical_name in aliases.items():
+    if not isinstance(alias, str) or not alias.strip():
+      raise ValueError("trusted MCP server aliases must have non-empty string names")
+    if not isinstance(canonical_name, str) or not canonical_name.strip():
+      raise ValueError("trusted MCP server aliases must target non-empty string names")
+
+  allowed_servers: set[str] = set()
+  for server_name in trusted_allowed_servers:
+    if not isinstance(server_name, str) or not server_name.strip():
+      raise ValueError("trusted MCP allowed servers must be non-empty strings")
+    allowed_servers.add(server_name)
+
+  canonical_allowed_servers = {
+    aliases.get(server_name, server_name)
+    for server_name in allowed_servers
+  }
+  disallowed_inline_servers: list[str] = []
+  for server_name in (mcp_servers or {}):
+    if not isinstance(server_name, str) or not server_name.strip():
+      raise ValueError("inline MCP server names must be non-empty strings")
+    if aliases.get(server_name, server_name) not in canonical_allowed_servers:
+      disallowed_inline_servers.append(server_name)
+  if disallowed_inline_servers:
+    raise ValueError(
+      "inline MCP server(s) absent from the trusted allowlist: "
+      f"{', '.join(sorted(disallowed_inline_servers))}"
+    )
+
+  return allowed_servers, aliases
+
+
+def _resolve_session_log_base_dir(
+  configured: str | Path | None,
+) -> Path:
+  """Resolve durable storage for direct autonomous runs without cwd drift."""
+
+  raw = str(configured or "").strip()
+  if not raw:
+    raw = os.getenv(_SESSION_LOG_BASE_DIR_ENV, "").strip()
+    if raw:
+      env_path = Path(raw).expanduser()
+      if not env_path.is_absolute():
+        raise ValueError(
+          f"{_SESSION_LOG_BASE_DIR_ENV} must be an absolute path"
+        )
+      return env_path.resolve(strict=False)
+  if raw:
+    return Path(raw).expanduser().resolve(strict=False)
+  return Path("~/.cache/agent-gateway/agent-sessions").expanduser()
+
+
+def _autonomous_session_log(
+  session: GatewaySession,
+  *,
+  session_id: str,
+  base_dir: Path,
+  supplied: AgentSessionLog | None,
+) -> AgentSessionLog:
+  existing = getattr(session, "agent_session_log", None)
+  if supplied is not None and not isinstance(supplied, AgentSessionLog):
+    raise TypeError("agent_session_log must be AgentSessionLog")
+  if existing is not None and not isinstance(existing, AgentSessionLog):
+    raise TypeError(
+      "GatewaySession.agent_session_log must be AgentSessionLog"
+    )
+  if supplied is not None and existing is not None and supplied is not existing:
+    raise ValueError(
+      "agent_session_log does not match GatewaySession.agent_session_log"
+    )
+  if supplied is not None:
+    session_log = supplied
+  elif existing is not None:
+    session_log = existing
+  else:
+    path = (
+      base_dir
+      / "autonomous"
+      / (
+        f"agentsess_{slugify(session_id)}_"
+        f"{slugify(session.user_id)}.jsonl"
+      )
+    )
+    session_log = AgentSessionLog(
+      path=path,
+      gateway_session=session,
+    )
+  setattr(session, "agent_session_log", session_log)
+  return session_log
 
 
 class _NullMcpClient:
@@ -276,23 +396,110 @@ def _consume_late_run_task_result(task: asyncio.Task[None]) -> None:
     log.warning("Autonomous run raised after timeout return: %s", exc)
 
 
+def _top_level_skill_enrolled(runner: Any) -> bool:
+  return bool(getattr(runner, "top_level_skill_enrolled", False))
+
+
+def _set_server_terminal_cause(
+  runner: Any,
+  cause: str,
+) -> bool:
+  setter = getattr(runner, "set_server_terminal_cause", None)
+  if not callable(setter):
+    return False
+  return bool(setter(cause))
+
+
+async def _drain_enrolled_run_settlement(
+  runner: Any,
+  run_task: asyncio.Task[None],
+) -> None:
+  run_failure: Exception | None = None
+  try:
+    await drain_owned_lifecycle_task(run_task)
+  except asyncio.CancelledError:
+    pass
+  except Exception as exc:
+    run_failure = exc
+  waiter = getattr(
+    runner,
+    "wait_for_top_level_skill_settlement",
+    None,
+  )
+  if not callable(waiter):
+    raise RuntimeError(
+      "Enrolled top-level skill runner is missing its settlement "
+      "handshake"
+    )
+  settlement_task = asyncio.create_task(
+    waiter(),
+    name="top-level-skill:settlement-handshake",
+  )
+  try:
+    await drain_owned_lifecycle_task(settlement_task)
+  except Exception as settlement_failure:
+    if run_failure is not None:
+      raise run_failure from settlement_failure
+    raise
+
+
+async def _wait_for_enrolled_run_and_settlement(
+  runner: Any,
+  run_task: asyncio.Task[None],
+) -> None:
+  run_failure: Exception | None = None
+  try:
+    await asyncio.shield(run_task)
+  except asyncio.CancelledError:
+    raise
+  except Exception as exc:
+    run_failure = exc
+  try:
+    await _wait_for_enrolled_settlement(runner)
+  except Exception as settlement_failure:
+    if run_failure is not None:
+      raise run_failure from settlement_failure
+    raise
+
+
+async def _wait_for_enrolled_settlement(runner: Any) -> None:
+  waiter = getattr(
+    runner,
+    "wait_for_top_level_skill_settlement",
+    None,
+  )
+  if not callable(waiter):
+    raise RuntimeError(
+      "Enrolled top-level skill runner is missing its settlement "
+      "handshake"
+    )
+  settlement_task = asyncio.create_task(
+    waiter(),
+    name="top-level-skill:settlement-handshake",
+  )
+  try:
+    await asyncio.shield(settlement_task)
+  except asyncio.CancelledError:
+    await drain_owned_lifecycle_task(settlement_task)
+    raise
+
+
 async def run_session(
   runner: AgentRunner,
   event_log: EventLog,
   *,
-  model: str,
   max_turns: int,
   timeout_seconds: float | None,
   initial_message: str,
-  system_prompt: str | list[tuple[str, bool]],
+  system_prompt: str | list[tuple[str, bool]] | None,
 ) -> RunOutput:
   timed_out = False
   error_msg: str | None = None
   lease_skip = False
+  enrolled_top_level_skill = _top_level_skill_enrolled(runner)
   coro = runner.run(
     messages=[{"role": "user", "content": initial_message}],
     system_prompt=system_prompt,
-    model_override=model,
     max_turns=max_turns,
   )
   run_task: asyncio.Task[None] | None = None
@@ -301,32 +508,113 @@ async def run_session(
       run_task = asyncio.create_task(coro)
       done, _pending = await asyncio.wait({run_task}, timeout=timeout_seconds)
       if run_task in done:
-        await run_task
+        if enrolled_top_level_skill:
+          await _wait_for_enrolled_run_and_settlement(
+            runner,
+            run_task,
+          )
+        else:
+          await run_task
       else:
-        timed_out = True
         log.warning("Autonomous run timed out after %ss", timeout_seconds)
+        cause_accepted = _set_server_terminal_cause(
+          runner,
+          "timeout",
+        )
+        if enrolled_top_level_skill and not cause_accepted:
+          await _wait_for_enrolled_run_and_settlement(
+            runner,
+            run_task,
+          )
+        else:
+          timed_out = True
+          run_task.cancel()
+          try:
+            await _force_close_runner(
+              runner,
+              timeout=_RUN_SESSION_FORCE_CLOSE_SECONDS,
+            )
+          except Exception as exc:
+            log.warning(
+              "Autonomous runner force-close after timeout failed: %s",
+              exc,
+            )
+          if enrolled_top_level_skill:
+            await _drain_enrolled_run_settlement(
+              runner,
+              run_task,
+            )
+            current_task = asyncio.current_task()
+            if (
+              current_task is not None
+              and current_task.cancelling()
+            ):
+              raise asyncio.CancelledError
+          else:
+            drained = await _drain_cancelled_run_task(
+              run_task,
+              timeout=_RUN_SESSION_CANCEL_DRAIN_SECONDS,
+            )
+            if not drained:
+              log.warning(
+                "Autonomous run cancellation did not drain within %ss "
+                "after timeout",
+                _RUN_SESSION_CANCEL_DRAIN_SECONDS,
+              )
+              run_task.add_done_callback(
+                _consume_late_run_task_result
+              )
+    else:
+      if enrolled_top_level_skill:
+        run_task = asyncio.create_task(coro)
+        await _wait_for_enrolled_run_and_settlement(
+          runner,
+          run_task,
+        )
+      else:
+        await coro
+  except asyncio.CancelledError:
+    if run_task is not None and enrolled_top_level_skill:
+      cause_resolver = getattr(
+        runner,
+        "classify_server_cancellation_cause",
+        None,
+      )
+      cause = (
+        cause_resolver()
+        if callable(cause_resolver)
+        else "caller_cancellation"
+      )
+      cause_accepted = _set_server_terminal_cause(runner, cause)
+      if not run_task.done() and cause_accepted:
         run_task.cancel()
         try:
-          await _force_close_runner(runner, timeout=_RUN_SESSION_FORCE_CLOSE_SECONDS)
-        except Exception as exc:
-          log.warning("Autonomous runner force-close after timeout failed: %s", exc)
-        drained = await _drain_cancelled_run_task(run_task, timeout=_RUN_SESSION_CANCEL_DRAIN_SECONDS)
-        if not drained:
-          log.warning(
-            "Autonomous run cancellation did not drain within %ss after timeout",
-            _RUN_SESSION_CANCEL_DRAIN_SECONDS,
+          await _force_close_runner(
+            runner,
+            timeout=_RUN_SESSION_FORCE_CLOSE_SECONDS,
           )
-          run_task.add_done_callback(_consume_late_run_task_result)
-    else:
-      await coro
-  except asyncio.CancelledError:
-    if run_task is not None and not run_task.done():
+        except Exception as exc:
+          log.warning(
+            "Autonomous runner force-close after cancellation failed: %s",
+            exc,
+          )
+      await _drain_enrolled_run_settlement(runner, run_task)
+    elif run_task is not None and not run_task.done():
       run_task.cancel()
       try:
-        await _force_close_runner(runner, timeout=_RUN_SESSION_FORCE_CLOSE_SECONDS)
+        await _force_close_runner(
+          runner,
+          timeout=_RUN_SESSION_FORCE_CLOSE_SECONDS,
+        )
       except Exception as exc:
-        log.warning("Autonomous runner force-close after cancellation failed: %s", exc)
-      drained = await _drain_cancelled_run_task(run_task, timeout=_RUN_SESSION_CANCEL_DRAIN_SECONDS)
+        log.warning(
+          "Autonomous runner force-close after cancellation failed: %s",
+          exc,
+        )
+      drained = await _drain_cancelled_run_task(
+        run_task,
+        timeout=_RUN_SESSION_CANCEL_DRAIN_SECONDS,
+      )
       if not drained:
         run_task.add_done_callback(_consume_late_run_task_result)
     raise
@@ -335,11 +623,15 @@ async def run_session(
     error_msg = f"{type(exc).__name__}: {exc}"
     log.info("Autonomous run skipped: %s", error_msg)
   except Exception as exc:
+    if enrolled_top_level_skill:
+      raise
     error_msg = f"{type(exc).__name__}: {exc}"
     log.error("Autonomous run failed: %s", error_msg, exc_info=True)
 
   output = collect_run_output(event_log, timed_out=timed_out)
-  if error_msg and not output.error:
+  if timed_out and output.error == "missing_terminal_event":
+    output.error = None
+  if error_msg and output.error in {None, "missing_terminal_event"}:
     output.error = error_msg
   if lease_skip:
     output.exit_reason = "writer_lease_already_held"
@@ -467,22 +759,22 @@ async def run_autonomous(
   system_prompt: str | list[tuple[str, bool]],
   initial_message: str,
   *,
-  provider: str | ModelProvider = "anthropic",
-  model: str | None = None,
-  api_key: str | None = None,
-  auth_token: str | None = None,
-  auth_config: dict[str, Any] | None = None,
-  provider_config: dict[str, Any] | None = None,
-  max_tokens: int = 16_000,
+  capability_execution: BoundCapabilityExecution,
+  session: GatewaySession,
   mcp_servers: dict[str, dict[str, Any]] | None = None,
   mcp_config_path: str | Path | None = None,
+  trusted_mcp_allowed_servers: set[str] | None = None,
+  trusted_mcp_server_aliases: dict[str, str] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
+  mcp_meta_inject_servers: frozenset[str] | None = None,
   mcp_timeout_overrides: dict[str, int] | None = None,
   tool_handlers: dict[str, LocalToolHandler] | None = None,
   tool_definitions: list[dict[str, Any]] | None = None,
   skills_dir: str | Path | None = None,
   skills_excluded_tools: set[str] | None = None,
   outputs_dir: str | Path | None = None,
+  agent_session_log: AgentSessionLog | None = None,
+  session_log_base_dir: str | Path | None = None,
   needs_approval: Callable[..., bool] | None = None,
   excluded_tools: set[str] | None = None,
   interceptors: Sequence[ToolInterceptor] | None = None,
@@ -495,7 +787,7 @@ async def run_autonomous(
   # runaway bounds = max_turns / max_budget_usd / timeout_seconds.
   per_turn_timeout: float | None = None,
   client_timeout: float = 90.0,
-  max_concurrent_sub_agents: int | None = None,
+  max_concurrent_sub_agents: int | None = 4,
   compaction_instructions: str | None = None,
   state_dir: str | Path | None = None,
   state_file: str = "state.json",
@@ -505,34 +797,153 @@ async def run_autonomous(
   on_tool_result: Callable[[ToolResultContext], Awaitable[Any] | Any] | None = None,
   on_tool_timing: Callable[..., None] | None = None,
   session_id: str | None = None,
+  top_level_skill_name: str | None = None,
+  skill_run_id: str | None = None,
   user_id: str,
   billing_mode: str,
   rate_table_version: str,
   coordinator: CoordinatorConfig | None = None,
+  capability_execution_resolver: CapabilityExecutionResolver | None = None,
   commercial_usage_producer: Any | None = None,
 ) -> RunOutput:
-  """Run a headless agent to completion without an HTTP server.
+  """Execute one already-resolved headless session-driver execution.
 
-  Use for cron jobs, batch tasks, or as the building block for HeartbeatLoop.
+  Capability, provider, credential, model, and effort selection must happen
+  before this execution-only helper is called.
+
+  Use for autonomous/cron jobs or as the building block for HeartbeatLoop.
   Supports MCP tools, local tool handlers, skills/sub-agents, state persistence,
   and delivery (Telegram, webhook, or callback) on completion.
+  Inline or file-backed MCP configuration requires a launcher-owned
+  `trusted_mcp_allowed_servers`; skill metadata is not an admission policy.
   The default execution control is turn-based; pass `timeout_seconds` only for
   callers that need an explicit wall-clock SLA, and set `max_budget_usd` for
   production cost control.
+  Standalone top-level skill callers must bind both `top_level_skill_name` and
+  a unique `skill_run_id`; these values are trusted runtime context, not model input.
   """
-  provider_instance, _provider_name, resolved_auth_config = _resolve_provider(
-    provider,
-    model,
-    api_key,
-    auth_token,
-    provider_config,
-    auth_config=auth_config,
-    max_tokens=max_tokens,
+  if type(session) is not GatewaySession:
+    raise TypeError("run_autonomous requires an exact GatewaySession")
+  if not isinstance(capability_execution, BoundCapabilityExecution):
+    raise TypeError(
+      "run_autonomous requires a BoundCapabilityExecution"
+    )
+  capability_execution.validate()
+  capability_bind = capability_execution.bind
+  if capability_bind.capability_id != "session.driver":
+    raise ValueError(
+      "run_autonomous requires a session.driver capability execution"
+    )
+  if capability_bind.run_mode not in {"autonomous", "cron"}:
+    raise ValueError(
+      "run_autonomous requires an autonomous or cron capability execution"
+    )
+  resolved_auth_config = dict(capability_execution.auth_config)
+  if top_level_skill_name is None:
+    if skill_run_id is not None:
+      raise ValueError(
+        "run_autonomous skill_run_id requires top_level_skill_name"
+      )
+    trusted_skill_name = None
+    trusted_skill_run_id = None
+    policy_bundle_hash = "unknown"
+  else:
+    if (
+      type(top_level_skill_name) is not str
+      or not top_level_skill_name
+      or top_level_skill_name != top_level_skill_name.strip()
+    ):
+      raise ValueError(
+        "run_autonomous top_level_skill_name must be canonical non-empty text"
+      )
+    if (
+      type(skill_run_id) is not str
+      or not skill_run_id
+      or skill_run_id != skill_run_id.strip()
+    ):
+      raise ValueError(
+        "run_autonomous top-level skill requires a canonical skill_run_id"
+      )
+    policy_bundle_hash = str(
+      getattr(session.approval_policy, "policy_bundle_hash", "")
+    ).strip()
+    if (
+      len(policy_bundle_hash) != 64
+      or any(character not in "0123456789abcdef" for character in policy_bundle_hash)
+    ):
+      raise ValueError(
+        "run_autonomous top-level skill requires a trusted policy bundle"
+      )
+    trusted_skill_name = top_level_skill_name
+    trusted_skill_run_id = skill_run_id
+  max_tokens = resolved_auth_config.get("max_tokens")
+  if (
+    isinstance(max_tokens, bool)
+    or not isinstance(max_tokens, int)
+    or max_tokens <= 0
+  ):
+    raise ValueError(
+      "capability execution max_tokens must be a positive integer"
+    )
+  resolved_mcp_allowed_servers, resolved_mcp_server_aliases = (
+    _trusted_autonomous_mcp_policy(
+      mcp_servers=mcp_servers,
+      mcp_config_path=mcp_config_path,
+      trusted_allowed_servers=trusted_mcp_allowed_servers,
+      trusted_server_aliases=trusted_mcp_server_aliases,
+    )
   )
-  resolved_model = str(resolved_auth_config.get("model") or _get_default_model_for_provider(_provider_name))
-  allowed_models = _allowed_models_for_provider(provider_instance, resolved_model)
+  provider_name_for_scope = capability_bind.provider
+  resolved_model = capability_bind.upstream_model
+  durable_session = state_dir is not None or session_id is not None
   sid = str(session_id or f"autonomous-{secrets.token_hex(8)}")
+  sid = scope_provider_session_id(
+    sid,
+    provider=provider_name_for_scope,
+    durable=durable_session,
+    openai_epoch=(
+      os.environ.get(OPENAI_SESSION_EPOCH_ENV)
+      if provider_name_for_scope == "openai"
+      else None
+    ),
+  )
+  run_context = RunContext(
+    user_id=session.user_id,
+    request_id=str(getattr(session, "request_id", "") or sid),
+    session_id=sid,
+    run_id=trusted_skill_run_id,
+    profile="autonomous",
+    channel=str(session.channel or "autonomous"),
+    skill=trusted_skill_name,
+    scheduled_investment_authority=getattr(
+      session,
+      "scheduled_investment_authority",
+      None,
+    ),
+    decider_role=session.role,
+    policy_bundle_hash=policy_bundle_hash,
+  )
+  session.run_context = run_context
   skill_loader = SkillLoader(skills_dir) if skills_dir else None
+  durable_session_log = (
+    _autonomous_session_log(
+      session,
+      session_id=sid,
+      base_dir=_resolve_session_log_base_dir(session_log_base_dir),
+      supplied=agent_session_log,
+    )
+    if skill_loader is not None
+    else None
+  )
+  if (
+    skill_loader is not None
+    and "run_agent" not in (tool_handlers or {})
+    and capability_execution_resolver is None
+  ):
+    raise ValueError(
+      "run_autonomous requires capability_execution_resolver before "
+      "registering the run_agent child surface"
+    )
   excel_dispatch_config: tuple[str, str] | None = None
   excel_dispatch_enabled = os.getenv("EXCEL_ORCHESTRATION_DEV", "").strip() == "1"
   if excel_dispatch_enabled and "message_excel_agent" not in (tool_handlers or {}):
@@ -552,12 +963,19 @@ async def run_autonomous(
     if excel_dispatch_config is not None:
       builtin_names.add("message_excel_agent")
     if skills_dir and "run_agent" not in builtin_names:
-      builtin_names |= {"run_agent", "get_background_result", "send_message"}
+      builtin_names |= {
+        "run_agent",
+        "get_agent_result_content",
+        "get_background_result",
+        "send_message",
+      }
     mcp_client = McpClientManager(
+      allowed_servers=resolved_mcp_allowed_servers,
       inline_servers=mcp_servers,
       config_path=mcp_config_path,
       builtin_tool_names=builtin_names,
       timeout_overrides=mcp_timeout_overrides,
+      server_aliases=resolved_mcp_server_aliases,
     )
 
   try:
@@ -582,6 +1000,7 @@ async def run_autonomous(
     if skill_loader is not None and "run_agent" not in local_handlers:
       local_handlers["run_agent"] = make_run_agent_handler(
         runner_ref,
+        parent_session=session,
         skill_loader=skill_loader,
         mcp_client=mcp_client or _NullMcpClient(),
         needs_approval=needs_approval,
@@ -589,8 +1008,7 @@ async def run_autonomous(
         local_tool_handlers=local_handlers,
         excluded_tools=skills_excluded_tools,
         outputs_dir=Path(outputs_dir) if outputs_dir is not None else None,
-        default_model=resolved_model,
-        allowed_models=allowed_models,
+        capability_execution_resolver=capability_execution_resolver,
         coordinator_config=coordinator,
       )
       if "get_background_result" not in local_handlers:
@@ -601,6 +1019,8 @@ async def run_autonomous(
         extra_tool_defs.append(make_run_agent_tool_def(skill_loader))
       if not any(definition.get("name") == "get_background_result" for definition in extra_tool_defs):
         extra_tool_defs.append(make_get_background_result_tool_def())
+      if not any(definition.get("name") == "get_agent_result_content" for definition in extra_tool_defs):
+        extra_tool_defs.append(make_get_agent_result_content_tool_def())
       if not any(definition.get("name") == "send_message" for definition in extra_tool_defs):
         extra_tool_defs.append(make_send_message_tool_def())
 
@@ -629,14 +1049,21 @@ async def run_autonomous(
       session_id=sid,
       should_avoid_permission_prompts=True,
       mcp_session_inject_servers=mcp_session_inject_servers,
+      mcp_meta_inject_servers=mcp_meta_inject_servers,
+      user_id=session.user_id,
+      risk_user_id=session.risk_user_id,
+      channel=session.channel,
+      role=session.role,
+      session=session,
+      run_context=run_context,
       get_tool_definitions=_get_tool_defs,
     )
     runner = AgentRunner(
       event_log=event_log,
       dispatcher=dispatcher,
       session_id=sid,
-      provider=provider_instance,
-      auth_config=resolved_auth_config,
+      capability_execution=capability_execution,
+      allow_stub_response=False,
       client_timeout=client_timeout,
       max_tokens_override=max_tokens,
       per_turn_timeout=per_turn_timeout,
@@ -653,8 +1080,10 @@ async def run_autonomous(
       rate_table_version=rate_table_version,
       max_budget_usd=max_budget_usd,
       max_concurrent_sub_agents=max_concurrent_sub_agents,
+      skill_run_id=trusted_skill_run_id,
       compaction_instructions=compaction_instructions,
       coordinator=coordinator,
+      agent_session_log=durable_session_log,
       commercial_usage_producer=commercial_usage_producer,
     )
     runner_ref[0] = runner
@@ -663,7 +1092,6 @@ async def run_autonomous(
     output = await run_session(
       runner,
       event_log,
-      model=resolved_model,
       max_turns=max_turns,
       timeout_seconds=timeout_seconds,
       initial_message=initial_message,
@@ -700,12 +1128,43 @@ async def run_autonomous(
 def run_autonomous_sync(
   system_prompt: str | list[tuple[str, bool]],
   initial_message: str,
+  *,
+  capability_execution: BoundCapabilityExecution,
+  session: GatewaySession,
   **kwargs: Any,
 ) -> RunOutput:
+  removed_selection_fields = sorted(
+    {
+      "api_key",
+      "auth_config",
+      "auth_token",
+      "bound_auth_config",
+      "capability_bind",
+      "execution_transport",
+      "max_tokens",
+      "model",
+      "provider",
+      "provider_config",
+    }.intersection(kwargs)
+  )
+  if removed_selection_fields:
+    fields = ", ".join(removed_selection_fields)
+    raise TypeError(
+      "run_autonomous_sync no longer accepts raw execution selection "
+      f"fields: {fields}"
+    )
   try:
     asyncio.get_running_loop()
   except RuntimeError:
-    return asyncio.run(run_autonomous(system_prompt, initial_message, **kwargs))
+    return asyncio.run(
+        run_autonomous(
+          system_prompt,
+          initial_message,
+          capability_execution=capability_execution,
+          session=session,
+          **kwargs,
+      )
+    )
   raise RuntimeError("run_autonomous_sync cannot run inside an active asyncio loop.")
 
 

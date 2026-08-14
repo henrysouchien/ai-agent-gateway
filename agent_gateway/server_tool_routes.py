@@ -8,7 +8,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from .approvals import ApprovalActionError
-from .session import AuthManager
+from .session import AuthManager, session_owner_user_id
 
 
 async def tool_result_response(
@@ -47,7 +47,16 @@ async def tool_result_response(
 
   tool_name = pending.get("tool_name", "?")
   if payload.error:
-    log.warning("Tool result: %s | error=%s", tool_name, payload.error)
+    has_error_code = (
+      isinstance(payload.error, dict)
+      and isinstance(payload.error.get("code"), str)
+      and bool(payload.error.get("code"))
+    )
+    log.warning(
+      "Tool result: %s | error=true | has_code=%s",
+      tool_name,
+      has_error_code,
+    )
   else:
     log.info("Tool result: %s | success", tool_name)
   return JSONResponse({"status": "ok"})
@@ -73,7 +82,7 @@ async def tool_approval_response(
       pending_entry=pending,
       tool_call_id=payload.tool_call_id,
       nonce=payload.nonce,
-      decider_id=session.user_id,
+      decider_id=session_owner_user_id(session),
       decider_role=getattr(session, "role", None),
       approved=payload.approved,
       allow_tool_type=payload.allow_tool_type,

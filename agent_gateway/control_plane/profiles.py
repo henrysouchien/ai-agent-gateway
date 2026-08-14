@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from agent_gateway.session import AuthManager
 
+
 _AGENT_PROFILES_MODULE_NAMES = frozenset({"agent", "agent.profiles"})
 
 

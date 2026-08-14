@@ -17,12 +17,7 @@ from agent_gateway.runner_prompt_rules import (  # noqa: E402
 )
 
 
-def test_runner_preserves_prompt_rule_helper_aliases() -> None:
-  assert gateway_runner._system_prompt_text is system_prompt_text
-  assert gateway_runner._system_prompt_requires_tool_only_turns is system_prompt_requires_tool_only_turns
-  assert gateway_runner._message_content_text is message_content_text
-  assert gateway_runner._messages_require_tool_only_turns is messages_require_tool_only_turns
-  assert gateway_runner._prepend_system_prompt_preamble is prepend_system_prompt_preamble
+def test_runner_preserves_last_user_message_helper_alias() -> None:
   assert gateway_runner._last_user_message is last_user_message
 
 

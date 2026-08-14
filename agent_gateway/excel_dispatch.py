@@ -18,6 +18,18 @@ ALLOWED_DELEGATION_TOOL_CLASSES = frozenset({"read", "pure_transform", "artifact
 _SUBMIT_TIMEOUT_SECONDS: ContextVar[int | None] = ContextVar("_SUBMIT_TIMEOUT_SECONDS", default=None)
 
 
+def _validate_relay_restart_exceptions(
+  value: tuple[type[Exception], ...],
+) -> tuple[type[Exception], ...]:
+  if not isinstance(value, tuple) or not value or any(
+    not isinstance(exception_type, type)
+    or not issubclass(exception_type, Exception)
+    for exception_type in value
+  ):
+    raise TypeError("relay_restart_exceptions must contain only Exception types")
+  return value
+
+
 def _error(code: str, message: str, **details: Any) -> dict[str, Any]:
   payload: dict[str, Any] = {"code": code, "message": message}
   payload.update(details)
@@ -149,8 +161,13 @@ async def mint_and_submit(
   default_ceiling: frozenset[str] = ALLOWED_DELEGATION_TOOL_CLASSES,
   relay_timeout_seconds: Any = None,
   seed_history: Any = None,
+  relay_restart_exceptions: tuple[type[Exception], ...],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
   """Discover a target workbook, mint its grant, and submit one Excel agent turn."""
+
+  restart_exception_types = _validate_relay_restart_exceptions(
+    relay_restart_exceptions
+  )
 
   parsed_ceiling, error = validate_requested_ceiling(default_ceiling)
   if error is not None:
@@ -174,6 +191,7 @@ async def mint_and_submit(
     return None, error
   assert mint_inputs is not None
 
+  created_delegation_id: str | None = None
   try:
     listed = await relay.list_workbooks(gateway_session_id, user_id)
     if not isinstance(listed, list):
@@ -234,6 +252,7 @@ async def mint_and_submit(
       expires_at=created_at + timedelta(seconds=grant_window_seconds),
     )
     await approval_store.create_delegation_grant(grant)
+    created_delegation_id = delegation_id
 
     resolved_relay_timeout_seconds = parsed_relay_timeout_seconds
     if resolved_relay_timeout_seconds is None:
@@ -258,6 +277,8 @@ async def mint_and_submit(
       request_id=request_id,
     )
     if not isinstance(submitted, dict) or submitted.get("request_id") != request_id:
+      await approval_store.revoke_delegation_grant(delegation_id)
+      created_delegation_id = None
       return None, _error("relay_error", "Excel relay did not accept the pre-reserved request_id")
 
     return {
@@ -267,7 +288,20 @@ async def mint_and_submit(
       "workbook": target_workbook_name,
     }, None
   except Exception as exc:
-    return None, _error("internal_error", str(exc) or exc.__class__.__name__)
+    if created_delegation_id is not None:
+      try:
+        await approval_store.revoke_delegation_grant(created_delegation_id)
+      except Exception:
+        return None, _error(
+          "internal_error",
+          "Failed to revoke unsubmitted delegation grant",
+        )
+    if isinstance(exc, restart_exception_types):
+      return None, _error(
+        "relay_restart_in_progress",
+        "Excel MCP relay restart in progress; retry after gateway restart",
+      )
+    return None, _error("internal_error", "Excel relay submission failed")
 
 
 async def poll_result(
@@ -307,15 +341,13 @@ async def poll_result(
         return {"result": payload}, None
 
       if state in {"failed", "timeout"}:
-        error_payload = response.get("error")
-        message = ""
-        if isinstance(error_payload, dict):
-          message = str(error_payload.get("message") or "")
-        if not message:
-          message = f"Excel relay request {state}"
         return None, _error(
           "excel_agent_failed" if state == "failed" else "timeout",
-          message,
+          (
+            "Excel agent request failed"
+            if state == "failed"
+            else "Excel relay request timed out"
+          ),
           request_id=request_id,
           status=status,
         )
@@ -323,16 +355,15 @@ async def poll_result(
       if status != "ok":
         return None, _error(
           "relay_error",
-          f"Excel relay result returned status '{status}'",
+          "Excel relay result returned an invalid status",
           request_id=request_id,
         )
 
       if state != "pending":
         return None, _error(
           "relay_error",
-          f"Excel relay returned unknown result state '{state}'",
+          "Excel relay returned an invalid result state",
           request_id=request_id,
-          status=status,
         )
 
       remaining = deadline - loop.time()
@@ -343,8 +374,12 @@ async def poll_result(
           request_id=request_id,
         )
       await asyncio.sleep(min(poll_interval, remaining))
-  except Exception as exc:
-    return None, _error("internal_error", str(exc) or exc.__class__.__name__)
+  except Exception:
+    return None, _error(
+      "internal_error",
+      "Excel relay result polling failed",
+      request_id=request_id,
+    )
 
 
 def make_message_excel_agent_handler(
@@ -358,8 +393,13 @@ def make_message_excel_agent_handler(
   default_window_seconds: int = 600,
   default_ceiling: frozenset[str] = frozenset({"read", "pure_transform", "artifact_write", "state_write"}),
   poll_interval_seconds: float = 1.0,
+  relay_restart_exceptions: tuple[type[Exception], ...],
 ):
   """Build a standalone message_excel_agent relay dispatch handler."""
+
+  restart_exception_types = _validate_relay_restart_exceptions(
+    relay_restart_exceptions
+  )
 
   async def _handle_message_excel_agent(tool_input: dict[str, Any], **kwargs: Any):
     _ = kwargs
@@ -401,6 +441,7 @@ def make_message_excel_agent_handler(
         default_ceiling=default_ceiling,
         relay_timeout_seconds=relay_timeout_seconds,
         seed_history=tool_input.get("seed_history"),
+        relay_restart_exceptions=restart_exception_types,
       )
     finally:
       _SUBMIT_TIMEOUT_SECONDS.reset(token)

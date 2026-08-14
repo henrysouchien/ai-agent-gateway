@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import asyncio
 import sys
 from pathlib import Path
@@ -11,7 +13,13 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import SessionStore
-from agent_gateway.approval_policy import ApprovalDecision as PolicyApprovalDecision, ApprovalRequest, ApprovalRequestPayload, RunContext
+from agent_gateway.approval_policy import (
+  ApprovalDecision as PolicyApprovalDecision,
+  ApprovalRequest,
+  ApprovalRequestPayload,
+  RunContext,
+  build_approval_request,
+)
 from agent_gateway.approval_policy import DelegationGrant, utc_now
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.approvals import _record_vote_and_unblock
@@ -119,6 +127,7 @@ def _dispatcher(
   return ToolDispatcher(
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"write_file": _ok_handler},
+    role="owner",
     needs_approval=needs_approval or (lambda _name, _tool_input, _qualifier: False),
     request_approval=request_approval,
     approved_tool_types=approved_tool_types,
@@ -268,10 +277,15 @@ def test_lifecycle_approval_request_times_out_without_user_response(monkeypatch,
 
     event_log = EventLog()
     store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
+      role="owner",
+    )
     dispatcher = ToolDispatcher(
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"write_file": _ok_handler},
+      role=session.role,
       needs_approval=lambda _name, _tool_input, _qualifier: True,
       event_log=event_log,
       session=session,
@@ -338,10 +352,15 @@ def test_lifecycle_relay_policy_denial_emits_provenance_and_error(tmp_path: Path
     event_log = EventLog()
     store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
     policy = _Policy()
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
+      role="owner",
+    )
     dispatcher = ToolDispatcher(
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"write_file": _ok_handler},
+      role=session.role,
       needs_approval=lambda _name, _tool_input, _qualifier: True,
       event_log=event_log,
       session=session,
@@ -399,15 +418,87 @@ def test_lifecycle_relay_policy_denial_emits_provenance_and_error(tmp_path: Path
   asyncio.run(_run())
 
 
+def test_interactive_irreversible_approval_coerces_allow_tool_type_false(tmp_path: Path) -> None:
+  async def _run() -> None:
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    policy = _ManualApprovalBasePolicy()
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    request = build_approval_request(
+      tool_call_id="tool-irreversible",
+      tool_name="memory_write",
+      tool_class="irreversible",
+      tool_args_redacted={"file": "notes/test.md"},
+      args_hash="irreversible-args-hash",
+      run_context=RunContext(
+        user_id="alice",
+        request_id="request-irreversible",
+        session_id=session.session_id,
+        channel="web",
+      ),
+      reason="Tool requires approval",
+      state="pending_user",
+      approval_constraint="standard",
+    )
+    request.persistent_grant_scope = "irreversible:memory_write"
+    await store.create(request)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+    pending = {
+      "approval_id": request.approval_id,
+      "nonce": "nonce-irreversible",
+      "status": "approval_pending",
+      "tool_name": request.tool_name,
+    }
+    session.approval_store = store
+    session.approval_policy = policy
+    session.pending_tools[request.tool_call_id] = pending
+    session.approval_queues[request.tool_call_id] = queue
+
+    await _record_vote_and_unblock(
+      target_session=session,
+      pending_entry=pending,
+      tool_call_id=request.tool_call_id,
+      nonce="nonce-irreversible",
+      decider_id="alice",
+      decider_role="owner",
+      approved=True,
+      allow_tool_type=True,
+      reason="approved once",
+      app_state=SimpleNamespace(
+        gateway_approval_store=store,
+        gateway_approval_policy=policy,
+      ),
+    )
+
+    assert pending["allow_tool_type"] is False
+    assert queue.get_nowait() == {
+      "approved": True,
+      "allow_tool_type": False,
+      "approval_id": request.approval_id,
+      "denied_by": None,
+    }
+    assert await store.find_persistent_grant(
+      user_id="alice",
+      tool_name=request.tool_name,
+      scope_hint=request.persistent_grant_scope,
+    ) is None
+
+  asyncio.run(_run())
+
+
 def test_delegated_lifecycle_auto_approval_emits_delegated_source(tmp_path: Path) -> None:
   async def _run() -> None:
     event_log = EventLog()
     store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
+      role="owner",
+    )
     policy = DelegationApprovalPolicy(base=_ManualApprovalBasePolicy())
     dispatcher = _ClassifiedToolDispatcher(
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"write_file": _ok_handler},
+      role=session.role,
       needs_approval=lambda _name, _tool_input, _qualifier: True,
       event_log=event_log,
       session=session,
@@ -448,11 +539,16 @@ def test_delegated_lifecycle_external_write_escalates_without_auto_approval(monk
 
     event_log = EventLog()
     store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
+      role="owner",
+    )
     policy = DelegationApprovalPolicy(base=_ManualApprovalBasePolicy())
     dispatcher = _ClassifiedToolDispatcher(
       mcp_client=_NullMcpClient(),
       local_tool_handlers={"write_file": _ok_handler},
+      role=session.role,
       needs_approval=lambda _name, _tool_input, _qualifier: True,
       event_log=event_log,
       session=session,
@@ -552,7 +648,10 @@ def test_session_cache_auto_approval_emits_standalone_decided_event() -> None:
     assert len(events) == 1
     assert events[0]["decision_source"] == "session_cache_approved"
     assert events[0]["outcome"] == "approved"
-    assert not any(event.get("type") == "tool_approval_request" for event in events)
+    assert not any(
+      entry.event.get("type") == "tool_approval_request"
+      for entry in event_log.entries
+    )
 
   asyncio.run(_run())
 
@@ -577,7 +676,7 @@ def test_session_cache_denied_guard_suppresses_cache_approved_emission() -> None
   asyncio.run(_run())
 
 
-def test_all_package_decision_sources_have_decided_event_coverage() -> None:
+def test_callback_headless_and_cache_decision_sources_have_decided_event_coverage() -> None:
   async def _run() -> None:
     sources = set()
 

@@ -7,8 +7,18 @@ import pytest
 from pydantic import ValidationError
 
 from agent_gateway.approval_policy import RunContext
+from agent_gateway.capability_binding import (
+  CredentialHandle,
+)
+from agent_gateway.model_registry import (
+  CAPABILITY_IDS,
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
 from agent_gateway.event_log import EventLog
 from agent_gateway.events import UiBlocksReadyEvent, event_from_dict, event_to_dict
+from agent_gateway.providers import AnthropicProvider
+from agent_gateway.server import MaterializedCredential
 from agent_gateway.server_chat_helpers import _dispatch_chat_turn
 from agent_gateway.server_models import (
   ChatMessage,
@@ -20,6 +30,59 @@ from agent_gateway.server_models import (
 from agent_gateway.session import GatewaySession
 from agent_gateway.tool_dispatcher import ToolDispatcher
 from agent_gateway.ui_blocks_run import UiBlocksRunRegistry
+
+
+_SERVICE_HANDLE = CredentialHandle(
+  handle_id="service:ui-blocks-tests:anthropic",
+  provider="anthropic",
+  principal="service",
+  tenant_id="ui-blocks-tests",
+  actor_id=None,
+)
+_PROVIDER = AnthropicProvider()
+
+
+def _materialize_service_credential(
+  handle: CredentialHandle,
+) -> MaterializedCredential:
+  assert handle is _SERVICE_HANDLE
+  return MaterializedCredential(
+    handle=handle,
+    auth_config={
+      "provider": "anthropic",
+      "api_key": "test-key",
+      "billing_mode": "byok",
+      "rate_table_version": "test-v1",
+    },
+  )
+
+
+def _configure_runtime_builder(builder) -> None:
+  setattr(builder, "_gateway_model_registry", INITIAL_MODEL_REGISTRY)
+  setattr(
+    builder,
+    "_gateway_model_selection_policy",
+    INITIAL_MODEL_SELECTION_POLICY,
+  )
+  setattr(builder, "_gateway_tenant_id", _SERVICE_HANDLE.tenant_id)
+  setattr(
+    builder,
+    "_gateway_service_provider_handles",
+    {"anthropic": _SERVICE_HANDLE},
+  )
+  setattr(
+    builder,
+    "_gateway_service_auth_config_resolver",
+    _materialize_service_credential,
+  )
+  setattr(
+    builder,
+    "_gateway_capability_adapter_resolver",
+    lambda adapter: _PROVIDER
+    if adapter == "anthropic.messages"
+    else (_ for _ in ()).throw(ValueError(f"unexpected adapter: {adapter}")),
+  )
+  setattr(builder, "_gateway_channel_profile_allowlist", None)
 
 
 def _run(coro):
@@ -366,8 +429,9 @@ class _NullMcp:
 
 
 class _TerminalRunner:
-  def __init__(self, event_log: EventLog) -> None:
+  def __init__(self, event_log: EventLog, capability_execution: Any) -> None:
     self._event_log = event_log
+    self.capability_execution = capability_execution
 
   async def run(self, **_kwargs: Any) -> None:
     self._event_log.append({"type": "stream_complete", "usage": {}})
@@ -381,6 +445,10 @@ def _session() -> GatewaySession:
     expires_at=4_000_000_000,
     user_id="alice",
     channel="web",
+    tenant_id=_SERVICE_HANDLE.tenant_id,
+    allow_service_for_interactive=True,
+    model_entitled_capabilities=CAPABILITY_IDS,
+    model_entitled_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
   )
 
 
@@ -395,7 +463,6 @@ def test_pin_and_run_object_survive_full_gateway_dispatch_chain(tmp_path) -> Non
       "request_id": "caller-controlled-request-id",
       "ui_blocks_contract": {
         "contract_version": 1,
-        "manifest_digest": "sha256:" + "ab" * 32,
       },
     })
     assert isinstance(inbound.ui_blocks_contract, UiBlocksContractPin)
@@ -404,7 +471,7 @@ def test_pin_and_run_object_survive_full_gateway_dispatch_chain(tmp_path) -> Non
       request_id=inbound.request_id,
       context=dict(inbound.context),
       metadata=dict(inbound.metadata),
-      model=inbound.model,
+      model_key=inbound.model_key,
       effort=inbound.effort,
       ui_blocks_contract=inbound.ui_blocks_contract,
     )
@@ -412,6 +479,8 @@ def test_pin_and_run_object_survive_full_gateway_dispatch_chain(tmp_path) -> Non
 
     async def build_chat_runtime(*, request, **_kwargs: Any) -> ChatRuntime:
       captured["request"] = request
+      capability_bind = request.capability_bind
+      assert capability_bind is not None
       run_context = RunContext(
         user_id="alice",
         request_id=str(request.request_id),
@@ -431,16 +500,20 @@ def test_pin_and_run_object_survive_full_gateway_dispatch_chain(tmp_path) -> Non
       )
       return ChatRuntime(
         system_prompt="test",
-        build_runner=lambda event_log, _sid: _TerminalRunner(event_log),
+        build_runner=lambda event_log, _sid, _started_at: _TerminalRunner(
+          event_log,
+          request.capability_execution,
+        ),
+        capability_execution=request.capability_execution,
       )
 
+    _configure_runtime_builder(build_chat_runtime)
     await _dispatch_chat_turn(
       _session(),
       inputs,
       event_log=EventLog(),
       on_event=_no_event,
       build_chat_runtime=build_chat_runtime,
-      credentials_resolver=None,
       transcript_dir=tmp_path,
     )
 
@@ -462,7 +535,6 @@ def test_malformed_contract_pin_is_rejected_without_coercion() -> None:
       "messages": [{"role": "user", "content": "show me"}],
       "ui_blocks_contract": {
         "contract_version": "1",
-        "manifest_digest": "sha256:" + "ab" * 32,
       },
     })
 
@@ -474,11 +546,18 @@ def test_unpinned_dispatch_has_none_capability_and_turn_keys_are_per_dispatch(tm
 
     async def build_chat_runtime(*, request, **_kwargs: Any) -> ChatRuntime:
       captured_runs.append(request._ui_blocks_run)
+      capability_bind = request.capability_bind
+      assert capability_bind is not None
       return ChatRuntime(
         system_prompt="test",
-        build_runner=lambda event_log, _sid: _TerminalRunner(event_log),
+        build_runner=lambda event_log, _sid, _started_at: _TerminalRunner(
+          event_log,
+          request.capability_execution,
+        ),
+        capability_execution=request.capability_execution,
       )
 
+    _configure_runtime_builder(build_chat_runtime)
     for _ in range(2):
       await _dispatch_chat_turn(
         session,
@@ -487,12 +566,11 @@ def test_unpinned_dispatch_has_none_capability_and_turn_keys_are_per_dispatch(tm
           request_id="same-caller-request-id",
           context={},
           metadata={},
-          model=None,
+          model_key=None,
         ),
         event_log=EventLog(),
         on_event=_no_event,
         build_chat_runtime=build_chat_runtime,
-        credentials_resolver=None,
         transcript_dir=tmp_path,
       )
       # Completed turns remain attachable for a grace window; simulate the
@@ -512,9 +590,15 @@ def test_turn_key_and_registry_survive_stream_retry_event(tmp_path) -> None:
     captured: dict[str, Any] = {}
 
     class RetryRunner:
-      def __init__(self, event_log: EventLog, ui_run) -> None:
+      def __init__(
+        self,
+        event_log: EventLog,
+        ui_run,
+        capability_execution: Any,
+      ) -> None:
         self.event_log = event_log
         self.ui_run = ui_run
+        self.capability_execution = capability_execution
 
       async def run(self, **_kwargs: Any) -> None:
         captured["before_retry"] = self.ui_run
@@ -525,14 +609,19 @@ def test_turn_key_and_registry_survive_stream_retry_event(tmp_path) -> None:
 
     async def build_chat_runtime(*, request, **_kwargs: Any) -> ChatRuntime:
       captured["request_run"] = request._ui_blocks_run
+      capability_bind = request.capability_bind
+      assert capability_bind is not None
       return ChatRuntime(
         system_prompt="test",
-        build_runner=lambda event_log, _sid: RetryRunner(
+        build_runner=lambda event_log, _sid, _started_at: RetryRunner(
           event_log,
           request._ui_blocks_run,
+          request.capability_execution,
         ),
+        capability_execution=request.capability_execution,
       )
 
+    _configure_runtime_builder(build_chat_runtime)
     await _dispatch_chat_turn(
       _session(),
       ChatTurnInputs(
@@ -540,12 +629,11 @@ def test_turn_key_and_registry_survive_stream_retry_event(tmp_path) -> None:
         request_id="request-id",
         context={},
         metadata={},
-        model=None,
+        model_key=None,
       ),
       event_log=EventLog(),
       on_event=_no_event,
       build_chat_runtime=build_chat_runtime,
-      credentials_resolver=None,
       transcript_dir=tmp_path,
     )
     assert captured["before_retry"] is captured["request_run"]
@@ -564,7 +652,7 @@ def test_ui_blocks_ready_dataclass_coercion_round_trip() -> None:
     "turn_key": "turn-key",
     "emission_index": 3,
     "ui_blocks_id": "ub_deadbeefdeadbeef",
-    "manifest_digest": "sha256:" + "cd" * 32,
+    "contract_version": 1,
     "payload": {"kind": "hank_ui_blocks.v1", "contract_version": 1, "blocks": []},
     "text_fallback": "Fallback",
     "ts": 123.5,

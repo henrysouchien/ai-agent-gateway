@@ -79,7 +79,7 @@ def coerce_planner_result_payload(payload: Any) -> Any:
 
 
 def looks_like_source_pack_payload(payload: Any) -> bool:
-  required = ("matched_intent", "source_pack_sha256", "required_reads", "rationale")
+  required = ("matched_intent", "required_reads", "rationale")
   if isinstance(payload, dict):
     return all(key in payload for key in required)
   if payload is None:

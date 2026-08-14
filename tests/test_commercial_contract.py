@@ -9,15 +9,38 @@ import pytest
 
 from agent_gateway.commercial_contract import (
   CONTRACT_FILES,
+  USAGE_V3_CONTRACT_FILES,
   canonical_usage_payload_sha256,
   packaged_contract_directory,
+  packaged_usage_v3_contract_directory,
   verify_contract_directory,
+  verify_usage_v3_contract_directory,
 )
 
 
 def test_packaged_cross_repository_contract_digests_and_cases_pass() -> None:
   digests = verify_contract_directory(packaged_contract_directory())
   assert set(digests) == CONTRACT_FILES
+
+
+def test_packaged_commercial_usage_v3_contract_digest_and_schema_pass() -> None:
+  digests = verify_usage_v3_contract_directory(
+    packaged_usage_v3_contract_directory()
+  )
+  assert set(digests) == USAGE_V3_CONTRACT_FILES
+  pyproject = Path(__file__).parents[1] / "pyproject.toml"
+  assert '"contracts/commercial-usage-v3/*.json"' in pyproject.read_text(
+    encoding="utf-8"
+  )
+
+
+def test_commercial_usage_v3_contract_tamper_fails_closed(tmp_path: Path) -> None:
+  target = tmp_path / "commercial-usage-v3"
+  shutil.copytree(packaged_usage_v3_contract_directory(), target)
+  schema = target / "commercial-usage-event-v3.schema.json"
+  schema.write_text(schema.read_text(encoding="utf-8") + " ", encoding="utf-8")
+  with pytest.raises(ValueError, match="digest mismatch"):
+    verify_usage_v3_contract_directory(target)
 
 
 def test_contract_digest_tamper_fails_closed(tmp_path: Path) -> None:

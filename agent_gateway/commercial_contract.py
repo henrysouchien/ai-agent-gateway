@@ -37,10 +37,34 @@ CONTRACT_FILES = frozenset({
   "canonicalization-v1-vectors.json",
 })
 MANIFEST_FILE = "commercial-contract-digests-v1.json"
+USAGE_V3_CONTRACT_FILES = frozenset({"commercial-usage-event-v3.schema.json"})
+USAGE_V3_MANIFEST_FILE = "commercial-usage-v3-digests.json"
 
 
 def packaged_contract_directory() -> Path:
   return Path(str(files("agent_gateway") / "contracts" / "claim-contract-v1"))
+
+
+def packaged_usage_v3_contract_directory() -> Path:
+  return Path(str(files("agent_gateway") / "contracts" / "commercial-usage-v3"))
+
+
+def verify_usage_v3_contract_directory(directory: Path) -> dict[str, str]:
+  manifest = json.loads(
+    (directory / USAGE_V3_MANIFEST_FILE).read_text(encoding="utf-8")
+  )
+  if manifest.get("contract_version") != "commercial-usage-v3":
+    raise ValueError("commercial Usage V3 manifest version is unsupported")
+  digests = manifest.get("digests")
+  if not isinstance(digests, dict) or set(digests) != USAGE_V3_CONTRACT_FILES:
+    raise ValueError("commercial Usage V3 manifest file set is invalid")
+  for name in sorted(USAGE_V3_CONTRACT_FILES):
+    data = (directory / name).read_bytes()
+    actual = "sha256:" + hashlib.sha256(data).hexdigest()
+    if digests[name] != actual:
+      raise ValueError(f"commercial Usage V3 contract digest mismatch: {name}")
+    Draft202012Validator.check_schema(json.loads(data))
+  return dict(digests)
 
 
 def verify_contract_directory(directory: Path) -> dict[str, str]:

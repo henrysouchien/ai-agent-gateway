@@ -9,19 +9,24 @@ from typing import Any, Callable, FrozenSet
 
 from .session import GatewaySession
 from .artifact_paths import canonicalize_ticker
-from .skills import SkillLoader, SkillProfile
+from .skills import SkillLoader, SkillProfile, operation_tool_ids
 from .task_registry import ParentMessage
 
 log = logging.getLogger("agent_gateway.sub_agent")
 
-_DEFAULT_EXCLUDED_TOOLS = frozenset({"run_agent", "get_background_result", "send_message"})
+_DEFAULT_EXCLUDED_TOOLS = frozenset({
+  "run_agent",
+  "get_agent_result_content",
+  "get_background_result",
+  "send_message",
+})
 
 # Finite by default: with timeout=None a wedged sub-agent parks the parent's
 # run_agent tool call on an unbounded await, which holds the chat turn lock
 # forever (stuck "Running" card, dead Esc, 409 on every new message — ACUI-1).
 # Skill profiles with an explicit `timeout` still override this.
 DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = 1800.0
-_ARTIFACT_EMIT_TOOLS = frozenset({"emit_html_artifact", "emit_dashboard_artifact"})
+_ARTIFACT_EMIT_TOOLS = frozenset({"emit_canvas_artifact", "emit_dashboard_artifact"})
 _RESEARCH_FILE_ID_RE = re.compile(r"\b(?:research[_ ]file[_ ]id|RESEARCH_FILE_ID)\b\s*[:=]\s*(\d+)", re.IGNORECASE)
 ExcludedToolsResolver = Callable[[], FrozenSet[str]]
 NeedsApprovalResolver = Callable[[FrozenSet[str]], Callable[..., bool] | None]
@@ -42,28 +47,18 @@ _DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
   "Today's date: {date}"
 )
 _RUN_AGENT_DESCRIPTION = (
-  "Spawn a focused sub-agent. Pass `agent` for a named skill workflow; omit for a generic "
-  "sub-agent. Sub-agents run independently with their own turn budget, cannot spawn further "
-  "sub-agents, and cannot access Excel tools or trading/order-management tools."
+  "Spawn a focused child from a registered executable operation. Pass the "
+  "complete operation identity advertised below, or omit it to select the "
+  "registered generic explore operation. The server admits model, semantic "
+  "capabilities, and an exact tool grant; operation prose does not grant tools."
 )
 _RESUME_AGENT_DESCRIPTION = (
   "Resume an interrupted background sub-agent. Only resumable skills can be resumed; "
-  "check skill `resumable` flag in get_background_result response. Returns new task_id."
+  "read the `resumable` and lineage fields from its automatic interrupted notification "
+  "(use get_background_result only for a historical or explicitly omitted notification). "
+  "The exact original complete capability bind and credential authority are "
+  "reused; selection overrides are not accepted. Returns new task_id."
 )
-
-
-def _entry_child_budget_usd(entry: Any) -> float | None:
-  metadata = getattr(entry, "metadata", None)
-  if not isinstance(metadata, dict):
-    return None
-  raw_budget = metadata.get("child_budget_usd")
-  if raw_budget is None or isinstance(raw_budget, bool):
-    return None
-  try:
-    budget = float(raw_budget)
-  except (TypeError, ValueError):
-    return None
-  return budget if budget > 0 else None
 
 
 _CONTEXT_TICKER_RE = re.compile(r"\b([A-Z0-9]{1,6}(?:\.[A-Z]{1,2})?)\b")
@@ -123,12 +118,21 @@ def _artifact_storage_user_id(parent_session: GatewaySession | None, fallback_us
   return fallback_user_id
 
 
-def _render_agent_param_description(entries: list[tuple[str, str]]) -> str:
-  base = "Named agent profile to use. Omit to run without a skill."
+def _render_agent_param_description(entries: list[tuple[Any, str]]) -> str:
+  base = (
+    "Full immutable AgentOperationRef. Omit to select the registered generic "
+    "explore operation. Bare methodology/skill names are not accepted."
+  )
   if not entries:
     return base
-  lines = [base, "", "Available agents:"]
-  lines.extend(f"- {name}: {description}" for name, description in entries)
+  lines = [base, "", "Available operations:"]
+  lines.extend(
+    (
+      f"- {operation.namespace}/{operation.name}@{operation.version} "
+      f"({operation.digest}): {description}"
+    )
+    for operation, description in entries
+  )
   return "\n".join(lines)
 
 
@@ -229,12 +233,12 @@ def _extract_research_file_id_from_resume_messages(
   return _extract_research_file_id_from_task(additional_context or "")
 
 
-def _html_artifact_ticker(profile: SkillProfile, context_ticker: str) -> str | None:
+def _artifact_ticker(profile: SkillProfile, context_ticker: str) -> str | None:
   return canonicalize_ticker(context_ticker) if profile.scope == "ticker" and context_ticker else None
 
 
-def _html_artifact_scope(profile: SkillProfile, context_ticker: str) -> str:
-  return "ticker" if _html_artifact_ticker(profile, context_ticker) else "portfolio"
+def _artifact_scope(profile: SkillProfile, context_ticker: str) -> str:
+  return "ticker" if _artifact_ticker(profile, context_ticker) else "portfolio"
 
 
 def _dashboard_artifact_ticker(profile: SkillProfile, context_ticker: str) -> str | None:
@@ -265,116 +269,72 @@ def _skill_extra_excluded_tool_names(skill_profile: SkillProfile | None) -> set[
   return tool_names
 
 
-def _skill_html_excluded_tools(
+def _skill_artifact_excluded_tools(
   effective_excluded: set[str] | FrozenSet[str],
   *,
   skill_profile: SkillProfile | None = None,
 ) -> set[str]:
   excluded = set(effective_excluded)
   skill_excluded = _skill_extra_excluded_tool_names(skill_profile)
-  if getattr(skill_profile, "mutation_mode", None) is None:
-    excluded.difference_update(_ARTIFACT_EMIT_TOOLS - skill_excluded)
+  declared_artifact_routes = (
+    operation_tool_ids(skill_profile) & _ARTIFACT_EMIT_TOOLS
+    if skill_profile is not None
+    else frozenset()
+  )
+  excluded.difference_update(declared_artifact_routes - skill_excluded)
   return excluded
 
 
-def _install_emit_html_artifact_handler(
-  *,
-  sub_local: dict[str, Any],
-  profile: SkillProfile,
-  skill_run_id: str,
-  context_ticker: str,
-  context_research_file_id: int | None,
-  parent_session: GatewaySession | None,
-  fallback_user_id: str | None,
+def _install_emit_canvas_artifact_handler(
+  *, sub_local: dict[str, Any], profile: SkillProfile, skill_run_id: str,
+  context_ticker: str, context_research_file_id: int | None,
+  parent_session: GatewaySession | None, fallback_user_id: str | None,
   emit_parent_event: Callable[[dict[str, Any]], None],
-  emit_skill_run_started: Callable[[], None],
-) -> None:
+) -> bool:
+  from .canvas_build_environment import preflight_canvas_build_environment
+
+  preflight = preflight_canvas_build_environment()
+  if preflight is None:
+    return False
   artifact_storage_user_id = _artifact_storage_user_id(parent_session, fallback_user_id)
 
-  async def _handle_emit_html_artifact(
-    tool_input: dict[str, Any],
-    **handler_kwargs: Any,
-  ):
-    html_tool_ctx = handler_kwargs.get("tool_ctx")
-    tool_call_id = getattr(html_tool_ctx, "tool_call_id", None)
-    artifact_ticker = _html_artifact_ticker(profile, context_ticker)
-    emit_skill_run_started()
+  async def _handle_emit_canvas_artifact(tool_input: dict[str, Any], **_: Any):
     try:
       from memory import get_workspace_dir
-      from schema.html_artifact import HtmlArtifact, StaticExports
       from schema.thesis_shared_slice import SourceRecord
-
-      from .html_artifact_store import write_html_artifact
+      from .canvas_artifact_pipeline import emit_canvas_artifact_async
 
       raw_sources = tool_input.get("sources") or []
       if not isinstance(raw_sources, list):
         raise ValueError("sources must be a list")
-
-      now = datetime.datetime.now(datetime.timezone.utc)
-      artifact_id = f"{now.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(8)}"
       research_file_id = _optional_research_file_id(
-        tool_input.get("research_file_id"),
-        default=context_research_file_id,
+        tool_input.get("research_file_id"), default=context_research_file_id,
       )
-      control_run_id = str(getattr(parent_session, "session_id", "") or "").strip() or None
-      artifact = HtmlArtifact(
-        artifact_id=artifact_id,
-        title=str(tool_input["title"]),
-        purpose=tool_input["purpose"],
-        content_ref=f"{artifact_id}.html",
-        summary=str(tool_input["summary"]),
-        ticker=artifact_ticker,
-        session_id=None,
-        source_skill=profile.name,
-        sources=[SourceRecord.model_validate(source) for source in raw_sources],
-        exports=StaticExports(
-          copy_as_prompt=tool_input.get("copy_as_prompt"),
-          copy_as_markdown=tool_input.get("copy_as_markdown"),
-          copy_as_json=tool_input.get("copy_as_json"),
-        ),
-        ts=now.isoformat(),
+      def _emit_canvas_event(event: dict[str, Any]) -> None:
+        emit_parent_event(event)
+
+      result = await emit_canvas_artifact_async(
+        workspace_dir=get_workspace_dir(artifact_storage_user_id), preflight=preflight,
+        title=str(tool_input["title"]), purpose=str(tool_input["purpose"]),
+        summary=str(tool_input["summary"]), tsx_source=str(tool_input["tsx_source"]),
+        copy_as_markdown=str(tool_input["copy_as_markdown"]),
+        copy_as_prompt=tool_input.get("copy_as_prompt"),
+        copy_as_json=tool_input.get("copy_as_json"),
+        sources=[SourceRecord.model_validate(value) for value in raw_sources],
+        source_skill=profile.name, skill_run_id=skill_run_id,
+        ticker=_artifact_ticker(profile, context_ticker),
+        session_id=str(getattr(parent_session, "session_id", "") or "").strip() or None,
         research_file_id=research_file_id,
-        control_run_id=control_run_id,
-        origin_kind=None if research_file_id is not None else "product",
-        visibility=None if research_file_id is not None else "default",
+        control_run_id=str(getattr(parent_session, "session_id", "") or "").strip() or None,
+        user_id=artifact_storage_user_id or "", emit_event=_emit_canvas_event,
       )
-      workspace_dir = get_workspace_dir(artifact_storage_user_id)
-      write_html_artifact(
-        workspace_dir=workspace_dir,
-        artifact=artifact,
-        html_content=tool_input["html"],
-      )
-      emit_parent_event({
-        "type": "artifact_ready",
-        "skill_run_id": skill_run_id,
-        "ticker": artifact_ticker,
-        "skill": "_html",
-        "artifact_id": artifact_id,
-        "artifact_path": f"artifacts/_html/{artifact_id}.json",
-        "binary_artifact_path": f"artifacts/_html/{artifact_id}.html",
-        "contract_name": "HtmlArtifact",
-        "data_source": "live",
-        "ts": time.time(),
-        "scope": "ticker" if artifact_ticker else "portfolio",
-        "portfolio_id": None,
-      })
-      return {"artifact_id": artifact_id, "status": "ok"}, None
+      return result, None
     except Exception as exc:
-      log.warning("emit_html_artifact failed: %s", exc)
-      emit_parent_event({
-        "type": "artifact_failed",
-        "skill_run_id": skill_run_id,
-        "ticker": artifact_ticker,
-        "skill": "_html",
-        "error_code": "tool_write_failed",
-        "error_detail": str(exc),
-        "source_path": None,
-        "tool_call_id": tool_call_id,
-        "ts": time.time(),
-      })
+      log.warning("emit_canvas_artifact failed: %s", exc)
       return None, {"code": "internal_error", "message": str(exc)}
 
-  sub_local["emit_html_artifact"] = _handle_emit_html_artifact
+  sub_local["emit_canvas_artifact"] = _handle_emit_canvas_artifact
+  return True
 
 
 def _install_emit_dashboard_artifact_handler(
@@ -387,7 +347,6 @@ def _install_emit_dashboard_artifact_handler(
   parent_session: GatewaySession | None,
   fallback_user_id: str | None,
   emit_parent_event: Callable[[dict[str, Any]], None],
-  emit_skill_run_started: Callable[[], None],
 ) -> None:
   artifact_storage_user_id = _artifact_storage_user_id(parent_session, fallback_user_id)
 
@@ -444,7 +403,6 @@ def _install_emit_dashboard_artifact_handler(
         artifact=artifact,
         payload_json=built["payload_json"],
       )
-      emit_skill_run_started()
       emit_parent_event({
         "type": "artifact_ready",
         "skill_run_id": skill_run_id,
@@ -485,43 +443,79 @@ def _install_emit_dashboard_artifact_handler(
 def make_run_agent_tool_def(skill_loader: SkillLoader | None = None) -> dict[str, Any]:
   """Build the public tool schema for `run_agent`.
 
-  When a `SkillLoader` is provided, the agent parameter description includes
-  the currently available callable named skills.
+  When a ``SkillLoader`` is provided, the operation description includes the
+  currently available immutable operation identities.
   """
-  skills = skill_loader.list_callable_skills_with_descriptions() if skill_loader else []
+  operations = (
+    skill_loader.list_callable_operations_with_descriptions()
+    if skill_loader
+    else []
+  )
 
   return {
     "name": "run_agent",
     "description": _RUN_AGENT_DESCRIPTION,
     "input_schema": {
       "type": "object",
+      "additionalProperties": False,
       "properties": {
-        "agent": {
-          "type": "string",
-          "description": _render_agent_param_description(skills),
+        "operation": {
+          "type": "object",
+          "additionalProperties": False,
+          "properties": {
+            "namespace": {"type": "string"},
+            "name": {"type": "string"},
+            "version": {"type": "string"},
+            "digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$",
+            },
+          },
+          "required": ["namespace", "name", "version", "digest"],
+          "description": _render_agent_param_description(operations),
         },
-        "task": {
+        "objective": {
           "type": "string",
-          "description": "Instructions for the sub-agent.",
+          "description": "The objective for the admitted child task.",
         },
-        "model": {
+        "ticker": {
           "type": "string",
-          "description": "Optional model override.",
+          "pattern": "^[A-Z0-9]{1,6}(?:\\.[A-Z]{1,2})?$",
+          "description": (
+            "Optional exact context ticker. When supplied, it must match the "
+            "ticker stated in objective; the server never uses it to select an "
+            "artifact or widen scope."
+          ),
         },
-        "provider": {
-          "type": "string",
-          "description": "Model provider to use (e.g. 'anthropic', 'openai', 'codex', or 'xai'). Defaults to parent's provider.",
+        "research_file_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": (
+            "Optional exact research-file context. Supply it for operations "
+            "whose required_context includes research_file_id. When the "
+            "objective also states an ID, both must match; the server never "
+            "uses it to select a latest or substitute artifact."
+          ),
+        },
+        "cost_observation_threshold_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": (
+            "Optional cost observation threshold in USD. Crossing it may emit "
+            "telemetry or a runaway warning, but never stops or fails the child."
+          ),
         },
         "background": {
           "type": "boolean",
           "description": (
-            "If true, run the sub-agent in the background and return immediately with a task_id. "
-            "Use get_background_result to retrieve the result later."
+            "Run the sub-agent in the background and return immediately with a task_id. "
+            "This defaults to true; set false only when the current turn must wait for "
+            "the validated typed child result."
           ),
-          "default": False,
+          "default": True,
         },
       },
-      "required": ["task"],
+      "required": ["objective"],
     },
   }
 
@@ -529,9 +523,12 @@ def make_run_agent_tool_def(skill_loader: SkillLoader | None = None) -> dict[str
 def make_get_background_result_tool_def() -> dict[str, Any]:
   """Build the public tool schema for ``get_background_result``.
 
-  The tool lets the model poll or wait for background sub-agent tasks
-  launched via ``run_agent(background=true)``.  Pass ``task_id='*'`` to
-  inspect all tracked background tasks at once.
+  The tool retrieves historical or explicitly omitted results. When automatic
+  notifications are disabled, it can also perform one explicit wait for a
+  background sub-agent task launched via ``run_agent(background=true)``.
+  Pass ``task_id='*'`` to list eligible tracked task IDs without returning
+  their payloads. Oversized exact results are returned in bounded JSON-text
+  pages; pass the opaque ``cursor`` back with the same exact task ID.
 
   Returns:
     A tool-definition dict suitable for inclusion in ``get_tool_definitions``.
@@ -539,15 +536,21 @@ def make_get_background_result_tool_def() -> dict[str, Any]:
   return {
     "name": "get_background_result",
     "description": (
-      "Check status or wait for a background sub-agent task. Poll returns immediately. "
-      "Use task_id='*' to inspect all tracked background tasks."
+      "Retrieve a historical or explicitly omitted background result. When "
+      "automatic notifications are disabled, explicitly wait for a known task. "
+      "Current-run outcomes are delivered completely through notifications; "
+      "never poll them. Use task_id='*' only to list eligible tracked task IDs. "
+      "For a paged exact result, pass each returned opaque cursor unchanged."
     ),
     "input_schema": {
       "type": "object",
       "properties": {
         "task_id": {
           "type": "string",
-          "description": "Task ID from run_agent(background=true), or '*' for all tasks.",
+          "description": (
+            "Exact task ID from run_agent(background=true), or '*' for the "
+            "bounded task-ID/status directory allowed by the active delivery mode."
+          ),
         },
         "wait": {
           "type": "boolean",
@@ -558,6 +561,13 @@ def make_get_background_result_tool_def() -> dict[str, Any]:
           "type": "number",
           "description": "Maximum seconds to wait (clamped to 120).",
           "default": 60,
+        },
+        "cursor": {
+          "type": "string",
+          "description": (
+            "Opaque cursor returned by a prior page for the same exact task_id. "
+            "Omit to start or restart delivery from the first page."
+          ),
         },
       },
       "required": ["task_id"],
@@ -602,6 +612,8 @@ def make_send_message_tool_def() -> dict[str, Any]:
         },
         "message": {
           "type": "string",
+          "minLength": 1,
+          "maxLength": 12000,
           "description": "Message content to deliver to the agent.",
         },
       },

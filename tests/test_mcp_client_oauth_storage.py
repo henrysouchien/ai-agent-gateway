@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
@@ -48,6 +50,29 @@ def test_json_file_key_value_isolates_custom_collections_and_sets_private_mode(
   assert _run(storage.get("same-key")) == {"token": "default"}
   assert _run(storage.get("same-key", collection="custom-coll")) == {"token": "custom"}
   assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_json_file_key_value_fails_closed_when_private_mode_cannot_be_set(
+  monkeypatch,
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "tokens.json"
+  storage = JsonFileKeyValue(path)
+  original_chmod = Path.chmod
+
+  def fail_chmod(self: Path, mode: int, *, follow_symlinks: bool = True) -> None:
+    del self, mode, follow_symlinks
+    raise OSError("mode refused")
+
+  monkeypatch.setattr(Path, "chmod", fail_chmod)
+  try:
+    with pytest.raises(OSError, match="mode refused"):
+      _run(storage.put("alpha", {"token": "CUSTOM-CREDENTIAL-8f21d7"}))
+  finally:
+    monkeypatch.setattr(Path, "chmod", original_chmod)
+
+  assert not path.exists()
+  assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_json_file_key_value_handles_missing_malformed_and_non_dict_files(
@@ -116,7 +141,10 @@ def test_parent_json_file_key_value_routes_replace_and_time_through_parent_modul
   storage = _JsonFileKeyValue(tmp_path / "tokens.json")
 
   _run(storage.put("alpha", {"token": "a"}, ttl=10))
-  assert replacements == [("tokens.json.tmp", "tokens.json")]
+  assert len(replacements) == 1
+  assert replacements[0][0].startswith(".tokens.json.")
+  assert replacements[0][0].endswith(".tmp")
+  assert replacements[0][1] == "tokens.json"
 
   fake_time.current = 205.0
   value, ttl = _run(storage.ttl("alpha"))

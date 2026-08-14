@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import asyncio
 import json
 import sys
@@ -20,14 +22,17 @@ from agent_gateway.approval_policy import RunContext
 from agent_gateway.approval_resolver import resolve_policy
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.fixture_gate import (
-  FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME,
+  FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME,
+  FIXTURE_CANVAS_ARTIFACT_SKILL_NAME,
   FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME,
   FIXTURE_APPROVAL_TOOL_NAME,
-  FIXTURE_HTML_ARTIFACT_SKILL_NAME,
   FIXTURE_MODEL_ID,
   FIXTURE_TERMINAL_FAILURE_SKILL_NAME,
 )
 from agent_gateway.providers.fixture import FixtureClient, FixtureProvider
+from tests.capability_execution_test_support import (
+  stub_runner_capability_execution,
+)
 
 
 class _NullMcpClient:
@@ -110,7 +115,7 @@ def test_fixture_stream_turn_two_echoes_operator_steering(monkeypatch) -> None:
   assert client.turn == 2
 
 
-def test_fixture_html_artifact_stream_emits_complete_html_tool_call(monkeypatch) -> None:
+def test_fixture_canvas_artifact_stream_emits_complete_canvas_tool_call(monkeypatch) -> None:
   monkeypatch.setattr("agent_gateway.providers.fixture._fixture_run_seconds", lambda: 0.0)
   provider = FixtureProvider()
   client = provider.create_client({"model": FIXTURE_MODEL_ID})
@@ -123,7 +128,7 @@ def test_fixture_html_artifact_stream_emits_complete_html_tool_call(monkeypatch)
         "messages": [],
         "system_prompt": (
           "Today is 2026-06-05. Execute the deterministic fixture skill "
-          f"{FIXTURE_HTML_ARTIFACT_SKILL_NAME}."
+          f"{FIXTURE_CANVAS_ARTIFACT_SKILL_NAME}."
         ),
       },
     )
@@ -137,14 +142,14 @@ def test_fixture_html_artifact_stream_emits_complete_html_tool_call(monkeypatch)
     "tool_use_end",
     "message_end",
   ]
-  assert events[2].tool_name == "emit_html_artifact"
-  assert events[4].tool_name == "emit_html_artifact"
-  assert events[4].tool_input["title"] == "Fixture HTML Artifact"
-  assert events[4].tool_input["purpose"] == "report"
-  assert "ha-section" in events[4].tool_input["html"]
+  assert events[2].tool_name == "emit_canvas_artifact"
+  assert events[4].tool_name == "emit_canvas_artifact"
+  assert events[4].tool_input["title"] == "Fixture Canvas Artifact"
+  assert events[4].tool_input["purpose"] == "exploration"
+  assert "@hank/canvas-kit" in events[4].tool_input["tsx_source"]
   assert events[4].tool_input["copy_as_json"] == {
-    "fixture": FIXTURE_HTML_ARTIFACT_SKILL_NAME,
-    "contract_name": "HtmlArtifact",
+    "fixture": FIXTURE_CANVAS_ARTIFACT_SKILL_NAME,
+    "contract_name": "CanvasArtifact",
   }
   assert events[-1].stop_reason == "tool_use"
 
@@ -156,7 +161,7 @@ def test_fixture_html_artifact_stream_emits_complete_html_tool_call(monkeypatch)
         "messages": [
           {"role": "assistant", "content": "tool result: ok"},
         ],
-        "system_prompt": f"Execute the deterministic fixture skill {FIXTURE_HTML_ARTIFACT_SKILL_NAME}.",
+        "system_prompt": f"Execute the deterministic fixture skill {FIXTURE_CANVAS_ARTIFACT_SKILL_NAME}.",
       },
     )
   )
@@ -221,7 +226,7 @@ def test_fixture_dashboard_artifact_stream_emits_checked_in_payload(monkeypatch)
   assert client.turn == 2
 
 
-def test_fixture_approval_html_artifact_stream_requests_approval_with_evidence(monkeypatch) -> None:
+def test_fixture_approval_canvas_artifact_stream_requests_approval_with_evidence(monkeypatch) -> None:
   monkeypatch.setattr("agent_gateway.providers.fixture._fixture_run_seconds", lambda: 0.0)
   provider = FixtureProvider()
   client = provider.create_client({"model": FIXTURE_MODEL_ID})
@@ -234,14 +239,14 @@ def test_fixture_approval_html_artifact_stream_requests_approval_with_evidence(m
         "messages": [],
         "system_prompt": (
           "Today is 2026-06-05. Execute the deterministic fixture skill "
-          f"{FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME}."
+          f"{FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME}."
         ),
       },
     )
   )
 
-  assert first_turn[2].tool_name == "emit_html_artifact"
-  assert first_turn[4].tool_name == "emit_html_artifact"
+  assert first_turn[2].tool_name == "emit_canvas_artifact"
+  assert first_turn[4].tool_name == "emit_canvas_artifact"
   assert first_turn[-1].stop_reason == "tool_use"
 
   second_turn = asyncio.run(
@@ -255,13 +260,13 @@ def test_fixture_approval_html_artifact_stream_requests_approval_with_evidence(m
             "content": [
               {
                 "type": "tool_result",
-                "tool_use_id": "fixture_html_artifact_1",
-                "content": '{"artifact_id":"artifact-html-evidence-1","status":"ok"}',
+                "tool_use_id": "fixture_canvas_artifact_1",
+                "content": '{"artifact_id":"artifact-canvas-evidence-1","status":"ok"}',
               }
             ],
           }
         ],
-        "system_prompt": f"Execute the deterministic fixture skill {FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME}.",
+        "system_prompt": f"Execute the deterministic fixture skill {FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME}.",
       },
     )
   )
@@ -277,12 +282,12 @@ def test_fixture_approval_html_artifact_stream_requests_approval_with_evidence(m
   assert second_turn[2].tool_name == FIXTURE_APPROVAL_TOOL_NAME
   assert second_turn[4].tool_name == FIXTURE_APPROVAL_TOOL_NAME
   assert second_turn[4].tool_input["evidence_artifact"] == {
-    "artifact_id": "artifact-html-evidence-1",
-    "title": "Fixture HTML Approval Evidence",
-    "skill": "_html",
-    "contract_name": "HtmlArtifact",
-    "artifact_path": "artifacts/_html/artifact-html-evidence-1.json",
-    "binary_artifact_path": "artifacts/_html/artifact-html-evidence-1.html",
+    "artifact_id": "artifact-canvas-evidence-1",
+    "title": "Fixture Canvas Approval Evidence",
+    "skill": "_canvas",
+    "contract_name": "CanvasArtifact",
+    "artifact_path": "artifacts/_canvas/artifact-canvas-evidence-1.json",
+    "binary_artifact_path": "artifacts/_canvas/artifact-canvas-evidence-1.bundle.js",
     "data_source": "fixture",
   }
   assert second_turn[-1].stop_reason == "tool_use"
@@ -298,13 +303,13 @@ def test_fixture_approval_html_artifact_stream_requests_approval_with_evidence(m
             "content": [
               {
                 "type": "tool_result",
-                "tool_use_id": "fixture_html_artifact_approval_1",
+                "tool_use_id": "fixture_canvas_artifact_approval_1",
                 "content": '{"ok":true}',
               }
             ],
           }
         ],
-        "system_prompt": f"Execute the deterministic fixture skill {FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME}.",
+        "system_prompt": f"Execute the deterministic fixture skill {FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME}.",
       },
     )
   )
@@ -380,6 +385,7 @@ def test_fixture_runner_reaches_approval_pending_then_completes(monkeypatch, tmp
       event_log=event_log,
       session_id="fixture-session",
       session=session,
+      role=session.role,
       store=store,
       policy=policy,
       run_context=session.run_context,
@@ -389,15 +395,17 @@ def test_fixture_runner_reaches_approval_pending_then_completes(monkeypatch, tmp
       event_log=event_log,
       dispatcher=dispatcher,
       session_id="fixture-session",
-      provider=provider,
-      auth_config={
-        "auth_mode": "none",
-        "api_key": "",
-        "auth_token": "",
-        "model": FIXTURE_MODEL_ID,
-        "max_tokens": 1_024,
-        "thinking": False,
-      },
+      capability_execution=stub_runner_capability_execution(
+        provider=provider,
+        auth_config={
+          "auth_mode": "none",
+          "api_key": "",
+          "auth_token": "",
+          "max_tokens": 1_024,
+        },
+        model=FIXTURE_MODEL_ID,
+        effort="none",
+      ),
       get_tool_definitions=lambda: [
         {
           "name": FIXTURE_APPROVAL_TOOL_NAME,

@@ -2,7 +2,10 @@
 
 import asyncio
 import logging
+import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,7 +54,256 @@ def test_server_tool_usage_preserves_known_billable_units_and_rejects_unknown_po
 
 
 def _model_info() -> ModelInfo:
-  return ModelInfo(id="claude-sonnet-4-6", provider="anthropic")
+  return AnthropicProvider().get_model_info("claude-sonnet-4-6")
+
+
+def _cached_tool() -> dict[str, object]:
+  return {
+    "name": "lookup",
+    "description": "Look up a value.",
+    "input_schema": {"type": "object", "properties": {}},
+    "cache_control": {"type": "ephemeral"},
+  }
+
+
+def _cache_marker_locations(params: dict[str, object]) -> list[tuple[str, int, int | None]]:
+  locations: list[tuple[str, int, int | None]] = []
+  for section in ("system", "tools"):
+    blocks = params.get(section)
+    if not isinstance(blocks, list):
+      continue
+    locations.extend(
+      (section, index, None)
+      for index, block in enumerate(blocks)
+      if isinstance(block, dict) and "cache_control" in block
+    )
+  messages = params.get("messages")
+  if isinstance(messages, list):
+    for message_index, message in enumerate(messages):
+      if not isinstance(message, dict):
+        continue
+      content = message.get("content")
+      if not isinstance(content, list):
+        continue
+      locations.extend(
+        ("messages", message_index, block_index)
+        for block_index, block in enumerate(content)
+        if isinstance(block, dict) and "cache_control" in block
+      )
+  return locations
+
+
+def test_build_request_params_places_fourth_marker_on_interactive_message_tail() -> None:
+  params = AnthropicProvider().build_request_params(
+    model="claude-sonnet-4-6",
+    messages=[{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "first"},
+        {"type": "text", "text": "last"},
+      ],
+    }],
+    system_prompt=[("static", True), ("dynamic", True)],
+    tools=[_cached_tool()],
+    max_tokens=4096,
+  )
+
+  assert _cache_marker_locations(params) == [
+    ("system", 0, None),
+    ("system", 1, None),
+    ("tools", 0, None),
+    ("messages", 0, 1),
+  ]
+  assert params["messages"][-1]["content"][-1]["cache_control"] == {
+    "type": "ephemeral"
+  }
+
+
+def test_build_request_params_places_third_marker_for_sub_agent_shape() -> None:
+  params = AnthropicProvider().build_request_params(
+    model="claude-sonnet-4-6",
+    messages=[{
+      "role": "user",
+      "content": [{"type": "text", "text": "review this"}],
+    }],
+    system_prompt="sub-agent system",
+    tools=[_cached_tool()],
+    max_tokens=4096,
+  )
+
+  assert _cache_marker_locations(params) == [
+    ("system", 0, None),
+    ("tools", 0, None),
+    ("messages", 0, 0),
+  ]
+
+
+def test_build_request_params_never_adds_a_fifth_explicit_marker() -> None:
+  params = AnthropicProvider().build_request_params(
+    model="claude-sonnet-4-6",
+    messages=[{
+      "role": "user",
+      "content": [{"type": "text", "text": "do not mark past the API limit"}],
+    }],
+    system_prompt=[
+      ("first", True),
+      ("second", True),
+      ("third", True),
+    ],
+    tools=[_cached_tool()],
+    max_tokens=4096,
+  )
+
+  assert _cache_marker_locations(params) == [
+    ("system", 0, None),
+    ("system", 1, None),
+    ("system", 2, None),
+    ("tools", 0, None),
+  ]
+
+
+@pytest.mark.parametrize(
+  "final_block",
+  [
+    pytest.param({"type": "text", "text": "continue"}, id="text"),
+    pytest.param(
+      {
+        "type": "tool_result",
+        "tool_use_id": "tool-1",
+        "content": "result",
+      },
+      id="tool-result",
+    ),
+  ],
+)
+def test_build_request_params_marks_cacheable_final_block(
+  final_block: dict[str, object],
+) -> None:
+  params = AnthropicProvider().build_request_params(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": [final_block]}],
+    system_prompt=None,
+    tools=[],
+    max_tokens=4096,
+  )
+
+  assert _cache_marker_locations(params) == [("messages", 0, 0)]
+  assert params["messages"][0]["content"][0]["cache_control"] == {
+    "type": "ephemeral"
+  }
+
+
+def test_build_request_params_normalizes_bare_string_final_content_for_marker() -> None:
+  params = AnthropicProvider().build_request_params(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "bare prompt"}],
+    system_prompt=None,
+    tools=[],
+    max_tokens=4096,
+  )
+
+  assert params["messages"] == [{
+    "role": "user",
+    "content": [{
+      "type": "text",
+      "text": "bare prompt",
+      "cache_control": {"type": "ephemeral"},
+    }],
+  }]
+
+
+def test_build_request_params_skips_marker_without_cacheable_final_block(
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  caplog.set_level(logging.DEBUG, logger="agent_gateway.providers.anthropic")
+
+  params = AnthropicProvider().build_request_params(
+    model="claude-sonnet-4-6",
+    messages=[{
+      "role": "user",
+      "content": [{"type": "thinking", "thinking": "private"}],
+    }],
+    system_prompt=None,
+    tools=[],
+    max_tokens=4096,
+  )
+
+  assert _cache_marker_locations(params) == []
+  skip_records = [
+    record
+    for record in caplog.records
+    if "final message has no cacheable block" in record.getMessage()
+  ]
+  assert len(skip_records) == 1
+
+
+def test_build_request_params_strips_stale_message_markers_before_placement() -> None:
+  messages = [
+    {
+      "role": "user",
+      "cache_control": {"type": "ephemeral"},
+      "content": [{
+        "type": "text",
+        "text": "old boundary",
+        "cache_control": {"type": "ephemeral"},
+      }],
+    },
+    {
+      "role": "assistant",
+      "content": [{
+        "type": "text",
+        "text": "answer",
+        "cache_control": {"type": "ephemeral"},
+      }],
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "not final",
+          "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "text", "text": "authoritative boundary"},
+      ],
+    },
+  ]
+
+  params = AnthropicProvider().build_request_params(
+    model="claude-sonnet-4-6",
+    messages=messages,
+    system_prompt=None,
+    tools=[],
+    max_tokens=4096,
+  )
+
+  assert _cache_marker_locations(params) == [("messages", 2, 1)]
+  assert "cache_control" not in params["messages"][0]
+  assert "cache_control" in messages[0]
+  assert "cache_control" in messages[0]["content"][0]
+
+
+def test_build_request_params_never_marks_trailing_thinking_block() -> None:
+  params = AnthropicProvider().build_request_params(
+    model="claude-sonnet-4-6",
+    messages=[{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "cache here"},
+        {
+          "type": "thinking",
+          "thinking": "never cache directly",
+          "cache_control": {"type": "ephemeral"},
+        },
+      ],
+    }],
+    system_prompt=None,
+    tools=[],
+    max_tokens=4096,
+  )
+
+  assert _cache_marker_locations(params) == [("messages", 0, 0)]
+  assert "cache_control" not in params["messages"][0]["content"][1]
 
 
 def _make_anthropic_api_status_error(status_code: int, message: str):
@@ -63,6 +315,94 @@ def _make_anthropic_api_status_error(status_code: int, message: str):
     response=response,
     body={"error": {"message": message}},
   )
+
+
+def test_create_client_isolates_bound_credentials_and_routes_concurrently(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  anthropic = pytest.importorskip("anthropic")
+  barrier = threading.Barrier(2)
+  ambient = {
+    "ANTHROPIC_API_KEY": "ambient-api-key",
+    "ANTHROPIC_AUTH_TOKEN": "ambient-oauth-token",
+    "ANTHROPIC_BASE_URL": "https://ambient.invalid/v1",
+  }
+  for key, value in ambient.items():
+    monkeypatch.setenv(key, value)
+
+  class _RecordingAsyncAnthropic:
+    def __init__(self, **kwargs):
+      self.kwargs = kwargs
+      self.environment = {
+        key: os.environ.get(key)
+        for key in ambient
+      }
+      barrier.wait(timeout=5.0)
+
+  monkeypatch.setattr(anthropic, "AsyncAnthropic", _RecordingAsyncAnthropic)
+  provider = AnthropicProvider()
+
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    api_future = executor.submit(
+      provider.create_client,
+      {
+        "auth_mode": "api",
+        "api_key": "bound-api-key",
+      },
+    )
+    oauth_future = executor.submit(
+      provider.create_client,
+      {
+        "auth_mode": "oauth",
+        "auth_token": "bound-oauth-token",
+        "baseURL": "https://bound.anthropic.example/v1",
+      },
+    )
+    api_client = api_future.result(timeout=5.0)
+    oauth_client = oauth_future.result(timeout=5.0)
+
+  assert {
+    key: os.environ.get(key)
+    for key in ambient
+  } == ambient
+  assert api_client.environment == ambient
+  assert oauth_client.environment == ambient
+
+  assert api_client.kwargs["api_key"] == "bound-api-key"
+  assert api_client.kwargs["auth_token"] == ""
+  assert api_client.kwargs["base_url"] == "https://api.anthropic.com"
+  assert isinstance(
+    api_client.kwargs["default_headers"]["Authorization"],
+    anthropic.Omit,
+  )
+
+  assert oauth_client.kwargs["api_key"] == ""
+  assert oauth_client.kwargs["auth_token"] == "bound-oauth-token"
+  assert oauth_client.kwargs["base_url"] == "https://bound.anthropic.example/v1"
+  assert isinstance(
+    oauth_client.kwargs["default_headers"]["X-Api-Key"],
+    anthropic.Omit,
+  )
+
+
+@pytest.mark.parametrize(
+  "config",
+  [
+    {"auth_mode": "api", "api_key": "   "},
+    {"auth_mode": "oauth", "auth_token": "   "},
+  ],
+)
+def test_provider_rejects_blank_bound_credential_despite_ambient_values(
+  monkeypatch: pytest.MonkeyPatch,
+  config: dict[str, str],
+) -> None:
+  monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-api-key")
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ambient-oauth-token")
+  provider = AnthropicProvider()
+
+  assert provider.has_active_credential(config) is False
+  with pytest.raises(RuntimeError, match="No Anthropic .* credential configured"):
+    provider.create_client(config)
 
 
 def test_anthropic_provider_helper_exports_are_parent_aliases() -> None:
@@ -77,6 +417,7 @@ def test_anthropic_provider_helper_exports_are_parent_aliases() -> None:
     "_OAUTH_IDENTITY",
     "_SENSITIVE_ERROR_KEY_RE",
     "_SENSITIVE_ERROR_VALUE_RES",
+    "_STRUCTURED_OUTPUTS_BETA_SLUG",
     "_TOOL_ID_RE",
     "_exception_body",
     "_exception_status_code",
@@ -100,11 +441,102 @@ def test_anthropic_provider_helper_exports_are_parent_aliases() -> None:
 
 
 def test_model_info_defaults_derive_thinking_mode_from_supports_thinking() -> None:
-  assert ModelInfo(id="stub", provider="test").thinking_mode == "none"
+  default_info = ModelInfo(id="stub", provider="test")
+  assert default_info.thinking_mode == "none"
+  assert default_info.supports_native_compaction is False
   info = ModelInfo(id="stub", provider="test", supports_thinking=True)
 
   assert info.thinking_mode == "adaptive"
   assert info.supports_thinking is True
+
+
+@pytest.mark.parametrize(
+  ("model", "expected"),
+  [
+    ("claude-fable-5", True),
+    ("claude-mythos-5", True),
+    ("claude-opus-4-8", True),
+    ("claude-opus-4-7", True),
+    ("claude-sonnet-5", True),
+    ("claude-sonnet-4-6", True),
+    ("claude-sonnet-4-6-20260615", True),
+    ("claude-opus-4-6", True),
+    ("claude-sonnet-4-5", False),
+    ("claude-opus-4-5", False),
+    ("claude-haiku-4-5", False),
+    ("claude-3.7-sonnet-20250219", False),
+    ("claude-sonnet-4-60", False),
+    ("claude-sonnet-4-6x", False),
+    ("claude-zenith-9", False),
+  ],
+)
+def test_native_compaction_capability_is_model_specific_and_fail_closed(
+  model: str,
+  expected: bool,
+) -> None:
+  info = AnthropicProvider().get_model_info(model)
+
+  assert info.supports_native_compaction is expected
+
+
+@pytest.mark.parametrize(
+  ("model", "expects_native_compaction"),
+  [
+    ("claude-sonnet-4-6", True),
+    ("claude-haiku-4-5", False),
+    ("claude-sonnet-4-60", False),
+    ("claude-sonnet-4-6x", False),
+    ("claude-zenith-9", False),
+  ],
+)
+def test_compaction_request_is_emitted_only_for_supported_models(
+  model: str,
+  expects_native_compaction: bool,
+) -> None:
+  params = AnthropicProvider().build_request_params(
+    model=model,
+    messages=[],
+    system_prompt=None,
+    tools=[],
+    max_tokens=4096,
+    compaction_trigger=160_000,
+    compaction_instructions="Preserve durable state.",
+  )
+
+  assert ("context_management" in params) is expects_native_compaction
+  if expects_native_compaction:
+    assert params["context_management"] == {
+      "edits": [{
+        "type": "compact_20260112",
+        "trigger": {"type": "input_tokens", "value": 160_000},
+        "pause_after_compaction": False,
+        "instructions": "Preserve durable state.",
+      }],
+    }
+
+
+def test_haiku_normalizes_portable_compaction_anchor_to_text() -> None:
+  provider = AnthropicProvider()
+  messages = [
+    {"role": "user", "content": "superseded history"},
+    {
+      "role": "assistant",
+      "content": [{"type": "compaction", "content": "portable summary"}],
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5",
+      "stop_reason": "compaction",
+    },
+    {"role": "user", "content": "continue"},
+  ]
+
+  normalized = provider.normalize_messages(
+    messages,
+    provider.get_model_info("claude-haiku-4-5"),
+  )
+
+  assert normalized[0]["content"][0]["type"] == "text"
+  assert "portable summary" in normalized[0]["content"][0]["text"]
+  assert "superseded history" not in str(normalized)
 
 
 def test_fable_model_info_uses_bundled_rates_and_adaptive_thinking() -> None:
@@ -128,13 +560,67 @@ def test_opus48_model_info_uses_bundled_rates_and_adaptive_thinking() -> None:
   info = provider.get_model_info("claude-opus-4-8")
 
   assert info.context_window == 1_000_000
-  assert info.max_output_tokens == 32_000
+  assert info.max_output_tokens == 128_000
   assert info.input_cost_per_mtok == 5.0
   assert info.output_cost_per_mtok == 25.0
   assert info.cache_read_cost_per_mtok == 0.5
   assert info.cache_write_cost_per_mtok == 6.25
   assert info.supports_thinking is True
   assert info.thinking_mode == "adaptive"
+
+
+def test_opus5_model_info_uses_bundled_rates_and_adaptive_thinking() -> None:
+  provider = AnthropicProvider()
+
+  info = provider.get_model_info("claude-opus-5")
+
+  assert info.context_window == 1_000_000
+  assert info.max_output_tokens == 128_000
+  assert info.input_cost_per_mtok == 5.0
+  assert info.output_cost_per_mtok == 25.0
+  assert info.cache_read_cost_per_mtok == 0.5
+  assert info.cache_write_cost_per_mtok == 6.25
+  assert info.supports_thinking is True
+  assert info.thinking_mode == "adaptive"
+
+
+@pytest.mark.parametrize(
+  ("requested", "expected_thinking", "expected_output_config"),
+  [
+    (ThinkingLevel.NONE, {"type": "disabled"}, None),
+    (ThinkingLevel.XHIGH, {"type": "adaptive"}, {"effort": "xhigh"}),
+    (ThinkingLevel.MAX, {"type": "adaptive"}, {"effort": "max"}),
+  ],
+)
+def test_opus5_resolved_effort_emits_complete_payload_pair(
+  requested: ThinkingLevel,
+  expected_thinking: dict[str, str],
+  expected_output_config: dict[str, str] | None,
+) -> None:
+  provider = AnthropicProvider()
+  info = provider.get_model_info("claude-opus-5")
+  resolution = provider.resolve_effort(
+    requested=requested,
+    model=info.id,
+    model_info=info,
+    max_tokens=4096,
+  )
+
+  params = provider.build_request_params(
+    model=info.id,
+    messages=[],
+    system_prompt=None,
+    tools=[],
+    max_tokens=4096,
+    thinking_level=requested,
+    effort_resolution=resolution,
+  )
+
+  assert params["thinking"] == expected_thinking
+  if expected_output_config is None:
+    assert "output_config" not in params
+  else:
+    assert params["output_config"] == expected_output_config
 
 
 def test_haiku_45_model_info_preserves_no_thinking_with_real_rates() -> None:
@@ -257,6 +743,85 @@ def test_fable_request_params_do_not_send_sampling_knobs() -> None:
   assert params["thinking"] == {"type": "adaptive"}
   for key in ("temperature", "top_p", "top_k"):
     assert key not in params
+
+
+def test_strict_tool_schema_is_transformed_without_widening_gateway_contract() -> None:
+  pytest.importorskip("anthropic")
+  provider = AnthropicProvider()
+  gateway_schema = {
+    "type": "object",
+    "properties": {
+      "summary": {"type": "string", "minLength": 1, "maxLength": 20},
+      "findings": {
+        "type": "array",
+        "maxItems": 2,
+        "items": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {"type": "string", "const": "finding"},
+                "claim": {"type": "string"},
+              },
+              "required": ["claim"],
+            }
+          ],
+        },
+      },
+    },
+    "required": ["summary"],
+  }
+  tools = [{
+    "name": "structured_write",
+    "strict": True,
+    "eager_input_streaming": False,
+    "input_schema": gateway_schema,
+  }]
+
+  params = provider.build_request_params(
+    model="claude-opus-4-8",
+    messages=[],
+    system_prompt=None,
+    tools=tools,
+    max_tokens=4096,
+    thinking_level=ThinkingLevel.HIGH,
+  )
+
+  strict_tool = params["tools"][0]
+  strict_schema = strict_tool["input_schema"]
+  assert strict_tool["strict"] is True
+  assert strict_tool["eager_input_streaming"] is False
+  assert strict_schema["additionalProperties"] is False
+  assert strict_schema["properties"]["findings"]["type"] == "array"
+  assert "anyOf" in strict_schema["properties"]["findings"]["items"]
+  assert "oneOf" not in strict_schema["properties"]["findings"]["items"]
+  assert "maxLength" not in strict_schema["properties"]["summary"]
+  assert "maxLength: 20" in strict_schema["properties"]["summary"]["description"]
+  assert gateway_schema["properties"]["summary"]["maxLength"] == 20
+  assert "oneOf" in gateway_schema["properties"]["findings"]["items"]
+
+
+def test_non_strict_tools_skip_anthropic_schema_transformation() -> None:
+  provider = AnthropicProvider()
+  tools = [{
+    "name": "lookup",
+    "input_schema": {
+      "type": "object",
+      "properties": {"query": {"type": "string", "maxLength": 20}},
+    },
+  }]
+
+  params = provider.build_request_params(
+    model="claude-opus-4-8",
+    messages=[],
+    system_prompt=None,
+    tools=tools,
+    max_tokens=4096,
+    thinking_level=ThinkingLevel.HIGH,
+  )
+
+  assert params["tools"] is tools
+  assert params["tools"][0]["input_schema"]["properties"]["query"]["maxLength"] == 20
 
 
 def test_normalize_messages_synthetic_tool_result_has_no_internal_tool_name() -> None:
@@ -398,6 +963,7 @@ class _FakeStreamingMessages:
 class _FakeStreamingClient:
   def __init__(self, events: list[object]):
     self.messages = _FakeStreamingMessages(events)
+    self.beta = SimpleNamespace(messages=_FakeStreamingMessages(events))
 
 
 async def _drain_stream(provider: AnthropicProvider, client: object, params: dict[str, object]) -> None:
@@ -407,6 +973,78 @@ async def _drain_stream(provider: AnthropicProvider, client: object, params: dic
 
 async def _collect_stream_types(provider: AnthropicProvider, client: object, params: dict[str, object]) -> list[str]:
   return [event.type async for event in provider.stream(client, params)]
+
+
+async def _collect_stream_events(provider: AnthropicProvider, client: object, params: dict[str, object]) -> list[object]:
+  return [event async for event in provider.stream(client, params)]
+
+
+@pytest.mark.parametrize(
+  ("model", "auth_mode", "compaction_trigger", "expected_betas"),
+  [
+    (
+      "claude-haiku-4-5",
+      "api",
+      None,
+      [anthropic_provider_module._STRUCTURED_OUTPUTS_BETA_SLUG],
+    ),
+    (
+      "claude-haiku-4-5",
+      "oauth",
+      None,
+      [
+        *anthropic_provider_module._OAUTH_BETA_SLUGS,
+        anthropic_provider_module._STRUCTURED_OUTPUTS_BETA_SLUG,
+      ],
+    ),
+    (
+      "claude-opus-4-8",
+      "oauth",
+      160_000,
+      [
+        *anthropic_provider_module._OAUTH_BETA_SLUGS,
+        anthropic_provider_module._STRUCTURED_OUTPUTS_BETA_SLUG,
+        anthropic_provider_module._COMPACTION_BETA_SLUG,
+      ],
+    ),
+  ],
+)
+def test_stream_routes_strict_tools_through_structured_outputs_beta(
+  model: str,
+  auth_mode: str,
+  compaction_trigger: int | None,
+  expected_betas: list[str],
+) -> None:
+  provider = AnthropicProvider()
+  strict_tool = {
+    "name": "structured_write",
+    "strict": True,
+    "eager_input_streaming": False,
+    "input_schema": {
+      "type": "object",
+      "properties": {"value": {"type": "string"}},
+      "required": ["value"],
+    },
+  }
+  params = provider.build_request_params(
+    model=model,
+    messages=[],
+    system_prompt=None,
+    tools=[strict_tool],
+    max_tokens=4096,
+    thinking_level=ThinkingLevel.NONE,
+    auth_mode=auth_mode,
+    compaction_trigger=compaction_trigger,
+  )
+  client = _FakeStreamingClient([])
+
+  asyncio.run(_drain_stream(provider, client, params))
+
+  assert client.messages.kwargs is None
+  assert client.beta.messages.kwargs is not None
+  assert client.beta.messages.kwargs["betas"] == expected_betas
+  assert "_provider_auth_mode" not in client.beta.messages.kwargs
+  assert client.beta.messages.kwargs["tools"][0]["strict"] is True
 
 
 def test_anthropic_rejection_detail_redacts_sensitive_body_fallback() -> None:
@@ -516,6 +1154,63 @@ def test_stream_separates_provider_ping_from_silent_progress_metadata() -> None:
     "compaction",
     "message_end",
   ]
+
+
+def test_stream_sums_compaction_usage_iterations() -> None:
+  provider = AnthropicProvider()
+  client = _FakeStreamingClient(
+    [
+      SimpleNamespace(
+        type="message_start",
+        message=SimpleNamespace(
+          usage=SimpleNamespace(
+            input_tokens=100,
+            output_tokens=0,
+            cache_creation_input_tokens=1,
+            cache_read_input_tokens=2,
+          )
+        ),
+      ),
+      SimpleNamespace(
+        type="message_delta",
+        delta=SimpleNamespace(stop_reason="end_turn"),
+        usage=SimpleNamespace(
+          input_tokens=100,
+          output_tokens=10,
+          cache_creation_input_tokens=1,
+          cache_read_input_tokens=2,
+          iterations=[
+            SimpleNamespace(
+              input_tokens=100,
+              output_tokens=10,
+              cache_creation_input_tokens=1,
+              cache_read_input_tokens=2,
+            ),
+            SimpleNamespace(
+              input_tokens=50,
+              output_tokens=5,
+              cache_creation_input_tokens=3,
+              cache_read_input_tokens=4,
+            ),
+          ],
+        ),
+      ),
+    ]
+  )
+
+  events = asyncio.run(_collect_stream_events(provider, client, {"model": "claude-sonnet-4-6", "messages": []}))
+
+  message_start = events[0]
+  usage_update = events[1]
+  assert message_start.type == "message_start"
+  assert message_start.input_tokens == 100
+  assert message_start.cache_creation_tokens == 1
+  assert message_start.cache_read_tokens == 2
+  assert usage_update.type == "usage_update"
+  assert usage_update.input_tokens == 50
+  assert usage_update.output_tokens == 15
+  assert usage_update.cache_creation_tokens == 3
+  assert usage_update.cache_read_tokens == 4
 
 
 def test_normalize_messages_drops_orphan_tool_result_message() -> None:

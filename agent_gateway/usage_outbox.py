@@ -16,6 +16,7 @@ from typing import Any, Iterable, Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from jsonschema import Draft202012Validator
+from agent_workflow_contracts import CapabilityBind
 
 from .commercial_contract import canonical_usage_payload_sha256
 
@@ -497,7 +498,7 @@ class CommercialUsageOutbox:
           / "gateway-usage-reconciliation-evidence.schema.json"
         ).read_text(encoding="utf-8")
       ))
-      for version in (1, 2)
+      for version in (1, 2, 3)
     }
     self._prepare_private_parent()
     self._harden_storage_files()
@@ -1276,14 +1277,32 @@ class CommercialUsageOutbox:
     if present_lineage and present_lineage != lineage_fields:
       raise ValueError("commercial reconciliation attempt lineage is incomplete")
     if present_lineage:
+      expected_source_schema_version = (
+        3 if payload.get("source_usage_schema_version") == 3 else 2
+      )
       expected_lineage = tuple(payload.get(field) for field in sorted(lineage_fields))
       if any(
-        line.get("source_schema_version") != 2
+        line.get("source_schema_version") != expected_source_schema_version
         or tuple(line.get(field) for field in sorted(lineage_fields))
            != expected_lineage
         for line in lines
       ):
         raise ValueError("commercial reconciliation attempt lineage is inconsistent")
+    if payload.get("source_usage_schema_version") == 3:
+      try:
+        for line in lines:
+          bind = CapabilityBind.from_receipt(line.get("capability_bind"))
+          if (
+            line.get("capability_bind") != bind.receipt()
+            or line.get("provider") != bind.provider
+            or line.get("model") != bind.upstream_model
+            or line.get("capability_id") != bind.capability_id
+          ):
+            raise ValueError
+      except (TypeError, ValueError) as exc:
+        raise ValueError(
+          "commercial reconciliation capability identity is inconsistent"
+        ) from exc
     is_match = (
       not any(
         int(payload.get(field) or 0)
@@ -1347,7 +1366,15 @@ class CommercialUsageOutbox:
     present_lineage = lineage_fields.intersection(payload)
     if present_lineage and present_lineage != lineage_fields:
       raise ValueError("commercial reconciliation attempt lineage is incomplete")
-    evidence_schema_version = 2 if present_lineage else 1
+    source_usage_schema_version = payload.get("source_usage_schema_version")
+    if source_usage_schema_version == 3:
+      if present_lineage != lineage_fields:
+        raise ValueError("commercial Usage V3 reconciliation lineage is incomplete")
+      evidence_schema_version = 3
+    elif source_usage_schema_version is not None:
+      raise ValueError("commercial reconciliation source usage schema is invalid")
+    else:
+      evidence_schema_version = 2 if present_lineage else 1
     request_id = str(payload.get("request_id") or "").strip()
     session_id = str(payload.get("session_id") or "").strip()
     environment = str(payload.get("environment") or "").strip()
@@ -1405,7 +1432,7 @@ class CommercialUsageOutbox:
           raise ValueError(
             "commercial reconciliation evidence version cannot change within a revision chain"
           )
-        if prior is not None and evidence_schema_version == 2:
+        if prior is not None and evidence_schema_version in {2, 3}:
           prior_payload = json.loads(str(prior["payload_json"]))
           attempt_fields = (
             "workflow_attempt_group_id", "workflow_attempt_number",

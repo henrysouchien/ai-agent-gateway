@@ -262,6 +262,41 @@ def test_handler_returns_classified_error_on_submit_http_error(monkeypatch) -> N
   assert [request["method"] for request in transport.requests] == ["POST", "POST"]
 
 
+def test_handler_preserves_retryable_relay_restart_submit_error(monkeypatch) -> None:
+  base = "https://gateway.example"
+  transport = _FakeGatewayHttp(
+    [
+      _response("POST", f"{base}/api/chat/init", 200, {"session_token": "jwt-token"}),
+      _response(
+        "POST",
+        f"{base}/api/orchestration/excel-dispatch",
+        503,
+        {
+          "code": "relay_restart_in_progress",
+          "message": "Excel MCP relay restart in progress",
+        },
+      ),
+    ]
+  )
+  monkeypatch.setattr(dispatch, "_get_session_token", None)
+  monkeypatch.setattr(dispatch.httpx, "AsyncClient", transport.client_factory)
+
+  handler = dispatch.make_autonomous_message_excel_agent_handler(
+    gateway_url=base,
+    gateway_api_key="api-key-1",
+    poll_interval_seconds=0.001,
+    tls_verify=False,
+  )
+  result, error = _run(handler({"text": "Update the model"}))
+
+  assert result is None
+  assert error is not None
+  assert error["code"] == "relay_restart_in_progress"
+  assert error["reason"] == "relay_restart_in_progress"
+  assert error["status_code"] == 503
+  assert error["payload"]["code"] == "relay_restart_in_progress"
+
+
 def test_handler_classifies_focus_lost_status_error(monkeypatch) -> None:
   base = "https://gateway.example"
   transport = _FakeGatewayHttp(

@@ -1,7 +1,6 @@
 {
   "contract": {
     "contract_version": 1,
-    "compatible_digests": {},
     "caps": {
       "canonical_submitted_payload_bytes": 32768,
       "blocks_per_payload": 24,

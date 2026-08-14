@@ -1,6 +1,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from agent_gateway.runner_state import (
   append_deferred_tool_extras,
   append_tool_execution_result,
@@ -28,10 +30,17 @@ from agent_gateway.runner_state import (
   stream_turn_log_summary,
   StreamTurnResult,
   sub_agent_batch_error,
+  tool_execution_order_indices,
   turn_reminder_state,
   usage_cache_status,
   user_turn_message,
 )
+
+
+def test_tool_execution_order_preserves_model_authored_order() -> None:
+  tool_names = ["support_probe", "lookup", "fms_report_demo"]
+
+  assert tool_execution_order_indices(tool_names) == (0, 1, 2)
 
 
 def test_normalized_run_config_coerces_fields_and_preserves_extra_keys() -> None:
@@ -39,60 +48,47 @@ def test_normalized_run_config_coerces_fields_and_preserves_extra_keys() -> None
     "auth_mode": " OAuth ",
     "api_key": 123,
     "auth_token": None,
-    "model": "",
     "max_tokens": "2048",
-    "thinking": "false",
     "base_url": "https://example.test",
   }
 
   config = normalized_run_config(
     auth_config,
-    default_model="default-model",
-    model_override=None,
+    upstream_model="bound-model",
+    effort="low",
   )
 
   assert config == {
     "auth_mode": "oauth",
     "api_key": "123",
     "auth_token": "None",
-    "model": "default-model",
+    "model": "bound-model",
     "max_tokens": 2048,
-    "effort": "none",
-    "thinking_enabled_requested": False,
+    "effort": "low",
+    "thinking_enabled_requested": True,
     "base_url": "https://example.test",
   }
   assert auth_config["auth_mode"] == " OAuth "
-  assert auth_config["model"] == ""
+  assert "model" not in auth_config
 
 
-def test_normalized_run_config_uses_defaults_for_missing_fields() -> None:
-  config = normalized_run_config(
-    {},
-    default_model="provider-default",
-    model_override=None,
-  )
-
-  assert config == {
-    "auth_mode": "api",
-    "api_key": "",
-    "auth_token": "",
-    "model": "provider-default",
-    "max_tokens": 16000,
-    "effort": "high",
-    "thinking_enabled_requested": True,
-  }
+def test_normalized_run_config_rejects_blank_bound_effort() -> None:
+  with pytest.raises(ValueError, match="must not be blank"):
+    normalized_run_config({}, upstream_model="bound-model", effort="")
 
 
-def test_normalized_run_config_model_override_wins() -> None:
-  config = normalized_run_config(
-    {"model": "configured-model", "thinking": "false"},
-    default_model="provider-default",
-    model_override="override-model",
-  )
-
-  assert config["model"] == "override-model"
-  assert config["effort"] == "none"
-  assert config["thinking_enabled_requested"] is False
+def test_normalized_run_config_rejects_auth_config_selection_fields() -> None:
+  with pytest.raises(ValueError, match="credential auth_config"):
+    normalized_run_config(
+      {
+        "model": "configured-model",
+        "effort": "none",
+        "thinking": False,
+        "thinking_enabled_requested": False,
+      },
+      upstream_model="bound-model",
+      effort="none",
+    )
 
 
 def test_assistant_turn_message_shapes_conversation_entry_and_copies_content() -> None:
@@ -152,7 +148,12 @@ def test_user_turn_message_shapes_list_content_without_copying() -> None:
 def test_background_tasks_completed_user_message_shapes_reminder() -> None:
   assert background_tasks_completed_user_message() == {
     "role": "user",
-    "content": "[System: Background tasks have completed. Check results with get_background_result.]",
+    "content": (
+      "[System: New background-task notifications are included above. Use those "
+      "outcomes directly. Each notification includes its complete payload or "
+      "explicitly marks an omission. Do not call get_background_result for tasks "
+      "from this run unless a notification explicitly says its payload was omitted.]"
+    ),
   }
 
 
@@ -224,6 +225,14 @@ def test_max_tokens_continuation_decision_increments_and_checks_bound() -> None:
   assert second.should_continue is True
   assert terminal.attempts == 3
   assert terminal.should_continue is False
+
+  unbounded = max_tokens_continuation_decision(
+    current_attempts=200,
+    max_attempts=2,
+    unbounded=True,
+  )
+  assert unbounded.attempts == 201
+  assert unbounded.should_continue is True
 
 
 def test_no_tool_use_turn_outcome_continues_pause_and_compaction() -> None:
@@ -349,7 +358,12 @@ def test_no_tool_use_turn_outcome_continues_for_pending_notifications() -> None:
     },
     {
       "role": "user",
-      "content": "[System: Background tasks have completed. Check results with get_background_result.]",
+      "content": (
+        "[System: New background-task notifications are included above. Use those "
+        "outcomes directly. Each notification includes its complete payload or "
+        "explicitly marks an omission. Do not call get_background_result for tasks "
+        "from this run unless a notification explicitly says its payload was omitted.]"
+      ),
     },
   ]
 

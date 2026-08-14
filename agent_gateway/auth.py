@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
+from .capability_binding import CredentialPrincipal
 from .fixture_gate import fixture_provider_available
+from .model_registry import CAPABILITY_IDS
+from .session_capabilities import normalize_session_capabilities
 
 
 _VALID_PROVIDERS = {"anthropic", "openai", "codex", "xai"}
@@ -25,9 +28,8 @@ class AuthConfig:
 
   provider: Literal["anthropic", "openai", "codex", "xai", "fixture"]
   billing_mode: Literal["byok", "metered"]
-  model: str | None
   max_tokens: int | None
-  _raw: Mapping[str, Any]
+  _raw: Mapping[str, Any] = field(repr=False)
 
   @classmethod
   def from_dict(cls, d: Mapping[str, Any]) -> "AuthConfig":
@@ -48,7 +50,16 @@ class AuthConfig:
       raise ValueError(f"Unsupported billing_mode '{billing_mode}'. Expected 'byok' or 'metered'.")
 
     raw = dict(d)
-    model = raw.get("model")
+    forbidden_selection = sorted(
+      field_name
+      for field_name in ("model", "model_key", "effort", "thinking")
+      if field_name in raw
+    )
+    if forbidden_selection:
+      raise ValueError(
+        "AuthConfig credential material must not select execution identity: "
+        + ", ".join(forbidden_selection)
+      )
     max_tokens = raw.get("max_tokens")
     if max_tokens is not None:
       max_tokens = int(max_tokens)
@@ -56,7 +67,6 @@ class AuthConfig:
     return cls(
       provider=provider,  # type: ignore[arg-type]
       billing_mode=billing_mode,  # type: ignore[arg-type]
-      model=str(model) if model is not None else None,
       max_tokens=max_tokens,
       _raw=MappingProxyType(raw),
     )
@@ -69,10 +79,40 @@ class AuthConfig:
 class ResolverResult:
   user_id: str
   channel: str
-  auth_config: AuthConfig
+  auth_config: AuthConfig = field(repr=False)
+  credential_principal: CredentialPrincipal
+  allow_service_for_interactive: bool = False
   risk_user_id: int | None = None
-  role: Literal["owner", "invite"] = "owner"
+  role: Literal["owner", "invite"] = "invite"
   user_email: str | None = None
+  capabilities: frozenset[str] = frozenset()
+  model_entitled_capabilities: frozenset[str] = frozenset()
+  model_entitled_keys: frozenset[str] = frozenset()
+
+  def __post_init__(self) -> None:
+    if self.credential_principal not in {"user", "service"}:
+      raise ValueError(
+        "credential_principal must be declared as 'user' or 'service'"
+      )
+    if not isinstance(self.allow_service_for_interactive, bool):
+      raise ValueError("allow_service_for_interactive must be a bool")
+    self.capabilities = normalize_session_capabilities(self.capabilities)
+    self.model_entitled_capabilities = frozenset(
+      str(value or "").strip()
+      for value in self.model_entitled_capabilities
+      if str(value or "").strip()
+    )
+    unknown = self.model_entitled_capabilities - CAPABILITY_IDS
+    if unknown:
+      raise ValueError(
+        "unknown model-entitled capabilities: "
+        f"{', '.join(sorted(unknown))}"
+      )
+    self.model_entitled_keys = frozenset(
+      str(value or "").strip()
+      for value in self.model_entitled_keys
+      if str(value or "").strip()
+    )
 
 
 CredentialsResolver = Callable[

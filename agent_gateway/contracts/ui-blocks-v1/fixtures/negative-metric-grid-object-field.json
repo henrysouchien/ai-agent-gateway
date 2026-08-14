@@ -1,0 +1,20 @@
+{
+  "name": "negative-metric-grid-object-field",
+  "expectation": "reject",
+  "payload": {
+    "kind": "hank_ui_blocks.v1",
+    "contract_version": 1,
+    "blocks": [
+      {
+        "block": "sdk:metric-grid",
+        "props": {
+          "source": "portfolio-summary",
+          "fields": [
+            "summary"
+          ]
+        }
+      }
+    ]
+  },
+  "expected_code": "field_mapping_invalid"
+}

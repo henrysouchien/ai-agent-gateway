@@ -29,12 +29,45 @@ from agent_gateway.batch_approval_projection import (  # noqa: E402
   BatchApprovalScope,
 )
 from agent_gateway.providers.agent_sdk import SDK_PINNED_VERSION  # noqa: E402
-from agent_gateway.runner import _ACTIVE_SKILL_DENY_RESULT_KEY, _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY  # noqa: E402
+from agent_gateway.runner import (  # noqa: E402
+  _ACTIVE_SKILL_ALLOW_RESULT_KEY,
+  _ACTIVE_SKILL_DENY_RESULT_KEY,
+  _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY,
+)
 from agent_gateway.skill_context import clear_current_skill, current_skill, set_current_skill  # noqa: E402
+from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution  # noqa: E402
 
 
 def _run(coro):
   return asyncio.run(coro)
+
+
+def test_sdk_approval_context_uses_canonical_session_owner_identity() -> None:
+  session = SimpleNamespace(
+    user_id="henry",
+    owner_user_id="1",
+    channel="cli",
+    role="owner",
+  )
+
+  resolved = sdk_runner_approval.resolve_run_context(
+    run_context=RunContext(
+      user_id="henry",
+      request_id="request-1",
+      session_id="session-1",
+      profile="chat",
+      channel="cli",
+    ),
+    usage_user_id="henry",
+    session=session,
+    approval_policy=SimpleNamespace(policy_bundle_hash="policy-1"),
+    request_id="request-1",
+    session_id="session-1",
+    channel="cli",
+    effective_model="test-model",
+  )
+
+  assert resolved.user_id == "1"
 
 
 class _PermissionResultAllow:
@@ -91,6 +124,7 @@ class _AsyncMessages:
 
 def _sdk_result_message() -> types.SimpleNamespace:
   return types.SimpleNamespace(
+    subtype="success",
     duration_ms=1,
     num_turns=1,
     usage={
@@ -131,22 +165,119 @@ def _make_runner(
   *,
   event_log: EventLog | None = None,
   disallowed_tools: list[str] | None = None,
+  mcp_server_configs: dict[str, Any] | None = None,
   on_tool_result: Any | None = None,
+  run_context: RunContext | None = None,
+  skill_run_id: str | None = None,
+  max_tokens_override: int | None = None,
+  api_key: str = "test-secret",
 ) -> AgentSDKRunner:
   return AgentSDKRunner(
     event_log=event_log or EventLog(),
     session_id="sess-sdk-enforce",
     sdk_config=AgentSDKConfig(
-      api_key="k",
-      model="claude-sonnet-4-6",
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
     ),
+    capability_execution=stub_sdk_capability_execution(api_key=api_key),
     system_prompt="test",
     disallowed_tools=list(disallowed_tools or []),
+    mcp_server_configs=mcp_server_configs,
     on_tool_result=on_tool_result,
+    run_context=run_context,
+    skill_run_id=skill_run_id,
+    max_tokens_override=max_tokens_override,
   )
+
+
+def test_sdk_post_tool_use_replaces_model_output_with_sanitized_projection() -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-CODEX-SDK-8f21d7"
+  runner = _make_runner(api_key=secret)
+
+  hook_result = _run(
+    runner._post_tool_use_hook(
+      {
+        "tool_name": "lookup",
+        "tool_input": {"query": "ordinary"},
+        "result": json.dumps({"status": "ok", "credential": secret}),
+      },
+      "tool-secret",
+      None,
+    )
+  )
+
+  serialized = json.dumps(hook_result)
+  assert secret not in serialized
+  assert "<redacted-secret>" in serialized
+
+
+def test_sdk_post_tool_failure_blocks_raw_secret_from_model_continuation() -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-CODEX-SDK-ERROR-8f21d7"
+  runner = _make_runner(api_key=secret)
+
+  hook_result = _run(
+    runner._post_tool_use_failure_hook(
+      {
+        "tool_name": "lookup",
+        "tool_input": {"query": "ordinary"},
+        "error": f"provider rejected credential {secret}",
+      },
+      "tool-secret-error",
+      None,
+    )
+  )
+
+  serialized = json.dumps(hook_result)
+  assert hook_result["decision"] == "block"
+  assert secret not in serialized
+  assert "<redacted-secret>" in serialized
+
+
+def test_sdk_runner_projects_max_tokens_override_to_pinned_sdk_environment() -> None:
+  runner = _make_runner(max_tokens_override=32000)
+
+  assert runner._max_tokens_override == 32000
+  assert runner._credential_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32000"
+
+
+def test_sdk_runner_denies_forged_same_server_tool_outside_advertised_stage_scope(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+
+  class _StageMcpConfigs(dict[str, Any]):
+    sdk_admission_enforced = True
+    advertised_mcp_tool_ids_by_server = {
+      "research-corpus-mcp": {
+        "mcp__research-corpus-mcp__filings_read",
+      }
+    }
+
+  runner = _make_runner(
+    mcp_server_configs=_StageMcpConfigs({
+      "research-corpus-mcp": {"command": "research-corpus"},
+    })
+  )
+
+  allowed = _run(
+    runner._can_use_tool_callback(
+      "mcp__research-corpus-mcp__filings_read",
+      {},
+      None,
+    )
+  )
+  denied = _run(
+    runner._can_use_tool_callback(
+      "mcp__research-corpus-mcp__transcripts_read",
+      {},
+      None,
+    )
+  )
+
+  assert allowed.behavior == "allow"
+  assert denied.behavior == "deny"
+  assert "not available in this context" in denied.message
 
 
 def test_sdk_runner_static_disallowed_tool_denied_without_approval(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -166,6 +297,43 @@ def test_sdk_runner_static_disallowed_tool_denied_without_approval(monkeypatch: 
 
   allowed = _run(callback("file_read", {"path": "x"}, None))
   assert allowed.behavior == "allow"
+
+
+def test_sdk_runner_executes_report_admission_with_same_carried_run_identity(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  state = _install_fake_agent_sdk(monkeypatch)
+  run_context = RunContext(
+    user_id="alice",
+    request_id="request-sdk-report",
+    session_id="sess-sdk-report",
+    run_id="skill-run-sdk-report",
+  )
+  runner = _make_runner(
+    run_context=run_context,
+    skill_run_id="skill-run-sdk-report",
+  )
+
+  _run(runner.run([{"role": "user", "content": "report the build"}]))
+
+  callback = state.options[0].kwargs["can_use_tool"]
+  decision = _run(callback("fms_report_build_model", {}, None))
+  assert decision.behavior == "allow"
+  assert runner._resolve_run_context().run_id == "skill-run-sdk-report"
+
+
+def test_sdk_runner_report_admission_fails_closed_without_carrier(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  runner = _make_runner()
+
+  decision = _run(
+    runner._can_use_tool_callback("fms_report_build_model", {}, None)
+  )
+
+  assert decision.behavior == "deny"
+  assert "[run_identity_required]" in decision.message
 
 
 def test_sdk_runner_stale_prefixed_mcp_tool_denied_without_approval(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -215,8 +383,7 @@ def test_sdk_runner_stale_prefixed_mcp_tool_policy_import_drift_fails_loud(
 @pytest.mark.parametrize(
   "tool_name",
   [
-    "merge_diligence_pr",
-    "mcp__portfolio-proposals-local__merge_diligence_pr",
+    "promote_reviewed_change",
   ],
 )
 @pytest.mark.parametrize("lifecycle_configured", [False, True])
@@ -226,6 +393,11 @@ def test_sdk_runner_promotion_saga_requires_owner_control_route_before_approval(
   lifecycle_configured: bool,
 ) -> None:
   _install_fake_agent_sdk(monkeypatch)
+  monkeypatch.setattr(
+    sdk_runner_approval,
+    "constraint_for_catalog_tool",
+    lambda _tool_name: "fresh_human_owner",
+  )
   calls: list[str] = []
 
   class Store:
@@ -257,7 +429,7 @@ def test_sdk_runner_promotion_saga_requires_owner_control_route_before_approval(
   denied = _run(
     runner._can_use_tool_callback(
       tool_name,
-      {"pr_id": "dpr-1", "confirm_merge": True},
+      {"change_id": "change-1", "confirm": True},
       None,
     )
   )
@@ -338,12 +510,11 @@ def test_sdk_runner_relay_policy_denial_uses_machine_readable_message(
       event_log=EventLog(),
       session_id=session.session_id,
       sdk_config=AgentSDKConfig(
-        api_key="k",
-        model="claude-sonnet-4-6",
         user_id="alice",
         billing_mode="byok",
         rate_table_version="unknown",
       ),
+      capability_execution=stub_sdk_capability_execution(),
       system_prompt="test",
       session=session,
       store=store,
@@ -443,12 +614,11 @@ def test_sdk_batch_admission_cancel_before_pending_publish_aborts_durable_row(
       event_log=EventLog(),
       session_id=session.session_id,
       sdk_config=AgentSDKConfig(
-        api_key="k",
-        model="claude-sonnet-4-6",
         user_id="alice",
         billing_mode="byok",
         rate_table_version="unknown",
       ),
+      capability_execution=stub_sdk_capability_execution(),
       system_prompt="test",
       session=session,
       store=store,
@@ -618,12 +788,11 @@ def test_sdk_runner_policy_modified_input_behavior_is_unchanged(
     event_log=EventLog(),
     session_id=session.session_id,
     sdk_config=AgentSDKConfig(
-      api_key="k",
-      model="claude-sonnet-4-6",
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
     ),
+    capability_execution=stub_sdk_capability_execution(),
     system_prompt="test",
     session=session,
     store=store,
@@ -638,6 +807,82 @@ def test_sdk_runner_policy_modified_input_behavior_is_unchanged(
   assert original == {"path": "raw"}
   assert len(resolved) == 1
   assert resolved[0].state == "auto_approved"
+
+
+def test_sdk_approval_persists_exact_secret_safe_projection_but_policy_receives_raw_input(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-SDK-APPROVAL-8f21d7"
+  original = {
+    "path": "/Users/alice/Documents/report.xlsx",
+    "credential": secret,
+    "api_key_set": True,
+    "note": "Ordinary api_key discussion and sk-example text.",
+  }
+
+  class _Policy:
+    policy_bundle_hash = "test-policy"
+
+    def __init__(self) -> None:
+      self.raw_args: dict[str, Any] | None = None
+      self.request: ApprovalRequest | None = None
+
+    async def decide(
+      self,
+      *,
+      payload: ApprovalRequestPayload,
+      request: ApprovalRequest,
+      run_context: RunContext,
+    ) -> PolicyApprovalDecision:
+      _ = run_context
+      self.raw_args = dict(payload.tool_args)
+      self.request = request
+      return PolicyApprovalDecision(
+        outcome="auto_approve",
+        reason="approved",
+      )
+
+    async def on_resolve(self, *, request: ApprovalRequest) -> None:
+      _ = request
+
+  store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+  policy = _Policy()
+  session = SessionStore(ttl=3600).create_session(
+    api_key_hash="hash",
+    user_id="alice",
+  )
+  runner = AgentSDKRunner(
+    event_log=EventLog(),
+    session_id=session.session_id,
+    sdk_config=AgentSDKConfig(
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    ),
+    capability_execution=stub_sdk_capability_execution(api_key=secret),
+    system_prompt="test",
+    session=session,
+    store=store,
+    policy=policy,
+  )
+
+  allowed = _run(runner._can_use_tool_callback("file_write", original, None))
+
+  assert allowed.behavior == "allow"
+  assert policy.raw_args == original
+  assert policy.request is not None
+  expected_projection = {
+    **original,
+    "credential": "<redacted-secret>",
+  }
+  assert policy.request.tool_args_redacted == expected_projection
+  stored = _run(store.get(policy.request.approval_id))
+  assert stored is not None
+  assert stored.tool_args_redacted == expected_projection
+  assert secret not in json.dumps(stored.tool_args_redacted)
+  assert original["credential"] == secret
 
 
 def test_sdk_runner_trade_approval_record_includes_preview_summary(
@@ -714,12 +959,11 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
       event_log=event_log,
       session_id=session.session_id,
       sdk_config=AgentSDKConfig(
-        api_key="k",
-        model="claude-sonnet-4-6",
         user_id="alice",
         billing_mode="byok",
         rate_table_version="unknown",
       ),
+      capability_execution=stub_sdk_capability_execution(),
       system_prompt="test",
       session=session,
       store=store,
@@ -771,7 +1015,9 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
   _run(_case())
 
 
-def test_sdk_runner_opted_in_skill_result_activates_write_tool_deny(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sdk_runner_opted_in_skill_result_activates_exact_allow_and_write_deny(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
   _install_fake_agent_sdk(monkeypatch)
   contexts = []
 
@@ -779,10 +1025,14 @@ def test_sdk_runner_opted_in_skill_result_activates_write_tool_deny(monkeypatch:
     contexts.append(ctx)
     return []
 
-  runner = _make_runner(on_tool_result=_on_tool_result)
+  runner = _make_runner(
+    on_tool_result=_on_tool_result,
+    disallowed_tools=["start_investment_run"],
+  )
   result = {
     "skill": "phase0-agent",
     "content": "Do the work.",
+    _ACTIVE_SKILL_ALLOW_RESULT_KEY: ["start_investment_run"],
     _ACTIVE_SKILL_DENY_RESULT_KEY: ["file_write"],
   }
 
@@ -799,13 +1049,22 @@ def test_sdk_runner_opted_in_skill_result_activates_write_tool_deny(monkeypatch:
   )
 
   assert hook_result == {}
+  assert runner._active_skill_allow == {"start_investment_run"}
   assert runner._active_skill_deny == {"file_write"}
   assert contexts[0].result == {"skill": "phase0-agent", "content": "Do the work."}
+  assert _ACTIVE_SKILL_ALLOW_RESULT_KEY not in contexts[0].result
   assert _ACTIVE_SKILL_DENY_RESULT_KEY not in contexts[0].result
+
+  allowed = _run(runner._can_use_tool_callback("start_investment_run", {}, None))
+  assert allowed.behavior == "allow"
 
   denied = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
   assert denied.behavior == "deny"
   assert denied.message == "Tool 'file_write' is not available in this context"
+
+  runner._activate_skill_deny(["start_investment_run"])
+  denied_again = _run(runner._can_use_tool_callback("start_investment_run", {}, None))
+  assert denied_again.behavior == "deny"
 
 
 def test_sdk_runner_legacy_skill_result_does_not_activate_active_skill_gate(
@@ -852,19 +1111,19 @@ def test_sdk_runner_active_skill_deny_replaces_existing_set(monkeypatch: pytest.
 def test_sdk_runner_report_door_clears_active_skill_gate(monkeypatch: pytest.MonkeyPatch) -> None:
   _install_fake_agent_sdk(monkeypatch)
   runner = _make_runner()
-  runner._active_skill_deny = {"emit_html_artifact"}
+  runner._active_skill_deny = {"emit_canvas_artifact"}
   set_current_skill("sniff-test")
 
   try:
     invoke_result = {
       "skill": "sniff-test",
       "content": "Do the sniff test.",
-      _ACTIVE_SKILL_DENY_RESULT_KEY: ["emit_html_artifact"],
+      _ACTIVE_SKILL_DENY_RESULT_KEY: ["emit_canvas_artifact"],
       _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY: {"fms_report_sniff_test": "sniff-test"},
     }
     stripped = runner._consume_private_tool_result_fields(invoke_result)
     assert stripped == {"skill": "sniff-test", "content": "Do the sniff test."}
-    assert runner._active_skill_deny == {"emit_html_artifact"}
+    assert runner._active_skill_deny == {"emit_canvas_artifact"}
     assert runner._active_skill_report_doors == {"fms_report_sniff_test": "sniff-test"}
 
     result = {
@@ -954,7 +1213,7 @@ def test_sdk_runner_report_door_semantic_error_does_not_clear_active_skill_gate(
 ) -> None:
   _install_fake_agent_sdk(monkeypatch)
   runner = _make_runner()
-  runner._active_skill_deny = {"emit_html_artifact"}
+  runner._active_skill_deny = {"emit_canvas_artifact"}
   runner._active_skill_report_doors = {"fms_report_sniff_test": "sniff-test"}
   set_current_skill("sniff-test")
 
@@ -971,7 +1230,7 @@ def test_sdk_runner_report_door_semantic_error_does_not_clear_active_skill_gate(
     )
 
     assert cleared is False
-    assert runner._active_skill_deny == {"emit_html_artifact"}
+    assert runner._active_skill_deny == {"emit_canvas_artifact"}
     assert runner._active_skill_report_doors == {"fms_report_sniff_test": "sniff-test"}
     assert current_skill() == "sniff-test"
   finally:

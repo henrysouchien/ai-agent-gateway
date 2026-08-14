@@ -11,7 +11,6 @@ class UiBlocksCapability(Protocol):
   """Structural type for the client contract capability pinned to a run."""
 
   contract_version: int
-  manifest_digest: str
 
 
 ResultT = TypeVar("ResultT")

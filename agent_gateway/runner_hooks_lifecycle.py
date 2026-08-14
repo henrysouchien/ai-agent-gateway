@@ -5,11 +5,13 @@ import time
 from typing import Any, Dict, List
 
 from .auth import ProviderCredentialFailure
+from .capability_execution import BoundCapabilityExecution
 from .multi_user.billing import SessionUsageSummary, UsageEvent
 from .runner_auth import (
   call_credential_refresher as _call_credential_refresher,
   merge_refreshed_auth_config as _merge_refreshed_auth_config,
 )
+from .secret_boundary import SecretBoundary
 from .runner_callbacks import (
   call_before_stream_complete_hook as _call_before_stream_complete_hook,
   call_metric_hook as _call_metric_hook,
@@ -18,7 +20,7 @@ from .runner_callbacks import (
 )
 from .runner_background_lifecycle import _runner_module_attr
 from .runner_session_lifecycle import _runner_attr
-from .runner_state import ToolResultContext
+from .runner_state import ToolResultContext, normalized_run_config
 from .runner_usage import (
   build_usage_event as _build_usage_event,
   call_late_usage_event_hook as _call_late_usage_event_hook,
@@ -104,16 +106,50 @@ class RunnerHooksLifecycleMixin:
     )
 
   def _apply_refreshed_auth_config(self, config: Dict[str, Any], refreshed: Dict[str, Any]) -> None:
-    active_config = dict(config)
+    execution = getattr(self, "_capability_execution", None)
+    if not isinstance(execution, BoundCapabilityExecution):
+      raise RuntimeError(
+        "credential refresh requires an immutable capability execution"
+      )
+    execution.validate()
+    active_config = dict(self._auth_config)
     if getattr(self, "_billing_mode", None):
       active_config["billing_mode"] = self._billing_mode
     if getattr(self, "_rate_table_version", None):
       active_config["rate_table_version"] = self._rate_table_version
     merged = _runner_attr(self, "_merge_refreshed_auth_config", _merge_refreshed_auth_config)(active_config, refreshed)
+    refreshed_execution = BoundCapabilityExecution(
+      bind=execution.bind,
+      registry=execution.registry,
+      adapter=execution.adapter,
+      auth_config=merged,
+    )
+    refreshed_run_config = normalized_run_config(
+      refreshed_execution.auth_config,
+      upstream_model=refreshed_execution.bind.upstream_model,
+      effort=refreshed_execution.bind.effort,
+    )
     config.clear()
-    config.update(merged)
+    config.update(refreshed_run_config)
     self._auth_config.clear()
-    self._auth_config.update(merged)
+    self._auth_config.update(refreshed_execution.auth_config)
+    self._provider = refreshed_execution.provider
+    self._capability_execution = refreshed_execution
+    current_boundary = getattr(self, "_secret_boundary", None)
+    self._secret_boundary = (
+      current_boundary.extended_for_capability_execution(
+        refreshed_execution
+      )
+      if isinstance(current_boundary, SecretBoundary)
+      else SecretBoundary.from_capability_execution(refreshed_execution)
+    )
+    bind_dispatcher_boundary = getattr(
+      getattr(self, "_dispatcher", None),
+      "bind_secret_boundary",
+      None,
+    )
+    if callable(bind_dispatcher_boundary):
+      bind_dispatcher_boundary(self._secret_boundary)
 
   @staticmethod
   def _usage_has_tokens(usage_totals: Dict[str, int]) -> bool:

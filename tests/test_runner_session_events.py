@@ -22,6 +22,7 @@ from agent_gateway.runner_session_events import (  # noqa: E402
   build_budget_exceeded_event,
   build_budget_exceeded_text_event,
   build_chat_done_log_data,
+  build_context_pressure_reminder,
   build_context_warning_log_data,
   build_detach_event,
   build_error_event,
@@ -49,6 +50,13 @@ from agent_gateway.runner_session_events import (  # noqa: E402
   shutdown_interrupted_reason,
   write_lease_metadata,
 )
+
+
+def test_context_pressure_reminder_copy_is_model_actionable() -> None:
+  assert build_context_pressure_reminder(pct=60) == (
+    "Context at 60% — prefer delegating further reading; "
+    "large results will spill."
+  )
 
 
 def _run(coro):
@@ -282,6 +290,44 @@ def test_session_event_builders_copy_inputs_and_shape_payloads() -> None:
   }
 
 
+def test_assistant_message_event_records_exact_logical_response_lineage() -> None:
+  origin = build_assistant_message_event(
+    content_blocks=[{"type": "text", "text": "first"}],
+    stop_reason="max_tokens",
+    model="model-1",
+    provider="stub",
+    usage={},
+    logical_response_id="logical-1",
+    logical_response_segment_ordinal=0,
+  )
+  continuation = build_assistant_message_event(
+    content_blocks=[{"type": "text", "text": "second"}],
+    stop_reason="end_turn",
+    model="model-1",
+    provider="stub",
+    usage={},
+    logical_response_id="logical-1",
+    logical_response_segment_ordinal=1,
+    continued_from_assistant_message_seq=17,
+  )
+
+  assert origin["logical_response_id"] == "logical-1"
+  assert origin["logical_response_segment_ordinal"] == 0
+  assert "continued_from_assistant_message_seq" not in origin
+  assert continuation["logical_response_segment_ordinal"] == 1
+  assert continuation["continued_from_assistant_message_seq"] == 17
+
+  with pytest.raises(ValueError, match="requires logical_response_id"):
+    build_assistant_message_event(
+      content_blocks=[],
+      stop_reason="end_turn",
+      model="model-1",
+      provider="stub",
+      usage={},
+      logical_response_segment_ordinal=0,
+    )
+
+
 def test_write_lease_metadata_helper_writes_only_for_active_writer(tmp_path: Path) -> None:
   lease_path = tmp_path / "session.jsonl.write_lease.meta"
   session_log = SimpleNamespace(write_lease_meta_path=lease_path)
@@ -336,8 +382,6 @@ def test_runner_write_lease_metadata_delegates_to_session_event_helper(
 
   monkeypatch.setattr(gateway_runner.time, "time", lambda: 3.5)
   monkeypatch.setattr(gateway_runner.socket, "gethostname", lambda: "host")
-
-  assert gateway_runner._write_lease_metadata is write_lease_metadata
 
   runner._write_lease_metadata()
 
@@ -428,7 +472,11 @@ def test_stub_response_events_build_text_chunks_and_terminal_event() -> None:
   assert "".join(event.get("text", "") for event in events if event.get("type") == "text_delta") == (
     "Stub response (no Stub credential configured). You asked: latest prompt "
   )
-  assert events[-1] == {"type": "stream_complete", "usage": {}}
+  assert events[-1] == {
+    "type": "stream_complete",
+    "terminal_disposition": "completed",
+    "usage": {},
+  }
 
 
 def test_stub_response_events_default_prompt_without_user_message() -> None:
@@ -575,6 +623,7 @@ def test_run_terminal_and_limit_event_builders_shape_payloads() -> None:
   }
   assert build_stream_complete_event(usage_totals=usage, estimated_cost=0.12345) == {
     "type": "stream_complete",
+    "terminal_disposition": "completed",
     "usage": {
       "input_tokens": 10,
       "output_tokens": 20,
@@ -898,5 +947,9 @@ def test_runner_stub_response_delegate_appends_built_events(monkeypatch) -> None
   _run(AgentRunner._emit_stub_response(runner, [{"role": "user", "content": "hello"}]))
 
   assert [event["type"] for event in appended][-1] == "stream_complete"
-  assert appended[-1] == {"type": "stream_complete", "usage": {}}
+  assert appended[-1] == {
+    "type": "stream_complete",
+    "terminal_disposition": "completed",
+    "usage": {},
+  }
   assert sleep_delays == [0.05] * (len(appended) - 1)

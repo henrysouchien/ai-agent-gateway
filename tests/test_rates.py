@@ -9,7 +9,12 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.rates import ModelRates, UnknownModelError, load_rate_table
+from agent_gateway.rates import (
+  ModelRates,
+  UnknownModelError,
+  load_rate_table,
+  resolve_configured_rates_file,
+)
 
 
 def _write_rate_table(tmp_path: Path, payload: dict) -> Path:
@@ -82,6 +87,43 @@ def test_load_rate_table_kwarg_wins_over_env(monkeypatch: pytest.MonkeyPatch, tm
   assert table.version == "kwarg-version"
 
 
+def test_explicit_rate_path_precedes_invalid_relative_env(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  path = _write_rate_table(tmp_path, _base_payload(version="explicit-version"))
+  monkeypatch.setenv("AGENT_GATEWAY_RATES_FILE", "relative/rates.json")
+
+  assert load_rate_table(path).version == "explicit-version"
+
+
+def test_configured_rates_file_rejects_relative_path() -> None:
+  with pytest.raises(
+    ValueError,
+    match="AGENT_GATEWAY_RATES_FILE must configure an absolute path",
+  ):
+    resolve_configured_rates_file({
+      "AGENT_GATEWAY_RATES_FILE": "relative/rates.json",
+    })
+
+
+def test_configured_rates_file_expands_user_identically(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setenv("HOME", str(tmp_path))
+  configured = resolve_configured_rates_file({
+    "AGENT_GATEWAY_RATES_FILE": "~/rates.json",
+  })
+
+  assert configured == tmp_path / "rates.json"
+
+
+def test_configured_rates_file_unset_or_blank_returns_none() -> None:
+  assert resolve_configured_rates_file({}) is None
+  assert resolve_configured_rates_file({"AGENT_GATEWAY_RATES_FILE": "  "}) is None
+
+
 def test_lookup_exact_match_returns_model_rates() -> None:
   table = load_rate_table(None)
 
@@ -117,7 +159,21 @@ def test_lookup_opus48_returns_bundled_model_rates() -> None:
   assert rates.output_cost_per_mtok == 25.0
   assert rates.cache_read_cost_per_mtok == 0.5
   assert rates.cache_write_cost_per_mtok == 6.25
-  assert rates.max_tokens == 32_000
+  assert rates.max_tokens == 128_000
+  assert rates.context_window == 1_000_000
+
+
+def test_lookup_opus5_returns_bundled_model_rates() -> None:
+  table = load_rate_table(None)
+
+  rates = table.lookup("anthropic", "claude-opus-5")
+
+  assert rates.display_name == "Claude Opus 5"
+  assert rates.input_cost_per_mtok == 5.0
+  assert rates.output_cost_per_mtok == 25.0
+  assert rates.cache_read_cost_per_mtok == 0.5
+  assert rates.cache_write_cost_per_mtok == 6.25
+  assert rates.max_tokens == 128_000
   assert rates.context_window == 1_000_000
 
 

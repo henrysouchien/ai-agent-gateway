@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 import uuid
 from pathlib import Path
@@ -9,8 +10,13 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 
+from agent_gateway.capability_binding import CapabilityResolutionError
 from agent_gateway.event_log import EventLog
-from agent_gateway.session import GatewaySession
+from agent_gateway.runner_introspection import exception_traceback_already_logged
+from agent_gateway.session import (
+  GatewaySession,
+  session_owner_user_id,
+)
 
 from .runs_helpers import (
   ChatMessage,
@@ -23,6 +29,9 @@ from .runs_helpers import (
   _session_has_cancel_event,
   _state_from_session,
 )
+
+log = logging.getLogger(__name__)
+
 
 def _require_control_session(session: GatewaySession) -> None:
   if session.kind != "control":
@@ -94,12 +103,20 @@ async def _maybe_call_on_event(callback: Any, event: dict[str, Any], control_run
     await result
 
 
-async def _publish_control_event(app_state: Any, user_id: str, control_run_id: str, event: dict[str, Any]) -> None:
+async def _publish_control_event(
+  app_state: Any,
+  session: GatewaySession,
+  control_run_id: str,
+  event: dict[str, Any],
+) -> None:
   event_copy = _event_for_run(event, control_run_id)
   user_event_bus = getattr(app_state, "user_event_bus", None)
   if user_event_bus is not None:
-    await user_event_bus.publish(
-      user_id=user_id,
+    publisher = getattr(user_event_bus, "publish", None)
+    if not callable(publisher):
+      raise RuntimeError("session event delivery bus is unavailable")
+    await publisher(
+      user_id=session_owner_user_id(session),
       control_run_id=control_run_id,
       event=event_copy,
     )
@@ -107,10 +124,20 @@ async def _publish_control_event(app_state: Any, user_id: str, control_run_id: s
   await _maybe_call_on_event(getattr(config, "on_event", None), event_copy, control_run_id)
 
 
-async def _cleanup_run_buffer(app_state: Any, user_id: str, control_run_id: str) -> None:
+async def _cleanup_run_buffer(
+  app_state: Any,
+  session: GatewaySession,
+  control_run_id: str,
+) -> None:
   user_event_bus = getattr(app_state, "user_event_bus", None)
   if user_event_bus is not None:
-    await user_event_bus.cleanup_run(user_id, control_run_id)
+    cleanup = getattr(user_event_bus, "cleanup_run", None)
+    if not callable(cleanup):
+      raise RuntimeError("session event delivery cleanup is unavailable")
+    await cleanup(
+      session_owner_user_id(session),
+      control_run_id,
+    )
 
 
 async def _record_chat_parent_message_event(
@@ -147,7 +174,12 @@ async def _record_chat_parent_message_event(
     "ts": sent_at,
   }
   session.event_history.append(event)
-  await _publish_control_event(app_state, _session_owner_user_id(session), control_run_id, event)
+  await _publish_control_event(
+    app_state,
+    session,
+    control_run_id,
+    event,
+  )
 
 
 async def _cancel_control_chat_background_tasks(
@@ -193,15 +225,29 @@ async def _finalize_control_chat_task(
     state = str(getattr(result, "state", "") or _state_from_session(session, session.event_history.snapshot()))
   except asyncio.CancelledError:
     state = "cancelled"
-  except Exception:
+  except Exception as exc:
+    log.warning(
+      "control chat turn dispatch failed for %s: %s",
+      session.session_id,
+      exc,
+      exc_info=None if exception_traceback_already_logged(exc) else exc,
+    )
     state = "failed"
   finally:
     session.control_chat_tasks.pop(task_key, None)
     if _session_has_cancel_event(session):
-      await _cleanup_run_buffer(app_state, _session_owner_user_id(session), session.session_id)
+      await _cleanup_run_buffer(
+        app_state,
+        session,
+        session.session_id,
+      )
       return
     if state not in {"approval_pending", "running", "starting"}:
-      await _cleanup_run_buffer(app_state, _session_owner_user_id(session), session.session_id)
+      await _cleanup_run_buffer(
+        app_state,
+        session,
+        session.session_id,
+      )
 
 
 async def _dispatch_control_chat_turn(
@@ -211,12 +257,15 @@ async def _dispatch_control_chat_turn(
   messages: list[ChatMessage],
   request_id: str | None,
   context: dict[str, Any],
-  model: str | None,
+  model_key: str | None,
+  effort: str | None,
+  catalog_revision: str | None,
   deadline_sec: int | None,
   record_parent_message: bool = False,
 ) -> ChatRunResponse:
   from agent_gateway.server import ChatMessage as ServerChatMessage
   from agent_gateway.server import ChatTurnInputs, _dispatch_chat_turn
+  from agent_gateway.server_chat_helpers import prepare_session_driver_turn
 
   app_state = request.app.state
   control_run_id = session.session_id
@@ -225,9 +274,35 @@ async def _dispatch_control_chat_turn(
     message if isinstance(message, ServerChatMessage) else ServerChatMessage(role=message.role, content=message.content)
     for message in messages
   ]
+  inputs = ChatTurnInputs(
+    messages=server_messages,
+    request_id=request_id,
+    context=dict(context),
+    metadata=None,
+    model_key=model_key,
+    effort=effort,
+    catalog_revision=catalog_revision,
+  )
   if record_parent_message:
     if session.stream_active or (session.active_turn is not None and session.active_turn.is_running):
       raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
+
+  try:
+    prepared_turn = prepare_session_driver_turn(
+      session,
+      inputs,
+      build_chat_runtime=app_state.gateway_build_chat_runtime,
+    )
+  except CapabilityResolutionError as exc:
+    raise HTTPException(
+      status_code=400,
+      detail={
+        **exc.receipt(),
+        "message": str(exc),
+      },
+    ) from exc
+
+  if record_parent_message:
     await _record_chat_parent_message_event(
       app_state=app_state,
       session=session,
@@ -237,11 +312,16 @@ async def _dispatch_control_chat_turn(
 
   async def _on_event(event: dict[str, Any]) -> None:
     event_with_run = _event_for_run(event, control_run_id)
-    await _publish_control_event(app_state, _session_owner_user_id(session), control_run_id, event_with_run)
+    await _publish_control_event(
+      app_state,
+      session,
+      control_run_id,
+      event_with_run,
+    )
     if event_with_run.get("type") == "tool_approval_request":
       await _publish_control_event(
         app_state,
-        _session_owner_user_id(session),
+        session,
         control_run_id,
         _run_state_event(control_run_id, "approval_pending"),
       )
@@ -251,19 +331,14 @@ async def _dispatch_control_chat_turn(
   dispatch_task = asyncio.create_task(
     _dispatch_chat_turn(
       session,
-      ChatTurnInputs(
-        messages=server_messages,
-        request_id=request_id,
-        context=dict(context),
-        metadata=None,
-        model=model,
-      ),
+      inputs,
       event_log=event_log,
       on_event=_on_event,
       build_chat_runtime=app_state.gateway_build_chat_runtime,
-      credentials_resolver=getattr(getattr(app_state, "gateway_config", None), "credentials_refresh_resolver", None),
       transcript_dir=_transcript_dir_from_app_state(app_state),
       publish_lifecycle_events=True,
+      prepared_turn=prepared_turn,
+      required_event_delivery=False,
     )
   )
   task_key = f"control_chat_turn:{control_run_id}:{id(dispatch_task)}"
@@ -284,7 +359,11 @@ async def _dispatch_control_chat_turn(
     result = await dispatch_task
     state = str(getattr(result, "state", "") or _state_from_session(session, session.event_history.snapshot()))
     if state not in {"approval_pending", "running", "starting"}:
-      await _cleanup_run_buffer(app_state, _session_owner_user_id(session), control_run_id)
+      await _cleanup_run_buffer(
+        app_state,
+        session,
+        control_run_id,
+      )
     return _chat_run_from_session(session)
 
   if pending_task in done:

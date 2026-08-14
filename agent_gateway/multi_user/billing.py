@@ -9,12 +9,21 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from agent_workflow_contracts import CapabilityBind
+
 
 DEFAULT_USAGE_DLQ_PATH = Path("~/.gateway/usage_dlq.jsonl").expanduser()
 
 
 @dataclass(frozen=True)
 class UsageEvent:
+  """Secret-free usage observation with admitted and reported identity split.
+
+  ``capability_bind`` is the authoritative admitted identity receipt.  The
+  compatibility ``model`` and ``provider`` projections must exactly match it
+  and are never replaced with ``provider_reported_model``.
+  """
+
   user_id: str
   session_id: str
   request_id: str
@@ -29,15 +38,32 @@ class UsageEvent:
   rate_table_version: str
   billing_mode: Literal["byok", "metered"]
   channel: str | None
+  provider: str
+  capability_bind: dict[str, str]
+  provider_reported_model: str | None
   reasoning_tokens_observed: int | None = None
   provider_reported_cost_usd: str | None = None
   separately_billed_tool_cost_usd: str = "0"
   provider_units: str | int | float | None = None
   provider_unit_deltas: dict[str, int] | None = None
   is_batch: bool = False
-  provider: str | None = None
   product_id: str | None = None
   event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+  def __post_init__(self) -> None:
+    bind = CapabilityBind.from_receipt(self.capability_bind)
+    if self.model != bind.upstream_model:
+      raise ValueError("usage model projection differs from capability bind")
+    if self.provider != bind.provider:
+      raise ValueError("usage provider projection differs from capability bind")
+    object.__setattr__(self, "capability_bind", bind.receipt())
+    if self.provider_reported_model is not None:
+      if not isinstance(self.provider_reported_model, str):
+        raise ValueError("provider_reported_model must be a string when present")
+      reported = self.provider_reported_model.strip()
+      if not reported:
+        raise ValueError("provider_reported_model must be non-empty when present")
+      object.__setattr__(self, "provider_reported_model", reported)
 
 
 @dataclass(frozen=True)
@@ -71,6 +97,42 @@ class SessionUsageSummary:
   context_surfaces: list[dict[str, Any]] = field(default_factory=list)
   usage_event_count: int = 0
   usage_event_ids: tuple[str, ...] = ()
+  compaction_count: int = 0
+  capability_bind: dict[str, str] | None = None
+  provider_reported_model: str | None = None
+
+  def __post_init__(self) -> None:
+    if self.usage_event_count < 0:
+      raise ValueError("usage_event_count cannot be negative")
+    if self.capability_bind is not None:
+      if self.usage_event_count == 0:
+        raise ValueError(
+          "usage summaries with a capability bind require provider observations"
+        )
+      bind = CapabilityBind.from_receipt(self.capability_bind)
+      if self.model is not None and self.model != bind.upstream_model:
+        raise ValueError("usage summary model projection differs from capability bind")
+      if self.provider is not None and self.provider != bind.provider:
+        raise ValueError("usage summary provider projection differs from capability bind")
+      object.__setattr__(self, "capability_bind", bind.receipt())
+      object.__setattr__(self, "model", bind.upstream_model)
+      object.__setattr__(self, "provider", bind.provider)
+    elif (
+      self.usage_event_count
+      or self.model is not None
+      or self.provider is not None
+      or self.provider_reported_model is not None
+    ):
+      raise ValueError(
+        "usage summaries with provider observations require a capability bind"
+      )
+    if self.provider_reported_model is not None:
+      if not isinstance(self.provider_reported_model, str):
+        raise ValueError("provider_reported_model must be a string when present")
+      reported = self.provider_reported_model.strip()
+      if not reported:
+        raise ValueError("provider_reported_model must be non-empty when present")
+      object.__setattr__(self, "provider_reported_model", reported)
 
 
 @dataclass
@@ -145,7 +207,10 @@ class _UsageAggregator:
     self._turns = 0
     self._last_model: str | None = None
     self._last_provider: str | None = None
+    self._last_capability_bind: dict[str, str] | None = None
+    self._last_provider_reported_model: str | None = None
     self._event_ids: list[str] = []
+    self._compaction_count = 0
     self._closed = False
 
   async def record(self, event: UsageEvent) -> bool:
@@ -160,8 +225,17 @@ class _UsageAggregator:
       self._turns += 1
       self._last_model = event.model
       self._last_provider = event.provider
+      self._last_capability_bind = dict(event.capability_bind)
+      self._last_provider_reported_model = event.provider_reported_model
       self._event_ids.append(event.event_id)
       return True
+
+  def record_compaction_nowait(self) -> bool:
+    """Record one live compaction on the aggregator's owning event loop."""
+    if self._closed:
+      return False
+    self._compaction_count += 1
+    return True
 
   async def close(self) -> None:
     async with self._lock:
@@ -195,8 +269,11 @@ class _UsageAggregator:
         ended_at=ended_at if ended_at is not None else time.time(),
         drain_complete=drain_complete,
         in_flight_task_count=in_flight_task_count,
+        compaction_count=self._compaction_count,
         model=self._last_model,
         provider=self._last_provider,
+        capability_bind=self._last_capability_bind,
+        provider_reported_model=self._last_provider_reported_model,
         rate_table_version=self._rate_table_version,
         billing_mode=self._billing_mode,
         context_surfaces=[
@@ -259,6 +336,8 @@ class SqliteUsageLedger:
         timestamp REAL NOT NULL,
         model TEXT NOT NULL,
         provider TEXT,
+        capability_bind_json TEXT,
+        provider_reported_model TEXT,
         input_tokens INTEGER NOT NULL,
         output_tokens INTEGER NOT NULL,
         cache_read_tokens INTEGER NOT NULL,
@@ -273,6 +352,9 @@ class SqliteUsageLedger:
     columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(usage_events)").fetchall()}
     if "provider" not in columns:
       conn.execute("ALTER TABLE usage_events ADD COLUMN provider TEXT")
+    for column in ("capability_bind_json", "provider_reported_model"):
+      if column not in columns:
+        conn.execute(f"ALTER TABLE usage_events ADD COLUMN {column} TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_events(user_id, timestamp DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_user_mode ON usage_events(user_id, billing_mode, timestamp DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_request ON usage_events(request_id)")
@@ -295,6 +377,8 @@ class SqliteUsageLedger:
           timestamp,
           model,
           provider,
+          capability_bind_json,
+          provider_reported_model,
           input_tokens,
           output_tokens,
           cache_read_tokens,
@@ -303,7 +387,7 @@ class SqliteUsageLedger:
           rate_table_version,
           billing_mode,
           channel
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
           event.user_id,
@@ -313,6 +397,17 @@ class SqliteUsageLedger:
           event.timestamp,
           event.model,
           event.provider,
+          (
+            json.dumps(
+              event.capability_bind,
+              sort_keys=True,
+              separators=(",", ":"),
+              ensure_ascii=False,
+              allow_nan=False,
+            )
+            if event.capability_bind is not None else None
+          ),
+          event.provider_reported_model,
           event.input_tokens,
           event.output_tokens,
           event.cache_read_tokens,
@@ -414,7 +509,10 @@ def write_dlq(event: UsageEvent, spool_path: Path) -> None:
   spool_path = Path(spool_path).expanduser()
   spool_path.parent.mkdir(parents=True, exist_ok=True)
   with spool_path.open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps(asdict(event), sort_keys=True) + "\n")
+    handle.write(json.dumps({
+      "usage_event_schema_version": 2,
+      "event": asdict(event),
+    }, sort_keys=True) + "\n")
 
 
 async def replay_dlq(ledger: UsageLedger, spool_path: Path) -> dict:
@@ -432,7 +530,13 @@ async def replay_dlq(ledger: UsageLedger, spool_path: Path) -> dict:
     stats["total"] += 1
     try:
       payload = json.loads(line)
-      event = UsageEvent(**payload)
+      if (
+        not isinstance(payload, dict)
+        or payload.get("usage_event_schema_version") != 2
+        or not isinstance(payload.get("event"), dict)
+      ):
+        raise ValueError("usage DLQ envelope version is unsupported")
+      event = UsageEvent(**payload["event"])
     except Exception:
       stats["invalid"] += 1
       keep_lines.append(line)

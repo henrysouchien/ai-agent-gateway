@@ -129,6 +129,7 @@ _PROVIDER_SYMBOL_TICKER_TOOLS = frozenset({
   "get_financials",
   "get_metric",
   "get_metric_series",
+  "get_operational_kpi_driver_rows",
   "get_operational_kpi_drivers",
   "get_statement",
   "list_metrics",
@@ -159,7 +160,6 @@ def _resolve_mcp_config_path(config_path: Path | str | None | object = _UNSET) -
     config_path,
     unset=_UNSET,
     environ=os.environ,
-    home_factory=Path.home,
   )
 
 
@@ -377,6 +377,16 @@ def _startup_failure_from_exception(exc: BaseException) -> Dict[str, Any]:
   )
 
 
+def _preflight_stdio_executable(
+  command: str,
+  args: Sequence[str],
+  env: Mapping[str, str],
+) -> None:
+  missing = _config_helpers.resolve_missing_stdio_executable(command, args, env)
+  if missing is not None:
+    raise _error_helpers.McpExecutableMissingError(missing)
+
+
 @dataclass
 class _ServerState:
   name: str
@@ -395,6 +405,33 @@ class _PerUserServerState:
   last_used_at: float
   active_calls: int = 0
   draining: bool = False
+  binding_fingerprint: bytes | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PerUserGatewaySubject:
+  """Identity derived from an authenticated gateway session, never a caller id."""
+
+  user_id: str
+  user_email: str | None = None
+
+  @classmethod
+  def from_gateway_session(cls, session: Any) -> "_PerUserGatewaySubject":
+    from .session import GatewaySession
+
+    if not isinstance(session, GatewaySession):
+      raise ValueError("per-user MCP requires a gateway session")
+    risk_user_id = session.risk_user_id
+    owner_user_id = str(session.owner_user_id or "").strip()
+    if (
+      isinstance(risk_user_id, bool)
+      or not isinstance(risk_user_id, int)
+      or risk_user_id <= 0
+      or owner_user_id != str(risk_user_id)
+    ):
+      raise ValueError("gateway session has no canonical per-user subject")
+    user_email = str(session.user_email or "").strip().lower() or None
+    return cls(user_id=owner_user_id, user_email=user_email)
 
 
 class _PerUserMcpError(RuntimeError):
@@ -406,13 +443,14 @@ class _PerUserMcpError(RuntimeError):
 class McpClientManager:
   """Manage MCP server lifecycles and tool routing.
 
-  The manager can load servers from inline config, from `MCP_CONFIG_PATH`, from
-  `~/.claude.json`, or from an alternate config path. On startup it connects to
-  each allowed server, lists its tools, filters name collisions, and exposes a
-  merged tool catalog to the runner.
+  The manager can load servers from inline config, from `MCP_CONFIG_PATH`, or
+  from an explicit alternate config path. With none of those inputs, it loads
+  zero file-backed servers. On startup it connects to each allowed server,
+  lists its tools, filters name collisions, and exposes a merged tool catalog
+  to the runner.
 
   `inline_servers` is the easiest way to ship self-contained examples because it
-  avoids any dependency on the user's Claude desktop config.
+  avoids any dependency on a separate config file.
   """
 
   def __init__(
@@ -428,6 +466,9 @@ class McpClientManager:
     logical_tool_aliases: Dict[str, Dict[str, str]] | None = None,
     provider_ids_by_server: Dict[str, str] | None = None,
     server_env_passthrough: Mapping[str, Set[str]] | None = None,
+    per_user_env_resolver: Callable[
+      [str, str, str | None], Mapping[str, str]
+    ] | None = None,
     startup_timeout: int = 15,
     default_tool_timeout: int = 30,
     strip_input_fields: set[str] | None = None,
@@ -460,6 +501,8 @@ class McpClientManager:
       self._canonical_server_name(server_name): {str(env_name) for env_name in env_names}
       for server_name, env_names in dict(server_env_passthrough or {}).items()
     }
+    self._per_user_env_resolver = per_user_env_resolver
+    self._per_user_binding_hmac_key = os.urandom(32)
     self._logical_tool_definitions: Dict[str, List[Dict[str, Any]]] = {}
     self._dispatch_to_original: Dict[str, str] = {}
     self._allowed_servers = self._canonical_server_names(allowed_servers) if allowed_servers is not None else None
@@ -574,6 +617,7 @@ class McpClientManager:
       stdio_connect_stabilize_delay=_stdio_connect_stabilize_delay,
       is_retryable_stdio_startup_error=_is_retryable_stdio_startup_error,
       build_mcp_env=_build_mcp_env,
+      preflight_stdio_executable=_preflight_stdio_executable,
       build_http_headers=_build_http_headers,
       safe_cache_name=_safe_cache_name,
       close_contexts=self._close_contexts,
@@ -769,17 +813,104 @@ class McpClientManager:
     return bool(config and config.get("per_user") is True)
 
   @staticmethod
+  def _declared_per_user_env(config: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = config.get("per_user_env")
+    if raw is None:
+      return ()
+    if (
+      not isinstance(raw, list)
+      or not raw
+      or any(not isinstance(name, str) or not name.strip() for name in raw)
+    ):
+      raise ValueError("per_user_env must be a non-empty list of environment names")
+    names = tuple(name.strip() for name in raw)
+    if len(set(names)) != len(names):
+      raise ValueError("per_user_env must not contain duplicate environment names")
+    if config.get("per_user") is not True:
+      raise ValueError("per_user_env requires per_user=true")
+    return names
+
+  def _prepare_server_config_for_startup(
+    self,
+    config: Mapping[str, Any],
+  ) -> Dict[str, Any]:
+    prepared = copy.deepcopy(dict(config))
+    dynamic_env_names = self._declared_per_user_env(prepared)
+    if not dynamic_env_names:
+      return prepared
+    env = dict(prepared.get("env") or {})
+    for name in dynamic_env_names:
+      env.pop(name, None)
+    prepared["env"] = env
+    return prepared
+
+  def _resolve_per_user_env(
+    self,
+    server_name: str,
+    subject: _PerUserGatewaySubject,
+    config: Mapping[str, Any],
+  ) -> tuple[Dict[str, str], bytes] | None:
+    env_names = self._declared_per_user_env(config)
+    if not env_names:
+      return None
+    if self._per_user_env_resolver is None:
+      raise _PerUserMcpError(
+        "mcp_user_authority_unavailable",
+        "User-scoped MCP authority is not configured.",
+      )
+    try:
+      resolved = self._per_user_env_resolver(
+        server_name,
+        subject.user_id,
+        subject.user_email,
+      )
+    except Exception as exc:
+      raise _PerUserMcpError(
+        "mcp_user_authority_unavailable",
+        "User-scoped MCP authority could not be resolved.",
+      ) from exc
+    if not isinstance(resolved, Mapping):
+      raise _PerUserMcpError(
+        "mcp_user_authority_unavailable",
+        "User-scoped MCP authority is invalid.",
+      )
+    projection = {
+      str(name): str(value).strip()
+      for name, value in resolved.items()
+      if isinstance(name, str) and isinstance(value, str)
+    }
+    if set(projection) != set(env_names) or any(not projection[name] for name in env_names):
+      raise _PerUserMcpError(
+        "mcp_user_authority_unavailable",
+        "User-scoped MCP authority is incomplete.",
+      )
+    canonical = json.dumps(
+      {name: projection[name] for name in sorted(env_names)},
+      sort_keys=True,
+      separators=(",", ":"),
+    ).encode("utf-8")
+    fingerprint = hmac.new(
+      self._per_user_binding_hmac_key,
+      canonical,
+      hashlib.sha256,
+    ).digest()
+    return projection, fingerprint
+
+  @staticmethod
   def _canonical_broker_body(payload: Dict[str, Any]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
-  async def _mint_gsheets_broker_session(self, user_id: str) -> tuple[str, float, str]:
+  async def _mint_gsheets_broker_session(
+    self,
+    subject: _PerUserGatewaySubject,
+  ) -> tuple[str, float, str]:
     hmac_key = os.environ.get("GATEWAY_GOOGLE_SHEETS_BROKER_HMAC_KEY", "").strip()
     base_url = os.environ.get("GOOGLE_SHEETS_BROKER_URL", "").strip().rstrip("/")
     if not hmac_key or not base_url:
       raise _PerUserMcpError("sheets_unavailable", "Google Sheets broker is not configured")
     timestamp = int(time.time())
     payload = {
-      "user_id": user_id,
+      "user_id": subject.user_id,
       "scopes": [GSHEETS_BROKER_SCOPE],
       "request_id": uuid.uuid4().hex,
       "ttl_s": PER_USER_SESSION_TTL_SECONDS,
@@ -817,28 +948,40 @@ class McpClientManager:
   async def _spawn_per_user_server(
     self,
     server_name: str,
-    user_id: str,
+    subject: _PerUserGatewaySubject,
     broker_session: tuple[str, float, str] | None = None,
+    projected_env: tuple[Dict[str, str], bytes] | None = None,
   ) -> _PerUserServerState:
     definition = self._servers.get(server_name)
     if definition is None or not definition.config:
       raise _PerUserMcpError("sheets_unavailable", f"MCP server unavailable: {server_name}")
-    if broker_session is None:
-      broker_session = await self._mint_gsheets_broker_session(user_id)
-    token, expires_at, broker_url = broker_session
     config = copy.deepcopy(definition.config)
     env = dict(config.get("env") or {})
-    env.update({
-      "GSHEETS_TOKEN_MODE": "broker",
-      "GSHEETS_HEADLESS": "1",
-      "GSHEETS_BROKER_URL": broker_url,
-      "GSHEETS_BROKER_SESSION_TOKEN": token,
-    })
+    binding_fingerprint: bytes | None = None
+    if projected_env is not None:
+      projection, binding_fingerprint = projected_env
+      env.update(projection)
+      expires_at = float("inf")
+    else:
+      if broker_session is None:
+        broker_session = await self._mint_gsheets_broker_session(subject)
+      token, expires_at, broker_url = broker_session
+      env.update({
+        "GSHEETS_TOKEN_MODE": "broker",
+        "GSHEETS_HEADLESS": "1",
+        "GSHEETS_BROKER_URL": broker_url,
+        "GSHEETS_BROKER_SESSION_TOKEN": token,
+      })
     config["env"] = env
     # The tier-1 credential is read only by this gateway process and is never
     # copied into the child config/environment.
     state = await self._connect_stdio_with_retries(f"{server_name}[user]", config)
-    return _PerUserServerState(state, expires_at, time.time())
+    return _PerUserServerState(
+      state,
+      expires_at,
+      time.time(),
+      binding_fingerprint=binding_fingerprint,
+    )
 
   async def _close_per_user_when_drained(self, state: _PerUserServerState) -> None:
     deadline = time.monotonic() + PER_USER_DRAIN_TIMEOUT_SECONDS
@@ -884,34 +1027,53 @@ class McpClientManager:
   async def _get_per_user_server(
     self,
     server_name: str,
-    user_id: str,
+    subject: _PerUserGatewaySubject,
     *,
     force: bool = False,
     discard_current_on_failure: bool = False,
   ) -> _PerUserServerState:
-    key = (server_name, user_id)
+    key = (server_name, subject.user_id)
     lock = self._per_user_spawn_locks.setdefault(key, asyncio.Lock())
     try:
       async with lock:
         now = time.time()
         self._reap_idle_per_user_servers(now)
+        definition = self._servers.get(server_name)
+        if definition is None or not definition.config:
+          raise _PerUserMcpError(
+            "mcp_user_authority_unavailable",
+            f"MCP server unavailable: {server_name}",
+          )
+        projected_env = self._resolve_per_user_env(
+          server_name,
+          subject,
+          definition.config,
+        )
+        binding_fingerprint = projected_env[1] if projected_env is not None else None
         current = self._per_user_servers.get(key)
         alive = current is not None and not current.draining and bool(current.server.exit_contexts)
-        if alive and not force and current.expires_at - now > PER_USER_EXPIRY_MARGIN_SECONDS:
+        if (
+          alive
+          and not force
+          and current.expires_at - now > PER_USER_EXPIRY_MARGIN_SECONDS
+          and current.binding_fingerprint == binding_fingerprint
+        ):
           current.last_used_at = now
           return current
 
         # Mint before changing capacity accounting or evicting a healthy child.
         # A forced broker-expiry replacement is the exception: the current
         # child is known invalid and must not remain cached when minting fails.
-        try:
-          broker_session = await self._mint_gsheets_broker_session(user_id)
-        except BaseException:
-          if force and discard_current_on_failure:
-            expired = self._per_user_servers.pop(key, None)
-            if expired is not None:
-              self._schedule_drain(expired)
-          raise
+        broker_session = None
+        if projected_env is None:
+          try:
+            broker_session = await self._mint_gsheets_broker_session(subject)
+          except BaseException:
+            if force and discard_current_on_failure:
+              expired = self._per_user_servers.pop(key, None)
+              if expired is not None:
+                self._schedule_drain(expired)
+            raise
         current = self._per_user_servers.get(key)
         old_state = None
         if current is not None:
@@ -929,9 +1091,18 @@ class McpClientManager:
               if candidate_key[0] == server_name and candidate.active_calls == 0
             ]
             if not idle:
+              projected_authority = projected_env is not None
               raise _PerUserMcpError(
-                "sheets_unavailable",
-                "Google Sheets per-user instance capacity reached",
+                (
+                  "mcp_user_authority_unavailable"
+                  if projected_authority
+                  else "sheets_unavailable"
+                ),
+                (
+                  "Per-user MCP instance capacity reached"
+                  if projected_authority
+                  else "Google Sheets per-user instance capacity reached"
+                ),
               )
             _, evict_key, evicted = min(idle)
             self._per_user_servers.pop(evict_key, None)
@@ -943,10 +1114,13 @@ class McpClientManager:
         replacement = None
         spawned = False
         try:
+          spawn_kwargs: Dict[str, Any] = {"broker_session": broker_session}
+          if projected_env is not None:
+            spawn_kwargs["projected_env"] = projected_env
           replacement = await self._spawn_per_user_server(
             server_name,
-            user_id,
-            broker_session=broker_session,
+            subject,
+            **spawn_kwargs,
           )
           spawned = True
         finally:
@@ -1066,7 +1240,7 @@ class McpClientManager:
     tool_input: Dict[str, Any],
     meta: Dict[str, Any] | None = None,
     abort_event: asyncio.Event | None = None,
-    user_id: str | int | None = None,
+    gateway_session: Any | None = None,
   ) -> Tuple[Any | None, Dict[str, Any] | None]:
     server_name = self._tool_to_server.get(name)
     if not server_name:
@@ -1096,10 +1270,19 @@ class McpClientManager:
         return None, _sheets_gateway_error(payload)
       return None, {"code": "mcp_tool_error", "message": f"MCP server unavailable: {server_name}"}
     per_user_state: _PerUserServerState | None = None
-    normalized_user_id: str | None = None
+    per_user_subject: _PerUserGatewaySubject | None = None
     if self.is_per_user_server(transport_server_name):
-      normalized_user_id = str(user_id or "").strip()
-      if not normalized_user_id or not normalized_user_id.isdigit() or int(normalized_user_id) <= 0:
+      try:
+        per_user_subject = _PerUserGatewaySubject.from_gateway_session(
+          gateway_session
+        )
+      except ValueError:
+        if not is_sheets:
+          return None, {
+            "code": "mcp_tool_error",
+            "sub_code": "missing_user_identity",
+            "message": "User-scoped MCP requires an authenticated user identity.",
+          }
         payload = _gateway_sheets_error_payload(
           original_name,
           code="missing_user_identity",
@@ -1113,8 +1296,17 @@ class McpClientManager:
         )
         return None, _sheets_gateway_error(payload)
       try:
-        per_user_state = await self._get_per_user_server(transport_server_name, normalized_user_id)
+        per_user_state = await self._get_per_user_server(
+          transport_server_name,
+          per_user_subject,
+        )
       except _PerUserMcpError as exc:
+        if not is_sheets:
+          return None, {
+            "code": "mcp_tool_error",
+            "sub_code": exc.code,
+            "message": str(exc),
+          }
         action = "connect_sheets" if exc.code == "sheets_not_connected" else "retry"
         payload = _gateway_sheets_error_payload(
           original_name,
@@ -1129,6 +1321,12 @@ class McpClientManager:
         )
         return None, _sheets_gateway_error(payload)
       except Exception:
+        if not is_sheets:
+          return None, {
+            "code": "mcp_tool_error",
+            "sub_code": "mcp_user_authority_unavailable",
+            "message": "User-scoped MCP could not be started before dispatch.",
+          }
         payload = _gateway_sheets_error_payload(
           original_name,
           code="sheets_unavailable",
@@ -1160,7 +1358,8 @@ class McpClientManager:
       )
     except Exception as exc:
       if per_user_state is not None:
-        key = (transport_server_name, normalized_user_id or "")
+        assert per_user_subject is not None
+        key = (transport_server_name, per_user_subject.user_id)
         if self._per_user_servers.get(key) is per_user_state:
           self._per_user_servers.pop(key, None)
           self._retire_per_user_spawn_lock(key)
@@ -1283,10 +1482,11 @@ class McpClientManager:
       and sheets_error["error"]["code"] == "broker_session_expired"
     ):
       replay_safe = _sheets_error_allows_automatic_read_retry(sheets_error, policy_class)
+      assert per_user_subject is not None
       try:
         replacement = await self._get_per_user_server(
           transport_server_name,
-          normalized_user_id or "",
+          per_user_subject,
           force=True,
           discard_current_on_failure=True,
         )
@@ -1307,7 +1507,7 @@ class McpClientManager:
             timeout_seconds=timeout_seconds,
           )
         except Exception as exc:
-          key = (server_name, normalized_user_id or "")
+          key = (server_name, per_user_subject.user_id)
           if self._per_user_servers.get(key) is replacement:
             self._per_user_servers.pop(key, None)
             self._retire_per_user_spawn_lock(key)
@@ -1338,7 +1538,7 @@ class McpClientManager:
           sheets_error is not None
           and sheets_error["error"]["code"] == "broker_session_expired"
         ):
-          key = (server_name, normalized_user_id or "")
+          key = (server_name, per_user_subject.user_id)
           if self._per_user_servers.get(key) is replacement:
             self._per_user_servers.pop(key, None)
             self._retire_per_user_spawn_lock(key)

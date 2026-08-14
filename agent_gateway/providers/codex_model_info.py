@@ -2,6 +2,21 @@ from __future__ import annotations
 
 from .base import ModelInfo, ThinkingLevel
 
+# context_window derivation (two intentional sources — do NOT unify blindly):
+#   400_000  = ChatGPT-backend enforced ceiling, probed live 2026-07-21
+#              (~370k accepted / 385k rejected, rounded up). Applies to the
+#              gpt-5.6 family, gpt-5.5, gpt-5.1 — the models actually runnable
+#              on the ChatGPT backend.
+#   272_000  = OpenAI published catalog context for the codex-specialized
+#              rows (5.1-codex-*, 5.2/-codex, 5.3-codex, 5.4). NOT backend-probed.
+#   128_000  = gpt-5.3-codex-spark catalog context.
+# WHY THIS MATTERS: effective_compaction_trigger = max(window*0.8, 160k). The
+# trigger-above-wall defect (the one fixed for grok in fac666326) only bites
+# when the registered window EXCEEDS the real enforced ceiling. The 272k rows
+# are conservative (below any plausible real ceiling → early trigger, no hedge
+# dependency), so they are SAFE as-is. Do not "fix" them upward to match 400k
+# without a live probe of each model's real ceiling — that would reintroduce
+# the exact defect. To unify, probe each row live and lower/keep, never raise.
 _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
   *[
     (
@@ -9,7 +24,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
       ModelInfo(
         id=model_id,
         provider="codex",
-        context_window=1_050_000,
+        context_window=400_000,  # ChatGPT backend enforces ~370-385k input (probed live 2026-07-21)
         max_output_tokens=128_000,
         supports_thinking=True,
         supports_vision=True,
@@ -30,7 +45,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
     ModelInfo(
       id="gpt-5.5",
       provider="codex",
-      context_window=1_050_000,
+      context_window=400_000,
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,
@@ -44,7 +59,7 @@ _MODEL_INFO_BY_TAG: list[tuple[tuple[str, ...], ModelInfo]] = [
     ModelInfo(
       id="gpt-5.1",
       provider="codex",
-      context_window=1_050_000,
+      context_window=400_000,
       max_output_tokens=128_000,
       supports_thinking=True,
       supports_vision=True,

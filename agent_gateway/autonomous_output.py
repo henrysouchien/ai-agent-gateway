@@ -62,6 +62,7 @@ def collect_run_output(
   max_turns_reached = False
   operator_paused = False
   max_tokens_reached = False
+  terminal_seen = False
 
   for entry in event_log.entries:
     event = entry.event
@@ -74,9 +75,26 @@ def collect_run_output(
     elif event_type == "tool_call_start":
       tool_calls.append(str(event.get("tool_name", "")))
     elif event_type == "stream_complete":
+      terminal_seen = True
       event_usage = event.get("usage")
       if isinstance(event_usage, dict):
         usage = event_usage
+      disposition = event.get("terminal_disposition")
+      if disposition not in {"completed", "interrupted"}:
+        error_msg = f"invalid_terminal_disposition: {disposition!r}"
+      elif disposition == "interrupted":
+        reason = str(event.get("reason") or "unspecified")
+        if reason == "budget_exceeded":
+          budget_exceeded = True
+        elif reason == "max_turns_reached":
+          max_turns_reached = True
+        elif reason == "operator_pause":
+          operator_paused = True
+        elif reason == "timeout":
+          pass
+        else:
+          error_msg = f"Autonomous run interrupted: {reason}"
+      break
     elif event_type == "budget_exceeded":
       budget_exceeded = True
     elif event_type == "max_turns_reached":
@@ -91,6 +109,11 @@ def collect_run_output(
       operator_paused = True
     elif event_type == "error":
       error_msg = str(event.get("error", "Autonomous run encountered an error"))
+      terminal_seen = True
+      break
+
+  if not terminal_seen:
+    error_msg = "missing_terminal_event"
 
   return run_output_cls(
     response="".join(text_parts).strip(),
@@ -212,7 +235,8 @@ def build_state_payload(
   state: dict[str, Any] = {}
   if isinstance(previous_state, dict):
     state.update(previous_state)
-  if isinstance(model_state, dict):
+  outcome = run_output_outcome(run_output)
+  if outcome == "success" and isinstance(model_state, dict):
     state.update(model_state)
 
   summary_fn = extract_summary_fn or _extract_summary
@@ -227,6 +251,7 @@ def build_state_payload(
   state["max_turns_reached"] = run_output.max_turns_reached
   state["max_tokens_reached"] = run_output.max_tokens_reached
   state["operator_paused"] = run_output.operator_paused
+  state["last_outcome"] = outcome
   state["connected_servers"] = connected_server_names
   state["active_servers"] = active_server_names
   state["tools_used"] = sorted({name for name in run_output.tools_used if name})

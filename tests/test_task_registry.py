@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import asyncio
 import sys
 import time
@@ -10,11 +12,100 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.task_registry import TaskEntry, TaskRegistry, TaskState, _TERMINAL_STATES, make_progress_tracker
+from agent_gateway.runner_background_lifecycle import RunnerBackgroundLifecycleMixin
+from agent_gateway.runner_background_tasks import (
+  background_task_payload,
+)
+from agent_gateway.task_registry import (
+  ParentMessage,
+  ResumeSuccessorConflictError,
+  TaskDurableEventConflictError,
+  TaskEntry,
+  TaskRegistry,
+  TaskState,
+  _TERMINAL_STATES,
+  make_progress_tracker,
+)
+
+
+def _bind_receipt(*, provider: str, model: str) -> dict[str, str]:
+  return {
+    "capability_id": "node.implement",
+    "provider": provider,
+    "model": model,
+    "effort": "high",
+    "policy_id": "test-policy",
+    "policy_version": "1",
+    "credential_principal": "user",
+    "run_mode": "interactive",
+  }
 
 
 def _run(coro):
   return asyncio.run(coro)
+
+
+def _child_report(summary: str = "done") -> dict[str, object]:
+  return {
+    "kind": "report",
+    "version": "1",
+    "report": {
+      "summary": summary,
+      "findings": [],
+      "artifacts": [],
+      "caveats": [],
+    },
+    "usage": {},
+    "tools_used": [],
+    "fms_results": None,
+    "artifact_events": None,
+    "warning": None,
+  }
+
+
+def _canonical_skipped_result() -> dict[str, object]:
+  digest = f"sha256:{'1' * 64}"
+  return {
+    "schema_version": "2.0",
+    "task_result_id": "result-bg-7",
+    "logical_task": {
+      "kind": "ordinary_delegation",
+      "delegation_id": "delegation-bg-7",
+      "operation": {
+        "namespace": "agent-workflow",
+        "name": "research",
+        "version": "v1",
+        "digest": digest,
+      },
+    },
+    "attempt": {
+      "attempt_number": 1,
+      "attempt_id": "attempt-bg-7",
+      "physical_task_id": "bg_7",
+    },
+    "execution": {
+      "status": "skipped",
+      "terminal_reason": "not required",
+    },
+    "outcome": None,
+    "evidence": {"observed_sources": [], "tools_used": []},
+    "values": {
+      "terminal_narrative": None,
+      "projection": None,
+      "artifacts": [],
+    },
+    "observation": {
+      "transcript": {"kind": "child_transcript", "owner_id": "bg_7"},
+      "activity": {"kind": "child_activity", "owner_id": "bg_7"},
+      "usage": {},
+    },
+    "provenance": {
+      "admitted_task_digest": digest,
+      "model_bind_digest": digest,
+      "capability_binding_digest": digest,
+      "tool_grant_digest": digest,
+    },
+  }
 
 
 class _RecordingListener:
@@ -23,6 +114,25 @@ class _RecordingListener:
 
   def on_transition(self, entry: TaskEntry, old_state: TaskState, new_state: TaskState) -> None:
     self.transitions.append((entry.task_id, old_state, new_state))
+
+
+class _BackgroundLifecycleHarness(RunnerBackgroundLifecycleMixin):
+  def __init__(self) -> None:
+    self._task_registry = TaskRegistry()
+    self.listener = _RecordingListener()
+    self._task_registry.add_listener(self.listener)
+    self._runner_id = "runner-test"
+    self._role = "writer"
+    self._sid = "session-test"
+    self.durable_events: list[dict[str, object]] = []
+    self.append_invocations = 0
+
+  def _ensure_sub_agent_semaphore(self) -> None:
+    return None
+
+  async def _append_durable_event(self, event: dict[str, object]) -> None:
+    self.append_invocations += 1
+    self.durable_events.append(event)
 
 
 def test_task_registry_register_transition_get_and_list_tasks() -> None:
@@ -61,7 +171,7 @@ def test_transition_terminal_guard_is_no_op() -> None:
   assert listener.transitions == [(entry.task_id, TaskState.PENDING, TaskState.COMPLETED)]
 
 
-def test_kill_cancels_asyncio_task_and_transitions_to_killed() -> None:
+def test_kill_records_intent_and_cancels_without_pretransitioning() -> None:
   async def _case() -> None:
     registry = TaskRegistry()
     entry = registry.register("background_agent")
@@ -84,9 +194,810 @@ def test_kill_cancels_asyncio_task_and_transitions_to_killed() -> None:
     assert registry.kill(entry.task_id) is True
     await asyncio.wait_for(cancelled.wait(), timeout=1.0)
     await asyncio.gather(task, return_exceptions=True)
+    assert entry.termination_intent == "killed"
+    assert entry.state == TaskState.RUNNING
+    assert entry.completed is False
+    assert entry.completed_at is None
+
+  _run(_case())
+
+
+def test_kill_records_parent_cancellation_and_does_not_repeat_same_request() -> None:
+  class _Cancelable:
+    def __init__(self) -> None:
+      self.cancel_count = 0
+
+    def cancel(self) -> None:
+      self.cancel_count += 1
+
+  registry = TaskRegistry()
+  entry = registry.register("background_agent")
+  task = _Cancelable()
+  entry.asyncio_task = task  # type: ignore[assignment]
+  registry.transition(entry.task_id, TaskState.RUNNING)
+
+  assert registry.kill(entry.task_id, termination_intent="cancelled") is True
+  assert registry.kill(entry.task_id, termination_intent="cancelled") is False
+  assert registry.kill(entry.task_id, termination_intent="killed") is False
+  assert entry.termination_intent == "cancelled"
+  assert task.cancel_count == 1
+  assert entry.state == TaskState.RUNNING
+
+
+@pytest.mark.parametrize("termination_intent", ["cancelled", "killed"])
+def test_background_finalizer_persists_canonical_termination_result(
+  termination_intent: str,
+) -> None:
+  async def _case() -> None:
+    harness = _BackgroundLifecycleHarness()
+    entry = harness._task_registry.register("background_agent")
+    entry.metadata["sub_agent_id"] = "sub0:session-test"
+    started = asyncio.Event()
+    completed: list[str] = []
+
+    async def _handler(
+      _tool_input: dict[str, object],
+      **_kwargs: object,
+    ) -> tuple[None, None]:
+      started.set()
+      await asyncio.sleep(60)
+      return None, None
+
+    async def _on_complete(completed_entry: TaskEntry) -> None:
+      completed.append(completed_entry.task_id)
+
+    task = asyncio.create_task(
+      harness._run_background_agent(
+        entry,
+        _handler,
+        {},
+        0,
+        on_complete=_on_complete,
+      )
+    )
+    entry.asyncio_task = task
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    await started.wait()
+
+    assert harness._task_registry.kill(
+      entry.task_id,
+      termination_intent=termination_intent,  # type: ignore[arg-type]
+    )
+    await task
+
     assert entry.state == TaskState.KILLED
-    assert entry.completed is True
-    assert entry.completed_at is not None
+    assert entry.error is None
+    assert entry.result is not None
+    assert entry.result["reason"] == termination_intent
+    assert entry.result["usage"] == {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "turn_count": 0,
+    }
+    assert entry.result["tools_used"] == []
+    assert completed == [entry.task_id]
+    assert len(harness.durable_events) == 1
+    durable = harness.durable_events[0]
+    assert durable["type"] == "task_completed"
+    assert durable["final_state"] == "killed"
+    assert durable["result"] == entry.result
+    assert durable["error"] is None
+    assert entry.completion_persistence_state == "committed"
+    assert harness.append_invocations == 1
+    assert [
+      transition
+      for transition in harness.listener.transitions
+      if transition[2] in _TERMINAL_STATES
+    ] == [(entry.task_id, TaskState.RUNNING, TaskState.KILLED)]
+
+  _run(_case())
+
+
+def test_cancelled_accepted_report_is_durably_killed() -> None:
+  async def _case() -> None:
+    harness = _BackgroundLifecycleHarness()
+    entry = harness._task_registry.register("background_agent")
+    entry.metadata["sub_agent_id"] = "sub0:session-test"
+    accepted_result = {
+      "kind": "report",
+      "version": "1",
+      "report": {
+        "summary": "Accepted before cancellation",
+        "findings": [],
+        "artifacts": [],
+        "caveats": [],
+      },
+      "usage": {"input_tokens": 3},
+      "tools_used": ["lookup"],
+      "fms_results": None,
+      "artifact_events": None,
+      "warning": "observed_terminal_signals=cancelled",
+    }
+    staged = asyncio.Event()
+
+    async def _handler(
+      _tool_input: dict[str, object],
+      **_kwargs: object,
+    ) -> tuple[dict[str, object], None]:
+      entry.result = accepted_result
+      staged.set()
+      await asyncio.Event().wait()
+      return accepted_result, None
+
+    task = asyncio.create_task(
+      harness._run_background_agent(entry, _handler, {}, 0)
+    )
+    entry.asyncio_task = task
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    await staged.wait()
+
+    assert harness._task_registry.kill(
+      entry.task_id,
+      termination_intent="cancelled",
+    )
+    await task
+
+    assert entry.state == TaskState.KILLED
+    assert entry.termination_intent == "cancelled"
+    assert entry.result is not None
+    assert entry.result["status"] == "interrupted"
+    assert entry.result["reason"] == "cancelled"
+    assert entry.error is None
+    assert entry.completion_persistence_state == "committed"
+    assert harness.append_invocations == 1
+    assert len(harness.durable_events) == 1
+    durable = harness.durable_events[0]
+    assert durable["type"] == "task_completed"
+    assert durable["task_id"] == entry.task_id
+    assert durable["final_state"] == "killed"
+    assert durable["result"] == entry.result
+    assert durable["error"] is None
+
+  _run(_case())
+
+
+def test_background_finalizer_preserves_result_accepted_during_kill_race() -> None:
+  async def _case() -> None:
+    append_started = asyncio.Event()
+    release_append = asyncio.Event()
+
+    class _BlockedAppendHarness(_BackgroundLifecycleHarness):
+      async def _append_durable_event(self, event: dict[str, object]) -> None:
+        append_started.set()
+        await release_append.wait()
+        await super()._append_durable_event(event)
+
+    harness = _BlockedAppendHarness()
+    entry = harness._task_registry.register("background_agent")
+    accepted_result = {
+      "kind": "report",
+      "version": "1",
+      "report": {
+        "summary": "Accepted before cancellation",
+        "findings": [],
+        "artifacts": [],
+        "caveats": [],
+      },
+      "usage": {},
+      "tools_used": [],
+      "fms_results": None,
+      "artifact_events": None,
+      "warning": None,
+    }
+
+    async def _handler(
+      _tool_input: dict[str, object],
+      **_kwargs: object,
+    ) -> tuple[dict[str, object], None]:
+      return accepted_result, None
+
+    task = asyncio.create_task(
+      harness._run_background_agent(entry, _handler, {}, 0)
+    )
+    entry.asyncio_task = task
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    await append_started.wait()
+
+    assert harness._task_registry.kill(entry.task_id)
+    release_append.set()
+    await task
+
+    assert entry.state == TaskState.COMPLETED
+    assert entry.result == accepted_result
+    assert entry.error is None
+    assert len(harness.durable_events) == 1
+    assert harness.durable_events[0]["final_state"] == "completed"
+    assert harness.durable_events[0]["result"] == accepted_result
+    assert entry.completion_persistence_state == "committed"
+    assert harness.append_invocations == 1
+    assert [
+      transition
+      for transition in harness.listener.transitions
+      if transition[2] in _TERMINAL_STATES
+    ] == [(entry.task_id, TaskState.RUNNING, TaskState.COMPLETED)]
+
+  _run(_case())
+
+
+def test_background_finalizer_marks_real_failed_child_result_failed_and_visible() -> None:
+  async def _case() -> None:
+    harness = _BackgroundLifecycleHarness()
+    entry = harness._task_registry.register("background_agent")
+    failed_error = {"code": "provider_error", "message": "provider failed"}
+
+    async def _handler(
+      _tool_input: dict[str, object],
+      **_kwargs: object,
+    ) -> tuple[None, dict[str, object]]:
+      return None, failed_error
+
+    completed: list[TaskEntry] = []
+    task = asyncio.create_task(
+      harness._run_background_agent(
+        entry,
+        _handler,
+        {},
+        0,
+        on_complete=completed.append,
+      )
+    )
+    entry.asyncio_task = task
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    await task
+
+    assert entry.state == TaskState.FAILED
+    assert entry.error == failed_error
+    assert entry.result is None
+    assert completed == [entry]
+    assert len(harness.durable_events) == 1
+    durable = harness.durable_events[0]
+    assert durable["final_state"] == "failed"
+    assert durable["result"] is None
+    assert durable["error"] == failed_error
+
+  _run(_case())
+
+
+def test_background_finalizer_append_failure_does_not_publish_success() -> None:
+  async def _case() -> None:
+    class _RaisingAppendHarness(_BackgroundLifecycleHarness):
+      async def _append_durable_event(self, event: dict[str, object]) -> None:
+        _ = event
+        self.append_invocations += 1
+        raise RuntimeError("durable append failed")
+
+    harness = _RaisingAppendHarness()
+    entry = harness._task_registry.register("background_agent")
+
+    async def _handler(
+      _tool_input: dict[str, object],
+      **_kwargs: object,
+    ) -> tuple[dict[str, object], None]:
+      return {"response": "accepted"}, None
+
+    completed: list[TaskEntry] = []
+    task = asyncio.create_task(
+      harness._run_background_agent(
+        entry,
+        _handler,
+        {},
+        0,
+        on_complete=completed.append,
+      )
+    )
+    entry.asyncio_task = task
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+    with pytest.raises(RuntimeError, match="durable append failed"):
+      await task
+
+    assert entry.state == TaskState.INTERRUPTED
+    assert entry.result is None
+    assert entry.error is not None
+    assert (
+      entry.error["code"]
+      == "background_completion_persistence_uncertain"
+    )
+    assert entry.pending_final_state == TaskState.FAILED
+    assert entry.pending_result is not None
+    assert entry.pending_result["reason"] == "runtime_error"
+    assert entry.completion_persistence_state == "uncertain"
+    assert "durable append failed" in str(entry.completion_persistence_error)
+    assert harness.append_invocations == 2
+    assert harness.durable_events == []
+    assert completed == []
+    assert [
+      transition
+      for transition in harness.listener.transitions
+      if transition[2] in _TERMINAL_STATES
+    ] == [(entry.task_id, TaskState.RUNNING, TaskState.INTERRUPTED)]
+
+  _run(_case())
+
+
+@pytest.mark.parametrize(
+  "lookup_failure_type",
+  [OSError, asyncio.CancelledError],
+)
+def test_primary_completion_lookup_uncertainty_does_not_write_fallback(
+  lookup_failure_type: type[BaseException],
+) -> None:
+  async def _case() -> None:
+    class _PostFsyncUnknownHarness(_BackgroundLifecycleHarness):
+      async def _append_durable_event(
+        self,
+        event: dict[str, object],
+      ) -> None:
+        self.append_invocations += 1
+        self.durable_events.append(event)
+        raise RuntimeError("append failed after fsync")
+
+      async def _confirmed_durable_background_completion(
+        self,
+        _bg_task: TaskEntry,
+      ) -> TaskEntry | None:
+        raise lookup_failure_type("durable lookup outcome unknown")
+
+    harness = _PostFsyncUnknownHarness()
+    harness._writer_lease_poisoned = False
+    entry = harness._task_registry.register("background_agent")
+    accepted_result = {
+      "kind": "report",
+      "version": "1",
+      "report": {
+        "summary": "Durably accepted before lookup failed",
+        "findings": [],
+        "artifacts": [],
+        "caveats": [],
+      },
+      "usage": {},
+      "tools_used": [],
+      "fms_results": None,
+      "artifact_events": None,
+      "warning": None,
+    }
+    completed: list[TaskEntry] = []
+
+    async def _handler(
+      _tool_input: dict[str, object],
+      **_kwargs: object,
+    ) -> tuple[dict[str, object], None]:
+      return accepted_result, None
+
+    task = asyncio.create_task(
+      harness._run_background_agent(
+        entry,
+        _handler,
+        {},
+        0,
+        on_complete=completed.append,
+      )
+    )
+    entry.asyncio_task = task
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+    with pytest.raises(lookup_failure_type):
+      await task
+    await asyncio.sleep(0)
+    pending_reconciliations = tuple(
+      getattr(harness, "_pending_background_initializations", ())
+    )
+    if pending_reconciliations:
+      await asyncio.gather(
+        *pending_reconciliations,
+        return_exceptions=True,
+      )
+
+    assert harness.append_invocations == 1
+    assert len(harness.durable_events) == 1
+    assert harness.durable_events[0]["final_state"] == "completed"
+    assert harness.durable_events[0]["result"] == accepted_result
+    assert entry.state == TaskState.INTERRUPTED
+    assert entry.result is None
+    assert entry.pending_final_state == TaskState.COMPLETED
+    assert entry.completion_persistence_state == "uncertain"
+    assert entry.completion_callback_invoked is False
+    assert completed == []
+    assert harness._writer_lease_poisoned is True
+
+  _run(_case())
+
+
+def test_background_finalizer_hanging_append_and_shield_cancel_are_bounded() -> None:
+  async def _case() -> None:
+    append_started = asyncio.Event()
+    release_append = asyncio.Event()
+
+    class _HangingAppendHarness(_BackgroundLifecycleHarness):
+      async def _append_durable_event(self, event: dict[str, object]) -> None:
+        self.append_invocations += 1
+        append_started.set()
+        while not release_append.is_set():
+          try:
+            await release_append.wait()
+          except asyncio.CancelledError:
+            continue
+        self.durable_events.append(event)
+
+    harness = _HangingAppendHarness()
+    harness._background_completion_persist_timeout_seconds = 0.01
+    entry = harness._task_registry.register("background_agent")
+    accepted_result = {
+      "kind": "report",
+      "version": "1",
+      "report": {
+        "summary": "Accepted before persistence stalled",
+        "findings": [],
+        "artifacts": [],
+        "caveats": [],
+      },
+      "usage": {},
+      "tools_used": [],
+      "fms_results": None,
+      "artifact_events": None,
+      "warning": None,
+    }
+
+    async def _handler(
+      _tool_input: dict[str, object],
+      **_kwargs: object,
+    ) -> tuple[dict[str, object], None]:
+      return accepted_result, None
+
+    task = asyncio.create_task(
+      harness._run_background_agent(entry, _handler, {}, 0)
+    )
+    entry.asyncio_task = task
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    await append_started.wait()
+
+    started_at = asyncio.get_running_loop().time()
+    assert harness._task_registry.kill(entry.task_id)
+    with pytest.raises(asyncio.TimeoutError):
+      await task
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    assert elapsed < 0.2
+    assert entry.state == TaskState.INTERRUPTED
+    assert entry.result is None
+    assert entry.pending_final_state == TaskState.COMPLETED
+    assert entry.completion_persistence_state == "uncertain"
+    assert harness.append_invocations == 1
+    assert harness.durable_events == []
+
+    release_append.set()
+    for _ in range(100):
+      if entry.state == TaskState.COMPLETED:
+        break
+      await asyncio.sleep(0)
+
+    assert entry.state == TaskState.COMPLETED
+    assert entry.result == accepted_result
+    assert entry.error is None
+    assert entry.completion_persistence_state == "committed"
+    assert harness.append_invocations == 1
+    assert len(harness.durable_events) == 1
+    assert harness.durable_events[0]["final_state"] == "completed"
+    assert [
+      transition
+      for transition in harness.listener.transitions
+      if transition[2] in _TERMINAL_STATES
+    ] == [
+      (entry.task_id, TaskState.RUNNING, TaskState.INTERRUPTED),
+      (entry.task_id, TaskState.INTERRUPTED, TaskState.COMPLETED),
+    ]
+
+  _run(_case())
+
+
+def test_cancelled_detached_completion_reconciliation_poisons_writer_lease() -> None:
+  async def _case() -> None:
+    lookup_started = asyncio.Event()
+
+    class _BlockedReconciliationHarness(_BackgroundLifecycleHarness):
+      async def _confirmed_durable_background_completion(
+        self,
+        _bg_task: TaskEntry,
+      ) -> TaskEntry | None:
+        lookup_started.set()
+        await asyncio.Future()
+
+    harness = _BlockedReconciliationHarness()
+    harness._writer_lease_poisoned = False
+    entry = harness._task_registry.register("background_agent")
+    harness._task_registry.transition(entry.task_id, TaskState.INTERRUPTED)
+    entry.completion_finalizer_detached = True
+
+    harness._schedule_detached_completion_reconciliation(entry)
+    reconciliation_task = next(iter(harness._pending_background_initializations))
+    await lookup_started.wait()
+    reconciliation_task.cancel()
+    await asyncio.gather(reconciliation_task, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert reconciliation_task.cancelled()
+    assert harness._writer_lease_poisoned is True
+    assert entry.state == TaskState.INTERRUPTED
+    assert entry.completion_finalizer_detached is True
+
+  _run(_case())
+
+
+def test_failed_detached_completion_lookup_poisons_writer_lease() -> None:
+  async def _case() -> None:
+    class _FailedReconciliationHarness(_BackgroundLifecycleHarness):
+      async def _confirmed_durable_background_completion(
+        self,
+        _bg_task: TaskEntry,
+      ) -> TaskEntry | None:
+        raise RuntimeError("durable lookup failed")
+
+    harness = _FailedReconciliationHarness()
+    harness._writer_lease_poisoned = False
+    entry = harness._task_registry.register("background_agent")
+    harness._task_registry.transition(entry.task_id, TaskState.INTERRUPTED)
+    entry.completion_finalizer_detached = True
+
+    harness._schedule_detached_completion_reconciliation(entry)
+    reconciliation_task = next(iter(harness._pending_background_initializations))
+    await reconciliation_task
+    await asyncio.sleep(0)
+
+    assert harness._writer_lease_poisoned is True
+    assert entry.state == TaskState.INTERRUPTED
+    assert entry.completion_finalizer_detached is True
+
+  _run(_case())
+
+
+@pytest.mark.parametrize(
+  ("was_cancelled", "expected_intent"),
+  [(True, "cancelled"), (False, "killed")],
+)
+def test_shutdown_routes_intent_and_durably_reconciles(
+  monkeypatch: pytest.MonkeyPatch,
+  was_cancelled: bool,
+  expected_intent: str,
+) -> None:
+  import agent_gateway.runner as gateway_runner
+
+  class _Cancelable:
+    def __init__(self) -> None:
+      self.cancel_count = 0
+
+    def cancel(self) -> None:
+      self.cancel_count += 1
+
+  async def _case() -> None:
+    harness = _BackgroundLifecycleHarness()
+    entry = harness._task_registry.register("background_agent")
+    task = _Cancelable()
+    entry.asyncio_task = task  # type: ignore[assignment]
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+    async def _drain(
+      running_entries: object,
+      _pending: object,
+      **kwargs: object,
+    ) -> None:
+      selected = list(running_entries)  # type: ignore[arg-type]
+      kill_task = kwargs["kill_task"]
+      kill_task(selected[0].task_id)  # type: ignore[operator]
+
+    monkeypatch.setattr(
+      gateway_runner,
+      (
+        "_drain_cancelled_background_tasks"
+        if was_cancelled
+        else "_drain_still_pending_background_tasks"
+      ),
+      _drain,
+    )
+
+    await harness._shutdown_background_tasks(was_cancelled)
+
+    assert entry.termination_intent == expected_intent
+    assert entry.state == TaskState.KILLED
+    assert task.cancel_count == 1
+    assert entry.result["reason"] == expected_intent
+    assert entry.completion_persistence_state == "committed"
+    assert entry.completion_persistence_error is None
+    assert harness.append_invocations == 1
+    assert len(harness.durable_events) == 1
+    assert harness.durable_events[0]["final_state"] == "killed"
+    assert harness.durable_events[0]["result"] == entry.result
+    assert [
+      transition
+      for transition in harness.listener.transitions
+      if transition[2] in _TERMINAL_STATES
+    ] == [(entry.task_id, TaskState.RUNNING, TaskState.KILLED)]
+
+  _run(_case())
+
+
+@pytest.mark.parametrize(
+  ("was_cancelled", "expected_intent"),
+  [(True, "cancelled"), (False, "killed")],
+)
+def test_shutdown_drain_error_still_durably_reconciles_once(
+  monkeypatch: pytest.MonkeyPatch,
+  was_cancelled: bool,
+  expected_intent: str,
+) -> None:
+  import agent_gateway.runner as gateway_runner
+
+  class _Cancelable:
+    def __init__(self) -> None:
+      self.cancel_count = 0
+
+    def cancel(self) -> None:
+      self.cancel_count += 1
+
+  async def _case() -> None:
+    harness = _BackgroundLifecycleHarness()
+    entry = harness._task_registry.register("background_agent")
+    task = _Cancelable()
+    entry.asyncio_task = task  # type: ignore[assignment]
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+    async def _timeout(*_args: object, **_kwargs: object) -> None:
+      raise asyncio.TimeoutError
+
+    monkeypatch.setattr(
+      gateway_runner,
+      (
+        "_drain_cancelled_background_tasks"
+        if was_cancelled
+        else "_drain_still_pending_background_tasks"
+      ),
+      _timeout,
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+      await harness._shutdown_background_tasks(was_cancelled)
+    await harness._finalize_background_agent(
+      entry,
+      final_state=TaskState.FAILED,
+      result=None,
+      error={"code": "late_finalizer"},
+    )
+
+    assert entry.termination_intent == expected_intent
+    assert entry.state == TaskState.KILLED
+    assert entry.error is None
+    assert entry.result["reason"] == expected_intent
+    assert task.cancel_count == 1
+    assert entry.completion_persistence_state == "committed"
+    assert harness.append_invocations == 1
+    assert len(harness.durable_events) == 1
+    assert harness.durable_events[0]["final_state"] == "killed"
+    assert [
+      transition
+      for transition in harness.listener.transitions
+      if transition[2] in _TERMINAL_STATES
+    ] == [(entry.task_id, TaskState.RUNNING, TaskState.KILLED)]
+
+  _run(_case())
+
+
+def test_shutdown_reconciles_done_but_live_task_without_duplicate_append() -> None:
+  async def _case() -> None:
+    harness = _BackgroundLifecycleHarness()
+    entry = harness._task_registry.register("background_agent")
+    result = {"response": "durably complete"}
+
+    async def _done() -> None:
+      return None
+
+    asyncio_task = asyncio.create_task(_done())
+    await asyncio_task
+    entry.asyncio_task = asyncio_task
+    entry.pending_final_state = TaskState.COMPLETED
+    entry.pending_result = result
+    entry.result = result
+    entry.completion_persistence_state = "committed"
+    harness.durable_events.append({
+      "type": "task_completed",
+      "task_id": entry.task_id,
+      "final_state": "completed",
+      "result": result,
+    })
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+    await harness._shutdown_background_tasks(was_cancelled=False)
+
+    assert entry.state == TaskState.COMPLETED
+    assert entry.result == result
+    assert entry.completion_persistence_state == "committed"
+    assert entry.completion_persistence_error is None
+    assert harness.append_invocations == 0
+    assert len(harness.durable_events) == 1
+    assert [
+      transition
+      for transition in harness.listener.transitions
+      if transition[2] in _TERMINAL_STATES
+    ] == [(entry.task_id, TaskState.RUNNING, TaskState.COMPLETED)]
+
+  _run(_case())
+
+
+def test_shutdown_reconciles_running_entry_without_asyncio_handle() -> None:
+  async def _case() -> None:
+    harness = _BackgroundLifecycleHarness()
+    entry = harness._task_registry.register("background_agent")
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+    await harness._shutdown_background_tasks(was_cancelled=True)
+
+    assert entry.state == TaskState.KILLED
+    assert entry.termination_intent == "cancelled"
+    assert entry.result["reason"] == "cancelled"
+    assert entry.completion_persistence_state == "committed"
+    assert harness.append_invocations == 1
+    assert len(harness.durable_events) == 1
+    assert harness.durable_events[0]["final_state"] == "killed"
+    assert [
+      transition
+      for transition in harness.listener.transitions
+      if transition[2] in _TERMINAL_STATES
+    ] == [(entry.task_id, TaskState.RUNNING, TaskState.KILLED)]
+
+  _run(_case())
+
+
+def test_late_cancellation_resistant_handler_cannot_replace_shutdown_result() -> None:
+  async def _case() -> None:
+    harness = _BackgroundLifecycleHarness()
+    harness._background_grace_wait_timeout_seconds = 0.0
+    harness._background_kill_drain_timeout_seconds = 0.01
+    entry = harness._task_registry.register("background_agent")
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release_handler = asyncio.Event()
+    late_result = {"response": "late accepted result"}
+
+    async def _handler(
+      _tool_input: dict[str, object],
+      **_kwargs: object,
+    ) -> tuple[dict[str, object], None]:
+      started.set()
+      try:
+        await release_handler.wait()
+      except asyncio.CancelledError:
+        cancelled.set()
+        await release_handler.wait()
+      return late_result, None
+
+    task = asyncio.create_task(
+      harness._run_background_agent(entry, _handler, {}, 0)
+    )
+    entry.asyncio_task = task
+    harness._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    await started.wait()
+
+    await harness._shutdown_background_tasks(was_cancelled=False)
+    await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+
+    assert entry.state == TaskState.KILLED
+    shutdown_result = dict(entry.result or {})
+    shutdown_pending_state = entry.pending_final_state
+    assert shutdown_result["reason"] == "killed"
+    assert shutdown_pending_state == TaskState.KILLED
+    assert harness.append_invocations == 1
+
+    release_handler.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert entry.state == TaskState.KILLED
+    assert entry.result == shutdown_result
+    assert entry.pending_final_state == shutdown_pending_state
+    assert entry.error is None
+    assert harness.append_invocations == 1
+    assert [
+      transition
+      for transition in harness.listener.transitions
+      if transition[2] in _TERMINAL_STATES
+    ] == [(entry.task_id, TaskState.RUNNING, TaskState.KILLED)]
 
   _run(_case())
 
@@ -99,7 +1010,68 @@ def test_kill_returns_false_for_terminal_task() -> None:
   assert registry.kill(entry.task_id) is False
 
 
-def test_inflight_count_only_counts_running_tasks() -> None:
+def test_finalize_interrupted_is_explicit_and_idempotent() -> None:
+  registry = TaskRegistry()
+  listener = _RecordingListener()
+  registry.add_listener(listener)
+  entry = registry.register("background_agent")
+  entry.state = TaskState.INTERRUPTED
+  result = {
+    "kind": "unstructured",
+    "reason": "resume_abandoned",
+  }
+
+  finalized = registry.finalize_interrupted(
+    entry.task_id,
+    TaskState.FAILED,
+    result=result,
+  )
+  repeated = registry.finalize_interrupted(
+    entry.task_id,
+    TaskState.FAILED,
+    result={"unexpected": True},
+  )
+
+  assert finalized is entry
+  assert repeated is entry
+  assert entry.state == TaskState.FAILED
+  assert entry.result == result
+  assert listener.transitions == [
+    (entry.task_id, TaskState.INTERRUPTED, TaskState.FAILED)
+  ]
+
+
+def test_adopt_interrupted_accepts_only_reconstructed_interrupted_tasks() -> None:
+  registry = TaskRegistry()
+  entry = TaskEntry(
+    task_id="bg_17",
+    task_type="background_agent",
+    state=TaskState.INTERRUPTED,
+    reconstructed_from_log=True,
+  )
+
+  adopted = registry.adopt_interrupted(entry)
+  repeated = registry.adopt_interrupted(entry)
+
+  assert adopted is entry
+  assert repeated is entry
+  assert registry.get(entry.task_id) is entry
+  assert registry.register("background_agent").task_id == "bg_18"
+
+  with pytest.raises(
+    ValueError,
+    match="only reconstructed interrupted tasks",
+  ):
+    registry.adopt_interrupted(
+      TaskEntry(
+        task_id="bg_live",
+        task_type="background_agent",
+        state=TaskState.INTERRUPTED,
+      )
+    )
+
+
+def test_registry_counts_running_and_admission_slots_separately() -> None:
   registry = TaskRegistry()
   pending = registry.register("background_agent")
   running = registry.register("background_agent")
@@ -112,6 +1084,7 @@ def test_inflight_count_only_counts_running_tasks() -> None:
 
   assert pending.state == TaskState.PENDING
   assert registry.inflight_count == 1
+  assert registry.admission_count == 2
 
 
 def test_max_inflight_enforced_only_for_running_tasks() -> None:
@@ -206,6 +1179,7 @@ def test_load_from_events_reconstructs_tasks_restores_seq_and_bypasses_listeners
   registry = TaskRegistry()
   listener = _RecordingListener()
   registry.add_listener(listener)
+  completed_result = _child_report()
 
   registry.load_from_events(
     [
@@ -214,15 +1188,17 @@ def test_load_from_events_reconstructs_tasks_restores_seq_and_bypasses_listeners
         "task_id": "bg_7",
         "final_state": "completed",
         "completed_at": 125.0,
-        "result": {"response": "done"},
+        "result": completed_result,
         "owner_runner_id": "runner_old",
         "owner_role": "writer",
         "sub_agent_id": "sub7:sess-parent",
         "parent_turn_id": "turn-1",
         "call_index": 7,
         "task_type": "background",
-        "provider_name": "anthropic",
-        "model": "claude-sonnet-4-6",
+        "capability_bind": _bind_receipt(
+          provider="anthropic",
+          model="claude-sonnet-4-6",
+        ),
       },
       {
         "type": "task_registered",
@@ -236,8 +1212,10 @@ def test_load_from_events_reconstructs_tasks_restores_seq_and_bypasses_listeners
         "parent_turn_id": "turn-1",
         "call_index": 7,
         "task_type": "background",
-        "provider_name": "anthropic",
-        "model": "claude-sonnet-4-6",
+        "capability_bind": _bind_receipt(
+          provider="anthropic",
+          model="claude-sonnet-4-6",
+        ),
       },
       {
         "type": "task_registered",
@@ -249,15 +1227,39 @@ def test_load_from_events_reconstructs_tasks_restores_seq_and_bypasses_listeners
         "sub_agent_id": "sub9:sess-parent",
         "parent_turn_id": "turn-2",
         "call_index": 9,
-        "task_type": "background",
-        "provider_name": "openai",
-        "model": "gpt-5.2",
+        "task_type": "plan_run",
+        "capability_bind": _bind_receipt(provider="openai", model="gpt-5.2"),
+        "metadata": {
+          "owner_runner_id": "runner_old",
+          "owner_role": "writer",
+          "sub_agent_id": "sub9:sess-parent",
+          "parent_turn_id": "turn-2",
+          "call_index": 9,
+          "task_type": "background",
+          "capability_bind": _bind_receipt(
+            provider="openai",
+            model="gpt-5.2",
+          ),
+        },
+        "_durable_seq": 3,
       },
       {
         "type": "parent_message_sent",
         "task_id": "bg_9",
+        "owner_runner_id": "runner_old",
+        "owner_role": "writer",
+        "sub_agent_id": "sub9:sess-parent",
+        "parent_turn_id": "turn-2",
+        "call_index": 9,
+        "task_type": "background",
+        "capability_bind": _bind_receipt(
+          provider="openai",
+          model="gpt-5.2",
+        ),
         "message_id": "msg-1",
         "message": "status",
+        "sent_at": 210.0,
+        "_durable_seq": 4,
       },
     ]
   )
@@ -267,15 +1269,270 @@ def test_load_from_events_reconstructs_tasks_restores_seq_and_bypasses_listeners
   assert completed is not None
   assert interrupted is not None
   assert completed.state == TaskState.COMPLETED
-  assert completed.result == {"response": "done"}
+  assert completed.result == completed_result
   assert completed.completed_at == 125.0
   assert completed.metadata["custom"] == "value"
   assert interrupted.state == TaskState.INTERRUPTED
   assert interrupted.completed_at == 200.0
+  assert interrupted.task_type == "plan_run"
   assert interrupted.reconstructed_from_log is True
+  assert interrupted.capability_bind_receipt == _bind_receipt(
+    provider="openai",
+    model="gpt-5.2",
+  )
   assert interrupted.metadata["parent_messages"][0]["message_id"] == "msg-1"
+  assert interrupted.accepted_parent_messages["msg-1"] == ParentMessage(
+    message_id="msg-1",
+    text="status",
+    sent_at=210.0,
+    task_id="bg_9",
+    sent_seq=4,
+  )
+  assert interrupted.delivered_messages == {"msg-1"}
   assert registry.register("background_agent").task_id == "bg_10"
   assert listener.transitions == []
+
+
+def test_load_from_events_accepts_exact_duplicate_task_events() -> None:
+  registry = TaskRegistry()
+  registration = {
+    "type": "task_registered",
+    "task_id": "bg_7",
+    "task_type": "background",
+    "agent_name": "writer",
+    "started_at": 100.0,
+  }
+  completion = {
+    "type": "task_completed",
+    "task_id": "bg_7",
+    "final_state": "completed",
+    "completed_at": 125.0,
+    "result": _child_report(),
+    "error": None,
+  }
+
+  registry.load_from_events([
+    {**registration, "_durable_seq": 1},
+    {**registration, "_durable_seq": 2},
+    {**completion, "_durable_seq": 3},
+    {**completion, "_durable_seq": 4},
+  ])
+
+  entry = registry.get("bg_7")
+  assert entry is not None
+  assert entry.state is TaskState.COMPLETED
+
+
+@pytest.mark.parametrize(
+  ("event_type", "changed_field", "changed_value"),
+  [
+    ("task_registered", "agent_name", "reviewer"),
+    ("task_completed", "final_state", "failed"),
+  ],
+)
+def test_load_from_events_rejects_conflicting_duplicate_task_events(
+  event_type: str,
+  changed_field: str,
+  changed_value: object,
+) -> None:
+  registry = TaskRegistry()
+  registration = {
+    "type": "task_registered",
+    "task_id": "bg_7",
+    "task_type": "background",
+    "agent_name": "writer",
+    "started_at": 100.0,
+  }
+  completion = {
+    "type": "task_completed",
+    "task_id": "bg_7",
+    "final_state": "completed",
+    "completed_at": 125.0,
+    "result": _child_report(),
+    "error": None,
+  }
+  source = registration if event_type == "task_registered" else completion
+  events = [registration, completion, {**source, changed_field: changed_value}]
+
+  with pytest.raises(
+    TaskDurableEventConflictError,
+    match=f"conflicting durable {event_type}",
+  ):
+    registry.load_from_events(events)
+
+
+@pytest.mark.parametrize(
+  ("final_state", "error"),
+  [
+    ("failed", None),
+    ("completed", {"code": "provider_error", "message": "failed"}),
+    ("not-a-state", None),
+    (None, None),
+  ],
+)
+def test_load_from_events_quarantines_task_result_settlement_mismatch(
+  final_state: object,
+  error: dict[str, str] | None,
+) -> None:
+  registry = TaskRegistry()
+  registry.load_from_events([
+    {
+      "type": "task_registered",
+      "task_id": "bg_7",
+      "task_type": "background",
+      "agent_name": "writer",
+      "started_at": 100.0,
+    },
+    {
+      "type": "task_completed",
+      "task_id": "bg_7",
+      "final_state": final_state,
+      "completed_at": 125.0,
+      "result": _canonical_skipped_result(),
+      "error": error,
+    },
+  ])
+
+  entry = registry.get("bg_7")
+  assert entry is not None
+  assert entry.state is TaskState.FAILED
+  assert entry.task_result is None
+  assert entry.error is not None
+  assert entry.error["code"] == "task_result_settlement_mismatch"
+
+
+def test_load_from_events_rejects_raw_completed_child_payload() -> None:
+  registry = TaskRegistry()
+  raw_result = {
+    "response": "partial",
+    "error_detail": "provider failed",
+  }
+
+  registry.load_from_events(
+    [
+      {
+        "type": "task_registered",
+        "task_id": "bg_3",
+        "agent_name": "reviewer",
+        "started_at": 100.0,
+      },
+      {
+        "type": "task_completed",
+        "task_id": "bg_3",
+        "final_state": "completed",
+        "completed_at": 125.0,
+        "result": raw_result,
+        "error": None,
+      },
+    ]
+  )
+
+  reconstructed = registry.get("bg_3")
+  assert reconstructed is not None
+  assert reconstructed.state == TaskState.FAILED
+  assert reconstructed.result == raw_result
+  assert reconstructed.error is not None
+  assert reconstructed.error["code"] == "invalid_task_result"
+  assert reconstructed.completed_at == 125.0
+  assert reconstructed.completion_persistence_state == "committed"
+
+
+@pytest.mark.parametrize(
+  "stored_error",
+  ["provider failed", 42, ["provider failed"], True],
+  ids=["string", "integer", "list", "boolean"],
+)
+@pytest.mark.parametrize("final_state", ["completed", "failed", "killed"])
+def test_load_from_events_rejects_malformed_child_error(
+  stored_error: object,
+  final_state: str,
+) -> None:
+  registry = TaskRegistry()
+  completed_result = _child_report()
+
+  registry.load_from_events(
+    [
+      {
+        "type": "task_registered",
+        "task_id": "bg_5",
+        "agent_name": "reviewer",
+        "started_at": 100.0,
+      },
+      {
+        "type": "task_completed",
+        "task_id": "bg_5",
+        "final_state": final_state,
+        "completed_at": 125.0,
+        "result": completed_result,
+        "error": stored_error,
+      },
+    ]
+  )
+
+  reconstructed = registry.get("bg_5")
+  assert reconstructed is not None
+  assert reconstructed.state == TaskState.FAILED
+  assert reconstructed.result == completed_result
+  assert reconstructed.error is not None
+  assert reconstructed.error["code"] == "invalid_child_error"
+  assert type(stored_error).__name__ in reconstructed.error["message"]
+  assert reconstructed.completed_at == 125.0
+  assert reconstructed.completion_persistence_state == "committed"
+  payload = background_task_payload(
+    reconstructed,
+    elapsed_seconds=25,
+    now=126.0,
+  )
+  assert payload["status"] == "error"
+  assert payload["error"]["code"] == "invalid_child_error"
+
+
+def test_load_from_events_quarantines_legacy_cancelled_report_completion() -> None:
+  registry = TaskRegistry()
+  accepted_result = {
+    "kind": "report",
+    "version": "1",
+    "report": {
+      "summary": "Accepted before cancellation",
+      "findings": [],
+      "artifacts": [],
+      "caveats": [],
+    },
+    "usage": {"input_tokens": 3},
+    "tools_used": ["lookup"],
+    "fms_results": None,
+    "artifact_events": None,
+    "warning": "observed_terminal_signals=cancelled",
+  }
+
+  registry.load_from_events(
+    [
+      {
+        "type": "task_completed",
+        "task_id": "bg_4",
+        "final_state": "completed",
+        "completed_at": 125.0,
+        "result": accepted_result,
+        "error": None,
+      },
+      {
+        "type": "task_registered",
+        "task_id": "bg_4",
+        "agent_name": "reviewer",
+        "started_at": 100.0,
+      },
+    ]
+  )
+
+  reconstructed = registry.get("bg_4")
+  assert reconstructed is not None
+  assert reconstructed.state == TaskState.FAILED
+  assert reconstructed.termination_intent is None
+  assert reconstructed.result == accepted_result
+  assert reconstructed.error is not None
+  assert reconstructed.error["code"] == "invalid_task_result"
+  assert reconstructed.completed_at == 125.0
+  assert reconstructed.completion_persistence_state == "committed"
 
 
 def test_load_from_events_ignores_resume_suffix_for_seq_base() -> None:
@@ -308,6 +1565,52 @@ def test_register_accepts_original_task_id_and_explicit_resume_id() -> None:
 
   assert entry.task_id == "bg_3_r1"
   assert entry.original_task_id == "bg_3"
+
+
+def test_claim_resume_successor_is_idempotent_for_the_same_lineage() -> None:
+  registry = TaskRegistry()
+
+  first, first_created = registry.claim_resume_successor(
+    "background_agent",
+    agent_name="reviewer",
+    task_id="bg_3_r1",
+    original_task_id="bg_3",
+  )
+  repeated, repeated_created = registry.claim_resume_successor(
+    "background_agent",
+    agent_name="ignored-on-replay",
+    task_id="bg_3_r1",
+    original_task_id="bg_3",
+  )
+
+  assert first_created is True
+  assert repeated_created is False
+  assert repeated is first
+  assert first.agent_name == "reviewer"
+  assert registry.list_tasks() == [first]
+
+
+def test_claim_resume_successor_rejects_cross_lineage_collision() -> None:
+  registry = TaskRegistry()
+  registry.register(
+    "background_agent",
+    task_id="bg_3_r1",
+    original_task_id="bg_other",
+  )
+
+  with pytest.raises(
+    ResumeSuccessorConflictError,
+    match="requested original_task_id='bg_3'",
+  ) as exc_info:
+    registry.claim_resume_successor(
+      "background_agent",
+      task_id="bg_3_r1",
+      original_task_id="bg_3",
+    )
+
+  assert exc_info.value.task_id == "bg_3_r1"
+  assert exc_info.value.existing_original_task_id == "bg_other"
+  assert len(registry.list_tasks()) == 1
 
 
 def test_make_progress_tracker_updates_tool_usage_fields() -> None:

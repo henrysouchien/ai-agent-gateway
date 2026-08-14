@@ -47,6 +47,7 @@ _SURROGATE_RE = re.compile(r"[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udb
 @dataclass
 class _ResponsesStreamState:
   message_started: bool = False
+  provider_reported_model: str | None = None
   current_item: dict[str, Any] | None = None
   current_block_type: str | None = None
   current_text: str = ""
@@ -54,6 +55,7 @@ class _ResponsesStreamState:
   current_tool_id: str = ""
   current_tool_name: str = ""
   current_tool_json: str = ""
+  saw_argument_delta: bool = False
   saw_tool_use: bool = False
 
 
@@ -293,7 +295,12 @@ def _build_headers(
   return headers
 
 
-def _convert_tools(tools: list[dict[str, Any]], *, strict: bool | None = False) -> list[dict[str, Any]]:
+def convert_codex_tools(
+  tools: list[dict[str, Any]],
+  *,
+  strict: bool | None = False,
+) -> list[dict[str, Any]]:
+  """Convert gateway tool definitions to exact Codex wire tools."""
   converted: list[dict[str, Any]] = []
   for tool in tools:
     converted.append(
@@ -306,6 +313,15 @@ def _convert_tools(tools: list[dict[str, Any]], *, strict: bool | None = False) 
       }
     )
   return converted
+
+
+def _convert_tools(
+  tools: list[dict[str, Any]],
+  *,
+  strict: bool | None = False,
+) -> list[dict[str, Any]]:
+  """Backward-compatible private seam used by existing provider callers."""
+  return convert_codex_tools(tools, strict=strict)
 
 
 def _convert_messages(messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
@@ -487,6 +503,12 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
   event_type = event.get("type")
   if not isinstance(event_type, str):
     return []
+  response_envelope = (
+    event.get("response") if isinstance(event.get("response"), dict) else {}
+  )
+  reported_model = str(response_envelope.get("model") or "").strip() or None
+  if reported_model is not None:
+    state.provider_reported_model = reported_model
 
   if event_type == "error":
     code = str(event.get("code") or "")
@@ -526,6 +548,7 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
       events.append(
         StreamEvent(
           type="message_start",
+          provider_reported_model=state.provider_reported_model,
           input_tokens=input_tokens,
           cache_read_tokens=cached_tokens,
         )
@@ -564,6 +587,7 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
       item_id = str(item.get("id") or "")
       state.current_tool_id = f"{call_id}|{item_id}" if item_id else call_id
       state.current_tool_json = str(item.get("arguments") or "")
+      state.saw_argument_delta = False
       state.saw_tool_use = True
       return [
         StreamEvent(
@@ -576,13 +600,22 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
     return []
 
   if event_type == "response.reasoning_summary_part.added":
+    separator: list[StreamEvent] = []
     if state.current_item and state.current_item.get("type") == "reasoning":
       summary = state.current_item.setdefault("summary", [])
       if isinstance(summary, list):
         part = event.get("part") or {}
         if isinstance(part, dict):
+          # The separator belongs BETWEEN parts, mirroring the "\n\n".join() that
+          # rebuilds the durable thinking block at response.output_item.done.
+          # Emitting it on part.done instead appends one after the FINAL part, so
+          # the client stream ends "...second\n\n" while the durable block ends
+          # "...second" -- the two representations disagree.
+          if summary and state.current_block_type == "thinking":
+            state.current_thinking += "\n\n"
+            separator.append(StreamEvent(type="thinking_delta", thinking_text="\n\n"))
           summary.append(part)
-    return []
+    return separator
 
   if event_type == "response.reasoning_summary_text.delta":
     if state.current_block_type != "thinking" or not state.current_item or state.current_item.get("type") != "reasoning":
@@ -596,14 +629,11 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
     return [StreamEvent(type="thinking_delta", thinking_text=delta)]
 
   if event_type == "response.reasoning_summary_part.done":
-    if state.current_block_type != "thinking" or not state.current_item or state.current_item.get("type") != "reasoning":
-      return []
-    summary = state.current_item.setdefault("summary", [])
-    if not isinstance(summary, list) or not summary or not isinstance(summary[-1], dict):
-      return []
-    summary[-1]["text"] = f"{summary[-1].get('text', '')}\n\n"
-    state.current_thinking += "\n\n"
-    return [StreamEvent(type="thinking_delta", thinking_text="\n\n")]
+    # The separator is emitted on the NEXT part's .added event, not here -- see above.
+    # Appending it per-part also placed one after the FINAL part, which no "\n\n".join()
+    # rebuild ever produces. The old summary[-1]["text"] mutation is dropped with it: no
+    # finalization path reads state.current_item["summary"], so it was dead either way.
+    return []
 
   if event_type == "response.content_part.added":
     if not state.current_item or state.current_item.get("type") != "message":
@@ -648,6 +678,18 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
     if state.current_block_type != "tool_use" or not state.current_item or state.current_item.get("type") != "function_call":
       return []
     delta = str(event.get("delta") or "")
+    # output_item.added may carry a complete arguments snapshot. Separate deltas are
+    # authoritative, so the first one REPLACES that snapshot instead of appending to it --
+    # otherwise a backend that both seeds and streams yields the arguments twice over.
+    # Mirrors the replace-on-first-delta guard in openai_responses_helpers.py. The mappers are
+    # NOT identical past this point: OpenAI suppresses the event for an empty delta and this
+    # one still emits it. Filed, not silently aligned -- see the residuals note in
+    # docs/design/gateway-codex-reasoning-separator-fix.md.
+    # `delta and` matters: an empty delta must NOT discard a valid seeded snapshot, which
+    # would degrade the call to "{}" when output_item.done omits arguments.
+    if delta and not state.saw_argument_delta:
+      state.current_tool_json = ""
+      state.saw_argument_delta = True
     state.current_tool_json += delta
     return [StreamEvent(type="tool_use_delta", tool_input_json=delta)]
 
@@ -704,6 +746,12 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
       state.current_item = None
       return [StreamEvent(type="text_end", text=state.current_text, raw_block=raw_block)]
     if item_type == "function_call":
+      # Accumulator first, and deliberately NOT the item-first order that
+      # openai_responses_helpers.py uses. function_call_arguments.done is the contract's
+      # finalization event and lands in current_tool_json, so item-first lets a stale
+      # output_item.done.arguments overwrite explicitly finalized arguments. The two mappers
+      # genuinely disagree here; OpenAI's order is the suspect one. See the residual note in
+      # docs/design/gateway-codex-reasoning-separator-fix.md.
       args_source = state.current_tool_json or str(item.get("arguments") or "{}")
       tool_input = _parse_streaming_json(args_source)
       call_id = str(item.get("call_id") or "")
@@ -718,7 +766,9 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
           deployment_secret=get_audit_hmac_secret(),
         )
       except Exception:
-        redacted_tool_input = tool_input
+        from ..secret_boundary import sanitization_failure_tool_input
+
+        redacted_tool_input = sanitization_failure_tool_input()
       raw_block = {
         "type": "tool_use",
         "id": tool_id,
@@ -730,6 +780,9 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
       state.current_tool_id = ""
       state.current_tool_name = ""
       state.current_tool_json = ""
+      # No saw_argument_delta reset here: unlike the OpenAI mapper (which READS the flag at
+      # finalization to synthesize a missing delta), nothing downstream consults it, and the
+      # next call's output_item.added resets it. A reset here would be decorative.
       return [
         StreamEvent(
           type="tool_use_end",

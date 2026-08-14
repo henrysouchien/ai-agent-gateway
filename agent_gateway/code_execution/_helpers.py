@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import base64
+import errno
 import os
+import site
+import stat as stat_module
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
+from ..child_environment import CODE_EXECUTE_ENVIRONMENT, filter_child_environment
 from ._config import CodeExecutionConfig
 
 if TYPE_CHECKING:
@@ -25,18 +29,6 @@ _CODE_EXECUTE_IMAGE_SUFFIXES = {
 }
 _CODE_EXECUTE_STDERR_NOISE = (
   "Matplotlib is building the font cache; this may take a moment.",
-)
-_SANDBOX_ENV_DENYLIST = frozenset(
-  {
-    "AGENT_API_USER_CLAIM_HMAC_KEY",
-    "AGENT_API_CLAIM_TTL_SECONDS",
-    "GATEWAY_RESOLVER_HMAC_KEY",
-    "CHAT_API_SECRET",
-    "CHAT_VALID_KEYS",
-    "EXCEL_MCP_API_KEY",
-    "ADDIN_DISPATCH_API_KEY",
-    "RISK_API_KEY",
-  }
 )
 _MISSING = object()
 
@@ -151,12 +143,6 @@ def _build_subprocess_env(extra_env: Optional[Dict[str, str]] = None) -> Dict[st
     text_value = str(value)
     existing = env.get(key)
     env[key] = f"{text_value}{os.pathsep}{existing}" if existing else text_value
-  return _strip_sandbox_secrets(env)
-
-
-def _strip_sandbox_secrets(env: Dict[str, str]) -> Dict[str, str]:
-  for key in _SANDBOX_ENV_DENYLIST:
-    env.pop(key, None)
   return env
 
 
@@ -258,7 +244,33 @@ def _prepare_code_execute_env(config: CodeExecutionConfig) -> Dict[str, str]:
     prepared = config.prepare_env(env)
     if prepared is not None:
       env = prepared
-  return _strip_sandbox_secrets(env)
+
+  work_dir = str(env.get("AGENT_CODE_EXECUTE_WORK_DIR") or "").strip()
+  if work_dir:
+    isolated_home = Path(work_dir) / ".code_execute_home"
+    user_site = site.getusersitepackages()
+    user_site_paths = [user_site] if isinstance(user_site, str) else list(user_site)
+    python_paths = [value for value in env.get("PYTHONPATH", "").split(os.pathsep) if value]
+    seen_python_paths = {os.path.realpath(value) for value in python_paths}
+    for value in user_site_paths:
+      resolved = os.path.realpath(value)
+      if not Path(resolved).is_dir() or resolved in seen_python_paths:
+        continue
+      python_paths.append(resolved)
+      seen_python_paths.add(resolved)
+    if python_paths:
+      env["PYTHONPATH"] = os.pathsep.join(python_paths)
+  else:
+    isolated_home = shared_cache_root / "home"
+  if str(isolated_home) != "/workspace/.code_execute_home":
+    isolated_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+      isolated_home.chmod(0o700)
+    except OSError:
+      pass
+  env["HOME"] = str(isolated_home)
+
+  return filter_child_environment(env, purpose=CODE_EXECUTE_ENVIRONMENT)
 
 
 def _strip_code_execute_stderr_noise(stderr: str) -> str:
@@ -273,16 +285,56 @@ def _strip_code_execute_stderr_noise(stderr: str) -> str:
 
 def _snapshot_image_mtimes(work_dir: Path) -> Dict[Path, int]:
   mtimes: Dict[Path, int] = {}
-  for candidate in work_dir.rglob("*"):
-    if not candidate.is_file():
-      continue
-    if candidate.suffix.lower() not in _CODE_EXECUTE_IMAGE_SUFFIXES:
-      continue
-    try:
-      mtimes[candidate.resolve()] = candidate.stat().st_mtime_ns
-    except OSError:
-      continue
+  no_follow = getattr(os, "O_NOFOLLOW", 0)
+  if not no_follow:
+    return mtimes
+  try:
+    root_fd = os.open(
+      work_dir,
+      os.O_RDONLY
+      | no_follow
+      | getattr(os, "O_DIRECTORY", 0)
+      | getattr(os, "O_CLOEXEC", 0),
+    )
+  except OSError:
+    return mtimes
+  try:
+    for name in os.listdir(root_fd):
+      candidate = Path(name)
+      if not name.startswith("_plot_"):
+        continue
+      if candidate.suffix.lower() not in _CODE_EXECUTE_IMAGE_SUFFIXES:
+        continue
+      try:
+        candidate_stat = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+      except OSError:
+        continue
+      if not stat_module.S_ISREG(candidate_stat.st_mode):
+        continue
+      mtimes[work_dir / name] = candidate_stat.st_mtime_ns
+  finally:
+    os.close(root_fd)
   return mtimes
+
+
+def _image_magic_matches(media_type: str, data: bytes) -> bool:
+  if media_type == "image/png":
+    return data.startswith(b"\x89PNG\r\n\x1a\n")
+  if media_type == "image/jpeg":
+    return data.startswith(b"\xff\xd8\xff")
+  if media_type == "image/svg+xml":
+    prefix = data[:4096].lstrip(b"\xef\xbb\xbf\x00\t\n\r ")
+    if prefix.startswith(b"<svg"):
+      return True
+    if prefix.startswith(b"<?xml"):
+      declaration_end = prefix.find(b"?>")
+      if declaration_end >= 0:
+        return prefix[declaration_end + 2 :].lstrip().startswith(b"<svg")
+  return False
+
+
+def _encoded_base64_size(raw_size: int) -> int:
+  return 4 * ((raw_size + 2) // 3)
 
 
 def _collect_generated_images(
@@ -295,49 +347,113 @@ def _collect_generated_images(
 ) -> List[Dict[str, Any]]:
   images: List[Dict[str, Any]] = []
   captured_count = 0
-  task_prefix = f"_plot_{task_id}_" if task_id else ""
+  task_prefix = f"_plot_{task_id}_" if task_id else "_plot_"
+  no_follow = getattr(os, "O_NOFOLLOW", 0)
+  if not no_follow:
+    return images
 
-  for candidate in sorted(work_dir.rglob("*")):
-    if not candidate.is_file():
-      continue
-    media_type = _CODE_EXECUTE_IMAGE_SUFFIXES.get(candidate.suffix.lower())
-    if media_type is None:
-      continue
-    if task_prefix and not candidate.name.startswith(task_prefix):
-      continue
-    try:
-      stat = candidate.stat()
-    except OSError as exc:
-      images.append({"filename": candidate.name, "skipped": True, "reason": f"stat_failed: {exc}"})
-      continue
-    previous_mtime = (before_mtimes or {}).get(candidate.resolve())
-    if stat.st_mtime_ns < started_ns and (previous_mtime is not None and stat.st_mtime_ns <= previous_mtime):
-      continue
-    if captured_count >= config.max_images:
-      images.append({"filename": candidate.name, "skipped": True, "reason": f"exceeds {config.max_images} image limit"})
-      continue
-    try:
-      data_base64 = base64.b64encode(candidate.read_bytes()).decode("ascii")
-    except OSError as exc:
-      images.append({"filename": candidate.name, "skipped": True, "reason": f"read_failed: {exc}"})
-      continue
-    if len(data_base64.encode("ascii")) > config.max_image_base64_bytes:
-      images.append(
-        {
-          "filename": candidate.name,
-          "skipped": True,
-          "reason": f"exceeds {config.max_image_base64_bytes // 1024}KB",
-        }
-      )
-      continue
-    images.append(
-      {
-        "filename": candidate.name,
-        "media_type": media_type,
-        "data_base64": data_base64,
-      }
+  try:
+    root_fd = os.open(
+      work_dir,
+      os.O_RDONLY
+      | no_follow
+      | getattr(os, "O_DIRECTORY", 0)
+      | getattr(os, "O_CLOEXEC", 0),
     )
-    captured_count += 1
+  except OSError:
+    return images
+
+  try:
+    for name in sorted(os.listdir(root_fd)):
+      candidate = Path(name)
+      if not name.startswith(task_prefix):
+        continue
+      media_type = _CODE_EXECUTE_IMAGE_SUFFIXES.get(candidate.suffix.lower())
+      if media_type is None:
+        continue
+      if captured_count >= config.max_images:
+        images.append({"filename": name, "skipped": True, "reason": f"exceeds {config.max_images} image limit"})
+        continue
+
+      flags = (
+        os.O_RDONLY
+        | no_follow
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+      )
+      try:
+        image_fd = os.open(name, flags, dir_fd=root_fd)
+      except OSError as exc:
+        reason = "symbolic_link_rejected" if exc.errno == errno.ELOOP else f"open_failed: {exc}"
+        images.append({"filename": name, "skipped": True, "reason": reason})
+        continue
+
+      try:
+        candidate_stat = os.fstat(image_fd)
+        if not stat_module.S_ISREG(candidate_stat.st_mode):
+          images.append({"filename": name, "skipped": True, "reason": "not_a_regular_file"})
+          continue
+        if candidate_stat.st_nlink != 1:
+          images.append({"filename": name, "skipped": True, "reason": "multiple_hard_links"})
+          continue
+        candidate_path = work_dir / name
+        previous_mtime = (before_mtimes or {}).get(candidate_path)
+        if (
+          candidate_stat.st_mtime_ns < started_ns
+          and previous_mtime is not None
+          and candidate_stat.st_mtime_ns <= previous_mtime
+        ):
+          continue
+        if _encoded_base64_size(candidate_stat.st_size) > config.max_image_base64_bytes:
+          images.append(
+            {
+              "filename": name,
+              "skipped": True,
+              "reason": f"exceeds {config.max_image_base64_bytes // 1024}KB",
+            }
+          )
+          continue
+
+        data = bytearray()
+        while len(data) <= candidate_stat.st_size:
+          chunk = os.read(image_fd, min(64 * 1024, candidate_stat.st_size + 1 - len(data)))
+          if not chunk:
+            break
+          data.extend(chunk)
+        final_stat = os.fstat(image_fd)
+        initial_identity = (
+          candidate_stat.st_dev,
+          candidate_stat.st_ino,
+          candidate_stat.st_size,
+          candidate_stat.st_mtime_ns,
+        )
+        final_identity = (
+          final_stat.st_dev,
+          final_stat.st_ino,
+          final_stat.st_size,
+          final_stat.st_mtime_ns,
+        )
+        if initial_identity != final_identity or len(data) != candidate_stat.st_size:
+          images.append({"filename": name, "skipped": True, "reason": "changed_during_read"})
+          continue
+        raw_data = bytes(data)
+        if not _image_magic_matches(media_type, raw_data):
+          images.append({"filename": name, "skipped": True, "reason": "invalid_image_magic"})
+          continue
+        images.append(
+          {
+            "filename": name,
+            "media_type": media_type,
+            "data_base64": base64.b64encode(raw_data).decode("ascii"),
+          }
+        )
+        captured_count += 1
+      except OSError as exc:
+        images.append({"filename": name, "skipped": True, "reason": f"read_failed: {exc}"})
+      finally:
+        os.close(image_fd)
+  finally:
+    os.close(root_fd)
 
   return images
 

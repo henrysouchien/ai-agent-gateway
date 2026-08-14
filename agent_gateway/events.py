@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union, cast
+
+from agent_workflow_contracts import AgentCompletionEnvelope, sha256_digest
+
+from .skill_lifecycle import TopLevelSkillLifecycleMetadata
+from .workflow_output_attachment import WorkflowOutputAttachment
 
 if TYPE_CHECKING:
   from .multi_user.billing import SessionUsageSummary
@@ -52,9 +57,9 @@ class SkillRunStartedEvent:
   skill_run_id: RunId
   skill: str
   ticker: str | None
+  scope: Literal["ticker", "portfolio"]
+  portfolio_id: str | None
   ts: float
-  scope: Literal["ticker", "portfolio"] = "ticker"
-  portfolio_id: str | None = None
   type: Literal["skill_run_started"] = field(default="skill_run_started", init=False)
 
 
@@ -63,6 +68,8 @@ class SkillResultCapturedEvent:
   skill_run_id: RunId
   skill: str
   ticker: str | None
+  scope: Literal["ticker", "portfolio"]
+  portfolio_id: str | None
   exit_code: int
   outcome: str
   status: str
@@ -77,6 +84,7 @@ class SkillResultCapturedEvent:
   duration_s: float | None
   error: str | None
   warnings: list[str]
+  compaction_count: int = 0
   approval_outcome: str | None = None
   approval_id: str | None = None
   approval_tool_name: str | None = None
@@ -106,11 +114,70 @@ class UiBlocksReadyEvent:
   turn_key: str
   emission_index: int
   ui_blocks_id: str
-  manifest_digest: str
+  contract_version: int
   payload: dict[str, Any]
   text_fallback: str
   ts: float
   type: Literal["ui_blocks_ready"] = field(default="ui_blocks_ready", init=False)
+
+
+@dataclass(frozen=True)
+class AgentCompletionEvent:
+  """Durable direct-parent publication of one ordinary agent result."""
+
+  task_id: str
+  envelope: AgentCompletionEnvelope
+  ts: float
+  event_id: str = field(init=False)
+  fingerprint: str = field(init=False)
+  type: Literal["agent_completion"] = field(
+    default="agent_completion",
+    init=False,
+  )
+
+  def __post_init__(self) -> None:
+    if (
+      type(self.task_id) is not str
+      or not self.task_id
+      or self.task_id != self.task_id.strip()
+    ):
+      raise ValueError(
+        "agent completion event requires a canonical physical task ID"
+      )
+    if not isinstance(self.envelope, AgentCompletionEnvelope):
+      raise TypeError(
+        "agent completion event requires AgentCompletionEnvelope"
+      )
+    if self.envelope.task_result_ref.attempt.physical_task_id != self.task_id:
+      raise ValueError(
+        "agent completion event must address its physical task"
+      )
+    event_id = (
+      "agent-completion:"
+      + sha256_digest({
+        "type": "agent_completion",
+        "task_id": self.task_id,
+      }).removeprefix("sha256:")
+    )
+    fingerprint = sha256_digest({
+      "event_id": event_id,
+      "task_id": self.task_id,
+      "envelope": self.envelope.model_dump(mode="json"),
+    })
+    object.__setattr__(self, "event_id", event_id)
+    object.__setattr__(self, "fingerprint", fingerprint)
+
+
+@dataclass(frozen=True)
+class WorkflowOutputAttachedEvent:
+  assistant_message_seq: int | None
+  delivery_envelope: dict[str, Any]
+  read: dict[str, str]
+  kind: Literal["workflow_primary_output"] = "workflow_primary_output"
+  type: Literal["workflow_output_attached"] = field(
+    default="workflow_output_attached",
+    init=False,
+  )
 
 
 @dataclass(frozen=True)
@@ -279,6 +346,8 @@ TypedEvent = Union[
   SkillResultCapturedEvent,
   ArtifactReadyEvent,
   UiBlocksReadyEvent,
+  AgentCompletionEvent,
+  WorkflowOutputAttachedEvent,
   ArtifactUpdatedEvent,
   TypedRecommendationsExtractedEvent,
   AggregateReadyEvent,
@@ -295,6 +364,8 @@ TYPED_EVENT_TYPES = frozenset(
     "skill_result_captured",
     "artifact_ready",
     "ui_blocks_ready",
+    "agent_completion",
+    "workflow_output_attached",
     "artifact_updated",
     "typed_recommendations_extracted",
     "aggregate_ready",
@@ -320,6 +391,15 @@ RUN_SCOPED_EVENT_TYPES = frozenset(
 
 
 def event_to_dict(event: TypedEvent) -> dict[str, Any]:
+  if isinstance(event, AgentCompletionEvent):
+    return {
+      "type": event.type,
+      "event_id": event.event_id,
+      "fingerprint": event.fingerprint,
+      "task_id": event.task_id,
+      "ts": event.ts,
+      "envelope": event.envelope.model_dump(mode="json"),
+    }
   payload = asdict(event)
   event_type = payload.pop("type")
   return {"type": event_type, **payload}
@@ -328,40 +408,60 @@ def event_to_dict(event: TypedEvent) -> dict[str, Any]:
 def event_from_dict(payload: dict[str, Any]) -> TypedEvent:
   event_type = payload.get("type")
   if event_type == "skill_run_started":
+    lifecycle = TopLevelSkillLifecycleMetadata(
+      skill_run_id=cast(str, payload["skill_run_id"]),
+      skill=cast(str, payload["skill"]),
+      scope=cast(
+        Literal["ticker", "portfolio"],
+        payload["scope"],
+      ),
+      ticker=cast(str | None, payload["ticker"]),
+      portfolio_id=cast(str | None, payload["portfolio_id"]),
+    )
     return SkillRunStartedEvent(
-      skill_run_id=str(payload["skill_run_id"]),
-      skill=str(payload["skill"]),
-      ticker=_optional_str(payload.get("ticker")),
+      skill_run_id=lifecycle.skill_run_id,
+      skill=lifecycle.skill,
+      ticker=lifecycle.ticker,
       ts=float(payload["ts"]),
-      scope=str(payload.get("scope", "ticker")),  # type: ignore[arg-type]
-      portfolio_id=_optional_str(payload.get("portfolio_id")),
+      scope=lifecycle.scope,
+      portfolio_id=lifecycle.portfolio_id,
     )
   if event_type == "skill_result_captured":
-    verdict_echo = payload.get("verdict_echo")
-    return SkillResultCapturedEvent(
-      skill_run_id=str(payload["skill_run_id"]),
-      skill=str(payload["skill"]),
-      ticker=_optional_str(payload.get("ticker")),
-      exit_code=int(payload["exit_code"]),
-      outcome=str(payload["outcome"]),
-      status=str(payload.get("status") or payload["outcome"]),
-      gate_code=_optional_str(payload.get("gate_code")),
-      artifact_refs=_string_list(payload.get("artifact_refs")),
-      proposal_ids=_string_list(payload.get("proposal_ids")),
-      verdict_echo=dict(verdict_echo) if isinstance(verdict_echo, dict) else None,
-      fms_results=_mapping_list(payload.get("fms_results", []), "skill_result_captured.fms_results"),
-      artifact_events=_mapping_list(
-        payload.get("artifact_events", []),
-        "skill_result_captured.artifact_events",
+    lifecycle = TopLevelSkillLifecycleMetadata(
+      skill_run_id=cast(str, payload["skill_run_id"]),
+      skill=cast(str, payload["skill"]),
+      scope=cast(
+        Literal["ticker", "portfolio"],
+        payload["scope"],
       ),
-      output_memory_file=_optional_str(payload.get("output_memory_file")),
-      cost_usd=_optional_float(payload.get("cost_usd")),
-      duration_s=_optional_float(payload.get("duration_s")),
-      error=_optional_str(payload.get("error")),
-      warnings=_string_list(payload.get("warnings")),
-      approval_outcome=_optional_str(payload.get("approval_outcome")),
-      approval_id=_optional_str(payload.get("approval_id")),
-      approval_tool_name=_optional_str(payload.get("approval_tool_name")),
+      ticker=cast(str | None, payload["ticker"]),
+      portfolio_id=cast(str | None, payload["portfolio_id"]),
+    )
+    canonical = lifecycle.normalize_result_event(payload)
+    return SkillResultCapturedEvent(
+      skill_run_id=canonical["skill_run_id"],
+      skill=canonical["skill"],
+      ticker=canonical["ticker"],
+      scope=canonical["scope"],
+      portfolio_id=canonical["portfolio_id"],
+      exit_code=canonical["exit_code"],
+      outcome=canonical["outcome"],
+      status=canonical["status"],
+      gate_code=canonical["gate_code"],
+      artifact_refs=canonical["artifact_refs"],
+      proposal_ids=canonical["proposal_ids"],
+      verdict_echo=canonical["verdict_echo"],
+      fms_results=canonical["fms_results"],
+      artifact_events=canonical["artifact_events"],
+      output_memory_file=canonical["output_memory_file"],
+      cost_usd=canonical["cost_usd"],
+      duration_s=canonical["duration_s"],
+      error=canonical["error"],
+      warnings=canonical["warnings"],
+      compaction_count=canonical["compaction_count"],
+      approval_outcome=canonical["approval_outcome"],
+      approval_id=canonical["approval_id"],
+      approval_tool_name=canonical["approval_tool_name"],
     )
   if event_type == "artifact_ready":
     return ArtifactReadyEvent(
@@ -387,10 +487,40 @@ def event_from_dict(payload: dict[str, Any]) -> TypedEvent:
       turn_key=str(payload["turn_key"]),
       emission_index=int(payload["emission_index"]),
       ui_blocks_id=str(payload["ui_blocks_id"]),
-      manifest_digest=str(payload["manifest_digest"]),
+      contract_version=int(payload["contract_version"]),
       payload=dict(ui_payload),
       text_fallback=str(payload["text_fallback"]),
       ts=float(payload["ts"]),
+    )
+  if event_type == "agent_completion":
+    event = AgentCompletionEvent(
+      task_id=str(payload["task_id"]),
+      envelope=AgentCompletionEnvelope.model_validate(payload["envelope"]),
+      ts=_event_ts(payload),
+    )
+    if payload.get("event_id") != event.event_id:
+      raise ValueError(
+        "agent completion event_id conflicts with its semantic binding"
+      )
+    if payload.get("fingerprint") != event.fingerprint:
+      raise ValueError(
+        "agent completion fingerprint conflicts with its canonical payload"
+      )
+    return event
+  if event_type == "workflow_output_attached":
+    attachment = WorkflowOutputAttachment.from_mapping({
+      "kind": payload.get("kind"),
+      "delivery_envelope": payload.get("delivery_envelope"),
+      "read": payload.get("read"),
+    })
+    raw_seq = payload.get("assistant_message_seq")
+    if raw_seq is not None and (type(raw_seq) is not int or raw_seq < 1):
+      raise ValueError(
+        "workflow_output_attached.assistant_message_seq must be positive"
+      )
+    return WorkflowOutputAttachedEvent(
+      assistant_message_seq=raw_seq,
+      **attachment.to_dict(),
     )
   if event_type == "artifact_updated":
     partial_view_model = payload.get("partial_view_model", {})
@@ -592,9 +722,15 @@ def _session_usage_summary(value: Any) -> SessionUsageSummary | None:
     ended_at=float(value["ended_at"]),
     drain_complete=bool(value.get("drain_complete", True)),
     in_flight_task_count=int(value.get("in_flight_task_count", 0)),
+    compaction_count=int(value.get("compaction_count", 0)),
     product_id=_optional_str(value.get("product_id")),
     model=_optional_str(value.get("model")),
     provider=_optional_str(value.get("provider")),
+    capability_bind=(
+      dict(value["capability_bind"])
+      if isinstance(value.get("capability_bind"), dict) else None
+    ),
+    provider_reported_model=_optional_str(value.get("provider_reported_model")),
     rate_table_version=_optional_str(value.get("rate_table_version")),
     billing_mode=value.get("billing_mode"),
     context_surfaces=_mapping_list(value.get("context_surfaces", []), "session_recap.usage.context_surfaces"),
@@ -703,6 +839,7 @@ def _recap_failure_type(value: Any) -> RecapFailureType:
 
 
 __all__ = [
+  "AgentCompletionEvent",
   "AggregateReadyEvent",
   "AggregateReadyTrigger",
   "ApprovalDecisionSource",

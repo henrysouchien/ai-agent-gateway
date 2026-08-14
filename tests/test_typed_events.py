@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 
@@ -30,19 +31,81 @@ from agent_gateway.events import (
   ToolApprovalDecidedEvent,
   ToolApprovalRequestEvent,
   TypedRecommendationsExtractedEvent,
+  WorkflowOutputAttachedEvent,
   event_from_dict,
   event_to_dict,
 )
 from agent_gateway.multi_user.billing import SessionUsageSummary
+from agent_workflow_contracts import (
+  AuthoredDeliverySummary,
+  ContentHandle,
+  ContractRef,
+  DeliveryEnvelope,
+  DeliveryPrimary,
+  PublishedOutputRef,
+)
+
+
+def _capability_bind_receipt() -> dict[str, str]:
+  return {
+    "schema_version": "1.0",
+    "capability_id": "session.driver",
+    "model_key": "test.anthropic.claude-sonnet-test",
+    "provider": "anthropic",
+    "upstream_model": "claude-sonnet-test",
+    "adapter": "test.anthropic",
+    "protocol_profile": "test.reasoning",
+    "route": "test.in_process",
+    "effort": "none",
+    "credential_principal": "user",
+    "credential_ref": "test-user:anthropic",
+    "run_mode": "interactive",
+    "registry_revision": "test-typed-events.1",
+    "policy_revision": "test-typed-events.1",
+    "selection_source": "capability_default",
+  }
+
+
+def _contract(name: str) -> ContractRef:
+  return ContractRef(
+    namespace="agent-workflow",
+    name=name,
+    version="v1",
+    digest="sha256:" + hashlib.sha256(name.encode("utf-8")).hexdigest(),
+  )
+
+
+def _text_content(text: str, *, contract: ContractRef) -> ContentHandle:
+  encoded = text.encode("utf-8")
+  digest = hashlib.sha256(encoded).hexdigest()
+  return ContentHandle(
+    content_id=f"sha256:{digest}",
+    content_sha256=digest,
+    content_chars=len(text),
+    content_bytes=len(encoded),
+    contract=contract,
+    media_type="text/plain; charset=utf-8",
+    encoding="utf-8",
+    retention="durable",
+  )
 
 
 def test_typed_events_round_trip_with_type_discriminator() -> None:
   events = [
-    SkillRunStartedEvent(skill_run_id="run-1", skill="earnings-scenarios", ticker="PCTY", ts=1.0),
+    SkillRunStartedEvent(
+      skill_run_id="run-1",
+      skill="earnings-scenarios",
+      ticker="PCTY",
+      scope="ticker",
+      portfolio_id=None,
+      ts=1.0,
+    ),
     SkillResultCapturedEvent(
       skill_run_id="run-1",
       skill="earnings-scenarios",
       ticker="PCTY",
+      scope="ticker",
+      portfolio_id=None,
       exit_code=0,
       outcome="success",
       status="noop",
@@ -68,6 +131,51 @@ def test_typed_events_round_trip_with_type_discriminator() -> None:
       contract_name="EarningsScenarios",
       data_source="live",
       ts=3.0,
+    ),
+    WorkflowOutputAttachedEvent(
+      assistant_message_seq=12,
+      delivery_envelope=DeliveryEnvelope(
+        workflow_run_id="workflow-1",
+        phase_number=2,
+        revision=3,
+        summary=AuthoredDeliverySummary(
+          text="Grounded summary",
+          source=PublishedOutputRef(
+            output_id=(
+              "wout:workflow-1:phase:2:revision:3:summary"
+            ),
+            contract=(summary_contract := _contract("delivery-summary")),
+            content=_text_content(
+              "Grounded summary",
+              contract=summary_contract,
+            ),
+          ),
+        ),
+        primary=DeliveryPrimary(
+          name="synthesis",
+          published_output_ref=PublishedOutputRef(
+            output_id=(
+              "wout:workflow-1:phase:2:revision:3:synthesis"
+            ),
+            contract=(report_contract := _contract("workflow-report")),
+            content=ContentHandle(
+              content_id="sha256:" + "a" * 64,
+              content_sha256="a" * 64,
+              content_chars=120,
+              content_bytes=122,
+              contract=report_contract,
+              media_type="text/markdown; charset=utf-8",
+              encoding="utf-8",
+              retention="durable",
+            ),
+          ),
+        ),
+      ).model_dump(mode="json"),
+      read={
+        "action": "output",
+        "workflow_run_id": "workflow-1",
+        "output_id": "wout:workflow-1:phase:2:revision:3:synthesis",
+      },
     ),
     ArtifactUpdatedEvent(
       skill_run_id="run-1",
@@ -135,6 +243,8 @@ def test_skill_result_captured_event_round_trip() -> None:
     skill_run_id="run-risk",
     skill="risk-review",
     ticker=None,
+    scope="portfolio",
+    portfolio_id="portfolio-1",
     exit_code=0,
     outcome="success",
     status="noop",
@@ -373,34 +483,40 @@ def test_artifact_updated_event_rejects_malformed_partial_view_model() -> None:
     raise AssertionError("malformed partial_view_model should raise")
 
 
-def test_extended_events_default_legacy_payloads_to_ticker_scope() -> None:
-  payloads = [
-    {
-      "type": "skill_run_started",
-      "skill_run_id": "run-1",
-      "skill": "earnings-scenarios",
-      "ticker": "PCTY",
-      "ts": 1.0,
-    },
-    {
-      "type": "artifact_ready",
-      "skill_run_id": "run-1",
-      "ticker": "PCTY",
-      "skill": "earnings-scenarios",
-      "artifact_id": "artifact-1",
-      "artifact_path": "artifacts/research/PCTY/earnings-scenarios.json",
-      "binary_artifact_path": None,
-      "contract_name": "EarningsScenarios",
-      "data_source": "live",
-      "ts": 3.0,
-    },
-  ]
+def test_skill_lifecycle_rejects_legacy_payload_without_identity() -> None:
+  payload = {
+    "type": "skill_run_started",
+    "skill_run_id": "run-1",
+    "skill": "earnings-scenarios",
+    "ticker": "PCTY",
+    "ts": 1.0,
+  }
 
-  for payload in payloads:
-    hydrated = event_from_dict(payload)
-    serialized = event_to_dict(hydrated)
-    assert serialized["scope"] == "ticker"
-    assert serialized["portfolio_id"] is None
+  try:
+    event_from_dict(payload)
+  except KeyError as exc:
+    assert exc.args == ("scope",)
+  else:
+    raise AssertionError("missing lifecycle identity should raise")
+
+
+def test_artifact_event_still_defaults_legacy_scope() -> None:
+  payload = {
+    "type": "artifact_ready",
+    "skill_run_id": "run-1",
+    "ticker": "PCTY",
+    "skill": "earnings-scenarios",
+    "artifact_id": "artifact-1",
+    "artifact_path": "artifacts/research/PCTY/earnings-scenarios.json",
+    "binary_artifact_path": None,
+    "contract_name": "EarningsScenarios",
+    "data_source": "live",
+    "ts": 3.0,
+  }
+
+  serialized = event_to_dict(event_from_dict(payload))
+  assert serialized["scope"] == "ticker"
+  assert serialized["portfolio_id"] is None
 
 
 def test_tool_approval_decided_event_supports_all_decision_sources_and_outcomes() -> None:
@@ -487,6 +603,7 @@ def test_session_recap_event_round_trip_with_nested_types() -> None:
   assert payload["type"] == "session_recap"
   assert "session_recap" in TYPED_EVENT_TYPES
   assert "session_recap" not in RUN_SCOPED_EVENT_TYPES
+  assert payload["usage"]["compaction_count"] == 2
   assert hydrated == event
   assert json_hydrated == event
 
@@ -629,6 +746,11 @@ def _session_recap_event(
       drain_complete=True,
       in_flight_task_count=0,
       product_id="addin",
+      compaction_count=2,
+      capability_bind=_capability_bind_receipt(),
+      provider_reported_model=None,
+      usage_event_count=1,
+      usage_event_ids=("usage-event-1",),
     ),
     ts=1010.0,
   )

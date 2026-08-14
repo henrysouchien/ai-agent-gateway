@@ -38,14 +38,156 @@ from agent_gateway.batch_approval_projection import (
   BatchApprovalScope,
   current_batch_approval_scope,
 )
+from agent_gateway.capability_binding import (
+  CredentialHandle,
+)
+from agent_gateway.capability_execution import MaterializedCredential
 from agent_gateway.control_plane import batches as batches_module
 from agent_gateway.control_plane.valuation_ready_tools import make_valuation_ready_skill_tool_bundle
+from agent_gateway.providers import ModelInfo, ModelProvider
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.claim_signing_authority import (
+  GatewayClaimSigningAuthority,
+)
+from agent_gateway.session import GatewaySession
 from agent_gateway.skill_context import clear_current_skill, reset_current_skill, set_current_skill
-from api.agent.batch.registry import BatchRegistry
+from api.agent.batch.registry import (
+  ActiveBatchError,
+  BatchDispatchRecord,
+  BatchRegistry,
+)
+from tests.capability_execution_test_support import (
+  stub_capability_execution_resolver,
+)
 
 
 API_KEY = "batch-control-key"
+_BATCH_CAPABILITY_RESOLVER = stub_capability_execution_resolver(
+  default_provider="anthropic",
+  default_model="claude-sonnet-4-6",
+  default_effort="none",
+  run_mode="batch",
+)
+_MODEL_REGISTRY = _BATCH_CAPABILITY_RESOLVER.registry
+_MODEL_SELECTION_POLICY = _BATCH_CAPABILITY_RESOLVER.selection_policy
+
+
+class _BatchTestProvider(ModelProvider):
+  def __init__(self, name: str = "anthropic") -> None:
+    self.name = name
+
+  def has_active_credential(self, config: dict[str, Any]) -> bool:
+    return bool(config.get("api_key"))
+
+  def get_model_info(self, model: str) -> ModelInfo:
+    return ModelInfo(
+      id=model,
+      provider=self.name,
+      max_output_tokens=16_000,
+      supports_thinking=False,
+    )
+
+
+_BATCH_TEST_PROVIDER = _BatchTestProvider("anthropic")
+_OPENAI_BATCH_TEST_PROVIDER = _BatchTestProvider("openai")
+_SERVICE_HANDLE = CredentialHandle(
+  handle_id="control-batches-service-anthropic",
+  provider="anthropic",
+  principal="service",
+  tenant_id="test-product",
+  actor_id=None,
+)
+_SERVICE_MATERIAL = MaterializedCredential(
+  handle=_SERVICE_HANDLE,
+  auth_config={
+    "provider": "anthropic",
+    "api_key": "control-batches-service-secret",
+  },
+)
+
+
+def _service_materializer(handle: CredentialHandle) -> MaterializedCredential:
+  if handle is not _SERVICE_HANDLE:
+    raise RuntimeError("unexpected control-batches credential handle")
+  return _SERVICE_MATERIAL
+
+
+def _adapter_resolver(adapter: str) -> ModelProvider:
+  if adapter == "test.anthropic":
+    return _BATCH_TEST_PROVIDER
+  if adapter == "test.openai":
+    return _OPENAI_BATCH_TEST_PROVIDER
+  raise RuntimeError(f"unexpected control-batches adapter: {adapter}")
+
+
+def _gateway_config(*, mcp_client: Any = None) -> SimpleNamespace:
+  return SimpleNamespace(
+    tenant_id="test-product",
+    model_registry=_MODEL_REGISTRY,
+    model_selection_policy=_MODEL_SELECTION_POLICY,
+    service_provider_handles={"anthropic": _SERVICE_HANDLE},
+    service_auth_config_resolver=_service_materializer,
+    capability_adapter_resolver=_adapter_resolver,
+    default_provider=_BATCH_TEST_PROVIDER,
+    mcp_client=mcp_client,
+  )
+
+
+def _gateway_session(
+  *,
+  owner_user_id: str = "1",
+  user_id: str = "alice",
+  user_email: str = "alice@example.com",
+  channel: str = "tui",
+) -> GatewaySession:
+  now = int(time.time())
+  session = GatewaySession(
+    session_id=f"control-batches-{uuid.uuid4().hex}",
+    api_key_hash="control-batches-hash",
+    created_at=now,
+    expires_at=now + 60,
+    user_id=user_id,
+    owner_user_id=owner_user_id,
+    user_email=user_email,
+    risk_user_id=int(owner_user_id),
+    kind="chat",
+    channel=channel,
+    auth_config={
+      "provider": "anthropic",
+      "api_key": "control-batches-session-secret",
+    },
+    tenant_id="test-product",
+    session_credential_handle=_SERVICE_HANDLE,
+  )
+  return session
+
+
+def test_batch_admission_remains_fail_closed_without_claim_authority() -> None:
+  session = _gateway_session()
+  app_state = SimpleNamespace(
+    gateway_config=_gateway_config(),
+    gateway_claim_signing_authority=None,
+  )
+
+  with pytest.raises(
+    RuntimeError,
+    match="batch admission claim-signing authority is unavailable",
+  ):
+    batches_module._acquire_and_start_batch(
+      {},
+      app_state=app_state,
+      registry=object(),
+      task_registry=batches_module.BatchTaskRegistry(),
+      dispatch_key="missing-authority",
+      dispatch_request_spec={},
+      user_id=session.user_id,
+      user_email=session.user_email,
+      role=session.role,
+      channel=session.channel,
+      authenticated_session=session,
+      capability_execution_resolver=object(),
+      session_driver_execution=object(),
+    )
 
 
 def _run(coro):
@@ -94,19 +236,25 @@ class FakeBatchController:
     *,
     registry: BatchRegistry,
     host: str,
+    capability_bind: dict[str, Any],
     pid: int | None = None,
+    dispatch_key: str | None = None,
+    dispatch_request_spec: dict[str, Any] | None = None,
     user_id: str | None = None,
     user_email: str | None = None,
   ) -> tuple[int, str, str | None]:
     if self.raise_active:
       raise FakeActiveBatchError(99)
     resolved_user_id = user_id or "alice"
-    batch_id = registry.acquire_batch(
+    batch_id = _acquire_test_batch(registry,
       user_id=resolved_user_id,
       host=host,
       spec=spec,
+      capability_bind=capability_bind,
+      dispatch_request_spec=dispatch_request_spec,
       budget_usd=float(spec.get("budget_usd") or spec.get("budget") or 0),
       pid=pid,
+      dispatch_key=dispatch_key,
     )
     self.acquire_calls.append(
       {
@@ -114,6 +262,8 @@ class FakeBatchController:
         "spec": dict(spec),
         "user_id": resolved_user_id,
         "user_email": user_email,
+        "dispatch_key": dispatch_key,
+        "capability_bind": dict(capability_bind),
       }
     )
     return batch_id, resolved_user_id, user_email
@@ -124,10 +274,24 @@ class FakeBatchController:
     spec: dict[str, Any],
     *,
     registry: BatchRegistry,
+    capability_execution_resolver: Any,
+    session_driver_execution: Any,
+    captured_run_admission_factory: Any,
     _identity: tuple[str, str | None] | None = None,
     _on_finalize=None,
   ) -> dict[str, Any]:
-    self.run_calls.append({"batch_id": batch_id, "spec": dict(spec), "identity": _identity})
+    assert capability_execution_resolver.auth_context.run_mode == "batch"
+    assert session_driver_execution.bind.run_mode == "batch"
+    self.run_calls.append({
+      "batch_id": batch_id,
+      "spec": dict(spec),
+      "identity": _identity,
+      "capability_execution_resolver": capability_execution_resolver,
+      "session_driver_execution": session_driver_execution,
+      "captured_run_admission_factory": (
+        captured_run_admission_factory
+      ),
+    })
     if self.wait_for_cancel:
       for _ in range(50):
         if str(registry.get_batch_digest(batch_id).get("status") or "") == "cancelling":
@@ -179,17 +343,29 @@ class FakeBatchController:
 
 def _make_app(*, mcp_client: Any = None):
   async def _build_chat_runtime(*, session, request, channel, auth_manager):
-    _ = session, request, channel, auth_manager
-    return ChatRuntime(system_prompt="test", build_runner=lambda *_args: None)
+    _ = session, channel, auth_manager
+    return ChatRuntime(
+      system_prompt="test",
+      build_runner=lambda *_args: None,
+      capability_execution=request.capability_execution,
+    )
 
   return create_gateway_app(
     GatewayServerConfig(
+      default_provider=_BATCH_TEST_PROVIDER,
       jwt_secret="batch-control-test-secret-0123456789",
       valid_api_keys={API_KEY},
-      auth_config={"model": "test-model"},
-      allowed_models=set(),
+      tenant_id="test-product",
+      model_registry=_MODEL_REGISTRY,
+      model_selection_policy=_MODEL_SELECTION_POLICY,
+      service_provider_handles={"anthropic": _SERVICE_HANDLE},
+      service_auth_config_resolver=_service_materializer,
+      capability_adapter_resolver=_adapter_resolver,
       build_chat_runtime=_build_chat_runtime,
       mcp_client=mcp_client,
+      claim_signing_authority=GatewayClaimSigningAuthority(
+        "batch-control-test-claim-key-at-least-32-bytes"
+      ),
     )
   )
 
@@ -218,8 +394,15 @@ def _control_session(client: TestClient, user_id: str = "alice") -> dict[str, An
   return response.json()
 
 
-def _headers(session_payload: dict[str, Any]) -> dict[str, str]:
-  return {"Authorization": f"Bearer {session_payload['session_token']}"}
+def _headers(
+  session_payload: dict[str, Any],
+  *,
+  idempotency_key: str | None = None,
+) -> dict[str, str]:
+  return {
+    "Authorization": f"Bearer {session_payload['session_token']}",
+    "Idempotency-Key": idempotency_key or f"batch-test-{uuid.uuid4().hex}",
+  }
 
 
 def _batch_spec(*, universe: list[str] | None = None) -> dict[str, Any]:
@@ -229,6 +412,28 @@ def _batch_spec(*, universe: list[str] | None = None) -> dict[str, Any]:
     "budget_usd": 1.0,
     "max_concurrency": 2,
   }
+
+
+def _acquire_test_batch(
+  registry: BatchRegistry,
+  **kwargs: Any,
+) -> int:
+  capability_bind = kwargs.pop("capability_bind", None)
+  if capability_bind is None:
+    owner_user_id = str(kwargs.get("user_id") or "alice")
+    _resolver, execution = (
+      batches_module._batch_capability_execution_context(
+        app_state=SimpleNamespace(gateway_config=_gateway_config()),
+        user_id=owner_user_id,
+        authenticated_session=None,
+      )
+    )
+    capability_bind = execution.bind.receipt()
+  return BatchRegistry.acquire_batch(
+    registry,
+    capability_bind=capability_bind,
+    **kwargs,
+  )
 
 
 def _install_batch_pending_approval(
@@ -349,7 +554,7 @@ def test_control_batches_dispatch_list_and_get(fake_batch_control: FakeBatchCont
       }
     ]
     assert detail["proposals"] == []
-    assert detail["diligence_prs"] == []
+    assert set(detail) == {"batch", "verdict_matrix", "candidates", "proposals", "failures"}
 
     list_response = client.get("/api/control/batches", headers=headers)
     assert list_response.status_code == 200, list_response.text
@@ -357,6 +562,847 @@ def test_control_batches_dispatch_list_and_get(fake_batch_control: FakeBatchCont
     assert [item["batch_id"] for item in batches] == [batch_id]
     assert batches[0]["cost_usd"] == pytest.approx(0.125)
     assert fake_batch_control.run_calls[0]["identity"] == ("alice", "alice@example.com")
+
+
+def test_control_batch_dispatch_replays_same_key_without_duplicate_task(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(
+      _control_session(client),
+      idempotency_key="batch-replay-test",
+    )
+    first = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+    assert first.status_code == 200, first.text
+    batch_id = int(first.json()["batch_id"])
+    _wait_for_batch_status(client, headers, batch_id, {"completed"})
+
+    replay = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+
+  assert replay.status_code == 200, replay.text
+  assert replay.json() == {
+    "batch_id": batch_id,
+    "status": "completed",
+    "replayed": True,
+  }
+  assert len(fake_batch_control.acquire_calls) == 1
+  assert len(fake_batch_control.run_calls) == 1
+
+
+def test_control_batch_dispatch_replay_preserves_locally_admitted_task(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  fake_batch_control.wait_for_cancel = True
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(
+      _control_session(client),
+      idempotency_key="batch-live-local-replay",
+    )
+    first = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+    replay = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+
+  assert first.status_code == 200, first.text
+  assert replay.status_code == 200, replay.text
+  assert replay.json() == {
+    "batch_id": int(first.json()["batch_id"]),
+    "status": "running",
+    "replayed": True,
+  }
+  assert len(fake_batch_control.acquire_calls) == 1
+  assert len(fake_batch_control.run_calls) == 1
+
+
+def test_control_batch_dispatch_key_rejects_payload_drift(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(
+      _control_session(client),
+      idempotency_key="batch-conflict-test",
+    )
+    first = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+    assert first.status_code == 200, first.text
+    _wait_for_batch_status(
+      client,
+      headers,
+      int(first.json()["batch_id"]),
+      {"completed"},
+    )
+
+    conflict = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(universe=["ADI"]),
+    )
+
+  assert conflict.status_code == 409, conflict.text
+  assert "different spec" in conflict.json()["detail"]
+  assert len(fake_batch_control.acquire_calls) == 1
+  assert len(fake_batch_control.run_calls) == 1
+
+
+def test_control_batch_dispatch_requires_idempotency_key(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    session = _control_session(client)
+    response = client.post(
+      "/api/control/batches",
+      headers={"Authorization": f"Bearer {session['session_token']}"},
+      json=_batch_spec(),
+    )
+
+  assert response.status_code == 400, response.text
+  assert response.json()["detail"] == (
+    "Idempotency-Key is required for batch dispatch"
+  )
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_control_batch_post_admission_value_error_is_not_attested_unadmitted(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  fake_batch_control.wait_for_cancel = True
+  app = _make_app()
+  original_handoff = batches_module._acquire_and_start_batch
+  handoff_calls = 0
+
+  def fail_once_after_handoff(*args: Any, **kwargs: Any) -> int:
+    nonlocal handoff_calls
+    handoff_calls += 1
+    batch_id = original_handoff(*args, **kwargs)
+    if handoff_calls == 1:
+      raise ValueError("post-admission task handoff response failed")
+    return batch_id
+
+  monkeypatch.setattr(
+    batches_module,
+    "_acquire_and_start_batch",
+    fail_once_after_handoff,
+  )
+  with TestClient(app) as client:
+    headers = _headers(
+      _control_session(client),
+      idempotency_key="batch-post-admission-value-error",
+    )
+    first = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+    registry = batches_module._registry_for_user("alice")
+    admitted = registry.list_batches("alice")
+    registry.close()
+    second = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+
+  assert first.status_code == 422, first.text
+  assert "X-Batch-Dispatch-Admitted" not in first.headers
+  assert len(admitted) == 1
+  assert second.status_code == 200, second.text
+  assert second.json()["batch_id"] == admitted[0]["batch_id"]
+  assert second.json()["replayed"] is True
+  assert len(fake_batch_control.run_calls) == 1
+
+
+def test_control_batch_dispatch_replay_survives_gateway_restart(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  key = "batch-restart-replay-test"
+  first_app = _make_app()
+  with TestClient(first_app) as client:
+    headers = _headers(_control_session(client), idempotency_key=key)
+    first = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+    assert first.status_code == 200, first.text
+    batch_id = int(first.json()["batch_id"])
+    _wait_for_batch_status(client, headers, batch_id, {"completed"})
+
+  restarted_app = _make_app()
+  with TestClient(restarted_app) as client:
+    headers = _headers(_control_session(client), idempotency_key=key)
+    replay = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+
+  assert replay.status_code == 200, replay.text
+  assert replay.json()["batch_id"] == batch_id
+  assert replay.json()["status"] == "completed"
+  assert replay.json()["replayed"] is True
+  assert len(fake_batch_control.acquire_calls) == 1
+  assert len(fake_batch_control.run_calls) == 1
+
+
+def test_exact_replay_precedes_all_mutable_fresh_admission_gates(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  key = "batch-replay-before-mutable-gates"
+  request_spec = _batch_spec()
+  registry = batches_module._registry_for_user("alice")
+  batch_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host="old-gateway",
+    spec={**request_spec, "batch_date": "2026-07-25"},
+    dispatch_request_spec=request_spec,
+    budget_usd=1.0,
+    pid=999_999,
+    dispatch_key=key,
+  )
+  registry.set_status(batch_id, "completed")
+  registry.close()
+
+  def forbidden_gate(*_args: Any, **_kwargs: Any) -> Any:
+    raise AssertionError("exact replay reached a fresh-admission gate")
+
+  async def forbidden_readiness(*_args: Any, **_kwargs: Any) -> Any:
+    forbidden_gate()
+
+  task_registry = batches_module.BatchTaskRegistry()
+  monkeypatch.setattr(batches_module, "_has_active_credential", forbidden_gate)
+  monkeypatch.setattr(
+    batches_module,
+    "_batch_capability_execution_context",
+    forbidden_gate,
+  )
+  monkeypatch.setattr(
+    batches_module,
+    "require_corpus_readiness",
+    forbidden_readiness,
+  )
+  monkeypatch.setattr(task_registry, "assert_accepting", forbidden_gate)
+  app_state = SimpleNamespace(
+    gateway_config=SimpleNamespace(credentials_resolver=object()),
+    batch_task_registry=task_registry,
+  )
+
+  result = asyncio.run(
+    batches_module.dispatch_batch_in_process(
+      request_spec,
+      app_state=app_state,
+      user_id="alice",
+      dispatch_key=key,
+      user_email="alice@example.com",
+      authenticated_session=_gateway_session(),
+    )
+  )
+
+  assert result == {
+    "batch_id": batch_id,
+    "status": "completed",
+    "replayed": True,
+  }
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_control_batch_dispatch_replay_terminalizes_fresh_foreign_orphan(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    batches_module.socket,
+    "gethostname",
+    lambda: "local-gateway",
+  )
+  key = "batch-fresh-foreign-replay"
+  registry = batches_module._registry_for_user("alice")
+  batch_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host="foreign-gateway",
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=999_999,
+    now=time.time(),
+    dispatch_key=key,
+  )
+  registry.close()
+
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client), idempotency_key=key)
+    replay = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+
+  assert replay.status_code == 200, replay.text
+  assert replay.json() == {
+    "batch_id": batch_id,
+    "status": "failed",
+    "replayed": True,
+  }
+  reopened = batches_module._registry_for_user("alice")
+  try:
+    digest = reopened.get_batch_digest(batch_id)
+  finally:
+    reopened.close()
+  assert digest["status"] == "failed"
+  assert digest["error"] == (
+    "batch_dispatch_replay_orphaned_after_gateway_restart"
+  )
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_control_batch_dispatch_replay_terminalizes_same_host_pid_reuse_orphan(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    batches_module.socket,
+    "gethostname",
+    lambda: "local-gateway",
+  )
+  key = "batch-same-host-pid-reuse-replay"
+  registry = batches_module._registry_for_user("alice")
+  batch_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host="local-gateway",
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=batches_module.os.getpid(),
+    now=time.time(),
+    dispatch_key=key,
+  )
+  registry.close()
+
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client), idempotency_key=key)
+    replay = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+
+  assert replay.status_code == 200, replay.text
+  assert replay.json() == {
+    "batch_id": batch_id,
+    "status": "failed",
+    "replayed": True,
+  }
+  reopened = batches_module._registry_for_user("alice")
+  try:
+    digest = reopened.get_batch_digest(batch_id)
+  finally:
+    reopened.close()
+  assert digest["error"] == (
+    "batch_dispatch_replay_orphaned_after_gateway_restart"
+  )
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_control_batch_dispatch_replay_fails_closed_on_malformed_owner(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    batches_module.socket,
+    "gethostname",
+    lambda: "local-gateway",
+  )
+  key = "batch-malformed-owner-replay"
+  registry = batches_module._registry_for_user("alice")
+  batch_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host="local-gateway",
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=batches_module.os.getpid(),
+    now=time.time(),
+    dispatch_key=key,
+  )
+  with registry._db_lock:
+    conn = registry._ensure_db()
+    conn.execute(
+      "UPDATE batches SET host = 12345 WHERE batch_id = ?",
+      (batch_id,),
+    )
+    conn.commit()
+  registry.close()
+
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client), idempotency_key=key)
+    replay = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+
+  assert replay.status_code == 200, replay.text
+  assert replay.json() == {
+    "batch_id": batch_id,
+    "status": "failed",
+    "replayed": True,
+  }
+  reopened = batches_module._registry_for_user("alice")
+  try:
+    digest = reopened.get_batch_digest(batch_id)
+  finally:
+    reopened.close()
+  assert digest["error"] == (
+    "batch_dispatch_replay_orphaned_after_gateway_restart"
+  )
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_validation_rejection_race_reconciles_admitted_winner(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  request_spec = _batch_spec()
+  dispatch_key = "batch-admission-wins-validation-race"
+
+  class RaceRegistry:
+    def __init__(self) -> None:
+      self.rejection_calls = 0
+      self.close_calls = 0
+
+    def lookup_batch_dispatch(self, **_kwargs: Any) -> None:
+      return None
+
+    def list_active_batches(self, _user_id: str) -> list[dict[str, Any]]:
+      return []
+
+    def record_batch_dispatch_rejection(
+      self,
+      **_kwargs: Any,
+    ) -> BatchDispatchRecord:
+      self.rejection_calls += 1
+      return BatchDispatchRecord(
+        batch_id=17,
+        dispatch_key=dispatch_key,
+        request_spec=request_spec,
+      )
+
+    def get_batch_digest(self, _batch_id: int) -> dict[str, Any]:
+      return {
+        "batch_id": 17,
+        "user_id": "alice",
+        "status": "completed",
+        "cost_usd": 0.0,
+      }
+
+    def close(self) -> None:
+      self.close_calls += 1
+
+  registry = RaceRegistry()
+  monkeypatch.setattr(
+    batches_module,
+    "_registry_for_user",
+    lambda _user_id: registry,
+  )
+  monkeypatch.setattr(
+    batches_module,
+    "_batch_capability_execution_context",
+    lambda **_kwargs: (object(), object()),
+  )
+  monkeypatch.setattr(
+    batches_module,
+    "require_corpus_readiness",
+    lambda payload, **_kwargs: asyncio.sleep(
+      0,
+      result=(payload, None),
+    ),
+  )
+
+  def fail_validation(*_args: Any, **_kwargs: Any) -> int:
+    raise batches_module._BatchDispatchValidationError("invalid request")
+
+  monkeypatch.setattr(
+    batches_module,
+    "_acquire_and_start_batch",
+    fail_validation,
+  )
+  app_state = SimpleNamespace(
+    gateway_config=SimpleNamespace(credentials_resolver=None),
+    batch_task_registry=batches_module.BatchTaskRegistry(),
+  )
+
+  result = asyncio.run(
+    batches_module.dispatch_batch_in_process(
+      request_spec,
+      app_state=app_state,
+      user_id="alice",
+      role="owner",
+      dispatch_key=dispatch_key,
+      user_email="alice@example.com",
+    )
+  )
+
+  assert result == {
+    "batch_id": 17,
+    "status": "completed",
+    "replayed": True,
+  }
+  assert registry.rejection_calls == 1
+  assert registry.close_calls == 2
+
+
+@pytest.mark.parametrize(
+  ("owner_host", "owner_pid"),
+  [
+    ("foreign-gateway", 999_999),
+    ("local-gateway", batches_module.os.getpid()),
+  ],
+  # Explicit ids: the second value is the collecting process's pid, which
+  # differs per xdist worker — a pid-bearing auto-id makes workers collect
+  # different test ids and aborts the run.
+  ids=("foreign-owner", "local-owner"),
+)
+def test_fresh_key_terminalizes_unowned_active_batch_before_admission(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+  owner_host: str,
+  owner_pid: int,
+) -> None:
+  monkeypatch.setattr(
+    batches_module.socket,
+    "gethostname",
+    lambda: "local-gateway",
+  )
+  registry = batches_module._registry_for_user("alice")
+  orphan_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host=owner_host,
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=owner_pid,
+  )
+  registry.close()
+
+  app = _make_app()
+  with TestClient(app) as client:
+    response = client.post(
+      "/api/control/batches",
+      headers=_headers(
+        _control_session(client),
+        idempotency_key=f"fresh-after-orphan-{owner_host}",
+      ),
+      json=_batch_spec(universe=["ADI"]),
+    )
+
+  assert response.status_code == 200, response.text
+  assert int(response.json()["batch_id"]) != orphan_id
+  reopened = batches_module._registry_for_user("alice")
+  try:
+    orphan = reopened.get_batch_digest(orphan_id)
+  finally:
+    reopened.close()
+  assert orphan["status"] == "failed"
+  assert orphan["error"] == (
+    "batch_dispatch_orphaned_before_fresh_admission"
+  )
+  assert len(fake_batch_control.acquire_calls) == 1
+  assert len(fake_batch_control.run_calls) == 1
+
+
+def test_fresh_key_preserves_locally_owned_active_batch(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  registry = batches_module._registry_for_user("alice")
+  active_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host="local-gateway",
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=batches_module.os.getpid(),
+  )
+  registry.close()
+  task_registry = batches_module.BatchTaskRegistry()
+  monkeypatch.setattr(
+    task_registry,
+    "has_admitted_batch",
+    lambda *, owner_user_id, batch_id: (
+      owner_user_id == "alice" and batch_id == active_id
+    ),
+  )
+  app_state = SimpleNamespace(
+    gateway_config=_gateway_config(),
+    batch_task_registry=task_registry,
+    gateway_approval_store=None,
+    gateway_approval_policy=None,
+    gateway_claim_signing_authority=GatewayClaimSigningAuthority(
+      "local-active-batch-test-key-at-least-32-bytes"
+    ),
+    autonomous_storage_root=Path(
+      "/tmp/agent-gateway-local-active-batch-test"
+    ),
+  )
+
+  with pytest.raises(ActiveBatchError) as exc_info:
+    asyncio.run(
+      batches_module.dispatch_batch_in_process(
+        _batch_spec(universe=["ADI"]),
+        app_state=app_state,
+        user_id="alice",
+        role="owner",
+        dispatch_key="fresh-while-local-batch-live",
+        user_email="alice@example.com",
+      )
+    )
+
+  assert exc_info.value.batch_id == active_id
+  reopened = batches_module._registry_for_user("alice")
+  try:
+    assert reopened.get_batch_digest(active_id)["status"] == "running"
+    assert len(reopened.list_batches("alice")) == 1
+  finally:
+    reopened.close()
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_control_batch_dispatch_replay_terminalizes_restart_orphan(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  key = "batch-restart-orphan-test"
+  registry = batches_module._registry_for_user("alice")
+  batch_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host="",
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=999_999,
+    dispatch_key=key,
+  )
+  registry.close()
+
+  restarted_app = _make_app()
+  with TestClient(restarted_app) as client:
+    headers = _headers(_control_session(client), idempotency_key=key)
+    replay = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+
+  assert replay.status_code == 200, replay.text
+  assert replay.json() == {
+    "batch_id": batch_id,
+    "status": "failed",
+    "replayed": True,
+  }
+  reopened = batches_module._registry_for_user("alice")
+  try:
+    digest = reopened.get_batch_digest(batch_id)
+  finally:
+    reopened.close()
+  assert digest["status"] == "failed"
+  assert digest["error"] == (
+    "batch_dispatch_replay_orphaned_after_gateway_restart"
+  )
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_control_batch_dispatch_replay_fails_if_orphan_stays_active(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  key = "batch-restart-orphan-transition-failure"
+  registry = batches_module._registry_for_user("alice")
+  _acquire_test_batch(registry,
+    user_id="alice",
+    host="",
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=999_999,
+    dispatch_key=key,
+  )
+  registry.close()
+  monkeypatch.setattr(
+    BatchRegistry,
+    "transition_status_if_current",
+    lambda *_args, **_kwargs: None,
+  )
+
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client), idempotency_key=key)
+    replay = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+
+  assert replay.status_code == 503, replay.text
+  assert replay.json()["detail"] == (
+    "orphaned batch replay could not be terminalized"
+  )
+  assert "X-Batch-Dispatch-Admitted" not in replay.headers
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_in_process_batch_task_contains_system_exit(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def run_case() -> None:
+    class SystemExitController:
+      def acquire_batch_run(self, _payload, **_kwargs):
+        return 17, "alice", "alice@example.com"
+
+      async def run_acquired_batch(self, *_args, **_kwargs):
+        raise SystemExit("malformed MCP config")
+
+    registry = SimpleNamespace(
+      close=lambda: None,
+      list_active_batches=lambda _user_id: [],
+      lookup_batch_dispatch=lambda **_kwargs: None,
+    )
+    captured_tasks: list[asyncio.Task[Any]] = []
+    task_registry = batches_module.BatchTaskRegistry()
+    original_start = task_registry.start
+
+    def capture_start(**kwargs) -> None:
+      captured_tasks.append(kwargs["task"])
+      original_start(**kwargs)
+
+    monkeypatch.setattr(task_registry, "start", capture_start)
+    monkeypatch.setattr(batches_module, "_controller", lambda: SystemExitController())
+    monkeypatch.setattr(batches_module, "_registry_for_user", lambda _user_id: registry)
+    monkeypatch.setattr(
+      batches_module,
+      "require_corpus_readiness",
+      lambda payload, **_kwargs: asyncio.sleep(0, result=(payload, None)),
+    )
+    app_state = SimpleNamespace(
+      gateway_config=_gateway_config(),
+      batch_task_registry=task_registry,
+      gateway_approval_store=None,
+      gateway_approval_policy=None,
+      gateway_claim_signing_authority=GatewayClaimSigningAuthority(
+        "batch-system-exit-test-key-at-least-32-bytes"
+      ),
+      autonomous_storage_root=Path(
+        "/tmp/agent-gateway-batch-system-exit-test"
+      ),
+    )
+
+    result = await batches_module.dispatch_batch_in_process(
+      _batch_spec(),
+      app_state=app_state,
+      user_id="alice",
+      role="owner",
+      dispatch_key="batch-system-exit-test",
+      user_email="alice@example.com",
+    )
+    assert result == {
+      "batch_id": 17,
+      "status": "running",
+      "replayed": False,
+    }
+    assert len(captured_tasks) == 1
+    assert await captured_tasks[0] is None
+    await asyncio.sleep(0)
+    assert not asyncio.current_task().cancelled()
+
+  asyncio.run(run_case())
+
+
+def test_in_process_batch_task_preserves_cancellation(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def run_case() -> None:
+    started = asyncio.Event()
+
+    class CancelledController:
+      def acquire_batch_run(self, _payload, **_kwargs):
+        return 18, "alice", "alice@example.com"
+
+      async def run_acquired_batch(self, *_args, **_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    registry = SimpleNamespace(
+      close=lambda: None,
+      list_active_batches=lambda _user_id: [],
+      lookup_batch_dispatch=lambda **_kwargs: None,
+    )
+    captured_tasks: list[asyncio.Task[Any]] = []
+    task_registry = batches_module.BatchTaskRegistry()
+    original_start = task_registry.start
+
+    def capture_start(**kwargs) -> None:
+      captured_tasks.append(kwargs["task"])
+      original_start(**kwargs)
+
+    monkeypatch.setattr(task_registry, "start", capture_start)
+    monkeypatch.setattr(batches_module, "_controller", lambda: CancelledController())
+    monkeypatch.setattr(batches_module, "_registry_for_user", lambda _user_id: registry)
+    monkeypatch.setattr(
+      batches_module,
+      "require_corpus_readiness",
+      lambda payload, **_kwargs: asyncio.sleep(0, result=(payload, None)),
+    )
+    app_state = SimpleNamespace(
+      gateway_config=_gateway_config(),
+      batch_task_registry=task_registry,
+      gateway_approval_store=None,
+      gateway_approval_policy=None,
+      gateway_claim_signing_authority=GatewayClaimSigningAuthority(
+        "batch-cancellation-test-key-at-least-32-bytes"
+      ),
+      autonomous_storage_root=Path(
+        "/tmp/agent-gateway-batch-cancellation-test"
+      ),
+    )
+
+    await batches_module.dispatch_batch_in_process(
+      _batch_spec(),
+      app_state=app_state,
+      user_id="alice",
+      role="owner",
+      dispatch_key="batch-admission-failure-test",
+      user_email="alice@example.com",
+    )
+    assert len(captured_tasks) == 1
+    await started.wait()
+    captured_tasks[0].cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await captured_tasks[0]
+
+  asyncio.run(run_case())
 
 
 def test_control_batches_use_canonical_session_owner_identity(
@@ -381,7 +1427,7 @@ def test_control_batches_use_canonical_session_owner_identity(
 
 def test_batch_detail_adds_force_rerun_hint_for_existing_unroutable(tmp_path: Path) -> None:
   registry = BatchRegistry(tmp_path / "batch.db")
-  batch_id = registry.acquire_batch(
+  batch_id = _acquire_test_batch(registry,
     user_id="alice",
     host="test-host",
     spec={
@@ -427,47 +1473,7 @@ def test_batch_detail_adds_force_rerun_hint_for_existing_unroutable(tmp_path: Pa
       },
     }
   ]
-  assert detail["diligence_prs"] == []
-  registry.close()
-
-
-def test_batch_detail_includes_diligence_prs(tmp_path: Path) -> None:
-  registry = BatchRegistry(tmp_path / "batch.db")
-  batch_id = registry.acquire_batch(
-    user_id="alice",
-    host="test-host",
-    spec={"source": "quality_screen", "universe": ["MSFT"]},
-    budget_usd=3.0,
-    pid=None,
-  )
-  with registry._db_lock:
-    conn = registry._ensure_db()
-    conn.execute(
-      """
-      INSERT INTO diligence_prs (
-        pr_id, batch_id, ticker, state, workspace_ref, workspace_id,
-        model_workspace_json, proposal_ids_json, run_seqs_json,
-        base_hashes_json, summary_json, created_at, updated_at
-      ) VALUES (
-        'dpr_batch_detail', ?, 'MSFT', 'open',
-        'model_workspaces/batch_1/MSFT/workspace.json', 'batch_1_MSFT',
-        '{}', '[]', '[1]',
-        '{"schema_version":1,"thesis":{"hash":"sha256:abc"}}',
-        '{}', 101.0, 101.0
-      )
-      """,
-      (batch_id,),
-    )
-    conn.commit()
-
-  detail = batches_module._batch_detail_payload(registry, batch_id, top_n=10)
-
-  assert len(detail["diligence_prs"]) == 1
-  pr = detail["diligence_prs"][0]
-  assert pr["ticker"] == "MSFT"
-  assert pr["state"] == "open"
-  assert pr["workspace_id"] == "batch_1_MSFT"
-  assert pr["base_hashes"]["thesis"]["hash"] == "sha256:abc"
+  assert set(detail) == {"batch", "verdict_matrix", "candidates", "proposals", "failures"}
   registry.close()
 
 
@@ -509,15 +1515,15 @@ def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
     mcp_client = ReadyCorpusMcpClient()
     app_state = SimpleNamespace(
       user_event_bus=None,
-      gateway_config=SimpleNamespace(mcp_client=mcp_client),
+      gateway_config=_gateway_config(mcp_client=mcp_client),
+      gateway_claim_signing_authority=GatewayClaimSigningAuthority(
+        "valuation-ready-dispatch-test-key-at-least-32-bytes"
+      ),
+      autonomous_storage_root=Path(
+        "/tmp/agent-gateway-valuation-ready-dispatch-test"
+      ),
     )
-    session = SimpleNamespace(
-      user_id="alice",
-      owner_user_id="1",
-      risk_user_id=1,
-      user_email="alice@example.com",
-      channel="tui",
-    )
+    session = _gateway_session()
     bundle = make_valuation_ready_skill_tool_bundle(app_state=app_state, session=session)
     dispatch = bundle["handlers"]["valuation_ready_batch_dispatch"]
     read = bundle["handlers"]["valuation_ready_batch_read"]
@@ -534,7 +1540,7 @@ def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
         "ticker": "adi",
         "required_filings": ["2025-FY", "2026-Q2"],
         "required_transcripts": ["2026-Q1", "2026-Q2"],
-      })
+      }, tool_ctx=SimpleNamespace(tool_call_id="valuation-ready-dispatch-1"))
       assert error is None
       assert result["status"] == "running"
       assert result["source"] == "explicit_ticker"
@@ -567,6 +1573,16 @@ def test_gateway_local_valuation_ready_dispatch_uses_batch_helper(
   assert fake_batch_control.run_calls[0]["identity"] == ("1", "alice@example.com")
 
 
+def test_batch_admission_to_task_handoff_is_structurally_synchronous() -> None:
+  handoff = batches_module._acquire_and_start_batch
+  source = inspect.getsource(handoff)
+
+  assert not inspect.iscoroutinefunction(handoff)
+  assert "asyncio.create_task(" in source
+  assert "async def _captured_run_admission_factory(" in source
+  assert source.index("acquire_batch_run") < source.rindex("task_registry.start")
+
+
 def test_gateway_local_valuation_ready_dispatch_propagates_session_channel(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -579,6 +1595,7 @@ def test_gateway_local_valuation_ready_dispatch_propagates_session_channel(
   monkeypatch.setattr(batches_module, "dispatch_batch_in_process", fake_dispatch)
   app_state = SimpleNamespace()
   session = SimpleNamespace(
+    session_id="valuation-session-1",
     user_id="henry",
     owner_user_id="1",
     risk_user_id=1,
@@ -595,7 +1612,8 @@ def test_gateway_local_valuation_ready_dispatch_propagates_session_channel(
           "ticker": "PCTY",
           "required_filings": ["2025-FY"],
           "required_transcripts": ["2026-Q2"],
-        }
+        },
+        tool_ctx=SimpleNamespace(tool_call_id="valuation-ready-dispatch-channel"),
       )
       assert error is None
       assert result["batch_id"] == 7
@@ -605,6 +1623,55 @@ def test_gateway_local_valuation_ready_dispatch_propagates_session_channel(
   _run(run_case())
   assert captured["user_id"] == "1"
   assert captured["channel"] == "telegram"
+  assert captured["dispatch_key"].startswith("valuation-ready-")
+
+
+def test_gateway_local_valuation_ready_dispatch_scopes_key_to_tool_call(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  dispatch_keys: list[str] = []
+
+  async def fake_dispatch(_spec, **kwargs):
+    dispatch_keys.append(str(kwargs["dispatch_key"]))
+    return {"batch_id": len(dispatch_keys), "status": "running"}
+
+  monkeypatch.setattr(batches_module, "dispatch_batch_in_process", fake_dispatch)
+  session = SimpleNamespace(
+    session_id="valuation-session-idempotency",
+    user_id="henry",
+    owner_user_id="1",
+    risk_user_id=1,
+    user_email="henry@example.com",
+    channel="cli",
+  )
+  dispatch = make_valuation_ready_skill_tool_bundle(
+    app_state=SimpleNamespace(),
+    session=session,
+  )["handlers"]["valuation_ready_batch_dispatch"]
+  async def run_case() -> None:
+    token = set_current_skill("valuation-ready")
+    try:
+      for tool_call_id, ticker in (
+        ("tool-call-1", "PCTY"),
+        ("tool-call-1", "ADI"),
+        ("tool-call-2", "PCTY"),
+      ):
+        result, error = await dispatch(
+          {
+            "ticker": ticker,
+            "required_filings": ["2025-FY"],
+            "required_transcripts": ["2026-Q2"],
+          },
+          tool_ctx=SimpleNamespace(tool_call_id=tool_call_id),
+        )
+        assert error is None
+        assert result["status"] == "running"
+    finally:
+      reset_current_skill(token)
+
+  _run(run_case())
+  assert dispatch_keys[0] == dispatch_keys[1]
+  assert dispatch_keys[2] != dispatch_keys[0]
 
 
 def test_gateway_local_valuation_ready_dispatch_blocks_before_batch_admission_on_corpus_gap(
@@ -614,15 +1681,9 @@ def test_gateway_local_valuation_ready_dispatch_blocks_before_batch_admission_on
     mcp_client = ReadyCorpusMcpClient(ready=False)
     app_state = SimpleNamespace(
       user_event_bus=None,
-      gateway_config=SimpleNamespace(mcp_client=mcp_client),
+      gateway_config=_gateway_config(mcp_client=mcp_client),
     )
-    session = SimpleNamespace(
-      user_id="alice",
-      owner_user_id="1",
-      risk_user_id=1,
-      user_email="alice@example.com",
-      channel="tui",
-    )
+    session = _gateway_session()
     bundle = make_valuation_ready_skill_tool_bundle(app_state=app_state, session=session)
 
     token = set_current_skill("valuation-ready")
@@ -631,7 +1692,7 @@ def test_gateway_local_valuation_ready_dispatch_blocks_before_batch_admission_on
         "ticker": "PCTY",
         "required_filings": ["2025-FY"],
         "required_transcripts": ["2026-Q2"],
-      })
+      }, tool_ctx=SimpleNamespace(tool_call_id="valuation-ready-dispatch-gap"))
     finally:
       reset_current_skill(token)
 
@@ -654,7 +1715,10 @@ def test_gateway_local_valuation_ready_dispatch_refuses_unsupported_runtime(
     dispatch = bundle["handlers"]["valuation_ready_batch_dispatch"]
     clear_current_skill()
 
-    result, error = await dispatch({"ticker": "ADI"})
+    result, error = await dispatch(
+      {"ticker": "ADI"},
+      tool_ctx=SimpleNamespace(tool_call_id="valuation-ready-unsupported"),
+    )
 
     assert result is None
     assert error["code"] == "unsupported_runtime"
@@ -674,7 +1738,131 @@ def test_control_batches_active_batch_conflict_maps_to_409(fake_batch_control: F
     response = client.post("/api/control/batches", headers=headers, json=_batch_spec())
 
   assert response.status_code == 409
+  assert "X-Batch-Dispatch-Admitted" not in response.headers
   assert "active batch already exists" in response.json()["detail"]
+
+
+def test_control_batches_capability_failure_attests_not_admitted(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  def fail_capability_resolution(**_kwargs: Any) -> Any:
+    raise RuntimeError("batch capability configuration unavailable")
+
+  monkeypatch.setattr(
+    batches_module,
+    "_batch_capability_execution_context",
+    fail_capability_resolution,
+  )
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    response = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+
+  assert response.status_code == 503, response.text
+  assert "X-Batch-Dispatch-Admitted" not in response.headers
+  assert response.json()["detail"] == (
+    "batch capability configuration unavailable"
+  )
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_control_batches_malformed_field_type_attests_not_admitted(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  validation_calls = 0
+
+  def reject_malformed_spec(*_args: Any, **_kwargs: Any) -> Any:
+    nonlocal validation_calls
+    validation_calls += 1
+    raise TypeError("max_concurrency must be an integer")
+
+  monkeypatch.setattr(
+    fake_batch_control,
+    "acquire_batch_run",
+    reject_malformed_spec,
+  )
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    response = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json={**_batch_spec(), "max_concurrency": {"invalid": True}},
+    )
+    replay = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json={**_batch_spec(), "max_concurrency": {"invalid": True}},
+    )
+
+  assert response.status_code == 422, response.text
+  assert response.headers["X-Batch-Dispatch-Admitted"] == "false"
+  assert response.json()["detail"] == "max_concurrency must be an integer"
+  assert replay.status_code == 422, replay.text
+  assert replay.headers["X-Batch-Dispatch-Admitted"] == "false"
+  assert replay.json()["detail"] == "max_concurrency must be an integer"
+  assert validation_calls == 1
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_control_batches_durably_rejects_intrinsic_corpus_request_error(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  app = _make_app()
+  key = "batch-missing-corpus-requirements"
+  invalid_spec = {
+    "source": "explicit_ticker",
+    "universe": ["PCTY"],
+    "pipeline_template": "valuation-ready",
+    "budget_usd": 25.0,
+  }
+  with TestClient(app) as client:
+    headers = _headers(
+      _control_session(client),
+      idempotency_key=key,
+    )
+    first = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=invalid_spec,
+    )
+    replay = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=invalid_spec,
+    )
+    drift = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json={**invalid_spec, "universe": ["ADI"]},
+    )
+
+  expected_detail = {
+    "code": "missing_corpus_requirements",
+    "message": (
+      "valuation-ready batches require exact filing and transcript "
+      "period declarations."
+    ),
+    "details": {"pipeline_template": "valuation-ready"},
+  }
+  assert first.status_code == 422, first.text
+  assert first.headers["X-Batch-Dispatch-Admitted"] == "false"
+  assert first.json()["detail"] == expected_detail
+  assert replay.status_code == 422, replay.text
+  assert replay.headers["X-Batch-Dispatch-Admitted"] == "false"
+  assert replay.json()["detail"] == expected_detail
+  assert drift.status_code == 409, drift.text
+  assert "X-Batch-Dispatch-Admitted" not in drift.headers
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
 
 
 def test_control_batches_corpus_gap_maps_to_409_before_batch_admission(
@@ -700,6 +1888,7 @@ def test_control_batches_corpus_gap_maps_to_409_before_batch_admission(
     )
 
   assert response.status_code == 409
+  assert "X-Batch-Dispatch-Admitted" not in response.headers
   assert response.json()["detail"]["code"] == "corpus_not_ready"
   assert fake_batch_control.acquire_calls == []
   assert fake_batch_control.run_calls == []
@@ -719,9 +1908,9 @@ def test_control_batches_workflows_catalog(fake_batch_control: FakeBatchControll
   assert workflows["valuation-ready"]["pipeline_template"] == "valuation-ready"
   assert workflows["valuation-ready"]["source_pipeline_template"] == "compounder"
   assert workflows["valuation-ready"]["default_max_concurrency"] == 2
-  assert workflows["full-diligence"]["reservation_budget_usd_per_name"] == 59.0
-  assert workflows["full-diligence"]["suggested_budget_usd_per_name"] == 59.0
-  assert workflows["valuation-ready"]["reservation_budget_usd_per_name"] == 30.0
+  assert workflows["full-diligence"]["reservation_budget_usd_per_name"] == 55.0
+  assert workflows["full-diligence"]["suggested_budget_usd_per_name"] == 55.0
+  assert workflows["valuation-ready"]["reservation_budget_usd_per_name"] == 26.0
   assert (
     workflows["full-diligence"]["budget_model"]["admission_formula"]
     == "spent_usd + in_flight_reserved_usd + next_stage_reserved_usd <= budget_usd"
@@ -808,7 +1997,7 @@ def test_fixture_batch_seeds_registry_without_controller(
         },
       }
     ]
-    assert payload["diligence_prs"] == []
+    assert set(payload) == {"batch", "verdict_matrix", "candidates", "proposals", "failures"}
     assert payload["failures"] == [
       {
         "ticker": "TSLA",
@@ -841,6 +2030,318 @@ def test_control_batches_cancel_awaits_terminal_state(fake_batch_control: FakeBa
     cancel_response = client.delete(f"/api/control/batches/{batch_id}", headers=headers)
     assert cancel_response.status_code == 200, cancel_response.text
     assert cancel_response.json()["batch"]["status"] == "cancelled", cancel_response.json()["batch"]
+
+
+def test_terminal_batch_delete_is_read_only_and_does_not_republish(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  registry = batches_module._registry_for_user("alice")
+  batch_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host="test-host",
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=None,
+  )
+  registry.set_status(batch_id, "completed")
+  registry.close()
+
+  app = _make_app()
+  publish_calls = 0
+
+  async def forbidden_publish(*_args: Any, **_kwargs: Any) -> bool:
+    nonlocal publish_calls
+    publish_calls += 1
+    raise AssertionError("terminal DELETE must not republish")
+
+  app.state.user_event_bus.publish_terminal_if_absent = forbidden_publish
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    response = client.delete(
+      f"/api/control/batches/{batch_id}",
+      headers=headers,
+    )
+
+  assert response.status_code == 200, response.text
+  assert response.json()["batch"]["status"] == "completed"
+  assert publish_calls == 0
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_duplicate_batch_cancel_during_reversible_preflight_is_not_attested(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  registry = batches_module._registry_for_user("alice")
+  batch_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host="test-host",
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=None,
+  )
+  registry.close()
+
+  app = _make_app()
+  task_registry = batches_module.BatchTaskRegistry()
+  app.state.batch_task_registry = task_registry
+  task_registry.begin_batch_cancellation(
+    owner_user_id="alice",
+    batch_id=batch_id,
+  )
+  with TestClient(app) as client:
+    try:
+      headers = _headers(_control_session(client))
+      response = client.delete(
+        f"/api/control/batches/{batch_id}",
+        headers=headers,
+      )
+    finally:
+      task_registry.abort_batch_cancellation(
+        owner_user_id="alice",
+        batch_id=batch_id,
+      )
+    retry_fence = task_registry.begin_batch_cancellation(
+      owner_user_id="alice",
+      batch_id=batch_id,
+    )
+    task_registry.abort_batch_cancellation(
+      owner_user_id="alice",
+      batch_id=batch_id,
+    )
+
+  assert response.status_code == 409, response.text
+  assert "X-Batch-Cancellation-Committed" not in response.headers
+  assert response.json()["detail"] == "batch cancellation is already in progress"
+  assert retry_fence.progress.boundary_crossed is False
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_duplicate_batch_cancel_after_boundary_is_marked_drainable(
+  fake_batch_control: FakeBatchController,
+) -> None:
+  registry = batches_module._registry_for_user("alice")
+  batch_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host="test-host",
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=None,
+  )
+  registry.close()
+
+  app = _make_app()
+  task_registry = batches_module.BatchTaskRegistry()
+  app.state.batch_task_registry = task_registry
+  cancellation_fence = task_registry.begin_batch_cancellation(
+    owner_user_id="alice",
+    batch_id=batch_id,
+  )
+  cancellation_fence.progress.boundary_crossed = True
+  try:
+    with TestClient(app) as client:
+      headers = _headers(_control_session(client))
+      response = client.delete(
+        f"/api/control/batches/{batch_id}",
+        headers=headers,
+      )
+  finally:
+    task_registry.finish_batch_cancellation(
+      owner_user_id="alice",
+      batch_id=batch_id,
+    )
+
+  assert response.status_code == 409, response.text
+  assert response.headers["X-Batch-Cancellation-Committed"] == "true"
+  assert response.json()["detail"] == "batch cancellation is already in progress"
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_batch_cancel_terminal_publish_failure_is_marked_drainable(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  fake_batch_control.wait_for_cancel = True
+  app = _make_app()
+
+  async def fail_terminal_publish(**_kwargs: Any) -> bool:
+    raise RuntimeError("event bus unavailable")
+
+  monkeypatch.setattr(
+    app.state.batch_task_registry,
+    "publish_terminal_event",
+    fail_terminal_publish,
+  )
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    dispatched = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+    batch_id = int(dispatched.json()["batch_id"])
+    response = client.delete(
+      f"/api/control/batches/{batch_id}",
+      headers=headers,
+    )
+    detail = client.get(
+      f"/api/control/batches/{batch_id}",
+      headers=headers,
+    )
+
+  assert response.status_code == 503, response.text
+  assert response.headers["X-Batch-Cancellation-Committed"] == "true"
+  assert response.json()["detail"] == {
+    "error": "Batch cancellation completion failed"
+  }
+  assert detail.status_code == 200, detail.text
+  assert detail.json()["batch"]["status"] == "cancelled"
+
+
+@pytest.mark.parametrize(
+  ("fault_method", "expected_error"),
+  [
+    ("snapshot_fenced_batch", "Late batch approval quarantine failed"),
+    ("close_batch", "Batch approval quarantine close failed"),
+  ],
+)
+def test_batch_cancel_late_quarantine_fault_still_terminalizes_orphan(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+  fault_method: str,
+  expected_error: str,
+) -> None:
+  registry = batches_module._registry_for_user("alice")
+  batch_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host="",
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=999_999,
+  )
+  registry.close()
+
+  app = _make_app()
+  projections = app.state.batch_task_registry.approval_projections
+  original = getattr(projections, fault_method)
+  fault_calls = 0
+
+  def fail_once(*args: Any, **kwargs: Any):
+    nonlocal fault_calls
+    fault_calls += 1
+    fail_on_call = 2 if fault_method == "snapshot_fenced_batch" else 1
+    if fault_calls == fail_on_call:
+      raise OSError(f"{fault_method} unavailable after cancellation boundary")
+    return original(*args, **kwargs)
+
+  monkeypatch.setattr(projections, fault_method, fail_once)
+  published: list[dict[str, Any]] = []
+  original_publish = app.state.batch_task_registry.publish_terminal_event
+
+  async def capture_publish(**kwargs: Any) -> bool:
+    published.append(dict(kwargs["event"]))
+    return await original_publish(**kwargs)
+
+  monkeypatch.setattr(
+    app.state.batch_task_registry,
+    "publish_terminal_event",
+    capture_publish,
+  )
+
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    response = client.delete(
+      f"/api/control/batches/{batch_id}",
+      headers=headers,
+    )
+    detail = client.get(
+      f"/api/control/batches/{batch_id}",
+      headers=headers,
+    )
+
+  assert response.status_code == 503, response.text
+  assert response.headers["X-Batch-Cancellation-Committed"] == "true"
+  assert response.json()["detail"] == {"error": expected_error}
+  assert detail.status_code == 200, detail.text
+  assert detail.json()["batch"]["status"] == "cancelled"
+  assert [event["status"] for event in published] == ["cancelled"]
+  assert fault_calls >= 1
+  assert fake_batch_control.acquire_calls == []
+  assert fake_batch_control.run_calls == []
+
+
+def test_batch_cancel_preboundary_transition_failure_is_not_attested(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  fake_batch_control.wait_for_cancel = True
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    dispatched = client.post(
+      "/api/control/batches",
+      headers=headers,
+      json=_batch_spec(),
+    )
+    batch_id = int(dispatched.json()["batch_id"])
+
+    def fail_transition(*_args: Any, **_kwargs: Any) -> None:
+      raise OSError("registry unavailable before cancellation commit")
+
+    monkeypatch.setattr(
+      BatchRegistry,
+      "transition_status_if_current",
+      fail_transition,
+    )
+    response = client.delete(
+      f"/api/control/batches/{batch_id}",
+      headers=headers,
+    )
+
+  assert response.status_code == 503, response.text
+  assert "X-Batch-Cancellation-Committed" not in response.headers
+  assert response.json()["detail"] == {
+    "error": "Batch cancellation completion failed"
+  }
+
+
+def test_batch_cancel_orphan_transition_failure_is_not_attested(
+  fake_batch_control: FakeBatchController,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  registry = batches_module._registry_for_user("alice")
+  batch_id = _acquire_test_batch(registry,
+    user_id="alice",
+    host="",
+    spec=_batch_spec(),
+    budget_usd=1.0,
+    pid=999_999,
+  )
+  registry.close()
+
+  def fail_transition(*_args: Any, **_kwargs: Any) -> bool:
+    raise OSError("registry unavailable before orphan cancellation commit")
+
+  monkeypatch.setattr(
+    BatchRegistry,
+    "transition_status_if_current",
+    fail_transition,
+  )
+  app = _make_app()
+  with TestClient(app) as client:
+    headers = _headers(_control_session(client))
+    response = client.delete(
+      f"/api/control/batches/{batch_id}",
+      headers=headers,
+    )
+
+  assert response.status_code == 503, response.text
+  assert "X-Batch-Cancellation-Committed" not in response.headers
+  assert response.json()["detail"] == {
+    "error": "Batch cancellation completion failed"
+  }
 
 
 def test_http_batch_cancel_cancels_hanging_admitted_producer_before_drain(
@@ -886,10 +2387,20 @@ def test_http_batch_cancel_cancels_hanging_admitted_producer_before_drain(
     spec: dict[str, Any],
     *,
     registry: BatchRegistry,
+    capability_execution_resolver: Any,
+    session_driver_execution: Any,
+    captured_run_admission_factory: Any,
     _identity: tuple[str, str | None] | None = None,
     _on_finalize=None,
   ) -> dict[str, Any]:
-    _ = spec, _identity, _on_finalize
+    _ = (
+      spec,
+      capability_execution_resolver,
+      session_driver_execution,
+      captured_run_admission_factory,
+      _identity,
+      _on_finalize,
+    )
     scope = current_batch_approval_scope()
     assert scope is not None
     session = SimpleNamespace(
@@ -1020,10 +2531,20 @@ def test_http_batch_cancel_authorizes_bound_durable_request_before_publication(
     spec: dict[str, Any],
     *,
     registry: BatchRegistry,
+    capability_execution_resolver: Any,
+    session_driver_execution: Any,
+    captured_run_admission_factory: Any,
     _identity: tuple[str, str | None] | None = None,
     _on_finalize=None,
   ) -> dict[str, Any]:
-    _ = spec, _identity, _on_finalize
+    _ = (
+      spec,
+      capability_execution_resolver,
+      session_driver_execution,
+      captured_run_admission_factory,
+      _identity,
+      _on_finalize,
+    )
     scope = current_batch_approval_scope()
     assert scope is not None
     session = SimpleNamespace(
@@ -1255,10 +2776,20 @@ def test_http_batch_cancel_retains_transient_projection_published_during_preflig
     spec: dict[str, Any],
     *,
     registry: BatchRegistry,
+    capability_execution_resolver: Any,
+    session_driver_execution: Any,
+    captured_run_admission_factory: Any,
     _identity: tuple[str, str | None] | None = None,
     _on_finalize=None,
   ) -> dict[str, Any]:
-    _ = spec, _identity, _on_finalize
+    _ = (
+      spec,
+      capability_execution_resolver,
+      session_driver_execution,
+      captured_run_admission_factory,
+      _identity,
+      _on_finalize,
+    )
     scope = current_batch_approval_scope()
     assert scope is not None
     session = SimpleNamespace(
@@ -2042,6 +3573,7 @@ def test_control_batches_cancel_store_failure_after_preflight_still_settles_task
     cancel_response = client.delete(f"/api/control/batches/{batch_id}", headers=headers)
 
     assert cancel_response.status_code == 503
+    assert cancel_response.headers["X-Batch-Cancellation-Committed"] == "true"
     assert cancel_response.json()["detail"]["error"] == (
       "Batch approval cancellation quarantine failed"
     )
@@ -2420,7 +3952,7 @@ def test_batch_cancel_survives_post_commit_audit_and_policy_cancelled_error(
 def test_batch_task_registry_cancelled_task_finishes_cancelled(tmp_path: Path) -> None:
   async def run_case() -> None:
     registry = BatchRegistry(tmp_path / "cancelled-task.db")
-    batch_id = registry.acquire_batch(
+    batch_id = _acquire_test_batch(registry,
       user_id="alice",
       host="test-host",
       spec=_batch_spec(),
@@ -2447,7 +3979,7 @@ def test_batch_task_monitor_terminal_transition_cannot_overwrite_concurrent_comp
   tmp_path: Path,
 ) -> None:
   registry = BatchRegistry(tmp_path / "monitor-status-race.db")
-  batch_id = registry.acquire_batch(
+  batch_id = _acquire_test_batch(registry,
     user_id="alice",
     host="test-host",
     spec=_batch_spec(),
@@ -2482,7 +4014,7 @@ def test_batch_task_registry_shutdown_terminalizes_pending_before_projection_cle
         self.resolved.append(request.approval_id)
 
     registry = BatchRegistry(tmp_path / "shutdown-batch.db")
-    batch_id = registry.acquire_batch(
+    batch_id = _acquire_test_batch(registry,
       user_id="alice",
       host="test-host",
       spec=_batch_spec(),
@@ -2574,7 +4106,7 @@ def test_batch_shutdown_quarantines_late_row_on_preregistered_empty_carrier(
           await callback(request)
 
     registry = BatchRegistry(tmp_path / "shutdown-late-existing-batch.db")
-    batch_id = registry.acquire_batch(
+    batch_id = _acquire_test_batch(registry,
       user_id="alice",
       host="test-host",
       spec=_batch_spec(),
@@ -2696,7 +4228,7 @@ def test_batch_task_registry_shutdown_rejects_projection_created_during_teardown
           await self.create_late_projection()
 
     registry = BatchRegistry(tmp_path / "late-projection-batch.db")
-    batch_id = registry.acquire_batch(
+    batch_id = _acquire_test_batch(registry,
       user_id="alice",
       host="test-host",
       spec=_batch_spec(),
@@ -2829,7 +4361,7 @@ def test_batch_shutdown_cancels_hanging_admitted_producer_before_drain(
         _ = request
 
     registry = BatchRegistry(tmp_path / "shutdown-hanging-batch.db")
-    batch_id = registry.acquire_batch(
+    batch_id = _acquire_test_batch(registry,
       user_id="alice",
       host="test-host",
       spec=_batch_spec(),
@@ -2919,7 +4451,7 @@ def test_batch_shutdown_retains_projection_published_between_snapshots(
         self.resolved.append(request.approval_id)
 
     registry = BatchRegistry(tmp_path / "shutdown-between-snapshots-batch.db")
-    batch_id = registry.acquire_batch(
+    batch_id = _acquire_test_batch(registry,
       user_id="alice",
       host="test-host",
       spec=_batch_spec(),
@@ -3029,7 +4561,7 @@ def test_batch_task_registry_shutdown_fences_post_empty_task_and_projection_admi
     assert not shutdown_task.done()
 
     registry = BatchRegistry(tmp_path / "post-empty-shutdown.db")
-    batch_id = registry.acquire_batch(
+    batch_id = _acquire_test_batch(registry,
       user_id="alice",
       host="test-host",
       spec=_batch_spec(),
@@ -3083,7 +4615,7 @@ def test_batch_task_registry_shutdown_missing_durable_row_still_settles_task(
 
     registry_path = tmp_path / "missing-row-batch.db"
     registry = BatchRegistry(registry_path)
-    batch_id = registry.acquire_batch(
+    batch_id = _acquire_test_batch(registry,
       user_id="alice",
       host="test-host",
       spec=_batch_spec(),
@@ -3148,7 +4680,7 @@ def test_batch_task_registry_does_not_collide_on_same_batch_id_across_users(tmp_
     for owner in gates:
       registry = BatchRegistry(tmp_path / f"{owner}.db")
       registries.append(registry)
-      batch_id = registry.acquire_batch(
+      batch_id = _acquire_test_batch(registry,
         user_id=owner,
         host="test-host",
         spec=_batch_spec(),
@@ -3192,7 +4724,7 @@ def test_control_batches_digest_allows_terminal_statuses(
 
   monkeypatch.setattr(batches_module, "_registry_for_user", registry_for_user)
   source_registry = BatchRegistry(registry_path)
-  batch_id = source_registry.acquire_batch(
+  batch_id = _acquire_test_batch(source_registry,
     user_id="alice",
     host="test-host",
     spec=_batch_spec(universe=["AAPL", "MSFT"]),
@@ -3241,7 +4773,7 @@ def test_control_batches_digest_allows_terminal_statuses(
 def test_batch_task_registry_does_not_overwrite_blocked_status(tmp_path: Path) -> None:
   async def run_case() -> None:
     registry = BatchRegistry(tmp_path / "blocked-task.db")
-    batch_id = registry.acquire_batch(
+    batch_id = _acquire_test_batch(registry,
       user_id="alice",
       host="test-host",
       spec=_batch_spec(),
@@ -3277,7 +4809,7 @@ def test_control_batches_retry_failed_uses_failed_tickers_only(
 
   monkeypatch.setattr(batches_module, "_registry_for_user", registry_for_user)
   source_registry = BatchRegistry(registry_path)
-  source_batch_id = source_registry.acquire_batch(
+  source_batch_id = _acquire_test_batch(source_registry,
     user_id="alice",
     host="test-host",
     spec=_batch_spec(universe=["AAPL", "MSFT"]),
@@ -3309,19 +4841,33 @@ def test_control_batches_retry_failed_uses_failed_tickers_only(
   with TestClient(app) as client:
     headers = _headers(_control_session(client))
     response = client.post(f"/api/control/batches/{source_batch_id}/retry-failed", headers=headers)
+    replay = client.post(
+      f"/api/control/batches/{source_batch_id}/retry-failed",
+      headers=headers,
+    )
 
   assert response.status_code == 200, response.text
   retry_batch_id = int(response.json()["batch_id"])
+  assert replay.status_code == 200, replay.text
+  assert int(replay.json()["batch_id"]) == retry_batch_id
+  assert replay.json()["replayed"] is True
   assert retry_batch_id != source_batch_id
   assert fake_batch_control.acquire_calls[-1]["spec"]["universe"] == ["AAPL"]
+  assert len(fake_batch_control.acquire_calls) == 1
 
 
 def test_publish_batch_terminal_event_uses_batch_control_run_id() -> None:
   published: list[dict[str, Any]] = []
 
   class FakeBus:
-    async def publish(self, *, user_id: str, control_run_id: str, event: dict[str, Any]) -> None:
+    async def publish_terminal_if_absent(
+      self,
+      user_id: str,
+      control_run_id: str,
+      event: dict[str, Any],
+    ) -> bool:
       published.append({"user_id": user_id, "control_run_id": control_run_id, "event": dict(event)})
+      return True
 
   asyncio.run(
     batches_module._publish_batch_terminal_event(
@@ -3350,3 +4896,200 @@ def test_publish_batch_terminal_event_uses_batch_control_run_id() -> None:
       },
     }
   ]
+
+
+def test_authorized_batch_cancellation_publishes_terminal_event() -> None:
+  published: list[dict[str, Any]] = []
+  terminalized: set[tuple[str, str]] = set()
+
+  class FakeBus:
+    async def publish_terminal_if_absent(
+      self,
+      user_id: str,
+      control_run_id: str,
+      event: dict[str, Any],
+    ) -> bool:
+      key = (user_id, control_run_id)
+      if key in terminalized:
+        return False
+      terminalized.add(key)
+      published.append({
+        "user_id": user_id,
+        "control_run_id": control_run_id,
+        "event": dict(event),
+      })
+      return True
+
+  class FakeRegistry:
+    def __init__(self) -> None:
+      self.digest = {
+        "batch_id": 42,
+        "status": "running",
+        "user_id": "alice",
+        "cost_usd": 0.0,
+        "total_spent_usd": 0.0,
+        "counts_by_status": {},
+        "counts_by_gate_code": {},
+        "counts_by_semantic_result": {},
+        "counts_by_execution_termination": {},
+        "error": None,
+      }
+
+    def transition_status_if_current(
+      self,
+      _batch_id: int,
+      status: str,
+      *,
+      expected_statuses: set[str],
+      error: str | None = None,
+    ) -> None:
+      if self.digest["status"] in expected_statuses:
+        self.digest["status"] = status
+        self.digest["error"] = error
+
+    def set_status(
+      self,
+      _batch_id: int,
+      status: str,
+      *,
+      error: str | None = None,
+    ) -> None:
+      self.digest["status"] = status
+      self.digest["error"] = error
+
+    def get_batch_digest(self, _batch_id: int) -> dict[str, Any]:
+      return dict(self.digest)
+
+    def close(self) -> None:
+      return None
+
+  async def case() -> None:
+    registry = FakeRegistry()
+    task_registry = batches_module.BatchTaskRegistry()
+    task = asyncio.create_task(asyncio.Event().wait())
+    task_registry.start(
+      owner_user_id="alice",
+      batch_id=42,
+      task=task,
+      registry=registry,
+    )
+    await asyncio.sleep(0)
+    cancellation_fence = task_registry.begin_batch_cancellation(
+      owner_user_id="alice",
+      batch_id=42,
+    )
+    app_state = SimpleNamespace(user_event_bus=FakeBus())
+    approval_error, digest = (
+      await batches_module._complete_authorized_batch_cancellation(
+        task_registry=task_registry,
+        registry=registry,
+        projections=cancellation_fence.projections,
+        owner_user_id="alice",
+        batch_id=42,
+        authenticated=SimpleNamespace(role="owner"),
+        app_state=app_state,
+        progress=batches_module._BatchCancellationProgress(),
+      )
+    )
+    task_registry.finish_batch_cancellation(
+      owner_user_id="alice",
+      batch_id=42,
+    )
+
+    assert approval_error is None
+    assert digest["status"] == "cancelled"
+    assert task.done()
+    duplicate = batch_terminal_event_payload_from_digest(42, digest)
+    assert await task_registry.publish_terminal_event(
+      app_state=app_state,
+      event=duplicate,
+    ) is False
+
+  from api.agent.batch.controller_finalization import (
+    batch_terminal_event_payload_from_digest,
+  )
+
+  asyncio.run(case())
+
+  assert len(published) == 1
+  assert published[0]["user_id"] == "alice"
+  assert published[0]["control_run_id"] == "batch_42"
+  assert published[0]["event"]["state"] == "cancelled"
+
+
+def test_batch_task_monitor_publishes_failure_before_controller_try() -> None:
+  published: list[dict[str, Any]] = []
+
+  class FakeBus:
+    async def publish_terminal_if_absent(
+      self,
+      user_id: str,
+      control_run_id: str,
+      event: dict[str, Any],
+    ) -> bool:
+      published.append({
+        "user_id": user_id,
+        "control_run_id": control_run_id,
+        "event": dict(event),
+      })
+      return True
+
+  class FakeRegistry:
+    def __init__(self) -> None:
+      self.digest = {
+        "batch_id": 43,
+        "status": "running",
+        "user_id": "alice",
+        "cost_usd": 0.0,
+        "total_spent_usd": 0.0,
+        "counts_by_status": {},
+        "counts_by_gate_code": {},
+        "counts_by_semantic_result": {},
+        "counts_by_execution_termination": {},
+        "error": None,
+      }
+
+    def transition_status_if_current(
+      self,
+      _batch_id: int,
+      status: str,
+      *,
+      expected_statuses: set[str],
+      error: str | None = None,
+    ) -> None:
+      if self.digest["status"] in expected_statuses:
+        self.digest["status"] = status
+        self.digest["error"] = error
+
+    def get_batch_digest(self, _batch_id: int) -> dict[str, Any]:
+      return dict(self.digest)
+
+    def close(self) -> None:
+      return None
+
+  async def fail_before_controller_try() -> None:
+    raise RuntimeError("lease_acquisition_failed")
+
+  async def case() -> None:
+    registry = FakeRegistry()
+    task_registry = batches_module.BatchTaskRegistry()
+    task = asyncio.create_task(fail_before_controller_try())
+    task_registry.start(
+      owner_user_id="alice",
+      batch_id=43,
+      task=task,
+      registry=registry,
+      app_state=SimpleNamespace(user_event_bus=FakeBus()),
+    )
+    monitor = task_registry._monitors[("alice", 43)]
+    await monitor
+
+    assert registry.digest["status"] == "failed"
+    assert registry.digest["error"] == "lease_acquisition_failed"
+    assert task_registry.get(owner_user_id="alice", batch_id=43) is None
+
+  asyncio.run(case())
+
+  assert len(published) == 1
+  assert published[0]["control_run_id"] == "batch_43"
+  assert published[0]["event"]["state"] == "failed"

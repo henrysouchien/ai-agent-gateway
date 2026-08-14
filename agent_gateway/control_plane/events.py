@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any, AsyncIterator
 
@@ -11,12 +12,17 @@ from starlette.background import BackgroundTask
 
 from agent_gateway.event_adapter import adapt_control_event
 from agent_gateway.events import DEFAULT_SCHEMA_VERSION
-from agent_gateway.session import AuthManager, GatewaySession
+from agent_gateway.session import (
+  AuthManager,
+  GatewaySession,
+  session_owner_user_id,
+)
 
 _PROJECTED_SCHEMA_VERSION_ALIASES = {"1", "v1"}
 _PROJECTED_KEEPALIVE_SECONDS = 15.0
 _PROJECTED_COALESCE_SECONDS = 0.5
 _DELTA_EVENT_TYPES = {"text_delta", "thinking_delta"}
+log = logging.getLogger(__name__)
 
 
 def _require_bearer_session(request: Request, auth: AuthManager) -> GatewaySession:
@@ -86,10 +92,12 @@ async def _projected_control_event_chunks(
   app_state: Any,
   authenticated: GatewaySession,
   schema_version: int,
+  enforce_visibility: bool = True,
 ) -> AsyncIterator[bytes]:
   pending: dict[str, Any] | None = None
   pending_started = 0.0
   next_keepalive_at = time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
+  next_entry_task: asyncio.Task[Any] | None = None
 
   async def flush_pending() -> bytes | None:
     nonlocal pending
@@ -99,73 +107,137 @@ async def _projected_control_event_chunks(
     pending = None
     return _sse_data(envelope)
 
-  while True:
-    now = time.monotonic()
-    deadlines = [next_keepalive_at]
-    if pending is not None:
-      deadlines.append(pending_started + _PROJECTED_COALESCE_SECONDS)
-    timeout = max(0.0, min(deadlines) - now)
-    try:
-      entry = await asyncio.wait_for(subscription.__anext__(), timeout=timeout)
-    except asyncio.TimeoutError:
+  try:
+    while True:
       now = time.monotonic()
-      if pending is not None and now >= pending_started + _PROJECTED_COALESCE_SECONDS:
+      deadlines = [next_keepalive_at]
+      if pending is not None:
+        deadlines.append(
+          pending_started + _PROJECTED_COALESCE_SECONDS
+        )
+      timeout = max(0.0, min(deadlines) - now)
+      if next_entry_task is None:
+        next_entry_task = asyncio.create_task(
+          subscription.__anext__()
+        )
+      done, _waiting = await asyncio.wait(
+        (next_entry_task,),
+        timeout=timeout,
+        return_when=asyncio.FIRST_COMPLETED,
+      )
+      if next_entry_task not in done:
+        now = time.monotonic()
+        if (
+          pending is not None
+          and now
+          >= pending_started + _PROJECTED_COALESCE_SECONDS
+        ):
+          chunk = await flush_pending()
+          if chunk is not None:
+            next_keepalive_at = (
+              time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
+            )
+            yield chunk
+          continue
+        if now >= next_keepalive_at:
+          next_keepalive_at = (
+            now + _PROJECTED_KEEPALIVE_SECONDS
+          )
+          yield _sse_keepalive()
+        continue
+
+      completed_entry_task = next_entry_task
+      next_entry_task = None
+      try:
+        entry = completed_entry_task.result()
+      except StopAsyncIteration:
         chunk = await flush_pending()
         if chunk is not None:
-          next_keepalive_at = time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
           yield chunk
+        return
+
+      raw_event = dict(getattr(entry, "event", {}))
+      raw_event_type = raw_event.get("type")
+      try:
+        visibility_event = dict(raw_event)
+        entry_run_id = getattr(entry, "control_run_id", None)
+        if isinstance(entry_run_id, str) and entry_run_id:
+          visibility_event.setdefault(
+            "control_run_id",
+            entry_run_id,
+          )
+        if (
+          enforce_visibility
+          and not _event_visible_to_session(
+            auth=auth,
+            app_state=app_state,
+            authenticated=authenticated,
+            event=visibility_event,
+          )
+        ):
+          continue
+        projected_event = adapt_control_event(
+          raw_event,
+          schema_version,
+        )
+      except ValueError as exc:
+        error_text = str(exc)
+        log.warning(
+          "control event adaptation failed (type=%s): %s",
+          raw_event_type,
+          error_text,
+          exc_info=exc,
+        )
+        projected_event = adapt_control_event(
+          {"type": "stream_error", "error": error_text},
+          DEFAULT_SCHEMA_VERSION,
+        )
+      if projected_event is None:
+        if raw_event_type not in _DELTA_EVENT_TYPES:
+          chunk = await flush_pending()
+          if chunk is not None:
+            next_keepalive_at = (
+              time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
+            )
+            yield chunk
         continue
-      if now >= next_keepalive_at:
-        next_keepalive_at = now + _PROJECTED_KEEPALIVE_SECONDS
-        yield _sse_keepalive()
-      continue
-    except StopAsyncIteration:
+
+      envelope = _projected_envelope(entry, projected_event)
+      event_type = projected_event.get("type")
+      if event_type in _DELTA_EVENT_TYPES:
+        if pending is not None and _can_coalesce(
+          pending,
+          envelope,
+        ):
+          _merge_delta_envelope(pending, envelope)
+        else:
+          chunk = await flush_pending()
+          if chunk is not None:
+            next_keepalive_at = (
+              time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
+            )
+            yield chunk
+          pending = envelope
+          pending_started = time.monotonic()
+        continue
+
       chunk = await flush_pending()
       if chunk is not None:
+        next_keepalive_at = (
+          time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
+        )
         yield chunk
-      return
-
-    raw_event = dict(getattr(entry, "event", {}))
-    raw_event_type = raw_event.get("type")
-    try:
-      if not _event_visible_to_session(
-        auth=auth,
-        app_state=app_state,
-        authenticated=authenticated,
-        event=raw_event,
-      ):
-        continue
-      projected_event = adapt_control_event(raw_event, schema_version)
-    except ValueError as exc:
-      projected_event = adapt_control_event({"type": "stream_error", "error": str(exc)}, DEFAULT_SCHEMA_VERSION)
-    if projected_event is None:
-      if raw_event_type not in _DELTA_EVENT_TYPES:
-        chunk = await flush_pending()
-        if chunk is not None:
-          next_keepalive_at = time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
-          yield chunk
-      continue
-
-    envelope = _projected_envelope(entry, projected_event)
-    event_type = projected_event.get("type")
-    if event_type in _DELTA_EVENT_TYPES:
-      if pending is not None and _can_coalesce(pending, envelope):
-        _merge_delta_envelope(pending, envelope)
-      else:
-        chunk = await flush_pending()
-        if chunk is not None:
-          next_keepalive_at = time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
-          yield chunk
-        pending = envelope
-        pending_started = time.monotonic()
-      continue
-
-    chunk = await flush_pending()
-    if chunk is not None:
-      next_keepalive_at = time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
-      yield chunk
-    next_keepalive_at = time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
-    yield _sse_data(envelope)
+      next_keepalive_at = (
+        time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
+      )
+      yield _sse_data(envelope)
+  finally:
+    if next_entry_task is not None:
+      next_entry_task.cancel()
+      await asyncio.gather(
+        next_entry_task,
+        return_exceptions=True,
+      )
 
 
 def _normalize_channel(channel: str | None) -> str | None:
@@ -199,6 +271,10 @@ def _autonomous_record_for_run(app_state: Any, run_id: str) -> Any | None:
   if record is not None:
     return record
   return next((task for task in tasks.values() if getattr(task, "control_run_id", None) == run_id), None)
+
+
+def _autonomous_record_owner_user_id(record: Any) -> str:
+  return str(getattr(record, "owner_user_id", None) or "").strip()
 
 
 def _autonomous_replay_events_for_record(record: Any) -> list[dict[str, Any]]:
@@ -245,12 +321,55 @@ async def _seed_autonomous_replay_buffer(
   events = _autonomous_replay_events_for_record(record)
   if events:
     await seed(
-      getattr(record, "user_id", ""),
+      _autonomous_record_owner_user_id(record),
       control_run_id,
       events,
       terminated=_autonomous_record_is_terminated(record),
     )
   return control_run_id
+
+
+async def _seed_batch_replay_buffer(
+  *,
+  user_event_bus: Any,
+  run_id: str | None,
+  user_id: str,
+) -> str | None:
+  if run_id is None or not run_id.startswith("batch_"):
+    return None
+  try:
+    from .batches import terminal_batch_event_for_user
+
+    event = await asyncio.to_thread(
+      terminal_batch_event_for_user,
+      run_id,
+      user_id=user_id,
+    )
+  except HTTPException:
+    raise
+  except Exception as exc:
+    raise HTTPException(
+      status_code=503,
+      detail="Batch event authority unavailable",
+    ) from exc
+  if event is None:
+    return run_id
+  publish_terminal = getattr(
+    user_event_bus,
+    "publish_terminal_if_absent",
+    None,
+  )
+  if not callable(publish_terminal):
+    raise HTTPException(
+      status_code=503,
+      detail="Batch event replay unavailable",
+    )
+  await publish_terminal(
+    user_id,
+    run_id,
+    event,
+  )
+  return run_id
 
 
 def _run_visible_to_session(
@@ -264,15 +383,17 @@ def _run_visible_to_session(
   if session is not None:
     return (
       session.kind == "chat"
-      and session.user_id == authenticated.user_id
+      and session_owner_user_id(session)
+      == session_owner_user_id(authenticated)
       and _channel_matches(session.channel, authenticated.channel)
     )
 
   record = _autonomous_record_for_run(app_state, run_id)
   if record is None:
-    return True
+    return run_id.startswith("batch_")
   return (
-    getattr(record, "user_id", None) == authenticated.user_id
+    _autonomous_record_owner_user_id(record)
+    == session_owner_user_id(authenticated)
     and _channel_matches(getattr(record, "channel", None), authenticated.channel)
   )
 
@@ -286,15 +407,17 @@ def _event_visible_to_session(
 ) -> bool:
   if authenticated.kind == "chat":
     return _event_run_id(event) == authenticated.session_id
-  run_id = _event_run_id(event)
-  if run_id is None:
-    return True
-  return _run_visible_to_session(
-    auth=auth,
-    app_state=app_state,
-    authenticated=authenticated,
-    run_id=run_id,
-  )
+  elif authenticated.kind == "control":
+    run_id = _event_run_id(event)
+    if run_id is None:
+      return True
+    return _run_visible_to_session(
+      auth=auth,
+      app_state=app_state,
+      authenticated=authenticated,
+      run_id=run_id,
+    )
+  return False
 
 
 async def _shielded_aclose(iterator: Any) -> None:
@@ -302,18 +425,81 @@ async def _shielded_aclose(iterator: Any) -> None:
   if not callable(close):
     return
   close_task = asyncio.create_task(close())
-  try:
-    await asyncio.shield(close_task)
-  except asyncio.CancelledError:
-    close_task.cancel()
-    await asyncio.gather(close_task, return_exceptions=True)
-    raise
+  cancellation: asyncio.CancelledError | None = None
+  while True:
+    try:
+      await asyncio.shield(close_task)
+      break
+    except asyncio.CancelledError as exc:
+      if cancellation is None:
+        cancellation = exc
+      if close_task.done():
+        close_task.result()
+        break
+  if cancellation is not None:
+    raise cancellation
 
 
-def build_events_router(*, auth: AuthManager) -> APIRouter:
+class _OwnedStreamingResponse(StreamingResponse):
+  """Close stream resources even when ASGI send fails before background."""
+
+  def __init__(
+    self,
+    *args: Any,
+    owned_subscription: Any,
+    **kwargs: Any,
+  ) -> None:
+    self._owned_subscription = owned_subscription
+    super().__init__(*args, **kwargs)
+
+  async def __call__(
+    self,
+    scope: Any,
+    receive: Any,
+    send: Any,
+  ) -> None:
+    primary_failure: BaseException | None = None
+    try:
+      await super().__call__(scope, receive, send)
+    except BaseException as exc:
+      primary_failure = exc
+    for resource_name, resource in (
+      ("body iterator", self.body_iterator),
+      ("subscription", self._owned_subscription),
+    ):
+      try:
+        await _shielded_aclose(resource)
+      except BaseException as exc:
+        if primary_failure is None:
+          primary_failure = exc
+          continue
+        try:
+          primary_failure.add_note(
+            f"Additional SSE {resource_name} close failure: "
+            f"{type(exc).__name__}: {exc}"
+          )
+        except AttributeError:
+          pass
+        log.error(
+          "Additional SSE %s close failure",
+          resource_name,
+          exc_info=(type(exc), exc, exc.__traceback__),
+        )
+    if primary_failure is not None:
+      raise primary_failure.with_traceback(
+        primary_failure.__traceback__
+      )
+
+
+def build_events_router(
+  *,
+  auth: AuthManager,
+  route_path: str = "/events",
+  endpoint_name: str = "control_events",
+) -> APIRouter:
   router = APIRouter()
 
-  @router.get("/events")
+  @router.get(route_path, name=endpoint_name)
   async def control_events(
     request: Request,
     control_run_id: str | None = Query(default=None),
@@ -328,62 +514,124 @@ def build_events_router(*, auth: AuthManager) -> APIRouter:
       if scoped_run_id is not None and scoped_run_id != authenticated.session_id:
         raise HTTPException(status_code=401, detail="Chat session token cannot subscribe to another run")
       scoped_run_id = authenticated.session_id
-    elif scoped_run_id is not None and not _run_visible_to_session(
-      auth=auth,
-      app_state=request.app.state,
-      authenticated=authenticated,
-      run_id=scoped_run_id,
-    ):
-      raise HTTPException(status_code=404, detail="Run not found")
+    elif authenticated.kind == "control":
+      if (
+        scoped_run_id is not None
+        and not _run_visible_to_session(
+        auth=auth,
+        app_state=request.app.state,
+        authenticated=authenticated,
+        run_id=scoped_run_id,
+        )
+      ):
+        raise HTTPException(status_code=404, detail="Run not found")
+    else:
+      raise HTTPException(status_code=401, detail="Chat or control session required")
 
-    user_event_bus = getattr(request.app.state, "user_event_bus", None)
+    normalized_after_seq = (
+      _normalize_after_seq(after_seq)
+      if projected_schema_version is not None
+      else 0
+    )
+    user_event_bus = getattr(
+      request.app.state,
+      "user_event_bus",
+      None,
+    )
     if user_event_bus is None:
-      raise HTTPException(status_code=503, detail="User event bus unavailable")
-    if authenticated.kind != "chat":
-      scoped_run_id = await _seed_autonomous_replay_buffer(
+      raise HTTPException(
+        status_code=503,
+        detail="User event bus unavailable",
+      )
+    if authenticated.kind == "control":
+      autonomous_run_id = await _seed_autonomous_replay_buffer(
         user_event_bus=user_event_bus,
         app_state=request.app.state,
         run_id=scoped_run_id,
-      ) or scoped_run_id
+      )
+      if autonomous_run_id is not None:
+        scoped_run_id = autonomous_run_id
+      else:
+        scoped_run_id = await _seed_batch_replay_buffer(
+          user_event_bus=user_event_bus,
+          run_id=scoped_run_id,
+          user_id=session_owner_user_id(authenticated),
+        ) or scoped_run_id
 
+    subscription: AsyncIterator[Any]
     if projected_schema_version is None:
-      subscription: AsyncIterator[Any] = user_event_bus.subscribe(
-        authenticated.user_id,
+      subscription = user_event_bus.subscribe(
+        session_owner_user_id(authenticated),
         control_run_id=scoped_run_id,
       )
     else:
-      subscription = user_event_bus.subscribe_entries(
-        authenticated.user_id,
+      subscription = await user_event_bus.subscribe_entries(
+        session_owner_user_id(authenticated),
         control_run_id=scoped_run_id,
-        after_seq=_normalize_after_seq(after_seq),
+        after_seq=normalized_after_seq,
       )
 
     async def event_generator() -> AsyncIterator[bytes]:
-      if projected_schema_version is not None:
-        async for chunk in _projected_control_event_chunks(
-          subscription=subscription,
-          auth=auth,
-          app_state=request.app.state,
-          authenticated=authenticated,
-          schema_version=projected_schema_version,
-        ):
-          yield chunk
-        return
-
-      async for event in subscription:
-        try:
-          event_dict = dict(event)
-          if not _event_visible_to_session(
+      try:
+        if projected_schema_version is not None:
+          projected_chunks = _projected_control_event_chunks(
+            subscription=subscription,
             auth=auth,
             app_state=request.app.state,
             authenticated=authenticated,
-            event=event_dict,
-          ):
-            continue
-          yield _sse_data(event_dict)
-        except Exception as exc:
-          yield _sse_data({"type": "stream_error", "error": f"SSE serialization failed: {exc}"})
+            schema_version=projected_schema_version,
+            enforce_visibility=True,
+          )
+          try:
+            async for chunk in projected_chunks:
+              yield chunk
+          finally:
+            await _shielded_aclose(projected_chunks)
           return
+
+        async for entry in subscription:
+          try:
+            if isinstance(entry, dict):
+              event_dict = dict(entry)
+            else:
+              event_dict = dict(
+                getattr(entry, "event", {})
+              )
+            visibility_event = dict(event_dict)
+            entry_run_id = getattr(
+              entry,
+              "control_run_id",
+              None,
+            )
+            if isinstance(entry_run_id, str) and entry_run_id:
+              visibility_event.setdefault(
+                "control_run_id",
+                entry_run_id,
+              )
+            if (
+              not _event_visible_to_session(
+                auth=auth,
+                app_state=request.app.state,
+                authenticated=authenticated,
+                event=visibility_event,
+              )
+            ):
+              continue
+            yield _sse_data(event_dict)
+          except Exception as exc:
+            error_text = str(exc)
+            log.warning(
+              "SSE serialization failed: %s",
+              error_text,
+              exc_info=exc,
+            )
+            yield _sse_data({
+              "type": "stream_error",
+              "error": f"SSE serialization failed: {error_text}",
+            })
+            return
+      finally:
+        await _shielded_aclose(subscription)
 
     headers = {
       "Content-Type": "text/event-stream",
@@ -391,8 +639,9 @@ def build_events_router(*, auth: AuthManager) -> APIRouter:
       "X-Accel-Buffering": "no",
       "Connection": "keep-alive",
     }
-    return StreamingResponse(
+    return _OwnedStreamingResponse(
       event_generator(),
+      owned_subscription=subscription,
       headers=headers,
       background=BackgroundTask(_shielded_aclose, subscription),
     )

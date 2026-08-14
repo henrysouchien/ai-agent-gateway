@@ -39,12 +39,16 @@ def build_parser() -> argparse.ArgumentParser:
     help="Target directory. Defaults to the project name.",
   )
   init_parser.add_argument(
-    "--provider",
-    default="anthropic",
-    choices=["anthropic", "openai", "codex", "xai"],
-    help="Default model provider.",
+    "--model-key",
+    default=None,
+    help="Optional stable product model key.",
   )
-  init_parser.add_argument("--model", default=None, help="Optional default model.")
+  init_parser.add_argument(
+    "--effort",
+    default=None,
+    choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    help="Optional effort for --model-key.",
+  )
   init_parser.add_argument("--force", action="store_true", help="Overwrite generated files.")
 
   run_parser = subparsers.add_parser("run", help="Run the current agent project.")
@@ -70,10 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
     help=f"Path to agent config. Defaults to {DEFAULT_AGENT_CONFIG}.",
   )
 
-  add_provider = add_sub.add_parser("provider", help="Set the default model provider.")
-  add_provider.add_argument("provider", choices=["anthropic", "openai", "codex", "xai"])
-  add_provider.add_argument("--model", default=None, help="Optional default model.")
-  add_provider.add_argument(
+  add_model = add_sub.add_parser("model", help="Set stable model-key intent.")
+  add_model.add_argument("model_key", help="Stable product model key.")
+  add_model.add_argument(
+    "--effort",
+    default=None,
+    choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+  )
+  add_model.add_argument(
     "--config",
     default=DEFAULT_AGENT_CONFIG,
     help=f"Path to agent config. Defaults to {DEFAULT_AGENT_CONFIG}.",
@@ -121,8 +129,8 @@ def main(
       written = write_agent_project(
         target,
         name=args.name,
-        provider=args.provider,
-        model=args.model,
+        model_key=args.model_key,
+        effort=args.effort,
         force=args.force,
       )
       stdout.write(f"Created agent project in {target}\n")
@@ -136,8 +144,8 @@ def main(
     if args.command == "add":
       if args.add_command == "mcp":
         return _add_mcp(args, stdout=stdout)
-      if args.add_command == "provider":
-        return _add_provider(args, stdout=stdout)
+      if args.add_command == "model":
+        return _add_model(args, stdout=stdout)
 
     if args.command == "auth":
       if args.auth_command == "login":
@@ -238,20 +246,26 @@ def _extract_remainder_config(args: list[str], default_config: str) -> tuple[lis
   return stripped_args, config_path
 
 
-def _add_provider(args: argparse.Namespace, *, stdout: TextIO) -> int:
+def _add_model(args: argparse.Namespace, *, stdout: TextIO) -> int:
   payload = load_agent_project_payload(args.config)
-  payload["provider"] = args.provider
-  payload["model"] = args.model
+  model_key = str(args.model_key or "").strip()
+  if not model_key:
+    raise AgentProjectError("model_key cannot be blank")
+  payload["model_key"] = model_key
+  if args.effort is None:
+    payload.pop("effort", None)
+  else:
+    payload["effort"] = args.effort
   save_agent_project_payload(payload, args.config)
-  stdout.write(f"Set provider to {args.provider}\n")
+  stdout.write(f"Set model key to {model_key}\n")
   return 0
 
 
 def _list_project(args: argparse.Namespace, *, stdout: TextIO) -> int:
   config = load_agent_project_config(args.config)
   stdout.write(f"name: {config.name}\n")
-  stdout.write(f"provider: {config.provider}\n")
-  stdout.write(f"model: {config.model or ''}\n")
+  stdout.write(f"model_key: {config.model_key or ''}\n")
+  stdout.write(f"effort: {config.effort or ''}\n")
   stdout.write(f"address: http://{config.host}:{config.port}{config.api_prefix}\n")
   stdout.write(f"skills_dir: {config.skills_dir or ''}\n")
   stdout.write(f"mcp_servers: {', '.join(sorted(config.mcp_servers))}\n")
@@ -271,7 +285,8 @@ def _auth_login(args: argparse.Namespace, *, stdout: TextIO) -> int:
   if args.provider == "openai":
     raise AgentProjectError(
       "The OpenAI API does not provide ChatGPT subscription OAuth login. "
-      "Use OPENAI_API_KEY for provider=openai, or run `agent auth login codex` "
+      "Use OPENAI_API_KEY for provider=openai, or run "
+      "`python3 -m agent_gateway.cli auth login codex` "
       "for ChatGPT subscription authentication. No credentials were changed."
     )
 
@@ -383,7 +398,7 @@ def _auth_status(args: argparse.Namespace, *, stdout: TextIO) -> int:
       return 0
     stdout.write(
       "OpenAI API: no credential configured. Set OPENAI_API_KEY; for ChatGPT subscription "
-      "auth use provider=codex and `agent auth login codex`.\n"
+      "auth use provider=codex and `python3 -m agent_gateway.cli auth login codex`.\n"
     )
     return 1
 
@@ -392,6 +407,7 @@ def _auth_status(args: argparse.Namespace, *, stdout: TextIO) -> int:
     resolve_xai_oauth_settings,
     token_needs_refresh,
     token_store_is_private,
+    xai_record_requires_reauth,
   )
 
   settings = resolve_xai_oauth_settings(_xai_auth_config(args))
@@ -399,7 +415,19 @@ def _auth_status(args: argparse.Namespace, *, stdout: TextIO) -> int:
   if not record:
     stdout.write(f"xAI OAuth: not logged in ({settings.store_path})\n")
     return 1
-  state = "refresh required" if token_needs_refresh(record) else "active"
+  if xai_record_requires_reauth(record):
+    if record.get("reauth_required"):
+      stdout.write("xAI OAuth: logged out — re-authentication required\n")
+    else:
+      stdout.write(
+        "xAI OAuth: previous refresh did not complete — re-authentication required\n"
+      )
+    return 1
+  # This check is local-only: it reads the stored record and its expiry, and never contacts xAI.
+  # A refresh token the server has REVOKED still looks fine here, so do not report it as "active"
+  # — that is a claim this code cannot support, and it has misled an operator into trusting a dead
+  # credential. Say exactly what was checked.
+  state = "refresh required" if token_needs_refresh(record) else "stored; not server-validated"
   permissions = "0600" if token_store_is_private(settings.store_path) else "insecure permissions"
   stdout.write(f"xAI OAuth: {state}; store={settings.store_path}; permissions={permissions}\n")
   return 0
@@ -431,10 +459,25 @@ def _auth_logout(args: argparse.Namespace, *, stdout: TextIO) -> int:
     path = resolve_anthropic_auth_store_path(_xai_auth_config(args))
     provider_label = "Anthropic"
   else:
-    from .providers.xai_oauth import resolve_xai_oauth_settings
+    from .providers.xai_oauth import (
+      _store_lock,
+      _write_reauth_tombstone,
+      resolve_xai_oauth_settings,
+    )
 
     path = resolve_xai_oauth_settings(_xai_auth_config(args)).store_path
     provider_label = "xAI"
+
+    async def logout_xai() -> None:
+      async with _store_lock(path):
+        _write_reauth_tombstone(path)
+
+    try:
+      asyncio.run(logout_xai())
+    except OSError as exc:
+      raise AgentProjectError(f"Unable to update {provider_label} OAuth token store: {path}") from exc
+    stdout.write(f"Removed {provider_label} OAuth token store: {path}\n")
+    return 0
   try:
     path.unlink()
   except FileNotFoundError:

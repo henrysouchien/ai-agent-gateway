@@ -152,7 +152,7 @@ def test_context_builder_tool_call_complete_backward_compat_with_final_blocks(tm
         {
           "type": "tool_result",
           "tool_use_id": "tool-1",
-          "content": "{\"ok\": true}",
+          "content": "{\"ok\": true, \"_runner_warning\": \"annotated\"}",
         }
       ],
     }

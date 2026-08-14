@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .agent_session_log import AgentSessionLog, LogEntry
+from .secret_boundary import sanitize_tool_event
 
 Message = dict[str, Any]
 
@@ -378,6 +379,7 @@ class SessionContextBuilder:
     return messages
 
   def _entry_to_message(self, event_type: str, event: dict[str, Any]) -> Message | list[Message] | None:
+    event = sanitize_tool_event(event, sink="context_replay")
     if event_type == "user_message":
       return {
         "role": "user",
@@ -420,6 +422,15 @@ class SessionContextBuilder:
       tool_call_id = str(event.get("tool_call_id") or "")
       if not tool_call_id:
         return None
+      final_blocks = event.get("final_tool_result_blocks")
+      if isinstance(final_blocks, list):
+        blocks = [
+          dict(block)
+          for block in final_blocks
+          if isinstance(block, dict) and not block.get("_event_only")
+        ]
+        if blocks:
+          return {"role": "user", "content": blocks}
       error = event.get("error")
       if error is not None:
         content = json.dumps({"error": error}, default=str)

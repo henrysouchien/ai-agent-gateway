@@ -203,6 +203,69 @@ def test_stdio_missing_command_is_not_retried(monkeypatch, caplog):
   assert manager.get_startup_diagnostics()["bad-stdio"]["retryable"] is False
 
 
+def test_stdio_missing_shell_exec_env_executable_is_not_retried(monkeypatch, caplog):
+  monkeypatch.setenv("MCP_STDIO_CONNECT_RETRIES", "5")
+  monkeypatch.setenv("MCP_STDIO_CONNECT_BACKOFF_S", "0.01")
+  sleep_calls: list[float] = []
+
+  async def _fake_sleep(delay):
+    sleep_calls.append(delay)
+
+  monkeypatch.setattr(mcp_client_module.asyncio, "sleep", _fake_sleep)
+  manager = McpClientManager(config_path=None)
+  caplog.set_level(logging.WARNING, logger="agent_gateway.mcp_client")
+
+  config = {
+    "type": "stdio",
+    "command": "bash",
+    "args": ["-c", 'exec "$GSHEETS_MCP_EXECUTABLE" serve'],
+    "env": {"GSHEETS_MCP_EXECUTABLE": "/nonexistent/hank-test/gsheets-mcp/venv/bin/gsheets-mcp"},
+  }
+
+  async def _run():
+    return await manager._connect_or_warn("gsheets-mcp", config)
+
+  result = asyncio.run(_run())
+
+  assert result is None
+  assert sleep_calls == []
+  assert "retrying" not in caplog.text
+  diagnostic = manager.get_startup_diagnostics()["gsheets-mcp"]
+  assert diagnostic["category"] == "executable_missing"
+  assert diagnostic["retryable"] is False
+  assert "/nonexistent/hank-test/gsheets-mcp/venv/bin/gsheets-mcp" in diagnostic["message"]
+  assert "GSHEETS_MCP_EXECUTABLE" in diagnostic["message"]
+
+
+def test_stdio_missing_direct_argv_executable_is_not_retried(monkeypatch, caplog):
+  monkeypatch.setenv("MCP_STDIO_CONNECT_RETRIES", "5")
+  monkeypatch.setenv("MCP_STDIO_CONNECT_BACKOFF_S", "0.01")
+  sleep_calls: list[float] = []
+
+  async def _fake_sleep(delay):
+    sleep_calls.append(delay)
+
+  monkeypatch.setattr(mcp_client_module.asyncio, "sleep", _fake_sleep)
+  manager = McpClientManager(config_path=None)
+  caplog.set_level(logging.WARNING, logger="agent_gateway.mcp_client")
+
+  async def _run():
+    return await manager._connect_or_warn(
+      "fmp-mcp",
+      {"type": "stdio", "command": "/nonexistent/hank-test/fmp-mcp"},
+    )
+
+  result = asyncio.run(_run())
+
+  assert result is None
+  assert sleep_calls == []
+  assert "retrying" not in caplog.text
+  diagnostic = manager.get_startup_diagnostics()["fmp-mcp"]
+  assert diagnostic["category"] == "executable_missing"
+  assert diagnostic["retryable"] is False
+  assert "/nonexistent/hank-test/fmp-mcp" in diagnostic["message"]
+
+
 class ClosedResourceError(Exception):
   pass
 

@@ -90,6 +90,44 @@ def register_html_artifact_sidecar(
   )
 
 
+def register_canvas_artifact_sidecar(
+  *,
+  workspace_dir: Path,
+  artifact: Any,
+  sidecar_path: Path,
+  bundle_path: Path,
+  user_id: str = "",
+) -> None:
+  effective_user_id = _effective_user_id(workspace_dir, user_id=user_id)
+  _upsert_index_row(
+    workspace_dir=workspace_dir,
+    row={
+      "user_id": effective_user_id,
+      "artifact_kind": "canvas",
+      "artifact_id": str(artifact.artifact_id),
+      "artifact_ref": _relative_to_workspace(workspace_dir, sidecar_path),
+      "payload_ref": _relative_to_workspace(workspace_dir, bundle_path),
+      "scope": "ticker" if artifact.ticker else "portfolio",
+      "scope_label": None,
+      "ticker": artifact.ticker,
+      "skill": artifact.source_skill,
+      "contract_name": getattr(artifact, "contract_name", "CanvasArtifact"),
+      "purpose": artifact.purpose,
+      "research_file_id": artifact.research_file_id,
+      "control_run_id": artifact.control_run_id,
+      "origin_kind": artifact.origin_kind,
+      "visibility": artifact.visibility,
+      "origin_ref": _json_or_none(artifact.origin_ref),
+      "classification_source": _classification_source(artifact),
+      "created_ts": artifact.ts,
+      "updated_ts": _mtime_ts(sidecar_path),
+      "sidecar_mtime_ns": sidecar_path.stat().st_mtime_ns,
+      "content_hash": _sha256_file(sidecar_path),
+      "index_version": INDEX_VERSION,
+    },
+  )
+
+
 def register_skill_artifact_sidecar(
   *,
   workspace_dir: Path,
@@ -141,9 +179,7 @@ def register_ui_blocks_payload_sidecar(
   turn_key: str,
   emission_index: int,
   ts: float,
-  manifest_digest: str,
 ) -> None:
-  del manifest_digest  # The digest stays in the envelope; the index has no digest column.
   effective_user_id = _effective_user_id(workspace_dir, user_id=user_id)
   envelope_path = _ensure_under_workspace(path, workspace_dir)
   envelope_ts = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
@@ -229,7 +265,9 @@ def reconcile_ui_blocks_index(users_root: Path) -> None:
         turn_key = str(envelope["turn_key"])
         emission_index = int(envelope["emission_index"])
         ts = float(envelope["ts"])
-        manifest_digest = str(envelope["manifest_digest"])
+        contract_version = int(envelope["contract_version"])
+        if contract_version < 1:
+          raise ValueError("invalid UI blocks contract_version")
       except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         if ui_blocks_id in rows_by_ref:
           mark_artifact_sidecar_index_row_stale(
@@ -256,7 +294,6 @@ def reconcile_ui_blocks_index(users_root: Path) -> None:
         turn_key=turn_key,
         emission_index=emission_index,
         ts=ts,
-        manifest_digest=manifest_digest,
       )
 
 
@@ -749,6 +786,7 @@ __all__ = [
   "get_artifact_sidecar_index_row_by_ref",
   "list_artifact_sidecar_index_rows",
   "mark_artifact_sidecar_index_row_stale",
+  "register_canvas_artifact_sidecar",
   "register_dashboard_artifact_sidecar",
   "register_html_artifact_sidecar",
   "register_skill_artifact_sidecar",

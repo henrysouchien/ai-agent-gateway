@@ -12,10 +12,15 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from agent_gateway.model_registry import (
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
+from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 
 
-HMAC_KEY = "artifact-api-test-secret"
+HMAC_KEY = "artifact-api-test-hmac-key-at-least-32-bytes"
 USER_ID = "alice"
 USER_EMAIL = "alice@example.com"
 CLAIM_HEADERS = {
@@ -27,8 +32,6 @@ CLAIM_HEADERS = {
   "nonce": "X-Agent-Claim-Nonce",
   "signature": "X-Agent-Claim-Signature",
 }
-
-
 @dataclass(frozen=True)
 class ArtifactApiFixture:
   app: Any
@@ -38,17 +41,25 @@ class ArtifactApiFixture:
 @pytest.fixture
 def artifact_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ArtifactApiFixture:
   data_dir = tmp_path / "data"
+  (data_dir / "gateway").mkdir(parents=True)
   monkeypatch.setenv("USER_DATA_DIR", str(data_dir))
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   monkeypatch.setenv("AGENT_API_CLAIM_MAX_TTL_SECONDS", "600")
 
-  async def _build_chat_runtime(_session, _request, _channel, _auth_manager):
-    return ChatRuntime(system_prompt="test", build_runner=lambda *_args: None)
+  async def _build_chat_runtime(_session, request, _channel, _auth_manager):
+    return ChatRuntime(
+      system_prompt="test",
+      build_runner=lambda *_args: None,
+      capability_execution=request.capability_execution,
+    )
 
   app = create_gateway_app(
     GatewayServerConfig(
-      auth_config={"model": "claude-sonnet-4-6"},
+      tenant_id="test-product",
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
+      claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
     )
   )
   return ArtifactApiFixture(app=app, data_dir=data_dir)

@@ -4,6 +4,17 @@ import asyncio
 from typing import Any, Callable
 
 
+class McpExecutableMissingError(RuntimeError):
+  """The configured stdio executable decisively cannot exist at spawn time.
+
+  Raised by the pre-spawn resolution check so a deleted server binary (for
+  example an out-of-band-removed venv) surfaces as a non-retryable
+  ``executable_missing`` startup diagnostic naming the missing path, instead of
+  burning stdio connect retries on a generic "Connection closed" transport
+  failure.
+  """
+
+
 def classify_exception(exc: Exception, msg: str) -> str:
   lower = msg.lower()
   if isinstance(exc, asyncio.TimeoutError) or "timeout" in lower or "timed out" in lower:
@@ -33,6 +44,13 @@ def startup_failure_from_exception(
   error_type = type(exc).__name__
   lower = message.lower()
 
+  if isinstance(exc, McpExecutableMissingError):
+    return {
+      "category": "executable_missing",
+      "retryable": False,
+      "message": message,
+      "error_type": error_type,
+    }
   if isinstance(exc, asyncio.TimeoutError):
     return {
       "category": "transient_timeout",
@@ -67,6 +85,7 @@ def startup_failure_from_exception(
 
 
 __all__ = [
+  "McpExecutableMissingError",
   "classify_exception",
   "classify_mcp_error",
   "startup_failure_from_exception",

@@ -92,6 +92,7 @@ def test_local_tool_schema_validation_rejects_missing_required_before_handler() 
     local_tool_handlers={"structured_write": _unexpected_handler},
     event_log=event_log,
     get_tool_definitions=_tool_defs,
+    role="owner",
   )
 
   result, error = _run(dispatcher.dispatch("call-1", "structured_write", {}))
@@ -165,6 +166,7 @@ def test_local_tool_schema_validation_preserves_dispatcher_override_seam() -> No
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _handler},
     get_tool_definitions=_tool_defs,
+    role="owner",
   )
 
   result, error = _run(
@@ -189,6 +191,7 @@ def test_local_tool_schema_validation_preserves_active_schema_override_seam() ->
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _ok_handler},
     get_tool_definitions=_tool_defs,
+    role="owner",
   )
 
   result, error = _run(
@@ -216,6 +219,7 @@ def test_local_tool_schema_validation_preserves_type_match_override_seam() -> No
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _handler},
     get_tool_definitions=_tool_defs,
+    role="owner",
   )
 
   result, error = _run(
@@ -232,6 +236,7 @@ def test_local_tool_schema_validation_rejects_unknown_top_level_field() -> None:
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _unexpected_handler},
     get_tool_definitions=_tool_defs,
+    role="owner",
   )
 
   result, error = _run(
@@ -249,6 +254,7 @@ def test_local_tool_schema_validation_rejects_top_level_type_mismatch() -> None:
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _unexpected_handler},
     get_tool_definitions=_tool_defs,
+    role="owner",
   )
 
   result, error = _run(
@@ -268,6 +274,7 @@ def test_local_tool_schema_validation_allows_valid_input() -> None:
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _ok_handler},
     get_tool_definitions=_tool_defs,
+    role="owner",
   )
 
   result, error = _run(
@@ -283,6 +290,7 @@ def test_local_tool_schema_validation_blocks_unadvertised_local_tool() -> None:
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"hidden_write": _unexpected_handler},
     get_tool_definitions=_tool_defs,
+    role="owner",
   )
 
   result, error = _run(dispatcher.dispatch("call-1", "hidden_write", {}))
@@ -300,12 +308,17 @@ def test_local_tool_schema_validation_rechecks_approval_modified_args(tmp_path: 
     return {"ok": True}, None
 
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-  session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+  session = SessionStore(ttl=3600).create_session(
+    api_key_hash="hash",
+    user_id="alice",
+    role="owner",
+  )
   dispatcher = ToolDispatcher(
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _handler},
     needs_approval=lambda _name, _tool_input, _qualifier: True,
     session=session,
+    role="owner",
     store=store,
     policy=_ModifiedArgsPolicy(),
     run_context=RunContext(

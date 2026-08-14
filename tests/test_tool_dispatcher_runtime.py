@@ -304,15 +304,29 @@ def test_tool_dispatcher_observes_post_construction_mutable_allowlist_updates() 
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
     local_tool_handlers={},
+    get_tool_definitions=lambda: [
+      {"name": "corpus_search"},
+      {"name": "corpus_write"},
+    ],
     allowed_mcp_tools_by_server=allowlist,
   )
 
   blocked_result, blocked_error = asyncio.run(
-    dispatcher.dispatch("call-1", "corpus_write", {"ticker": "MSFT"})
+    dispatcher.dispatch(
+      "call-1",
+      "corpus_write",
+      {"ticker": "MSFT"},
+      advertised_tool_names=frozenset({"corpus_search", "corpus_write"}),
+    )
   )
   allowlist["research-corpus-mcp"].add("corpus_write")
   allowed_result, allowed_error = asyncio.run(
-    dispatcher.dispatch("call-2", "corpus_write", {"ticker": "MSFT"})
+    dispatcher.dispatch(
+      "call-2",
+      "corpus_write",
+      {"ticker": "MSFT"},
+      advertised_tool_names=frozenset({"corpus_search", "corpus_write"}),
+    )
   )
 
   assert dispatcher._allowed_mcp_tools_by_server is allowlist
@@ -322,6 +336,167 @@ def test_tool_dispatcher_observes_post_construction_mutable_allowlist_updates() 
   assert allowed_error is None
   assert allowed_result == {"ok": "corpus_write"}
   assert mcp.calls == [("corpus_write", {"ticker": "MSFT"})]
+
+
+def test_tool_dispatcher_keeps_one_wire_snapshot_for_all_calls_in_provider_response() -> None:
+  mcp = _ScopedCorpusMcpClient()
+  advertised = {"corpus_search"}
+  dispatcher = ToolDispatcher(
+    mcp_client=mcp,
+    local_tool_handlers={},
+    get_tool_definitions=lambda: [
+      {"name": tool_name, "input_schema": {"type": "object"}}
+      for tool_name in sorted(advertised)
+    ],
+    allowed_mcp_tools_by_server={
+      "research-corpus-mcp": {"corpus_search", "corpus_write"},
+    },
+  )
+
+  first_result, first_error = asyncio.run(
+    dispatcher.dispatch(
+      "call-1",
+      "corpus_search",
+      {},
+      call_index=0,
+      advertised_tool_names=frozenset({"corpus_search"}),
+    )
+  )
+  advertised.add("corpus_write")
+  same_response_result, same_response_error = asyncio.run(
+    dispatcher.dispatch(
+      "call-2",
+      "corpus_write",
+      {"ticker": "MSFT"},
+      call_index=1,
+      advertised_tool_names=frozenset({"corpus_search"}),
+    )
+  )
+  next_response_result, next_response_error = asyncio.run(
+    dispatcher.dispatch(
+      "call-3",
+      "corpus_write",
+      {"ticker": "MSFT"},
+      call_index=0,
+      advertised_tool_names=frozenset({"corpus_search", "corpus_write"}),
+    )
+  )
+
+  assert first_error is None
+  assert first_result == {"ok": "corpus_search"}
+  assert same_response_result is None
+  assert same_response_error is not None
+  assert same_response_error["code"] == "mcp_tool_not_allowed"
+  assert next_response_error is None
+  assert next_response_result == {"ok": "corpus_write"}
+  assert mcp.calls == [
+    ("corpus_search", {}),
+    ("corpus_write", {"ticker": "MSFT"}),
+  ]
+
+
+def test_tool_dispatcher_snapshots_before_local_load_mutates_catalog() -> None:
+  mcp = _ScopedCorpusMcpClient()
+  advertised = {"load_tools", "corpus_search"}
+
+  async def load_tools(_tool_input, **_kwargs):
+    advertised.add("corpus_write")
+    return {"loaded_tools": ["corpus_write"]}, None
+
+  dispatcher = ToolDispatcher(
+    mcp_client=mcp,
+    local_tool_handlers={"load_tools": load_tools},
+    role="owner",
+    get_tool_definitions=lambda: [
+      {"name": tool_name, "input_schema": {"type": "object"}}
+      for tool_name in sorted(advertised)
+    ],
+    allowed_mcp_tools_by_server={
+      "research-corpus-mcp": {"corpus_search", "corpus_write"},
+    },
+  )
+
+  load_result, load_error = asyncio.run(
+    dispatcher.dispatch(
+      "call-load",
+      "load_tools",
+      {"servers": ["research-corpus-mcp"]},
+      call_index=0,
+      advertised_tool_names=frozenset({"load_tools", "corpus_search"}),
+    )
+  )
+  same_response_result, same_response_error = asyncio.run(
+    dispatcher.dispatch(
+      "call-write",
+      "corpus_write",
+      {"ticker": "MSFT"},
+      call_index=1,
+      advertised_tool_names=frozenset({"load_tools", "corpus_search"}),
+    )
+  )
+
+  assert load_error is None
+  assert load_result == {"loaded_tools": ["corpus_write"]}
+  assert same_response_result is None
+  assert same_response_error is not None
+  assert same_response_error["code"] == "mcp_tool_not_allowed"
+  assert mcp.calls == []
+
+
+def test_tool_dispatcher_uses_request_snapshot_when_live_catalog_mutates_before_dispatch() -> None:
+  mcp = _ScopedCorpusMcpClient()
+  live_catalog = {"corpus_search"}
+  request_snapshot = frozenset(live_catalog)
+
+  dispatcher = ToolDispatcher(
+    mcp_client=mcp,
+    local_tool_handlers={},
+    get_tool_definitions=lambda: [
+      {"name": tool_name} for tool_name in sorted(live_catalog)
+    ],
+    allowed_mcp_tools_by_server={
+      "research-corpus-mcp": {"corpus_search", "corpus_write"},
+    },
+  )
+  live_catalog.add("corpus_write")
+
+  result, error = asyncio.run(
+    dispatcher.dispatch(
+      "call-1",
+      "corpus_write",
+      {},
+      call_index=0,
+      advertised_tool_names=request_snapshot,
+    )
+  )
+
+  assert result is None
+  assert error is not None
+  assert error["code"] == "mcp_tool_not_allowed"
+  assert mcp.calls == []
+
+
+def test_tool_dispatcher_denies_mcp_when_advertisement_getter_is_absent() -> None:
+  mcp = _ScopedCorpusMcpClient()
+  dispatcher = ToolDispatcher(
+    mcp_client=mcp,
+    local_tool_handlers={},
+    allowed_mcp_tools_by_server={
+      "research-corpus-mcp": {"corpus_search"},
+    },
+  )
+
+  result, error = asyncio.run(
+    dispatcher.dispatch("call-1", "corpus_search", {}, call_index=0)
+  )
+
+  assert result is None
+  assert error == {
+    "code": "mcp_tool_not_allowed",
+    "sub_code": "advertisement_unavailable",
+    "message": "The advertised MCP tool snapshot is unavailable; dispatch was denied.",
+  }
+  assert mcp.calls == []
 
 
 def test_tool_dispatcher_still_copies_non_dict_allowlist_mappings() -> None:
@@ -335,7 +510,12 @@ def test_tool_dispatcher_still_copies_non_dict_allowlist_mappings() -> None:
 
   source["research-corpus-mcp"].add("corpus_write")
   result, error = asyncio.run(
-    dispatcher.dispatch("call-1", "corpus_write", {"ticker": "MSFT"})
+    dispatcher.dispatch(
+      "call-1",
+      "corpus_write",
+      {"ticker": "MSFT"},
+      advertised_tool_names=frozenset({"corpus_write"}),
+    )
   )
 
   assert dispatcher._allowed_mcp_tools_by_server is not source
@@ -354,7 +534,14 @@ def test_tool_dispatcher_enforces_mcp_scope_with_empty_identity_overrides() -> N
     allowed_mcp_tools_by_server={"research-corpus-mcp": {"corpus_search"}},
   )
 
-  result, error = asyncio.run(dispatcher.dispatch("call-1", "corpus_write", {"ticker": "MSFT"}))
+  result, error = asyncio.run(
+    dispatcher.dispatch(
+      "call-1",
+      "corpus_write",
+      {"ticker": "MSFT"},
+      advertised_tool_names=frozenset({"corpus_write"}),
+    )
+  )
 
   assert result is None
   assert error is not None
@@ -366,9 +553,17 @@ def test_dispatcher_adds_argument_guidance_to_direct_mcp_validation_errors() -> 
   dispatcher = ToolDispatcher(
     mcp_client=_ValidationErrorMcpClient(),  # type: ignore[arg-type]
     local_tool_handlers={},
+    get_tool_definitions=lambda: [{"name": "get_price_target"}],
   )
 
-  result, error = asyncio.run(dispatcher.dispatch("call-1", "get_price_target", {"ticker": "MSCI"}))
+  result, error = asyncio.run(
+    dispatcher.dispatch(
+      "call-1",
+      "get_price_target",
+      {"ticker": "MSCI"},
+      advertised_tool_names=frozenset({"get_price_target"}),
+    )
+  )
 
   assert result is None
   assert error is not None
@@ -381,9 +576,17 @@ def test_dispatcher_does_not_add_argument_guidance_to_non_validation_mcp_errors(
   dispatcher = ToolDispatcher(
     mcp_client=_NonValidationErrorMcpClient(),  # type: ignore[arg-type]
     local_tool_handlers={},
+    get_tool_definitions=lambda: [{"name": "get_price_target"}],
   )
 
-  result, error = asyncio.run(dispatcher.dispatch("call-1", "get_price_target", {"ticker": "MSCI"}))
+  result, error = asyncio.run(
+    dispatcher.dispatch(
+      "call-1",
+      "get_price_target",
+      {"ticker": "MSCI"},
+      advertised_tool_names=frozenset({"get_price_target"}),
+    )
+  )
 
   assert result is None
   assert error is not None
@@ -398,9 +601,17 @@ def test_dispatcher_uses_original_tool_name_for_prefixed_mcp_argument_guidance()
       original_name="get_price_target",
     ),  # type: ignore[arg-type]
     local_tool_handlers={},
+    get_tool_definitions=lambda: [{"name": "portfolio_get_price_target"}],
   )
 
-  result, error = asyncio.run(dispatcher.dispatch("call-1", "portfolio_get_price_target", {"ticker": "MSCI"}))
+  result, error = asyncio.run(
+    dispatcher.dispatch(
+      "call-1",
+      "portfolio_get_price_target",
+      {"ticker": "MSCI"},
+      advertised_tool_names=frozenset({"portfolio_get_price_target"}),
+    )
+  )
 
   assert result is None
   assert error is not None

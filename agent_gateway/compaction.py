@@ -8,8 +8,15 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from .agent_session_log import AgentSessionLog, LogEntry
+from .capability_execution import BoundCapabilityExecution
+from .child_result_trust import UNTRUSTED_CHILD_RESULTS_POLICY
 from .product_config import gateway_product_id
-from .providers import ModelProvider, ThinkingLevel
+from .provider_summarize import DEFAULT_SUMMARY_SYSTEM_PROMPT, _provider_summarize
+from .secret_boundary import (
+  sanitize_boundary_value,
+  sanitize_tool_event,
+  sanitization_failure_tool_input,
+)
 
 
 LOGGER = logging.getLogger("agent_gateway.compaction")
@@ -40,13 +47,13 @@ _SUMMARY_BULK_KEYS = {
 
 def _redact_tool_input_for_summary(tool_name: str, tool_input: Any) -> Any:
   if not isinstance(tool_input, dict):
-    return tool_input
+    return sanitize_boundary_value(tool_input, sink="compaction_prompt")
   try:
     from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
 
     return redact_tool_input(tool_name, tool_input, deployment_secret=get_audit_hmac_secret())
   except Exception:
-    return dict(tool_input)
+    return sanitization_failure_tool_input()
 
 
 @dataclass(frozen=True)
@@ -142,7 +149,7 @@ def _flatten_content_blocks(content_blocks: Any) -> str:
 
 
 def _format_entry_for_summary(entry: LogEntry) -> str | None:
-  event = entry.event
+  event = sanitize_tool_event(entry.event, sink="compaction_prompt")
   event_type = str(event.get("type") or "")
   prefix = f"seq={entry.seq} ts={_isoformat_timestamp(entry.timestamp)} type={event_type}"
 
@@ -281,70 +288,23 @@ def _format_summary_prompt(
   ).text
 
 
-async def _provider_summarize(
-  prompt_text: str,
-  *,
-  provider: ModelProvider,
-  auth_config: dict[str, Any],
-  model: str,
-) -> str:
-  config = dict(auth_config or {})
-  config["auth_mode"] = str(config.get("auth_mode", "api")).strip().lower() or "api"
-  config["model"] = model
-  if not provider.has_active_credential(config):
-    raise RuntimeError(f"No active credential configured for provider={provider.name}")
-
-  model_info = provider.get_model_info(model)
-  max_tokens = int(config.get("max_tokens") or min(model_info.max_output_tokens, 4096))
-  client = provider.create_client(config, timeout=float(config.get("client_timeout") or 60.0))
-  try:
-    params = provider.build_request_params(
-      model=model,
-      messages=[{"role": "user", "content": prompt_text}],
-      system_prompt="You write cumulative narrative summaries of autonomous analyst sessions.",
-      tools=[],
-      max_tokens=max_tokens,
-      thinking_level=ThinkingLevel.NONE,
-      auth_mode=config["auth_mode"],
-      compaction_trigger=None,
-      compaction_instructions=None,
-    )
-
-    pieces: list[str] = []
-    fallback_blocks: list[str] = []
-    async for event in provider.stream(client, params):
-      if event.type == "text_delta":
-        text = str(event.text or "")
-        if text:
-          pieces.append(text)
-      elif event.type == "text_end" and isinstance(event.raw_block, dict):
-        block_text = str(event.raw_block.get("text") or "").strip()
-        if block_text:
-          fallback_blocks.append(block_text)
-
-    summary_text = "".join(pieces).strip()
-    if not summary_text:
-      summary_text = "\n".join(fallback_blocks).strip()
-    if not summary_text:
-      raise RuntimeError("Summary generation returned empty text")
-    return summary_text
-  finally:
-    await provider.close_client(client, timeout=5.0)
-
-
 async def generate_and_append_summary(
   log: AgentSessionLog,
   *,
   from_seq: int,
   to_seq: int,
   prompt: str,
-  model: str,
-  auth_config: dict[str, Any],
+  capability_execution: BoundCapabilityExecution,
   prior_summary_text: str | None = None,
-  provider: ModelProvider | None = None,
   summarize_fn: SummaryFn | None = None,
   prompt_char_budget: int | None = SUMMARY_PROMPT_CHAR_BUDGET,
 ) -> LogEntry | None:
+  if not isinstance(capability_execution, BoundCapabilityExecution):
+    raise TypeError(
+      "session summary requires a BoundCapabilityExecution"
+    )
+  capability_execution.validate()
+  model = capability_execution.bind.upstream_model
   if from_seq <= 0:
     raise ValueError("from_seq must be positive")
   if to_seq <= 0:
@@ -362,7 +322,9 @@ async def generate_and_append_summary(
   if not entries:
     return None
 
-  prompt_prefix = f"{prompt.strip()}\n\n"
+  prompt_prefix = (
+    f"{UNTRUSTED_CHILD_RESULTS_POLICY}\n\n{prompt.strip()}\n\n"
+  )
   slice_budget = None
   if prompt_char_budget is not None:
     slice_budget = max(0, int(prompt_char_budget) - len(prompt_prefix))
@@ -386,31 +348,25 @@ async def generate_and_append_summary(
     return None
   full_prompt = f"{prompt_prefix}{prompt_slice.text}".strip()
 
-  try:
-    if summarize_fn is not None:
-      generated_summary_text = (await summarize_fn(full_prompt)).strip()
-    else:
-      if provider is None:
-        raise ValueError("provider is required when summarize_fn is not provided")
-      generated_summary_text = (await _provider_summarize(
-        full_prompt,
-        provider=provider,
-        auth_config=auth_config,
-        model=model,
-      )).strip()
-  except Exception as exc:
-    LOGGER.warning(
-      "Session summary generation failed for %s seq=%d..%d: %s",
-      log.path,
-      from_seq,
-      to_seq,
-      exc,
-    )
-    return None
+  if summarize_fn is not None:
+    generated_summary_text = (await summarize_fn(full_prompt)).strip()
+  else:
+    generated_summary_text = (await _provider_summarize(
+      full_prompt,
+      capability_execution=capability_execution,
+      system_prompt=(
+        f"{DEFAULT_SUMMARY_SYSTEM_PROMPT}\n\n"
+        f"{UNTRUSTED_CHILD_RESULTS_POLICY}"
+      ),
+    )).strip()
 
   if not generated_summary_text:
-    LOGGER.warning("Session summary generation returned empty text for %s seq=%d..%d", log.path, from_seq, to_seq)
-    return None
+    raise RuntimeError(
+      (
+        f"Session summary generation returned empty text for {log.path} "
+        f"seq={from_seq}..{to_seq}"
+      )
+    )
 
   event = {
     "type": "summary",

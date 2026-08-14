@@ -491,16 +491,20 @@ def test_publication_guard_failure_removes_the_linked_member(
       raise OSError("injected guard failure")
     return original_open(path, flags, *args, **kwargs)
 
-  monkeypatch.setattr(spill_module.os, "open", _fail_guard)
+  # spill_module.os IS the global os module and the guard raises for every
+  # O_RDONLY open — exactly what tmp_path retention rmtree does at teardown.
+  # Scope the patch so cleanup never runs against it.
+  with monkeypatch.context() as scoped:
+    scoped.setattr(spill_module.os, "open", _fail_guard)
 
-  with pytest.raises(OSError, match="injected guard failure"):
-    write_spill_set(
-      sink=sink,
-      tool_name="lookup",
-      tool_use_id="guard-failure",
-      content=json.dumps({"markdown": "x" * 10_000}),
-      model_max_chars=60_000,
-    )
+    with pytest.raises(OSError, match="injected guard failure"):
+      write_spill_set(
+        sink=sink,
+        tool_name="lookup",
+        tool_use_id="guard-failure",
+        content=json.dumps({"markdown": "x" * 10_000}),
+        model_max_chars=60_000,
+      )
 
   assert list(tmp_path.iterdir()) == []
   assert sink.budget.used_bytes == 0

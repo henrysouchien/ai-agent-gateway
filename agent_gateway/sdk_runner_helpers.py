@@ -154,7 +154,9 @@ def redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> D
 
     return redact_tool_input(tool_name, tool_input, deployment_secret=get_audit_hmac_secret())
   except Exception:
-    return dict(tool_input)
+    from .secret_boundary import sanitization_failure_tool_input
+
+    return sanitization_failure_tool_input()
 
 
 def policy_tool_name(tool_name: str) -> str:

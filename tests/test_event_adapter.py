@@ -12,7 +12,7 @@ from agent_gateway.event_adapter import (
 
 
 def test_v1_wire_projection_covers_every_v1_type() -> None:
-  assert len(V1_WIRE_EVENT_TYPES) == 38
+  assert len(V1_WIRE_EVENT_TYPES) == 42
   assert V1_WIRE_EVENT_TYPES
   assert set(V1_FIELD_PROJECTION) == set(V1_WIRE_EVENT_TYPES)
   assert all("type" in fields for fields in V1_FIELD_PROJECTION.values())
@@ -34,7 +34,7 @@ def test_ui_blocks_ready_projection_preserves_every_event_field() -> None:
     "turn_key": "turn-key",
     "emission_index": 2,
     "ui_blocks_id": "ub_deadbeefdeadbeef",
-    "manifest_digest": "sha256:" + "ab" * 32,
+    "contract_version": 1,
     "payload": {"kind": "hank_ui_blocks.v1", "contract_version": 1, "blocks": []},
     "text_fallback": "Fallback",
     "ts": 123.5,
@@ -113,11 +113,31 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
       "recovered_at": 1010.0,
       "safe_boundary": "before_turn",
     },
-    {"type": "stream_complete", "usage": {"input_tokens": 1}},
+    {
+      "type": "stream_complete",
+      "terminal_disposition": "interrupted",
+      "reason": "operator_pause",
+      "usage": {"input_tokens": 1},
+    },
     {"type": "stream_error", "error": "serialize"},
     {"type": "error", "error": "failed"},
     {"type": "tool_approval_request", "tool_call_id": "toolu_1", "approval_id": "appr_1", "nonce": "nonce", "tool_name": "bash", "tool_input": {}, "resolved_qualifier": "bash", "reason": "ask", "allow_persistent_approval": True, "ts": 1.0},
     {"type": "tool_approval_decided", "tool_call_id": "toolu_1", "tool_name": "bash", "outcome": "approved", "decision_source": "user_approved", "allow_tool_type_applied": True, "ts": 1.0},
+    {
+      "type": "approval_delivery_acknowledged",
+      "launch_nonce": "b" * 32,
+      "delivery_sequence": 1,
+      "approval_id": "appr_1",
+      "tool_call_id": "toolu_1",
+      "nonce": "nonce",
+      "task_id": "bg_1",
+      "control_run_id": "run_1",
+      "session_id": "sess_1",
+      "channel_id": "a" * 64,
+      "approved": True,
+      "allow_tool_type": False,
+      "decided_at_ns": 1,
+    },
     {"type": "headless_auto_deny", "tool_call_id": "toolu_1", "tool_name": "bash", "reason": "blocked", "source": "static"},
     {"type": "skill_run_started", "skill_run_id": "run-1", "skill": "model-review", "ticker": "MSFT", "ts": 1.0, "scope": "ticker", "portfolio_id": None},
     {
@@ -125,6 +145,8 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
       "skill_run_id": "run-1",
       "skill": "sniff-test",
       "ticker": "MSFT",
+      "scope": "ticker",
+      "portfolio_id": None,
       "exit_code": 0,
       "outcome": "success",
       "status": "noop",
@@ -137,8 +159,12 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
       "output_memory_file": "skills/sniff-test/2026-06-11-run.md",
       "cost_usd": 0.01,
       "duration_s": 12.3,
+      "compaction_count": 2,
       "error": None,
       "warnings": [],
+      "approval_outcome": None,
+      "approval_id": None,
+      "approval_tool_name": None,
     },
     {"type": "typed_recommendations_extracted", "skill": "model-review", "workflow_name": "build-model", "scope": "ticker", "ticker": "MSFT", "portfolio_id": None, "recommendations_count": 1, "verdict_code": "MODEL_HAS_ISSUES", "validation_errors": [], "warnings": [], "source_artifact_path": "skills/model-review.md", "ts": 1.0},
     {
@@ -170,10 +196,27 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
       "turn_key": "turn-key",
       "emission_index": 0,
       "ui_blocks_id": "ub_deadbeefdeadbeef",
-      "manifest_digest": "sha256:" + "ab" * 32,
+      "contract_version": 1,
       "payload": {"kind": "hank_ui_blocks.v1", "contract_version": 1, "blocks": []},
       "text_fallback": "Fallback",
       "ts": 1.0,
+    },
+    {
+      "type": "workflow_output_attached",
+      "assistant_message_seq": 12,
+      "kind": "workflow_primary_output",
+      "delivery_envelope": {
+        "schema_version": "1.0",
+        "workflow_run_id": "workflow-1",
+        "phase_number": 2,
+        "revision": 1,
+        "primary": {"name": "synthesis"},
+      },
+      "read": {
+        "action": "output",
+        "workflow_run_id": "workflow-1",
+        "output_id": "sha256:" + "b" * 64,
+      },
     },
     {"type": "artifact_failed", "skill_run_id": "run-1", "ticker": "MSFT", "skill": "model-review", "error_code": "validation", "error_detail": "bad", "source_path": "source.md", "tool_call_id": "toolu_1", "ts": 1.0},
     {"type": "artifact_unavailable", "ticker": "MSFT", "skill": "model-review", "reason": "stale", "affordance": "rerun", "ts": 1.0},
@@ -230,6 +273,15 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
       "sent_at": 1005.0,
       "message": "continue",
     },
+    {
+      "type": "parent_message_consumed",
+      "task_id": "bg_0",
+      "message_id": "msg-1",
+      "parent_message_seq": 40,
+      "consumer_turn": 2,
+      "assistant_message_seq": 45,
+      "consumed_at": 1006.0,
+    },
     {"type": "session_recap", "session_id": "sess_1", "seq_range": (1, 3), "started_at": 1.0, "ended_at": 2.0, "trigger": "turn_end", "artifacts": [], "verdicts": [], "approvals": [], "tool_calls_summary": {"total_calls": 0, "successes": 0, "errors": 0, "by_tool_name": {}, "by_server": {}}, "failures": [], "usage": None, "ts": 2.0},
   ]
 
@@ -279,8 +331,8 @@ def test_v1_adapter_strips_unknown_fields_for_known_type() -> None:
 @pytest.mark.parametrize(
   ("raw_state", "projected_state"),
   [
-    ("budget_limited", "failed"),
-    ("budget_exceeded", "failed"),
+    ("budget_limited", "budget_limited"),
+    ("budget_exceeded", "budget_limited"),
     ("blocked", "failed"),
     ("remediating", "running"),
     ("killed", "cancelled"),

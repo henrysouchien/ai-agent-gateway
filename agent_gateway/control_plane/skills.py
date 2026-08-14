@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from agent_gateway.session import AuthManager
 
+
 _SKILL_LOADER_MODULE_NAMES = frozenset({"agent", "agent.skills", "agent.skills.loader"})
 
 

@@ -7,7 +7,9 @@ import time
 from typing import Any, Sequence
 
 from . import sdk_runner_helpers as _sdk_runner_helpers
+from .model_bound_wire import serialize_model_bound_result
 from .runner import ToolResultContext
+from .secret_boundary import sanitize_boundary_value
 from .tool_result_semantics import classify_semantic_tool_error as _classify_semantic_tool_error
 
 
@@ -35,7 +37,11 @@ def context_surface_records(runner: Any, *, logger: Any) -> list[dict[str, Any]]
   try:
     return runner._normalize_context_surfaces(runner._context_surfaces_provider())
   except Exception as exc:
-    logger.warning("[%s] context surface provider failed (non-fatal): %s", runner._sid, exc)
+    logger.warning(
+      "[%s] context surface provider failed (non-fatal) | exception_type=%s",
+      runner._sid,
+      type(exc).__name__,
+    )
     return runner._normalize_context_surfaces(runner._context_surfaces_static)
 
 
@@ -61,7 +67,11 @@ async def call_on_usage(
           if inspect.isawaitable(late_result):
             await late_result
         except Exception as exc:
-          logger.warning("[%s] late commercial reconciliation failed: %s", runner._sid, exc)
+          logger.warning(
+            "[%s] late commercial reconciliation failed | exception_type=%s",
+            runner._sid,
+            type(exc).__name__,
+          )
     logger.warning("[%s] Usage event arrived after session summary emission: %s", runner._sid, usage_event.event_id)
     await runner._call_on_late_usage_event(usage_event)
     return
@@ -72,7 +82,11 @@ async def call_on_usage(
     if inspect.isawaitable(result):
       await result
   except Exception as exc:
-    logger.warning("[%s] on_usage hook failed (non-fatal): %s", runner._sid, exc)
+    logger.warning(
+      "[%s] on_usage hook failed (non-fatal) | exception_type=%s",
+      runner._sid,
+      type(exc).__name__,
+    )
 
 
 async def call_on_late_usage_event(runner: Any, usage_event: Any, *, logger: Any) -> None:
@@ -83,7 +97,11 @@ async def call_on_late_usage_event(runner: Any, usage_event: Any, *, logger: Any
     if inspect.isawaitable(result):
       await result
   except Exception as exc:
-    logger.warning("[%s] on_late_usage_event hook failed (non-fatal): %s", runner._sid, exc)
+    logger.warning(
+      "[%s] on_late_usage_event hook failed (non-fatal) | exception_type=%s",
+      runner._sid,
+      type(exc).__name__,
+    )
 
 
 async def call_on_session_summary(runner: Any, summary: Any, *, logger: Any) -> None:
@@ -94,7 +112,11 @@ async def call_on_session_summary(runner: Any, summary: Any, *, logger: Any) -> 
       try:
         await reconcile(summary)
       except Exception as exc:
-        logger.warning("[%s] commercial usage reconciliation failed: %s", runner._sid, exc)
+        logger.warning(
+          "[%s] commercial usage reconciliation failed | exception_type=%s",
+          runner._sid,
+          type(exc).__name__,
+        )
   if runner._on_session_summary is None:
     return
   try:
@@ -102,7 +124,11 @@ async def call_on_session_summary(runner: Any, summary: Any, *, logger: Any) -> 
     if inspect.isawaitable(result):
       await result
   except Exception as exc:
-    logger.warning("[%s] on_session_summary hook failed (non-fatal): %s", runner._sid, exc)
+    logger.warning(
+      "[%s] on_session_summary hook failed (non-fatal) | exception_type=%s",
+      runner._sid,
+      type(exc).__name__,
+    )
 
 
 def call_on_tool_timing(
@@ -139,7 +165,11 @@ def call_on_tool_timing(
       **kwargs,
     )
   except Exception as exc:
-    logger.warning("[%s] on_tool_timing hook failed (non-fatal): %s", runner._sid, exc)
+    logger.warning(
+      "[%s] on_tool_timing hook failed (non-fatal) | exception_type=%s",
+      runner._sid,
+      type(exc).__name__,
+    )
 
 
 async def call_on_tool_result(runner: Any, ctx: ToolResultContext, *, logger: Any) -> list[dict[str, Any]]:
@@ -148,7 +178,11 @@ async def call_on_tool_result(runner: Any, ctx: ToolResultContext, *, logger: An
   try:
     extra_blocks = await runner._on_tool_result(ctx)
   except Exception as exc:
-    logger.warning("[%s] on_tool_result hook failed (non-fatal): %s", runner._sid, exc)
+    logger.warning(
+      "[%s] on_tool_result hook failed (non-fatal) | exception_type=%s",
+      runner._sid,
+      type(exc).__name__,
+    )
     return []
   if not extra_blocks:
     return []
@@ -199,13 +233,13 @@ def make_result_entry(
     return {
       "type": "tool_result",
       "tool_use_id": tool_call_id,
-      "content": json.dumps({"error": error}, default=str),
+      "content": serialize_model_bound_result({"error": error}),
       "is_error": True,
     }
   entry = {
     "type": "tool_result",
     "tool_use_id": tool_call_id,
-    "content": json.dumps(result, default=str),
+    "content": serialize_model_bound_result(result),
   }
   classify = _compat("classify_semantic_tool_error", _classify_semantic_tool_error)
   if classify(result) is not None:
@@ -282,6 +316,11 @@ async def build_hook_additional_context(
       skill_run_id=runner._skill_run_id,
       workspace_dir=runner._workspace_dir,
       batch_id=getattr(runner, "_batch_id", None),
+      boundary_sanitizer=lambda value, sink: sanitize_boundary_value(
+        value,
+        sink=sink,
+        boundary=getattr(runner, "_secret_boundary", None),
+      ),
     )
   )
   additional_context = runner._format_additional_context(

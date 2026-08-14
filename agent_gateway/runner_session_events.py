@@ -4,6 +4,12 @@ import asyncio
 import json
 from typing import Any, Callable, Dict, Iterable, List
 
+from agent_workflow_contracts import AgentCompletionEnvelope
+
+from .events import AgentCompletionEvent, event_to_dict
+from .skill_lifecycle import TopLevelSkillLifecycleMetadata
+from .workflow_output_attachment import WorkflowOutputAttachment
+
 
 def durable_event_payload(
   event: Dict[str, Any],
@@ -102,21 +108,151 @@ def build_user_message_event(
   }
 
 
+def build_agent_completion_event(
+  *,
+  task_id: str,
+  envelope: AgentCompletionEnvelope,
+  ts: float,
+) -> Dict[str, Any]:
+  """Build one durable, typed direct-parent result publication."""
+
+  return event_to_dict(AgentCompletionEvent(
+    task_id=task_id,
+    envelope=envelope,
+    ts=float(ts),
+  ))
+
+
+def build_skill_run_started_event(
+  lifecycle: TopLevelSkillLifecycleMetadata,
+  *,
+  started_at: float,
+) -> Dict[str, Any]:
+  return {
+    "type": "skill_run_started",
+    **lifecycle.identity_fields(),
+    "ts": started_at,
+  }
+
+
+def build_skill_result_failure_event(
+  lifecycle: TopLevelSkillLifecycleMetadata,
+  *,
+  error: str,
+) -> Dict[str, Any]:
+  return {
+    "type": "skill_result_captured",
+    **lifecycle.identity_fields(),
+    "exit_code": 1,
+    "outcome": "error",
+    "status": "error",
+    "gate_code": None,
+    "artifact_refs": [],
+    "proposal_ids": [],
+    "verdict_echo": None,
+    "fms_results": [],
+    "artifact_events": [],
+    "output_memory_file": None,
+    "cost_usd": None,
+    "duration_s": None,
+    "compaction_count": 0,
+    "error": error,
+    "warnings": [],
+    "approval_outcome": None,
+    "approval_id": None,
+    "approval_tool_name": None,
+  }
+
+
 def build_assistant_message_event(
   *,
   content_blocks: List[Dict[str, Any]],
   stop_reason: str | None,
   model: str,
   provider: str | None,
-  usage: Dict[str, int],
+  usage: Dict[str, Any],
+  parent_message_consumptions: List[Dict[str, Any]] | None = None,
+  logical_response_id: str | None = None,
+  logical_response_segment_ordinal: int | None = None,
+  continued_from_assistant_message_seq: int | None = None,
+  workflow_output_attachments: Iterable[
+    WorkflowOutputAttachment
+  ] | None = None,
 ) -> Dict[str, Any]:
-  return {
+  event = {
     "type": "assistant_message",
     "content_blocks": list(content_blocks),
     "stop_reason": stop_reason,
     "model": model,
     "provider": provider,
     "usage": dict(usage),
+  }
+  attachments = [
+    attachment.to_dict()
+    for attachment in (workflow_output_attachments or ())
+  ]
+  if attachments:
+    event["workflow_output_attachments"] = attachments
+  if parent_message_consumptions:
+    event["parent_message_consumptions"] = [
+      dict(binding) for binding in parent_message_consumptions
+    ]
+  if logical_response_id is not None:
+    normalized_response_id = str(logical_response_id).strip()
+    if not normalized_response_id:
+      raise ValueError("logical_response_id must be non-empty")
+    if (
+      type(logical_response_segment_ordinal) is not int
+      or logical_response_segment_ordinal < 0
+    ):
+      raise ValueError(
+        "logical_response_segment_ordinal must be a non-negative integer"
+      )
+    if logical_response_segment_ordinal == 0:
+      if continued_from_assistant_message_seq is not None:
+        raise ValueError(
+          "the first logical response segment cannot continue another "
+          "assistant message"
+        )
+    elif (
+      type(continued_from_assistant_message_seq) is not int
+      or continued_from_assistant_message_seq <= 0
+    ):
+      raise ValueError(
+        "continued_from_assistant_message_seq must identify the prior "
+        "durable assistant message"
+      )
+    event.update({
+      "logical_response_id": normalized_response_id,
+      "logical_response_segment_ordinal": (
+        logical_response_segment_ordinal
+      ),
+    })
+    if continued_from_assistant_message_seq is not None:
+      event["continued_from_assistant_message_seq"] = (
+        continued_from_assistant_message_seq
+      )
+  elif (
+    logical_response_segment_ordinal is not None
+    or continued_from_assistant_message_seq is not None
+  ):
+    raise ValueError(
+      "logical response segment metadata requires logical_response_id"
+    )
+  return event
+
+
+def build_workflow_output_attached_event(
+  *,
+  attachment: WorkflowOutputAttachment,
+  assistant_message_seq: int | None,
+) -> Dict[str, Any]:
+  """Build the reader-visible projection of one final-message attachment."""
+
+  return {
+    "type": "workflow_output_attached",
+    "assistant_message_seq": assistant_message_seq,
+    **attachment.to_dict(),
   }
 
 
@@ -231,6 +367,7 @@ def build_stream_complete_event(
 ) -> Dict[str, Any]:
   return {
     "type": "stream_complete",
+    "terminal_disposition": "completed",
     "usage": {
       "input_tokens": usage_totals["input_tokens"],
       "output_tokens": usage_totals["output_tokens"],
@@ -260,6 +397,13 @@ def build_context_warning_log_data(
     "pct": round(est_tokens / context_limit * 100, 1),
   })
   return payload
+
+
+def build_context_pressure_reminder(*, pct: int) -> str:
+  return (
+    f"Context at {max(0, int(pct))}% — prefer delegating further reading; "
+    "large results will spill."
+  )
 
 
 def build_token_estimate_log_data(
@@ -483,5 +627,9 @@ def build_stub_response_events(
   prompt = last_user.get("content") or "your request"
   response = f"Stub response (no {provider_name.title()} credential configured). You asked: {prompt}"
   events = [{"type": "text_delta", "text": token + " "} for token in response.split()]
-  events.append({"type": "stream_complete", "usage": {}})
+  events.append({
+    "type": "stream_complete",
+    "terminal_disposition": "completed",
+    "usage": {},
+  })
   return events

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import copy
 import hashlib
 import hmac
 import json
 import os
 import re
 from typing import Any
+
+from .secret_boundary import sanitize_boundary_value, sanitization_failure_tool_input
 
 
 HMAC_KEY_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -51,7 +52,8 @@ def redact_tool_input(
   key_id: str | None = None,
 ) -> dict[str, Any]:
   _ = tool_name, server_name, deployment_secret, redaction_scope, key_id
-  return copy.deepcopy(tool_input or {})
+  sanitized = sanitize_boundary_value(tool_input or {}, sink="tool_input")
+  return sanitized if isinstance(sanitized, dict) else sanitization_failure_tool_input()
 
 
 def _canonical_leaf(value: Any) -> str:

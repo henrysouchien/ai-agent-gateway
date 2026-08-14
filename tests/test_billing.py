@@ -1,17 +1,21 @@
 import asyncio
+from dataclasses import asdict
+import json
 import sqlite3
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from agent_workflow_contracts import CapabilityBind
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.multi_user.billing import (
+from agent_gateway.multi_user.billing import (  # noqa: E402
+  SessionUsageSummary,
   SqliteUsageLedger,
   UsageEvent,
   _UsageAggregator,
@@ -25,6 +29,26 @@ def _run(coro):
   return asyncio.run(coro)
 
 
+def _bind_receipt(*, provider: str, model: str) -> dict[str, str]:
+  return CapabilityBind(
+    schema_version="1.0",
+    capability_id="session.driver",
+    model_key=f"test.{provider}.{model}",
+    provider=provider,
+    upstream_model=model,
+    adapter=f"test.{provider}",
+    protocol_profile="test.reasoning",
+    route="test.in_process",
+    effort="none",
+    credential_principal="service",
+    credential_ref=f"test-service:{provider}",
+    run_mode="interactive",
+    registry_revision="test-v1",
+    policy_revision="test-v1",
+    selection_source="capability_default",
+  ).receipt()
+
+
 def _event(
   *,
   user_id: str = "alice",
@@ -34,7 +58,8 @@ def _event(
   billing_mode: str = "metered",
   channel: str | None = "web",
   parent_turn_id: str | None = None,
-  provider: str | None = "anthropic",
+  provider: str = "anthropic",
+  provider_reported_model: str | None = None,
 ) -> UsageEvent:
   return UsageEvent(
     user_id=user_id,
@@ -52,6 +77,8 @@ def _event(
     billing_mode=billing_mode,  # type: ignore[arg-type]
     channel=channel,
     provider=provider,
+    capability_bind=_bind_receipt(provider=provider, model=model),
+    provider_reported_model=provider_reported_model,
   )
 
 
@@ -111,6 +138,8 @@ def test_sqlite_usage_ledger_get_total_filters_and_sums(tmp_path: Path) -> None:
       billing_mode="byok",
       channel="cli",
       provider="codex",
+      capability_bind=_bind_receipt(provider="codex", model="claude-opus-4-6"),
+      provider_reported_model=None,
     ),
     UsageEvent(
       user_id="bob",
@@ -127,6 +156,11 @@ def test_sqlite_usage_ledger_get_total_filters_and_sums(tmp_path: Path) -> None:
       rate_table_version="2026-04-08",
       billing_mode="metered",
       channel="web",
+      provider="anthropic",
+      capability_bind=_bind_receipt(
+        provider="anthropic", model="claude-sonnet-4-6"
+      ),
+      provider_reported_model=None,
     ),
   ]
   for event in events:
@@ -196,6 +230,11 @@ def test_sqlite_usage_ledger_handles_concurrent_writes(tmp_path: Path) -> None:
           rate_table_version="2026-04-08",
           billing_mode="metered",
           channel="web",
+          provider="anthropic",
+          capability_bind=_bind_receipt(
+            provider="anthropic", model="claude-sonnet-4-6"
+          ),
+          provider_reported_model=None,
         )
       )
     )
@@ -235,6 +274,18 @@ def test_dlq_spool_survives_as_file_on_disk(tmp_path: Path) -> None:
   assert spool_path.exists()
   line = spool_path.read_text(encoding="utf-8").strip()
   assert '"request_id": "req-1"' in line
+
+
+def test_dlq_replay_retains_unversioned_historical_payload(tmp_path: Path) -> None:
+  ledger = SqliteUsageLedger(tmp_path / "usage.db")
+  spool_path = tmp_path / "usage_dlq.jsonl"
+  spool_path.write_text(json.dumps(asdict(_event())) + "\n", encoding="utf-8")
+
+  stats = _run(replay_dlq(ledger, spool_path))
+
+  assert stats == {"total": 1, "replayed": 0, "failed": 0, "invalid": 1}
+  assert spool_path.exists()
+  assert _run(ledger.get_total("alice")).event_count == 0
 
 
 def test_sqlite_usage_ledger_schema_migration_is_idempotent(tmp_path: Path) -> None:
@@ -287,21 +338,27 @@ def test_sqlite_usage_ledger_schema_migration_is_idempotent(tmp_path: Path) -> N
 
   assert count == 2
   assert "provider" in columns
+  assert {
+    "capability_bind_json",
+    "provider_reported_model",
+  } <= columns
   assert legacy_provider is None
   assert new_provider == "anthropic"
   assert str(journal_mode).lower() == "wal"
 
 
-def test_usage_event_event_id_default_supports_old_dlq_payload() -> None:
+def test_usage_event_rejects_unversioned_old_dlq_payload() -> None:
   payload = _event().__dict__.copy()
   payload.pop("event_id", None)
   payload.pop("provider", None)
+  for field_name in (
+    "capability_bind",
+    "provider_reported_model",
+  ):
+    payload.pop(field_name, None)
 
-  event = UsageEvent(**payload)
-
-  assert event.event_id
-  assert event.provider is None
-  assert event.request_id == "req-1"
+  with pytest.raises(TypeError):
+    UsageEvent(**payload)
 
 
 def test_normalize_identity_requires_explicit_billing_identity() -> None:
@@ -319,7 +376,11 @@ def test_normalize_identity_requires_explicit_billing_identity() -> None:
 def test_usage_aggregator_accumulates_and_snapshots() -> None:
   async def case() -> None:
     aggregator = _UsageAggregator(user_id="alice", session_id="sess", request_id="req", channel="web", started_at=1.0)
-    await aggregator.record(_event(request_id="req", timestamp=2.0))
+    await aggregator.record(_event(
+      request_id="req",
+      timestamp=2.0,
+      provider_reported_model="claude-sonnet-4-6-20260801",
+    ))
     await aggregator.record(
       UsageEvent(
         user_id="alice",
@@ -337,6 +398,8 @@ def test_usage_aggregator_accumulates_and_snapshots() -> None:
         rate_table_version="2026-04-08",
         billing_mode="metered",
         channel="web",
+        capability_bind=_bind_receipt(provider="codex", model="gpt-5.5"),
+        provider_reported_model=None,
       )
     )
     summary = await aggregator.snapshot(ended_at=4.0, drain_complete=False, in_flight_task_count=1)
@@ -351,10 +414,65 @@ def test_usage_aggregator_accumulates_and_snapshots() -> None:
     assert summary.ended_at == 4.0
     assert summary.drain_complete is False
     assert summary.in_flight_task_count == 1
+    assert summary.compaction_count == 0
     assert summary.model == "gpt-5.5"
     assert summary.provider == "codex"
+    assert summary.capability_bind == _bind_receipt(
+      provider="codex", model="gpt-5.5"
+    )
+    assert summary.provider_reported_model is None
 
   _run(case())
+
+
+def test_usage_aggregator_compaction_count_is_exact_and_closed_fail_closed() -> None:
+  async def case() -> None:
+    aggregator = _UsageAggregator(
+      user_id="alice",
+      session_id="sess",
+      request_id="req",
+      channel="web",
+    )
+
+    assert aggregator.record_compaction_nowait() is True
+    assert aggregator.record_compaction_nowait() is True
+    await aggregator.close()
+    assert aggregator.record_compaction_nowait() is False
+
+    summary = await aggregator.snapshot()
+    assert summary.compaction_count == 2
+
+  _run(case())
+
+
+def test_usage_summary_identity_requires_a_provider_observation_and_receipt() -> None:
+  fields = {
+    "user_id": "alice",
+    "session_id": "sess",
+    "request_id": "req",
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cost": 0.0,
+    "turns": 0,
+    "channel": "web",
+    "started_at": 1.0,
+    "ended_at": 2.0,
+  }
+
+  with pytest.raises(ValueError, match="require provider observations"):
+    SessionUsageSummary(
+      **fields,
+      capability_bind=_bind_receipt(
+        provider="anthropic", model="claude-sonnet-4-6"
+      ),
+    )
+  with pytest.raises(ValueError, match="require a capability bind"):
+    SessionUsageSummary(
+      **fields,
+      provider_reported_model="claude-sonnet-4-6-20260801",
+    )
 
 
 def test_usage_aggregator_concurrent_record_calls() -> None:

@@ -1,8 +1,110 @@
 # Changelog
 
-## Unreleased (post-0.15.13)
+## Unreleased (post-0.16.0)
 
 _No unreleased changes recorded yet._
+
+## 0.16.0 (2026-08-13)
+
+This is a pre-1.0 breaking-minor release. It describes the complete package
+delta from the immutable public source baseline
+`aa74b5030384cd130118f6fd9293f2b13fd64bae`, not only the final release-prep
+commits.
+
+### Added
+
+- Added canonical capability policy, model catalog, credential-handle, and
+  `BoundCapabilityExecution` contracts, plus `GatewaySession`-owned identity
+  and credential provenance for interactive, autonomous, cron, and node runs.
+- Added portable compaction with provider-aware history normalization and
+  durable, provenance-preserving summaries across live and resumed sessions.
+- Added the Canvas artifact contract, validation/store/event pipeline, and the
+  pinned TypeScript/esbuild build resources shipped in the wheel.
+- Added durable child-agent and workflow delivery contracts, generated JSON
+  Schema/TypeScript artifacts in `agent_workflow_contracts`, typed result and
+  settlement materialization, idempotent journal replay, and parent-visible
+  workflow evidence.
+- Added owner-scoped control-plane admission, approval, readable-resource,
+  cancellation, resume, and autonomous launch-envelope boundaries.
+
+### Changed
+
+- `run_autonomous()`, `run_autonomous_sync()`, `send_prompt()`, and
+  `send_prompt_sync()` now consume one pre-resolved `BoundCapabilityExecution`;
+  autonomous entry points additionally require an exact `GatewaySession`.
+- `AgentRunner` now consumes a pre-resolved `BoundCapabilityExecution` instead
+  of selecting provider, model, effort, transport, or credential material.
+- OpenAI execution is Responses-API-only, targets the supported GPT-5.x model
+  family, and requires `openai>=2.31.0`; durable history is fenced to the
+  Responses epoch.
+- MCP startup is explicit: inline or file-backed configuration requires a
+  launcher-owned allowlist, and absent configuration no longer discovers an
+  ambient file.
+- SSE, terminal-state, and child-result handling now use typed final-state and
+  `ChildReturn` contracts rather than interpreting transport completion as the
+  workflow outcome.
+- Role and owner authorization is fail closed across approval, dispatch,
+  cancellation, persisted grants, and rehydration paths.
+
+### Fixed
+
+- Made parent-to-child message acknowledgement return the exact message
+  identity and distinguish durable `accepted` delivery from in-memory
+  `queued` delivery.
+- Persisted parent-to-child message acceptance before inbox delivery, made
+  exact message-ID replay idempotent without duplicate delivery, rejected
+  reuse of an accepted message ID with different content, and restored
+  accepted identities from the durable journal.
+- Kept the generic gateway install and import independent of the optional
+  Excel relay package while preserving exact typed restart admission handling
+  in deployments that assemble the Excel capability.
+- Preserved authority, run identity, usage, approval, compaction, and workflow
+  evidence across retry, resume, reconstruction, cancellation, and terminal
+  delivery seams.
+
+### Removed
+
+- Removed the public `ProviderResolver`, `ResolvedProvider`, and
+  `sub_agent_default_model` selection surfaces.
+- Removed the retired `runtime_auth_context`, `sub_agent_model_resolution`,
+  `providers.openai_helpers`, and control-plane diligence-PR modules.
+- Removed `emit_html_artifact`; product-facing rich output now uses Canvas.
+- Removed ambient `~/.claude.json` MCP discovery and the deleted diligence-PR
+  surface has no replacement.
+
+### Security
+
+- Capability, credential principal, owner, run, and tool authority are bound at
+  trusted admission boundaries and revalidated fail closed at execution and
+  recovery seams; secret-bearing values are kept out of child environments,
+  logs, events, and durable public contracts.
+- Security Wave 0 is `VERIFIED_NOT_VALIDATED`: automated and closest-local
+  user-MCP verification passed, but no deployed live-provider journey was run.
+  OpenAI's atomic Responses-epoch deployment remains an operational
+  requirement, Canvas deployed build/toolchain validation is pending, and the
+  orchestration product end-to-end journey remains open.
+
+### Breaking changes and migration
+
+- Replace `ProviderResolver` with `CapabilityProviderResolver` or the complete
+  `CapabilityExecutionResolver`; replace `ResolvedProvider` with
+  `BoundCapabilityExecution`.
+- Replace split execution arguments with one `capability_execution`. Pass an
+  exact `GatewaySession` to autonomous entry points.
+- Replace raw model/provider defaults and copied allowlists with a
+  `ProductModelRegistry`, `ProductModelSelectionPolicy`, and stable
+  `model_key` intent. Call `CapabilityExecutionResolver.resolve()` once for a
+  new execution or `materialize_bind()` for the exact durable receipt.
+- Replace `runtime_auth_context` with `GatewaySession` credential provenance
+  plus the bound execution snapshot.
+- Replace `providers.openai_helpers` imports with
+  `providers.openai_responses_helpers`, migrate supported OpenAI workloads to
+  the Responses API and GPT-5.x, and upgrade the OpenAI extra to
+  `openai>=2.31.0`.
+- Replace HTML artifact emission with Canvas artifacts. There is no migration
+  target for the removed diligence-PR API.
+- Configure MCP servers explicitly and update SSE/child consumers to honor the
+  typed `ChildReturn` and final-state contracts before upgrading.
 
 ## 0.15.13 (2026-07-15)
 

@@ -8,7 +8,13 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.sub_agent import make_run_agent_handler
+from agent_gateway.sub_agent import (  # noqa: E402
+  _effective_mcp_session_inject_servers,
+  make_run_agent_handler,
+)
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_capability_execution_resolver,
+)
 
 
 def _run(coro):
@@ -39,26 +45,58 @@ class _StubRunner:
     self.calls.append({"task": task, **kwargs})
     return {"response": "ok"}, None
 
+  def _get_tool_definitions(self) -> list[dict[str, str]]:
+    return [{"name": "file_read"}]
 
-def test_make_run_agent_handler_forwards_mcp_session_inject_servers_to_dispatcher() -> None:
+
+def test_make_run_agent_handler_bounds_session_injection_to_admitted_scope() -> None:
   runner = _StubRunner()
+  capability_execution_resolver = stub_capability_execution_resolver()
   handler = make_run_agent_handler(
     [runner],
     skill_loader=None,
     mcp_client=_StubMcpClient(),
     mcp_session_inject_servers={"browser"},
-    local_tool_handlers={"keep_tool": _dummy_tool},
+    local_tool_handlers={"file_read": _dummy_tool},
+    capability_execution_resolver=capability_execution_resolver,
   )
 
-  result, error = _run(handler({"task": "Collect page state"}))
+  result, error = _run(handler({
+    "background": False,
+    "objective": "Collect page state",
+  }))
 
   assert error is None
   assert result == {"response": "ok"}
-  assert runner.calls[0]["dispatcher"]._mcp_session_inject_servers == {"browser"}
+  assert runner.calls[0]["dispatcher"]._mcp_session_inject_servers == set()
+
+
+def test_named_child_does_not_inherit_loaded_servers_for_session_injection() -> None:
+  effective = _effective_mcp_session_inject_servers(
+    admitted_mcp_scope={},
+    configured_servers={"market-data-mcp"},
+  )
+
+  assert effective == set()
+
+
+def test_named_child_session_injection_requires_declaration_and_scope() -> None:
+  effective = _effective_mcp_session_inject_servers(
+    admitted_mcp_scope={"browser": {"browser_open"}},
+    configured_servers={"browser", "outside-scope", "loaded-only"},
+  )
+  unrestricted = _effective_mcp_session_inject_servers(
+    admitted_mcp_scope={"browser": {"browser_open"}},
+    configured_servers=None,
+  )
+
+  assert effective == {"browser"}
+  assert unrestricted == {"browser"}
 
 
 def test_make_run_agent_handler_forwards_meta_user_context_to_dispatcher() -> None:
   runner = _StubRunner()
+  capability_execution_resolver = stub_capability_execution_resolver()
   handler = make_run_agent_handler(
     [runner],
     skill_loader=None,
@@ -66,10 +104,14 @@ def test_make_run_agent_handler_forwards_meta_user_context_to_dispatcher() -> No
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp", "research-corpus-mcp"}),
     user_id="42",
     credentials_resolver_active=True,
-    local_tool_handlers={"keep_tool": _dummy_tool},
+    local_tool_handlers={"file_read": _dummy_tool},
+    capability_execution_resolver=capability_execution_resolver,
   )
 
-  result, error = _run(handler({"task": "Collect portfolio state"}))
+  result, error = _run(handler({
+    "background": False,
+    "objective": "Collect portfolio state",
+  }))
 
   assert error is None
   assert result == {"response": "ok"}

@@ -113,10 +113,14 @@ def test_importing_store_does_not_mutate_existing_gateway_session_config(
     provider="anthropic",
     auth_token="sk-ant-oat01-existing",
   )
-  before = dict(app.state.gateway_config.auth_config)
+  config = app.state.gateway_config
+  assert config.service_auth_config_resolver is not None
+  [handle] = config.service_provider_handles.values()
+  before = dict(config.service_auth_config_resolver(handle).auth_config)
   import_claude_setup_token("sk-ant-oat01-new", path=tmp_path / "oauth.json")
-  assert app.state.gateway_config.auth_config == before
-  assert app.state.gateway_config.auth_config["auth_token"] == "sk-ant-oat01-existing"
+  after = config.service_auth_config_resolver(handle).auth_config
+  assert after == before
+  assert after["auth_token"] == "sk-ant-oat01-existing"
 
 
 def test_openai_login_fails_without_changing_credentials(monkeypatch: pytest.MonkeyPatch) -> None:

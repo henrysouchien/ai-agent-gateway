@@ -12,7 +12,9 @@ from agent_gateway.providers.base import ModelInfo  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_limits import (  # noqa: E402
   COMPACTION_TRIGGER_PCT,
+  CONTEXT_PRESSURE_REMINDER_PCT,
   MODEL_CONTEXT_LIMIT,
+  context_pressure_reminder_decision,
   effective_compaction_trigger,
   estimate_tokens,
   model_context_window,
@@ -20,6 +22,96 @@ from agent_gateway.runner_limits import (  # noqa: E402
   token_breakdown_snapshot,
   token_estimate_snapshot,
 )
+
+
+def test_context_pressure_decision_exact_threshold_and_band_hysteresis() -> None:
+  below = context_pressure_reminder_decision(
+    est_tokens=599,
+    context_limit=1_000,
+    next_threshold_pct=CONTEXT_PRESSURE_REMINDER_PCT,
+  )
+  at_initial = context_pressure_reminder_decision(
+    est_tokens=600,
+    context_limit=1_000,
+    next_threshold_pct=below.next_threshold_pct,
+  )
+  below_next = context_pressure_reminder_decision(
+    est_tokens=699,
+    context_limit=1_000,
+    next_threshold_pct=at_initial.next_threshold_pct,
+  )
+  at_next = context_pressure_reminder_decision(
+    est_tokens=700,
+    context_limit=1_000,
+    next_threshold_pct=below_next.next_threshold_pct,
+  )
+
+  assert (below.reminder_pct, below.next_threshold_pct) == (None, 60)
+  assert (at_initial.reminder_pct, at_initial.next_threshold_pct) == (60, 70)
+  assert (below_next.reminder_pct, below_next.next_threshold_pct) == (None, 70)
+  assert (at_next.reminder_pct, at_next.next_threshold_pct) == (70, 80)
+
+
+def test_context_pressure_decision_jump_and_jitter_do_not_rearm() -> None:
+  initial = context_pressure_reminder_decision(
+    est_tokens=650,
+    context_limit=1_000,
+    next_threshold_pct=60,
+  )
+  below_next = context_pressure_reminder_decision(
+    est_tokens=749,
+    context_limit=1_000,
+    next_threshold_pct=initial.next_threshold_pct,
+  )
+  jump = context_pressure_reminder_decision(
+    est_tokens=899,
+    context_limit=1_000,
+    next_threshold_pct=below_next.next_threshold_pct,
+  )
+  drop = context_pressure_reminder_decision(
+    est_tokens=500,
+    context_limit=1_000,
+    next_threshold_pct=jump.next_threshold_pct,
+  )
+  jitter = context_pressure_reminder_decision(
+    est_tokens=989,
+    context_limit=1_000,
+    next_threshold_pct=drop.next_threshold_pct,
+  )
+  reset = context_pressure_reminder_decision(
+    est_tokens=650,
+    context_limit=1_000,
+    next_threshold_pct=60,
+  )
+
+  assert (initial.reminder_pct, initial.next_threshold_pct) == (65, 75)
+  assert (below_next.reminder_pct, below_next.next_threshold_pct) == (
+    None,
+    75,
+  )
+  assert (jump.reminder_pct, jump.next_threshold_pct) == (89, 99)
+  assert (drop.reminder_pct, drop.next_threshold_pct) == (None, 99)
+  assert (jitter.reminder_pct, jitter.next_threshold_pct) == (None, 99)
+  assert (reset.reminder_pct, reset.next_threshold_pct) == (65, 75)
+
+
+def test_context_pressure_decision_uses_exact_integer_boundary_math() -> None:
+  context_limit = 10**30 + 7
+  threshold_tokens = (60 * context_limit + 99) // 100
+
+  below = context_pressure_reminder_decision(
+    est_tokens=threshold_tokens - 1,
+    context_limit=context_limit,
+    next_threshold_pct=60,
+  )
+  at_or_above = context_pressure_reminder_decision(
+    est_tokens=threshold_tokens,
+    context_limit=context_limit,
+    next_threshold_pct=60,
+  )
+
+  assert below.reminder_pct is None
+  assert at_or_above.reminder_pct == 60
 
 
 def _model(context_window: int) -> ModelInfo:

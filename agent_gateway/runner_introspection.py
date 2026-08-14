@@ -5,6 +5,41 @@ import inspect
 from typing import Any
 
 
+_TRACEBACK_LOGGED_ATTR = "_gateway_traceback_logged"
+
+
+def mark_exception_traceback_logged(exc: BaseException) -> None:
+  """Mark exc as already logged with a traceback.
+
+  Call this at any site that logs exc_info and then re-raises, so the terminal
+  consumer (which converts the exception into a client-facing error event) logs
+  the message without duplicating the traceback.
+
+  Best-effort: an exception type that cannot take attributes stays unmarked and
+  the consumer logs a duplicate traceback (never zero). Never raises — the guard
+  is BaseException because the argument is a BaseException whose attribute hooks
+  may themselves raise non-Exception errors, and this helper runs inside error
+  handling where replacing the original failure is worse than swallowing.
+  """
+  try:
+    setattr(exc, _TRACEBACK_LOGGED_ATTR, True)
+  except BaseException:
+    pass
+
+
+def exception_traceback_already_logged(exc: BaseException) -> bool:
+  """True iff mark_exception_traceback_logged was (effectively) applied to exc.
+
+  Never raises (BaseException-guarded, same rationale as the marker) —
+  pathological attribute access reads as "not marked", which fails toward a
+  duplicate traceback, not a lost one.
+  """
+  try:
+    return bool(getattr(exc, _TRACEBACK_LOGGED_ATTR, False))
+  except BaseException:
+    return False
+
+
 def derive_sub_agent_id(parent_session: Any, call_index: int) -> str:
   parent_sid = str(getattr(parent_session, "session_id", parent_session) or "")
   return f"sub{int(call_index)}:{parent_sid}"

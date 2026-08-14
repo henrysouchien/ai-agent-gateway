@@ -56,7 +56,11 @@ def call_tool_timing_hook(
         **kwargs,
       )
   except Exception as exc:
-    logger.warning("[%s] on_tool_timing hook failed (non-fatal): %s", log_session_id, exc)
+    logger.warning(
+      "[%s] on_tool_timing hook failed (non-fatal) | exception_type=%s",
+      log_session_id,
+      type(exc).__name__,
+    )
 
 
 def call_metric_hook(
@@ -72,7 +76,11 @@ def call_metric_hook(
   try:
     on_metric(name, value)
   except Exception as exc:
-    logger.warning("[%s] metric hook failed (non-fatal): %s", log_session_id, exc)
+    logger.warning(
+      "[%s] metric hook failed (non-fatal) | exception_type=%s",
+      log_session_id,
+      type(exc).__name__,
+    )
 
 
 async def call_tool_result_hook(
@@ -89,7 +97,11 @@ async def call_tool_result_hook(
     if inspect.isawaitable(extra_blocks):
       extra_blocks = await extra_blocks
   except Exception as exc:
-    logger.warning("[%s] on_tool_result hook failed (non-fatal): %s", log_session_id, exc)
+    logger.warning(
+      "[%s] on_tool_result hook failed (non-fatal) | exception_type=%s",
+      log_session_id,
+      type(exc).__name__,
+    )
     return []
   if not extra_blocks:
     return []
@@ -108,24 +120,21 @@ async def call_before_stream_complete_hook(
 ) -> None:
   if on_before_stream_complete is None:
     return
-  try:
-    params = inspect.signature(on_before_stream_complete).parameters
-    accepts_terminal_event = (
-      any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params.values())
-      or "terminal_event" in params
-      or len([
-        param
-        for param in params.values()
-        if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-      ]) >= 2
-    )
-    if isinstance(terminal_event, dict) and terminal_event.get("type") != "stream_complete" and not accepts_terminal_event:
-      return
-    if accepts_terminal_event:
-      result = on_before_stream_complete(event_log, terminal_event)
-    else:
-      result = on_before_stream_complete(event_log)
-    if inspect.isawaitable(result):
-      await result
-  except Exception as exc:
-    logger.warning("[%s] on_before_stream_complete hook failed (non-fatal): %s", log_session_id, exc)
+  params = inspect.signature(on_before_stream_complete).parameters
+  accepts_terminal_event = (
+    any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params.values())
+    or "terminal_event" in params
+    or len([
+      param
+      for param in params.values()
+      if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]) >= 2
+  )
+  if isinstance(terminal_event, dict) and terminal_event.get("type") != "stream_complete" and not accepts_terminal_event:
+    return
+  if accepts_terminal_event:
+    result = on_before_stream_complete(event_log, terminal_event)
+  else:
+    result = on_before_stream_complete(event_log)
+  if inspect.isawaitable(result):
+    await result

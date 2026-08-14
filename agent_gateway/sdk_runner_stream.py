@@ -8,9 +8,12 @@ import time
 from typing import Any, Dict, List, Tuple
 
 from . import sdk_runner_helpers as _sdk_runner_helpers
+from .capability_binding import validate_reported_identity
 from .tool_display import resolve_display
 from .tool_result_semantics import classify_semantic_tool_error
 from .providers.anthropic import _server_tool_unit_deltas
+from .runner_tool_audit import get_tool_risk_value
+from .secret_boundary import SANITIZATION_FAILED, sanitize_boundary_value
 
 
 log = logging.getLogger("agent_gateway.sdk_runner")
@@ -86,16 +89,33 @@ def _time() -> float:
   return _parent_attr("time", time).time()
 
 
+def _is_accepted_ui_blocks_result(tool_name: str, result: Any, error: Any) -> bool:
+  if tool_name != "emit_ui_blocks" or error is not None or not isinstance(result, dict):
+    return False
+  accepted = result.get("accepted")
+  return isinstance(accepted, dict) and isinstance(accepted.get("ui_blocks_id"), str)
+
+
 class _SDKRunnerStreamMixin:
   def _handle_stream_event(self, raw_event: Dict[str, Any]) -> None:
     event_type = str(raw_event.get("type") or "")
     if event_type == "message_start":
-      if getattr(self, "_commercial_usage_producer", None) is None:
-        return
       message = _as_dict(raw_event.get("message"))
       usage = _as_dict(message.get("usage"))
+      bind = self._capability_execution.bind
+      reported_model = str(message.get("model") or "").strip() or None
+      if reported_model is not None:
+        reported_model = validate_reported_identity(
+          bind,
+          reported_model,
+          registry=self._capability_execution.registry,
+        )
+        self._usage["provider_reported_model"] = reported_model
+      if getattr(self, "_commercial_usage_producer", None) is None:
+        return
       self._sdk_provider_call_usage = {
-        "model": str(message.get("model") or self._effective_model),
+        "capability_bind": bind.receipt(),
+        "provider_reported_model": reported_model,
         "input_tokens": int(usage.get("input_tokens") or 0),
         "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
         "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
@@ -109,7 +129,8 @@ class _SDKRunnerStreamMixin:
         return
       usage = _as_dict(raw_event.get("usage"))
       current = dict(getattr(self, "_sdk_provider_call_usage", None) or {})
-      current.setdefault("model", self._effective_model)
+      bind = self._capability_execution.bind
+      current.setdefault("capability_bind", bind.receipt())
       current.setdefault("input_tokens", 0)
       current.setdefault("cache_read_input_tokens", 0)
       current.setdefault("cache_creation_input_tokens", 0)
@@ -137,7 +158,7 @@ class _SDKRunnerStreamMixin:
       delta_type = str(delta.get("type") or "")
       if delta_type == "text_delta":
         text = str(delta.get("text") or "")
-        if text:
+        if text and not getattr(self, "_suppress_text_after_accepted_ui_blocks", False):
           self._append({"type": "text_delta", "text": text})
         return
       if delta_type == "thinking_delta":
@@ -240,7 +261,6 @@ class _SDKRunnerStreamMixin:
     result: Any | None = None,
     error: Dict[str, Any] | None = None,
     synthetic: bool = False,
-    outcome: str | None = None,
   ) -> None:
     info = self._pending_tool_calls.pop(tool_call_id, None)
     if info is None:
@@ -262,6 +282,8 @@ class _SDKRunnerStreamMixin:
     }
     if semantic_error is not None:
       event["semantic_error"] = dict(semantic_error)
+    if semantic_error is None and _is_accepted_ui_blocks_result(info.tool_name, result, error):
+      self._suppress_text_after_accepted_ui_blocks = True
     self._clear_active_skill_if_report_door_completed(
       tool_name=info.tool_name,
       result=result,
@@ -280,9 +302,51 @@ class _SDKRunnerStreamMixin:
       request_id=self._request_id,
     )
 
+  def _interrupt_tool_call(self, tool_call_id: str, *, reason: str) -> None:
+    info = self._pending_tool_calls.pop(tool_call_id, None)
+    if info is None:
+      return
+    discovered_at = _time()
+    duration_ms = int((discovered_at - info.started_at) * 1000)
+    server = _server_for_tool(info.tool_name)
+    self._append({
+      "type": "tool_call_interrupted",
+      "tool_call_id": tool_call_id,
+      "tool_name": info.tool_name,
+      "tool_input": _redact_tool_input_for_event(
+        info.tool_name,
+        info.tool_input,
+      ),
+      "original_started_at": info.started_at,
+      "discovered_at": discovered_at,
+      "reason": reason,
+      "tool_risk": get_tool_risk_value(info.tool_name),
+      "role": "writer",
+    })
+    self._call_on_tool_timing(
+      tool_name=info.tool_name,
+      server=server,
+      duration_ms=duration_ms,
+      is_error=True,
+      result_bytes=0,
+      tool_call_id=tool_call_id,
+      request_id=self._request_id,
+    )
+
   def _flush_pending_tool_calls(self, *, outcome: str | None = None) -> None:
+    if outcome not in {
+      None,
+      "success",
+      "cancelled",
+      "tool_error",
+      "usage_durability_blocked",
+    }:
+      raise ValueError(f"unsupported pending tool outcome: {outcome!r}")
     for tool_call_id in list(self._pending_tool_calls.keys()):
-      self._complete_tool_call(tool_call_id, synthetic=True, outcome=outcome)
+      if outcome in {None, "success"}:
+        self._complete_tool_call(tool_call_id, synthetic=True)
+      else:
+        self._interrupt_tool_call(tool_call_id, reason=outcome)
 
   def _handle_user_message(self, message: Any) -> None:
     for block in self._extract_tool_result_blocks(message):
@@ -299,30 +363,77 @@ class _SDKRunnerStreamMixin:
   def _handle_system_message(self, message: Any) -> None:
     subtype = str(_get_attr(message, "subtype") or "")
     data = _as_dict(_get_attr(message, "data"))
+    safe_subtype = sanitize_boundary_value(
+      subtype or "unknown",
+      sink="sdk_system_message_subtype_log",
+      boundary=getattr(self, "_secret_boundary", None),
+    )
+    safe_data = sanitize_boundary_value(
+      data,
+      sink="sdk_system_message_data_log",
+      boundary=getattr(self, "_secret_boundary", None),
+    )
+    if not isinstance(safe_subtype, str):
+      safe_subtype = SANITIZATION_FAILED
     if subtype == "init":
-      statuses = data.get("mcp_servers")
-      log.info("[%s] SDK init | mcp_servers=%s", self._sid, statuses if statuses is not None else data)
+      statuses = safe_data.get("mcp_servers") if isinstance(safe_data, dict) else None
+      log.info(
+        "[%s] SDK init | mcp_servers=%s",
+        self._sid,
+        statuses if statuses is not None else safe_data,
+      )
       return
-    log.info("[%s] SDK system message | subtype=%s data=%s", self._sid, subtype or "unknown", data)
+    log.info(
+      "[%s] SDK system message | subtype=%s data=%s",
+      self._sid,
+      safe_subtype,
+      safe_data,
+    )
 
   def _handle_assistant_message(self, message: Any) -> None:
     error = _get_attr(message, "error")
     if error:
-      log.warning("[%s] SDK assistant message error: %s", self._sid, error)
+      safe_error = sanitize_boundary_value(
+        error,
+        sink="sdk_assistant_error_log",
+        boundary=getattr(self, "_secret_boundary", None),
+      )
+      log.warning("[%s] SDK assistant message error: %s", self._sid, safe_error)
 
-  def _emit_stream_complete(self) -> None:
+  def _emit_stream_complete(
+    self,
+    *,
+    terminal_disposition: str = "completed",
+    reason: str | None = None,
+  ) -> None:
     if self._stream_terminal_emitted:
       return
+    if terminal_disposition not in {"completed", "interrupted"}:
+      raise ValueError(
+        "terminal_disposition must be 'completed' or 'interrupted'"
+      )
+    if terminal_disposition == "interrupted" and not str(reason or "").strip():
+      raise ValueError("interrupted stream_complete requires a reason")
 
     cost_usd = float(self._usage.get("estimated_cost") or 0.0)
+    bind = self._capability_execution.bind
     usage = {
+      "capability_bind": bind.receipt(),
+      "provider_reported_model": self._usage.get("provider_reported_model"),
       "input_tokens": int(self._usage.get("input_tokens") or 0),
       "output_tokens": int(self._usage.get("output_tokens") or 0),
       "cache_creation_input_tokens": int(self._usage.get("cache_creation_input_tokens") or 0),
       "cache_read_input_tokens": int(self._usage.get("cache_read_input_tokens") or 0),
       "estimated_cost": round(cost_usd, 4),
     }
-    self._append({"type": "stream_complete", "usage": usage})
+    terminal_event = {
+      "type": "stream_complete",
+      "terminal_disposition": terminal_disposition,
+      "usage": usage,
+    }
+    if terminal_disposition == "interrupted":
+      terminal_event["reason"] = str(reason).strip()
+    self._append(terminal_event)
     self._stream_terminal_emitted = True
 
 

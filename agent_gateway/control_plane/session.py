@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -27,6 +27,8 @@ class ControlSessionRequest(BaseModel):
   api_key: str = Field(..., min_length=1)
   user_id: str | None = None
   user_email: str | None = None
+  request_id: str | None = None
+  subject_assertion: str | None = None
   context: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -86,10 +88,13 @@ def _error_response(
     return JSONResponse(payload, status_code=401)
 
   status_code = getattr(exc, "status_code", 500)
-  detail = getattr(exc, "detail", None)
   payload = {
     "error": "auth_failed" if status_code < 500 else "credentials_unavailable",
-    "message": str(detail) if detail is not None else str(exc),
+    "message": (
+      "Authentication failed"
+      if status_code < 500
+      else "Credential resolver unavailable"
+    ),
   }
   if user_id is not None:
     payload["user_id"] = user_id
@@ -111,7 +116,11 @@ def _normalize_channel(channel: str | None) -> str | None:
 
 
 def _resolver_contract_error(message: str, *, user_id: str | None) -> JSONResponse:
-  payload: dict[str, Any] = {"error": "credential_resolver_invalid", "message": message}
+  del message
+  payload: dict[str, Any] = {
+    "error": "credential_resolver_invalid",
+    "message": "Credential resolver returned invalid identity metadata",
+  }
   if user_id is not None:
     payload["user_id"] = user_id
   return JSONResponse(payload, status_code=400)
@@ -211,13 +220,18 @@ def build_session_router(
   auth: AuthManager,
   credentials_resolver: CredentialsResolver | None,
   resolver_timeout_seconds: float,
+  tenant_id: str | None,
+  allow_service_credentials_for_interactive: bool,
   approval_store: Any | None = None,
   approval_policy: Any | None = None,
 ) -> APIRouter:
   router = APIRouter()
 
   @router.post("/session", response_model=ControlSessionResponse)
-  async def control_session(payload: ControlSessionRequest) -> ControlSessionResponse | JSONResponse:
+  async def control_session(
+    payload: ControlSessionRequest,
+    response: Response,
+  ) -> ControlSessionResponse | JSONResponse:
     auth.validate_api_key(payload.api_key)
     try:
       resolved_user_id = _normalize_user_id(payload.user_id)
@@ -231,7 +245,14 @@ def build_session_router(
     resolved_auth_config: dict[str, Any] | None = None
     resolved_channel: str | None = None
     resolved_risk_user_id = 0
-    resolved_role: Literal["owner", "invite"] = "owner"
+    resolved_role: Literal["owner", "invite"] = "invite"
+    resolved_capabilities: frozenset[str] = frozenset()
+    resolved_model_entitled_capabilities: frozenset[str] = frozenset()
+    resolved_model_entitled_keys: frozenset[str] = frozenset()
+    resolved_credential_principal = None
+    resolved_allow_service_for_interactive = (
+      allow_service_credentials_for_interactive
+    )
 
     if credentials_resolver is not None:
       try:
@@ -275,7 +296,14 @@ def build_session_router(
           user_id=resolved_user_id,
         )
       resolved_role = result.role
+      resolved_capabilities = result.capabilities
+      resolved_model_entitled_capabilities = result.model_entitled_capabilities
+      resolved_model_entitled_keys = result.model_entitled_keys
       resolved_auth_config = result.auth_config.to_dict()
+      resolved_credential_principal = result.credential_principal
+      resolved_allow_service_for_interactive = (
+        result.allow_service_for_interactive
+      )
 
       claimed_channel = _claimed_channel(payload)
       if claimed_channel is not None and resolved_channel is not None and claimed_channel != resolved_channel:
@@ -310,6 +338,9 @@ def build_session_router(
       user_email=identity.user_email,
       risk_user_id=identity.risk_user_id,
       role=resolved_role,
+      capabilities=resolved_capabilities,
+      model_entitled_capabilities=resolved_model_entitled_capabilities,
+      model_entitled_keys=resolved_model_entitled_keys,
       kind="control",
       auth_config=resolved_auth_config,
       ttl_seconds=CONTROL_SESSION_TTL_SECONDS,
@@ -318,12 +349,18 @@ def build_session_router(
       user_slug=identity.user_slug,
       user_aliases=tuple(str(alias) for alias in identity.aliases),
       identity_status=str(identity.identity_status),
+      tenant_id=tenant_id,
+      credential_principal=(
+        resolved_credential_principal if tenant_id is not None else None
+      ),
+      allow_service_for_interactive=resolved_allow_service_for_interactive,
     )
     session.channel = resolved_channel
     session.is_public = False
     session.approval_store = approval_store
     session.approval_policy = approval_policy
 
+    response.headers["Cache-Control"] = "private, no-store"
     return ControlSessionResponse(
       session_token=auth.issue_token(session),
       session_id=session.session_id,

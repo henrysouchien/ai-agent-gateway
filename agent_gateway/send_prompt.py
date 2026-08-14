@@ -5,12 +5,16 @@ import logging
 import time
 from typing import Any, Callable
 
-from ._provider_utils import resolve_auth_config
-from .multi_user.billing import UsageEvent, normalize_identity
-from .providers.anthropic import AnthropicProvider
-from .providers.base import ThinkingLevel
-from .thinking import parse_effort
+from .capability_binding import (
+  require_capability_execution_bind,
+  validate_reported_identity,
+)
+from .capability_execution import (
+  BoundCapabilityExecution,
+)
 from .commercial_usage import CommercialUsageProducer
+from .multi_user.billing import UsageEvent, normalize_identity
+from .thinking import EffortResolution
 
 
 log = logging.getLogger("agent_gateway.send_prompt")
@@ -23,16 +27,45 @@ def _call_usage_callback(
   cb(usage_event)
 
 
+def _prepare_bound_execution(
+  capability_execution: BoundCapabilityExecution,
+) -> tuple[dict[str, Any], int, EffortResolution]:
+  if not isinstance(capability_execution, BoundCapabilityExecution):
+    raise TypeError("send_prompt requires a BoundCapabilityExecution")
+  capability_execution.validate()
+
+  capability_bind = capability_execution.bind
+  provider = capability_execution.provider
+  config = dict(capability_execution.auth_config)
+  max_tokens = config.get("max_tokens")
+  if (
+    isinstance(max_tokens, bool)
+    or not isinstance(max_tokens, int)
+    or max_tokens <= 0
+  ):
+    raise ValueError(
+      "bound_auth_config.max_tokens must be a positive integer"
+    )
+
+  model_info = provider.get_model_info(capability_bind.upstream_model)
+  model_max_output = int(getattr(model_info, "max_output_tokens", 0) or 0)
+  if model_max_output > 0 and max_tokens > model_max_output:
+    max_tokens = model_max_output
+
+  effort_resolution = require_capability_execution_bind(
+    capability_bind,
+    provider=provider,
+    auth_config=config,
+  )
+  return config, max_tokens, effort_resolution
+
+
 async def send_prompt(
   prompt: str,
   *,
-  model: str,
+  capability_execution: BoundCapabilityExecution,
   user_id: str,
   system_prompt: str | list[tuple[str, bool]] | None = None,
-  max_tokens: int = 4096,
-  thinking: bool | None = None,
-  effort: str | ThinkingLevel | None = None,
-  auth_config: dict[str, Any] | None = None,
   client_timeout: float = 180.0,
   session_id: str | None = None,
   request_id: str | None = None,
@@ -42,11 +75,11 @@ async def send_prompt(
   on_usage: Callable[..., None] | None = None,
   commercial_usage_producer: CommercialUsageProducer | None = None,
 ) -> str:
-  """Send one prompt through `AnthropicProvider` and return plain text.
+  """Execute one already-resolved capability bind and return plain text.
 
-  This helper is useful when you want provider normalization and usage tracking
-  without standing up the full gateway server. It supports the same cached
-  system prompt block format as `create_agent()`.
+  Capability, provider, credential, model, and effort selection must happen
+  before this execution-only helper is called. The exact provider adapter and
+  bound credential snapshot are validated before a provider client is created.
   """
   sid = str(session_id or "send-prompt")
   normalized_request_id = str(request_id or "").strip()
@@ -73,28 +106,13 @@ async def send_prompt(
     commercial_guard = getattr(commercial_usage_producer, "assert_work_allowed", None)
     if callable(commercial_guard):
       commercial_guard(resolved_billing_mode)
-  provider = AnthropicProvider()
-  config = resolve_auth_config(
-    auth_config=auth_config,
-    model=model,
-    max_tokens=max_tokens,
-    effort=effort,
-    thinking=(False if effort is None and thinking is None and not any(k in (auth_config or {}) for k in ("effort", "thinking")) else thinking),
+  config, max_tokens, effort_resolution = _prepare_bound_execution(
+    capability_execution
   )
-  if not provider.has_active_credential(config):
-    raise RuntimeError("No Anthropic credentials found")
-
-  thinking_level = parse_effort(config.get("effort")) or ThinkingLevel.NONE
-  effort_resolution = None
-  if hasattr(provider, "get_model_info") and hasattr(provider, "resolve_effort"):
-    model_info = provider.get_model_info(model)
-    effort_resolution = provider.resolve_effort(
-      requested=thinking_level,
-      model=model,
-      model_info=model_info,
-      max_tokens=max_tokens,
-      auth_mode=config.get("auth_mode"),
-    )
+  capability_bind = capability_execution.bind
+  provider = capability_execution.provider
+  model = capability_bind.upstream_model
+  thinking_level = effort_resolution.requested
   client: Any = None
   text_parts: list[str] = []
   input_tokens = 0
@@ -103,6 +121,7 @@ async def send_prompt(
   cache_creation_tokens = 0
   reasoning_tokens = 0
   provider_unit_deltas: dict[str, int] = {}
+  provider_reported_model: str | None = None
   stop_reason = ""
 
   async def _emit_usage(usage_state: str) -> None:
@@ -122,7 +141,7 @@ async def send_prompt(
       parent_turn_id=None,
       timestamp=time.time(),
       model=model,
-      provider=provider.name,
+      provider=capability_bind.provider,
       input_tokens=input_tokens,
       output_tokens=output_tokens,
       reasoning_tokens_observed=reasoning_tokens,
@@ -133,6 +152,8 @@ async def send_prompt(
       rate_table_version=resolved_rate_version,
       billing_mode=resolved_billing_mode,
       channel=resolved_channel,
+      capability_bind=capability_bind.receipt(),
+      provider_reported_model=provider_reported_model,
     )
     if commercial_usage_producer is not None:
       await commercial_usage_producer.emit(usage_event, usage_state=usage_state)
@@ -148,8 +169,8 @@ async def send_prompt(
       tools=[],
       max_tokens=max_tokens,
       thinking_level=thinking_level,
-      **({"effort_resolution": effort_resolution} if effort_resolution is not None else {}),
-      auth_mode=config["auth_mode"],
+      effort_resolution=effort_resolution,
+      auth_mode=config.get("auth_mode"),
     )
 
     try:
@@ -164,6 +185,12 @@ async def send_prompt(
           input_tokens += int(event.input_tokens or 0)
           cache_read_tokens += int(event.cache_read_tokens or 0)
           cache_creation_tokens += int(event.cache_creation_tokens or 0)
+          if event.provider_reported_model is not None:
+            provider_reported_model = validate_reported_identity(
+              capability_bind,
+              event.provider_reported_model,
+              registry=capability_execution.registry,
+            )
           if event.provider_unit_deltas:
             provider_unit_deltas.update(event.provider_unit_deltas)
           continue
@@ -216,10 +243,21 @@ async def send_prompt(
     await provider.close_client(client)
 
 
-def send_prompt_sync(prompt: str, **kwargs: Any) -> str:
+def send_prompt_sync(
+  prompt: str,
+  *,
+  capability_execution: BoundCapabilityExecution,
+  **kwargs: Any,
+) -> str:
   """Run `send_prompt()` from synchronous code."""
   try:
     asyncio.get_running_loop()
   except RuntimeError:
-    return asyncio.run(send_prompt(prompt, **kwargs))
+    return asyncio.run(
+      send_prompt(
+        prompt,
+        capability_execution=capability_execution,
+        **kwargs,
+      )
+    )
   raise RuntimeError("send_prompt_sync cannot run inside an active asyncio loop.")

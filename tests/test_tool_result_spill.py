@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -15,7 +16,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner, EventLog, ModelInfo, ModelProvider, SessionStore, ToolDispatcher  # noqa: E402
+from agent_gateway import AgentRunner, AgentSessionLog, EventLog, ModelInfo, ModelProvider, SessionStore, ToolDispatcher  # noqa: E402
 from agent_gateway.code_execution import CodeExecutionConfig, DockerBackend, build_code_execution  # noqa: E402
 from agent_gateway.providers import StreamEvent  # noqa: E402
 from agent_gateway.sub_agent import make_run_agent_handler  # noqa: E402
@@ -29,6 +30,10 @@ from agent_gateway.tool_result_compaction import (  # noqa: E402
 )
 import agent_gateway.tool_result_compaction as tool_result_compaction  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_capability_execution_resolver,
+  stub_runner_capability_execution,
+)
 
 
 CAP = 4_000
@@ -196,6 +201,7 @@ def _dispatcher(
     local_tool_handlers=handlers,
     event_log=event_log,
     session_id="sess-spill",
+    role="owner",
     approval_key_qualifier=approval_key_qualifier,
   )
 
@@ -206,8 +212,12 @@ def _runner(spill_provider: Callable[[], str] | None) -> AgentRunner:
     event_log=event_log,
     dispatcher=_dispatcher(event_log, {}),
     session_id="sess-spill",
-    provider=_RecordingProvider([]),
-    auth_config={"api_key": "k", "model": "stub-model"},
+    capability_execution=stub_runner_capability_execution(
+      provider=_RecordingProvider([]),
+      auth_config={"api_key": "k"},
+      model="stub-model",
+      effort="none",
+    ),
     user_id="alice",
     request_id="req-spill",
     billing_mode="byok",
@@ -232,25 +242,30 @@ class _RecordingLogger:
     self.warnings.append((message, args, kwargs))
 
 
-def test_emit_html_artifact_oversize_guard_returns_error_before_dispatch() -> None:
+def test_emit_canvas_artifact_oversize_guard_returns_error_before_dispatch() -> None:
+  # INC-4 retired emit_html_artifact; the pre-dispatch oversize guard now covers
+  # emit_canvas_artifact (tsx_source vs the kit-contract source cap).
+  from agent_gateway.canvas_kit_contract import limits as canvas_kit_limits
+
   runner = _runner(None)
-  html = "x" * ((512 * 1024) + 1)
+  source_cap = canvas_kit_limits()["source_max_bytes"]
+  tsx_source = "x" * (source_cap + 1)
 
   result, tool_name, live_events = _run(
     runner._execute_single_tool(
-      "tool-html",
-      "emit_html_artifact",
-      {"html": html},
+      "tool-canvas",
+      "emit_canvas_artifact",
+      {"tsx_source": tsx_source},
       {},
     )
   )
 
-  assert tool_name == "emit_html_artifact"
+  assert tool_name == "emit_canvas_artifact"
   assert live_events == []
   assert result["is_error"] is True
   payload = json.loads(result["content"])
   assert payload["error"]["code"] == "invalid_input"
-  assert "exceeds 512KB limit" in payload["error"]["message"]
+  assert f"exceeds {source_cap} byte limit" in payload["error"]["message"]
   assert [entry.event for entry in runner._log.entries] == []
 
 
@@ -281,6 +296,7 @@ async def _dispatch_bundle_tool(bundle: Any, tool_name: str, tool_input: dict[st
     mcp_client=_NullMcpClient(),
     local_tool_handlers=bundle.handlers,
     event_log=EventLog(),
+    role="owner",
     approval_key_qualifier=bundle.approval_qualifier,
   )
   return await dispatcher.dispatch(f"{tool_name}_call", tool_name, tool_input)
@@ -288,8 +304,6 @@ async def _dispatch_bundle_tool(bundle: Any, tool_name: str, tool_input: dict[st
 
 def test_truncate_tool_result_embeds_spill_pointer_only_when_provided() -> None:
   content = _large_content()
-
-  assert gateway_runner._truncate_model_tool_result_content is truncate_model_tool_result_content
 
   truncated, was_truncated = truncate_model_tool_result_content(
     content,
@@ -474,6 +488,93 @@ def test_compact_model_tool_result_entry_helper_spills_live_entry_and_logs(tmp_p
   assert logger.warnings == []
   assert logger.infos[0][2]["extra"]["data"]["event"] == "tool_result_compacted"
   assert logger.infos[0][2]["extra"]["data"]["session_id"] == "sess-direct"
+
+
+def test_business_model_terminal_success_uses_bounded_semantic_projection(
+  tmp_path: Path,
+) -> None:
+  verdict = {
+    "skill": "business-model-construction",
+    "verdict": "BM_CONSTRUCTED",
+    "confidence": "MEDIUM",
+    "revision": "pcty-business-model-rev-1",
+    "validation": {"large": "v" * PAYLOAD_SIZE},
+    "data_gaps": [
+      {
+        "key": "float_yield",
+        "text": "Average daily float yield is not disclosed.",
+        "claim_keys": ["interest_income_fy26"],
+      }
+    ],
+    "recommended_next_action": "Run forecast-assumptions.",
+  }
+  content = json.dumps(
+    {
+      "status": "staged",
+      "gate_code": "PROCEED",
+      "artifact_ref": "artifacts/PCTY/business-model.json",
+      "proposal_id": "proposal-1",
+      "error": None,
+      "verdict": verdict,
+      "verdict_echo": verdict,
+      "readback": {
+        "typed_outputs": {
+          "business_model_stage_receipt": {
+            "status": "accepted",
+            "stage_metadata": {"evidence_snapshot": "x" * PAYLOAD_SIZE},
+          },
+          "business_model": {"segments": ["x" * PAYLOAD_SIZE]},
+        }
+      },
+    }
+  )
+  result_entry = {
+    "type": "tool_result",
+    "tool_use_id": "bm-tool-1",
+    "content": content,
+  }
+  logger = _RecordingLogger()
+
+  live_entry, durable_entry = compact_model_tool_result_entry(
+    result_entry,
+    tool_name="fms_persist_business_model",
+    spill_dir_provider=lambda: str(tmp_path),
+    log_session_id="sess-bm",
+    logger=logger,
+  )
+
+  assert result_entry["content"] == content
+  assert live_entry == durable_entry
+  projection = json.loads(live_entry["content"])
+  assert projection == {
+    "status": "staged",
+    "gate_code": "PROCEED",
+    "artifact_ref": "artifacts/PCTY/business-model.json",
+    "proposal_id": "proposal-1",
+    "verdict": "BM_CONSTRUCTED",
+    "confidence": "MEDIUM",
+    "revision": "pcty-business-model-rev-1",
+    "stage_receipt_status": "accepted",
+    "data_gaps": [
+      {
+        "key": "float_yield",
+        "text": "Average daily float yield is not disclosed.",
+        "claim_keys": ["interest_income_fy26"],
+      }
+    ],
+    "recommended_next_action": "Run forecast-assumptions.",
+  }
+  assert "readback" not in projection
+  assert "validation" not in projection
+  assert len(live_entry["content"]) < CAP
+  assert list(tmp_path.iterdir()) == []
+  assert logger.infos[0][2]["extra"]["data"] == {
+    "event": "tool_result_semantically_compacted",
+    "session_id": "sess-bm",
+    "tool": "fms_persist_business_model",
+    "original_chars": len(content),
+    "compacted_chars": len(live_entry["content"]),
+  }
 
 
 def test_compact_spills_live_entry_and_keeps_durable_pointer_free(tmp_path: Path) -> None:
@@ -691,8 +792,12 @@ def test_runner_spills_large_tool_result_and_code_execute_reads_bare_filename(tm
       event_log=event_log,
       dispatcher=_dispatcher(event_log, local_handlers, approval_key_qualifier=bundle.approval_qualifier),
       session_id="sess-spill",
-      provider=provider,
-      auth_config={"api_key": "k", "model": "stub-model"},
+      capability_execution=stub_runner_capability_execution(
+        provider=provider,
+        auth_config={"api_key": "k"},
+        model="stub-model",
+        effort="none",
+      ),
       get_tool_definitions=lambda: [_tool_def("big_data"), *bundle.tool_definitions],
       user_id="alice",
       request_id="req-spill",
@@ -747,7 +852,7 @@ def test_runner_spills_large_tool_result_and_code_execute_reads_bare_filename(tm
   _run(_run_test())
 
 
-def test_run_agent_sub_runner_spills_into_parent_work_dir_and_code_execute_can_read_it(tmp_path: Path) -> None:
+def test_run_agent_sub_runner_spills_into_parent_work_dir(tmp_path: Path) -> None:
   async def _run_test() -> None:
     payload = "x" * PAYLOAD_SIZE
 
@@ -755,57 +860,73 @@ def test_run_agent_sub_runner_spills_into_parent_work_dir_and_code_execute_can_r
       _ = kwargs
       return {"status": "success", "payload": payload}, None
 
-    def _code_execute_turn(provider: _RecordingProvider) -> list[StreamEvent]:
-      filename = provider.last_spill_file
-      assert filename is not None
-      code = (
-        "import json\n"
-        f"data = json.load(open({filename!r}))\n"
-        "print(len(data['payload']))\n"
-      )
-      return _tool_use_turn("sub-code", "code_execute", {"host": "subprocess", "code": code})
-
-    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    provider = _RecordingProvider([
+      _tool_use_turn(
+        "parent-run",
+        "run_agent",
+        {
+          "background": False,
+          "objective": "read the big data",
+        },
+      ),
+      _tool_use_turn("sub-big", "file_read"),
+      _text_turn("read ok"),
+      _text_turn("parent done"),
+    ])
+    base_resolver = stub_capability_execution_resolver(
+      default_provider="stub",
+      default_model="stub-model",
+      extra_models=(("stub", "stub-model"),),
+    )
+    capability_execution_resolver = replace(
+      base_resolver,
+      adapter_resolver=lambda _adapter_id: provider,
+    )
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash",
+      user_id="alice",
+      role="owner",
+    )
     bundle = build_code_execution(
       session,
       config=CodeExecutionConfig(register_docker=False, work_dir_root=str(tmp_path)),
     )
     local_handlers = dict(bundle.handlers)
-    local_handlers["big_data"] = _big_data
+    local_handlers["file_read"] = _big_data
     runner_ref: list[Any] = [None]
     local_handlers["run_agent"] = make_run_agent_handler(
       runner_ref,
       parent_session=session,
       mcp_client=_NullMcpClient(),
       local_tool_handlers=local_handlers,
-      default_model="stub-model",
-      allowed_models={"stub-model"},
+      capability_execution_resolver=capability_execution_resolver,
       approval_key_qualifier=bundle.approval_qualifier,
     )
 
-    provider = _RecordingProvider([
-      _tool_use_turn("parent-run", "run_agent", {"task": "read the big data", "model": "stub-model"}),
-      _tool_use_turn("sub-big", "big_data"),
-      _code_execute_turn,
-      lambda provider: _text_turn("read ok" if provider.code_read_ok else "read failed"),
-      _text_turn("parent done"),
-    ])
     event_log = EventLog()
     runner = AgentRunner(
       event_log=event_log,
       dispatcher=_dispatcher(event_log, local_handlers, approval_key_qualifier=bundle.approval_qualifier),
       session_id="sess-parent",
-      provider=provider,
-      auth_config={"api_key": "k", "model": "stub-model"},
+      capability_execution=stub_runner_capability_execution(
+        provider=provider,
+        auth_config={"api_key": "k"},
+        model="stub-model",
+        effort="none",
+      ),
       get_tool_definitions=lambda: [
         _tool_def("run_agent"),
-        _tool_def("big_data"),
+        _tool_def("file_read"),
         *bundle.tool_definitions,
       ],
       user_id="alice",
       request_id="req-spill",
       billing_mode="byok",
       rate_table_version="unknown",
+      agent_session_log=AgentSessionLog(
+        path=tmp_path / "spill-agent-session.jsonl"
+      ),
+      workspace_dir=str(tmp_path),
       code_execution_spill_dir_provider=bundle.ensure_work_dir,
     )
     runner_ref[0] = runner
@@ -825,14 +946,22 @@ def test_run_agent_sub_runner_spills_into_parent_work_dir_and_code_execute_can_r
       for entry in event_log.entries
       if entry.event.get("type") == "tool_call_complete" and entry.event.get("tool_name") == "run_agent"
     )
-    assert run_agent_event["result"]["response"] == "read ok"
-    assert "big_data" in run_agent_event["result"]["tools_used"]
-    assert "code_execute" in run_agent_event["result"]["tools_used"]
+    assert (
+      run_agent_event["result"]["settlement_projection"]["execution_status"]
+      == "succeeded"
+    )
+    assert (
+      run_agent_event["result"]["parent_materialization"]["kind"]
+      == "terminal_narrative_inline_exact"
+    )
 
   _run(_run_test())
 
 
-def test_interactive_model_provider_runner_threads_spill_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_interactive_model_provider_runner_threads_spill_provider(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("MCP_CONFIG_PATH", str(ROOT / "deploy" / "mcp.production.json"))
   import api.agent.interactive.runtime as runtime
 
   captured: dict[str, Any] = {}
@@ -841,7 +970,12 @@ def test_interactive_model_provider_runner_threads_spill_provider(monkeypatch: p
     def __init__(self, **kwargs: Any) -> None:
       captured.update(kwargs)
 
-  class _FakeProvider:
+  class _FakeProvider(ModelProvider):
+    name = "stub"
+
+    def has_active_credential(self, config: dict[str, Any]) -> bool:
+      return bool(config.get("api_key"))
+
     def get_model_info(self, model: str) -> ModelInfo:
       return ModelInfo(id=model, provider="stub")
 
@@ -859,16 +993,27 @@ def test_interactive_model_provider_runner_threads_spill_provider(monkeypatch: p
     channel="web",
     role="owner",
   )
-  request = SimpleNamespace(model="stub-model", user_id="alice", request_id="req-runtime", context={})
+  capability_execution = stub_runner_capability_execution(
+    provider=_FakeProvider(),
+    auth_config={"api_key": "k"},
+    model="stub-model",
+    effort="none",
+  )
+  request = SimpleNamespace(
+    user_id="alice",
+    request_id="req-runtime",
+    context={},
+    capability_execution=capability_execution,
+  )
 
   runner = runtime._build_model_provider_runner(
     EventLog(),
     "sess-runtime",
+    10.0,
     request=request,
     session=session,
     runner_ref=runner_ref,
-    provider=_FakeProvider(),
-    auth_config={"api_key": "k", "model": "stub-model"},
+    capability_execution=capability_execution,
     mcp_client_manager=_NullMcpClient(),
     excluded_tools=set(),
     parent_per_turn_timeout=30,
@@ -880,4 +1025,5 @@ def test_interactive_model_provider_runner_threads_spill_provider(monkeypatch: p
   )
 
   assert captured["code_execution_spill_dir_provider"] is spill_provider
+  assert captured["capability_execution"] is capability_execution
   assert runner_ref[0] is runner

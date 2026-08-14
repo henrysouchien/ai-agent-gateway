@@ -52,7 +52,6 @@ def write_ui_blocks_payload(
       turn_key=str(envelope["turn_key"]),
       emission_index=int(envelope["emission_index"]),
       ts=float(envelope["ts"]),
-      manifest_digest=str(envelope["manifest_digest"]),
     )
   except Exception:
     log.warning(

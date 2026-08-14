@@ -3,9 +3,30 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+from agent_workflow_contracts import CapabilityBind
 
 from agent_gateway.multi_user.billing import SessionUsageSummary
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker
+
+
+def _bind_receipt() -> dict[str, str]:
+  return CapabilityBind(
+    schema_version="1.0",
+    capability_id="portfolio.review",
+    model_key="anthropic.claude-sonnet-test",
+    provider="anthropic",
+    upstream_model="claude-sonnet-test",
+    adapter="anthropic.sdk.messages",
+    protocol_profile="anthropic.messages",
+    route="direct",
+    effort="none",
+    credential_principal="user",
+    credential_ref="test-credential",
+    run_mode="interactive",
+    registry_revision="test-v1",
+    policy_revision="test-v1",
+    selection_source="explicit_user",
+  ).receipt()
 
 
 def _summary(**changes) -> SessionUsageSummary:
@@ -16,6 +37,7 @@ def _summary(**changes) -> SessionUsageSummary:
     "started_at": 1.0, "ended_at": 2.0, "drain_complete": True,
     "in_flight_task_count": 0,
     "usage_event_count": 1, "usage_event_ids": ("evt_001",),
+    "capability_bind": _bind_receipt(),
   }
   values.update(changes)
   return SessionUsageSummary(**values)
@@ -67,6 +89,105 @@ def _v2_payload(event_id: str = "evt_v2_001") -> dict:
     "workflow_attempt_kind": "initial",
     "work_authorization_id": "55555555-5555-4555-8555-555555555555",
   }
+
+
+def _v3_payload(event_id: str = "evt_v3_001") -> dict:
+  bind = _bind_receipt()
+  return {
+    **_base_payload(event_id),
+    "schema_version": 3,
+    "provider": bind["provider"],
+    "model": bind["upstream_model"],
+    "capability_id": bind["capability_id"],
+    "capability_bind": bind,
+    "provider_reported_model": "claude-sonnet-test-20260801",
+    "workflow_attempt_group_id": None,
+    "workflow_attempt_number": None,
+    "retry_of_workflow_run_id": None,
+    "workflow_attempt_kind": None,
+    "work_authorization_id": None,
+  }
+
+
+def _v3_attempt_payload(
+  event_id: str,
+  *,
+  source_product: str,
+  work_authorization_id: str | None,
+) -> dict:
+  return {
+    **_v3_payload(event_id),
+    "source_product": source_product,
+    "execution_context_id": "33333333-3333-4333-8333-333333333333",
+    "workflow_run_id": "44444444-4444-4444-8444-444444444444",
+    "funding_route_id": "55555555-5555-4555-8555-555555555555",
+    "reservation_id": None,
+    "workflow_attempt_group_id": "44444444-4444-4444-8444-444444444444",
+    "workflow_attempt_number": 1,
+    "retry_of_workflow_run_id": None,
+    "workflow_attempt_kind": "initial",
+    "work_authorization_id": work_authorization_id,
+  }
+
+
+def test_reconciliation_v3_carries_exact_identity_without_rebinding() -> None:
+  tracker = CommercialUsageReconciliationTracker(
+    request_id="req_001", session_id="sess_001"
+  )
+  payload = _v3_payload()
+  tracker.record_batch([payload])
+
+  report = tracker.compare(_summary(usage_event_ids=("evt_v3_001",)))
+  document = report.as_dict()
+
+  assert report.evidence_schema_version == 3
+  assert document["source_usage_schema_version"] == 3
+  line = document["event_lines"][0]
+  assert line["capability_bind"] == payload["capability_bind"]
+  assert line["provider_reported_model"] == "claude-sonnet-test-20260801"
+  assert line["provider"] == line["capability_bind"]["provider"]
+  assert line["model"] == line["capability_bind"]["upstream_model"]
+  assert line["capability_id"] == line["capability_bind"]["capability_id"]
+  assert line["workflow_attempt_group_id"] is None
+
+
+def test_reconciliation_v3_rejects_projection_drift_atomically() -> None:
+  tracker = CommercialUsageReconciliationTracker(
+    request_id="req_001", session_id="sess_001"
+  )
+  with pytest.raises(ValueError, match="projection mismatch"):
+    tracker.record_batch([{**_v3_payload(), "model": "unadmitted-model"}])
+  with pytest.raises(ValueError, match="source lineage is unavailable"):
+    tracker.compare(_summary(usage_event_ids=("evt_v3_001",)))
+
+
+@pytest.mark.parametrize(
+  ("source_product", "work_authorization_id"),
+  (
+    ("hank-agent-gateway", "66666666-6666-4666-8666-666666666666"),
+    ("risk-module-direct", None),
+  ),
+)
+def test_reconciliation_v3_accepts_source_specific_attempt_authority(
+  source_product: str,
+  work_authorization_id: str | None,
+) -> None:
+  tracker = CommercialUsageReconciliationTracker(
+    request_id="req_001", session_id="sess_001"
+  )
+  payload = _v3_attempt_payload(
+    "evt_v3_attempt",
+    source_product=source_product,
+    work_authorization_id=work_authorization_id,
+  )
+  tracker.record_batch([payload])
+
+  report = tracker.compare(
+    _summary(usage_event_ids=("evt_v3_attempt",))
+  )
+  assert report.evidence_schema_version == 3
+  assert report.workflow_attempt_group_id == payload["workflow_attempt_group_id"]
+  assert report.work_authorization_id == work_authorization_id
 
 
 def test_reconciliation_matches_tokens_estimate_counts_and_separate_units() -> None:

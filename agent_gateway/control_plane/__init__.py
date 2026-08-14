@@ -11,7 +11,6 @@ from agent_gateway.session import AuthManager
 from .approvals import build_approvals_router
 from .artifacts import build_artifacts_router
 from .batches import build_batches_router
-from .diligence_prs import build_diligence_prs_router
 from .events import build_events_router
 from .health import build_health_router
 from .profiles import build_profiles_router
@@ -27,31 +26,36 @@ def create_control_plane_router(
   auth: AuthManager,
   credentials_resolver: CredentialsResolver | None,
   resolver_timeout_seconds: float,
+  tenant_id: str | None,
+  allow_service_credentials_for_interactive: bool,
   route_prefix: str,
   skills_dir: Path,
   artifact_auth_dependency: Callable[[Request], str],
   autonomous_registry: Any | None = None,
-  agent_schedule_store: Any | None = None,
+  agent_schedule_store_for: Any | None = None,
   agent_schedule_runner: Any | None = None,
   approval_store: Any | None = None,
   approval_policy: Any | None = None,
   dispatch_scope_validator: Callable[[Any, dict[str, Any]], Any] | None = None,
 ) -> APIRouter:
   router = APIRouter()
-  router.include_router(
-    build_session_router(
-      auth=auth,
-      credentials_resolver=credentials_resolver,
-      resolver_timeout_seconds=resolver_timeout_seconds,
-      approval_store=approval_store,
-      approval_policy=approval_policy,
-    )
+  session_router = build_session_router(
+    auth=auth,
+    credentials_resolver=credentials_resolver,
+    resolver_timeout_seconds=resolver_timeout_seconds,
+    tenant_id=tenant_id,
+    allow_service_credentials_for_interactive=(
+      allow_service_credentials_for_interactive
+    ),
+    approval_store=approval_store,
+    approval_policy=approval_policy,
   )
+  router.include_router(session_router)
   router.include_router(build_profiles_router(auth=auth))
   router.include_router(build_skills_router(auth=auth, skills_dir=skills_dir))
   router.include_router(build_schedules_router(
     auth=auth,
-    agent_schedule_store=agent_schedule_store,
+    agent_schedule_store_for=agent_schedule_store_for,
     agent_schedule_runner=agent_schedule_runner,
     dispatch_scope_validator=dispatch_scope_validator,
   ))
@@ -62,7 +66,6 @@ def create_control_plane_router(
     dispatch_scope_validator=dispatch_scope_validator,
   ))
   router.include_router(build_batches_router(auth=auth))
-  router.include_router(build_diligence_prs_router(auth=auth))
   router.include_router(build_approvals_router(auth=auth, autonomous_registry=autonomous_registry))
   router.include_router(build_events_router(auth=auth))
   router.include_router(build_readable_resources_router(

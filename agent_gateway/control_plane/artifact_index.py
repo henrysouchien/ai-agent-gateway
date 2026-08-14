@@ -100,6 +100,12 @@ def _list_stored_html_artifacts(*args: Any, **kwargs: Any) -> Any:
   return list_html_artifacts(*args, **kwargs)
 
 
+def _list_stored_canvas_artifacts(*args: Any, **kwargs: Any) -> Any:
+  from agent_gateway.canvas_artifact_store import list_canvas_artifacts
+
+  return list_canvas_artifacts(*args, **kwargs)
+
+
 def _list_stored_dashboard_artifacts(*args: Any, **kwargs: Any) -> Any:
   from agent_gateway.dashboard_artifact_store import list_dashboard_artifacts
 
@@ -709,6 +715,77 @@ def _dashboard_artifact_responses_for_user(
   return responses
 
 
+def _canvas_artifact_responses_for_user(
+  workspace_root: Path,
+  *,
+  user_id: str,
+  ticker_filter: str | None,
+  skill_filter: str | None,
+  run_index: dict[str, dict[str, str]],
+  filters: dict[str, Any],
+  limit: int,
+) -> list[tuple[int, str, ArtifactResponse]]:
+  try:
+    canvas_artifacts = _list_stored_canvas_artifacts(
+      workspace_root,
+      ticker=ticker_filter,
+      limit=limit,
+    )
+  except ModuleNotFoundError as exc:
+    if exc.name == "schema":
+      return []
+    raise
+  except ValueError as exc:
+    raise HTTPException(status_code=400, detail="Unsafe artifact path") from exc
+
+  responses: list[tuple[int, str, ArtifactResponse]] = []
+  for artifact in canvas_artifacts:
+    source_skill = _string_or_none(artifact.source_skill) or "_canvas"
+    if skill_filter is not None and source_skill != skill_filter:
+      continue
+    artifact_id = _string_or_none(artifact.artifact_id)
+    if artifact_id is None:
+      continue
+    try:
+      sidecar_path = (workspace_root / "artifacts" / "_canvas" / f"{artifact_id}.json").resolve()
+      sidecar_path.relative_to(workspace_root.resolve())
+      mtime_ns = sidecar_path.stat().st_mtime_ns
+    except (OSError, ValueError):
+      continue
+    payload = artifact.model_dump(mode="json")
+    payload.update(_effective_auxiliary_artifact_fields(payload, user_id=user_id))
+    if not _payload_matches_artifact_filters(payload, filters=filters):
+      continue
+    artifact_path = f"artifacts/_canvas/{artifact_id}.json"
+    binary_artifact_path = f"artifacts/_canvas/{artifact_id}.bundle.js"
+    run_metadata = _artifact_run_metadata(
+      run_index,
+      artifact_id=artifact_id,
+      artifact_path=artifact_path,
+      binary_artifact_path=binary_artifact_path,
+    )
+    run_id = run_metadata.get("run_id") or _string_or_none(payload.get("control_run_id")) or _string_or_none(artifact.session_id)
+    responses.append(
+      (
+        mtime_ns,
+        artifact_path,
+        ArtifactResponse(
+          ticker=_string_or_none(artifact.ticker) or "CANVAS",
+          skill=source_skill,
+          artifact_id=artifact_id,
+          artifact_path=artifact_path,
+          binary_artifact_path=binary_artifact_path,
+          contract_name="CanvasArtifact",
+          data_source="live",
+          created_at=_string_or_none(artifact.ts) or _created_at_from_mtime(sidecar_path),
+          skill_run_id=run_metadata.get("skill_run_id") or _string_or_none(artifact.session_id) or artifact_id,
+          run_id=run_id,
+        ),
+      )
+    )
+  return responses
+
+
 def artifact_responses_for_user(
   *,
   request: Request,
@@ -783,6 +860,18 @@ def _artifact_responses_for_user_impl(
     artifact_entries.append((_mtime_ns, path.as_posix(), artifact))
 
   for entry in _html_artifact_responses_for_user(
+    workspace_root=workspace_root,
+    user_id=user_id,
+    ticker_filter=ticker_filter,
+    skill_filter=skill_filter,
+    run_index=run_index,
+    filters=filters,
+    limit=max(effective_limit, 500),
+  ):
+    if _artifact_matches_optional_run_filter(entry[2], run_id_filter, run_windows):
+      artifact_entries.append(entry)
+
+  for entry in _canvas_artifact_responses_for_user(
     workspace_root=workspace_root,
     user_id=user_id,
     ticker_filter=ticker_filter,

@@ -13,10 +13,12 @@ def default_tool_definitions(get_tool_definitions: Any, mcp_client: Any) -> List
   return []
 
 
-def effective_excluded_tools(excluded_tools: Set[str], active_skill_deny: Set[str]) -> set[str]:
-  if not active_skill_deny:
-    return set(excluded_tools)
-  return set(excluded_tools) | set(active_skill_deny)
+def effective_excluded_tools(
+  excluded_tools: Set[str],
+  active_skill_deny: Set[str],
+  active_skill_allow: Set[str] | None = None,
+) -> set[str]:
+  return (set(excluded_tools) - set(active_skill_allow or ())) | set(active_skill_deny)
 
 
 def filter_excluded_tool_definitions(tools: List[Dict[str, Any]], excluded_tools: Set[str]) -> List[Dict[str, Any]]:

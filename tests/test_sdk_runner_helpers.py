@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import sqlite3
 import sys
 from pathlib import Path
@@ -16,7 +17,8 @@ API_DIR = ROOT / "api"
 if str(API_DIR) not in sys.path:
   sys.path.insert(0, str(API_DIR))
 
-from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog  # noqa: E402
+from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog, ToolResultContext  # noqa: E402
+from agent_gateway.secret_boundary import SecretBoundary  # noqa: E402
 from agent_gateway import approval_policy  # noqa: E402
 import agent_gateway.sdk_runner as sdk_runner  # noqa: E402
 import agent_gateway.sdk_runner_approval as sdk_runner_approval  # noqa: E402
@@ -25,6 +27,7 @@ from agent_gateway import policy_imports  # noqa: E402
 from agent_gateway import sdk_runner_helpers  # noqa: E402
 from agent.shared import hooks  # noqa: E402
 from logs import cost_tracker  # noqa: E402
+from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution  # noqa: E402
 
 
 def _make_runner() -> AgentSDKRunner:
@@ -32,12 +35,11 @@ def _make_runner() -> AgentSDKRunner:
     event_log=EventLog(),
     session_id="sess-sdk-helpers",
     sdk_config=AgentSDKConfig(
-      api_key="k",
-      model="claude-sonnet-4-6",
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
     ),
+    capability_execution=stub_sdk_capability_execution(),
     system_prompt="test",
   )
 
@@ -62,6 +64,54 @@ def test_sdk_runner_helper_aliases_remain_on_parent_module() -> None:
   assert sdk_runner.call_policy_safely is approval_policy.call_policy_safely
   assert sdk_runner.sha256_args is approval_policy.sha256_args
   assert sdk_runner.utc_now is approval_policy.utc_now
+
+
+def test_sdk_tool_input_redaction_fails_closed_on_policy_import_error(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  original_import = builtins.__import__
+
+  def import_without_redaction(name: str, *args, **kwargs):
+    if name == "agent.shared.tool_redaction":
+      raise ImportError("forced missing redaction policy")
+    return original_import(name, *args, **kwargs)
+
+  monkeypatch.setattr(builtins, "__import__", import_without_redaction)
+
+  assert sdk_runner_helpers.redact_tool_input_for_event(
+    "lookup",
+    {"credential": "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"},
+  ) == {"_boundary_error": "<secret-sanitization-failed>"}
+
+
+def test_update_model_log_uses_runner_owned_secret_boundary(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-UPDATE-MODEL-8f21d7"
+  boundary = SecretBoundary((secret,))
+  (tmp_path / "api").mkdir()
+  fake_hooks_path = tmp_path / "api" / "agent" / "shared" / "hooks.py"
+  monkeypatch.setattr(hooks, "__file__", str(fake_hooks_path))
+  ctx = ToolResultContext(
+    tool_name="update_model",
+    tool_input={"credential": secret, "path": "/Users/alice/model.xlsx"},
+    result={"status": "ok", "credential": secret},
+    error=None,
+    duration_ms=12,
+    tool_call_id="tool-1",
+    session_id="session-1",
+    server=None,
+    result_entry=None,
+    boundary_sanitizer=lambda value, sink: boundary.sanitize(value, sink=sink),
+  )
+
+  hooks.update_model_log_hook(ctx)
+
+  payload = next((tmp_path / "api" / "logs").glob("update_model_*.json")).read_text()
+  assert secret not in payload
+  assert "<redacted-secret>" in payload
+  assert "/Users/alice/model.xlsx" in payload
 
 
 def test_sdk_runner_approval_wrapper_threads_parent_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -115,12 +165,11 @@ def test_sdk_runner_context_surfaces_use_parent_normalizer(monkeypatch: pytest.M
     event_log=EventLog(),
     session_id="sess-sdk-helpers",
     sdk_config=AgentSDKConfig(
-      api_key="k",
-      model="claude-sonnet-4-6",
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
     ),
+    capability_execution=stub_sdk_capability_execution(),
     system_prompt="test",
     context_surfaces=lambda: [{"name": "brief"}, "ignored", {"name": "tooling"}],
   )
@@ -134,6 +183,32 @@ def test_sdk_runner_context_surfaces_use_parent_normalizer(monkeypatch: pytest.M
 
   assert runner._context_surface_records() == [{"patched": True}]
   assert normalized_inputs == [[{"name": "brief"}, "ignored", {"name": "tooling"}]]
+
+
+def test_sdk_context_surface_failure_log_is_value_free(caplog) -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-sdk-context-8f21d7"
+
+  def fail_context_surfaces():
+    raise RuntimeError(secret)
+
+  runner = AgentSDKRunner(
+    event_log=EventLog(),
+    session_id="sess-sdk-context-failure",
+    sdk_config=AgentSDKConfig(
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    ),
+    capability_execution=stub_sdk_capability_execution(api_key=secret),
+    system_prompt="test",
+    context_surfaces=fail_context_surfaces,
+  )
+
+  with caplog.at_level("WARNING", logger="agent_gateway.sdk_runner"):
+    assert runner._context_surface_records() == []
+
+  assert secret not in caplog.text
+  assert "exception_type=RuntimeError" in caplog.text
 
 
 def test_sdk_runner_context_hook_resolves_parent_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -182,13 +257,12 @@ def test_sdk_runner_stream_forwards_ids_and_hook_resolves_namespaced_mcp(
     event_log=EventLog(),
     session_id="sess-sdk-timing",
     sdk_config=AgentSDKConfig(
-      api_key="k",
-      model="claude-sonnet-4-6",
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
       request_id="req-sdk-timing",
     ),
+    capability_execution=stub_sdk_capability_execution(),
     system_prompt="test",
     on_tool_timing=hooks.tool_timing_hook,
   )

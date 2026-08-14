@@ -4,9 +4,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from agent_gateway.autonomous_runner import AutonomousRegistry
 from agent_gateway.control_plane.runs_helpers import AutonomousResumeRequest
 from agent_gateway.control_plane.runs_resume_helpers import _build_autonomous_resume_context
+
+from .manifest_helpers import write_v6_manifest
 
 
 def _paths(log_dir: Path, task_id: str) -> dict[str, Path]:
@@ -35,36 +39,21 @@ def _write_manifest(
   completed_at: float | None = None,
   resumed_as: list[str] | None = None,
 ) -> dict[str, Any]:
-  paths = _paths(log_dir, task_id)
-  manifest = {
-    "manifest_version": 1,
-    "task_id": task_id,
-    "control_run_id": f"run-{task_id}",
-    "user_id": "user-h5",
-    "user_email": "user@example.com",
-    "profile": "analyst",
-    "mode": "skill",
-    "task": None,
-    "skill": "earnings-review",
-    "context": f"durable original context for {task_id}",
-    "ticker": "AAPL",
-    "channel": "tui",
-    "dev_mode": False,
-    "cmd": ["python3", "-m", "agent.autonomous"],
-    "log_path": str(paths["log"]),
-    "events_path": str(paths["events"]),
-    "operator_inbox_path": str(paths["operator"]),
-    "approval_decisions_path": str(paths["approvals"]),
-    "started_at": started_at,
-    "state": state,
-    "exit_code": 1 if state == "interrupted" else 0,
-    "error": "gateway restarted while run was active" if state == "interrupted" else None,
-    "completed_at": completed_at,
-    "resumed_from": None,
-    "resumed_as": resumed_as or [],
-  }
-  paths["manifest"].write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
-  return manifest
+  return write_v6_manifest(
+    log_dir,
+    task_id,
+    control_run_id=f"run-{task_id}",
+    user_id="user-h5",
+    user_email="user@example.com",
+    context=f"durable original context for {task_id}",
+    ticker="AAPL",
+    started_at=started_at,
+    state=state,
+    exit_code=1 if state == "interrupted" else 0,
+    error="gateway restarted while run was active" if state == "interrupted" else None,
+    completed_at=completed_at,
+    resumed_as=resumed_as or [],
+  )
 
 
 def _write_resume_evidence(log_dir: Path, task_id: str) -> None:
@@ -119,7 +108,7 @@ def _all_resume_evidence_exists(log_dir: Path, task_id: str) -> bool:
   return all(path.exists() for path in paths.values())
 
 
-def test_resume_context_rehydrates_from_manifest_and_evidence_files(tmp_path: Path) -> None:
+def _rehydrated_resume_context(tmp_path: Path) -> str:
   _write_manifest(tmp_path, "bg_10", state="interrupted", completed_at=200.0)
   _write_resume_evidence(tmp_path, "bg_10")
 
@@ -131,13 +120,46 @@ def test_resume_context_rehydrates_from_manifest_and_evidence_files(tmp_path: Pa
     AutonomousResumeRequest(message="operator resume instruction from request"),
   )
 
+  return context
+
+
+def test_resume_context_rehydrates_surviving_manifest_and_file_evidence(tmp_path: Path) -> None:
+  context = _rehydrated_resume_context(tmp_path)
   assert "state=interrupted" in context
   assert "operator resume instruction from request" in context
   assert "durable original context for bg_10" in context
-  assert "bg_10 durable event tail" in context
   assert "bg_10 durable log tail line" in context
   assert "bg_10 durable operator message" in context
+
+
+def test_resume_context_rehydrates_durable_event_and_tool_evidence(tmp_path: Path) -> None:
+  context = _rehydrated_resume_context(tmp_path)
+  assert "bg_10 durable event tail" in context
   assert "bg_10 durable completed tool result" in context
+
+
+@pytest.mark.parametrize(
+  "status",
+  ["missing", "unreadable", "partial_malformed", "tail_truncated", "path_mismatch"],
+)
+def test_resume_context_warns_for_every_incomplete_event_evidence_status(
+  tmp_path: Path,
+  status: str,
+) -> None:
+  _write_manifest(tmp_path, "bg_11", state="interrupted", completed_at=200.0)
+  registry = AutonomousRegistry(api_dir=tmp_path, log_dir=tmp_path)
+  record = registry._tasks["bg_11"]
+  record.events_evidence_status = status
+
+  context = _build_autonomous_resume_context(
+    record,
+    AutonomousResumeRequest(),
+  )
+
+  assert context.startswith(
+    f"durable event evidence for this run is {status}; treat all durable writes "
+    "as possibly already applied and inspect current state before writing"
+  )
 
 
 def test_registry_boot_keeps_resume_evidence_for_central_retention(monkeypatch, tmp_path: Path) -> None:

@@ -23,7 +23,6 @@ def test_runner_preserves_introspection_helper_aliases() -> None:
   assert gateway_runner._derive_sub_agent_id is derive_sub_agent_id
   assert package_derive_sub_agent_id is derive_sub_agent_id
   assert sub_agent_derive_sub_agent_id is derive_sub_agent_id
-  assert gateway_runner._format_exc is format_exc
   assert gateway_runner._detect_user_id_param is detect_user_id_param
   assert sdk_detect_user_id_param is detect_user_id_param
 

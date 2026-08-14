@@ -8,10 +8,11 @@ import logging
 import os
 import time
 from importlib import import_module
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, TYPE_CHECKING
+from typing import AbstractSet, Any, Callable, Dict, Literal, Mapping, Optional, Sequence, Set, TYPE_CHECKING
 
 from . import approval_settings
 from .approval_policy import (
+  ApprovalConstraint,
   ApprovalConstraintError,
   ApprovalDecision as PolicyApprovalDecision,
   ApprovalPolicy,
@@ -27,8 +28,34 @@ from .approval_constraints import (
   trusted_catalog_action,
 )
 from .event_log import EventLog
+from .investment_capability_claim import (
+  INVESTMENT_CAPABILITY_FACADE_TOOLS,
+  InvestmentCapabilityClaimError,
+  issue_investment_capability_claim,
+)
+from .control_plane.market_scan_occurrence import (
+  MarketScanOccurrenceMaterializationError,
+  ScheduledInvestmentRunAuthority,
+)
 from .mcp_client_catalog import tool_argument_guidance
-from .policy_imports import resolve_server_policy_tool_class
+from .policy_imports import (
+  authority_policy_denies_tool,
+  resolve_effective_role,
+  resolve_server_policy_tool_class,
+)
+from .run_identity import (
+  MODEL_RUN_IDENTITY_LOCAL_TOOLS,
+  MODEL_RUN_IDENTITY_MCP_TOOLS,
+  RunIdentityCarrier,
+  RunIdentityCarrierError,
+  mcp_metadata_skill_run_id,
+  validate_run_identity,
+)
+from .secret_boundary import (
+  SANITIZATION_FAILED,
+  SecretBoundary,
+  sanitize_boundary_value,
+)
 from .skill_context import current_skill
 from . import tool_dispatcher_audit as _audit_helpers
 from . import tool_dispatcher_approval_lifecycle as _approval_lifecycle_helpers
@@ -67,7 +94,6 @@ from .tool_dispatcher_helpers import (
   validate_against_local_schema as _validate_against_local_schema_helper,
   validate_local_tool_input as _validate_local_tool_input_helper,
 )
-
 if TYPE_CHECKING:
   from .mcp_client import McpClientManager
 
@@ -111,6 +137,22 @@ def _scope_text(value: Any) -> str | None:
   return value if value.strip() else None
 
 
+class _BoundaryEventLogProjection:
+  """Sanitize dispatcher-owned durable events while preserving log reads."""
+
+  def __init__(self, owner: "ToolDispatcher") -> None:
+    self._owner = owner
+
+  def append(self, event: dict[str, Any]) -> Any | None:
+    return self._owner._append_event(event)
+
+  def __getattr__(self, name: str) -> Any:
+    event_log = self._owner._event_log
+    if event_log is None:
+      raise AttributeError(name)
+    return getattr(event_log, name)
+
+
 class ToolDispatcher:
   """Route tool calls to local handlers or MCP servers.
 
@@ -139,7 +181,7 @@ class ToolDispatcher:
     on_headless_ask: HeadlessAskCallback | None = None,
     mcp_session_inject_servers: set[str] | None = None,
     mcp_meta_inject_servers: frozenset[str] | None = None,
-    mcp_identity_overrides: Mapping[str, int] | None = None,
+    mcp_identity_overrides: Mapping[str, str | int] | None = None,
     user_id: str | None = None,
     risk_user_id: int | None = None,
     channel: str | None = None,
@@ -164,6 +206,7 @@ class ToolDispatcher:
     self._request_approval = request_approval
     self._approved_tool_types = approved_tool_types if approved_tool_types is not None else set()
     self._event_log = event_log
+    self._boundary_event_log = _BoundaryEventLogProjection(self)
     self._approval_key_qualifier = approval_key_qualifier
     self._interceptors: Sequence[ToolInterceptor] = list(interceptors or [])
     self._session_id = session_id
@@ -175,7 +218,7 @@ class ToolDispatcher:
     self._user_id = user_id
     self._risk_user_id = risk_user_id
     self._channel = channel
-    self._role = role or "owner"
+    self._role = resolve_effective_role(role)
     self._credentials_resolver_active = credentials_resolver_active
     self._session_cache_denied = session_cache_denied_tools or frozenset()
     self._source_pack_session = session
@@ -189,6 +232,7 @@ class ToolDispatcher:
     self._commercial_work_start = commercial_work_start
     self._commercial_irreversible_recheck = commercial_irreversible_recheck
     self._commercial_mcp_servers = commercial_mcp_servers or frozenset()
+    self._secret_boundary = SecretBoundary()
     self._mcp_accepts_abort_event = self._callable_accepts_kw(getattr(self._mcp, "call_tool", None), "abort_event")
     if allowed_mcp_tools_by_server is None:
       self._allowed_mcp_tools_by_server = None
@@ -199,6 +243,36 @@ class ToolDispatcher:
         str(server_name): {str(tool_name) for tool_name in tool_names}
         for server_name, tool_names in allowed_mcp_tools_by_server.items()
       }
+
+  def bind_secret_boundary(self, boundary: SecretBoundary) -> None:
+    """Bind lifecycle-local secret knowledge supplied by the owning runner."""
+
+    if not isinstance(boundary, SecretBoundary):
+      raise TypeError("dispatcher secret boundary must be SecretBoundary")
+    self._secret_boundary = boundary
+
+  def _append_event(self, event: dict[str, Any]) -> Any | None:
+    if self._event_log is None:
+      return None
+    projected = sanitize_boundary_value(
+      event,
+      sink="dispatcher_event",
+      boundary=self._secret_boundary,
+    )
+    if not isinstance(projected, dict):
+      projected = {
+        "type": "dispatcher_boundary_failure",
+        "message": SANITIZATION_FAILED,
+      }
+    return self._event_log.append(projected)
+
+  def get_tool_definitions(self) -> list[dict[str, Any]]:
+    """Return the exact tool catalog enforced by this dispatcher."""
+    if self._get_tool_definitions is not None:
+      return list(self._get_tool_definitions())
+    if self._mcp is not None:
+      return list(self._mcp.get_tool_definitions())
+    return []
 
   def ensure_gateway_local_tool_handler(self, tool_name: str) -> bool:
     return _skill_tool_helpers.ensure_gateway_local_tool_handler(
@@ -263,7 +337,11 @@ class ToolDispatcher:
       tool_input,
       local_tool_handlers=self._local,
       get_tool_definitions=self._get_tool_definitions,
-      event_log=self._event_log,
+      event_log=(
+        self._boundary_event_log
+        if self._event_log is not None
+        else None
+      ),
       active_local_tool_schema_fn=self._active_local_tool_schema,
       validate_against_local_schema_fn=self._validate_against_local_schema,
     )
@@ -279,7 +357,11 @@ class ToolDispatcher:
       tool_name,
       tool_input,
       interceptors=self._interceptors,
-      event_log=self._event_log,
+      event_log=(
+        self._boundary_event_log
+        if self._event_log is not None
+        else None
+      ),
       session_id=self._session_id,
       log=log,
     )
@@ -289,6 +371,35 @@ class ToolDispatcher:
       tool_name,
       server_name,
       allowed_mcp_tools_by_server=self._allowed_mcp_tools_by_server,
+      scope_context=self._mcp_scope_context,
+      describe_scope_block=self._describe_mcp_scope_block,
+    )
+
+  def _wire_mcp_scope_error(
+    self,
+    tool_name: str,
+    server_name: str | None,
+    advertised_tool_names: AbstractSet[str] | None,
+  ) -> Dict[str, Any] | None:
+    """Reject MCP calls absent from the exact provider-request tool snapshot."""
+
+    if advertised_tool_names is None:
+      return {
+        "code": "mcp_tool_not_allowed",
+        "sub_code": "advertisement_unavailable",
+        "message": "The advertised MCP tool snapshot is unavailable; dispatch was denied.",
+      }
+    if tool_name in advertised_tool_names:
+      return None
+    advertised_scope = (
+      {server_name: set(advertised_tool_names)}
+      if server_name
+      else {}
+    )
+    return _runtime_helpers.mcp_scope_error(
+      tool_name,
+      server_name,
+      allowed_mcp_tools_by_server=advertised_scope,
       scope_context=self._mcp_scope_context,
       describe_scope_block=self._describe_mcp_scope_block,
     )
@@ -389,6 +500,15 @@ class ToolDispatcher:
     prepared_accept = getattr(finalizer, "prepared_accept", None)
     serializer = getattr(prepared_accept, "to_canonical_bytes", None)
     if not callable(serializer):
+      # Blocked/non-success verdicts intentionally carry no accepted business
+      # model. They still execute through the generic exact-plan lifecycle;
+      # only an actual accept is eligible for the stronger durable replay row.
+      if (
+        finalizer is None
+        and prepared_accept is None
+        and hasattr(completion, "projection")
+      ):
+        return None
       raise TrustedToolPlanError(
         "business-model exact plan lost its immutable accept payload"
       )
@@ -417,7 +537,7 @@ class ToolDispatcher:
 
     from research.patch_engine import prepare_raw_patch_apply
     from research.repository import get_repository_factory
-    from research.route_deps import route_workspace_dir
+    from research.workspace_paths import route_workspace_dir
 
     run_context = self._resolve_run_context()
     user_id = str(run_context.user_id or "").strip()
@@ -465,7 +585,11 @@ class ToolDispatcher:
     return ToolExecutionContext(
       tool_call_id=tool_call_id,
       tool_name=tool_name,
-      event_log=self._event_log,
+      event_log=(
+        self._boundary_event_log
+        if self._event_log is not None
+        else None
+      ),
       resolved_qualifier=qualifier,
       abort_event=abort_event,
       skill_run_id=skill_run_id,
@@ -485,6 +609,7 @@ class ToolDispatcher:
     tool_input: Dict[str, Any],
     *,
     call_index: int = 0,
+    advertised_tool_names: AbstractSet[str] | None = None,
     abort_event: asyncio.Event | None = None,
     skill_run_id: str | None = None,
     step_id: str | None = None,
@@ -509,10 +634,52 @@ class ToolDispatcher:
       - Interceptor warnings are attached to successful dict results under
         `_interceptor_warnings`.
     """
+    self.ensure_gateway_local_tool_handler(tool_name)
+    lifecycle_tool_name = tool_name
+    get_original_tool_name = getattr(self._mcp, "get_original_tool_name", None)
+    if callable(get_original_tool_name):
+      try:
+        lifecycle_tool_name = str(
+          get_original_tool_name(tool_name) or tool_name
+        )
+      except Exception:
+        lifecycle_tool_name = tool_name
+    if authority_policy_denies_tool(
+      session=self._session,
+      role=self._role,
+      tool_name=tool_name,
+      is_local=tool_name in self._local,
+      profile_name=str(getattr(self._run_context, "profile", "") or "") or None,
+    ):
+      return None, {
+        "code": "role_policy_denied",
+        "message": f"Role '{self._role}' is not authorized to execute '{tool_name}'",
+      }
+
     if abort_event is not None and abort_event.is_set():
       raise asyncio.CancelledError()
 
-    self.ensure_gateway_local_tool_handler(tool_name)
+    if lifecycle_tool_name in (
+      MODEL_RUN_IDENTITY_MCP_TOOLS | MODEL_RUN_IDENTITY_LOCAL_TOOLS
+    ):
+      try:
+        carrier = RunIdentityCarrier.from_optional(skill_run_id)
+        if carrier is None:
+          raise RunIdentityCarrierError(
+            "run_identity_required",
+            f"Tool '{lifecycle_tool_name}' requires a server-owned run identity.",
+          )
+        run_context_id = validate_run_identity(
+          self._resolve_run_context().run_id
+        )
+        if run_context_id != carrier.run_id:
+          raise RunIdentityCarrierError(
+            "run_identity_mismatch",
+            f"Tool '{lifecycle_tool_name}' received conflicting run identities.",
+          )
+      except RunIdentityCarrierError as exc:
+        return None, {"code": exc.code, "message": str(exc)}
+
     input_schema_error = self._validate_local_tool_input(tool_call_id, tool_name, tool_input)
     if input_schema_error is not None:
       return None, input_schema_error
@@ -528,7 +695,14 @@ class ToolDispatcher:
       return None, ir.error
 
     if tool_name not in self._local and self._mcp.is_mcp_tool(tool_name):
-      scope_error = self._mcp_scope_error(tool_name, self._mcp.get_server_for_tool(tool_name))
+      server_name = self._mcp.get_server_for_tool(tool_name)
+      scope_error = self._wire_mcp_scope_error(
+        tool_name,
+        server_name,
+        advertised_tool_names,
+      )
+      if scope_error is None:
+        scope_error = self._mcp_scope_error(tool_name, server_name)
       if scope_error is not None:
         return None, scope_error
 
@@ -621,13 +795,21 @@ class ToolDispatcher:
       except PlannedWritePlanningRejected as exc:
         return exc.tool_result()
       except (ApprovalConstraintError, TrustedToolPlanError) as exc:
-        log.error("Invalid exact-plan contract for %s: %s", tool_name, exc)
+        log.error(
+          "Invalid exact-plan contract for %s | exception_type=%s",
+          tool_name,
+          type(exc).__name__,
+        )
         return None, {
           "code": "planned_write_contract_invalid",
           "message": f"Tool '{tool_name}' has an invalid exact-write planning contract.",
         }
-      except Exception:
-        log.exception("Exact-write planning failed for %s", tool_name)
+      except Exception as exc:
+        log.error(
+          "Exact-write planning failed for %s | exception_type=%s",
+          tool_name,
+          type(exc).__name__,
+        )
         return None, {
           "code": "planned_write_planning_failed",
           "message": f"Tool '{tool_name}' could not produce a trusted exact-write plan.",
@@ -654,13 +836,19 @@ class ToolDispatcher:
           tool_ctx=tool_ctx,
         )
       except TrustedToolPlanError as exc:
-        log.error("Invalid raw MCP exact-plan contract: %s", exc)
+        log.error(
+          "Invalid raw MCP exact-plan contract | exception_type=%s",
+          type(exc).__name__,
+        )
         return None, {
           "code": "planned_write_contract_invalid",
           "message": "Tool 'apply_patch_ops' has an invalid exact-write plan.",
         }
-      except Exception:
-        log.exception("Exact-write planning failed for apply_patch_ops")
+      except Exception as exc:
+        log.error(
+          "Exact-write planning failed for apply_patch_ops | exception_type=%s",
+          type(exc).__name__,
+        )
         return None, {
           "code": "planned_write_planning_failed",
           "message": "Tool 'apply_patch_ops' could not produce a trusted exact-write plan.",
@@ -679,8 +867,7 @@ class ToolDispatcher:
 
     if (
       trusted_plan is None
-      and
-      not static_needs_approval
+      and not static_needs_approval
       and not dynamic_ask
       and self._tool_was_cache_hit(tool_name, qualifier)
     ):
@@ -739,7 +926,10 @@ class ToolDispatcher:
                 raw = await raw
               hook_result = raw if raw in ("allow", "deny") else "deny"
             except Exception as exc:
-              log.warning("Headless ask hook failed: %s — auto-denying", exc)
+              log.warning(
+                "Headless ask hook failed; auto-denying | exception_type=%s",
+                type(exc).__name__,
+              )
           if hook_result == "allow":
             automatic_approval_reason = (
               "Headless approval hook authorized the exact planned identity"
@@ -978,8 +1168,12 @@ class ToolDispatcher:
             deny_user_prompt=deny_user_prompt,
           )
         )
-      except Exception:
-        log.exception("Durable exact-write authorization failed for %s", tool_name)
+      except Exception as exc:
+        log.error(
+          "Durable exact-write authorization failed for %s | exception_type=%s",
+          tool_name,
+          type(exc).__name__,
+        )
         return None, {
           "code": "planned_write_authorization_persistence_failed",
           "message": (
@@ -1076,7 +1270,11 @@ class ToolDispatcher:
           raise TrustedToolPlanError("approval lifecycle returned no durable request")
         trusted_plan.verify_approval_request(approval_request_record)
       except TrustedToolPlanError as exc:
-        log.error("Unbound exact-write approval for %s: %s", tool_name, exc)
+        log.error(
+          "Unbound exact-write approval for %s | exception_type=%s",
+          tool_name,
+          type(exc).__name__,
+        )
         return None, {
           "code": "planned_write_authorization_identity_invalid",
           "message": f"Tool '{tool_name}' approval did not bind the exact planned identity.",
@@ -1174,7 +1372,7 @@ class ToolDispatcher:
             else f"Tool '{tool_name}' requires static approval in headless context"
           )
           if self._event_log is not None:
-            self._event_log.append(
+            self._append_event(
               {
                 "type": "headless_auto_deny",
                 "tool_call_id": tool_call_id,
@@ -1209,7 +1407,10 @@ class ToolDispatcher:
               raw = await raw
             hook_result = raw if raw in ("allow", "deny") else "deny"
           except Exception as exc:
-            log.warning("Headless ask hook failed: %s — auto-denying", exc)
+            log.warning(
+              "Headless ask hook failed; auto-denying | exception_type=%s",
+              type(exc).__name__,
+            )
             hook_result = "deny"
 
         if hook_result != "allow":
@@ -1219,7 +1420,7 @@ class ToolDispatcher:
             else "Approval required in headless context"
           )
           if self._event_log is not None:
-            self._event_log.append(
+            self._append_event(
               {
                 "type": "headless_auto_deny",
                 "tool_call_id": tool_call_id,
@@ -1384,10 +1585,22 @@ class ToolDispatcher:
             "code": "planned_write_trusted_plan_lost",
             "message": f"Tool '{tool_name}' lost its trusted exact-write authorization.",
           }
+        executor_parameters = inspect.signature(
+          planned_executor
+        ).parameters
+        assert approval_request_record is not None
+        assert tool_ctx.approval_id
+        assert tool_ctx.approval_chain_id
         try:
-          trusted_plan.verify_approval_request(approval_request_record)
+          trusted_plan.verify_approval_request(
+            approval_request_record
+          )
         except TrustedToolPlanError as exc:
-          log.error("Exact-write authorization drift for %s: %s", tool_name, exc)
+          log.error(
+            "Exact-write authorization drift for %s | exception_type=%s",
+            tool_name,
+            type(exc).__name__,
+          )
           return None, {
             "code": "planned_write_trusted_plan_lost",
             "message": f"Tool '{tool_name}' lost its trusted exact-write authorization.",
@@ -1403,7 +1616,6 @@ class ToolDispatcher:
           "approval_chain_id": tool_ctx.approval_chain_id,
           **local_kwargs,
         }
-        executor_parameters = inspect.signature(planned_executor).parameters
         if "approval_request" in executor_parameters or any(
           parameter.kind is inspect.Parameter.VAR_KEYWORD
           for parameter in executor_parameters.values()
@@ -1434,16 +1646,16 @@ class ToolDispatcher:
           "code": "commercial_mcp_destination_denied",
           "message": "Commercial work cannot be dispatched to this MCP destination.",
         }
-      if server and callable(getattr(self._mcp, "is_per_user_server", None)) and self._mcp.is_per_user_server(server):
-        resolved_risk_user_id = self._mcp_identity_overrides.get(server, self._risk_user_id)
-        result, error = await self._call_mcp_tool(
-          tool_name,
-          final_tool_input,
-          abort_event=abort_event,
-          user_id=resolved_risk_user_id,
+      per_user_server = bool(
+        server
+        and callable(getattr(self._mcp, "is_per_user_server", None))
+        and self._mcp.is_per_user_server(server)
+      )
+      if server and server in self._mcp_meta_inject_servers:
+        resolved_risk_user_id = self._mcp_identity_overrides.get(
+          server,
+          self._risk_user_id,
         )
-      elif server and server in self._mcp_meta_inject_servers:
-        resolved_risk_user_id = self._mcp_identity_overrides.get(server, self._risk_user_id)
         if resolved_risk_user_id is None and self._user_id is not None and str(self._user_id).isdigit():
           resolved_risk_user_id = int(str(self._user_id))
         if self._credentials_resolver_active and not resolved_risk_user_id:
@@ -1454,18 +1666,157 @@ class ToolDispatcher:
           "channel": self._channel,
           "role": self._role,
         }
-        if skill_run_id is not None:
-          meta["skill_run_id"] = skill_run_id
+        routed_skill_run_id = mcp_metadata_skill_run_id(
+          lifecycle_tool_name,
+          skill_run_id,
+        )
+        if routed_skill_run_id is not None:
+          meta["skill_run_id"] = routed_skill_run_id
         if workspace_dir is not None:
           meta["workspace_dir"] = workspace_dir
         if batch_id is not None:
           meta["batch_id"] = str(batch_id)
-        result, error = await self._call_mcp_tool(tool_name, final_tool_input, meta=meta, abort_event=abort_event)
+        if (
+          server == "idea-workbench-mcp"
+          and lifecycle_tool_name in INVESTMENT_CAPABILITY_FACADE_TOOLS
+        ):
+          run_context = self._resolve_run_context()
+          scheduled_authority = run_context.scheduled_investment_authority
+          if (
+            scheduled_authority is not None
+            and type(scheduled_authority) is not ScheduledInvestmentRunAuthority
+          ):
+            return None, {
+              "code": "scheduled_investment_authority_invalid",
+              "message": "Trusted scheduled investment authority is invalid.",
+            }
+          if (
+            scheduled_authority is not None
+            and lifecycle_tool_name != "start_investment_run"
+          ):
+            return None, {
+              "code": "scheduled_investment_tool_not_allowed",
+              "message": (
+                "Trusted scheduled investment authority permits only the exact "
+                "scheduled start operation."
+              ),
+            }
+          if lifecycle_tool_name == "start_investment_run":
+            if scheduled_authority is None:
+              if "external_refs" in final_tool_input:
+                return None, {
+                  "code": "scheduled_investment_authority_required",
+                  "message": (
+                    "Schedule references require trusted scheduled investment "
+                    "authority."
+                  ),
+                }
+            else:
+              try:
+                final_tool_input = scheduled_authority.bind_tool_arguments(
+                  final_tool_input
+                )
+              except MarketScanOccurrenceMaterializationError:
+                return None, {
+                  "code": "scheduled_investment_authority_mismatch",
+                  "message": (
+                    "Investment facade arguments do not match the trusted "
+                    "scheduled occurrence."
+                  ),
+                }
+          run_context_skill = str(run_context.skill or "").strip()
+          active_skill = str(current_skill() or "").strip()
+          if (
+            run_context_skill
+            and active_skill
+            and run_context_skill != active_skill
+          ):
+            return None, {
+              "code": "investment_capability_claim_unavailable",
+              "message": (
+                "Trusted investment capability identity is unavailable for "
+                f"tool '{lifecycle_tool_name}'."
+              ),
+            }
+          trusted_skill = run_context_skill or active_skill
+          trusted_research_file_id: int | None = None
+          if lifecycle_tool_name == "start_quant_research":
+            trusted_research_file_id = run_context.research_file_id
+            request_payload = final_tool_input.get("request")
+            request_research_file_id = (
+              request_payload.get("research_file_id")
+              if isinstance(request_payload, dict)
+              else None
+            )
+            if (
+              isinstance(trusted_research_file_id, bool)
+              or not isinstance(trusted_research_file_id, int)
+              or not 1 <= trusted_research_file_id < (1 << 63)
+              or isinstance(request_research_file_id, bool)
+              or not isinstance(request_research_file_id, int)
+              or request_research_file_id != trusted_research_file_id
+            ):
+              return None, {
+                "code": "investment_capability_claim_unavailable",
+                "message": (
+                  "Trusted investment capability identity is unavailable for "
+                  f"tool '{lifecycle_tool_name}'."
+                ),
+              }
+          try:
+            meta["investment_capability_claim"] = (
+              issue_investment_capability_claim(
+                user_id=str(resolved_risk_user_id or ""),
+                session_id=str(self._session_id or run_context.session_id or ""),
+                skill_run_id=str(skill_run_id or ""),
+                channel=str(self._channel or run_context.channel or ""),
+                tool_name=lifecycle_tool_name,
+                request_id=str(run_context.request_id or ""),
+                jti=str(tool_call_id or ""),
+                skill=trusted_skill,
+                policy_bundle_hash=str(run_context.policy_bundle_hash or ""),
+                research_file_id=trusted_research_file_id,
+              )
+            )
+          except InvestmentCapabilityClaimError:
+            return None, {
+              "code": "investment_capability_claim_unavailable",
+              "message": (
+                "Trusted investment capability identity is unavailable for "
+                f"tool '{lifecycle_tool_name}'."
+              ),
+            }
+        result, error = await ToolDispatcher._call_mcp_tool(
+          self,
+          tool_name,
+          final_tool_input,
+          meta=meta,
+          abort_event=abort_event,
+          gateway_session=self._session if per_user_server else None,
+        )
+      elif server and per_user_server:
+        result, error = await ToolDispatcher._call_mcp_tool(
+          self,
+          tool_name,
+          final_tool_input,
+          abort_event=abort_event,
+          gateway_session=self._session,
+        )
       elif server and server in self._mcp_session_inject_servers:
         final_tool_input = {**final_tool_input, "_session_id": self._session_id}
-        result, error = await self._call_mcp_tool(tool_name, final_tool_input, abort_event=abort_event)
+        result, error = await ToolDispatcher._call_mcp_tool(
+          self,
+          tool_name,
+          final_tool_input,
+          abort_event=abort_event,
+        )
       else:
-        result, error = await self._call_mcp_tool(tool_name, final_tool_input, abort_event=abort_event)
+        result, error = await ToolDispatcher._call_mcp_tool(
+          self,
+          tool_name,
+          final_tool_input,
+          abort_event=abort_event,
+        )
     else:
       result, error = None, {"code": "unknown_tool", "message": f"Unknown tool: {tool_name}"}
 
@@ -1636,6 +1987,8 @@ class ToolDispatcher:
     qualifier: str,
     reason: str,
     allow_persistent: bool,
+    approval_constraint: ApprovalConstraint = "standard",
+    required_owner_user_id: str | None = None,
     approval_identity: Mapping[str, Any] | None = None,
     prepared_authorization_payload: bytes | None = None,
     prepared_business_model_change: Mapping[str, Any] | None = None,
@@ -1657,6 +2010,8 @@ class ToolDispatcher:
       qualifier=qualifier,
       reason=reason,
       allow_persistent=allow_persistent,
+      approval_constraint=approval_constraint,
+      required_owner_user_id=required_owner_user_id,
       approval_identity=approval_identity,
       prepared_authorization_payload=prepared_authorization_payload,
       prepared_business_model_change=prepared_business_model_change,
@@ -1674,6 +2029,7 @@ class ToolDispatcher:
       effective_trade_approval_decision_fn=self._effective_trade_approval_decision,
       await_user_approval_via_pending_tools_fn=self._await_user_approval_via_pending_tools,
       approval_queue_timeout_seconds_fn=_approval_queue_timeout_seconds,
+      secret_boundary=getattr(self, "_secret_boundary", None),
     )
 
   async def _await_user_approval_via_pending_tools(
@@ -1690,7 +2046,7 @@ class ToolDispatcher:
     return await _approval_lifecycle_helpers.await_user_approval_via_pending_tools(
       session=self._session,
       approval_store=self._approval_store,
-      event_log=self._event_log,
+      event_log=self._boundary_event_log,
       request=request,
       decision=decision,
       nonce=nonce,
@@ -1862,7 +2218,7 @@ class ToolDispatcher:
     request: PolicyApprovalRequest | None,
     raw_tool_args: Dict[str, Any],
     *,
-    outcome: str,
+    outcome: Literal["success", "tool_error", "cancelled"],
     error_summary: str | None = None,
   ) -> None:
     await _audit_helpers.emit_execution_audit(
@@ -1871,6 +2227,11 @@ class ToolDispatcher:
       approval_store=self._approval_store,
       outcome=outcome,
       error_summary=error_summary,
+      boundary_sanitizer=lambda value, sink: sanitize_boundary_value(
+        value,
+        sink=sink,
+        boundary=self._secret_boundary,
+      ),
     )
 
   async def _call_mcp_tool(
@@ -1880,7 +2241,7 @@ class ToolDispatcher:
     *,
     meta: Dict[str, Any] | None = None,
     abort_event: asyncio.Event | None = None,
-    user_id: str | int | None = None,
+    gateway_session: Any | None = None,
   ) -> ToolResult:
     kwargs: Dict[str, Any] = {}
     effective_meta = dict(meta or {})
@@ -1906,8 +2267,8 @@ class ToolDispatcher:
       kwargs["meta"] = effective_meta
     if abort_event is not None and self._mcp_accepts_abort_event:
       kwargs["abort_event"] = abort_event
-    if user_id is not None:
-      kwargs["user_id"] = user_id
+    if gateway_session is not None:
+      kwargs["gateway_session"] = gateway_session
     result, error = await self._mcp.call_tool(tool_name, tool_input, **kwargs)
     if isinstance(error, dict) and "tool_usage_hint" not in error and _is_mcp_validation_error(error):
       hint = self._mcp_tool_argument_guidance(tool_name)
@@ -2011,7 +2372,7 @@ class ToolDispatcher:
     allow_tool_type_applied: bool,
   ) -> None:
     _audit_helpers.emit_approval_decided(
-      self._event_log,
+      self._boundary_event_log,
       tool_call_id,
       tool_name,
       outcome=outcome,

@@ -10,7 +10,6 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional
 
 from fastapi import FastAPI, HTTPException
 
-from ._provider_utils import _get_allowed_models_for_provider_name
 from .agent_session_log import _atomic_write_sidecar
 from .approval_audit import ApprovalAuditEmitter
 from .approval_notifications import (
@@ -20,13 +19,31 @@ from .approval_notifications import (
 from .approval_resolver import resolve_policy
 from .approval_store import SQLiteApprovalStore, resolve_approval_db_path
 from .audit_resolver import resolve_audit_writer
-from .auth import CredentialRefreshRequest, CredentialsResolver, ProviderCredentialFailure
+from .capability_binding import (
+  CAPABILITY_IDS,
+  AuthContext,
+  CapabilityId,
+  CapabilityResolutionError,
+  CredentialHandle,
+  ModelSelectionIntent,
+  eligible_model_choices,
+  resolve_capability_model,
+)
+from .capability_execution import CapabilityExecutionResolver
+from .model_registry import ProductModelRegistry, ProductModelSelectionPolicy
 from .event_adapter import adapt_event
 from .event_log import EventLog, log_has_terminal
 from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 from .product_config import gateway_product_id
 from .providers import StreamEvent
-from .session import GatewaySession, SessionStore, SessionStream, StreamSubscriber
+from .runner_introspection import exception_traceback_already_logged
+from .session import (
+  GatewaySession,
+  SessionStore,
+  SessionStream,
+  StreamSubscriber,
+  bind_session_capability_selections,
+)
 from .session_recap import emit_recap_then_terminal
 from . import server_chat_stream_core as _chat_stream_core
 from . import server_chat_transcripts as _chat_transcripts
@@ -41,12 +58,20 @@ from .ui_blocks_run import (
 from .server_artifact_helpers import _json_dumps, _model_to_dict
 from .server_models import (
   BuildChatRuntime,
+  CapabilityChoice,
+  CapabilityChoiceNotice,
+  CapabilityChoiceResponse,
+  CapabilityChoiceSelection,
+  CapabilitySelection,
   ChatRequest,
   ChatRuntime,
   ChatTurnInputs,
   ChatTurnResult,
   GatewayServerConfig,
+  MaterializedCredential,
+  PreparedChatTurn,
   RequestApproval,
+  SessionExecutionPolicy,
   _ACTIVE_TURN_GRACE_SECONDS,
   _STREAM_SUBSCRIBER_DONE,
   _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS,
@@ -162,7 +187,9 @@ def _redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> 
       deployment_secret=get_audit_hmac_secret(),
     )
   except Exception:
-    return dict(tool_input)
+    from .secret_boundary import sanitization_failure_tool_input
+
+    return sanitization_failure_tool_input()
 
 
 async def _cleanup_sessions_loop(
@@ -417,12 +444,23 @@ def _make_request_approval(
 
 
 def _chat_turn_state_from_events(events: list[dict[str, Any]]) -> str:
-  for event in reversed(events):
+  for event in events:
     event_type = event.get("type")
     if event_type == "error":
       return "failed"
+    if event_type in {
+      "operator_pause",
+      "budget_exceeded",
+      "max_turns_reached",
+    }:
+      continue
     if event_type == "stream_complete":
-      return "completed"
+      disposition = event.get("terminal_disposition")
+      if disposition == "completed":
+        return "completed"
+      if disposition == "interrupted":
+        return "interrupted"
+      return "failed"
   return "completed" if events else "starting"
 
 
@@ -449,6 +487,435 @@ def _latest_chat_run_state(session: GatewaySession, session_id: str) -> str | No
   return None
 
 
+def build_capability_choices(
+  *,
+  session: GatewaySession,
+  build_chat_runtime: BuildChatRuntime,
+) -> dict[str, CapabilityChoiceResponse]:
+  """Return only authenticated, session-executable stable-key choices."""
+
+  resolver = _capability_execution_resolver_for_session(
+    session=session,
+    build_chat_runtime=build_chat_runtime,
+  )
+  registry = resolver.registry
+  policy_artifact = resolver.selection_policy
+  responses: dict[str, CapabilityChoiceResponse] = {}
+  preference_store = getattr(
+    build_chat_runtime,
+    "_gateway_model_preference_store",
+    None,
+  )
+  for capability_id, policy in sorted(policy_artifact.capabilities.items()):
+    if capability_id != "session.driver" and not policy.allow_authenticated_run_override:
+      continue
+    eligible = eligible_model_choices(
+      capability_id,
+      registry=registry,
+      selection_policy=policy_artifact,
+      auth=resolver.auth_context,
+    )
+    choices = [
+      CapabilityChoice(
+        model_key=choice.key,
+        label=choice.label,
+        supported_efforts=list(choice.supported_efforts),
+        default_effort=choice.default_effort,
+        lifecycle=choice.lifecycle,
+      )
+      for choice in eligible
+    ]
+    notices: list[CapabilityChoiceNotice] = []
+    selected: CapabilityChoiceSelection | None = None
+    if policy.default.kind == "inherit_parent":
+      notices.append(CapabilityChoiceNotice(
+        code="inherits_parent",
+        message=f"{capability_id} inherits the exact parent binding by default.",
+      ))
+    else:
+      saved_preference = None
+      if capability_id == "session.driver" and preference_store is not None:
+        saved_preference = preference_store.get(
+          tenant_id=resolver.auth_context.tenant_id,
+          actor_id=resolver.auth_context.actor_id,
+          capability_id=capability_id,
+        )
+      try:
+        bind = resolve_capability_model(
+          capability_id,
+          registry=registry,
+          selection_policy=policy_artifact,
+          auth=resolver.auth_context,
+          saved_preference=saved_preference,
+          trusted_channel=resolver.trusted_channel,
+        )
+      except CapabilityResolutionError as exc:
+        notices.append(CapabilityChoiceNotice(
+          code=exc.code,
+          message=str(exc),
+          model_key=exc.model_key,
+        ))
+      else:
+        entry = registry.require(bind.model_key)
+        selected = CapabilityChoiceSelection(
+          model_key=bind.model_key,
+          label=entry.label,
+          effort=bind.effort,
+          reason=bind.selection_source,
+        )
+        if (
+          saved_preference is not None
+          and bind.selection_source != "saved_preference"
+        ):
+          notices.append(CapabilityChoiceNotice(
+            code="saved_preference_not_applied",
+            message=(
+              "The saved preference is currently ineligible and was not "
+              "applied; it remains saved until replaced or cleared."
+            ),
+            model_key=saved_preference.model_key,
+          ))
+    responses[capability_id] = CapabilityChoiceResponse(
+      capability=capability_id,
+      catalog_revision=registry.revision,
+      policy_revision=policy_artifact.revision,
+      selected=selected,
+      notices=notices,
+      choices=choices,
+    )
+  return responses
+
+
+def _session_driver_auth_context(
+  *,
+  session: GatewaySession,
+  tenant_id: str,
+  service_provider_handles: dict[str, CredentialHandle],
+) -> AuthContext:
+  session_handle = session.session_credential_handle
+  user_handles: dict[str, CredentialHandle] = {}
+  service_handles = dict(service_provider_handles)
+  if session_handle is not None:
+    if session_handle.principal == "user":
+      user_handles[session_handle.provider] = session_handle
+    else:
+      service_handles[session_handle.provider] = session_handle
+
+  actor_id = str(session.owner_user_id or session.user_id or "").strip()
+  return AuthContext(
+    run_mode="interactive",
+    actor_id=actor_id,
+    tenant_id=tenant_id,
+    user_provider_handles=user_handles,
+    service_provider_handles=service_handles,
+    entitled_capabilities=session.model_entitled_capabilities,
+    entitled_model_keys=session.model_entitled_keys,
+    allow_service_for_interactive=session.allow_service_for_interactive,
+  )
+
+
+def _materialize_credential(
+  *,
+  session: GatewaySession,
+  handle: CredentialHandle,
+  service_auth_config_resolver: Callable[
+    [CredentialHandle],
+    MaterializedCredential,
+  ] | None,
+) -> MaterializedCredential:
+  if handle is session.session_credential_handle:
+    if session.auth_config is None:
+      raise RuntimeError(
+        "selected session credential handle has no session credential material"
+      )
+    return MaterializedCredential(
+      handle=handle,
+      auth_config=session.auth_config,
+    )
+
+  if handle.principal != "service":
+    raise RuntimeError("non-session user credential handles are not supported")
+  if service_auth_config_resolver is None:
+    raise RuntimeError(
+      f"service credential materializer is missing for provider {handle.provider}"
+    )
+  materialized = service_auth_config_resolver(handle)
+  if not isinstance(materialized, MaterializedCredential):
+    raise RuntimeError(
+      "service credential materializer must return MaterializedCredential"
+    )
+  if materialized.handle is not handle:
+    raise RuntimeError(
+      "service credential materializer returned a different credential handle"
+    )
+  return materialized
+
+
+def _capability_execution_resolver_for_session(
+  *,
+  session: GatewaySession,
+  build_chat_runtime: BuildChatRuntime,
+  run_overrides: dict[CapabilityId, ModelSelectionIntent] | None = None,
+) -> CapabilityExecutionResolver:
+  registry: ProductModelRegistry | None = getattr(
+    build_chat_runtime,
+    "_gateway_model_registry",
+    None,
+  )
+  selection_policy: ProductModelSelectionPolicy | None = getattr(
+    build_chat_runtime,
+    "_gateway_model_selection_policy",
+    None,
+  )
+  if registry is None or selection_policy is None:
+    raise CapabilityResolutionError(
+      "capability_policy_missing",
+      "deployment capability policy is not configured",
+      capability_id="session.driver",
+    )
+
+  configured_tenant = str(
+    getattr(build_chat_runtime, "_gateway_tenant_id", "") or ""
+  ).strip()
+  session_tenant = str(session.tenant_id or "").strip()
+  tenant_id = session_tenant or configured_tenant
+  if not tenant_id:
+    raise RuntimeError("tenant_id is required for capability-bound chat")
+  if (
+    configured_tenant
+    and session_tenant
+    and configured_tenant != session_tenant
+  ):
+    raise RuntimeError("session tenant does not match gateway tenant")
+
+  service_handles = dict(
+    getattr(
+      build_chat_runtime,
+      "_gateway_service_provider_handles",
+      {},
+    )
+    or {}
+  )
+  auth = _session_driver_auth_context(
+    session=session,
+    tenant_id=tenant_id,
+    service_provider_handles=service_handles,
+  )
+  adapter_resolver = getattr(
+    build_chat_runtime,
+    "_gateway_capability_adapter_resolver",
+    None,
+  )
+  if adapter_resolver is None:
+    raise RuntimeError("capability adapter resolver is not configured")
+  return CapabilityExecutionResolver(
+    registry=registry,
+    selection_policy=selection_policy,
+    auth_context=auth,
+    credential_materializer=lambda handle: _materialize_credential(
+      session=session,
+      handle=handle,
+      service_auth_config_resolver=getattr(
+        build_chat_runtime,
+        "_gateway_service_auth_config_resolver",
+        None,
+      ),
+    ),
+    adapter_resolver=adapter_resolver,
+    trusted_channel=session.channel,
+    authenticated_run_overrides=(
+      dict(session.capability_run_overrides)
+      if run_overrides is None
+      else run_overrides
+    ),
+  )
+
+
+def bind_init_capability_selections(
+  *,
+  session: GatewaySession,
+  selections: dict[str, CapabilitySelection],
+  build_chat_runtime: BuildChatRuntime,
+) -> None:
+  """Validate, materialize, and freeze init-time role selections."""
+
+  selection_policy: ProductModelSelectionPolicy | None = getattr(
+    build_chat_runtime,
+    "_gateway_model_selection_policy",
+    None,
+  )
+  if selection_policy is None:
+    raise CapabilityResolutionError(
+      "capability_policy_missing",
+      "deployment capability policy is not configured",
+      capability_id="session.driver",
+    )
+
+  normalized: dict[CapabilityId, CapabilitySelection] = {}
+  for raw_capability_id, selection in selections.items():
+    capability_id = str(raw_capability_id or "").strip()
+    if capability_id not in CAPABILITY_IDS:
+      raise CapabilityResolutionError(
+        "unknown_capability",
+        f"unknown capability_id: {capability_id!r}",
+        capability_id=capability_id,
+      )
+    policy = selection_policy.capabilities.get(capability_id)
+    if (
+      policy is None
+      or capability_id in {"session.driver", "node.fork"}
+      or not policy.allow_authenticated_run_override
+    ):
+      raise CapabilityResolutionError(
+        "capability_model_not_allowed",
+        f"run selection is not allowed for {capability_id}",
+        capability_id=capability_id,
+      )
+    normalized[capability_id] = selection  # type: ignore[index]
+
+  run_overrides: dict[CapabilityId, ModelSelectionIntent] = {}
+  for capability_id, selection in normalized.items():
+    run_overrides[capability_id] = ModelSelectionIntent(
+      model_key=selection.model_key,
+      effort=selection.effort,
+      source="explicit_user",
+    )
+
+  resolver = _capability_execution_resolver_for_session(
+    session=session,
+    build_chat_runtime=build_chat_runtime,
+    run_overrides=run_overrides,
+  )
+  for capability_id in sorted(normalized):
+    resolver.resolve(capability_id)
+  bind_session_capability_selections(
+    session,
+    run_overrides=run_overrides,
+  )
+
+
+def prepare_session_driver_turn(
+  session: GatewaySession,
+  inputs: ChatTurnInputs,
+  *,
+  build_chat_runtime: BuildChatRuntime,
+) -> PreparedChatTurn:
+  """Build and bind one trusted chat request before any billable side effect."""
+
+  request_id = (
+    inputs.request_id.strip()
+    if isinstance(inputs.request_id, str)
+    else inputs.request_id
+  )
+  request_id = request_id or str(uuid.uuid4())
+  context = dict(inputs.context or {})
+  context["profile"] = _resolve_chat_profile_name(context)
+  request = ChatRequest(
+    messages=list(inputs.messages),
+    user_id=session.user_id,
+    request_id=request_id,
+    context=context,
+    metadata=dict(inputs.metadata or {}),
+    model_key=inputs.model_key,
+    effort=inputs.effort,
+    catalog_revision=inputs.catalog_revision,
+    ui_blocks_contract=inputs.ui_blocks_contract,
+  )
+
+  raw_channel = context.get("channel")
+  claimed_channel = (
+    raw_channel.strip().lower()
+    if isinstance(raw_channel, str)
+    else None
+  )
+  channel = session.channel or claimed_channel
+  channel_profile_allowlist = getattr(
+    build_chat_runtime,
+    "_gateway_channel_profile_allowlist",
+    None,
+  )
+  if channel_profile_allowlist is not None and session.channel is not None:
+    allowed_profiles = channel_profile_allowlist.get(session.channel)
+    if (
+      allowed_profiles is not None
+      and context["profile"] not in set(allowed_profiles)
+    ):
+      raise HTTPException(
+        status_code=403,
+        detail=(
+          f"Profile '{context['profile']}' is not permitted on "
+          f"channel '{session.channel}'"
+        ),
+      )
+
+  capability_execution_resolver = _capability_execution_resolver_for_session(
+    session=session,
+    build_chat_runtime=build_chat_runtime,
+  )
+  execution_policy_resolver = getattr(
+    build_chat_runtime,
+    "_gateway_session_execution_policy_resolver",
+    None,
+  )
+  try:
+    execution_policy = (
+      execution_policy_resolver(context)
+      if callable(execution_policy_resolver)
+      else None
+    )
+  except Exception as exc:
+    raise HTTPException(
+      status_code=400,
+      detail=f"Invalid session execution policy: {exc}",
+    ) from exc
+  if execution_policy is not None and not isinstance(
+    execution_policy, SessionExecutionPolicy
+  ):
+    raise RuntimeError(
+      "session_execution_policy_resolver must return "
+      "SessionExecutionPolicy or None"
+    )
+  explicit_intent = (
+    ModelSelectionIntent(
+      model_key=request.model_key,
+      effort=request.effort,
+      source="explicit_user",
+      catalog_revision=request.catalog_revision,
+    )
+    if request.model_key is not None
+    else None
+  )
+  preference_store = getattr(
+    build_chat_runtime,
+    "_gateway_model_preference_store",
+    None,
+  )
+  saved_preference = (
+    preference_store.get(
+      tenant_id=capability_execution_resolver.auth_context.tenant_id,
+      actor_id=capability_execution_resolver.auth_context.actor_id,
+      capability_id="session.driver",
+    )
+    if preference_store is not None and explicit_intent is None
+    else None
+  )
+  capability_execution = capability_execution_resolver.resolve(
+    "session.driver",
+    explicit_intent=explicit_intent,
+    saved_preference=saved_preference,
+  )
+  request._bind_session_execution_policy(execution_policy)
+  request._bind_session_driver(
+    capability_execution=capability_execution,
+    capability_execution_resolver=capability_execution_resolver,
+  )
+  return PreparedChatTurn(
+    session_id=session.session_id,
+    request=request,
+    channel=channel,
+  )
+
+
 async def _dispatch_chat_turn(
   session: GatewaySession,
   inputs: ChatTurnInputs,
@@ -456,9 +923,10 @@ async def _dispatch_chat_turn(
   event_log: EventLog,
   on_event: Callable[[StreamEvent], Awaitable[None]],
   build_chat_runtime: BuildChatRuntime,
-  credentials_resolver: CredentialsResolver | None,
   transcript_dir: Path | None,
   publish_lifecycle_events: bool = False,
+  prepared_turn: PreparedChatTurn | None = None,
+  required_event_delivery: bool = False,
 ) -> ChatTurnResult:
   """Run one chat turn outside the ASGI response lifecycle."""
   try:
@@ -468,9 +936,10 @@ async def _dispatch_chat_turn(
       event_log=event_log,
       on_event=on_event,
       build_chat_runtime=build_chat_runtime,
-      credentials_resolver=credentials_resolver,
       transcript_dir=transcript_dir,
       publish_lifecycle_events=publish_lifecycle_events,
+      prepared_turn=prepared_turn,
+      required_event_delivery=required_event_delivery,
     )
   finally:
     if (
@@ -489,9 +958,10 @@ async def _dispatch_chat_turn_body(
   event_log: EventLog,
   on_event: Callable[[StreamEvent], Awaitable[None]],
   build_chat_runtime: BuildChatRuntime,
-  credentials_resolver: CredentialsResolver | None,
   transcript_dir: Path | None,
   publish_lifecycle_events: bool = False,
+  prepared_turn: PreparedChatTurn | None = None,
+  required_event_delivery: bool = False,
 ) -> ChatTurnResult:
   if (
     inputs.commercial_dispatch_owner is not None
@@ -507,21 +977,17 @@ async def _dispatch_chat_turn_body(
   if session.stream_active:
     raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
 
-  request_id = inputs.request_id.strip() if isinstance(inputs.request_id, str) else inputs.request_id
-  request_id = request_id or str(uuid.uuid4())
-  context = dict(inputs.context or {})
-  context["profile"] = _resolve_chat_profile_name(context)
-  request_metadata = dict(inputs.metadata or {})
-  request = ChatRequest(
-    messages=list(inputs.messages),
-    user_id=session.user_id,
-    request_id=request_id,
-    context=context,
-    metadata=request_metadata,
-    model=inputs.model,
-    effort=inputs.effort,
-    ui_blocks_contract=inputs.ui_blocks_contract,
+  prepared = prepared_turn or prepare_session_driver_turn(
+    session,
+    inputs,
+    build_chat_runtime=build_chat_runtime,
   )
+  if prepared.session_id != session.session_id:
+    raise RuntimeError("prepared chat turn belongs to a different session")
+  request = prepared.request
+  request_id = request.request_id or str(uuid.uuid4())
+  context = dict(request.context or {})
+  request_metadata = dict(request.metadata or {})
   request._bind_commercial_work_start(inputs.commercial_work_start)
   ui_blocks_run = UiBlocksRunContext(
     capability=request.ui_blocks_contract,
@@ -531,22 +997,9 @@ async def _dispatch_chat_turn_body(
   )
   request._bind_ui_blocks_run(ui_blocks_run)
 
-  raw_channel = context.get("channel")
-  claimed_channel = raw_channel.strip().lower() if isinstance(raw_channel, str) else None
-  channel = session.channel or claimed_channel
+  channel = prepared.channel
   log = getattr(build_chat_runtime, "_gateway_log", logging.getLogger("agent_gateway.server"))
-  resolver_timeout_seconds = float(getattr(build_chat_runtime, "_gateway_resolver_timeout_seconds", 5.0))
-  config_auth_config = getattr(build_chat_runtime, "_gateway_auth_config", {})
-  allowed_models = getattr(build_chat_runtime, "_gateway_allowed_models", None)
-  channel_profile_allowlist = getattr(build_chat_runtime, "_gateway_channel_profile_allowlist", None)
   auth_manager = getattr(build_chat_runtime, "_gateway_auth_manager", None)
-  if channel_profile_allowlist is not None and session.channel is not None:
-    allowed_profiles = channel_profile_allowlist.get(session.channel)
-    if allowed_profiles is not None and context["profile"] not in set(allowed_profiles):
-      raise HTTPException(
-        status_code=403,
-        detail=f"Profile '{context['profile']}' is not permitted on channel '{session.channel}'",
-      )
 
   if inputs.commercial_dispatch_owner is not None:
     if session._commercial_dispatch_owner is not inputs.commercial_dispatch_owner:
@@ -566,6 +1019,9 @@ async def _dispatch_chat_turn_body(
   previous_session_id = getattr(event_log, "_session_id", "")
   fanout_stop = object()
   fanout_queue: asyncio.Queue[Any] = asyncio.Queue()
+  fanout_failure: asyncio.Future[BaseException] = (
+    asyncio.get_running_loop().create_future()
+  )
 
   async def _fanout_worker() -> None:
     while True:
@@ -574,7 +1030,17 @@ async def _dispatch_chat_turn_body(
         return
       try:
         await on_event(dict(event))
+      except asyncio.CancelledError as exc:
+        if required_event_delivery:
+          if not fanout_failure.done():
+            fanout_failure.set_result(exc)
+          return
+        raise
       except Exception as exc:
+        if required_event_delivery:
+          if not fanout_failure.done():
+            fanout_failure.set_result(exc)
+          return
         log.warning("chat turn event fan-out failed for %s: %s", sid, exc)
 
   def _record_event(event: Dict[str, Any], event_session_id: str) -> None:
@@ -600,74 +1066,6 @@ async def _dispatch_chat_turn_body(
   runtime: ChatRuntime | None = None
   runner: Any | None = None
   runner_task: asyncio.Task[Any] | None = None
-
-  async def _credential_refresher(failure: ProviderCredentialFailure) -> Dict[str, Any] | None:
-    resolver = credentials_resolver
-    if resolver is None:
-      return None
-    session_auth_config = session.auth_config or config_auth_config
-    request_billing_mode = (
-      session_auth_config.get("billing_mode")
-      or getattr(runner, "_billing_mode", None)
-      or config_auth_config.get("billing_mode")
-    )
-    request_rate_table_version = (
-      session_auth_config.get("rate_table_version")
-      or getattr(runner, "_rate_table_version", None)
-      or config_auth_config.get("rate_table_version")
-    )
-    refresh_request = CredentialRefreshRequest(
-      user_id=session.user_id,
-      user_email=session.user_email,
-      session_id=session.session_id,
-      api_key_hash=session.api_key_hash,
-      channel=channel,
-      provider=failure.provider,
-      billing_mode=str(request_billing_mode or "") or None,
-      rate_table_version=str(request_rate_table_version or "") or None,
-      model=str(session_auth_config.get("model", "") or "") or None,
-      auth_mode=str(session_auth_config.get("auth_mode", "") or "") or None,
-      request_id=request_id,
-      failure=failure,
-    )
-    try:
-      auth_config = await asyncio.wait_for(
-        resolver(refresh_request),  # type: ignore[arg-type]
-        timeout=resolver_timeout_seconds,
-      )
-    except Exception as exc:
-      log.warning(
-        "Credential refresh failed | session=%s user=%s provider=%s kind=%s detail=%s",
-        session.session_id,
-        session.user_id,
-        failure.provider,
-        failure.kind,
-        exc,
-      )
-      return None
-    if auth_config is None:
-      log.info(
-        "Credential refresh unavailable | session=%s user=%s provider=%s kind=%s",
-        session.session_id,
-        session.user_id,
-        failure.provider,
-        failure.kind,
-      )
-      return None
-    if auth_config.provider != failure.provider:
-      log.warning(
-        "Credential refresh returned provider=%s for provider=%s; ignoring",
-        auth_config.provider,
-        failure.provider,
-      )
-      return None
-    refreshed_auth_config = auth_config.to_dict()
-    if request_billing_mode:
-      refreshed_auth_config["billing_mode"] = request_billing_mode
-    if request_rate_table_version:
-      refreshed_auth_config["rate_table_version"] = request_rate_table_version
-    session.auth_config = refreshed_auth_config
-    return dict(refreshed_auth_config)
 
   async def _safe_fire_disconnect() -> None:
     if runtime is None:
@@ -709,6 +1107,19 @@ async def _dispatch_chat_turn_body(
 
     ui_blocks_token = activate_ui_blocks_run(ui_blocks_run)
     try:
+      capability_execution = request.capability_execution
+      if capability_execution is None:
+        raise RuntimeError(
+          "prepared chat turn has no session.driver capability execution"
+        )
+      capability_bind = capability_execution.bind
+      _record_event(
+        {
+          "type": "capability_bound",
+          **capability_bind.receipt(),
+        },
+        sid,
+      )
       runtime = await _call_build_chat_runtime(
         build_chat_runtime,
         session=session,
@@ -716,23 +1127,28 @@ async def _dispatch_chat_turn_body(
         channel=channel,
         auth_manager=auth_manager,
       )
-      session_auth_config = session.auth_config or config_auth_config
-      resolved_model = runtime.model_override or request.model or str(session_auth_config.get("model", "")).strip() or None
-      if resolved_model:
-        resolved_provider_name = str(getattr(runtime, "resolved_provider_name", "") or "").strip().lower()
-        if resolved_provider_name:
-          provider_allowed_models = _get_allowed_models_for_provider_name(resolved_provider_name)
-          if provider_allowed_models and resolved_model not in provider_allowed_models:
-            raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
-        elif allowed_models and resolved_model not in allowed_models:
-          raise HTTPException(status_code=400, detail=f"Invalid model: {resolved_model}")
+      if runtime.capability_execution is not capability_execution:
+        raise RuntimeError(
+          "chat runtime did not preserve the exact session.driver execution"
+        )
       runner = _build_runner_with_started_at(runtime.build_runner, event_log, sid, started_at)
+      set_purpose = getattr(runner, "set_purpose", None)
+      if callable(set_purpose):
+        set_purpose(runtime.purpose)
+      if getattr(runner, "capability_execution", None) is not capability_execution:
+        raise RuntimeError(
+          "chat runner did not preserve the exact session.driver execution"
+        )
+      clear_credential_refresher = getattr(
+        runner,
+        "set_credential_refresher",
+        None,
+      )
+      if callable(clear_credential_refresher):
+        clear_credential_refresher(None)
     finally:
       reset_ui_blocks_run(ui_blocks_token)
     setattr(event_log, "_gateway_execution_location", runtime.execution_location)
-    set_credential_refresher = getattr(runner, "set_credential_refresher", None)
-    if callable(set_credential_refresher) and credentials_resolver is not None:
-      set_credential_refresher(_credential_refresher)
     if runtime.disconnect_handler is None:
       runner_on_disconnect = getattr(runner, "on_disconnect", None)
       if callable(runner_on_disconnect):
@@ -743,13 +1159,24 @@ async def _dispatch_chat_turn_body(
         await runner.run(
           messages=messages,
           system_prompt=runtime.system_prompt,
-          model_override=runtime.model_override,
           max_turns=runtime.max_turns,
         )
+        if not log_has_terminal(event_log):
+          log.warning(
+            "chat runner completed without a terminal event for %s; emitting stream-closed error",
+            sid,
+          )
       except asyncio.CancelledError:
         raise
       except Exception as exc:
-        _emit_terminal({"type": "error", "error": str(exc)})
+        error_text = str(exc)
+        log.error(
+          "chat runner failed for %s: %s",
+          sid,
+          error_text,
+          exc_info=None if exception_traceback_already_logged(exc) else exc,
+        )
+        _emit_terminal({"type": "error", "error": error_text})
       finally:
         if not log_has_terminal(event_log):
           _emit_terminal({"type": "error", "error": "stream closed"})
@@ -761,7 +1188,22 @@ async def _dispatch_chat_turn_body(
     # BEFORE cancelling runner_task, so an in-flight tool call gets the cooperative
     # abort handshake. Plain `await runner_task` cancels runner_task first, pre-empting
     # that handshake — the PR4 (47b91a31) regression this restores.
-    await asyncio.shield(runner_task)
+    if required_event_delivery:
+      done, _pending = await asyncio.wait(
+        (runner_task, fanout_failure),
+        return_when=asyncio.FIRST_COMPLETED,
+      )
+      if fanout_failure in done:
+        delivery_error = fanout_failure.result()
+        await _safe_fire_disconnect()
+        runner_task.cancel()
+        await asyncio.gather(runner_task, return_exceptions=True)
+        raise RuntimeError(
+          "required chat turn event delivery failed"
+        ) from delivery_error
+      await runner_task
+    else:
+      await asyncio.shield(runner_task)
     session.stream_active = False
     if publish_lifecycle_events:
       events = [dict(entry.event) for entry in event_log.entries]
@@ -799,6 +1241,11 @@ async def _dispatch_chat_turn_body(
     session.stream_active = False
     if session.active_turn is active_turn:
       _schedule_active_turn_clear(session, active_turn)
+
+  if required_event_delivery and fanout_failure.done():
+    raise RuntimeError(
+      "required chat turn event delivery failed"
+    ) from fanout_failure.result()
 
   events = [dict(entry.event) for entry in event_log.entries]
   return ChatTurnResult(

@@ -96,11 +96,17 @@ class ApprovalAuditEntry:
   review_reference: dict[str, Any] | None = None
   execution_semantics_digest: str | None = None
   tenant_id: str | None = None
+  kept_paths: list[str] | None = None
+  dropped_paths: list[str] | None = None
   retention_class: Literal["dev", "operational", "compliance"] = "operational"
   legal_hold: bool = False
 
   def to_json_dict(self) -> dict[str, Any]:
     payload = asdict(self)
+    if self.kept_paths is None:
+      payload.pop("kept_paths")
+    if self.dropped_paths is None:
+      payload.pop("dropped_paths")
     payload["ts"] = self.ts.isoformat()
     return payload
 
@@ -128,9 +134,14 @@ def build_audit_entry(
   outcome: Literal["success", "tool_error", "cancelled"] | None = None,
   error_summary: str | None = None,
   skill: str | None = None,
+  kept_paths: list[str] | None = None,
+  dropped_paths: list[str] | None = None,
   retention_class: Literal["dev", "operational", "compliance"] = "operational",
   legal_hold: bool = False,
   tool_input_redactor: Callable[..., dict[str, Any]] | None = None,
+  boundary_sanitizer: Callable[[Any, str], Any] | None = None,
+  entry_id: str | None = None,
+  event_ts: datetime | None = None,
 ) -> ApprovalAuditEntry:
   _alias = raw_tool_args
   del raw_tool_args
@@ -170,6 +181,25 @@ def build_audit_entry(
           hashlib.sha256,
         ).hexdigest()
         args_hash = f"hmac-sha256-v1:{key_id}:{digest}"
+    if boundary_sanitizer is not None:
+      projected_args = boundary_sanitizer(
+        tool_args_redacted or {},
+        "approval_audit",
+      )
+      tool_args_redacted = (
+        projected_args
+        if isinstance(projected_args, dict)
+        else {"_boundary_error": "<secret-sanitization-failed>"}
+      )
+      projected_error = boundary_sanitizer(
+        error_summary,
+        "approval_audit",
+      )
+      error_summary = (
+        projected_error
+        if projected_error is None or isinstance(projected_error, str)
+        else "<secret-sanitization-failed>"
+      )
   except BaseException as exc:
     caught = exc
   finally:
@@ -187,17 +217,40 @@ def build_audit_entry(
       "build_audit_entry failed (raw args, secret, and original exception detail redacted)"
     ) from None
 
+  resolved_entry_id = (
+    str(entry_id).strip()
+    if entry_id is not None
+    else str(uuid.uuid4())
+  )
+  if (
+    not resolved_entry_id
+    or resolved_entry_id != (
+      entry_id if entry_id is not None else resolved_entry_id
+    )
+    or len(resolved_entry_id) > 128
+    or "\x00" in resolved_entry_id
+  ):
+    raise ValueError("approval audit entry_id is invalid")
+  resolved_event_ts = event_ts if event_ts is not None else utc_now()
+  if (
+    not isinstance(resolved_event_ts, datetime)
+    or resolved_event_ts.tzinfo is None
+  ):
+    raise ValueError(
+      "approval audit event_ts must be timezone-aware"
+    )
+
   grant_tool_name = grant.tool_name if grant is not None else request.tool_name
   resolved_skill = skill if skill is not None else getattr(request, "skill", None)
   return ApprovalAuditEntry(
-    entry_id=str(uuid.uuid4()),
+    entry_id=resolved_entry_id,
     approval_id=request.approval_id,
     request_id=request.request_id,
     tool_call_id=request.tool_call_id,
     parent_approval_id=request.parent_approval_id,
     approval_chain_id=request.approval_chain_id,
     pending_tools_nonce=pending_tools_nonce,
-    ts=utc_now(),
+    ts=resolved_event_ts,
     event_type=event_type,
     user_id=request.user_id,
     profile=request.profile,
@@ -234,6 +287,8 @@ def build_audit_entry(
     review_reference=copy.deepcopy(request.review_reference),
     execution_semantics_digest=request.execution_semantics_digest,
     tenant_id=request.tenant_id,
+    kept_paths=copy.deepcopy(kept_paths),
+    dropped_paths=copy.deepcopy(dropped_paths),
     retention_class=retention_class,
     legal_hold=legal_hold,
   )
@@ -265,6 +320,9 @@ class ApprovalAuditEmitter:
     error_summary: str | None = None,
     pending_tools_nonce: str | None = None,
     skill: str | None = None,
+    entry_id: str | None = None,
+    event_ts: datetime | None = None,
+    boundary_sanitizer: Callable[[Any, str], Any] | None = None,
   ) -> None:
     entry = build_audit_entry(
       raw_tool_args=raw_tool_args,
@@ -279,6 +337,9 @@ class ApprovalAuditEmitter:
       pending_tools_nonce=pending_tools_nonce,
       skill=skill if skill is not None else current_skill(),
       tool_input_redactor=self._tool_input_redactor,
+      entry_id=entry_id,
+      event_ts=event_ts,
+      boundary_sanitizer=boundary_sanitizer,
     )
     del raw_tool_args
     await self._write(entry, pre_execution=event_type not in {"tool_executed_success", "tool_executed_error", "tool_cancelled"})
@@ -290,6 +351,7 @@ class ApprovalAuditEmitter:
     raw_tool_args: dict[str, Any],
     outcome: Literal["success", "tool_error", "cancelled"],
     error_summary: str | None = None,
+    boundary_sanitizer: Callable[[Any, str], Any] | None = None,
   ) -> None:
     event_type: AuditEventType = {
       "success": "tool_executed_success",
@@ -302,6 +364,7 @@ class ApprovalAuditEmitter:
       raw_tool_args=raw_tool_args,
       outcome=outcome,
       error_summary=error_summary,
+      boundary_sanitizer=boundary_sanitizer,
     )
 
   async def emit_grant_event(
@@ -320,10 +383,19 @@ class ApprovalAuditEmitter:
       grant=grant,
     )
 
-  async def _write(self, entry: ApprovalAuditEntry, *, pre_execution: bool) -> None:
+  async def _write(
+    self,
+    entry: ApprovalAuditEntry,
+    *,
+    pre_execution: bool,
+  ) -> None:
     try:
       await self._writer.write(entry)
     except Exception:
       if pre_execution and entry.tool_class in {"state_write", "external_write", "portfolio_config", "irreversible"}:
         raise
-      log.warning("Approval audit write failed for %s/%s", entry.approval_id, entry.event_type, exc_info=True)
+      log.warning(
+        "Approval audit write failed for %s/%s | failure=true",
+        entry.approval_id,
+        entry.event_type,
+      )

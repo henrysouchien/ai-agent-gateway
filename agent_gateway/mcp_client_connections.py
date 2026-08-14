@@ -5,7 +5,7 @@ import copy
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, MutableMapping, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,9 @@ class McpConnectionRuntime:
   stdio_connect_stabilize_delay: Callable[[], float]
   is_retryable_stdio_startup_error: Callable[[BaseException], bool]
   build_mcp_env: Callable[[dict[str, Any] | None], dict[str, str]]
+  # Raises when the configured stdio executable decisively cannot exist in the
+  # spawn env; a no-op for anything it cannot decisively resolve.
+  preflight_stdio_executable: Callable[[str, Sequence[str], Mapping[str, str]], None]
   build_http_headers: Callable[[dict[str, Any] | None], dict[str, str]]
   safe_cache_name: Callable[[str], str]
   close_contexts: Callable[[list[Any]], Any]
@@ -163,6 +166,7 @@ async def connect_stdio(
 
     env_raw = config.get("env")
     env = runtime.build_mcp_env(env_raw if isinstance(env_raw, dict) else None)
+    runtime.preflight_stdio_executable(command, args, env)
 
     cwd = config.get("cwd")
     tool_prefix = str(config.get("tool_prefix", "") or "").strip()

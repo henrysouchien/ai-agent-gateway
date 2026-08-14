@@ -22,7 +22,7 @@ uvicorn agent:app --reload --port 8000
 ```bash
 SESSION_TOKEN=$(curl -s http://127.0.0.1:8000/api/chat/init \
   -H 'Content-Type: application/json' \
-  -d '{"api_key":"demo-key"}' \
+  -d '{"api_key":"demo-key","user_id":"demo-user"}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_token"])')
 export SESSION_TOKEN
 ```
@@ -98,3 +98,8 @@ cat approved_notes/release-plan.txt
 - `ToolDispatcher` can enforce approval on any tool, not just code execution.
 - Clients approve tools by reacting to `tool_approval_request` SSE events.
 - Approval state is session-scoped and flows through `/api/chat/tool-approval`.
+- A server-owned `session.driver` policy binds the model, effort, provider,
+  credential principal, and native transport before runtime construction.
+- Service credential material is resolved from an opaque handle only after the
+  capability bind selects Anthropic; the runtime consumes that exact prepared
+  provider and auth configuration.

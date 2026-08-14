@@ -1,112 +1,32 @@
 from __future__ import annotations
 
-import logging
 import os
 from typing import Any
 
-from .fixture_gate import FIXTURE_MODEL_ID, require_fixture_provider_available
+from .fixture_gate import require_fixture_provider_available
 from .providers import AnthropicProvider, CodexProvider, FixtureProvider, ModelProvider, OpenAIProvider, XAIProvider
-from .thinking import ThinkingLevel, resolve_effort_pair
-
-log = logging.getLogger("agent_gateway.provider_utils")
-_SUB_AGENT_DEFAULT_MODEL_WARNED: set[str] = set()
-_API_CREDENTIALS_MODULE_NAMES = frozenset({"api", "api.credentials"})
-_API_TOOL_CATALOG_MODULE_NAMES = frozenset(
-  {"api", "api.agent", "api.agent.shared", "api.agent.shared.tool_catalog"}
-)
-_CREDENTIALS_MODULE_NAMES = frozenset({"credentials"})
-_TOOL_CATALOG_MODULE_NAMES = frozenset({"agent", "agent.shared", "agent.shared.tool_catalog"})
-
-_FALLBACK_DEFAULT_MODELS = {
-  "agent-sdk": "claude-sonnet-5",
-  "anthropic": "claude-sonnet-5",
-  "codex": "gpt-5.6-terra",
-  "fixture": FIXTURE_MODEL_ID,
-  "openai": "gpt-5.6-terra",
-  "xai": "grok-4.5",
-}
-
-_FALLBACK_ALLOWED_MODELS = {
-  "agent-sdk": {"claude-sonnet-5", "claude-fable-5", "claude-mythos-5", "claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"},
-  "anthropic": {"claude-sonnet-5", "claude-fable-5", "claude-mythos-5", "claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"},
-  "codex": {
-    "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-    "gpt-5.5",
-    "gpt-5.1",
-    "gpt-5.1-codex-max",
-    "gpt-5.1-codex-mini",
-    "gpt-5.2",
-    "gpt-5.2-codex",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-  },
-  "fixture": {FIXTURE_MODEL_ID},
-  "openai": {"gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-4o", "gpt-4o-mini", "o1", "o1-mini", "o3-mini"},
-  "xai": {"grok-4.5", "grok-4.3", "grok-latest", "grok-build-0.1", "grok-4.20-beta-latest-reasoning", "grok-4.20-beta-latest-non-reasoning"},
-}
 
 
-def _get_default_model_for_provider(provider: str | None = None) -> str:
-  resolved = str(provider or "anthropic").strip().lower() or "anthropic"
-  try:
-    from credentials import get_default_model as get_default_model
-  except ModuleNotFoundError as exc:
-    if exc.name not in _CREDENTIALS_MODULE_NAMES:
-      raise
-    try:
-      from api.credentials import get_default_model as get_default_model
-    except ModuleNotFoundError as exc:
-      if exc.name not in _API_CREDENTIALS_MODULE_NAMES:
-        raise
-      return _FALLBACK_DEFAULT_MODELS.get(resolved, _FALLBACK_DEFAULT_MODELS["anthropic"])
-  try:
-    model = str(get_default_model(resolved)).strip()
-  except Exception:
-    model = ""
-  if model:
-    return model
-  return _FALLBACK_DEFAULT_MODELS.get(resolved, _FALLBACK_DEFAULT_MODELS["anthropic"])
+_SELECTION_AUTH_CONFIG_FIELDS = frozenset({
+  "effort",
+  "model",
+  "model_key",
+  "thinking",
+  "thinking_enabled_requested",
+})
 
 
-def _get_allowed_models_for_provider_name(provider: str | None = None) -> set[str]:
-  resolved = str(provider or "anthropic").strip().lower() or "anthropic"
-  try:
-    from agent.shared.tool_catalog import get_allowed_models as get_allowed_models
-  except ModuleNotFoundError as exc:
-    if exc.name not in _TOOL_CATALOG_MODULE_NAMES:
-      raise
-    try:
-      from api.agent.shared.tool_catalog import get_allowed_models as get_allowed_models
-    except ModuleNotFoundError as exc:
-      if exc.name not in _API_TOOL_CATALOG_MODULE_NAMES:
-        raise
-      models = set(_FALLBACK_ALLOWED_MODELS.get(resolved, set()))
-      default_model = _get_default_model_for_provider(resolved)
-      if default_model:
-        models.add(default_model)
-      return models
-  return set(get_allowed_models(resolved))
-
-
-def sub_agent_default_model(allowed_models: set[str] | frozenset[str] | None) -> str | None:
-  """Return the operator's default sub-agent model when valid for this provider."""
-  raw_model = os.environ.get("SUB_AGENT_DEFAULT_MODEL", "").strip()
-  if not raw_model:
-    return None
-
-  allowed = set(allowed_models or set())
-  if raw_model in allowed:
-    return raw_model
-
-  if raw_model not in _SUB_AGENT_DEFAULT_MODEL_WARNED:
-    _SUB_AGENT_DEFAULT_MODEL_WARNED.add(raw_model)
-    log.warning(
-      "Ignoring SUB_AGENT_DEFAULT_MODEL=%r because it is not in the resolved provider allowlist",
-      raw_model,
+def _reject_selection_auth_config(
+  config: dict[str, Any] | None,
+  *,
+  field_name: str,
+) -> None:
+  duplicated = sorted(_SELECTION_AUTH_CONFIG_FIELDS & set(config or {}))
+  if duplicated:
+    raise ValueError(
+      f"{field_name} is not model-selection authority: "
+      + ", ".join(duplicated)
     )
-  return None
-
 
 def _classify_anthropic_credential(raw: str) -> dict[str, Any]:
   """Return the Anthropic credential field matching the raw token format."""
@@ -121,10 +41,7 @@ def resolve_auth_config(
   api_key: str | None = None,
   auth_token: str | None = None,
   auth_config: dict[str, Any] | None = None,
-  model: str | None = None,
   max_tokens: int | None = None,
-  effort: str | ThinkingLevel | None = None,
-  thinking: bool | None = None,
   infer_mode_from_prefix: bool = False,
   read_env: bool = True,
   read_env_auth_mode: bool = False,
@@ -136,38 +53,14 @@ def resolve_auth_config(
   Env vars are only consulted when ``auth_config`` is None and ``read_env``
   is True.  Extra keys in ``auth_config`` are preserved in the result.
 
-  This function does NOT inject default values for ``model``, ``max_tokens``,
-  or ``effort`` — it only sets them when a config layer supplies them.
-  Callers like ``_resolve_provider()`` handle their own model defaulting.
+  This function resolves credential and provider request-limit material only.
+  Model and effort selection live exclusively in a ``CapabilityBind``.
   """
   provider_name = provider.strip().lower() if isinstance(provider, str) else "anthropic"
+  _reject_selection_auth_config(auth_config, field_name="auth_config")
 
   # Start with a copy of auth_config to preserve extra keys.
   result: dict[str, Any] = dict(auth_config or {})
-
-  def finalize_effort() -> dict[str, Any]:
-    requested: ThinkingLevel | None
-    if effort is not None or thinking is not None:
-      requested = resolve_effort_pair(effort=effort, thinking=thinking)
-    elif "effort" in result or "thinking" in result:
-      requested = resolve_effort_pair(effort=result.get("effort"), thinking=result.get("thinking"))
-    elif read_env and auth_config is None:
-      prefix = provider_name.upper().replace("-", "_")
-      requested = resolve_effort_pair(
-        effort=os.environ.get(f"{prefix}_EFFORT"),
-        thinking=os.environ.get(f"{prefix}_THINKING"),
-        field_prefix=f"{prefix}_",
-        blank_is_unset=True,
-      )
-    else:
-      requested = None
-    result.pop("thinking", None)
-    if requested is not None:
-      result["effort"] = requested.value
-      result["thinking_enabled_requested"] = requested != ThinkingLevel.NONE
-    elif "effort" not in result:
-      result.pop("thinking_enabled_requested", None)
-    return result
 
   # --- Non-Anthropic path ---
   if provider_name != "anthropic":
@@ -179,6 +72,10 @@ def resolve_auth_config(
       (auth_token or "").strip()
       or str(result.get("auth_token", "")).strip()
     )
+    if read_env and auth_config is None and provider_name in {"openai", "xai"}:
+      prefix = provider_name.upper()
+      resolved_key = resolved_key or os.environ.get(f"{prefix}_API_KEY", "").strip()
+      resolved_token = resolved_token or os.environ.get(f"{prefix}_AUTH_TOKEN", "").strip()
 
     explicit_mode = str(result.get("auth_mode", "")).strip().lower()
 
@@ -189,11 +86,9 @@ def resolve_auth_config(
     elif resolved_token:
       auth_mode = "oauth"
     else:
-      if model is not None:
-        result["model"] = model
       if max_tokens is not None:
         result["max_tokens"] = max_tokens
-      return finalize_effort()
+      return result
 
     result["auth_mode"] = auth_mode
     if auth_config is None:
@@ -203,11 +98,9 @@ def resolve_auth_config(
       result["api_key"] = resolved_key
       result["auth_token"] = resolved_token
 
-    if model is not None:
-      result["model"] = model
     if max_tokens is not None:
       result["max_tokens"] = max_tokens
-    return finalize_effort()
+    return result
 
   # --- Anthropic path ---
   # Resolve credentials: args > config dict > env (env only if no config)
@@ -267,12 +160,10 @@ def resolve_auth_config(
     result["api_key"] = resolved_key
     result["auth_token"] = resolved_token
 
-  # Only set model/max_tokens when explicitly passed — no defaults injected.
-  if model is not None:
-    result["model"] = model
+  # Request limits may be carried with credential material; model selection may not.
   if max_tokens is not None:
     result["max_tokens"] = max_tokens
-  return finalize_effort()
+  return result
 
 
 def _resolve_provider(
@@ -286,6 +177,16 @@ def _resolve_provider(
   max_tokens: int = 16_000,
 ) -> tuple[ModelProvider, str, dict[str, Any]]:
   provider_name: str
+  normalized_model = str(model or "").strip()
+  if not normalized_model:
+    raise ValueError(
+      "adapter resolution requires an upstream model from a CapabilityBind"
+    )
+  _reject_selection_auth_config(
+    provider_config,
+    field_name="provider_config",
+  )
+  _reject_selection_auth_config(auth_config, field_name="auth_config")
   if isinstance(provider, str):
     provider_name = provider.strip().lower()
     if provider_name == "anthropic":
@@ -301,16 +202,9 @@ def _resolve_provider(
       provider_instance = FixtureProvider()
     else:
       raise ValueError(f"Unknown provider: {provider}. Use 'anthropic', 'codex', 'openai', 'xai', or dev-only 'fixture'.")
-    if model is None:
-      model = _get_default_model_for_provider(provider_name)
   elif isinstance(provider, ModelProvider):
     provider_instance = provider
     provider_name = str(getattr(provider, "name", "custom") or "custom")
-    if model is None:
-      # Fall back to auth_config["model"] if provided
-      model = str((auth_config or {}).get("model", "")).strip() or None
-      if model is None:
-        raise ValueError("model is required when passing a ModelProvider instance (via arg or auth_config)")
   else:
     raise TypeError("provider must be a string ('anthropic', 'codex', 'openai', 'xai') or a ModelProvider instance")
 
@@ -351,35 +245,14 @@ def _resolve_provider(
   else:
     resolved_auth_config = dict(auth_config)
 
-  # auth_config wins for model/max_tokens if explicitly provided;
-  # otherwise use the resolved values from args/defaults.
-  if "model" not in resolved_auth_config or auth_config is None:
-    resolved_auth_config["model"] = model
   if "max_tokens" not in resolved_auth_config or auth_config is None:
     resolved_auth_config["max_tokens"] = max_tokens
   if provider_config:
     resolved_auth_config.update(provider_config)
 
   return provider_instance, provider_name, resolved_auth_config
-
-
-def _allowed_models_for_provider(
-  provider: ModelProvider,
-  model: str,
-) -> set[str]:
-  if isinstance(provider, AnthropicProvider):
-    allowed_models = _get_allowed_models_for_provider_name("anthropic")
-    if model:
-      allowed_models.add(model)
-    return allowed_models
-  if isinstance(provider, FixtureProvider):
-    return {model or FIXTURE_MODEL_ID}
-  return set()
-
-
 __all__ = [
   "_classify_anthropic_credential",
-  "_allowed_models_for_provider",
   "_resolve_provider",
   "resolve_auth_config",
 ]

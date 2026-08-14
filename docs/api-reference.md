@@ -21,9 +21,12 @@ Use it when you want:
 
 Key parameters:
 
-- `provider`: `"anthropic"` (default), `"openai"`, or a `ModelProvider` instance
-- `model`: provider-specific default when omitted for string providers; required for provider instances
-- `provider_config`: merged into the provider auth config last for fields like `base_url` or `compat`
+- `model_key`: stable product-registry key for the `session.driver` default
+- `effort`: optional effort supported by that exact registry entry
+- `provider`: optional credential-family/adapter consistency assertion; it
+  cannot override the stable key's execution identity
+- `provider_config`: credential/endpoint configuration only; model-selection
+  fields are rejected
 - `skills_dir`: directory of markdown skill files used by the built-in `run_agent` tool
 - `skill_state_file`: optional JSON file for callable skills with `persist_state: true`; prior state is injected into the skill prompt, and final `## STATE_UPDATE_JSON` updates are merged back into the file
 - `outputs_dir`: directory for named-skill output files; stale same-day outputs are cleaned before background `run_agent` launch
@@ -36,19 +39,24 @@ app = create_agent("You are a concise assistant.")
 
 ### `run_autonomous()`
 
-Run the agent loop without the HTTP server and return a `RunOutput`.
+Execute one already-resolved headless `session.driver` capability without the
+HTTP server and return a `RunOutput`. Capability/provider/model/effort,
+credential, and session identity selection happen before this execution
+boundary.
 
 Use it when you want:
 
-- one autonomous task or batch job
+- one autonomous task or cron job
 - optional MCP tools and local tools
 - optional skills, state persistence, and completion delivery
 
 Key parameters:
 
-- `provider`: `"anthropic"` (default), `"openai"`, or a `ModelProvider` instance
-- `model`: provider-specific default when omitted for string providers; required for provider instances
-- `auth_config`: explicit auth dict; wins over `api_key`/`auth_token` if provided
+- `capability_execution`: immutable `BoundCapabilityExecution` for
+  `session.driver`, with an `autonomous` or `cron` run mode; it carries the
+  exact admitting registry, adapter, credential snapshot, and complete bind
+- `session`: exact `GatewaySession` that owns the authenticated runtime
+  identity and mutable lifecycle state
 - `user_id`: required stable user identity for usage accounting
 - `billing_mode`: required usage billing mode, either `byok` or `metered`
 - `rate_table_version`: required usage rate-table/version label
@@ -59,11 +67,19 @@ Key parameters:
 - `max_concurrent_sub_agents`: optional concurrency limit for sub-agents
 - `compaction_instructions`: optional instructions for context compaction
 
+Raw `model`, `api_key`, `auth_token`, `auth_config`, `provider_config`, and
+`max_tokens` selectors are not accepted. Split execution inputs are also
+rejected. Bind/config/adapter/registry disagreements and unavailable
+credentials fail before session scoping, MCP construction/startup, or
+provider-client creation. The executor snapshots the bound mapping before its
+first await and passes `allow_stub_response=False`.
+
 Returns `RunOutput` with `response`, `tools_used`, `usage`, `error`, `timed_out`, `budget_exceeded`, `max_turns_reached`.
 
 ### `run_autonomous_sync()`
 
-Synchronous wrapper around `run_autonomous()` for cron scripts and batch jobs. Same parameters, same return type.
+Synchronous wrapper around `run_autonomous()` for cron scripts and autonomous
+jobs. It requires the same prebound execution inputs and returns the same type.
 
 ### `RunOutput`
 
@@ -104,10 +120,29 @@ Use it when you want:
 
 ```python
 from functools import partial
-from agent_gateway import run_autonomous, HeartbeatLoop, HeartbeatConfig
+from agent_gateway import (
+    BoundCapabilityExecution,
+    GatewaySession,
+    HeartbeatConfig,
+    HeartbeatLoop,
+    run_autonomous,
+)
+
+capability_execution: BoundCapabilityExecution
+session: GatewaySession
+capability_execution, session = prepare_autonomous_execution()
 
 loop = HeartbeatLoop(
-    run_fn=partial(run_autonomous, system_prompt="...", initial_message="...", ...),
+    run_fn=partial(
+        run_autonomous,
+        system_prompt="...",
+        initial_message="...",
+        capability_execution=capability_execution,
+        session=session,
+        user_id="heartbeat-agent",
+        billing_mode="byok",
+        rate_table_version="current",
+    ),
     config=HeartbeatConfig(interval_seconds=1800, active_hours=(6, 22)),
     on_alert=my_delivery_fn,
 )
@@ -151,14 +186,61 @@ Result of a single heartbeat tick. Fields: `output`, `skipped`, `skip_reason`, `
 
 ### `send_prompt()` and `send_prompt_sync()`
 
-Single-call helpers for Anthropic text generation without the HTTP server.
+Execution-only, single-call text helpers for callers that already resolved a
+capability. Both require:
 
-Use them when:
+- an immutable `BoundCapabilityExecution` containing the exact capability bind,
+  admitting registry, provider adapter, and bound auth-config snapshot
 
-- you want one prompt/response
-- you do not need sessions or SSE
-- you still want the same provider normalization as the gateway
-- you can provide an explicit `user_id` for usage events
+They do not select a provider/model, resolve credentials, or read credential
+environment variables. Bind, registry, adapter, credential, model, and effort
+disagreements are rejected before provider-client creation. Usage callbacks and
+commercial usage production use the bound provider/model identity.
+
+## Capability Binding
+
+### `CapabilityExecutionResolver`
+
+The canonical server-owned resolver for `session.driver`, `plan.author`, and
+the `node.*` capability classes. Construct it with:
+
+- a versioned `ProductModelSelectionPolicy`
+- an `AuthContext` derived from authenticated identity and secret-free
+  user/service credential handles
+- a versioned `ProductModelRegistry`
+- trusted credential-materializer and adapter-resolver callbacks
+
+`resolve(capability_id, ...)` applies that capability's precedence and returns
+one immutable `BoundCapabilityExecution`. `materialize_bind(bind)` restores an
+exact durable bind without choosing a replacement. Both paths validate policy,
+registry, principal eligibility, provider adapter, credential material, and
+effort before returning.
+
+### `BoundCapabilityExecution`
+
+Carries the exact `CapabilityBind`, admitting `ProductModelRegistry`,
+`ModelProvider` adapter, and immutable credential auth-config snapshot consumed
+by a runner. Call `validate()` at an execution boundary to recheck agreement.
+
+### Autonomous capability handoff
+
+`AutonomousCapabilityBindingRequest` is passed only to the trusted
+`GatewayServerConfig.autonomous_capability_binding_resolver` callback.
+Fresh starts and schedules select once; resumes include the required persisted
+bind. The callback returns `AutonomousCapabilityBinding`, a secret-free exact
+bind and, only for a run-scoped user
+principal, an opaque credential-handle identity with repr-hidden,
+memory-only material for the launch pipe.
+
+Before spawning a child, the gateway persists that pair and uses
+`sign_autonomous_launch_envelope()` to bind it to the task id, control-run id,
+owner identity, expiry, and nonce. The child calls
+`verify_autonomous_launch_envelope()`, removes the envelope, handoff marker,
+and signing secret from its environment, validates any user credential read
+from the anonymous stdin pipe against the signed handle and launch identity,
+and materializes the verified bind without re-selection. Invalid, expired,
+replayed, or identity-mismatched envelopes and credential handoffs fail before
+model or MCP setup.
 
 ## Server
 
@@ -181,8 +263,18 @@ Top-level app configuration.
 Key fields:
 
 - `build_chat_runtime`: required async factory that returns `ChatRuntime`
-- `valid_api_keys`, `jwt_secret`, `session_ttl`: auth and session envelope
-- `allowed_models`: request-time allowlist
+- `auth_manager` or `valid_api_keys`, `jwt_secret`, and `session_ttl`: auth and
+  session envelope
+- `tenant_id`: server-owned tenant bound into credential provenance
+- `model_registry`, `model_selection_policy`: canonical stable execution
+  identity registry and product selection policy
+- `model_preference_store`: durable saved preferences keyed by authenticated
+  tenant, actor, and capability
+- `service_provider_handles`, `service_auth_config_resolver`,
+  `capability_adapter_resolver`: server-owned credential and adapter
+  materialization
+- `autonomous_capability_binding_resolver`: trusted pre-spawn resolver for
+  autonomous start, schedule, and exact resume
 - `dispatch_scope_validator`: optional dispatch-time validator/canonicalizer for redacted structured portfolio scope
 - `cors_origins`, `prefix`: HTTP surface
 - `on_event`, `on_startup`, `on_shutdown`: app lifecycle hooks
@@ -196,9 +288,8 @@ Key fields:
 
 - `system_prompt`
 - `build_runner`
+- `capability_execution`
 - `get_tool_definitions`
-- `provider`
-- `model_override`
 - `max_turns`
 - `execution_location`
 
@@ -402,7 +493,7 @@ Key parameters:
 - `on_before_background`: sync callback invoked just before a background task starts
 - `on_background_complete`: async callback invoked when a background task finishes
 
-The handler supports `background=true` in the tool input. When set, the sub-agent runs asynchronously and the tool returns immediately with a `task_id`. Use `get_background_result` to collect results later.
+The handler supports `background=true` in the tool input. When set, the sub-agent runs asynchronously and the tool returns immediately with a `task_id`. With automatic notifications enabled, the terminal result is delivered through a typed task notification; current-run tasks must not be polled.
 
 ### `make_run_agent_tool_def(...)`
 
@@ -410,11 +501,11 @@ Factory for the tool schema exposed to the model. Includes the `background` bool
 
 ### `make_get_background_result_handler(runner_ref)`
 
-Factory for the local `get_background_result` handler. Delegates to `AgentRunner.get_background_result()` to poll or wait for background sub-agent tasks.
+Factory for the local `get_background_result` handler. Delegates to `AgentRunner.get_background_result()`. The handler retrieves historical results and payloads explicitly omitted from automatic notifications. When automatic notifications are disabled, an exact task request may perform one explicit bounded wait.
 
 ### `make_get_background_result_tool_def()`
 
-Factory for the `get_background_result` tool schema. The tool accepts `task_id` (or `"*"` for all tasks), an optional `wait` boolean, and an optional `timeout` (clamped to 120 seconds).
+Factory for the `get_background_result` tool schema. The tool accepts an exact `task_id`, or `"*"` for a bounded task-ID/status directory that never returns aggregate payloads. Optional `wait` and `timeout` fields support the notification-disabled path, with timeout clamped to 120 seconds. Oversized exact results are delivered as bounded canonical-JSON text pages; callers pass each opaque `cursor` back unchanged. An omitted payload remains retained after its final exact page is returned. It is released only after a later successful provider request contains that page's tool result and the resulting assistant response is durably recorded.
 
 ## Typed Events
 
@@ -430,7 +521,7 @@ Fields: `skill_run_id`, `skill`, `ticker`, `ts`. `type` is fixed to `"skill_run_
 
 Emitted when a skill run completes with a structured runtime result. This is the display/control-plane source for status, gate code, artifact refs, proposal ids, FMS result envelopes, and verdict echo data.
 
-Fields: `skill_run_id`, `skill`, `ticker`, `exit_code`, `outcome`, `status`, `gate_code`, `artifact_refs`, `proposal_ids`, `verdict_echo`, `fms_results`, `artifact_events`, `output_memory_file`, `cost_usd`, `duration_s`, `error`, `warnings`.
+Fields: `skill_run_id`, `skill`, `ticker`, `exit_code`, `outcome`, `status`, `gate_code`, `artifact_refs`, `proposal_ids`, `verdict_echo`, `fms_results`, `artifact_events`, `output_memory_file`, `cost_usd`, `duration_s`, `compaction_count` (a non-negative per-run count; legacy captures default to `0`), `error`, `warnings`.
 
 ### `ArtifactReadyEvent`
 

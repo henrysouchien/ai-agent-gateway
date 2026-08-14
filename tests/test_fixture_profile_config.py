@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import asyncio
 import os
 import sys
@@ -23,6 +25,10 @@ from agent_gateway import AgentRunner, EventLog, ToolDispatcher
 from agent_gateway.fixture_gate import FIXTURE_APPROVAL_TOOL_NAME, FIXTURE_MODEL_ID
 from agent_gateway.providers.fixture import FixtureProvider
 from api.agent.autonomous import entry as autonomous_entry
+from tests.capability_execution_test_support import (
+  stub_capability_execution_resolver,
+  stub_runner_capability_execution,
+)
 
 
 class _NullMcpClient:
@@ -48,15 +54,17 @@ def _construct_runner_from_runtime_config(config: Any, *, session_id: str) -> Ag
     event_log=event_log,
     dispatcher=dispatcher,
     session_id=session_id,
-    provider=FixtureProvider(),
-    auth_config={
-      "auth_mode": "none",
-      "api_key": "",
-      "auth_token": "",
-      "model": FIXTURE_MODEL_ID,
-      "max_tokens": config.max_tokens,
-      "thinking": False,
-    },
+    capability_execution=stub_runner_capability_execution(
+      provider=FixtureProvider(),
+      auth_config={
+        "auth_mode": "none",
+        "api_key": "",
+        "auth_token": "",
+        "max_tokens": config.max_tokens,
+      },
+      model=FIXTURE_MODEL_ID,
+      effort="none",
+    ),
     get_tool_definitions=lambda: [],
     client_timeout=config.client_timeout,
     max_tokens_override=config.max_tokens,
@@ -70,6 +78,15 @@ def _construct_runner_from_runtime_config(config: Any, *, session_id: str) -> Ag
   )
 
 
+def _fixture_session_driver_execution():
+  resolver = stub_capability_execution_resolver(
+    default_provider="fixture",
+    default_model=FIXTURE_MODEL_ID,
+    run_mode="autonomous",
+  )
+  return resolver.resolve("session.driver")
+
+
 def test_fixture_profile_budgets_validate_through_runner_config(monkeypatch) -> None:
   monkeypatch.setenv("APP_ENV", "test")
   monkeypatch.delenv("ENVIRONMENT", raising=False)
@@ -77,8 +94,15 @@ def test_fixture_profile_budgets_validate_through_runner_config(monkeypatch) -> 
   monkeypatch.delenv("NODE_ENV", raising=False)
 
   profile = load_profile("_fixture")
-  run_config = autonomous_entry._run_once_config(profile)
-  dev_config = autonomous_entry._dev_config(profile)
+  execution = _fixture_session_driver_execution()
+  run_config = autonomous_entry._run_once_config(
+    profile,
+    session_driver_execution=execution,
+  )
+  dev_config = autonomous_entry._dev_config(
+    profile,
+    session_driver_execution=execution,
+  )
 
   assert run_config.max_budget_usd == profile.max_budget_usd > 0
   assert dev_config.max_budget_usd == profile.dev_max_budget_usd > 0
@@ -121,8 +145,15 @@ def test_fixture_profile_timeout_defaults_to_live_qa_window(monkeypatch) -> None
   monkeypatch.delenv("AGENT_GATEWAY_FIXTURE_PROFILE_TIMEOUT_SECONDS", raising=False)
 
   profile = load_profile("_fixture")
-  run_config = autonomous_entry._run_once_config(profile)
-  dev_config = autonomous_entry._dev_config(profile)
+  execution = _fixture_session_driver_execution()
+  run_config = autonomous_entry._run_once_config(
+    profile,
+    session_driver_execution=execution,
+  )
+  dev_config = autonomous_entry._dev_config(
+    profile,
+    session_driver_execution=execution,
+  )
 
   assert profile.timeout_seconds == 300
   assert profile.dev_timeout == 300
@@ -139,8 +170,15 @@ def test_fixture_profile_timeout_can_be_overridden_for_fast_tests(monkeypatch) -
   monkeypatch.delenv("AGENT_GATEWAY_FIXTURE_PROFILE_TIMEOUT_SECONDS", raising=False)
 
   profile = load_profile("_fixture")
-  run_config = autonomous_entry._run_once_config(profile)
-  dev_config = autonomous_entry._dev_config(profile)
+  execution = _fixture_session_driver_execution()
+  run_config = autonomous_entry._run_once_config(
+    profile,
+    session_driver_execution=execution,
+  )
+  dev_config = autonomous_entry._dev_config(
+    profile,
+    session_driver_execution=execution,
+  )
 
   assert profile.timeout_seconds == 42
   assert profile.dev_timeout == 42

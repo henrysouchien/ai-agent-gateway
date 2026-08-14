@@ -12,6 +12,15 @@ from typing import Any
 from fastapi.testclient import TestClient
 import pytest
 
+from agent_gateway.capability_binding import (
+  CredentialHandle,
+)
+from agent_gateway.auth import AuthConfig, ResolverResult
+from agent_gateway.model_registry import (
+  CAPABILITY_IDS,
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
 from agent_gateway.commercial_claims import CommercialClaimError
 from agent_gateway.commercial_work_start import (
   COMMERCIAL_CLAIM_HEADER,
@@ -22,7 +31,12 @@ from agent_gateway.commercial_work_start import (
   CommercialWorkStartContext,
   require_commercial_child_provider,
 )
-from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.server import (
+  ChatRuntime,
+  GatewayServerConfig,
+  MaterializedCredential,
+  create_gateway_app,
+)
 from agent_gateway.work_authorization_consumption import (
   WorkAuthorizationAlreadyAttached,
   WorkAuthorizationConsumptionConflict,
@@ -33,6 +47,71 @@ from agent_gateway.work_authorization_consumption import (
 CLAIM_TOKEN = "claim-token-must-not-persist"
 WORK_TOKEN = "work-token-must-not-persist"
 WORK_TOKEN_2 = "second-work-token-must-not-persist"
+_SERVICE_HANDLE = CredentialHandle(
+  handle_id="service:commercial-work-start-tests:anthropic",
+  provider="anthropic",
+  principal="service",
+  tenant_id="commercial-work-start-tests",
+  actor_id=None,
+)
+
+
+def _materialize_service_credential(
+  handle: CredentialHandle,
+) -> MaterializedCredential:
+  assert handle is _SERVICE_HANDLE
+  return MaterializedCredential(
+    handle=handle,
+    auth_config={
+      "provider": "anthropic",
+      "api_key": "test-key",
+      "billing_mode": "metered",
+      "rate_table_version": "test-v1",
+    },
+  )
+
+
+async def _resolve_credentials(
+  api_key: str,
+  payload: Any,
+) -> ResolverResult:
+  assert api_key == "gateway-key"
+  assert payload.user_id == "101"
+  return ResolverResult(
+    user_id="101",
+    channel="mcp",
+    auth_config=AuthConfig.from_dict({
+      "provider": "anthropic",
+      "billing_mode": "metered",
+      "auth_mode": "api",
+      "api_key": "test-key",
+      "rate_table_version": "test-v1",
+    }),
+    credential_principal="service",
+    allow_service_for_interactive=True,
+    risk_user_id=101,
+    role="owner",
+    model_entitled_capabilities=CAPABILITY_IDS,
+    model_entitled_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
+  )
+
+
+def _gateway_config(
+  *,
+  build_chat_runtime,
+  **overrides: Any,
+) -> GatewayServerConfig:
+  return GatewayServerConfig(
+    tenant_id=_SERVICE_HANDLE.tenant_id,
+    allow_service_credentials_for_interactive=True,
+    credentials_resolver=_resolve_credentials,
+    model_registry=INITIAL_MODEL_REGISTRY,
+    model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+    service_provider_handles={"anthropic": _SERVICE_HANDLE},
+    service_auth_config_resolver=_materialize_service_credential,
+    build_chat_runtime=build_chat_runtime,
+    **overrides,
+  )
 
 
 class _ClaimVerifier:
@@ -80,7 +159,7 @@ class _ConsumptionStore:
 
 
 def _gate(order: list[str], *, pre_consume=None):
-  claim = SimpleNamespace(name="verified-claim")
+  claim = SimpleNamespace(name="verified-claim", subject="user:101")
   authorization = SimpleNamespace(name="verified-authorization")
   record = SimpleNamespace(name="consumption-record")
   claim_verifier = _ClaimVerifier(order, claim)
@@ -111,7 +190,7 @@ def _gate(order: list[str], *, pre_consume=None):
 
 
 def _request_facts():
-  session = SimpleNamespace(session_id="session-1")
+  session = SimpleNamespace(session_id="session-1", owner_user_id="101")
   request = SimpleNamespace(request_id="request-1")
   headers = {
     COMMERCIAL_CLAIM_HEADER: CLAIM_TOKEN,
@@ -185,6 +264,21 @@ def test_gate_verifies_exact_facts_then_consumes_without_retaining_tokens() -> N
   assert WORK_TOKEN not in repr(pending)
   assert CLAIM_TOKEN not in repr(context)
   assert WORK_TOKEN not in repr(context)
+
+
+def test_gate_rejects_claim_for_a_different_session_owner_before_authorization() -> None:
+  order: list[str] = []
+  gate, _, authorization_verifier, store = _gate(order)
+  session, request, headers = _request_facts()
+  session.owner_user_id = "202"
+
+  with pytest.raises(CommercialWorkStartError) as raised:
+    gate.verify_request(headers, session=session, request=request, channel="mcp")
+
+  assert raised.value.code == "commercial_work_subject_mismatch"
+  assert raised.value.status_code == 403
+  assert authorization_verifier.calls == []
+  assert store.attached == []
 
 
 def test_gate_runs_durability_preflight_before_consuming_authority() -> None:
@@ -273,10 +367,17 @@ def test_gate_maps_invalid_replay_conflict_and_storage_failure_to_no_start() -> 
 
 
 class _CompleteRunner:
-  def __init__(self, event_log, order: list[str], delay: float) -> None:
+  def __init__(
+    self,
+    event_log,
+    order: list[str],
+    delay: float,
+    capability_execution,
+  ) -> None:
     self._event_log = event_log
     self._order = order
     self._delay = delay
+    self.capability_execution = capability_execution
 
   async def run(self, **_kwargs) -> None:
     self._order.append("provider_start")
@@ -307,19 +408,26 @@ def _server_app(tmp_path: Path, *, provider_delay: float = 0):
     order.append("runtime")
     observed_contexts.append(request.commercial_work_start)
     assert order.index("consume") < order.index("runtime")
+    capability_execution = request.capability_execution
+    assert capability_execution is not None
     return ChatRuntime(
       system_prompt="test",
-      build_runner=lambda event_log, _sid: _CompleteRunner(
-        event_log, order, provider_delay
+      build_runner=lambda event_log, _sid, _started_at: _CompleteRunner(
+        event_log,
+        order,
+        provider_delay,
+        capability_execution,
       ),
+      capability_execution=capability_execution,
     )
 
-  app = create_gateway_app(GatewayServerConfig(
-    auth_config={"model": "claude-sonnet-4-6"},
-    build_chat_runtime=build_runtime,
-    commercial_work_start_gate=gate,
-    transcript_dir=tmp_path,
-  ))
+  app = create_gateway_app(
+    _gateway_config(
+      build_chat_runtime=build_runtime,
+      commercial_work_start_gate=gate,
+      transcript_dir=tmp_path,
+    )
+  )
   return app, gate, store, order, observed_contexts
 
 
@@ -328,7 +436,7 @@ def _session_token(client: TestClient) -> str:
     "/api/chat/init",
     json={
       "api_key": "gateway-key",
-      "user_id": "alice",
+      "user_id": "101",
       "context": {"channel": "mcp"},
     },
   )
@@ -356,6 +464,7 @@ def test_server_consumes_before_runtime_and_never_transcripts_raw_tokens(
       headers=_chat_headers(token),
       json={
         "request_id": "request-1",
+        "user_id": "101",
         "context": {"channel": "mcp"},
         "messages": [{"role": "user", "content": "hello"}],
       },
@@ -384,6 +493,7 @@ def test_server_rejects_missing_or_replayed_authority_before_runtime(
       headers={"Authorization": f"Bearer {token}"},
       json={
         "request_id": "request-1",
+        "user_id": "101",
         "context": {"channel": "mcp"},
         "messages": [{"role": "user", "content": "hello"}],
       },
@@ -398,6 +508,7 @@ def test_server_rejects_missing_or_replayed_authority_before_runtime(
       headers=_chat_headers(token),
       json={
         "request_id": "request-1",
+        "user_id": "101",
         "context": {"channel": "mcp"},
         "messages": [{"role": "user", "content": "hello"}],
       },
@@ -423,6 +534,7 @@ def test_concurrent_requests_reserve_one_dispatch_before_consumption(
         headers=_chat_headers(token, work_token),
         json={
           "request_id": request_id,
+          "user_id": "101",
           "context": {"channel": "mcp"},
           "messages": [{"role": "user", "content": "hello"}],
         },
@@ -472,6 +584,7 @@ def test_server_rejects_commercial_bearer_material_anywhere_in_body(
     token = _session_token(client)
     body: dict[str, object] = {
       "request_id": "request-1",
+      "user_id": "101",
       "messages": [{"role": "user", "content": "hello"}],
     }
     body.update(body_changes)
@@ -490,6 +603,54 @@ def test_server_rejects_commercial_bearer_material_anywhere_in_body(
   persisted = b"".join(path.read_bytes() for path in tmp_path.glob("*.jsonl"))
   assert CLAIM_TOKEN.encode() not in persisted
   assert WORK_TOKEN.encode() not in persisted
+
+
+@pytest.mark.parametrize(
+  ("path", "payload", "secret_markers"),
+  (
+    (
+      "/api/chat",
+      {
+        "api_key": "sk_fake_chat_secret",
+        "session_token": "fake_session_secret",
+        "nested": {"access_token": "fake_nested_secret"},
+      },
+      (
+        "sk_fake_chat_secret",
+        "fake_session_secret",
+        "fake_nested_secret",
+      ),
+    ),
+    (
+      "/api/chat/init",
+      [
+        {
+          "api_key": "sk_fake_init_secret",
+          "anthropic_api_key": "sk_fake_provider_secret",
+        }
+      ],
+      ("sk_fake_init_secret", "sk_fake_provider_secret"),
+    ),
+  ),
+)
+def test_request_validation_errors_never_echo_request_values(
+  tmp_path: Path,
+  path: str,
+  payload: object,
+  secret_markers: tuple[str, ...],
+) -> None:
+  app, _, _, order, _ = _server_app(tmp_path)
+
+  with TestClient(app) as client:
+    response = client.post(path, json=payload)
+
+  assert response.status_code == 422
+  detail = response.json()["detail"]
+  assert detail
+  assert all({"type", "loc", "msg"} <= set(error) for error in detail)
+  assert all("input" not in error and "ctx" not in error for error in detail)
+  assert all(marker not in response.text for marker in secret_markers)
+  assert "runtime" not in order
 
 
 def _nested_string_values(value: object) -> list[str]:
@@ -513,7 +674,9 @@ def test_unconfigured_server_rejects_commercial_headers() -> None:
     runtime_calls.append("runtime")
     raise AssertionError("runtime must not be constructed")
 
-  app = create_gateway_app(GatewayServerConfig(build_chat_runtime=build_runtime))
+  app = create_gateway_app(
+    _gateway_config(build_chat_runtime=build_runtime)
+  )
   with TestClient(app) as client:
     token = _session_token(client)
     response = client.post(
@@ -521,6 +684,7 @@ def test_unconfigured_server_rejects_commercial_headers() -> None:
       headers=_chat_headers(token),
       json={
         "request_id": "request-1",
+        "user_id": "101",
         "context": {"channel": "mcp"},
         "messages": [{"role": "user", "content": "hello"}],
       },

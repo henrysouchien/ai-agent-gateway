@@ -2,36 +2,61 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Sequence, Set, Tuple
 
 from .runner_budget import (
   BudgetCostProgress as BudgetCostProgress,
   BudgetExceededState as BudgetExceededState,
   ChildCostAccumulator as ChildCostAccumulator,
   CostAccumulator as CostAccumulator,
+  ProviderRequestBudgetAdmission as ProviderRequestBudgetAdmission,
+  ProviderRequestBudgetError as ProviderRequestBudgetError,
+  admit_provider_request_budget as admit_provider_request_budget,
   budget_cost_progress as budget_cost_progress,
   budget_exceeded_state as budget_exceeded_state,
   budget_reason_suffix as budget_reason_suffix,
 )
-from .thinking import canonical_effort_config
+from .thinking import parse_effort
 
 
 def normalized_run_config(
   auth_config: Dict[str, Any],
   *,
-  default_model: str,
-  model_override: str | None,
+  upstream_model: str,
+  effort: str,
 ) -> Dict[str, Any]:
-  config = canonical_effort_config(auth_config)
+  config = dict(auth_config)
+  selection_fields = {
+    "effort",
+    "model",
+    "model_key",
+    "thinking",
+    "thinking_enabled_requested",
+  } & set(config)
+  if selection_fields:
+    raise ValueError(
+      "credential auth_config must not contain model selection"
+    )
+  normalized_model = str(upstream_model or "").strip()
+  if not normalized_model:
+    raise ValueError("native execution requires a bound upstream model")
+  requested_effort = parse_effort(
+    effort,
+    field_name="capability_execution.effort",
+  )
+  if requested_effort is None:
+    raise ValueError(
+      "native execution requires an explicitly bound effort"
+    )
   config.update({
     "auth_mode": str(config.get("auth_mode", "api")).strip().lower(),
     "api_key": str(config.get("api_key", "")),
     "auth_token": str(config.get("auth_token", "")),
-    "model": str(config.get("model") or default_model),
+    "model": normalized_model,
+    "effort": requested_effort.value,
+    "thinking_enabled_requested": requested_effort.value != "none",
     "max_tokens": int(config.get("max_tokens", 16000)),
   })
-  if model_override:
-    config["model"] = model_override
   return config
 
 
@@ -88,8 +113,18 @@ def user_turn_message(content: Any) -> Dict[str, Any]:
 
 def background_tasks_completed_user_message() -> Dict[str, Any]:
   return user_turn_message(
-    "[System: Background tasks have completed. Check results with get_background_result.]"
+    "[System: New background-task notifications are included above. Use those "
+    "outcomes directly. Each notification includes its complete payload or "
+    "explicitly marks an omission. Do not call get_background_result for tasks "
+    "from this run unless a notification explicitly says its payload was omitted.]"
   )
+
+
+def tool_execution_order_indices(
+  tool_names: Sequence[str],
+) -> tuple[int, ...]:
+  """Return the runtime execution order for one assistant tool-use turn."""
+  return tuple(range(len(tool_names)))
 
 
 @dataclass(frozen=True)
@@ -143,11 +178,12 @@ def max_tokens_continuation_decision(
   *,
   current_attempts: int,
   max_attempts: int,
+  unbounded: bool = False,
 ) -> MaxTokensContinuationDecision:
   attempts = current_attempts + 1
   return MaxTokensContinuationDecision(
     attempts=attempts,
-    should_continue=attempts <= max_attempts,
+    should_continue=unbounded or attempts <= max_attempts,
   )
 
 
@@ -161,6 +197,7 @@ def no_tool_use_turn_outcome(
   max_tokens_continuations: int,
   max_tokens_max_attempts: int,
   max_tokens_nudge: str,
+  unbounded_max_tokens_continuations: bool = False,
 ) -> NoToolUseTurnOutcome:
   if stop_reason in {"pause_turn", "compaction"}:
     return NoToolUseTurnOutcome(
@@ -181,6 +218,7 @@ def no_tool_use_turn_outcome(
     continuation_decision = max_tokens_continuation_decision(
       current_attempts=max_tokens_continuations,
       max_attempts=max_tokens_max_attempts,
+      unbounded=unbounded_max_tokens_continuations,
     )
     if continuation_decision.should_continue:
       messages: List[Dict[str, Any]] = []
@@ -550,18 +588,26 @@ async def execute_tool_use_loop(
   make_error_result: Callable[[str, str, str], Dict[str, Any]],
   model_visible_extra_blocks: Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]],
   on_exception: Callable[[BaseException], None],
+  should_stop_after_tool_result: Callable[[], bool] = lambda: False,
 ) -> ToolUseLoopResult:
+  ordered_tool_uses = [
+    tool_uses[index]
+    for index in tool_execution_order_indices(
+      [tool_name for _, tool_name, _ in tool_uses],
+    )
+  ]
+
   tool_results_content: List[Dict[str, Any]] = []
   deferred_extras: List[Dict[str, Any]] = []
   tools_used: List[str] = []
   i = 0
   run_agent_seq = 0
-  while i < len(tool_uses):
-    tool_id, tool_name, tool_input = tool_uses[i]
+  while i < len(ordered_tool_uses):
+    tool_id, tool_name, tool_input = ordered_tool_uses[i]
     excluded_tools = effective_excluded_tools()
     if should_execute_run_agent_batch(tool_name, excluded_tools):
       batch_call = await execute_run_agent_batch_call(
-        tool_uses,
+        ordered_tool_uses,
         start_index=i,
         start_call_index=run_agent_seq,
         run_agent_available=lambda: "run_agent" not in effective_excluded_tools(),
@@ -605,6 +651,19 @@ async def execute_tool_use_loop(
         single_call.tool_result,
       )
       i = single_call.next_index
+    if should_stop_after_tool_result():
+      for skipped_tool_id, skipped_tool_name, _ in ordered_tool_uses[i:]:
+        tool_results_content.append(
+          make_error_result(
+            skipped_tool_id,
+            "tool_skipped_after_terminal_result",
+            (
+              f"Tool '{skipped_tool_name}' was skipped because an earlier "
+              "tool result ended this turn"
+            ),
+          )
+        )
+      break
 
   append_deferred_tool_extras(tool_results_content, deferred_extras)
   return ToolUseLoopResult(
@@ -685,6 +744,10 @@ class ToolResultContext:
   workspace_dir: str | None = None
   registry_scope: RegistryScope | None = None
   batch_id: int | str | None = None
+  boundary_sanitizer: Callable[[Any, str], Any] | None = field(
+    default=None,
+    repr=False,
+  )
 
 
 @dataclass
@@ -704,6 +767,14 @@ class StreamTurnResult:
   stop_reason: str | None = None
   first_token_t: float | None = None
   content_blocks: List[Dict[str, Any]] = field(default_factory=list)
+  advertised_tool_names: frozenset[str] | None = None
+
+
+@dataclass(frozen=True)
+class StreamTurnFailure:
+  error: Exception
+  formatted_error: str
+  is_context_length: bool = False
 
 
 @dataclass(frozen=True)

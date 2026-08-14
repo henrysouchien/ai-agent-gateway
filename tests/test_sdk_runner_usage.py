@@ -13,6 +13,7 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog
 from agent_gateway.multi_user.billing import SessionUsageSummary, UsageEvent
+from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution
 
 
 def _run(coro):
@@ -21,21 +22,25 @@ def _run(coro):
 
 def test_sdk_runner_usage_event_threads_identity() -> None:
   events: list[UsageEvent] = []
+  execution = stub_sdk_capability_execution()
   runner = AgentSDKRunner(
     event_log=EventLog(),
     session_id="sess-sdk",
     sdk_config=AgentSDKConfig(
-      api_key="k",
-      model="claude-sonnet-4-6",
       user_id="alice",
       channel="web",
       rate_table_version="v1",
       billing_mode="metered",
       request_id="req-sdk",
     ),
+    capability_execution=execution,
     system_prompt="test",
     on_usage=events.append,
   )
+  runner._handle_stream_event({
+    "type": "message_start",
+    "message": {"model": execution.bind.upstream_model, "usage": {}},
+  })
   runner._update_usage(
     {
       "input_tokens": 10,
@@ -58,7 +63,9 @@ def test_sdk_runner_usage_event_threads_identity() -> None:
   assert event.billing_mode == "metered"
   assert event.request_id == "req-sdk"
   assert event.model == "claude-sonnet-4-6"
-  assert event.provider == "agent-sdk"
+  assert event.provider == "anthropic"
+  assert event.capability_bind == execution.bind.receipt()
+  assert event.provider_reported_model == execution.bind.upstream_model
   assert event.input_tokens == 10
   assert event.provider_unit_deltas == {"web_fetch": 1, "web_search": 2}
   assert event.cost_usd == pytest.approx(0.03)
@@ -69,7 +76,8 @@ def test_sdk_runner_requires_explicit_usage_identity() -> None:
     AgentSDKRunner(
       event_log=EventLog(),
       session_id="sess-sdk",
-      sdk_config=AgentSDKConfig(api_key="k", model="claude-sonnet-4-6"),
+      sdk_config=AgentSDKConfig(),
+      capability_execution=stub_sdk_capability_execution(),
       system_prompt="test",
     )
 
@@ -85,10 +93,11 @@ def test_sdk_stream_emits_one_commercial_delta_per_provider_call() -> None:
     event_log=EventLog(),
     session_id="sess-sdk",
     sdk_config=AgentSDKConfig(
-      api_key="k", model="claude-sonnet-4-6", user_id="alice",
+      user_id="alice",
       channel="web", rate_table_version="v1", billing_mode="metered",
       request_id="req-sdk",
     ),
+    capability_execution=stub_sdk_capability_execution(),
     system_prompt="test",
     commercial_usage_producer=Producer(),
   )
@@ -115,6 +124,13 @@ def test_sdk_stream_emits_one_commercial_delta_per_provider_call() -> None:
     (20, 5, 8, "succeeded"),
   ]
   assert {event.provider for event, _ in emitted} == {"anthropic"}
+  assert {
+    event.capability_bind["upstream_model"] for event, _ in emitted
+    if event.capability_bind is not None
+  } == {"claude-sonnet-4-6"}
+  assert {event.provider_reported_model for event, _ in emitted} == {
+    "claude-sonnet-4-6"
+  }
   assert [event.provider_unit_deltas for event, _ in emitted] == [
     {"web_fetch": 1, "web_search": 1},
     {"web_fetch": 1, "web_search": 1},
@@ -126,9 +142,10 @@ def test_sdk_commercial_default_off_preserves_cumulative_legacy_grain() -> None:
   runner = AgentSDKRunner(
     event_log=EventLog(), session_id="sess-sdk",
     sdk_config=AgentSDKConfig(
-      api_key="k", model="claude-sonnet-4-6", user_id="alice",
+      user_id="alice",
       request_id="req-sdk", rate_table_version="v1", billing_mode="byok",
     ),
+    capability_execution=stub_sdk_capability_execution(),
     system_prompt="test", on_usage=events.append,
   )
   runner._handle_stream_event({
@@ -156,9 +173,10 @@ def test_sdk_reconciliation_failure_does_not_block_summary_callback() -> None:
   runner = AgentSDKRunner(
     event_log=EventLog(), session_id="sess-sdk",
     sdk_config=AgentSDKConfig(
-      api_key="k", model="claude-sonnet-4-6", user_id="alice",
+      user_id="alice",
       request_id="req-sdk", rate_table_version="v1", billing_mode="byok",
     ),
+    capability_execution=stub_sdk_capability_execution(),
     system_prompt="test", commercial_usage_producer=Producer(),
     on_session_summary=summaries.append,
   )
@@ -179,12 +197,11 @@ def test_sdk_runner_explicit_identity_summary() -> None:
     event_log=EventLog(),
     session_id="sess-sdk",
     sdk_config=AgentSDKConfig(
-      api_key="k",
-      model="claude-sonnet-4-6",
       user_id="alice",
       rate_table_version="v1",
       billing_mode="byok",
     ),
+    capability_execution=stub_sdk_capability_execution(),
     system_prompt="test",
     on_session_summary=summaries.append,
   )
@@ -204,6 +221,6 @@ def test_sdk_runner_explicit_identity_summary() -> None:
   assert summaries[0].input_tokens == 3
   assert summaries[0].turns == 1
   assert summaries[0].model == "claude-sonnet-4-6"
-  assert summaries[0].provider == "agent-sdk"
+  assert summaries[0].provider == "anthropic"
   assert summaries[0].rate_table_version == "v1"
   assert summaries[0].billing_mode == "byok"

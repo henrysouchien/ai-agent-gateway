@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from .artifact_paths import ArtifactPath
 from .auth import ChannelMismatchError, CredentialsTimeoutError, CrossUserReuseError, MissingUserIdError, NoCredentialError
 from .session import AuthManager
+from .claim_signing_authority import GatewayClaimSigningAuthority
 from .server_models import (
   _AGENT_API_CLAIM_AUDIENCE,
   _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS,
@@ -110,15 +111,18 @@ def _verify_signed_user_claim(request: Request) -> dict[str, Any]:
   if claim_headers is None:
     raise HTTPException(status_code=401, detail="Signed user claim required")
 
-  hmac_key = os.getenv("AGENT_API_USER_CLAIM_HMAC_KEY", "").strip()
-  if not hmac_key:
+  authority = getattr(
+    request.app.state,
+    "gateway_claim_signing_authority",
+    None,
+  )
+  if type(authority) is not GatewayClaimSigningAuthority:
     raise HTTPException(
       status_code=503,
-      detail="Agent API signed claim verifier not configured (AGENT_API_USER_CLAIM_HMAC_KEY not set)",
+      detail="Agent API signed claim verifier not configured",
     )
 
-  verified = _verify_agent_claim_headers(
-    hmac_key,
+  verified = authority.verify_user_claim(
     claim_headers,
     ttl_ceiling=_claim_ttl_ceiling_seconds(),
   )
@@ -451,7 +455,11 @@ def _normalize_request_user_id(user_id: str | None) -> str | None:
 
 
 def _resolver_contract_payload(message: str, *, user_id: str | None = None) -> tuple[int, Dict[str, Any]]:
-  payload: Dict[str, Any] = {"error": "credential_resolver_invalid", "message": message}
+  del message
+  payload: Dict[str, Any] = {
+    "error": "credential_resolver_invalid",
+    "message": "Credential resolver returned invalid identity metadata",
+  }
   if user_id is not None:
     payload["user_id"] = user_id
   return 400, payload
@@ -510,13 +518,17 @@ def _error_payload(
   if isinstance(exc, HTTPException):
     payload = {
       "error": "auth_failed",
-      "message": str(exc.detail) if exc.detail is not None else "Authentication failed",
+      "message": "Authentication failed",
     }
     if user_id is not None:
       payload["user_id"] = user_id
     return exc.status_code, payload
 
-  payload = {"error": "credentials_unavailable", "message": str(exc), "reason": str(exc)}
+  payload = {
+    "error": "credentials_unavailable",
+    "message": "Credential resolver unavailable",
+    "reason": "credential_resolver_failed",
+  }
   if user_id is not None:
     payload["user_id"] = user_id
   return 500, payload

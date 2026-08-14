@@ -11,6 +11,7 @@ ControlRunState = Literal[
   "running",
   "approval_pending",
   "completed",
+  "budget_limited",
   "failed",
   "interrupted",
   "cancelled",
@@ -37,6 +38,7 @@ CONTROL_RUN_STATE_CLASSIFICATION: MappingProxyType[str, ControlRunStateClassific
       "cancellable": True,
     },
     "completed": {"active": False, "terminal": True, "resumable": False, "cancellable": False},
+    "budget_limited": {"active": False, "terminal": True, "resumable": False, "cancellable": False},
     "failed": {"active": False, "terminal": True, "resumable": True, "cancellable": False},
     "interrupted": {"active": False, "terminal": True, "resumable": True, "cancellable": False},
     "cancelled": {"active": False, "terminal": True, "resumable": True, "cancellable": False},
@@ -47,8 +49,7 @@ _INTERNAL_AUTONOMOUS_STATE_ALIASES: MappingProxyType[str, ControlRunState] = Map
   {
     "finished": "completed",
     "killed": "cancelled",
-    "budget_exceeded": "failed",
-    "budget_limited": "failed",
+    "budget_exceeded": "budget_limited",
     "blocked": "failed",
     "remediating": "running",
   }

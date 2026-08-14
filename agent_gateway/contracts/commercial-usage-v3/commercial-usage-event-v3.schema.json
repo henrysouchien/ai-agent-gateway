@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hank.investments/schemas/commercial/commercial-usage-event-v3.schema.json",
+  "title": "CommercialUsageEventV3",
+  "description": "One economic delta carrying the exact admitted capability receipt and a distinct provider-reported model identity.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_product",
+    "source_event_id",
+    "environment",
+    "occurred_at",
+    "execution_context_id",
+    "request_id",
+    "session_id",
+    "parent_turn_id",
+    "workflow_run_id",
+    "reservation_id",
+    "funding_route_id",
+    "channel",
+    "provider",
+    "operation",
+    "model",
+    "capability_id",
+    "capability_bind",
+    "provider_reported_model",
+    "usage_state",
+    "uncached_input_tokens",
+    "billable_output_tokens",
+    "reasoning_tokens_observed",
+    "cache_write_tokens",
+    "cache_read_tokens",
+    "is_batch",
+    "provider_units",
+    "separately_billed_tool_cost_usd",
+    "producer_estimated_cost_usd",
+    "provider_reported_cost_usd",
+    "cost_observation_kind",
+    "producer_rate_version",
+    "shadow_rate_version",
+    "raw_billing_mode",
+    "workflow_attempt_group_id",
+    "workflow_attempt_number",
+    "retry_of_workflow_run_id",
+    "workflow_attempt_kind",
+    "work_authorization_id",
+    "source_payload_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 3},
+    "source_product": {"enum": ["hank-agent-gateway", "risk-module-direct"]},
+    "source_event_id": {"type": "string", "minLength": 1, "maxLength": 255},
+    "environment": {"enum": ["dev", "staging", "prod"]},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "execution_context_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "request_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "session_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "parent_turn_id": {"$ref": "#/$defs/nullableText"},
+    "workflow_run_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "reservation_id": {"$ref": "#/$defs/nullableText"},
+    "funding_route_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "channel": {"$ref": "#/$defs/code"},
+    "provider": {"$ref": "#/$defs/code"},
+    "operation": {"$ref": "#/$defs/code"},
+    "model": {"type": "string", "minLength": 1, "maxLength": 512},
+    "capability_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "capability_bind": {"$ref": "#/$defs/capabilityBind"},
+    "provider_reported_model": {"$ref": "#/$defs/nullableText"},
+    "usage_state": {"enum": ["succeeded", "failed_billable", "failed_unbilled", "canceled"]},
+    "uncached_input_tokens": {"$ref": "#/$defs/tokenCount"},
+    "billable_output_tokens": {"$ref": "#/$defs/tokenCount"},
+    "reasoning_tokens_observed": {
+      "anyOf": [{"type": "null"}, {"$ref": "#/$defs/tokenCount"}]
+    },
+    "cache_write_tokens": {"$ref": "#/$defs/tokenCount"},
+    "cache_read_tokens": {"$ref": "#/$defs/tokenCount"},
+    "is_batch": {"type": "boolean"},
+    "provider_units": {"$ref": "#/$defs/nullableNonNegativeDecimal"},
+    "separately_billed_tool_cost_usd": {"$ref": "#/$defs/nonNegativeDecimal"},
+    "producer_estimated_cost_usd": {"$ref": "#/$defs/nullableNonNegativeDecimal"},
+    "provider_reported_cost_usd": {"$ref": "#/$defs/nullableNonNegativeDecimal"},
+    "cost_observation_kind": {"enum": ["producer_estimate", "provider_response", "unknown"]},
+    "producer_rate_version": {"$ref": "#/$defs/nullableText"},
+    "shadow_rate_version": {"type": "string", "minLength": 1, "maxLength": 512},
+    "raw_billing_mode": {"enum": ["byok", "metered"]},
+    "workflow_attempt_group_id": {"$ref": "#/$defs/nullableUuid"},
+    "workflow_attempt_number": {
+      "anyOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]
+    },
+    "retry_of_workflow_run_id": {
+      "anyOf": [{"type": "null"}, {"$ref": "#/$defs/uuid"}]
+    },
+    "workflow_attempt_kind": {
+      "anyOf": [
+        {"type": "null"},
+        {"enum": ["initial", "user_retry", "automatic_retry"]}
+      ]
+    },
+    "work_authorization_id": {"$ref": "#/$defs/nullableUuid"},
+    "source_payload_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"workflow_attempt_group_id": {"type": "null"}}},
+      "then": {
+        "properties": {
+          "workflow_attempt_number": {"type": "null"},
+          "retry_of_workflow_run_id": {"type": "null"},
+          "workflow_attempt_kind": {"type": "null"},
+          "work_authorization_id": {"type": "null"}
+        }
+      },
+      "else": {
+        "properties": {
+          "execution_context_id": {"$ref": "#/$defs/uuid"},
+          "workflow_run_id": {"$ref": "#/$defs/uuid"},
+          "reservation_id": {"$ref": "#/$defs/nullableUuid"},
+          "funding_route_id": {"$ref": "#/$defs/uuid"},
+          "workflow_attempt_number": {"type": "integer", "minimum": 1},
+          "workflow_attempt_kind": {"enum": ["initial", "user_retry", "automatic_retry"]}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"workflow_attempt_kind": {"const": "initial"}}},
+      "then": {
+        "properties": {
+          "workflow_attempt_number": {"const": 1},
+          "retry_of_workflow_run_id": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "workflow_attempt_kind": {"enum": ["user_retry", "automatic_retry"]}
+        }
+      },
+      "then": {
+        "properties": {
+          "workflow_attempt_number": {"type": "integer", "minimum": 2},
+          "retry_of_workflow_run_id": {"$ref": "#/$defs/uuid"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "workflow_attempt_group_id": {"not": {"type": "null"}},
+          "source_product": {"const": "hank-agent-gateway"}
+        }
+      },
+      "then": {"properties": {"work_authorization_id": {"$ref": "#/$defs/uuid"}}}
+    },
+    {
+      "if": {
+        "properties": {
+          "workflow_attempt_group_id": {"not": {"type": "null"}},
+          "source_product": {"const": "risk-module-direct"}
+        }
+      },
+      "then": {"properties": {"work_authorization_id": {"type": "null"}}}
+    }
+  ],
+  "$defs": {
+    "nullableUuid": {
+      "anyOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/uuid"}
+      ]
+    },
+    "code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9._:-]*$"
+    },
+    "nullableText": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "maxLength": 512}
+      ]
+    },
+    "tokenCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "nonNegativeDecimal": {
+      "anyOf": [
+        {"type": "number", "minimum": 0},
+        {"type": "string", "pattern": "^[+]?[0-9]+(?:\\.[0-9]+)?$"}
+      ]
+    },
+    "nullableNonNegativeDecimal": {
+      "anyOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/nonNegativeDecimal"}
+      ]
+    },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "capabilityBind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "capability_id",
+        "model_key",
+        "provider",
+        "upstream_model",
+        "adapter",
+        "protocol_profile",
+        "route",
+        "effort",
+        "credential_principal",
+        "credential_ref",
+        "run_mode",
+        "registry_revision",
+        "policy_revision",
+        "selection_source"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "capability_id": {"type": "string", "minLength": 1, "maxLength": 512},
+        "model_key": {"type": "string", "minLength": 1, "maxLength": 512},
+        "provider": {"type": "string", "minLength": 1, "maxLength": 512},
+        "upstream_model": {"type": "string", "minLength": 1, "maxLength": 512},
+        "adapter": {"type": "string", "minLength": 1, "maxLength": 512},
+        "protocol_profile": {"type": "string", "minLength": 1, "maxLength": 512},
+        "route": {"type": "string", "minLength": 1, "maxLength": 512},
+        "effort": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]},
+        "credential_principal": {"enum": ["user", "service"]},
+        "credential_ref": {"type": "string", "minLength": 1, "maxLength": 512},
+        "run_mode": {"enum": ["interactive", "fleet", "batch", "autonomous", "cron"]},
+        "registry_revision": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"},
+        "policy_revision": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"},
+        "selection_source": {
+          "enum": [
+            "explicit_user",
+            "saved_preference",
+            "channel_default",
+            "capability_default",
+            "internal_policy",
+            "parent_binding"
+          ]
+        }
+      }
+    }
+  }
+}

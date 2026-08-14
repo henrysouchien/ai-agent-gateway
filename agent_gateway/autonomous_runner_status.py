@@ -39,6 +39,8 @@ def status_payload(
     payload["exit_code"] = record.exit_code
   if record.error:
     payload["error"] = record.error
+  if record.terminal_reason is not None:
+    payload["terminal_reason"] = record.terminal_reason
   lines, _total = tail_lines_func(record.log_path, status_tail_lines)
   if lines:
     payload["log_tail"] = "\n".join(lines)

@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal, Union
 
 from fastapi import Body
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agent_gateway.control_run_lifecycle import ControlRunState
+from agent_gateway.thinking import parse_effort
 
 ChatRunState = ControlRunState
 AutonomousRunState = ControlRunState
@@ -100,12 +101,76 @@ class StagedProposalResponse(BaseModel):
 
 class PendingApprovalResponse(BaseModel):
   pending_id: str
+  approval_id: str
   tool_name: str
   tool_input: dict[str, Any]
+  planned_change: dict[str, Any] | None = None
   resolved_qualifier: str | None
   reason: str | None
   allow_persistent_approval: bool
   requested_at: str
+
+
+class ToolResultSummaryResponse(BaseModel):
+  """Bounded server-observed summary of the latest completed tool call."""
+
+  tool_call_id: str
+  tool_name: str
+  status: str | None = None
+  succeeded: bool
+  subcommand: str | None = None
+  gate_code: str | None = None
+  artifact_ref: str | None = None
+  proposal_id: str | None = None
+  verdict: str | None = None
+  stage_receipt_status: str | None = None
+  error_code: str | None = None
+  error_message: str | None = None
+  error_recoverable: bool | None = None
+
+
+class AutonomousResultReference(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  kind: Literal["skill_run", "artifact", "proposal", "output_memory"]
+  ref: str = Field(..., min_length=1)
+  skill_run_id: str | None = None
+
+
+class AutonomousTerminalReceipt(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  run_id: str = Field(..., min_length=1)
+  disposition: Literal[
+    "completed",
+    "budget_limited",
+    "failed",
+    "interrupted",
+    "cancelled",
+  ]
+  exit_code: int | None
+  error: str | None
+  terminal_reason: Literal["writer_lease_already_held"] | None
+  completed_at: str
+  log_ref: str = Field(..., min_length=1)
+  result_refs: list[AutonomousResultReference] = Field(default_factory=list)
+
+  @model_validator(mode="after")
+  def _validate_terminal_outcome(self) -> AutonomousTerminalReceipt:
+    if self.disposition == "completed" and (
+      self.exit_code != 0 or self.error is not None
+    ):
+      raise ValueError(
+        "completed terminal receipt requires exit_code=0 and error=null"
+      )
+    if (
+      self.terminal_reason is not None
+      and self.disposition != "completed"
+    ):
+      raise ValueError(
+        "terminal receipt reason requires completed disposition"
+      )
+    return self
 
 
 class DispatchScope(BaseModel):
@@ -158,10 +223,12 @@ class ChatRunResponse(BaseModel):
   started_at: str
   ended_at: str | None
   cost_usd: float | None
+  max_budget_usd: float | None = None
   initial_message: str
   skill_run_ids: list[str]
   current_verdict: VerdictSummaryResponse | None
   pending_approval: PendingApprovalResponse | None
+  latest_tool_result: ToolResultSummaryResponse | None = None
   dispatch_scope: DispatchScope | None = None
 
 
@@ -185,6 +252,9 @@ class AutonomousRunResponse(BaseModel):
   user_aliases: list[str] = Field(default_factory=list)
   identity_status: str | None = None
   state: AutonomousRunState
+  exit_code: int | None = None
+  error: str | None = None
+  terminal_receipt: AutonomousTerminalReceipt | None = None
   messageable: bool = False
   started_at: str
   ended_at: str | None
@@ -208,13 +278,19 @@ class ChatMessage(BaseModel):
 
 
 class ChatDispatchRequest(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
   kind: Literal["chat"]
   message: str = Field(..., min_length=1)
   channel: str = Field(..., min_length=1)
+  model_key: str | None = None
+  effort: str | None = None
+  catalog_revision: str | None = None
   skill: str | None = None
   ticker: str | None = None
   dev_mode: bool = False
   deadline_sec: int | None = Field(default=None, ge=1)
+  max_budget_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
   context: dict[str, Any] = Field(default_factory=dict)
   dispatch_scope: DispatchScope | None = None
 
@@ -223,11 +299,34 @@ class ChatDispatchRequest(BaseModel):
   def _reject_context_authority_fields(cls, value: dict[str, Any]) -> dict[str, Any]:
     return _reject_context_authority_fields(value)
 
+  @field_validator("effort", mode="before")
+  @classmethod
+  def _normalize_effort(cls, value: Any) -> str | None:
+    parsed = parse_effort(value)
+    return parsed.value if parsed is not None else None
+
+  @model_validator(mode="after")
+  def _require_complete_selection(self) -> "ChatDispatchRequest":
+    if self.effort is not None and self.model_key is None:
+      raise ValueError("effort requires an explicit model_key")
+    if self.catalog_revision is not None and self.model_key is None:
+      raise ValueError("catalog_revision requires an explicit model_key")
+    return self
+
+  @field_validator("max_budget_usd", mode="before")
+  @classmethod
+  def _reject_coerced_max_budget(cls, value: Any) -> Any:
+    if value is None:
+      return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+      raise ValueError("max_budget_usd must be a finite positive number")
+    return value
+
 
 class AutonomousDispatchRequest(BaseModel):
   kind: Literal["autonomous"]
   profile: str | None = None
-  mode: str | None = None
+  mode: Literal["once", "task", "skill"] | None = None
   skill: str | None = None
   task: str | None = None
   ticker: str | None = None
@@ -285,16 +384,34 @@ class RunLogsResponse(BaseModel):
 
 
 class ChatContinuationRequest(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
   messages: list[ChatMessage]
   request_id: str | None = None
   context: dict[str, Any] = Field(default_factory=dict)
-  model: str | None = None
+  model_key: str | None = None
+  effort: str | None = None
+  catalog_revision: str | None = None
   deadline_sec: int | None = Field(default=None, ge=1)
 
   @field_validator("context")
   @classmethod
   def _reject_context_authority_fields(cls, value: dict[str, Any]) -> dict[str, Any]:
     return _reject_context_authority_fields(value)
+
+  @field_validator("effort", mode="before")
+  @classmethod
+  def _normalize_effort(cls, value: Any) -> str | None:
+    parsed = parse_effort(value)
+    return parsed.value if parsed is not None else None
+
+  @model_validator(mode="after")
+  def _require_complete_selection(self) -> "ChatContinuationRequest":
+    if self.effort is not None and self.model_key is None:
+      raise ValueError("effort requires an explicit model_key")
+    if self.catalog_revision is not None and self.model_key is None:
+      raise ValueError("catalog_revision requires an explicit model_key")
+    return self
 
 
 class AutonomousRunMessageRequest(BaseModel):
@@ -321,9 +438,11 @@ __all__ = [
   "AutonomousDispatchRequest",
   "AutonomousDispatchResponse",
   "AutonomousResumeRequest",
+  "AutonomousResultReference",
   "AutonomousRunMessageRequest",
   "AutonomousRunResponse",
   "AutonomousRunState",
+  "AutonomousTerminalReceipt",
   "ChatContinuationRequest",
   "ChatDispatchRequest",
   "ChatDispatchResponse",
@@ -339,5 +458,6 @@ __all__ = [
   "RunMessageRequest",
   "RunResponse",
   "RunsListResponse",
+  "ToolResultSummaryResponse",
   "VerdictSummaryResponse",
 ]

@@ -3,15 +3,26 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner, EventLog, ToolDispatcher  # noqa: E402
+from agent_gateway import (  # noqa: E402
+  AgentRunner,
+  EventLog,
+  ModelInfo,
+  ModelProvider,
+  ToolDispatcher,
+)
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.auth import ProviderCredentialFailure  # noqa: E402
 from agent_gateway.runner_auth import call_credential_refresher, merge_refreshed_auth_config  # noqa: E402
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_bound_capability_execution,
+)
 
 
 class _NullMcpClient:
@@ -25,8 +36,19 @@ class _NullMcpClient:
     return []
 
 
-class _StubProvider:
+class _StubProvider(ModelProvider):
   name = "stub"
+
+  def has_active_credential(self, config: dict[str, Any]) -> bool:
+    return bool(config.get("api_key"))
+
+  def get_model_info(self, model: str) -> ModelInfo:
+    return ModelInfo(
+      id=model,
+      provider=self.name,
+      max_output_tokens=4096,
+      supports_thinking=True,
+    )
 
 
 class _Logger:
@@ -61,12 +83,17 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
 
 def _make_runner(*, on_credential_failure=None) -> AgentRunner:
   event_log = EventLog()
+  provider = _StubProvider()
   return AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-auth",
-    provider=_StubProvider(),
-    auth_config={"api_key": "old", "model": "stub-model"},
+    capability_execution=stub_bound_capability_execution(
+      provider=provider,
+      model="stub-model",
+      effort="none",
+      auth_config={"api_key": "old", "max_tokens": 512},
+    ),
     on_credential_failure=on_credential_failure,
     user_id="alice",
     billing_mode="byok",
@@ -75,20 +102,31 @@ def _make_runner(*, on_credential_failure=None) -> AgentRunner:
 
 
 def test_runner_auth_wrappers_resolve_parent_module_helpers(monkeypatch: Any) -> None:
-  runner = object.__new__(AgentRunner)
-  runner._auth_config = {"api_key": "old"}
-  config = {"api_key": "request-old"}
+  runner = _make_runner()
+  original_execution = runner.capability_execution
+  config = dict(original_execution.auth_config)
+  config["api_key"] = "request-old"
 
   monkeypatch.setattr(
     gateway_runner,
     "_merge_refreshed_auth_config",
-    lambda original, refreshed: {"api_key": f"{original['api_key']}->{refreshed['api_key']}"},
+    lambda original, refreshed: {
+      **original,
+      "api_key": f"{original['api_key']}->{refreshed['api_key']}",
+    },
   )
 
   AgentRunner._apply_refreshed_auth_config(runner, config, {"api_key": "new"})
 
-  assert config == {"api_key": "request-old->new"}
-  assert runner._auth_config == {"api_key": "request-old->new"}
+  assert config["api_key"] == "old->new"
+  assert runner._auth_config["api_key"] == "old->new"
+  assert runner.capability_execution is not original_execution
+  assert runner.capability_execution.bind is original_execution.bind
+  assert runner.capability_execution.provider is original_execution.provider
+  assert runner._secret_boundary.sanitize(
+    ["old", "old->new"],
+    sink="test",
+  ) == ["<redacted-secret>", "<redacted-secret>"]
 
 
 def test_merge_refreshed_auth_config_preserves_runtime_controls() -> None:
@@ -97,19 +135,15 @@ def test_merge_refreshed_auth_config_preserves_runtime_controls() -> None:
       "api_key": "old",
       "auth_mode": "oauth",
       "auth_token": "old-token",
-      "model": "chosen-model",
+      "provider": "stub",
       "max_tokens": 4096,
-      "thinking": False,
       "billing_mode": "metered",
       "rate_table_version": "2026-04-08",
     },
     {
       "api_key": "new",
-      "auth_mode": "api",
-      "auth_token": "",
-      "model": "ignored-model",
-      "max_tokens": 2000,
-      "thinking": True,
+      "auth_mode": "oauth",
+      "auth_token": "new-token",
       "billing_mode": "byok",
       "rate_table_version": "unknown",
     },
@@ -117,15 +151,29 @@ def test_merge_refreshed_auth_config_preserves_runtime_controls() -> None:
 
   assert merged == {
     "api_key": "new",
-    "auth_mode": "api",
-    "auth_token": "",
-    "model": "chosen-model",
+    "auth_mode": "oauth",
+    "auth_token": "new-token",
+    "provider": "stub",
     "max_tokens": 4096,
-    "effort": "none",
-    "thinking_enabled_requested": False,
     "billing_mode": "metered",
     "rate_table_version": "2026-04-08",
   }
+
+
+def test_merge_refreshed_auth_config_rejects_selection_material() -> None:
+  config = {
+    "api_key": "old",
+    "auth_mode": "api",
+    "provider": "stub",
+    "max_tokens": 4096,
+  }
+
+  with pytest.raises(ValueError, match="must not contain model selection"):
+    merge_refreshed_auth_config(config, {"model": "other-model"})
+  with pytest.raises(ValueError, match="must not contain model selection"):
+    merge_refreshed_auth_config(config, {"thinking": False})
+  with pytest.raises(ValueError, match="must not contain model selection"):
+    merge_refreshed_auth_config(config, {"execution_transport": "native"})
 
 
 def test_credential_refresher_helper_supports_sync_and_async_callbacks() -> None:

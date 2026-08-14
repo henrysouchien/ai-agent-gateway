@@ -16,6 +16,10 @@ from agent_gateway import (
 )
 from agent_gateway.providers import StreamEvent
 from agent_gateway.transcript import _tool_result_blocks_from_event
+from tests.capability_execution_test_support import (
+  stub_bound_capability_execution,
+)
+from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution
 
 
 class _NullMcpClient:
@@ -90,6 +94,15 @@ def _run(coro):
   return asyncio.run(coro)
 
 
+def _execution(provider: _RecordingProvider):
+  return stub_bound_capability_execution(
+    provider=provider,
+    model="stub-model",
+    effort="none",
+    auth_config={"api_key": "k"},
+  )
+
+
 def _tool_def(name: str) -> dict[str, Any]:
   return {"name": name, "description": "", "input_schema": {"type": "object", "properties": {}}}
 
@@ -123,6 +136,7 @@ def _dispatcher(event_log: EventLog, handlers: dict[str, Any]) -> ToolDispatcher
     local_tool_handlers=handlers,
     event_log=event_log,
     session_id="sess-event-only",
+    role="owner",
   )
 
 
@@ -194,8 +208,7 @@ def test_event_only_blocks_stay_in_sse_but_not_normal_tool_next_turn() -> None:
     event_log=event_log,
     dispatcher=_dispatcher(event_log, {"lookup": _ok_handler}),
     session_id="sess-event-only",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "stub-model"},
+    capability_execution=_execution(provider),
     get_tool_definitions=lambda: [_tool_def("lookup")],
     on_tool_result=_mixed_extra_blocks,
     user_id="alice",
@@ -237,8 +250,7 @@ def test_runner_context_uses_trusted_router_provider_not_payload_claim() -> None
       session_id="sess-provider-identity",
     ),
     session_id="sess-provider-identity",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "stub-model"},
+    capability_execution=_execution(provider),
     mcp_client=mcp_client,
     get_tool_definitions=mcp_client.get_tool_definitions,
     on_tool_result=record_context,
@@ -268,8 +280,7 @@ def test_event_only_blocks_are_filtered_from_batched_run_agent_next_turn() -> No
     event_log=event_log,
     dispatcher=_dispatcher(event_log, {"run_agent": _ok_handler}),
     session_id="sess-event-only",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "stub-model"},
+    capability_execution=_execution(provider),
     get_tool_definitions=lambda: [_tool_def("run_agent")],
     on_tool_result=_mixed_extra_blocks,
     user_id="alice",
@@ -319,8 +330,7 @@ def test_event_only_blocks_are_filtered_from_mixed_run_agent_and_normal_tools() 
     event_log=event_log,
     dispatcher=_dispatcher(event_log, {"run_agent": run_agent_handler, "lookup": lookup_handler}),
     session_id="sess-event-only",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "stub-model"},
+    capability_execution=_execution(provider),
     get_tool_definitions=lambda: [_tool_def("run_agent"), _tool_def("lookup")],
     on_tool_result=_mixed_extra_blocks,
     user_id="alice",
@@ -377,8 +387,7 @@ def test_run_agent_call_index_continues_across_separated_batches() -> None:
     event_log=event_log,
     dispatcher=_dispatcher(event_log, {"run_agent": run_agent_handler, "lookup": lookup_handler}),
     session_id="sess-event-only",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "stub-model"},
+    capability_execution=_execution(provider),
     get_tool_definitions=lambda: [_tool_def("run_agent"), _tool_def("lookup")],
     on_tool_result=_mixed_extra_blocks,
     user_id="alice",
@@ -426,12 +435,11 @@ def test_event_only_blocks_are_filtered_from_sdk_additional_context() -> None:
     event_log=EventLog(),
     session_id="sess-sdk",
     sdk_config=AgentSDKConfig(
-      api_key="k",
-      model="claude-sonnet-4-6",
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
     ),
+    capability_execution=stub_sdk_capability_execution(),
     system_prompt="test",
   )
 

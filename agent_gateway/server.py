@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import functools
 import logging
 import os
 import sys
@@ -10,14 +11,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi import APIRouter, Body, FastAPI, HTTPException, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
-from ._provider_utils import _get_allowed_models_for_provider_name
 from .artifact_paths import (
   ArtifactPath as ArtifactPath,
   ArtifactPathError as ArtifactPathError,
@@ -43,13 +43,36 @@ from .commercial_work_start import (
   COMMERCIAL_WORK_AUTHORIZATION_HEADER,
   CommercialWorkStartError,
 )
+from .capability_binding import (
+  CAPABILITY_IDS,
+  CapabilityResolutionError,
+  eligible_model_choices,
+)
+from .model_registry import CORE_CAPABILITY_IDS
 from .event_log import EventLog, UserEventBus
+from .dispatcher_factory import GatewayDispatcherDeps
 from .approvals import ApprovalActionError, _record_vote_and_unblock  # noqa: F401
 from .approval_resolver import resolve_policy  # noqa: F401 - compatibility alias
 from .approval_store import SQLiteApprovalStore, expire_pending_loop  # noqa: F401
 from .package_info import package_health
-from .providers import StreamEvent
-from .session import AuthManager, GatewaySession, SessionStore, StreamSubscriber
+from .providers import (
+  AnthropicProvider,
+  CodexProvider,
+  FixtureProvider,
+  ModelProvider,
+  OpenAIProvider,
+  StreamEvent,
+  XAIProvider,
+)
+from .runner_introspection import exception_traceback_already_logged
+from .session import (
+  AuthManager,
+  GatewaySession,
+  SessionStore,
+  StreamSubscriber,
+  bind_session_credentials,
+  session_owner_user_id,
+)
 from .ui_blocks_metrics import snapshot as ui_blocks_metrics_snapshot
 from .ui_blocks_store import read_ui_blocks_payload as read_ui_blocks_payload
 
@@ -58,6 +81,7 @@ from . import server_chat_control_routes as _server_chat_control_routes
 from . import server_artifact_routes as _server_artifact_routes  # noqa: F401 - dynamic artifact route deps alias
 from . import server_streaming as _server_streaming
 from . import server_tool_routes as _server_tool_routes
+from . import server_workflow_output_routes as _server_workflow_output_routes
 from .server_models import (  # noqa: F401
   SystemPrompt,
   ExecutionLocationResolver,
@@ -83,7 +107,6 @@ from .server_models import (  # noqa: F401
   _SIDECAR_SLUG_RE,
   _STREAM_SUBSCRIBER_DONE,
   ChatInitRequest,
-  ModelCatalog,
   ChatInitResponse,
   ChatMessage,
   ChatRequest,
@@ -92,13 +115,17 @@ from .server_models import (  # noqa: F401
   _resolve_chat_profile_name,
   ChatTurnInputs,
   ChatTurnResult,
+  PreparedChatTurn,
   ToolResultRequest,
   ToolApprovalRequest,
   ChatRuntime,
+  ModelPreferenceResponse,
+  ModelPreferenceUpdate,
   _build_runner_with_started_at,
   _call_build_chat_runtime,
   RequestContext,
   GatewayServerConfig,
+  MaterializedCredential,
 )
 from .server_artifact_helpers import (  # noqa: F401
   _model_to_dict,
@@ -165,6 +192,10 @@ from .server_chat_helpers import (  # noqa: F401
   _chat_turn_state_from_events,
   _chat_run_state_event,
   _latest_chat_run_state,
+  bind_init_capability_selections,
+  build_capability_choices,
+  _capability_execution_resolver_for_session,
+  prepare_session_driver_turn,
   _dispatch_chat_turn,
   _init_approval_subsystem,
 )
@@ -198,6 +229,37 @@ def _find_route_endpoint_by_name(routes: list[Any], route_name: str) -> Any:
     if nested_routes is not None:
       pending.extend(nested_routes)
   raise LookupError(f"Gateway route endpoint not found: {route_name}")
+
+
+def _public_request_validation_errors(
+  exc: RequestValidationError,
+) -> list[dict[str, Any]]:
+  """Return useful validation diagnostics without reflecting request values."""
+
+  public_fields = ("type", "loc", "msg", "url")
+  return [
+    {
+      field: error[field]
+      for field in public_fields
+      if field in error
+    }
+    for error in exc.errors()
+  ]
+
+
+async def _drain_shielded_lifecycle_task(
+  task: asyncio.Task[Any],
+) -> None:
+  """Wait for lifecycle work despite repeated cancellation of its owner."""
+
+  while True:
+    try:
+      await asyncio.shield(task)
+      return
+    except asyncio.CancelledError:
+      if task.done():
+        task.result()
+        return
 
 
 def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
@@ -240,9 +302,81 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   """
   if config.build_chat_runtime is None:
     raise ValueError("GatewayServerConfig.build_chat_runtime is required")
-  if config.allowed_models is None:
-    provider_name = str(getattr(config.default_provider, "name", "anthropic") or "anthropic")
-    config.allowed_models = _get_allowed_models_for_provider_name(provider_name)
+  if (
+    config.session_execution_policy_resolver is not None
+    and not callable(config.session_execution_policy_resolver)
+  ):
+    raise TypeError("session_execution_policy_resolver must be callable")
+  if not isinstance(config.allow_service_credentials_for_interactive, bool):
+    raise ValueError(
+      "allow_service_credentials_for_interactive must be a bool"
+    )
+  if config.model_registry is None or config.model_selection_policy is None:
+    raise ValueError("model_registry and model_selection_policy are required")
+  if not str(config.tenant_id or "").strip():
+    raise ValueError("tenant_id is required with model-selection authority")
+  config.model_selection_policy.admit_registry(config.model_registry)
+
+  capability_adapter_cache: dict[str, ModelProvider] = {}
+  configured_default_provider = config.default_provider
+  if configured_default_provider is not None:
+    configured_family = str(
+      getattr(configured_default_provider, "name", "") or ""
+    ).strip().lower()
+    if configured_family == "agent-sdk":
+      configured_family = "anthropic"
+    default_adapter = {
+      "anthropic": "anthropic.messages",
+      "codex": "codex.responses",
+      "openai": "openai.responses",
+      "xai": "xai.responses",
+      "fixture": "fixture.responses",
+    }.get(configured_family)
+    if default_adapter is not None:
+      capability_adapter_cache[default_adapter] = configured_default_provider
+
+  def _resolve_capability_adapter(adapter_id: str) -> ModelProvider:
+    normalized_adapter = str(adapter_id or "").strip()
+    provider = capability_adapter_cache.get(normalized_adapter)
+    if provider is None:
+      if config.capability_adapter_resolver is not None:
+        provider = config.capability_adapter_resolver(normalized_adapter)
+      else:
+        provider_factories: dict[str, type[ModelProvider]] = {
+          "anthropic.messages": AnthropicProvider,
+          "codex.responses": CodexProvider,
+          "fixture.responses": FixtureProvider,
+          "openai.responses": OpenAIProvider,
+          "xai.responses": XAIProvider,
+        }
+        factory = provider_factories.get(normalized_adapter)
+        if factory is None:
+          raise ValueError(
+            f"no installed capability adapter for {normalized_adapter!r}"
+          )
+        provider = factory()
+    expected_providers = {
+      entry.provider
+      for entry in config.model_registry.models.values()
+      if entry.adapter == normalized_adapter
+    }
+    resolved_family = str(getattr(provider, "name", "") or "").strip().lower()
+    if resolved_family == "agent-sdk":
+      resolved_family = "anthropic"
+    if expected_providers != {resolved_family}:
+      raise ValueError(
+        f"capability adapter {normalized_adapter!r} returned provider "
+        f"{resolved_family!r}; expected {sorted(expected_providers)}"
+      )
+    capability_adapter_cache[normalized_adapter] = provider
+    return provider
+
+  for adapter_id in {
+    entry.adapter
+    for entry in config.model_registry.models.values()
+    if set(entry.capabilities) & CORE_CAPABILITY_IDS
+  }:
+    _resolve_capability_adapter(adapter_id)
 
   auth = config.auth_manager or AuthManager(
     secret=config.jwt_secret,
@@ -309,47 +443,193 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
     if config.retention_sweeper is not None:
       retention_task = asyncio.create_task(_retention_loop())
-    startup_complete = False
-    try:
-      await _maybe_await(config.on_startup)
-      agent_schedule_runner = getattr(app.state, "agent_run_schedule_runner", None)
-      if agent_schedule_runner is not None:
-        agent_schedule_runner.start()
-      startup_complete = True
-      yield
-    finally:
-      if startup_complete:
-        await _maybe_await(config.on_shutdown)
-      agent_schedule_runner = getattr(app.state, "agent_run_schedule_runner", None)
-      if agent_schedule_runner is not None:
-        await agent_schedule_runner.shutdown()
-      subprocess_registry = getattr(app.state, "subprocess_registry", None)
-      if subprocess_registry is not None:
-        await subprocess_registry.shutdown()
-      batch_task_registry = getattr(app.state, "batch_task_registry", None)
-      if batch_task_registry is not None:
-        await batch_task_registry.shutdown(app_state=app.state)
-      user_event_bus = getattr(app.state, "user_event_bus", None)
-      if user_event_bus is not None:
-        await user_event_bus.shutdown()
-      cleanup_task.cancel()
-      approval_expire_task.cancel()
-      if retention_task is not None:
-        retention_task.cancel()
-      await asyncio.gather(
+    config_started = False
+    schedule_start_attempted = False
+    approval_delivery_start_attempted = False
+    primary_failure: BaseException | None = None
+
+    def record_failure(
+      phase: str,
+      failure: BaseException,
+    ) -> None:
+      nonlocal primary_failure
+      if primary_failure is None:
+        primary_failure = failure
+        return
+      try:
+        primary_failure.add_note(
+          f"Additional gateway teardown failure in {phase}: "
+          f"{type(failure).__name__}: {failure}"
+        )
+      except AttributeError:
+        pass
+      log.error(
+        "Additional gateway teardown failure in %s",
+        phase,
+        exc_info=(
+          type(failure),
+          failure,
+          failure.__traceback__,
+        ),
+      )
+
+    async def cleanup_phase(
+      phase: str,
+      cleanup: Any,
+    ) -> None:
+      try:
+        await cleanup()
+      except BaseException as exc:
+        record_failure(phase, exc)
+
+    async def teardown() -> None:
+      if config_started:
+        await cleanup_phase(
+          "configured shutdown",
+          lambda: _maybe_await(config.on_shutdown),
+        )
+
+      maintenance_tasks = [
         cleanup_task,
         approval_expire_task,
         *([retention_task] if retention_task is not None else []),
+      ]
+      for maintenance_task in maintenance_tasks:
+        maintenance_task.cancel()
+
+      agent_schedule_runner = getattr(
+        app.state,
+        "agent_run_schedule_runner",
+        None,
+      )
+      if (
+        schedule_start_attempted
+        and agent_schedule_runner is not None
+      ):
+        await cleanup_phase(
+          "agent schedule runner",
+          agent_schedule_runner.shutdown,
+        )
+      approval_delivery_coordinator = getattr(
+        app.state,
+        "autonomous_approval_delivery_coordinator",
+        None,
+      )
+      if (
+        approval_delivery_start_attempted
+        and approval_delivery_coordinator is not None
+      ):
+        await cleanup_phase(
+          "autonomous approval delivery coordinator",
+          approval_delivery_coordinator.shutdown,
+        )
+      subprocess_registry = getattr(
+        app.state,
+        "subprocess_registry",
+        None,
+      )
+      if subprocess_registry is not None:
+        await cleanup_phase(
+          "autonomous subprocess registry",
+          subprocess_registry.shutdown,
+        )
+      batch_task_registry = getattr(
+        app.state,
+        "batch_task_registry",
+        None,
+      )
+      if batch_task_registry is not None:
+        await cleanup_phase(
+          "batch task registry",
+          lambda: batch_task_registry.shutdown(
+            app_state=app.state
+          ),
+        )
+      maintenance_results = await asyncio.gather(
+        *maintenance_tasks,
         return_exceptions=True,
+      )
+      for index, result in enumerate(maintenance_results):
+        if (
+          isinstance(result, BaseException)
+          and not isinstance(result, asyncio.CancelledError)
+        ):
+          record_failure(
+            f"maintenance task {index}",
+            result,
+          )
+      user_event_bus = getattr(
+        app.state,
+        "user_event_bus",
+        None,
+      )
+      if user_event_bus is not None:
+        await cleanup_phase(
+          "user event bus",
+          user_event_bus.shutdown,
+        )
+
+    try:
+      await _maybe_await(config.on_startup)
+      config_started = True
+      approval_delivery_coordinator = getattr(
+        app.state,
+        "autonomous_approval_delivery_coordinator",
+        None,
+      )
+      if approval_delivery_coordinator is not None:
+        approval_delivery_start_attempted = True
+        approval_delivery_coordinator.start()
+      agent_schedule_runner = getattr(app.state, "agent_run_schedule_runner", None)
+      if agent_schedule_runner is not None:
+        schedule_start_attempted = True
+        agent_schedule_runner.start()
+      yield
+    except BaseException as exc:
+      primary_failure = exc
+    finally:
+      teardown_task = asyncio.create_task(teardown())
+      try:
+        await asyncio.shield(teardown_task)
+      except asyncio.CancelledError as exc:
+        record_failure("lifespan teardown cancellation", exc)
+        try:
+          await _drain_shielded_lifecycle_task(
+            teardown_task
+          )
+        except BaseException as teardown_exc:
+          record_failure(
+            "lifespan teardown task",
+            teardown_exc,
+          )
+      except BaseException as exc:
+        record_failure("lifespan teardown task", exc)
+    if primary_failure is not None:
+      raise primary_failure.with_traceback(
+        primary_failure.__traceback__
       )
 
   app = FastAPI(lifespan=lifespan)
 
   @app.exception_handler(RequestValidationError)
-  async def _sanitize_commercial_body_validation_error(
-    request: Request,
+  async def _sanitize_request_validation_error(
+    _request: Request,
     exc: RequestValidationError,
   ):
+    if any(
+      "capability_selections" in error.get("loc", ())
+      for error in exc.errors()
+    ):
+      return JSONResponse(
+        {
+          "error_code": "capability_selection_invalid",
+          "message": (
+            "capability_selections must map capability IDs to strict "
+            "model/effort selections"
+          ),
+        },
+        status_code=422,
+      )
     sensitive_error_types = {
       "commercial_bearer_material_forbidden",
     }
@@ -361,11 +641,15 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         },
         status_code=422,
       )
-    return await request_validation_exception_handler(request, exc)
+    return JSONResponse(
+      status_code=422,
+      content={
+        "detail": jsonable_encoder(_public_request_validation_errors(exc)),
+      },
+    )
 
   app.state.auth = auth
   app.state.gateway_config = config
-
   async def _build_chat_runtime_for_dispatch(
     *,
     session: GatewaySession,
@@ -374,6 +658,13 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     auth_manager: AuthManager | None,
   ) -> ChatRuntime:
     _ = auth_manager
+    dispatcher_deps = getattr(
+      _build_chat_runtime_for_dispatch,
+      "_gateway_dispatcher_deps",
+      None,
+    )
+    if dispatcher_deps is not None:
+      setattr(session, "_gateway_dispatcher_deps", dispatcher_deps)
     try:
       from .control_plane.valuation_ready_tools import make_valuation_ready_skill_tool_bundle
 
@@ -382,38 +673,134 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       ]
     except Exception:
       log.warning("Gateway-local skill tool injection failed", exc_info=True)
-    return await _call_build_chat_runtime(
+    runtime = await _call_build_chat_runtime(
       config.build_chat_runtime,
       session=session,
       request=request,
       channel=channel,
       auth_manager=auth,
+      storage_root=app.state.autonomous_storage_root,
     )
+    runtime.purpose = session.purpose
+    return runtime
 
   setattr(_build_chat_runtime_for_dispatch, "_gateway_auth_manager", auth)
-  setattr(_build_chat_runtime_for_dispatch, "_gateway_auth_config", config.auth_config)
-  setattr(_build_chat_runtime_for_dispatch, "_gateway_allowed_models", config.allowed_models)
+  setattr(
+    _build_chat_runtime_for_dispatch,
+    "_gateway_model_registry",
+    config.model_registry,
+  )
+  setattr(
+    _build_chat_runtime_for_dispatch,
+    "_gateway_model_selection_policy",
+    config.model_selection_policy,
+  )
+  setattr(
+    _build_chat_runtime_for_dispatch,
+    "_gateway_session_execution_policy_resolver",
+    config.session_execution_policy_resolver,
+  )
+  setattr(
+    _build_chat_runtime_for_dispatch,
+    "_gateway_service_provider_handles",
+    dict(config.service_provider_handles),
+  )
+  setattr(
+    _build_chat_runtime_for_dispatch,
+    "_gateway_service_auth_config_resolver",
+    config.service_auth_config_resolver,
+  )
+  setattr(
+    _build_chat_runtime_for_dispatch,
+    "_gateway_capability_adapter_resolver",
+    _resolve_capability_adapter,
+  )
+  setattr(
+    _build_chat_runtime_for_dispatch,
+    "_gateway_model_preference_store",
+    config.model_preference_store,
+  )
+  setattr(
+    _build_chat_runtime_for_dispatch,
+    "_gateway_tenant_id",
+    config.tenant_id,
+  )
   setattr(_build_chat_runtime_for_dispatch, "_gateway_channel_profile_allowlist", config.channel_profile_allowlist)
   setattr(_build_chat_runtime_for_dispatch, "_gateway_log", log)
   setattr(_build_chat_runtime_for_dispatch, "_gateway_resolver_timeout_seconds", config.resolver_timeout_seconds)
   app.state.gateway_build_chat_runtime = _build_chat_runtime_for_dispatch
   app.state.user_event_bus = UserEventBus()
   _init_approval_subsystem(app, config)
+  dispatcher_deps = GatewayDispatcherDeps(
+    mcp_client=config.mcp_client,
+    approval_store=app.state.gateway_approval_store,
+    approval_policy=app.state.gateway_approval_policy,
+    mcp_meta_inject_servers=(
+      config.mcp_meta_inject_servers or frozenset()
+    ),
+  )
+  app.state.gateway_dispatcher_deps = dispatcher_deps
+  setattr(
+    _build_chat_runtime_for_dispatch,
+    "_gateway_dispatcher_deps",
+    dispatcher_deps,
+  )
+  app.state.gateway_claim_signing_authority = (
+    config.claim_signing_authority
+  )
+  autonomous_storage_root = _default_autonomous_log_dir()
+  app.state.autonomous_storage_root = autonomous_storage_root
   app.state.subprocess_registry = AutonomousRegistry(
     api_dir=_default_autonomous_api_dir(),
+    tenant_id=config.tenant_id,
     python_executable=os.getenv("AGENT_GATEWAY_AUTONOMOUS_PYTHON", "").strip() or sys.executable,
-    log_dir=_default_autonomous_log_dir(),
+    log_dir=autonomous_storage_root,
     max_running=int(os.getenv("AGENT_GATEWAY_AUTONOMOUS_MAX_RUNNING", "2") or "2"),
-    approval_db_path=getattr(app.state.gateway_approval_store, "path", None),
+    approval_store=app.state.gateway_approval_store,
+    service_provider_handles=config.service_provider_handles,
+    autonomous_capability_binding_resolver=(
+      config.autonomous_capability_binding_resolver
+    ),
+    claim_signing_authority=config.claim_signing_authority,
   )
-  from .control_plane.schedules import AgentRunScheduleRunner, AgentRunScheduleStore
+  from .control_plane.autonomous_approval_drainer import (
+    AutonomousApprovalDeliveryCoordinator,
+  )
 
-  app.state.agent_run_schedule_store = AgentRunScheduleStore()
+  app.state.autonomous_approval_delivery_coordinator = (
+    AutonomousApprovalDeliveryCoordinator(
+      store=app.state.gateway_approval_store,
+      registry=app.state.subprocess_registry,
+    )
+  )
+  from .control_plane.schedules import (
+    AgentRunScheduleRunner,
+    ScheduleStoreUnreadableError,
+    agent_run_schedule_users_root,
+    schedule_store_for,
+  )
+
+  app.state.agent_run_schedule_store_for = functools.cache(schedule_store_for)
   app.state.agent_run_schedule_runner = AgentRunScheduleRunner(
-    store=app.state.agent_run_schedule_store,
+    store_for=app.state.agent_run_schedule_store_for,
+    users_root=agent_run_schedule_users_root(),
     autonomous_registry=app.state.subprocess_registry,
     user_event_bus_factory=lambda: getattr(app.state, "user_event_bus", None),
   )
+
+  @app.exception_handler(ScheduleStoreUnreadableError)
+  async def _schedule_store_unreadable_handler(
+    _request: Request,
+    exc: ScheduleStoreUnreadableError,
+  ) -> JSONResponse:
+    return JSONResponse(
+      status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+      content={
+        "error": "schedule_store_unreadable",
+        "message": str(exc),
+      },
+    )
+
   app.state.batch_task_registry = BatchTaskRegistry()
   control_prefix = _route_path(route_prefix, "/control")
   add_control_plane_version_header_middleware(
@@ -428,11 +815,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     allow_methods=list(config.cors_allow_methods),
     allow_headers=list(config.cors_allow_headers),
   )
-
   router = APIRouter(prefix=route_prefix)
 
   @router.post("/chat/init", response_model=ChatInitResponse)
-  async def chat_init(payload: ChatInitRequest) -> ChatInitResponse:
+  async def chat_init(payload: ChatInitRequest, response: Response) -> ChatInitResponse:
     auth.validate_api_key(payload.api_key)
     try:
       schema_version = _resolve_schema_version(payload.schema_version)
@@ -453,7 +839,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     resolved_auth_config: dict[str, Any] | None = None
     resolved_channel: str | None = None
     resolved_risk_user_id: int = 0
-    resolved_role: str = "owner"
+    resolved_role: str = "invite"
+    resolved_capabilities: frozenset[str] = frozenset()
+    resolved_model_entitled_capabilities: frozenset[str] = frozenset()
+    resolved_model_entitled_keys: frozenset[str] = frozenset()
+    resolved_credential_principal = None
+    resolved_allow_service_for_interactive = (
+      config.allow_service_credentials_for_interactive
+    )
     if resolver is not None:
       try:
         result = await asyncio.wait_for(
@@ -502,7 +895,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         )
         return JSONResponse(error_payload, status_code=status)
       resolved_role = result.role
+      resolved_capabilities = result.capabilities
+      resolved_model_entitled_capabilities = result.model_entitled_capabilities
+      resolved_model_entitled_keys = result.model_entitled_keys
       resolved_auth_config = result.auth_config.to_dict()
+      resolved_credential_principal = result.credential_principal
+      resolved_allow_service_for_interactive = (
+        result.allow_service_for_interactive
+      )
       claimed_init_channel: str | None = None
       if isinstance(payload.context, dict):
         raw_claim = payload.context.get("channel")
@@ -545,6 +945,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       user_email=identity.user_email,
       risk_user_id=identity.risk_user_id,
       role=resolved_role,  # type: ignore[arg-type]
+      capabilities=resolved_capabilities,
+      model_entitled_capabilities=resolved_model_entitled_capabilities,
+      model_entitled_keys=resolved_model_entitled_keys,
       kind="chat",
       auth_config=resolved_auth_config,
       schema_version=schema_version,
@@ -553,26 +956,173 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       user_slug=identity.user_slug,
       user_aliases=tuple(str(alias) for alias in identity.aliases),
       identity_status=str(identity.identity_status),
+      tenant_id=config.tenant_id,
+      allow_service_for_interactive=resolved_allow_service_for_interactive,
     )
     session.channel = resolved_channel
     session.is_public = resolved_channel == "public"
     session.approval_store = app.state.gateway_approval_store
     session.approval_policy = app.state.gateway_approval_policy
-    if config.on_session_created is not None:
-      try:
+    try:
+      if config.on_session_created is not None:
         config.on_session_created(session, payload.api_key, payload)
-      except Exception:
-        auth.session_store.expire_session(session.session_id)
-        raise
+      if (
+        session.session_credential_handle is None
+        and resolved_credential_principal is not None
+        and config.tenant_id is not None
+      ):
+        bind_session_credentials(
+          session,
+          tenant_id=config.tenant_id,
+          credential_principal=resolved_credential_principal,
+          allow_service_for_interactive=(
+            resolved_allow_service_for_interactive
+          ),
+        )
+      bind_init_capability_selections(
+        session=session,
+        selections=payload.capability_selections,
+        build_chat_runtime=app.state.gateway_build_chat_runtime,
+      )
+    except CapabilityResolutionError as exc:
+      auth.session_store.expire_session(session.session_id)
+      return JSONResponse(
+        {
+          **exc.receipt(),
+          "message": str(exc),
+        },
+        status_code=422,
+      )
+    except Exception:
+      auth.session_store.expire_session(session.session_id)
+      raise
     token = auth.issue_token(session)
     log.info("Session created: %s", session.session_id)
+    response.headers["Cache-Control"] = "private, no-store"
     return ChatInitResponse(
       user_id=resolved_user_id,
       session_token=token,
       session_id=session.session_id,
       expires_at=session.expires_at,
       schema_version=session.schema_version,
-      model_catalog=config.model_catalog,
+      capability_choices=build_capability_choices(
+        session=session,
+        build_chat_runtime=app.state.gateway_build_chat_runtime,
+      ),
+    )
+
+  def _model_preference_session(request: Request) -> GatewaySession:
+    token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
+    session, _claims = auth.verify_token_with_payload(token)
+    if session.kind != "chat":
+      raise HTTPException(
+        status_code=400,
+        detail="model preferences require a chat session",
+      )
+    return session
+
+  @router.put(
+    "/model-preferences/{capability_id}",
+    response_model=ModelPreferenceResponse,
+  )
+  async def put_model_preference(
+    capability_id: str,
+    request: Request,
+    body: ModelPreferenceUpdate,
+  ) -> ModelPreferenceResponse:
+    session = _model_preference_session(request)
+    store = config.model_preference_store
+    if store is None:
+      raise HTTPException(status_code=503, detail="model preference store is unavailable")
+    normalized_capability = str(capability_id or "").strip()
+    policy = config.model_selection_policy.capabilities.get(normalized_capability)
+    if policy is None or not policy.allow_saved_preference:
+      raise HTTPException(
+        status_code=422,
+        detail=f"saved preference is not allowed for {normalized_capability!r}",
+      )
+    resolver = _capability_execution_resolver_for_session(
+      session=session,
+      build_chat_runtime=app.state.gateway_build_chat_runtime,
+    )
+    choices = {
+      choice.key: choice
+      for choice in eligible_model_choices(
+        normalized_capability,
+        registry=resolver.registry,
+        selection_policy=resolver.selection_policy,
+        auth=resolver.auth_context,
+      )
+    }
+    choice = choices.get(body.model_key)
+    if choice is None:
+      return JSONResponse(
+        {
+          "error_code": "capability_model_unavailable",
+          "capability_id": normalized_capability,
+          "model_key": body.model_key,
+          "eligible_model_keys": sorted(choices),
+          "message": "The requested saved preference is not session-eligible.",
+        },
+        status_code=422,
+      )
+    effort = body.effort or choice.default_effort
+    if effort not in choice.supported_efforts:
+      return JSONResponse(
+        {
+          "error_code": "capability_effort_unsupported",
+          "capability_id": normalized_capability,
+          "model_key": body.model_key,
+          "supported_efforts": list(choice.supported_efforts),
+          "message": "The requested saved effort is not supported.",
+        },
+        status_code=422,
+      )
+    stored = store.put(
+      tenant_id=resolver.auth_context.tenant_id,
+      actor_id=resolver.auth_context.actor_id,
+      capability_id=normalized_capability,
+      model_key=body.model_key,
+      effort=effort,
+    )
+    return ModelPreferenceResponse(
+      capability=normalized_capability,
+      model_key=stored.model_key,
+      effort=stored.effort,
+    )
+
+  @router.delete(
+    "/model-preferences/{capability_id}",
+    response_model=ModelPreferenceResponse,
+  )
+  async def delete_model_preference(
+    capability_id: str,
+    request: Request,
+  ) -> ModelPreferenceResponse:
+    session = _model_preference_session(request)
+    store = config.model_preference_store
+    if store is None:
+      raise HTTPException(status_code=503, detail="model preference store is unavailable")
+    normalized_capability = str(capability_id or "").strip()
+    policy = config.model_selection_policy.capabilities.get(normalized_capability)
+    if policy is None or not policy.allow_saved_preference:
+      raise HTTPException(
+        status_code=422,
+        detail=f"saved preference is not allowed for {normalized_capability!r}",
+      )
+    resolver = _capability_execution_resolver_for_session(
+      session=session,
+      build_chat_runtime=app.state.gateway_build_chat_runtime,
+    )
+    store.delete(
+      tenant_id=resolver.auth_context.tenant_id,
+      actor_id=resolver.auth_context.actor_id,
+      capability_id=normalized_capability,
+    )
+    return ModelPreferenceResponse(
+      capability=normalized_capability,
+      model_key=None,
+      effort=None,
     )
 
   @router.post("/chat")
@@ -622,9 +1172,19 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     elif claimed_channel and claimed_channel != channel:
       log.warning("Client claimed channel=%s; session bound to %s; using session", claimed_channel, channel)
     sid = session.session_id
-
     commercial_work_start = None
     commercial_dispatch_owner = None
+    prepared_turn: PreparedChatTurn | None = None
+    inputs = ChatTurnInputs(
+      messages=list(body.messages),
+      request_id=body.request_id,
+      context=dict(body.context or {}),
+      metadata=dict(body.metadata or {}),
+      model_key=body.model_key,
+      effort=body.effort,
+      catalog_revision=body.catalog_revision,
+      ui_blocks_contract=body.ui_blocks_contract,
+    )
     commercial_gate = config.commercial_work_start_gate
     if (
       commercial_gate is not None
@@ -642,49 +1202,78 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         },
         status_code=409,
       )
-    if commercial_gate is None:
-      if (
-        request.headers.get(COMMERCIAL_CLAIM_HEADER) is not None
-        or request.headers.get(COMMERCIAL_WORK_AUTHORIZATION_HEADER) is not None
-      ):
-        return JSONResponse(
-          {
-            "error": "commercial_work_start_disabled",
-            "message": "Commercial work-start authorization is disabled.",
-          },
-          status_code=403,
-        )
-    else:
-      try:
+    raw_purpose = (body.context or {}).get("purpose")
+    session.purpose = (
+      raw_purpose.strip().lower()
+      if isinstance(raw_purpose, str) and raw_purpose.strip()
+      else None
+    )
+    try:
+      pending_work_start = None
+      if commercial_gate is None:
+        if (
+          request.headers.get(COMMERCIAL_CLAIM_HEADER) is not None
+          or request.headers.get(COMMERCIAL_WORK_AUTHORIZATION_HEADER) is not None
+        ):
+          return JSONResponse(
+            {
+              "error": "commercial_work_start_disabled",
+              "message": "Commercial work-start authorization is disabled.",
+            },
+            status_code=403,
+          )
+      else:
         if commercial_gate.enabled:
           commercial_dispatch_owner = object()
           session._commercial_dispatch_owner = commercial_dispatch_owner
+      prepared_turn = prepare_session_driver_turn(
+        session,
+        inputs,
+        build_chat_runtime=app.state.gateway_build_chat_runtime,
+      )
+      if commercial_gate is not None:
         pending_work_start = commercial_gate.verify_request(
           request.headers,
           session=session,
-          request=body,
-          channel=channel,
+          request=prepared_turn.request,
+          channel=prepared_turn.channel,
         )
         # Keep the bounded local attach synchronous while this opaque owner is
         # held. A detached worker cannot be cancelled safely after SQLite has
         # begun committing the one-time consumption record.
         commercial_work_start = commercial_gate.consume(pending_work_start)
-      except CommercialWorkStartError as exc:
-        if session._commercial_dispatch_owner is commercial_dispatch_owner:
-          session._commercial_dispatch_owner = None
-        log.warning(
-          "Commercial work start rejected | session=%s | code=%s",
-          sid,
-          exc.code,
-        )
-        return JSONResponse(
-          {"error": exc.code, "message": str(exc)},
-          status_code=exc.status_code,
-        )
-      except BaseException:
-        if session._commercial_dispatch_owner is commercial_dispatch_owner:
-          session._commercial_dispatch_owner = None
-        raise
+      inputs.commercial_work_start = commercial_work_start
+      inputs.commercial_dispatch_owner = commercial_dispatch_owner
+    except CapabilityResolutionError as exc:
+      if session._commercial_dispatch_owner is commercial_dispatch_owner:
+        session._commercial_dispatch_owner = None
+      return JSONResponse(
+        {
+          **exc.receipt(),
+          "message": str(exc),
+        },
+        status_code=400,
+      )
+    except CommercialWorkStartError as exc:
+      if session._commercial_dispatch_owner is commercial_dispatch_owner:
+        session._commercial_dispatch_owner = None
+      log.warning(
+        "Commercial work start rejected | session=%s | code=%s",
+        sid,
+        exc.code,
+      )
+      return JSONResponse(
+        {"error": exc.code, "message": str(exc)},
+        status_code=exc.status_code,
+      )
+    except HTTPException as exc:
+      if session._commercial_dispatch_owner is commercial_dispatch_owner:
+        session._commercial_dispatch_owner = None
+      return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    except BaseException:
+      if session._commercial_dispatch_owner is commercial_dispatch_owner:
+        session._commercial_dispatch_owner = None
+      raise
 
     headers = {
       "Content-Type": "text/event-stream",
@@ -693,13 +1282,20 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       "Connection": "keep-alive",
     }
     user_event_bus = app.state.user_event_bus
+    event_owner_user_id = session_owner_user_id(session)
+    publish_event = getattr(user_event_bus, "publish", None)
+    cleanup_event_run = getattr(user_event_bus, "cleanup_run", None)
+    if not callable(publish_event) or not callable(cleanup_event_run):
+      raise RuntimeError(
+        "session event delivery bus does not implement its bound domain"
+      )
 
     async def _on_chat_event(event: StreamEvent) -> None:
       event_dict = dict(event)  # type: ignore[arg-type]
       event_dict.setdefault("run_id", sid)
       try:
-        await user_event_bus.publish(
-          user_id=session.user_id,
+        await publish_event(
+          user_id=event_owner_user_id,
           control_run_id=sid,
           event=event_dict,
         )
@@ -712,17 +1308,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           pass
 
     event_log = EventLog(session_id=sid, defer_terminal_close=bool(body.drain_trailing))
-    inputs = ChatTurnInputs(
-      messages=list(body.messages),
-      request_id=body.request_id,
-      context=dict(body.context or {}),
-      metadata=dict(body.metadata or {}),
-      model=body.model,
-      effort=body.effort,
-      ui_blocks_contract=body.ui_blocks_contract,
-      commercial_work_start=commercial_work_start,
-      commercial_dispatch_owner=commercial_dispatch_owner,
-    )
     try:
       dispatch_task = asyncio.create_task(
         _dispatch_chat_turn(
@@ -731,9 +1316,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           event_log=event_log,
           on_event=_on_chat_event,
           build_chat_runtime=app.state.gateway_build_chat_runtime,
-          credentials_resolver=config.credentials_refresh_resolver,  # type: ignore[arg-type]
           transcript_dir=transcript_dir,
           publish_lifecycle_events=True,
+          prepared_turn=prepared_turn,
+          required_event_delivery=False,
         )
       )
     except BaseException:
@@ -760,9 +1346,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       except asyncio.CancelledError:
         pass
       except Exception as exc:
-        log.warning("chat turn dispatch failed for %s: %s", sid, exc)
+        log.warning(
+          "chat turn dispatch failed for %s: %s",
+          sid,
+          exc,
+          exc_info=None if exception_traceback_already_logged(exc) else exc,
+        )
       finally:
-        await user_event_bus.cleanup_run(session.user_id, sid)
+        await cleanup_event_run(event_owner_user_id, sid)
 
     asyncio.create_task(finalize_dispatch_task())
 
@@ -836,6 +1427,21 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       write_transcript=_write_transcript,
     )
 
+  @router.get("/workflow-outputs/{workflow_run_id}/{output_id}")
+  async def workflow_output(
+    request: Request,
+    workflow_run_id: str,
+    output_id: str,
+    download: bool = False,
+  ) -> Response:
+    return await _server_workflow_output_routes.workflow_output_response(
+      request,
+      workflow_run_id,
+      output_id,
+      auth=auth,
+      download=download,
+    )
+
   @router.get("/artifacts/{ticker}/{skill}/latest")
   async def artifact_latest(request: Request, ticker: str, skill: str) -> JSONResponse:
     return _server_artifact_routes.artifact_latest_response(globals(), request, ticker, skill)
@@ -890,16 +1496,34 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
   @router.get("/health")
   async def health() -> JSONResponse:
-    return JSONResponse({
-      "status": "ok",
-      "package": package_health(),
-      "counters": ui_blocks_metrics_snapshot(),
-    })
+    approval_delivery_fatal_error = getattr(
+      app.state.autonomous_approval_delivery_coordinator,
+      "fatal_error",
+      None,
+    )
+    return JSONResponse(
+      {
+        "status": (
+          "error"
+          if approval_delivery_fatal_error is not None
+          else "ok"
+        ),
+        "package": package_health(),
+        "counters": ui_blocks_metrics_snapshot(),
+      },
+      status_code=(
+        503
+        if approval_delivery_fatal_error is not None
+        else 200
+      ),
+    )
 
   from .control_plane.dashboard_artifacts import build_dashboard_artifacts_router
+  from .control_plane.canvas_artifacts import build_canvas_artifacts_router
   from .control_plane.html_artifacts import build_html_artifacts_router
 
   router.include_router(build_dashboard_artifacts_router(artifact_auth_dependency=_artifact_auth_dependency))
+  router.include_router(build_canvas_artifacts_router(artifact_auth_dependency=_artifact_auth_dependency))
   router.include_router(build_html_artifacts_router(artifact_auth_dependency=_artifact_auth_dependency))
   app.include_router(router)
   app.include_router(
@@ -907,11 +1531,15 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       auth=auth,
       credentials_resolver=config.credentials_resolver,
       resolver_timeout_seconds=config.resolver_timeout_seconds,
+      tenant_id=config.tenant_id,
+      allow_service_credentials_for_interactive=(
+        config.allow_service_credentials_for_interactive
+      ),
       route_prefix=route_prefix,
       skills_dir=config.control_skills_dir or _default_control_skills_dir(),
       artifact_auth_dependency=_artifact_auth_dependency,
       autonomous_registry=app.state.subprocess_registry,
-      agent_schedule_store=app.state.agent_run_schedule_store,
+      agent_schedule_store_for=app.state.agent_run_schedule_store_for,
       agent_schedule_runner=app.state.agent_run_schedule_runner,
       approval_store=app.state.gateway_approval_store,
       approval_policy=app.state.gateway_approval_policy,
@@ -948,7 +1576,8 @@ __all__ = [
   "ChatTurnResult",
   "ChatRuntime",
   "GatewayServerConfig",
-  "ModelCatalog",
+  "MaterializedCredential",
+  "PreparedChatTurn",
   "RequestContext",
   "ToolApprovalRequest",
   "ToolResultRequest",

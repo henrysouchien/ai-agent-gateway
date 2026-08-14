@@ -50,8 +50,22 @@ def build_health_router(*, route_prefix: str) -> APIRouter:
 
   @router.get("/health", response_model=ControlHealthResponse)
   async def control_health(request: Request) -> ControlHealthResponse:
+    approval_delivery_coordinator = getattr(
+      request.app.state,
+      "autonomous_approval_delivery_coordinator",
+      None,
+    )
+    approval_delivery_fatal_error = getattr(
+      approval_delivery_coordinator,
+      "fatal_error",
+      None,
+    )
     return ControlHealthResponse(
-      status="ok",
+      status=(
+        "error"
+        if approval_delivery_fatal_error is not None
+        else "ok"
+      ),
       version=CONTROL_PLANE_VERSION,
       endpoints=_control_route_entries(request, route_prefix),
     )

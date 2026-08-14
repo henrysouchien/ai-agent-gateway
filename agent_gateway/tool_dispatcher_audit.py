@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import inspect
 from typing import Any, Callable
 
 
@@ -11,6 +12,7 @@ async def emit_execution_audit(
   approval_store: Any | None,
   outcome: str,
   error_summary: str | None = None,
+  boundary_sanitizer: Any | None = None,
 ) -> None:
   if request is None or approval_store is None:
     return
@@ -20,12 +22,42 @@ async def emit_execution_audit(
     return
   raw_args = dict(raw_tool_args)
   try:
-    await emit(
-      request=request,
-      raw_tool_args=raw_args,
-      outcome=outcome,
-      error_summary=error_summary,
+    kwargs = {
+      "request": request,
+      "raw_tool_args": raw_args,
+      "outcome": outcome,
+      "error_summary": error_summary,
+    }
+    try:
+      parameters = inspect.signature(emit).parameters
+    except (TypeError, ValueError):
+      parameters = {}
+    sanitizer_aware = (
+      boundary_sanitizer is not None
+      and "boundary_sanitizer" in parameters
     )
+    if sanitizer_aware:
+      kwargs["boundary_sanitizer"] = boundary_sanitizer
+    elif boundary_sanitizer is not None:
+      projected_args = boundary_sanitizer(
+        raw_args,
+        "approval_audit",
+      )
+      kwargs["raw_tool_args"] = (
+        projected_args
+        if isinstance(projected_args, dict)
+        else {"_boundary_error": "<secret-sanitization-failed>"}
+      )
+      projected_error = boundary_sanitizer(
+        error_summary,
+        "approval_audit",
+      )
+      kwargs["error_summary"] = (
+        projected_error
+        if projected_error is None or isinstance(projected_error, str)
+        else "<secret-sanitization-failed>"
+      )
+    await emit(**kwargs)
   finally:
     raw_args.clear()
     del raw_args

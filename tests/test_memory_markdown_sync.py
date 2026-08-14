@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import get_type_hints
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
@@ -16,6 +18,20 @@ from agent_gateway.memory import MarkdownSyncManager, MemoryStore  # noqa: E402
 
 def _run(coro):
   return asyncio.run(coro)
+
+
+def test_corrupt_memory_store_refuses_without_moving_or_replacing_file(
+  tmp_path: Path,
+) -> None:
+  path = tmp_path / "memory.db"
+  original = b"not a sqlite database\x00user-recovery-data"
+  path.write_bytes(original)
+
+  with pytest.raises(memory_module.MemoryUnavailableError, match="preserved in place"):
+    MemoryStore(path)
+
+  assert path.read_bytes() == original
+  assert sorted(item.name for item in tmp_path.iterdir()) == ["memory.db"]
 
 
 def test_markdown_sync_round_trips_through_memory_import_surface(tmp_path: Path) -> None:

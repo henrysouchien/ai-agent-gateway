@@ -27,6 +27,7 @@ def _output(
   max_turns_reached: bool = False,
   max_tokens_reached: bool = False,
   operator_paused: bool = False,
+  exit_reason: str | None = None,
 ) -> RunOutput:
   return RunOutput(
     response=response,
@@ -38,6 +39,7 @@ def _output(
     max_turns_reached=max_turns_reached,
     max_tokens_reached=max_tokens_reached,
     operator_paused=operator_paused,
+    exit_reason=exit_reason,
   )
 
 
@@ -225,6 +227,75 @@ def test_run_autonomous_with_retry_operator_pause_is_not_retried(monkeypatch: py
 
   assert output.operator_paused is True
   assert sleep_calls == []
+
+
+def test_run_autonomous_with_retry_writer_lease_terminal_reason_is_not_retried(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  sleep_calls: list[float] = []
+  retry_calls: list[tuple[int, str, float]] = []
+  run_calls: list[dict[str, Any]] = []
+
+  async def _fake_sleep(delay: float) -> None:
+    sleep_calls.append(delay)
+
+  async def _on_retry(attempt_number: int, error_description: str, delay: float) -> None:
+    retry_calls.append((attempt_number, error_description, delay))
+
+  monkeypatch.setattr(retry.asyncio, "sleep", _fake_sleep)
+
+  lease_output = _output(
+    error="WriterLeaseAlreadyHeldError: another writer owns the lease",
+    exit_reason="writer_lease_already_held",
+  )
+  output = _run(
+    run_autonomous_with_retry(
+      _sequence_run_fn([lease_output, _output("unused")], calls=run_calls),
+      retry_config=RetryConfig(max_retries=3, backoff_steps=[1.0], on_retry=_on_retry),
+    )
+  )
+
+  assert output is lease_output
+  assert classify_outcome(None, lease_output) == "permanent"
+  assert len(run_calls) == 1
+  assert retry_calls == []
+  assert sleep_calls == []
+
+
+def test_run_autonomous_with_retry_does_not_infer_writer_lease_reason_from_error_text(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  sleep_calls: list[float] = []
+  run_calls: list[dict[str, Any]] = []
+
+  async def _fake_sleep(delay: float) -> None:
+    sleep_calls.append(delay)
+
+  monkeypatch.setattr(retry.asyncio, "sleep", _fake_sleep)
+
+  untyped_output = _output(error="WriterLeaseAlreadyHeldError: writer_lease_already_held")
+  assert classify_outcome(None, untyped_output) == "transient"
+  assert (
+    classify_outcome(
+      None,
+      _output(
+        error="WriterLeaseAlreadyHeldError: another writer owns the lease",
+        exit_reason="writer_lease_already_held ",
+      ),
+    )
+    == "transient"
+  )
+
+  output = _run(
+    run_autonomous_with_retry(
+      _sequence_run_fn([untyped_output, _output("retried")], calls=run_calls),
+      retry_config=RetryConfig(max_retries=1, backoff_steps=[0.25]),
+    )
+  )
+
+  assert output.response == "retried"
+  assert len(run_calls) == 2
+  assert sleep_calls == [0.25]
 
 
 def test_run_autonomous_with_retry_timeout_retries_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:

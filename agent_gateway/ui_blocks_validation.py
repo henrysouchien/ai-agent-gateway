@@ -219,7 +219,21 @@ def _field_mapping_code(block_name: str, props: dict[str, Any], bundle: dict[str
   fields = source.get("fields", {})
   if block_name == "sdk:metric-grid":
     keys = [item if isinstance(item, str) else item.get("key") for item in props.get("fields", []) if isinstance(item, (str, dict))]
-    return None if all(key in fields for key in keys) else FailureCode.FIELD_MAPPING_INVALID
+    scalar_types = {"string", "number", "integer", "boolean"}
+
+    def scalar_compatible(key: Any) -> bool:
+      descriptor = fields.get(key)
+      if not isinstance(descriptor, dict):
+        return False
+      field_type = descriptor.get("type")
+      if isinstance(field_type, str):
+        return field_type in scalar_types
+      if isinstance(field_type, list):
+        declared = set(field_type)
+        return bool(declared & scalar_types) and declared <= scalar_types | {"null"}
+      return False
+
+    return None if all(scalar_compatible(key) for key in keys) else FailureCode.FIELD_MAPPING_INVALID
   if block_name in {"sdk:source-table", "sdk:chart-panel"}:
     field = fields.get(props.get("field"), {})
     if field.get("type") != "array" or not isinstance(field.get("items"), dict):

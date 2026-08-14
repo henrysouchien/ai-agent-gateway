@@ -21,6 +21,7 @@ wheel
 # Dev/publish tools
 pytest
 pytest-asyncio
+pytest-xdist
 build
 twine
 pip-audit

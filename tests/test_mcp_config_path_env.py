@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import json
 import sys
 from pathlib import Path
@@ -35,7 +37,7 @@ def test_mcp_client_manager_uses_mcp_config_path_env(
   assert manager._config_path == config_path
 
 
-def test_mcp_client_manager_unset_env_falls_back_to_home_claude_json(
+def test_mcp_client_manager_unset_env_loads_no_file_backed_servers(
   monkeypatch,
   tmp_path: Path,
 ) -> None:
@@ -44,7 +46,7 @@ def test_mcp_client_manager_unset_env_falls_back_to_home_claude_json(
 
   manager = McpClientManager()
 
-  assert manager._config_path == tmp_path / ".claude.json"
+  assert manager._config_path is None
 
 
 def test_mcp_client_manager_explicit_config_path_wins_over_env(
@@ -72,7 +74,7 @@ def test_mcp_client_manager_expands_tilde_from_env(
   assert manager._config_path == tmp_path / "gateway.json"
 
 
-def test_mcp_client_manager_blank_env_falls_back_to_home_claude_json(
+def test_mcp_client_manager_blank_env_loads_no_file_backed_servers(
   monkeypatch,
   tmp_path: Path,
 ) -> None:
@@ -81,7 +83,7 @@ def test_mcp_client_manager_blank_env_falls_back_to_home_claude_json(
 
   manager = McpClientManager()
 
-  assert manager._config_path == tmp_path / ".claude.json"
+  assert manager._config_path is None
 
 
 def test_agent_sdk_loader_uses_mcp_config_path_env(
@@ -97,7 +99,7 @@ def test_agent_sdk_loader_uses_mcp_config_path_env(
   assert configs == {"research": {"command": "env-cmd"}}
 
 
-def test_agent_sdk_loader_unset_env_falls_back_to_home_claude_json(
+def test_agent_sdk_loader_unset_env_ignores_home_claude_json(
   monkeypatch,
   tmp_path: Path,
 ) -> None:
@@ -108,7 +110,7 @@ def test_agent_sdk_loader_unset_env_falls_back_to_home_claude_json(
 
   configs = load_mcp_config_for_sdk(None, _tiers("research"))
 
-  assert configs == {"research": {"command": "default-cmd"}}
+  assert configs == {}
 
 
 def test_agent_sdk_loader_explicit_config_path_wins_over_env(
@@ -140,7 +142,7 @@ def test_agent_sdk_loader_expands_tilde_from_env(
   assert configs == {"research": {"command": "tilde-cmd"}}
 
 
-def test_agent_sdk_loader_blank_env_falls_back_to_home_claude_json(
+def test_agent_sdk_loader_blank_env_ignores_home_claude_json(
   monkeypatch,
   tmp_path: Path,
 ) -> None:
@@ -151,7 +153,7 @@ def test_agent_sdk_loader_blank_env_falls_back_to_home_claude_json(
 
   configs = load_mcp_config_for_sdk(None, _tiers("research"))
 
-  assert configs == {"research": {"command": "default-cmd"}}
+  assert configs == {}
 
 
 def test_create_agent_uses_mcp_config_path_env(

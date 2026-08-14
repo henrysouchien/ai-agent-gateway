@@ -29,6 +29,15 @@ _RATE_LIMIT_PATTERNS = (
   re.compile(r"\brate(?:\s+limit(?:ed|ing)?|\s+limited)\b", re.IGNORECASE),
   re.compile(r"\btoo many requests\b", re.IGNORECASE),
 )
+_CONTEXT_LENGTH_PATTERNS = (
+  re.compile(r"\bcontext[_\s-]*length[_\s-]*(?:exceeded|error)\b", re.IGNORECASE),
+  re.compile(r"\bcontext\s+window\b", re.IGNORECASE),
+  re.compile(r"\bmaximum\s+context\s+length\b", re.IGNORECASE),
+  re.compile(r"\bprompt\s+too\s+long\b", re.IGNORECASE),
+  re.compile(r"\btoo\s+many\s+(?:input\s+)?tokens\b", re.IGNORECASE),
+  re.compile(r"\binput\s+(?:is\s+)?too\s+long\b", re.IGNORECASE),
+  re.compile(r"\btoken\s+limit\b", re.IGNORECASE),
+)
 
 ThinkingMode = Literal["adaptive", "budget", "none"]
 
@@ -44,6 +53,7 @@ class ModelInfo:
   supports_thinking: bool = False
   supports_vision: bool = True
   supports_tool_use: bool = True
+  supports_native_compaction: bool = False
   input_cost_per_mtok: float = 0.0
   output_cost_per_mtok: float = 0.0
   cache_read_cost_per_mtok: float = 0.0
@@ -80,6 +90,7 @@ class StreamEvent:
   cache_creation_tokens: int = 0
   raw_block: Any = None
   caller: dict[str, Any] | None = None
+  provider_reported_model: str | None = None
 
 
 @dataclass
@@ -183,6 +194,12 @@ def _classify_provider_credential_failure(
     )
 
   return None
+
+
+def _is_context_length_exception(exc: Exception) -> bool:
+  error_code = _error_code_from_exception(exc)
+  message = " ".join(part for part in (str(exc), _response_text(exc), error_code or "") if part)
+  return any(pattern.search(message) for pattern in _CONTEXT_LENGTH_PATTERNS)
 
 
 def truncate_to_last_compaction(
@@ -330,6 +347,9 @@ class ModelProvider:
     raise NotImplementedError
 
   def is_retryable_error(self, exc: Exception) -> bool:
+    return False
+
+  def is_context_length_error(self, exc: Exception) -> bool:
     return False
 
   def classify_credential_failure(self, exc: Exception) -> ProviderCredentialFailure | None:

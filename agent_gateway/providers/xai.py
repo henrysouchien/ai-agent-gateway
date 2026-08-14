@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Any, AsyncIterator
 from weakref import WeakKeyDictionary
 
 import httpx
 
 from ..thinking import EffortResolution, ThinkingLevel
-from .base import ModelInfo, ModelProvider, StreamEvent
+from .base import ModelInfo, ModelProvider, StreamEvent, _is_context_length_exception
 from .codex import CodexProvider
 from .xai_helpers import (
   DEFAULT_INSTRUCTIONS,
@@ -27,9 +26,78 @@ from .xai_helpers import (
 from .xai_oauth import (
   oauth_record_from_config,
   refresh_xai_oauth_token,
-  resolve_xai_auth_mode,
+  resolve_xai_oauth_settings,
   token_needs_refresh,
+  xai_record_requires_reauth,
 )
+
+
+def _bound_xai_base_url(config: dict[str, Any]) -> str:
+  configured = {
+    str(config[key]).strip()
+    for key in ("base_url", "baseURL")
+    if str(config.get(key) or "").strip()
+  }
+  if len(configured) > 1:
+    raise ValueError("conflicting xAI base_url and baseURL values")
+  return next(iter(configured), DEFAULT_XAI_BASE_URL)
+
+
+def _configured_auth_mode(config: dict[str, Any]) -> str:
+  explicit = str(config.get("auth_mode") or "").strip().lower()
+  if explicit:
+    if explicit not in {"api", "oauth"}:
+      raise ValueError(
+        f"Unknown xAI auth_mode={explicit!r}. Expected 'api' or 'oauth'."
+      )
+    return explicit
+  if str(config.get("api_key") or "").strip():
+    return "api"
+  if any(
+    str(config.get(field) or "").strip()
+    for field in ("auth_token", "refresh_token", "auth_store_path")
+  ):
+    return "oauth"
+  return "api"
+
+
+def _oauth_material_from_config(
+  config: dict[str, Any],
+) -> tuple[dict[str, Any] | None, Any | None]:
+  """Resolve only explicitly selected OAuth material.
+
+  An explicit store path authorizes loading and refreshing that store. Without
+  one, the access token remains usable but the process/default store is never
+  consulted or used as refresh state.
+  """
+
+  auth_store_path = str(config.get("auth_store_path") or "").strip()
+  if auth_store_path:
+    return oauth_record_from_config(config, environ={})
+
+  access_token = str(config.get("auth_token") or "").strip()
+  refresh_token = str(config.get("refresh_token") or "").strip()
+  if not access_token and not refresh_token:
+    return None, None
+  settings = resolve_xai_oauth_settings(config, environ={})
+  raw_expires = config.get("token_expires_at")
+  try:
+    expires_at = float(raw_expires) if raw_expires not in {None, ""} else 0.0
+  except (TypeError, ValueError):
+    expires_at = 0.0
+  record: dict[str, Any] = {
+    "access_token": access_token,
+    "refresh_token": refresh_token,
+    "expires_at": expires_at,
+    "scope": settings.scope,
+    "issuer": settings.issuer,
+    "client_id": settings.client_id,
+  }
+  for field in ("device_authorization_endpoint", "token_endpoint"):
+    value = str(config.get(field) or "").strip()
+    if value:
+      record[field] = value
+  return record, None
 
 
 class XAIProvider(ModelProvider):
@@ -41,22 +109,35 @@ class XAIProvider(ModelProvider):
     self._client_state: WeakKeyDictionary[httpx.AsyncClient, dict[str, Any]] = WeakKeyDictionary()
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
-    mode = resolve_xai_auth_mode(config)
+    mode = _configured_auth_mode(config)
     if mode == "oauth":
-      record, _settings = oauth_record_from_config(config)
-      return bool(record and (record.get("access_token") or record.get("refresh_token")))
-    return bool(str(config.get("api_key") or os.environ.get("XAI_API_KEY") or "").strip())
+      record, settings = _oauth_material_from_config(config)
+      return bool(
+        record
+        and not xai_record_requires_reauth(record)
+        and (
+          str(record.get("access_token") or "").strip()
+          or (
+            settings is not None
+            and str(record.get("refresh_token") or "").strip()
+          )
+        )
+      )
+    return bool(str(config.get("api_key") or "").strip())
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
-    mode = resolve_xai_auth_mode(config)
+    mode = _configured_auth_mode(config)
     oauth_record = None
     oauth_settings = None
     if mode == "oauth":
-      oauth_record, oauth_settings = oauth_record_from_config(config)
+      oauth_record, oauth_settings = _oauth_material_from_config(config)
       token = str((oauth_record or {}).get("access_token") or "").strip()
-      has_refresh = bool(str((oauth_record or {}).get("refresh_token") or "").strip())
+      has_refresh = bool(
+        oauth_settings is not None
+        and str((oauth_record or {}).get("refresh_token") or "").strip()
+      )
     else:
-      token = str(config.get("api_key") or os.environ.get("XAI_API_KEY") or "").strip()
+      token = str(config.get("api_key") or "").strip()
       has_refresh = False
     if not token and not has_refresh:
       raise RuntimeError(f"No xAI {mode} credential configured")
@@ -68,7 +149,7 @@ class XAIProvider(ModelProvider):
     client = httpx.AsyncClient(**client_kwargs)
     self._client_state[client] = {
       "token": token,
-      "endpoint_url": resolve_responses_url(str(config.get("base_url") or os.environ.get("XAI_BASE_URL") or DEFAULT_XAI_BASE_URL)),
+      "endpoint_url": resolve_responses_url(_bound_xai_base_url(config)),
       "headers": dict(config.get("headers") or {}) if isinstance(config.get("headers"), dict) else {},
       "auth_mode": mode,
       "oauth_record": oauth_record,
@@ -90,6 +171,11 @@ class XAIProvider(ModelProvider):
     model_id = str(model or "").strip()
     if not model_id:
       raise ValueError("Model is required")
+    # Context windows per docs.x.ai models pages (audited 2026-07-21):
+    # grok-4.3 and grok-4.20 variants 1M; grok-4.5 500k; grok-build-0.1 256k.
+    # grok-latest is not a documented alias — conservatively assume it resolves
+    # to grok-4.5 (500k) so compaction fires before any real wall.
+    # xAI publishes NO max-output cap; 128k is an internal assumption.
     common = dict(
       id=model_id,
       provider=self.name,
@@ -98,7 +184,7 @@ class XAIProvider(ModelProvider):
       supports_vision=False,
       supports_tool_use=True,
     )
-    if model_id == "grok-4.3" or model_id.startswith("grok-4.3-") or model_id == "grok-latest":
+    if model_id == "grok-4.3" or model_id.startswith("grok-4.3-"):
       return ModelInfo(
         **common,
         supports_thinking=True,
@@ -108,9 +194,19 @@ class XAIProvider(ModelProvider):
           "reasoningEffortDefault": "medium",
         },
       )
+    if model_id == "grok-latest":
+      return ModelInfo(
+        **{**common, "context_window": 500_000},
+        supports_thinking=True,
+        compat={
+          "supportsReasoningEffort": True,
+          "reasoningEffortValues": ("none", "low", "medium", "high"),
+          "reasoningEffortDefault": "medium",
+        },
+      )
     if model_id == "grok-4.5" or model_id.startswith("grok-4.5-"):
       return ModelInfo(
-        **common,
+        **{**common, "context_window": 500_000},
         supports_thinking=True,
         compat={
           "supportsReasoningEffort": True,
@@ -124,7 +220,7 @@ class XAIProvider(ModelProvider):
       "grok-4.20-beta-latest-non-reasoning",
     }:
       return ModelInfo(
-        **common,
+        **{**common, "context_window": 256_000 if model_id == "grok-build-0.1" else 1_000_000},
         supports_thinking=model_id.endswith("-reasoning"),
         compat={"supportsReasoningEffort": False},
       )
@@ -223,7 +319,7 @@ class XAIProvider(ModelProvider):
     if state.get("auth_mode") == "oauth":
       record = state.get("oauth_record")
       if isinstance(record, dict) and (not state.get("token") or token_needs_refresh(record)):
-        await self._refresh_oauth_state(state, client)
+        await self._refresh_oauth_state(state, client, force=False)
 
     request_params = dict(params)
     additional_headers = request_params.pop("_headers", None)
@@ -234,7 +330,8 @@ class XAIProvider(ModelProvider):
       else state["headers"]
     )
     for auth_attempt in range(2):
-      headers = build_headers(str(state["token"]), merged_headers)
+      attempt_token = str(state["token"])
+      headers = build_headers(attempt_token, merged_headers)
       refresh_after_response = False
       async with client.stream("POST", endpoint_url, json=request_params, headers=headers) as response:
         if response.status_code == 401 and state.get("auth_mode") == "oauth" and auth_attempt == 0:
@@ -259,9 +356,21 @@ class XAIProvider(ModelProvider):
                 yield mapped
           return
       if refresh_after_response:
-        await self._refresh_oauth_state(state, client)
+        await self._refresh_oauth_state(
+          state,
+          client,
+          force=True,
+          rejected_token=attempt_token,
+        )
 
-  async def _refresh_oauth_state(self, state: dict[str, Any], client: httpx.AsyncClient) -> None:
+  async def _refresh_oauth_state(
+    self,
+    state: dict[str, Any],
+    client: httpx.AsyncClient,
+    *,
+    force: bool = False,
+    rejected_token: str | None = None,
+  ) -> None:
     lock = state.get("refresh_lock")
     if lock is None:
       lock = asyncio.Lock()
@@ -270,8 +379,20 @@ class XAIProvider(ModelProvider):
       record = state.get("oauth_record")
       settings = state.get("oauth_settings")
       if not isinstance(record, dict) or settings is None:
-        raise RuntimeError("xAI OAuth refresh state is missing; run `agent auth login xai`")
-      refreshed = await refresh_xai_oauth_token(record, settings=settings, client=client)
+        raise RuntimeError(
+          "xAI OAuth refresh state is missing; run "
+          "`python3 -m agent_gateway.cli auth login xai`"
+        )
+      if not force and not token_needs_refresh(record):
+        return
+      if force and rejected_token is not None and str(state["token"]) != rejected_token:
+        return
+      refreshed = await refresh_xai_oauth_token(
+        record,
+        settings=settings,
+        client=client,
+        force=force,
+      )
       state["oauth_record"] = refreshed
       state["token"] = str(refreshed["access_token"])
 
@@ -279,6 +400,9 @@ class XAIProvider(ModelProvider):
     if isinstance(exc, httpx.HTTPStatusError):
       return exc.response.status_code in RETRYABLE_STATUSES
     return isinstance(exc, (httpx.TransportError, httpx.StreamError))
+
+  def is_context_length_error(self, exc: Exception) -> bool:
+    return _is_context_length_exception(exc)
 
 
 __all__ = ["XAIProvider"]

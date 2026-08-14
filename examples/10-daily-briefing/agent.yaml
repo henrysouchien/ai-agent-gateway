@@ -3,8 +3,6 @@ system_prompt: |
   You run a daily briefing workflow. Read only the local source files the user asks for,
   keep source facts separate from interpretation, and use the daily-briefing skill when
   the user asks for a finished briefing. Keep the final answer scannable and operational.
-provider: anthropic
-model: null
 host: 127.0.0.1
 port: 8010
 api_prefix: /api

@@ -6,6 +6,16 @@ from typing import Any
 
 import pytest
 
+from agent_workflow_contracts import (  # noqa: E402
+  AgentOperationRef,
+  AttemptRef,
+  OrdinaryDelegationTaskRef,
+  OutcomeRequirement,
+  ResultRequirement,
+  TaskResultProvenance,
+  sha256_digest,
+)
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
@@ -24,11 +34,101 @@ from agent_gateway import (  # noqa: E402
   ToolDispatcher,
 )
 from agent_gateway.providers import StreamEvent  # noqa: E402
+from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_runner_capability_execution,
+)
 
 
 def _run(coro):
   return asyncio.run(coro)
+
+
+def _child_report(summary: str = "done") -> dict[str, object]:
+  return {
+    "kind": "report",
+    "version": "1",
+    "report": {
+      "summary": summary,
+      "findings": [],
+      "artifacts": [],
+      "caveats": [],
+    },
+    "usage": {},
+    "tools_used": [],
+    "fms_results": None,
+    "artifact_events": None,
+    "warning": None,
+  }
+
+
+def _subagent_result_identity(
+  *,
+  delegation_id: str,
+  physical_task_id: str,
+) -> dict[str, object]:
+  operation = AgentOperationRef(
+    namespace="agent-operation",
+    name="test-child",
+    version="1.0",
+    digest=sha256_digest({"operation": "test-child", "version": "1.0"}),
+  )
+  logical_task = OrdinaryDelegationTaskRef(
+    delegation_id=delegation_id,
+    operation=operation,
+  )
+  attempt = AttemptRef(
+    attempt_number=1,
+    attempt_id=f"attempt:{physical_task_id}:1",
+    physical_task_id=physical_task_id,
+  )
+  return {
+    "logical_task": logical_task,
+    "attempt": attempt,
+    "result_requirement": ResultRequirement(
+      mode="narrative",
+      terminal_narrative="required",
+      outcome=OutcomeRequirement(required=False, source="none"),
+    ),
+    "result_provenance": TaskResultProvenance(
+      admitted_task_digest=sha256_digest({
+        "logical_task": logical_task.model_dump(mode="json"),
+        "attempt": attempt.model_dump(mode="json"),
+      }),
+      model_bind_digest=sha256_digest({"model_bind": "test-child"}),
+      capability_binding_digest=sha256_digest({
+        "capability": "node.implement"
+      }),
+      tool_grant_digest=sha256_digest({"tools": ["lookup"]}),
+    ),
+  }
+
+
+def _runner_execution(
+  provider: ModelProvider,
+  *,
+  model: str = "claude-sonnet-4-6",
+  capability_id: str = "session.driver",
+) -> BoundCapabilityExecution:
+  return stub_runner_capability_execution(
+    provider=provider,
+    model=model,
+    effort="none",
+    capability_id=capability_id,
+  )
+
+
+def _child_execution(
+  provider: ModelProvider,
+  *,
+  model: str = "claude-sonnet-4-6",
+) -> BoundCapabilityExecution:
+  return _runner_execution(
+    provider,
+    model=model,
+    capability_id="node.implement",
+  )
 
 
 class _NullMcpClient:
@@ -115,6 +215,10 @@ def _make_dispatcher(
     local_tool_handlers=local_tool_handlers or {},
     event_log=event_log or EventLog(),
     session_id="sess-parent",
+    # Owner authority: since S1 fail-closed roles a role-less dispatcher is
+    # invite and denies the synthetic local tools these logging tests execute.
+    role="owner",
+    get_tool_definitions=None,
   )
 
 
@@ -193,6 +297,17 @@ async def _warning_tool(tool_input: dict[str, Any], **kwargs: Any):
   return {"ok": True, "low_match_warning": tool_input.get("warning", "only 20% matched")}, None
 
 
+async def _interceptor_warning_tool(
+  tool_input: dict[str, Any],
+  **kwargs: Any,
+):
+  _ = tool_input, kwargs
+  return {
+    "ok": True,
+    "_interceptor_warnings": ["policy warning"],
+  }, None
+
+
 async def _large_result_tool(tool_input: dict[str, Any], **kwargs: Any):
   _ = kwargs
   size = int(tool_input.get("size", 10_000))
@@ -237,9 +352,9 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _lookup_tool}),
     session_id="sess-parent",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
+    workspace_dir=str(tmp_path),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -290,9 +405,9 @@ def test_runner_suppresses_text_from_tool_only_turns(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _lookup_tool}),
     session_id="sess-parent",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
+    workspace_dir=str(tmp_path),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -328,15 +443,15 @@ def test_semantic_tool_error_is_visible_in_trace_and_timing(tmp_path: Path) -> N
   log = AgentSessionLog(path=tmp_path / "sessions" / "semantic-error.jsonl")
   event_log = EventLog()
   timing_calls: list[tuple[Any, ...]] = []
+  provider = _ScriptedProvider([
+    _tool_turn(tool_input={"query": "X"}),
+    _text_turn("handled"),
+  ])
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _semantic_error_tool}),
     session_id="sess-parent",
-    provider=_ScriptedProvider([
-      _tool_turn(tool_input={"query": "X"}),
-      _text_turn("handled"),
-    ]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     on_tool_timing=lambda *args: timing_calls.append(args),
     user_id="alice",
@@ -372,15 +487,15 @@ def test_semantic_tool_error_is_visible_in_trace_and_timing(tmp_path: Path) -> N
 def test_semantic_tool_error_without_detail_warns_model_context(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "semantic-empty-error.jsonl")
   event_log = EventLog()
+  provider = _ScriptedProvider([
+    _tool_turn(tool_name="get_skill_artifact", tool_input={"ticker": "ADI"}),
+    _text_turn("handled"),
+  ])
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"get_skill_artifact": _empty_status_error_tool}),
     session_id="sess-parent",
-    provider=_ScriptedProvider([
-      _tool_turn(tool_name="get_skill_artifact", tool_input={"ticker": "ADI"}),
-      _text_turn("handled"),
-    ]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -417,6 +532,10 @@ def test_semantic_tool_error_without_detail_warns_model_context(tmp_path: Path) 
 def test_native_runner_semantic_error_includes_validation_details(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "semantic-validation-error.jsonl")
   event_log = EventLog()
+  provider = _ScriptedProvider([
+    _tool_turn(tool_name="thesis_append_decisions_log", tool_input={"research_file_id": 1, "entry": {}}),
+    _text_turn("handled"),
+  ])
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(
@@ -424,11 +543,7 @@ def test_native_runner_semantic_error_includes_validation_details(tmp_path: Path
       local_tool_handlers={"thesis_append_decisions_log": _decision_log_validation_error_tool},
     ),
     session_id="sess-parent",
-    provider=_ScriptedProvider([
-      _tool_turn(tool_name="thesis_append_decisions_log", tool_input={"research_file_id": 1, "entry": {}}),
-      _text_turn("handled"),
-    ]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -457,12 +572,12 @@ def test_operator_pause_before_turn_emits_clean_interruption(tmp_path: Path) -> 
   event_log = EventLog()
   pause_event = asyncio.Event()
   pause_event.set()
+  provider = _ScriptedProvider([])
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log),
     session_id="sess-parent",
-    provider=_ScriptedProvider([]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     operator_pause_event=pause_event,
     user_id="alice",
@@ -483,6 +598,11 @@ def test_operator_pause_before_turn_emits_clean_interruption(tmp_path: Path) -> 
     "session_recap",
     "stream_complete",
   ]
+  assert event_log.entries[-1].event["reason"] == "operator_pause"
+  assert (
+    event_log.entries[-1].event["terminal_disposition"]
+    == "interrupted"
+  )
 
 
 def test_operator_pause_after_turn_stops_before_tool_dispatch(tmp_path: Path) -> None:
@@ -496,12 +616,15 @@ def test_operator_pause_after_turn_stops_before_tool_dispatch(tmp_path: Path) ->
     tool_calls.append(tool_input)
     return {"unexpected": True}, None
 
+  provider = _ScriptedProvider(
+    [_tool_turn()],
+    after_turn=lambda _turn_index: pause_event.set(),
+  )
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"lookup": _unexpected_tool}),
     session_id="sess-parent",
-    provider=_ScriptedProvider([_tool_turn()], after_turn=lambda _turn_index: pause_event.set()),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     operator_pause_event=pause_event,
     user_id="alice",
@@ -522,6 +645,58 @@ def test_operator_pause_after_turn_stops_before_tool_dispatch(tmp_path: Path) ->
   assert "tool_call_interrupted" not in event_types
 
 
+def test_provider_client_creation_failure_terminalizes_without_raising(
+  tmp_path: Path,
+) -> None:
+  class _StartupFailureProvider(_ScriptedProvider):
+    def create_client(
+      self,
+      config: dict[str, Any],
+      *,
+      timeout: float | None = None,
+    ) -> Any:
+      _ = config, timeout
+      raise RuntimeError("sensitive client construction detail")
+
+  log = AgentSessionLog(
+    path=tmp_path / "sessions" / "provider-startup-failure.jsonl"
+  )
+  provider = _StartupFailureProvider([])
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log),
+    session_id="sess-parent",
+    capability_execution=_runner_execution(provider),
+    agent_session_log=log,
+    shutdown_signal_provider=lambda: {"signal_name": "SIGTERM"},
+    emit_session_recap=False,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  returned = _run(
+    runner.run(
+      messages=[{"role": "user", "content": "Start provider"}]
+    )
+  )
+
+  assert returned is None
+  entries, _ = _run(log.query(order="asc"))
+  events = [entry.event for entry in entries]
+  assert [event["type"] for event in events] == [
+    "attach",
+    "user_message",
+    "error",
+    "detach",
+  ]
+  assert events[2]["error"] == (
+    "Provider startup failed: could not create client for provider=stub."
+  )
+  assert events[3]["reason"] == "error"
+  assert "sensitive client construction detail" not in json.dumps(events)
+
+
 def test_sub_agent_cancelled_run_emits_sub_agent_interrupted_reason(tmp_path: Path) -> None:
   stream_started = asyncio.Event()
 
@@ -534,12 +709,12 @@ def test_sub_agent_cancelled_run_emits_sub_agent_interrupted_reason(tmp_path: Pa
       yield  # pragma: no cover
 
   log = AgentSessionLog(path=tmp_path / "sessions" / "sub-agent-cancelled.jsonl")
+  provider = _BlockingProvider([])
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sub-worker:parent",
-    provider=_BlockingProvider([]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -595,12 +770,12 @@ def test_runner_without_context_builder_does_not_inject_prior_durable_history(tm
         **kwargs,
       )
 
+  provider = _CapturingProvider([_text_turn("done")])
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_CapturingProvider([_text_turn("done")]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     context_builder=None,
     user_id="alice",
@@ -646,12 +821,12 @@ def test_runner_with_context_builder_ignores_fabricated_client_history(tmp_path:
         **kwargs,
       )
 
+  provider = _CapturingProvider([_text_turn("done")])
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_CapturingProvider([_text_turn("done")]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     context_builder=SessionContextBuilder(agent_session_log=log, tail_window_seconds=None),
     user_id="alice",
@@ -691,8 +866,7 @@ def test_stream_retry_and_terminal_error_are_durable(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log),
     session_id="sess-parent",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -729,8 +903,7 @@ def test_tool_call_complete_logs_final_model_facing_result_blocks(tmp_path: Path
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"warn_lookup": _warning_tool}),
     session_id="sess-parent",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -761,8 +934,7 @@ def test_tool_call_complete_pre_and_final_results_differ_when_annotated(tmp_path
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"warn_lookup": _warning_tool}),
     session_id="sess-parent",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -778,6 +950,51 @@ def test_tool_call_complete_pre_and_final_results_differ_when_annotated(tmp_path
   assert event["final_tool_result_blocks"][0]["content"] != json.dumps(event["result"], default=str)
 
 
+def test_tool_completion_retains_interceptor_warning_provenance(
+  tmp_path: Path,
+) -> None:
+  log = AgentSessionLog(
+    path=tmp_path / "sessions" / "interceptor-warning.jsonl"
+  )
+  provider = _ScriptedProvider([
+    _tool_turn(tool_name="warning_source", tool_input={}),
+    _text_turn("done"),
+  ])
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(
+      event_log=event_log,
+      local_tool_handlers={
+        "warning_source": _interceptor_warning_tool,
+      },
+    ),
+    session_id="sess-parent",
+    capability_execution=_runner_execution(provider),
+    agent_session_log=log,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "Run warning"}]))
+
+  entries, _ = _run(
+    log.query(event_types={"tool_call_complete"}, order="asc")
+  )
+  event = entries[0].event
+  assert event["result"]["_interceptor_warnings"] == [
+    "policy warning"
+  ]
+  model_result = json.loads(
+    event["final_tool_result_blocks"][0]["content"]
+  )
+  assert "_interceptor_warnings" not in model_result
+  assert model_result["_runner_warning"] == (
+    "Policy warning: policy warning"
+  )
+
+
 def test_large_tool_result_is_compacted_only_for_model_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setenv(gateway_runner.MODEL_TOOL_RESULT_MAX_CHARS_ENV, "4000")
   log = AgentSessionLog(path=tmp_path / "sessions" / "large-tool-result.jsonl")
@@ -790,8 +1007,7 @@ def test_large_tool_result_is_compacted_only_for_model_context(tmp_path: Path, m
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log=event_log, local_tool_handlers={"large_lookup": _large_result_tool}),
     session_id="sess-parent",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -840,12 +1056,12 @@ def test_rebuild_task_registry_ignores_tool_call_complete_final_blocks(tmp_path:
       }
     )
   )
+  provider = _ScriptedProvider([_text_turn("unused")])
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(local_tool_handlers={}),
     session_id="sess-parent",
-    provider=_ScriptedProvider([_text_turn("unused")]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     task_registry=TaskRegistry(),
     user_id="alice",
@@ -862,6 +1078,9 @@ def test_rebuild_task_registry_ignores_tool_call_complete_final_blocks(tmp_path:
 
 def test_task_durability_events_use_type_and_query_round_trips(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "task-events.jsonl")
+  capability_bind = _child_execution(
+    _ScriptedProvider([])
+  ).bind.receipt()
   correlation = {
     "task_id": "bg_0",
     "owner_runner_id": "runner_old",
@@ -870,13 +1089,12 @@ def test_task_durability_events_use_type_and_query_round_trips(tmp_path: Path) -
     "parent_turn_id": "turn-1",
     "call_index": 0,
     "task_type": "background",
-    "provider_name": "anthropic",
-    "model": "claude-sonnet-4-6",
+    "capability_bind": capability_bind,
   }
 
   _run(log.append({"type": "task_registered", **correlation, "agent_name": "writer", "started_at": 1.0}))
   _run(log.append({"type": "parent_message_sent", **correlation, "message_id": "msg-1", "message": "go"}))
-  _run(log.append({"type": "task_completed", **correlation, "final_state": "completed", "completed_at": 2.0, "result": {"response": "done"}, "error": None}))
+  _run(log.append({"type": "task_completed", **correlation, "final_state": "completed", "completed_at": 2.0, "result": _child_report(), "error": None}))
 
   entries, _ = _run(log.query(event_types={"task_registered", "parent_message_sent", "task_completed"}, order="asc"))
 
@@ -914,12 +1132,12 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
     )
   )
 
+  provider = _ScriptedProvider([_text_turn("recovered")])
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(local_tool_handlers={}),
     session_id="sess-parent",
-    provider=_ScriptedProvider([_text_turn("recovered")]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -952,23 +1170,23 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
 
 def test_second_writer_lease_acquisition_raises(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "lease.jsonl")
+  provider_one = _ScriptedProvider([_text_turn("one")])
   runner_one = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-one",
-    provider=_ScriptedProvider([_text_turn("one")]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider_one),
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
   )
+  provider_two = _ScriptedProvider([_text_turn("two")])
   runner_two = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-two",
-    provider=_ScriptedProvider([_text_turn("two")]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider_two),
     agent_session_log=log,
     user_id="alice",
     billing_mode="byok",
@@ -999,12 +1217,12 @@ def test_register_background_task_emits_task_registered_with_correlation(
       return f"sub{call_index}:derived-parent"
 
     monkeypatch.setattr(gateway_runner, "_derive_sub_agent_id", _fake_derive)
+    provider = _ScriptedProvider([_text_turn("unused")])
     runner = AgentRunner(
       event_log=EventLog(),
       dispatcher=_make_dispatcher(),
       session_id="sess-parent",
-      provider=_ScriptedProvider([_text_turn("unused")]),
-      auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      capability_execution=_runner_execution(provider),
       agent_session_log=log,
       user_id="alice",
       billing_mode="byok",
@@ -1013,13 +1231,17 @@ def test_register_background_task_emits_task_registered_with_correlation(
     runner._runner_id = "runner_new"
 
     async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
-      return {"response": "done"}, None
+      return _child_report(), None
 
+    capability_bind_receipt = _child_execution(
+      runner._provider,
+    ).bind.receipt()
     result, error = await runner._register_background_task(
-      tool_input={"task": "Collect", "provider": "anthropic", "model": "claude-sonnet-4-6"},
+      tool_input={"task": "Collect"},
       handler=_handler,
       agent_name="writer",
       parent_turn_id="turn-1",
+      capability_bind_receipt=capability_bind_receipt,
     )
     assert error is None
     assert result is not None
@@ -1037,9 +1259,10 @@ def test_register_background_task_emits_task_registered_with_correlation(
     assert event["sub_agent_id"] == "sub0:derived-parent"
     assert event["parent_turn_id"] == "turn-1"
     assert event["call_index"] == 0
-    assert event["task_type"] == "background"
-    assert event["provider_name"] == "anthropic"
-    assert event["model"] == "claude-sonnet-4-6"
+    assert event["task_type"] == "background_agent"
+    assert event["capability_bind"] == capability_bind_receipt
+    assert "provider_name" not in event
+    assert "model" not in event
     assert task.metadata["sub_agent_id"] == "sub0:derived-parent"
     assert calls == [("sess-parent", 0)]
 
@@ -1048,17 +1271,19 @@ def test_register_background_task_emits_task_registered_with_correlation(
 
 def test_task_completed_is_durable_before_terminal_transition() -> None:
   async def _case() -> None:
+    provider = _ScriptedProvider([_text_turn("unused")])
     runner = AgentRunner(
       event_log=EventLog(),
       dispatcher=_make_dispatcher(),
       session_id="sess-parent",
-      provider=_ScriptedProvider([_text_turn("unused")]),
-      auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      capability_execution=_runner_execution(provider),
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
     )
     entry = runner._task_registry.register("background_agent")
+    capability_bind = _child_execution(provider).bind.receipt()
+    entry.capability_bind_receipt = capability_bind
     entry.metadata.update(
       {
         "owner_runner_id": "runner_new",
@@ -1067,8 +1292,7 @@ def test_task_completed_is_durable_before_terminal_transition() -> None:
         "parent_turn_id": "turn-1",
         "call_index": 0,
         "task_type": "background",
-        "provider_name": "anthropic",
-        "model": "claude-sonnet-4-6",
+        "capability_bind": capability_bind,
       }
     )
     ordering: list[str] = []
@@ -1088,7 +1312,7 @@ def test_task_completed_is_durable_before_terminal_transition() -> None:
     runner._task_registry.transition = _transition  # type: ignore[method-assign]
 
     async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
-      return {"response": "done"}, None
+      return _child_report(), None
 
     await runner._run_background_agent(entry, _handler, {}, 0)
 
@@ -1100,6 +1324,8 @@ def test_task_completed_is_durable_before_terminal_transition() -> None:
 def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
   async def _case() -> None:
     log = AgentSessionLog(path=tmp_path / "sessions" / "rebuild.jsonl")
+    provider = _ScriptedProvider([_text_turn("unused")])
+    capability_bind = _child_execution(provider).bind.receipt()
     for index in range(4):
       await log.append(
         {
@@ -1111,8 +1337,7 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
           "parent_turn_id": f"turn-{index}",
           "call_index": index,
           "task_type": "background",
-          "provider_name": "anthropic",
-          "model": "claude-sonnet-4-6",
+          "capability_bind": capability_bind,
           "agent_name": f"agent-{index}",
           "started_at": 100.0 + index,
         }
@@ -1128,11 +1353,10 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
             "parent_turn_id": "turn-1",
             "call_index": 1,
             "task_type": "background",
-            "provider_name": "anthropic",
-            "model": "claude-sonnet-4-6",
+            "capability_bind": capability_bind,
             "final_state": "completed",
             "completed_at": 150.0,
-            "result": {"response": "done"},
+            "result": _child_report(),
             "error": None,
           }
         )
@@ -1146,8 +1370,7 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
         "parent_turn_id": "turn-99",
         "call_index": 99,
         "task_type": "background",
-        "provider_name": "anthropic",
-        "model": "claude-sonnet-4-6",
+        "capability_bind": capability_bind,
         "message_id": "msg-99",
         "message": "dangling event should not count toward hot set cap",
       }
@@ -1157,8 +1380,7 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
       event_log=EventLog(),
       dispatcher=_make_dispatcher(),
       session_id="sess-parent",
-      provider=_ScriptedProvider([_text_turn("unused")]),
-      auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      capability_execution=_runner_execution(provider),
       agent_session_log=log,
       task_registry=registry,
       user_id="alice",
@@ -1173,7 +1395,7 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
     lazy_result, lazy_error = await runner.get_background_result({"task_id": "bg_1"})
     assert lazy_error is None
     assert lazy_result["status"] == "completed"
-    assert lazy_result["response"] == "done"
+    assert lazy_result["report"]["summary"] == "done"
 
     assert registry.register("background_agent").task_id == "bg_4"
 
@@ -1183,25 +1405,24 @@ def test_rebuild_hot_set_lazy_lookup_and_seq_restore(tmp_path: Path) -> None:
 def test_rebuild_renders_interrupted_and_completed_crash_cases(tmp_path: Path) -> None:
   async def _case() -> None:
     log = AgentSessionLog(path=tmp_path / "sessions" / "crash-cases.jsonl")
+    provider = _ScriptedProvider([_text_turn("unused")])
     base = {
       "owner_runner_id": "runner_old",
       "owner_role": "writer",
       "parent_turn_id": "turn-1",
       "task_type": "background",
-      "provider_name": "anthropic",
-      "model": "claude-sonnet-4-6",
+      "capability_bind": _child_execution(provider).bind.receipt(),
     }
     await log.append({"type": "task_registered", **base, "task_id": "bg_0", "sub_agent_id": "sub0:sess-parent", "call_index": 0, "agent_name": "running", "started_at": 100.0})
     await log.append({"type": "task_registered", **base, "task_id": "bg_1", "sub_agent_id": "sub1:sess-parent", "call_index": 1, "agent_name": "done", "started_at": 110.0})
-    await log.append({"type": "task_completed", **base, "task_id": "bg_1", "sub_agent_id": "sub1:sess-parent", "call_index": 1, "final_state": "completed", "completed_at": 120.0, "result": {"response": "done"}, "error": None})
+    await log.append({"type": "task_completed", **base, "task_id": "bg_1", "sub_agent_id": "sub1:sess-parent", "call_index": 1, "final_state": "completed", "completed_at": 120.0, "result": _child_report(), "error": None})
     await log.append({"type": "task_registered", **base, "task_id": "bg_2", "sub_agent_id": "sub2:sess-parent", "call_index": 2, "agent_name": "killed", "started_at": 130.0})
 
     runner = AgentRunner(
       event_log=EventLog(),
       dispatcher=_make_dispatcher(),
       session_id="sess-parent",
-      provider=_ScriptedProvider([_text_turn("unused")]),
-      auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+      capability_execution=_runner_execution(provider),
       agent_session_log=log,
       user_id="alice",
       billing_mode="byok",
@@ -1221,7 +1442,7 @@ def test_rebuild_renders_interrupted_and_completed_crash_cases(tmp_path: Path) -
     assert interrupted["parent_turn_id"] == "turn-1"
     assert completed_error is None
     assert completed["status"] == "completed"
-    assert completed["response"] == "done"
+    assert completed["report"]["summary"] == "done"
     assert killed_error is None
     assert killed_as_interrupted["status"] == "interrupted"
 
@@ -1230,16 +1451,17 @@ def test_rebuild_renders_interrupted_and_completed_crash_cases(tmp_path: Path) -
 
 def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "sub-agent.jsonl")
+  provider = _ScriptedProvider([
+    _tool_turn(tool_id="tool-sub", tool_input={"query": "MSFT"}),
+    _text_turn("sub done"),
+  ])
   parent_runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(local_tool_handlers={"lookup": _lookup_tool}),
     session_id="sess-parent",
-    provider=_ScriptedProvider([
-      _tool_turn(tool_id="tool-sub", tool_input={"query": "MSFT"}),
-      _text_turn("sub done"),
-    ]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
+    workspace_dir=str(tmp_path),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -1250,13 +1472,20 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
     created_at=1,
     expires_at=2,
     user_id="alice",
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    auth_config={"api_key": "k"},
   )
-
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect background context",
-      dispatcher=_make_dispatcher(local_tool_handlers={"lookup": _lookup_tool}),
+      capability_execution=_child_execution(parent_runner._provider),
+      **_subagent_result_identity(
+        delegation_id="test-sub-agent-events",
+        physical_task_id="sub0:sess-parent",
+      ),
+      skill_name="test-child",
+      dispatcher=_make_dispatcher(
+        local_tool_handlers={"lookup": _lookup_tool},
+      ),
       sub_session=sub_session,
       max_turns=5,
       timeout=5.0,
@@ -1289,21 +1518,27 @@ def test_spawn_sub_agent_uses_shared_sub_agent_id_helper(tmp_path: Path, monkeyp
     return f"sub{call_index}:derived-parent"
 
   monkeypatch.setattr(gateway_runner, "_derive_sub_agent_id", _fake_derive)
+  provider = _ScriptedProvider([_text_turn("sub done")])
   parent_runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_ScriptedProvider([_text_turn("sub done")]),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     agent_session_log=log,
+    workspace_dir=str(tmp_path),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
   )
-
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect background context",
+      capability_execution=_child_execution(parent_runner._provider),
+      **_subagent_result_identity(
+        delegation_id="test-shared-sub-agent-id",
+        physical_task_id="sub3:derived-parent",
+      ),
+      skill_name="test-child",
       dispatcher=_make_dispatcher(),
       sub_session=None,
       max_turns=5,

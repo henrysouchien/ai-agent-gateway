@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import builtins
 import os
 import subprocess
@@ -8,14 +9,23 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
-from agent_gateway.approval_audit import build_audit_entry
+from agent_gateway.approval_audit import ApprovalAuditEmitter, build_audit_entry
 from agent_gateway.approval_policy import ApprovalRequest, utc_now
+from agent_gateway.model_registry import (
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.secret_boundary import SecretBoundary
 
 
 async def _build_chat_runtime(*, session, request, channel, auth_manager):
-  _ = session, request, channel, auth_manager
-  return ChatRuntime(system_prompt="test", build_runner=lambda *_args: None)
+  _ = session, channel, auth_manager
+  return ChatRuntime(
+    system_prompt="test",
+    build_runner=lambda *_args: None,
+    capability_execution=request.capability_execution,
+  )
 
 
 def test_leaf_imports_do_not_require_monorepo_schema(tmp_path: Path) -> None:
@@ -104,7 +114,9 @@ def test_create_gateway_app_does_not_import_monorepo_agent_modules(monkeypatch) 
     GatewayServerConfig(
       jwt_secret="package-boundary-test-secret-012345",
       valid_api_keys={"test-key"},
-      allowed_models=set(),
+      tenant_id="test-product",
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
     )
   )
@@ -167,3 +179,78 @@ def test_build_audit_entry_uses_injected_tool_redactor() -> None:
 
   assert calls == [("dangerous_tool", {"secret": "raw"})]
   assert entry.tool_args_redacted == {"safe": True}
+
+
+def test_approval_audit_emitter_sanitizes_written_entry_after_raw_redactor_input() -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-APPROVAL-AUDIT-8f21d7"
+  raw_seen: list[dict[str, Any]] = []
+  written: list[Any] = []
+
+  def passthrough_redactor(
+    _tool_name: str,
+    tool_input: dict[str, Any],
+    **_kwargs: Any,
+  ) -> dict[str, Any]:
+    raw_seen.append(dict(tool_input))
+    return dict(tool_input)
+
+  class Writer:
+    async def write(self, entry: Any) -> None:
+      written.append(entry)
+
+  request = ApprovalRequest(
+    approval_id="approval-secret",
+    request_id="request-secret",
+    tool_call_id="tool-secret",
+    parent_approval_id=None,
+    approval_chain_id="approval-secret",
+    user_id="user-1",
+    profile="analyst",
+    channel="cli",
+    session_id="session-1",
+    run_id=None,
+    tool_name="dangerous_tool",
+    tool_class="state_write",
+    tool_args_redacted={},
+    args_hash="",
+    reason="test",
+    blast_radius_summary="test",
+    state="created",
+    requested_at=utc_now(),
+    policy_id="test-policy",
+    policy_version="1",
+    policy_bundle_hash="bundle",
+  )
+  boundary = SecretBoundary((secret,))
+  raw_args = {
+    "credential": secret,
+    "api_key_set": True,
+    "path": "/Users/alice/Documents/report.xlsx",
+  }
+  emitter = ApprovalAuditEmitter(
+    writer=Writer(),
+    deployment_secret=b"test-secret",
+    key_id="test-key",
+    tool_input_redactor=passthrough_redactor,
+  )
+
+  asyncio.run(
+    emitter.emit_execution_outcome(
+      request=request,
+      raw_tool_args=raw_args,
+      outcome="tool_error",
+      error_summary=f"failed {secret}",
+      boundary_sanitizer=lambda value, sink: boundary.sanitize(
+        value,
+        sink=sink,
+      ),
+    )
+  )
+
+  assert raw_seen == [raw_args]
+  assert len(written) == 1
+  assert written[0].tool_args_redacted == {
+    **raw_args,
+    "credential": "<redacted-secret>",
+  }
+  assert written[0].error_summary == "failed <redacted-secret>"

@@ -68,6 +68,23 @@ def test_startup_failure_helper_classifies_timeout_config_and_default() -> None:
   }
 
 
+def test_startup_failure_helper_classifies_missing_executable_before_retryable() -> None:
+  def always_retryable(_exc: BaseException) -> bool:
+    return True
+
+  assert mcp_client_errors.startup_failure_from_exception(
+    mcp_client_errors.McpExecutableMissingError(
+      "stdio executable does not exist: /deleted/venv/bin/gsheets-mcp"
+    ),
+    is_retryable_stdio_connect_error=always_retryable,
+  ) == {
+    "category": "executable_missing",
+    "retryable": False,
+    "message": "stdio executable does not exist: /deleted/venv/bin/gsheets-mcp",
+    "error_type": "McpExecutableMissingError",
+  }
+
+
 def test_parent_startup_failure_wrapper_uses_parent_retryable_checker(monkeypatch) -> None:
   checked: list[BaseException] = []
   exc = RuntimeError("closed transport")

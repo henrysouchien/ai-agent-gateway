@@ -67,6 +67,9 @@ def test_connect_stdio_wrapper_uses_parent_module_runtime(monkeypatch) -> None:
   monkeypatch.setattr(mcp_client_module, "ClientSession", _FakeClientSession)
   monkeypatch.setattr(mcp_client_module, "_build_mcp_env", lambda env: {"PATCHED": str(env["raw"])})
   monkeypatch.setattr(mcp_client_module, "_stdio_connect_stabilize_delay", lambda: 0)
+  monkeypatch.setattr(
+    mcp_client_module, "_preflight_stdio_executable", lambda _command, _args, _env: None
+  )
 
   manager = McpClientManager(config_path=None)
   state = asyncio.run(

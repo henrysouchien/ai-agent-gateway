@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -94,6 +95,71 @@ def _build_sample_log(tmp_path: Path) -> tuple[AgentSessionLog, list]:
   return log, entries
 
 
+def test_append_sync_is_fsynced_and_immediately_queryable(
+  tmp_path: Path,
+) -> None:
+  log = AgentSessionLog(tmp_path / "terminal-sync.jsonl")
+
+  appended = log.append_sync({
+    "type": "skill_result_captured",
+    "skill_run_id": "skill-run-sync",
+    "outcome": "success",
+  })
+  entries, _ = _run(log.query(order="asc"))
+
+  assert appended.seq == 1
+  assert [entry.seq for entry in entries] == [1]
+  assert entries[0].event["type"] == "skill_result_captured"
+  assert entries[0].event["skill_run_id"] == "skill-run-sync"
+  assert entries[0].event["outcome"] == "success"
+
+
+def test_cancelled_append_keeps_underlying_sync_future_tracked(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def _case() -> None:
+    log = AgentSessionLog(tmp_path / "cancelled-append.jsonl")
+    append_sync = log._append_sync
+    sync_started = threading.Event()
+    release_sync = threading.Event()
+
+    def _blocked_append(event: dict) -> object:
+      sync_started.set()
+      assert release_sync.wait(timeout=2.0)
+      return append_sync(event)
+
+    monkeypatch.setattr(log, "_append_sync", _blocked_append)
+    append_task = asyncio.create_task(
+      log.append({"type": "task_completed", "task_id": "bg_0"})
+    )
+    assert await asyncio.to_thread(sync_started.wait, 1.0)
+
+    append_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await append_task
+
+    pending = log.pending_append_futures
+    assert len(pending) == 1
+    assert not pending[0].done()
+
+    release_sync.set()
+    for _ in range(100):
+      if not log.pending_append_futures:
+        break
+      await asyncio.sleep(0)
+
+    assert log.pending_append_futures == ()
+    entries, _ = await log.query(
+      event_types={"task_completed"},
+      order="asc",
+    )
+    assert len(entries) == 1
+    assert entries[0].event["task_id"] == "bg_0"
+
+  _run(_case())
+
+
 def test_agent_session_log_creates_parent_dirs_and_file_from_session_ref(tmp_path: Path) -> None:
   base_dir = tmp_path / "api" / "sessions"
   session_ref = AgentSessionRef(
@@ -115,7 +181,6 @@ def test_agent_session_log_record_helpers_are_parent_aliases() -> None:
   assert session_log_module.QueryCursor is session_log_records.QueryCursor
   assert session_log_module._QuerySpec is session_log_records._QuerySpec
   assert session_log_module._Segment is session_log_records._Segment
-  assert session_log_module._SLUG_RE is session_log_records._SLUG_RE
   assert session_log_module._SEGMENT_FILE_RE is session_log_records._SEGMENT_FILE_RE
   assert session_log_module._REVERSE_SCAN_CHUNK_SIZE == session_log_records._REVERSE_SCAN_CHUNK_SIZE
   assert session_log_module._MANIFEST_SCHEMA_VERSION == session_log_records._MANIFEST_SCHEMA_VERSION

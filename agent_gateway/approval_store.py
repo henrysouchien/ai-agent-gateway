@@ -9,9 +9,11 @@ import logging
 import os
 import secrets
 import sqlite3
+import stat
+import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import Any, Iterator, Mapping, Protocol
 
 from . import approval_store_rows as _rows
 from . import prepared_business_model_store as _prepared_bm
@@ -37,9 +39,717 @@ from .approval_policy import (
 
 TERMINAL_STATES = frozenset({"auto_approved", "auto_denied", "approved", "denied", "expired"})
 APPROVAL_DB_PATH_ENV = "GATEWAY_APPROVAL_DB_PATH"
+_AUTONOMOUS_APPROVAL_DELIVERY_OUTBOX_COLUMNS = frozenset({
+  "delivery_sequence",
+  "approval_id",
+  "tool_call_id",
+  "nonce",
+  "task_id",
+  "control_run_id",
+  "session_id",
+  "channel_id",
+  "approved",
+  "allow_tool_type",
+  "decided_at_ns",
+  "retry_deadline_ns",
+  "next_attempt_ns",
+  "last_attempt_ns",
+  "state",
+  "audit_state",
+  "triggering_vote_id",
+  "vote_audit_entry_id",
+  "terminal_audit_entry_id",
+  "attempt_count",
+  "last_error",
+  "created_at",
+  "updated_at",
+  "audit_ready_at",
+  "published_at",
+  "acknowledged_at",
+  "quarantined_at",
+})
 USER_DATA_DIR_ENV = "USER_DATA_DIR"
-DEFAULT_APPROVAL_DB_PATH = Path("data/gateway/approvals.sqlite3")
 log = logging.getLogger("agent_gateway.approval_store")
+_AUTONOMOUS_APPROVAL_DELIVERY_CONTEXT_FIELDS = frozenset({
+  "task_id",
+  "control_run_id",
+  "session_id",
+  "channel_id",
+  "tool_call_id",
+  "nonce",
+})
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm")
+AUTONOMOUS_APPROVAL_DELIVERY_MAX_ATTEMPTS = 5
+AUTONOMOUS_APPROVAL_DELIVERY_RETRY_WINDOW_NS = (
+  5 * 60 * 1_000_000_000
+)
+AUTONOMOUS_APPROVAL_DELIVERY_RETRY_BASE_NS = 1_000_000_000
+AUTONOMOUS_APPROVAL_DELIVERY_RETRY_MAX_NS = 16_000_000_000
+_SQLITE_MAX_INTEGER = (1 << 63) - 1
+
+
+def _require_secure_sqlite_parent(path: Path) -> os.stat_result:
+  try:
+    parent_stat = os.lstat(path.parent)
+  except OSError as exc:
+    raise RuntimeError(
+      f"approval store parent is unavailable: {path.parent}"
+    ) from exc
+  if (
+    not stat.S_ISDIR(parent_stat.st_mode)
+    or parent_stat.st_uid != os.geteuid()
+    or stat.S_IMODE(parent_stat.st_mode) & 0o022
+  ):
+    raise RuntimeError(
+      f"approval store parent has unsafe file identity: {path.parent}"
+    )
+  return parent_stat
+
+
+def _open_secure_sqlite_parent(
+  path: Path,
+) -> tuple[int, os.stat_result]:
+  parent_stat = _require_secure_sqlite_parent(path)
+  parent_flags = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+  )
+  try:
+    parent_fd = os.open(path.parent, parent_flags)
+  except OSError as exc:
+    raise RuntimeError(
+      f"approval store parent is unavailable: {path.parent}"
+    ) from exc
+  try:
+    bound_parent_stat = os.fstat(parent_fd)
+    visible_parent_stat = os.lstat(path.parent)
+    if (
+      not stat.S_ISDIR(bound_parent_stat.st_mode)
+      or bound_parent_stat.st_dev != parent_stat.st_dev
+      or bound_parent_stat.st_ino != parent_stat.st_ino
+      or bound_parent_stat.st_uid != os.geteuid()
+      or stat.S_IMODE(bound_parent_stat.st_mode) & 0o022
+      or visible_parent_stat.st_dev != bound_parent_stat.st_dev
+      or visible_parent_stat.st_ino != bound_parent_stat.st_ino
+      or visible_parent_stat.st_uid != os.geteuid()
+      or stat.S_IMODE(visible_parent_stat.st_mode) & 0o022
+    ):
+      raise RuntimeError(
+        f"approval store parent identity changed: {path.parent}"
+      )
+    return parent_fd, bound_parent_stat
+  except BaseException:
+    os.close(parent_fd)
+    raise
+
+
+def _require_matching_sqlite_identity(
+  path: Path,
+  *,
+  parent_fd: int,
+  bound_parent_stat: os.stat_result,
+  file_stat: os.stat_result,
+) -> None:
+  relative_stat = os.stat(
+    path.name,
+    dir_fd=parent_fd,
+    follow_symlinks=False,
+  )
+  visible_stat = os.lstat(path)
+  visible_parent_stat = os.lstat(path.parent)
+  if (
+    visible_parent_stat.st_dev != bound_parent_stat.st_dev
+    or visible_parent_stat.st_ino != bound_parent_stat.st_ino
+    or visible_parent_stat.st_uid != os.geteuid()
+    or stat.S_IMODE(visible_parent_stat.st_mode) & 0o022
+    or any(
+      (
+        candidate.st_dev != file_stat.st_dev
+        or candidate.st_ino != file_stat.st_ino
+        or not stat.S_ISREG(candidate.st_mode)
+        or stat.S_IMODE(candidate.st_mode) != 0o600
+        or candidate.st_nlink != 1
+        or candidate.st_uid != os.geteuid()
+      )
+      for candidate in (file_stat, relative_stat, visible_stat)
+    )
+  ):
+    raise RuntimeError(
+      f"approval store file identity changed: {path}"
+    )
+
+
+def _secure_create_sqlite_file(path: Path) -> os.stat_result:
+  parent_fd, bound_parent_stat = _open_secure_sqlite_parent(path)
+  fd = -1
+  created = False
+  try:
+    flags = (
+      os.O_RDWR
+      | os.O_CREAT
+      | os.O_EXCL
+      | getattr(os, "O_CLOEXEC", 0)
+      | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd = os.open(
+      path.name,
+      flags,
+      0o600,
+      dir_fd=parent_fd,
+    )
+    created = True
+    os.fchmod(fd, 0o600)
+    os.fsync(fd)
+    file_stat = os.fstat(fd)
+    _require_matching_sqlite_identity(
+      path,
+      parent_fd=parent_fd,
+      bound_parent_stat=bound_parent_stat,
+      file_stat=file_stat,
+    )
+    os.fsync(parent_fd)
+    _require_matching_sqlite_identity(
+      path,
+      parent_fd=parent_fd,
+      bound_parent_stat=bound_parent_stat,
+      file_stat=os.fstat(fd),
+    )
+    return file_stat
+  except BaseException as exc:
+    if created:
+      rollback_errors: list[BaseException] = []
+      try:
+        opened_stat = os.fstat(fd)
+        relative_stat = os.stat(
+          path.name,
+          dir_fd=parent_fd,
+          follow_symlinks=False,
+        )
+        if (
+          relative_stat.st_dev != opened_stat.st_dev
+          or relative_stat.st_ino != opened_stat.st_ino
+        ):
+          raise RuntimeError(
+            "approval store create rollback identity changed"
+          )
+        os.unlink(path.name, dir_fd=parent_fd)
+      except BaseException as rollback_exc:
+        rollback_errors.append(rollback_exc)
+      try:
+        os.fsync(parent_fd)
+      except BaseException as rollback_exc:
+        rollback_errors.append(rollback_exc)
+      if rollback_errors:
+        exc.add_note(
+          "approval store create rollback failed: "
+          + "; ".join(
+            f"{type(error).__name__}: {error}"
+            for error in rollback_errors
+          )
+        )
+    raise
+  finally:
+    if fd >= 0:
+      os.close(fd)
+    os.close(parent_fd)
+
+
+def _require_secure_sqlite_file(
+  path: Path,
+  *,
+  expected_device: int | None = None,
+  expected_inode: int | None = None,
+  repair_permissions: bool = False,
+) -> os.stat_result:
+  parent_fd, bound_parent_stat = _open_secure_sqlite_parent(path)
+  flags = (
+    os.O_RDWR
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+  )
+  try:
+    fd = os.open(path.name, flags, dir_fd=parent_fd)
+  except OSError as exc:
+    os.close(parent_fd)
+    raise RuntimeError(
+      f"approval store file is unavailable: {path}"
+    ) from exc
+  try:
+    file_stat = os.fstat(fd)
+    if (
+      not stat.S_ISREG(file_stat.st_mode)
+      or file_stat.st_nlink != 1
+      or file_stat.st_uid != os.geteuid()
+      or (
+        expected_device is not None
+        and file_stat.st_dev != expected_device
+      )
+      or (
+        expected_inode is not None
+        and file_stat.st_ino != expected_inode
+      )
+    ):
+      raise RuntimeError(
+        f"approval store file has unsafe identity: {path}"
+      )
+    if stat.S_IMODE(file_stat.st_mode) != 0o600:
+      if not repair_permissions:
+        raise RuntimeError(
+          f"approval store file has unsafe permissions: {path}"
+        )
+      os.fchmod(fd, 0o600)
+      os.fsync(fd)
+      file_stat = os.fstat(fd)
+    _require_matching_sqlite_identity(
+      path,
+      parent_fd=parent_fd,
+      bound_parent_stat=bound_parent_stat,
+      file_stat=file_stat,
+    )
+    os.fsync(parent_fd)
+    file_stat = os.fstat(fd)
+    _require_matching_sqlite_identity(
+      path,
+      parent_fd=parent_fd,
+      bound_parent_stat=bound_parent_stat,
+      file_stat=file_stat,
+    )
+    return file_stat
+  finally:
+    os.close(fd)
+    os.close(parent_fd)
+
+
+def _prepare_secure_sqlite_sidecar(path: Path) -> None:
+  try:
+    _secure_create_sqlite_file(path)
+  except FileExistsError:
+    _require_secure_sqlite_file(path)
+
+
+def _canonical_delivery_text(
+  value: Any,
+  *,
+  field_name: str,
+  max_length: int = 512,
+) -> str:
+  if (
+    type(value) is not str
+    or not value
+    or value != value.strip()
+    or len(value) > max_length
+    or "\x00" in value
+  ):
+    raise ValueError(
+      f"autonomous approval delivery {field_name} is invalid"
+    )
+  return value
+
+
+def _normalize_autonomous_approval_delivery_context(
+  value: Mapping[str, Any],
+) -> dict[str, str]:
+  if not isinstance(value, Mapping) or set(value) != (
+    _AUTONOMOUS_APPROVAL_DELIVERY_CONTEXT_FIELDS
+  ):
+    raise ValueError(
+      "autonomous approval delivery context fields are invalid"
+    )
+  normalized = {
+    field_name: _canonical_delivery_text(
+      value[field_name],
+      field_name=field_name,
+    )
+    for field_name in _AUTONOMOUS_APPROVAL_DELIVERY_CONTEXT_FIELDS
+  }
+  channel_id = normalized["channel_id"]
+  if (
+    len(channel_id) != 64
+    or any(character not in "0123456789abcdef" for character in channel_id)
+  ):
+    raise ValueError(
+      "autonomous approval delivery channel_id is invalid"
+    )
+  return normalized
+
+
+def _datetime_to_epoch_ns(value: datetime) -> int:
+  normalized = value.astimezone(UTC)
+  epoch = datetime(1970, 1, 1, tzinfo=UTC)
+  delta = normalized - epoch
+  return (
+    ((delta.days * 86_400) + delta.seconds) * 1_000_000_000
+    + delta.microseconds * 1_000
+  )
+
+
+def _trusted_utc_now(
+  conn: sqlite3.Connection,
+) -> tuple[int, datetime]:
+  """Advance the durable server-clock high-water or refuse rollback."""
+  now_ns = time.time_ns()
+  prior_row = conn.execute(
+    """
+    SELECT observed_at_ns FROM approval_clock_high_water
+    WHERE clock_id = 1
+    """
+  ).fetchone()
+  if (
+    prior_row is not None
+    and now_ns < int(prior_row["observed_at_ns"])
+  ):
+    raise RuntimeError(
+      "approval clock rollback detected"
+    )
+  conn.execute(
+    """
+    INSERT INTO approval_clock_high_water (clock_id, observed_at_ns)
+    VALUES (1, ?)
+    ON CONFLICT(clock_id) DO UPDATE SET
+      observed_at_ns = excluded.observed_at_ns
+    """,
+    (now_ns,),
+  )
+  seconds, nanoseconds = divmod(now_ns, 1_000_000_000)
+  now = datetime.fromtimestamp(seconds, tz=UTC).replace(
+    microsecond=nanoseconds // 1_000
+  )
+  return now_ns, now
+
+
+def _autonomous_approval_delivery_projection(
+  row: sqlite3.Row,
+) -> dict[str, Any]:
+  approved = int(row["approved"])
+  allow_tool_type = int(row["allow_tool_type"])
+  delivery_sequence = int(row["delivery_sequence"])
+  if (
+    approved not in {0, 1}
+    or allow_tool_type != 0
+    or delivery_sequence < 1
+  ):
+    raise RuntimeError(
+      "autonomous approval delivery outbox contains invalid values"
+    )
+  return {
+    "delivery_sequence": delivery_sequence,
+    "approval_id": str(row["approval_id"]),
+    "tool_call_id": str(row["tool_call_id"]),
+    "nonce": str(row["nonce"]),
+    "task_id": str(row["task_id"]),
+    "control_run_id": str(row["control_run_id"]),
+    "session_id": str(row["session_id"]),
+    "channel_id": str(row["channel_id"]),
+    "approved": bool(approved),
+    "allow_tool_type": False,
+    "decided_at_ns": int(row["decided_at_ns"]),
+    "retry_deadline_ns": int(row["retry_deadline_ns"]),
+    "next_attempt_ns": int(row["next_attempt_ns"]),
+    "last_attempt_ns": (
+      int(row["last_attempt_ns"])
+      if row["last_attempt_ns"] is not None
+      else None
+    ),
+    "state": str(row["state"]),
+    "audit_state": str(row["audit_state"]),
+    "triggering_vote_id": (
+      str(row["triggering_vote_id"])
+      if row["triggering_vote_id"] is not None
+      else None
+    ),
+    "vote_audit_entry_id": (
+      str(row["vote_audit_entry_id"])
+      if row["vote_audit_entry_id"] is not None
+      else None
+    ),
+    "terminal_audit_entry_id": str(
+      row["terminal_audit_entry_id"]
+    ),
+    "attempt_count": int(row["attempt_count"]),
+    "last_error": (
+      str(row["last_error"])
+      if row["last_error"] is not None
+      else None
+    ),
+    "created_at": str(row["created_at"]),
+    "updated_at": str(row["updated_at"]),
+    "audit_ready_at": (
+      str(row["audit_ready_at"])
+      if row["audit_ready_at"] is not None
+      else None
+    ),
+    "published_at": (
+      str(row["published_at"])
+      if row["published_at"] is not None
+      else None
+    ),
+    "acknowledged_at": (
+      str(row["acknowledged_at"])
+      if row["acknowledged_at"] is not None
+      else None
+    ),
+    "quarantined_at": (
+      str(row["quarantined_at"])
+      if row["quarantined_at"] is not None
+      else None
+    ),
+  }
+
+
+def _autonomous_approval_audit_entry_id(
+  *,
+  event_type: str,
+  approval_id: str,
+  tool_call_id: str,
+  nonce: str,
+  source_id: str,
+  event_at_ns: int,
+) -> str:
+  identity = "\0".join((
+    "autonomous-approval-delivery-audit-v1",
+    event_type,
+    approval_id,
+    tool_call_id,
+    nonce,
+    source_id,
+    str(event_at_ns),
+  )).encode("utf-8")
+  return (
+    "autonomous-approval-delivery-v1:"
+    f"{hashlib.sha256(identity).hexdigest()}"
+  )
+
+
+def _approval_vote_from_row(row: sqlite3.Row) -> ApprovalVote:
+  decision = str(row["decision"])
+  decided_at = _dt_from_text(str(row["decided_at"]))
+  if decision not in {"approved", "denied"} or decided_at is None:
+    raise RuntimeError(
+      "autonomous approval delivery vote row is invalid"
+    )
+  return ApprovalVote(
+    vote_id=str(row["vote_id"]),
+    approval_id=str(row["approval_id"]),
+    decider_id=str(row["decider_id"]),
+    decider_role=(
+      str(row["decider_role"])
+      if row["decider_role"] is not None
+      else None
+    ),
+    decision=decision,
+    decision_reason=(
+      str(row["decision_reason"])
+      if row["decision_reason"] is not None
+      else None
+    ),
+    decided_at=decided_at,
+    external_callback_id=(
+      str(row["external_callback_id"])
+      if row["external_callback_id"] is not None
+      else None
+    ),
+  )
+
+
+def _insert_autonomous_approval_delivery_in_transaction(
+  conn: sqlite3.Connection,
+  *,
+  request: ApprovalRequest,
+  delivery: Mapping[str, str],
+  approved: bool,
+  vote: ApprovalVote | None,
+) -> dict[str, Any]:
+  expected_state = "approved" if approved else "denied"
+  if request.state != expected_state:
+    raise ValueError(
+      "autonomous approval delivery disagrees with durable state"
+    )
+  if request.tool_call_id != delivery["tool_call_id"]:
+    raise ValueError(
+      "autonomous approval delivery tool-call identity changed"
+    )
+  if (
+    request.request_id != delivery["control_run_id"]
+    or request.run_id != delivery["control_run_id"]
+    or request.session_id != delivery["session_id"]
+  ):
+    raise ValueError(
+      "autonomous approval delivery run identity changed"
+    )
+  if request.decided_at is None:
+    raise RuntimeError(
+      "terminal autonomous approval is missing decided_at"
+    )
+  if vote is not None and (
+    vote.approval_id != request.approval_id
+    or vote.decision != expected_state
+    or _datetime_to_epoch_ns(vote.decided_at)
+    != _datetime_to_epoch_ns(request.decided_at)
+  ):
+    raise ValueError(
+      "autonomous approval delivery vote identity changed"
+    )
+  decided_at_ns = _datetime_to_epoch_ns(request.decided_at)
+  vote_audit_entry_id = (
+    _autonomous_approval_audit_entry_id(
+      event_type="vote_recorded",
+      approval_id=request.approval_id,
+      tool_call_id=request.tool_call_id,
+      nonce=delivery["nonce"],
+      source_id=vote.vote_id,
+      event_at_ns=_datetime_to_epoch_ns(vote.decided_at),
+    )
+    if vote is not None
+    else None
+  )
+  terminal_audit_entry_id = _autonomous_approval_audit_entry_id(
+    event_type=expected_state,
+    approval_id=request.approval_id,
+    tool_call_id=request.tool_call_id,
+    nonce=delivery["nonce"],
+    source_id=vote.vote_id if vote is not None else "cancellation",
+    event_at_ns=decided_at_ns,
+  )
+  delivery_now_ns, delivery_now_dt = _trusted_utc_now(conn)
+  if (
+    delivery_now_ns
+    > _SQLITE_MAX_INTEGER
+    - AUTONOMOUS_APPROVAL_DELIVERY_RETRY_WINDOW_NS
+  ):
+    raise RuntimeError(
+      "autonomous approval delivery retry deadline overflow"
+    )
+  retry_deadline_ns = (
+    delivery_now_ns
+    + AUTONOMOUS_APPROVAL_DELIVERY_RETRY_WINDOW_NS
+  )
+  delivery_now = _dt_to_text(delivery_now_dt)
+  sequence_row = conn.execute(
+    """
+    SELECT next_value
+    FROM autonomous_approval_delivery_sequence
+    WHERE sequence_id = 1
+    """
+  ).fetchone()
+  if sequence_row is None:
+    delivery_sequence = 1
+    conn.execute(
+      """
+      INSERT INTO autonomous_approval_delivery_sequence (
+        sequence_id, next_value
+      ) VALUES (1, 2)
+      """
+    )
+  else:
+    delivery_sequence = int(sequence_row["next_value"])
+    if not 1 <= delivery_sequence < _SQLITE_MAX_INTEGER:
+      raise RuntimeError(
+        "autonomous approval delivery sequence is invalid"
+      )
+    cursor = conn.execute(
+      """
+      UPDATE autonomous_approval_delivery_sequence
+      SET next_value = ?
+      WHERE sequence_id = 1 AND next_value = ?
+      """,
+      (delivery_sequence + 1, delivery_sequence),
+    )
+    if cursor.rowcount != 1:
+      raise RuntimeError(
+        "autonomous approval delivery sequence changed"
+      )
+  conn.execute(
+    """
+    INSERT INTO autonomous_approval_delivery_outbox (
+      delivery_sequence, approval_id, tool_call_id, nonce,
+      task_id, control_run_id,
+      session_id, channel_id, approved, allow_tool_type,
+      decided_at_ns, retry_deadline_ns, next_attempt_ns,
+      last_attempt_ns, state, audit_state,
+      triggering_vote_id,
+      vote_audit_entry_id, terminal_audit_entry_id,
+      attempt_count, last_error, created_at, updated_at,
+      audit_ready_at, published_at, acknowledged_at, quarantined_at
+    ) VALUES (
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    )
+    """,
+    (
+      delivery_sequence,
+      request.approval_id,
+      request.tool_call_id,
+      delivery["nonce"],
+      delivery["task_id"],
+      delivery["control_run_id"],
+      delivery["session_id"],
+      delivery["channel_id"],
+      1 if approved else 0,
+      0,
+      decided_at_ns,
+      retry_deadline_ns,
+      delivery_now_ns,
+      None,
+      "pending",
+      "pending",
+      vote.vote_id if vote is not None else None,
+      vote_audit_entry_id,
+      terminal_audit_entry_id,
+      0,
+      None,
+      delivery_now,
+      delivery_now,
+      None,
+      None,
+      None,
+      None,
+    ),
+  )
+  delivery_row = conn.execute(
+    """
+    SELECT * FROM autonomous_approval_delivery_outbox
+    WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+    """,
+    (
+      request.approval_id,
+      request.tool_call_id,
+      delivery["nonce"],
+    ),
+  ).fetchone()
+  if delivery_row is None:
+    raise RuntimeError(
+      "autonomous approval delivery outbox insert failed"
+    )
+  stored_delivery = _autonomous_approval_delivery_projection(
+    delivery_row
+  )
+  expected_delivery = {
+    "approval_id": request.approval_id,
+    "tool_call_id": request.tool_call_id,
+    "nonce": delivery["nonce"],
+    "task_id": delivery["task_id"],
+    "control_run_id": delivery["control_run_id"],
+    "session_id": delivery["session_id"],
+    "channel_id": delivery["channel_id"],
+    "approved": approved,
+    "allow_tool_type": False,
+    "decided_at_ns": decided_at_ns,
+    "triggering_vote_id": (
+      vote.vote_id if vote is not None else None
+    ),
+    "vote_audit_entry_id": vote_audit_entry_id,
+    "terminal_audit_entry_id": terminal_audit_entry_id,
+  }
+  if any(
+    stored_delivery[field_name] != expected_value
+    for field_name, expected_value in expected_delivery.items()
+  ):
+    raise ValueError(
+      "autonomous approval delivery id was reused with different content"
+    )
+  return stored_delivery
 
 
 class PersistentGrantCancellationFenced(RuntimeError):
@@ -107,20 +817,34 @@ def resolve_approval_db_path(
   *,
   env_get: Any = os.getenv,
 ) -> Path:
+  user_data_dir = str(
+    env_get(USER_DATA_DIR_ENV, "") or ""
+  ).strip()
+  if not user_data_dir:
+    raise RuntimeError(
+      "approval database requires USER_DATA_DIR"
+    )
+  user_data_path = Path(user_data_dir).expanduser()
+  if not user_data_path.is_absolute():
+    raise ValueError(
+      f"{USER_DATA_DIR_ENV} must be an absolute path"
+    )
+  canonical_path = (
+    user_data_path / "gateway" / "approvals.sqlite3"
+  ).resolve(strict=False)
+
   configured = str(env_get(APPROVAL_DB_PATH_ENV, "") or "").strip()
   if configured:
     path = Path(configured).expanduser()
     if not path.is_absolute():
       raise ValueError(f"{APPROVAL_DB_PATH_ENV} must be an absolute path")
-    return path.resolve(strict=False)
-
-  user_data_dir = str(env_get(USER_DATA_DIR_ENV, "") or "").strip()
-  if not user_data_dir:
-    return DEFAULT_APPROVAL_DB_PATH
-  path = Path(user_data_dir).expanduser()
-  if not path.is_absolute():
-    raise ValueError(f"{USER_DATA_DIR_ENV} must be an absolute path")
-  return (path / "gateway" / "approvals.sqlite3").resolve(strict=False)
+    configured_path = path.resolve(strict=False)
+    if configured_path != canonical_path:
+      raise ValueError(
+        f"{APPROVAL_DB_PATH_ENV} must equal "
+        f"{USER_DATA_DIR_ENV}/gateway/approvals.sqlite3"
+      )
+  return canonical_path
 
 
 _dt_to_text = _rows.dt_to_text
@@ -173,6 +897,7 @@ class ApprovalRequestStore(Protocol):
     decider_id: str | None = None,
     decider_role: str | None = None,
     decision_reason: str,
+    autonomous_delivery: Mapping[str, Any] | None = None,
   ) -> tuple[ApprovalRequest, bool, bool]: ...
   async def abort_unpublished_approval(
     self,
@@ -249,14 +974,46 @@ class SQLiteApprovalStore:
 
   def __init__(
     self,
-    path: str | os.PathLike[str] = DEFAULT_APPROVAL_DB_PATH,
+    path: str | os.PathLike[str],
     *,
     audit_emitter: Any | None = None,
     notification_destination_resolver: ApprovalNotificationDestinationResolver | None = None,
     notification_sender: ApprovalNotificationSender | None = None,
+    expected_device: int | None = None,
+    expected_inode: int | None = None,
   ) -> None:
-    self.path = Path(path)
-    self.path.parent.mkdir(parents=True, exist_ok=True)
+    if (expected_device is None) != (expected_inode is None):
+      raise ValueError(
+        "approval store expected device and inode must be provided together"
+      )
+    if expected_device is not None and (
+      type(expected_device) is not int
+      or expected_device < 0
+      or type(expected_inode) is not int
+      or expected_inode < 1
+    ):
+      raise ValueError("approval store expected identity is invalid")
+    self.path = Path(os.path.abspath(os.fspath(path)))
+    _require_secure_sqlite_parent(self.path)
+    try:
+      initial_stat = _secure_create_sqlite_file(self.path)
+    except FileExistsError:
+      initial_stat = _require_secure_sqlite_file(
+        self.path,
+        expected_device=expected_device,
+        expected_inode=expected_inode,
+        repair_permissions=expected_device is None,
+      )
+    if (
+      expected_device is not None
+      and (
+        initial_stat.st_dev != expected_device
+        or initial_stat.st_ino != expected_inode
+      )
+    ):
+      raise RuntimeError("approval store file identity changed")
+    self._device = initial_stat.st_dev
+    self._inode = initial_stat.st_ino
     self._audit_emitter = audit_emitter
     self._notification_destination_resolver = notification_destination_resolver
     self._notification_sender = notification_sender
@@ -268,12 +1025,53 @@ class SQLiteApprovalStore:
   def audit_emitter(self) -> Any | None:
     return self._audit_emitter
 
+  def _require_bound_file(self) -> os.stat_result:
+    _require_secure_sqlite_parent(self.path)
+    return _require_secure_sqlite_file(
+      self.path,
+      expected_device=self._device,
+      expected_inode=self._inode,
+    )
+
+  def _prepare_sidecars(self) -> None:
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+      _prepare_secure_sqlite_sidecar(
+        Path(f"{self.path}{suffix}")
+      )
+
+  def _require_sidecars(self) -> None:
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+      _require_secure_sqlite_file(
+        Path(f"{self.path}{suffix}")
+      )
+
   def _connect(self) -> sqlite3.Connection:
-    conn = sqlite3.connect(self.path, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    self._require_bound_file()
+    self._prepare_sidecars()
+    database_uri = f"{self.path.as_uri()}?mode=rw"
+    conn = sqlite3.connect(
+      database_uri,
+      isolation_level=None,
+      uri=True,
+    )
+    try:
+      self._require_bound_file()
+      conn.row_factory = sqlite3.Row
+      conn.execute("PRAGMA foreign_keys=ON")
+      journal_mode = str(
+        conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+      ).lower()
+      if journal_mode != "wal":
+        raise RuntimeError(
+          "approval store failed to enter canonical WAL mode"
+        )
+      conn.execute("PRAGMA synchronous=FULL")
+      self._require_bound_file()
+      self._require_sidecars()
+      return conn
+    except BaseException:
+      conn.close()
+      raise
 
   @contextmanager
   def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -286,6 +1084,24 @@ class SQLiteApprovalStore:
 
   def _init_schema(self) -> None:
     with self._connection() as conn:
+      existing_outbox_columns = {
+        str(row["name"])
+        for row in conn.execute(
+          "PRAGMA table_info(autonomous_approval_delivery_outbox)"
+        ).fetchall()
+      }
+      if (
+        existing_outbox_columns
+        and existing_outbox_columns
+        != _AUTONOMOUS_APPROVAL_DELIVERY_OUTBOX_COLUMNS
+      ):
+        if conn.execute(
+          "SELECT 1 FROM autonomous_approval_delivery_outbox LIMIT 1"
+        ).fetchone() is not None:
+          raise RuntimeError(
+            "noncanonical autonomous approval delivery outbox contains rows"
+          )
+        conn.execute("DROP TABLE autonomous_approval_delivery_outbox")
       conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS approval_requests (
@@ -436,8 +1252,145 @@ class SQLiteApprovalStore:
         );
         CREATE INDEX IF NOT EXISTS idx_approval_notification_outbox_state
           ON approval_notification_outbox(state, updated_at);
+
+        CREATE TABLE IF NOT EXISTS approval_clock_high_water (
+          clock_id INTEGER PRIMARY KEY CHECK (clock_id = 1),
+          observed_at_ns INTEGER NOT NULL CHECK (observed_at_ns > 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS autonomous_approval_delivery_sequence (
+          sequence_id INTEGER PRIMARY KEY CHECK (sequence_id = 1),
+          next_value INTEGER NOT NULL CHECK (next_value > 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS autonomous_approval_delivery_outbox (
+          delivery_sequence INTEGER NOT NULL UNIQUE
+            CHECK (delivery_sequence > 0),
+          approval_id TEXT NOT NULL
+            REFERENCES approval_requests(approval_id) ON DELETE CASCADE,
+          tool_call_id TEXT NOT NULL,
+          nonce TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          control_run_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          channel_id TEXT NOT NULL,
+          approved INTEGER NOT NULL CHECK (approved IN (0, 1)),
+          allow_tool_type INTEGER NOT NULL DEFAULT 0
+            CHECK (allow_tool_type = 0),
+          decided_at_ns INTEGER NOT NULL CHECK (decided_at_ns > 0),
+          retry_deadline_ns INTEGER NOT NULL
+            CHECK (retry_deadline_ns > 0),
+          next_attempt_ns INTEGER NOT NULL
+            CHECK (next_attempt_ns > 0),
+          last_attempt_ns INTEGER
+            CHECK (last_attempt_ns IS NULL OR last_attempt_ns > 0),
+          state TEXT NOT NULL DEFAULT 'pending'
+            CHECK (state IN (
+              'pending', 'published', 'acknowledged', 'quarantined'
+            )),
+          audit_state TEXT NOT NULL DEFAULT 'pending'
+            CHECK (audit_state IN ('pending', 'ready')),
+          triggering_vote_id TEXT
+            REFERENCES approval_votes(vote_id),
+          vote_audit_entry_id TEXT,
+          terminal_audit_entry_id TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL DEFAULT 0
+            CHECK (attempt_count >= 0),
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          audit_ready_at TEXT,
+          published_at TEXT,
+          acknowledged_at TEXT,
+          quarantined_at TEXT,
+          PRIMARY KEY (approval_id, tool_call_id, nonce),
+          UNIQUE (approval_id),
+          CHECK (
+            (triggering_vote_id IS NULL
+              AND vote_audit_entry_id IS NULL)
+            OR
+            (triggering_vote_id IS NOT NULL
+              AND vote_audit_entry_id IS NOT NULL)
+          ),
+          CHECK (
+            (audit_state = 'pending' AND audit_ready_at IS NULL)
+            OR
+            (audit_state = 'ready' AND audit_ready_at IS NOT NULL)
+          ),
+          CHECK (
+            state NOT IN ('published', 'acknowledged')
+            OR audit_state = 'ready'
+          ),
+          CHECK (
+            (state = 'pending'
+              AND published_at IS NULL
+              AND acknowledged_at IS NULL
+              AND quarantined_at IS NULL)
+            OR
+            (state = 'published'
+              AND published_at IS NOT NULL
+              AND acknowledged_at IS NULL
+              AND quarantined_at IS NULL)
+            OR
+            (state = 'acknowledged'
+              AND published_at IS NOT NULL
+              AND acknowledged_at IS NOT NULL
+              AND quarantined_at IS NULL)
+            OR
+            (state = 'quarantined'
+              AND published_at IS NULL
+              AND acknowledged_at IS NULL
+              AND quarantined_at IS NOT NULL)
+          )
+        );
+        CREATE INDEX IF NOT EXISTS idx_autonomous_approval_delivery_state
+          ON autonomous_approval_delivery_outbox(
+            state, audit_state, updated_at
+          );
         """
       )
+      outbox_columns = {
+        str(row["name"])
+        for row in conn.execute(
+          "PRAGMA table_info(autonomous_approval_delivery_outbox)"
+        ).fetchall()
+      }
+      if (
+        outbox_columns
+        != _AUTONOMOUS_APPROVAL_DELIVERY_OUTBOX_COLUMNS
+      ):
+        raise RuntimeError(
+          "autonomous approval delivery outbox schema is not canonical"
+        )
+      sequence_row = conn.execute(
+        """
+        SELECT next_value
+        FROM autonomous_approval_delivery_sequence
+        WHERE sequence_id = 1
+        """
+      ).fetchone()
+      high_water_row = conn.execute(
+        """
+        SELECT COALESCE(MAX(delivery_sequence), 0) AS high_water
+        FROM autonomous_approval_delivery_outbox
+        """
+      ).fetchone()
+      if high_water_row is None:
+        raise RuntimeError(
+          "autonomous approval delivery sequence query failed"
+        )
+      high_water = int(high_water_row["high_water"])
+      if (
+        (high_water > 0 and sequence_row is None)
+        or (
+          sequence_row is not None
+          and int(sequence_row["next_value"]) <= high_water
+        )
+      ):
+        raise RuntimeError(
+          "autonomous approval delivery sequence is inconsistent"
+        )
+      _trusted_utc_now(conn)
       columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(approval_requests)").fetchall()}
       if "skill" not in columns:
         conn.execute("ALTER TABLE approval_requests ADD COLUMN skill TEXT")
@@ -887,6 +1840,7 @@ class SQLiteApprovalStore:
     decider_id: str | None = None,
     decider_role: str | None = None,
     decision_reason: str,
+    autonomous_delivery: Mapping[str, Any] | None = None,
   ) -> tuple[ApprovalRequest, bool, bool]:
     """Atomically deny a still-pending approval without quorum semantics.
 
@@ -896,6 +1850,13 @@ class SQLiteApprovalStore:
     after the owning run has begun teardown.
     """
 
+    normalized_delivery = (
+      _normalize_autonomous_approval_delivery_context(
+        autonomous_delivery
+      )
+      if autonomous_delivery is not None
+      else None
+    )
     transitioned = False
     async with self._lock:
       with self._connection() as conn:
@@ -972,10 +1933,29 @@ class SQLiteApprovalStore:
         if cursor.rowcount != 1:
           conn.rollback()
           raise RuntimeError("approval cancellation compare-and-set failed")
+        if normalized_delivery is not None:
+          _insert_autonomous_approval_delivery_in_transaction(
+            conn,
+            request=updated,
+            delivery=normalized_delivery,
+            approved=False,
+            vote=None,
+          )
         conn.commit()
         transitioned = True
     if transitioned:
-      await self._emit("denied", updated)
+      if normalized_delivery is None:
+        await self._emit("denied", updated)
+      elif callable(getattr(
+        self._audit_emitter,
+        "emit_audit_for_lifecycle_event",
+        None,
+      )):
+        await self.ensure_autonomous_approval_delivery_audited(
+          updated.approval_id,
+          tool_call_id=normalized_delivery["tool_call_id"],
+          nonce=normalized_delivery["nonce"],
+        )
     return updated, transitioned, True
 
   async def abort_unpublished_approval(
@@ -1075,10 +2055,87 @@ class SQLiteApprovalStore:
     return updated, transitioned, True
 
   async def record_vote(self, approval_id: str, vote: ApprovalVote) -> ApprovalRequest:
+    return await self._record_vote(
+      approval_id,
+      vote,
+      autonomous_delivery=None,
+    )
+
+  async def record_vote_with_autonomous_delivery(
+    self,
+    approval_id: str,
+    vote: ApprovalVote,
+    *,
+    delivery: Mapping[str, Any],
+  ) -> ApprovalRequest:
+    return await self._record_vote(
+      approval_id,
+      vote,
+      autonomous_delivery=delivery,
+    )
+
+  async def _record_vote(
+    self,
+    approval_id: str,
+    vote: ApprovalVote,
+    *,
+    autonomous_delivery: Mapping[str, Any] | None,
+  ) -> ApprovalRequest:
     if vote.approval_id != approval_id:
       raise ValueError("approval vote identity does not match request")
+    normalized_delivery = (
+      _normalize_autonomous_approval_delivery_context(
+        autonomous_delivery
+      )
+      if autonomous_delivery is not None
+      else None
+    )
+    if normalized_delivery is not None:
+      existing_delivery = (
+        await self.get_autonomous_approval_delivery(
+          approval_id,
+          tool_call_id=normalized_delivery["tool_call_id"],
+          nonce=normalized_delivery["nonce"],
+        )
+      )
+      if existing_delivery is not None:
+        expected_decision = vote.decision == "approved"
+        expected_delivery = {
+          **normalized_delivery,
+          "approval_id": approval_id,
+          "approved": expected_decision,
+          "allow_tool_type": False,
+        }
+        if any(
+          existing_delivery[field_name] != expected_value
+          for field_name, expected_value
+          in expected_delivery.items()
+        ):
+          raise ValueError(
+            "autonomous approval delivery retry identity changed"
+          )
+        current = await self.get(approval_id)
+        expected_state = (
+          "approved" if expected_decision else "denied"
+        )
+        if (
+          current is None
+          or current.state != expected_state
+          or current.decision != expected_state
+          or current.decider_id != vote.decider_id
+        ):
+          raise ValueError(
+            "autonomous approval delivery retry decision changed"
+          )
+        await self.ensure_autonomous_approval_delivery_audited(
+          approval_id,
+          tool_call_id=normalized_delivery["tool_call_id"],
+          nonce=normalized_delivery["nonce"],
+        )
+        return current
     emitted_vote = False
     terminal_event: str | None = None
+    updated: ApprovalRequest
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -1089,107 +2146,1176 @@ class SQLiteApprovalStore:
         if current_row is None:
           raise KeyError(f"approval request not found: {approval_id}")
         current = self._row_to_request(current_row)
-        if vote.decision == "approved":
-          if current.approval_constraint == "legacy_unknown":
-            raise ValueError(
-              "approval constraint is unknown; replan and reauthorize"
-            )
-          if current.approval_constraint == "fresh_human_owner" and (
-            current.state not in {"created", "pending_user"}
-            or current.authorization_mode not in {
-              "HUMAN",
-              "OWNER_CONTROL_PLANE",
-            }
-            or vote.decider_id != current.required_owner_user_id
-            or vote.decider_role != "owner"
-          ):
-            raise ValueError(
-              "fresh owner approval constraint requires its exact owner vote"
-            )
+        if (
+          normalized_delivery is not None
+          and current.tool_call_id != normalized_delivery["tool_call_id"]
+        ):
+          raise ValueError(
+            "autonomous approval delivery tool-call identity changed"
+          )
         if current.state in TERMINAL_STATES:
           conn.commit()
           return current
 
-        existing = conn.execute(
-          "SELECT * FROM approval_votes WHERE approval_id = ? AND decider_id = ?",
-          (approval_id, vote.decider_id),
-        ).fetchone()
-        if existing is None:
+        trusted_now_ns, trusted_now = _trusted_utc_now(conn)
+        if (
+          current.expires_at is not None
+          and trusted_now_ns >= _datetime_to_epoch_ns(current.expires_at)
+        ):
+          updated = replace(
+            current,
+            state="expired",
+            state_version=current.state_version + 1,
+            decided_at=trusted_now,
+            decision="expired",
+          )
+          cursor = conn.execute(
+            """
+            UPDATE approval_requests SET
+              state = :state,
+              state_version = :state_version,
+              decided_at = :decided_at,
+              decision = :decision
+            WHERE approval_id = :approval_id
+              AND state_version = :expected_state_version
+              AND state NOT IN (
+                'auto_approved', 'auto_denied', 'approved',
+                'denied', 'expired'
+              )
+            """,
+            {
+              **self._request_to_row(updated),
+              "expected_state_version": current.state_version,
+            },
+          )
+          if cursor.rowcount != 1:
+            conn.rollback()
+            raise RuntimeError(
+              "approval expiration compare-and-set failed"
+            )
+          terminal_event = "expired"
+        else:
+          if vote.decision == "approved":
+            if current.approval_constraint == "legacy_unknown":
+              raise ValueError(
+                "approval constraint is unknown; replan and reauthorize"
+              )
+            if current.approval_constraint == "fresh_human_owner" and (
+              current.authorization_mode not in {
+                "HUMAN",
+                "OWNER_CONTROL_PLANE",
+              }
+              or vote.decider_id != current.required_owner_user_id
+              or vote.decider_role != "owner"
+            ):
+              raise ValueError(
+                "fresh owner approval constraint requires its exact owner vote"
+              )
+
+          existing = conn.execute(
+            "SELECT * FROM approval_votes WHERE approval_id = ? AND decider_id = ?",
+            (approval_id, vote.decider_id),
+          ).fetchone()
+          if existing is None:
+            conn.execute(
+              """
+              INSERT INTO approval_votes (
+                vote_id, approval_id, decider_id, decider_role, decision,
+                decision_reason, decided_at, external_callback_id
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              """,
+              (
+                vote.vote_id,
+                vote.approval_id,
+                vote.decider_id,
+                vote.decider_role,
+                vote.decision,
+                vote.decision_reason,
+                _dt_to_text(vote.decided_at),
+                vote.external_callback_id,
+              ),
+            )
+            emitted_vote = True
+
+          counts = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN decision = 'approved' THEN 1 ELSE 0 END)
+                AS approved_count,
+              SUM(CASE WHEN decision = 'denied' THEN 1 ELSE 0 END)
+                AS denied_count
+            FROM approval_votes
+            WHERE approval_id = ?
+            """,
+            (approval_id,),
+          ).fetchone()
+          total = int(counts["total"] or 0)
+          approved_count = int(counts["approved_count"] or 0)
+          denied_count = int(counts["denied_count"] or 0)
+          terminal_state: ApprovalState | None = None
+          if denied_count >= current.required_decider_count:
+            terminal_state = "denied"
+          elif approved_count >= current.required_decider_count:
+            terminal_state = "approved"
+
+          updated = replace(current, votes_received_count=total)
+          if terminal_state is not None:
+            updated = replace(
+              updated,
+              state=terminal_state,
+              state_version=current.state_version + 1,
+              decided_at=vote.decided_at,
+              decider_id=vote.decider_id,
+              decider_role=vote.decider_role,
+              decision=terminal_state,
+              decision_reason=vote.decision_reason,
+            )
+            terminal_event = terminal_state
+
           conn.execute(
             """
-            INSERT INTO approval_votes (
-              vote_id, approval_id, decider_id, decider_role, decision,
-              decision_reason, decided_at, external_callback_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            UPDATE approval_requests SET
+              state = :state,
+              state_version = :state_version,
+              votes_received_count = :votes_received_count,
+              decided_at = :decided_at,
+              decider_id = :decider_id,
+              decider_role = :decider_role,
+              decision = :decision,
+              decision_reason = :decision_reason
+            WHERE approval_id = :approval_id
             """,
-            (
-              vote.vote_id,
-              vote.approval_id,
-              vote.decider_id,
-              vote.decider_role,
-              vote.decision,
-              vote.decision_reason,
-              _dt_to_text(vote.decided_at),
-              vote.external_callback_id,
-            ),
+            self._request_to_row(updated),
           )
-          emitted_vote = True
-
-        counts = conn.execute(
-          """
-          SELECT
-            COUNT(*) AS total,
-            SUM(CASE WHEN decision = 'approved' THEN 1 ELSE 0 END) AS approved_count,
-            SUM(CASE WHEN decision = 'denied' THEN 1 ELSE 0 END) AS denied_count
-          FROM approval_votes
-          WHERE approval_id = ?
-          """,
-          (approval_id,),
-        ).fetchone()
-        total = int(counts["total"] or 0)
-        approved_count = int(counts["approved_count"] or 0)
-        denied_count = int(counts["denied_count"] or 0)
-        terminal_state: ApprovalState | None = None
-        if denied_count >= current.required_decider_count:
-          terminal_state = "denied"
-        elif approved_count >= current.required_decider_count:
-          terminal_state = "approved"
-
-        updated = replace(current, votes_received_count=total)
-        if terminal_state is not None:
-          updated = replace(
-            updated,
-            state=terminal_state,
-            state_version=current.state_version + 1,
-            decided_at=vote.decided_at,
-            decider_id=vote.decider_id,
-            decider_role=vote.decider_role,
-            decision=terminal_state,
-            decision_reason=vote.decision_reason,
-          )
-          terminal_event = terminal_state
-
-        conn.execute(
-          """
-          UPDATE approval_requests SET
-            state = :state,
-            state_version = :state_version,
-            votes_received_count = :votes_received_count,
-            decided_at = :decided_at,
-            decider_id = :decider_id,
-            decider_role = :decider_role,
-            decision = :decision,
-            decision_reason = :decision_reason
-          WHERE approval_id = :approval_id
-          """,
-          self._request_to_row(updated),
-        )
+          if (
+            normalized_delivery is not None
+            and updated.state in {"approved", "denied"}
+          ):
+            _insert_autonomous_approval_delivery_in_transaction(
+              conn,
+              request=updated,
+              delivery=normalized_delivery,
+              approved=updated.state == "approved",
+              vote=vote,
+            )
         conn.commit()
+    if (
+      normalized_delivery is not None
+      and updated.state in {"approved", "denied"}
+    ):
+      if callable(getattr(
+        self._audit_emitter,
+        "emit_audit_for_lifecycle_event",
+        None,
+      )):
+        await self.ensure_autonomous_approval_delivery_audited(
+          updated.approval_id,
+          tool_call_id=normalized_delivery["tool_call_id"],
+          nonce=normalized_delivery["nonce"],
+        )
+      return updated
     if emitted_vote:
       await self._emit("vote_recorded", updated, vote=vote)
     if terminal_event is not None:
-      await self._emit(terminal_event, updated, vote=vote)
+      if terminal_event == "expired":
+        await self._emit(terminal_event, updated)
+      else:
+        await self._emit(terminal_event, updated, vote=vote)
     return updated
+
+  async def ensure_autonomous_approval_delivery_audited(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+  ) -> dict[str, Any]:
+    """Durably audit an outbox decision before it may be published."""
+    normalized_approval_id = _canonical_delivery_text(
+      approval_id,
+      field_name="approval_id",
+    )
+    normalized_tool_call_id = _canonical_delivery_text(
+      tool_call_id,
+      field_name="tool_call_id",
+    )
+    normalized_nonce = _canonical_delivery_text(
+      nonce,
+      field_name="nonce",
+    )
+    async with self._lock:
+      with self._connection() as conn:
+        delivery_row = conn.execute(
+          """
+          SELECT * FROM autonomous_approval_delivery_outbox
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+          """,
+          (
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+          ),
+        ).fetchone()
+        if delivery_row is None:
+          raise KeyError(
+            "autonomous approval delivery outbox record not found"
+          )
+        delivery = _autonomous_approval_delivery_projection(
+          delivery_row
+        )
+        if delivery["audit_state"] == "ready":
+          return delivery
+        if delivery["state"] != "pending":
+          raise RuntimeError(
+            "unaudited autonomous approval delivery is not pending"
+          )
+        request_row = conn.execute(
+          "SELECT * FROM approval_requests WHERE approval_id = ?",
+          (normalized_approval_id,),
+        ).fetchone()
+        if request_row is None:
+          raise RuntimeError(
+            "autonomous approval delivery request is missing"
+          )
+        request = self._row_to_request(request_row)
+        expected_state = (
+          "approved" if delivery["approved"] else "denied"
+        )
+        if (
+          request.state != expected_state
+          or request.decision != expected_state
+          or request.approval_id != delivery["approval_id"]
+          or request.tool_call_id != delivery["tool_call_id"]
+          or request.request_id != delivery["control_run_id"]
+          or request.run_id != delivery["control_run_id"]
+          or request.session_id != delivery["session_id"]
+          or request.decided_at is None
+          or _datetime_to_epoch_ns(request.decided_at)
+          != delivery["decided_at_ns"]
+        ):
+          raise RuntimeError(
+            "autonomous approval delivery durable identity mismatch"
+          )
+
+        vote: ApprovalVote | None = None
+        triggering_vote_id = delivery["triggering_vote_id"]
+        if triggering_vote_id is not None:
+          vote_row = conn.execute(
+            "SELECT * FROM approval_votes WHERE vote_id = ?",
+            (triggering_vote_id,),
+          ).fetchone()
+          if vote_row is None:
+            raise RuntimeError(
+              "autonomous approval delivery triggering vote is missing"
+            )
+          vote = _approval_vote_from_row(vote_row)
+          if (
+            vote.approval_id != normalized_approval_id
+            or vote.decision != expected_state
+            or _datetime_to_epoch_ns(vote.decided_at)
+            != delivery["decided_at_ns"]
+          ):
+            raise RuntimeError(
+              "autonomous approval delivery vote identity mismatch"
+            )
+
+        expected_vote_entry_id = (
+          _autonomous_approval_audit_entry_id(
+            event_type="vote_recorded",
+            approval_id=normalized_approval_id,
+            tool_call_id=normalized_tool_call_id,
+            nonce=normalized_nonce,
+            source_id=vote.vote_id,
+            event_at_ns=_datetime_to_epoch_ns(vote.decided_at),
+          )
+          if vote is not None
+          else None
+        )
+        expected_terminal_entry_id = (
+          _autonomous_approval_audit_entry_id(
+            event_type=expected_state,
+            approval_id=normalized_approval_id,
+            tool_call_id=normalized_tool_call_id,
+            nonce=normalized_nonce,
+            source_id=(
+              vote.vote_id if vote is not None else "cancellation"
+            ),
+            event_at_ns=delivery["decided_at_ns"],
+          )
+        )
+        if (
+          delivery["vote_audit_entry_id"]
+          != expected_vote_entry_id
+          or delivery["terminal_audit_entry_id"]
+          != expected_terminal_entry_id
+        ):
+          raise RuntimeError(
+            "autonomous approval delivery audit receipt mismatch"
+          )
+
+    emit = getattr(
+      self._audit_emitter,
+      "emit_audit_for_lifecycle_event",
+      None,
+    )
+    if not callable(emit):
+      raise RuntimeError(
+        "autonomous approval delivery durable audit is unavailable"
+      )
+    if vote is not None:
+      await emit(
+        event_type="vote_recorded",
+        request=request,
+        raw_tool_args={},
+        vote=vote,
+        pending_tools_nonce=normalized_nonce,
+        skill=request.skill,
+        entry_id=expected_vote_entry_id,
+        event_ts=vote.decided_at,
+      )
+    await emit(
+      event_type=expected_state,
+      request=request,
+      raw_tool_args={},
+      vote=vote,
+      pending_tools_nonce=normalized_nonce,
+      skill=request.skill,
+      entry_id=expected_terminal_entry_id,
+      event_ts=request.decided_at,
+    )
+
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _ready_at_ns, ready_at_value = _trusted_utc_now(conn)
+        ready_at = _dt_to_text(ready_at_value)
+        current_row = conn.execute(
+          """
+          SELECT * FROM autonomous_approval_delivery_outbox
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+          """,
+          (
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+          ),
+        ).fetchone()
+        if current_row is None:
+          conn.rollback()
+          raise RuntimeError(
+            "autonomous approval delivery outbox disappeared"
+          )
+        current = _autonomous_approval_delivery_projection(
+          current_row
+        )
+        if current["audit_state"] == "ready":
+          conn.commit()
+          return current
+        cursor = conn.execute(
+          """
+          UPDATE autonomous_approval_delivery_outbox SET
+            audit_state = 'ready',
+            audit_ready_at = ?,
+            updated_at = ?
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+            AND state = 'pending'
+            AND audit_state = 'pending'
+            AND terminal_audit_entry_id = ?
+            AND (
+              (vote_audit_entry_id IS NULL AND ? IS NULL)
+              OR vote_audit_entry_id = ?
+            )
+          """,
+          (
+            ready_at,
+            ready_at,
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+            expected_terminal_entry_id,
+            expected_vote_entry_id,
+            expected_vote_entry_id,
+          ),
+        )
+        if cursor.rowcount != 1:
+          conn.rollback()
+          raise RuntimeError(
+            "autonomous approval delivery audit receipt compare-and-set failed"
+          )
+        stored = conn.execute(
+          """
+          SELECT * FROM autonomous_approval_delivery_outbox
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+          """,
+          (
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+          ),
+        ).fetchone()
+        conn.commit()
+    if stored is None:
+      raise RuntimeError(
+        "autonomous approval delivery outbox disappeared"
+      )
+    return _autonomous_approval_delivery_projection(stored)
+
+  async def get_autonomous_approval_delivery(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+  ) -> dict[str, Any] | None:
+    normalized_approval_id = _canonical_delivery_text(
+      approval_id,
+      field_name="approval_id",
+    )
+    normalized_tool_call_id = _canonical_delivery_text(
+      tool_call_id,
+      field_name="tool_call_id",
+    )
+    normalized_nonce = _canonical_delivery_text(
+      nonce,
+      field_name="nonce",
+    )
+    async with self._lock:
+      with self._connection() as conn:
+        row = conn.execute(
+          """
+          SELECT * FROM autonomous_approval_delivery_outbox
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+          """,
+          (
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+          ),
+        ).fetchone()
+    return (
+      _autonomous_approval_delivery_projection(row)
+      if row is not None
+      else None
+    )
+
+  @contextmanager
+  def autonomous_approval_delivery_append_transaction(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+    approved: bool,
+  ) -> Iterator[None]:
+    """Serialize one bounded child-inbox append against cancellation."""
+    normalized_approval_id = _canonical_delivery_text(
+      approval_id,
+      field_name="approval_id",
+    )
+    normalized_tool_call_id = _canonical_delivery_text(
+      tool_call_id,
+      field_name="tool_call_id",
+    )
+    normalized_nonce = _canonical_delivery_text(
+      nonce,
+      field_name="nonce",
+    )
+    if type(approved) is not bool:
+      raise ValueError(
+        "autonomous approval delivery approved is invalid"
+      )
+    with self._connection() as conn:
+      conn.execute("BEGIN IMMEDIATE")
+      row = conn.execute(
+        """
+        SELECT * FROM autonomous_approval_delivery_outbox
+        WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+        """,
+        (
+          normalized_approval_id,
+          normalized_tool_call_id,
+          normalized_nonce,
+        ),
+      ).fetchone()
+      if row is None:
+        conn.rollback()
+        raise KeyError(
+          "autonomous approval delivery outbox record not found"
+        )
+      delivery = _autonomous_approval_delivery_projection(row)
+      if delivery["approved"] is not approved:
+        conn.rollback()
+        raise ValueError(
+          "autonomous approval delivery decision changed"
+        )
+      if delivery["audit_state"] != "ready":
+        conn.rollback()
+        raise RuntimeError(
+          "autonomous approval delivery audit receipt is not ready"
+        )
+      if delivery["state"] != "pending":
+        conn.rollback()
+        raise RuntimeError(
+          "autonomous approval delivery is not pending"
+        )
+      if approved:
+        cancellation_fence = conn.execute(
+          """
+          SELECT 1 FROM persistent_grant_cancellation_fences
+          WHERE approval_id = ?
+          """,
+          (normalized_approval_id,),
+        ).fetchone()
+        if cancellation_fence is not None:
+          conn.rollback()
+          raise PersistentGrantCancellationFenced(
+            "approved autonomous delivery is fenced for cancellation"
+          )
+      try:
+        yield
+      except BaseException:
+        conn.rollback()
+        raise
+      else:
+        _published_at_ns, published_at_value = _trusted_utc_now(
+          conn
+        )
+        published_at = _dt_to_text(published_at_value)
+        cursor = conn.execute(
+          """
+          UPDATE autonomous_approval_delivery_outbox SET
+            state = 'published',
+            attempt_count = attempt_count + 1,
+            last_error = NULL,
+            updated_at = ?,
+            published_at = ?
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+            AND state = 'pending'
+            AND audit_state = 'ready'
+          """,
+          (
+            published_at,
+            published_at,
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+          ),
+        )
+        if cursor.rowcount != 1:
+          conn.rollback()
+          raise RuntimeError(
+            "autonomous approval publication compare-and-set failed"
+          )
+        conn.commit()
+
+  def reconcile_autonomous_approval_delivery_duplicate(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+    approved: bool,
+  ) -> dict[str, Any]:
+    """Reconcile an exact fsynced child record after a parent crash."""
+    normalized_approval_id = _canonical_delivery_text(
+      approval_id,
+      field_name="approval_id",
+    )
+    normalized_tool_call_id = _canonical_delivery_text(
+      tool_call_id,
+      field_name="tool_call_id",
+    )
+    normalized_nonce = _canonical_delivery_text(
+      nonce,
+      field_name="nonce",
+    )
+    if type(approved) is not bool:
+      raise ValueError(
+        "autonomous approval delivery approved is invalid"
+      )
+    with self._connection() as conn:
+      conn.execute("BEGIN IMMEDIATE")
+      row = conn.execute(
+        """
+        SELECT * FROM autonomous_approval_delivery_outbox
+        WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+        """,
+        (
+          normalized_approval_id,
+          normalized_tool_call_id,
+          normalized_nonce,
+        ),
+      ).fetchone()
+      if row is None:
+        conn.rollback()
+        raise KeyError(
+          "autonomous approval delivery outbox record not found"
+        )
+      delivery = _autonomous_approval_delivery_projection(row)
+      if delivery["approved"] is not approved:
+        conn.rollback()
+        raise ValueError(
+          "autonomous approval delivery decision changed"
+        )
+      if delivery["audit_state"] != "ready":
+        conn.rollback()
+        raise RuntimeError(
+          "autonomous approval delivery audit receipt is not ready"
+        )
+      if delivery["state"] in {"published", "acknowledged"}:
+        conn.commit()
+        return delivery
+      if delivery["state"] != "pending":
+        conn.rollback()
+        raise RuntimeError(
+          "autonomous approval delivery cannot be reconciled"
+        )
+      if approved:
+        cancellation_fence = conn.execute(
+          """
+          SELECT 1 FROM persistent_grant_cancellation_fences
+          WHERE approval_id = ?
+          """,
+          (normalized_approval_id,),
+        ).fetchone()
+        if cancellation_fence is not None:
+          conn.rollback()
+          raise PersistentGrantCancellationFenced(
+            "approved autonomous delivery is fenced for cancellation"
+          )
+      _published_at_ns, published_at_value = _trusted_utc_now(
+        conn
+      )
+      published_at = _dt_to_text(published_at_value)
+      cursor = conn.execute(
+        """
+        UPDATE autonomous_approval_delivery_outbox SET
+          state = 'published',
+          attempt_count = attempt_count + 1,
+          last_error = NULL,
+          updated_at = ?,
+          published_at = ?
+        WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+          AND state = 'pending'
+          AND audit_state = 'ready'
+        """,
+        (
+          published_at,
+          published_at,
+          normalized_approval_id,
+          normalized_tool_call_id,
+          normalized_nonce,
+        ),
+      )
+      if cursor.rowcount != 1:
+        conn.rollback()
+        raise RuntimeError(
+          "autonomous approval duplicate reconciliation failed"
+        )
+      stored = conn.execute(
+        """
+        SELECT * FROM autonomous_approval_delivery_outbox
+        WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+        """,
+        (
+          normalized_approval_id,
+          normalized_tool_call_id,
+          normalized_nonce,
+        ),
+      ).fetchone()
+      conn.commit()
+    if stored is None:
+      raise RuntimeError(
+        "autonomous approval delivery outbox disappeared"
+      )
+    return _autonomous_approval_delivery_projection(stored)
+
+  @contextmanager
+  def autonomous_approval_delivery_duplicate_transaction(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+    approved: bool,
+  ) -> Iterator[None]:
+    self.reconcile_autonomous_approval_delivery_duplicate(
+      approval_id,
+      tool_call_id=tool_call_id,
+      nonce=nonce,
+      approved=approved,
+    )
+    yield
+
+  async def acknowledge_autonomous_approval_delivery(
+    self,
+    approval_id: str,
+    *,
+    task_id: str,
+    control_run_id: str,
+    session_id: str,
+    channel_id: str,
+    tool_call_id: str,
+    nonce: str,
+    approved: bool,
+    decided_at_ns: int,
+  ) -> dict[str, Any]:
+    normalized_approval_id = _canonical_delivery_text(
+      approval_id,
+      field_name="approval_id",
+    )
+    authority = _normalize_autonomous_approval_delivery_context(
+      {
+        "task_id": task_id,
+        "control_run_id": control_run_id,
+        "session_id": session_id,
+        "channel_id": channel_id,
+        "tool_call_id": tool_call_id,
+        "nonce": nonce,
+      }
+    )
+    if type(approved) is not bool:
+      raise ValueError(
+        "autonomous approval acknowledgment decision is invalid"
+      )
+    if (
+      type(decided_at_ns) is not int
+      or decided_at_ns < 1
+    ):
+      raise ValueError(
+        "autonomous approval acknowledgment decided_at_ns is invalid"
+      )
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _acknowledged_at_ns, acknowledged_at = (
+          _trusted_utc_now(conn)
+        )
+        now_text = _dt_to_text(acknowledged_at)
+        row = conn.execute(
+          """
+          SELECT * FROM autonomous_approval_delivery_outbox
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+          """,
+          (
+            normalized_approval_id,
+            authority["tool_call_id"],
+            authority["nonce"],
+          ),
+        ).fetchone()
+        if row is None:
+          raise KeyError(
+            "autonomous approval delivery outbox record not found"
+          )
+        current = _autonomous_approval_delivery_projection(row)
+        expected_authority: dict[str, Any] = {
+          "approval_id": normalized_approval_id,
+          **authority,
+          "approved": approved,
+          "decided_at_ns": decided_at_ns,
+        }
+        if any(
+          current[field_name] != expected_value
+          for field_name, expected_value
+          in expected_authority.items()
+        ):
+          conn.rollback()
+          raise ValueError(
+            "autonomous approval acknowledgment authority mismatch"
+          )
+        if current["audit_state"] != "ready":
+          conn.rollback()
+          raise RuntimeError(
+            "autonomous approval acknowledgment audit is not ready"
+          )
+        if current["state"] == "acknowledged":
+          conn.commit()
+          return current
+        if current["state"] != "published":
+          conn.rollback()
+          raise RuntimeError(
+            "autonomous approval delivery was not published"
+          )
+        cursor = conn.execute(
+          """
+          UPDATE autonomous_approval_delivery_outbox SET
+            state = 'acknowledged',
+            last_error = NULL,
+            updated_at = ?,
+            acknowledged_at = ?
+          WHERE approval_id = ?
+            AND task_id = ?
+            AND control_run_id = ?
+            AND session_id = ?
+            AND channel_id = ?
+            AND tool_call_id = ?
+            AND nonce = ?
+            AND approved = ?
+            AND allow_tool_type = 0
+            AND decided_at_ns = ?
+            AND state = 'published'
+            AND audit_state = 'ready'
+          """,
+          (
+            now_text,
+            now_text,
+            normalized_approval_id,
+            authority["task_id"],
+            authority["control_run_id"],
+            authority["session_id"],
+            authority["channel_id"],
+            authority["tool_call_id"],
+            authority["nonce"],
+            1 if approved else 0,
+            decided_at_ns,
+          ),
+        )
+        if cursor.rowcount != 1:
+          conn.rollback()
+          raise RuntimeError(
+            "autonomous approval acknowledgment compare-and-set failed"
+          )
+        stored = conn.execute(
+          """
+          SELECT * FROM autonomous_approval_delivery_outbox
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+          """,
+          (
+            normalized_approval_id,
+            authority["tool_call_id"],
+            authority["nonce"],
+          ),
+        ).fetchone()
+        conn.commit()
+    if stored is None:
+      raise RuntimeError(
+        "autonomous approval delivery outbox disappeared"
+      )
+    projection = _autonomous_approval_delivery_projection(stored)
+    if projection["state"] != "acknowledged":
+      raise RuntimeError(
+        "autonomous approval delivery was not acknowledged"
+      )
+    return projection
+
+  async def list_pending_autonomous_approval_deliveries(
+    self,
+    *,
+    limit: int = 64,
+    after_sequence: int = 0,
+    through_sequence: int | None = None,
+  ) -> list[dict[str, Any]]:
+    if type(limit) is not int or not 1 <= limit <= 256:
+      raise ValueError(
+        "autonomous approval delivery limit must be 1..256"
+      )
+    if type(after_sequence) is not int or after_sequence < 0:
+      raise ValueError(
+        "autonomous approval delivery after_sequence is invalid"
+      )
+    if (
+      through_sequence is not None
+      and (
+        type(through_sequence) is not int
+        or through_sequence < after_sequence
+      )
+    ):
+      raise ValueError(
+        "autonomous approval delivery through_sequence is invalid"
+      )
+    async with self._lock:
+      with self._connection() as conn:
+        rows = conn.execute(
+          """
+          SELECT * FROM autonomous_approval_delivery_outbox
+          WHERE state = 'pending'
+            AND delivery_sequence > ?
+            AND (? IS NULL OR delivery_sequence <= ?)
+          ORDER BY delivery_sequence ASC
+          LIMIT ?
+          """,
+          (
+            after_sequence,
+            through_sequence,
+            through_sequence,
+            limit,
+          ),
+        ).fetchall()
+    return [
+      _autonomous_approval_delivery_projection(row)
+      for row in rows
+    ]
+
+  async def autonomous_approval_delivery_high_water(self) -> int:
+    window = await self.autonomous_approval_delivery_recovery_window()
+    return int(window["high_water"])
+
+  async def autonomous_approval_delivery_recovery_window(
+    self,
+  ) -> dict[str, int]:
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        observed_at_ns, _now = _trusted_utc_now(conn)
+        row = conn.execute(
+          """
+          SELECT COALESCE(MAX(delivery_sequence), 0) AS high_water
+          FROM autonomous_approval_delivery_outbox
+          """
+        ).fetchone()
+        conn.commit()
+    if row is None:
+      raise RuntimeError(
+        "autonomous approval delivery high-water query failed"
+      )
+    high_water = int(row["high_water"])
+    if high_water < 0:
+      raise RuntimeError(
+        "autonomous approval delivery high-water is invalid"
+      )
+    return {
+      "high_water": high_water,
+      "observed_at_ns": observed_at_ns,
+    }
+
+  async def record_autonomous_approval_delivery_failure(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+    error: str,
+  ) -> dict[str, Any]:
+    normalized_approval_id = _canonical_delivery_text(
+      approval_id,
+      field_name="approval_id",
+    )
+    normalized_tool_call_id = _canonical_delivery_text(
+      tool_call_id,
+      field_name="tool_call_id",
+    )
+    normalized_nonce = _canonical_delivery_text(
+      nonce,
+      field_name="nonce",
+    )
+    normalized_error = _canonical_delivery_text(
+      error,
+      field_name="last_error",
+      max_length=512,
+    )
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+          """
+          SELECT * FROM autonomous_approval_delivery_outbox
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+          """,
+          (
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+          ),
+        ).fetchone()
+        if row is None:
+          conn.rollback()
+          raise KeyError(
+            "autonomous approval delivery outbox record not found"
+          )
+        current = _autonomous_approval_delivery_projection(row)
+        if current["state"] in {"acknowledged", "quarantined"}:
+          conn.commit()
+          return current
+        now_ns, now = _trusted_utc_now(conn)
+        now_text = _dt_to_text(now)
+        next_attempt_count = int(current["attempt_count"]) + 1
+        quarantined = (
+          current["state"] == "pending"
+          and (
+            next_attempt_count
+            >= AUTONOMOUS_APPROVAL_DELIVERY_MAX_ATTEMPTS
+            or now_ns >= int(current["retry_deadline_ns"])
+          )
+        )
+        next_state = (
+          "quarantined" if quarantined else current["state"]
+        )
+        retry_delay_ns = min(
+          AUTONOMOUS_APPROVAL_DELIVERY_RETRY_BASE_NS
+          * (1 << min(max(next_attempt_count - 1, 0), 30)),
+          AUTONOMOUS_APPROVAL_DELIVERY_RETRY_MAX_NS,
+        )
+        if now_ns > _SQLITE_MAX_INTEGER - retry_delay_ns:
+          conn.rollback()
+          raise RuntimeError(
+            "autonomous approval delivery retry time overflow"
+          )
+        next_attempt_ns = (
+          now_ns
+          if quarantined or current["state"] == "published"
+          else now_ns + retry_delay_ns
+        )
+        cursor = conn.execute(
+          """
+          UPDATE autonomous_approval_delivery_outbox SET
+            state = ?,
+            attempt_count = ?,
+            last_error = ?,
+            updated_at = ?,
+            next_attempt_ns = ?,
+            last_attempt_ns = ?,
+            quarantined_at = ?
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+            AND state = ?
+            AND attempt_count = ?
+          """,
+          (
+            next_state,
+            next_attempt_count,
+            normalized_error,
+            now_text,
+            next_attempt_ns,
+            now_ns,
+            now_text if quarantined else None,
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+            current["state"],
+            current["attempt_count"],
+          ),
+        )
+        stored = conn.execute(
+          """
+          SELECT * FROM autonomous_approval_delivery_outbox
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+          """,
+          (
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+          ),
+        ).fetchone()
+        if stored is None:
+          conn.rollback()
+          raise KeyError(
+            "autonomous approval delivery outbox record not found"
+          )
+        if cursor.rowcount != 1:
+          conn.rollback()
+          raise RuntimeError(
+            "autonomous approval delivery failure compare-and-set failed"
+          )
+        conn.commit()
+    if stored is None:
+      raise RuntimeError(
+        "autonomous approval delivery outbox disappeared"
+      )
+    return _autonomous_approval_delivery_projection(stored)
+
+  async def quarantine_autonomous_approval_delivery(
+    self,
+    approval_id: str,
+    *,
+    tool_call_id: str,
+    nonce: str,
+    error: str,
+  ) -> dict[str, Any]:
+    normalized_approval_id = _canonical_delivery_text(
+      approval_id,
+      field_name="approval_id",
+    )
+    normalized_tool_call_id = _canonical_delivery_text(
+      tool_call_id,
+      field_name="tool_call_id",
+    )
+    normalized_nonce = _canonical_delivery_text(
+      nonce,
+      field_name="nonce",
+    )
+    normalized_error = _canonical_delivery_text(
+      error,
+      field_name="last_error",
+      max_length=512,
+    )
+    async with self._lock:
+      with self._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+          """
+          SELECT * FROM autonomous_approval_delivery_outbox
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+          """,
+          (
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+          ),
+        ).fetchone()
+        if row is None:
+          conn.rollback()
+          raise KeyError(
+            "autonomous approval delivery outbox record not found"
+          )
+        current = _autonomous_approval_delivery_projection(row)
+        if current["state"] == "quarantined":
+          conn.commit()
+          return current
+        if current["state"] != "pending":
+          conn.rollback()
+          raise RuntimeError(
+            "only pending autonomous approval delivery can be quarantined"
+          )
+        _now_ns, now = _trusted_utc_now(conn)
+        now_text = _dt_to_text(now)
+        cursor = conn.execute(
+          """
+          UPDATE autonomous_approval_delivery_outbox SET
+            state = 'quarantined',
+            attempt_count = attempt_count + 1,
+            last_error = ?,
+            updated_at = ?,
+            next_attempt_ns = ?,
+            last_attempt_ns = ?,
+            quarantined_at = ?
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+            AND state = 'pending'
+            AND attempt_count = ?
+          """,
+          (
+            normalized_error,
+            now_text,
+            _now_ns,
+            _now_ns,
+            now_text,
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+            current["attempt_count"],
+          ),
+        )
+        if cursor.rowcount != 1:
+          conn.rollback()
+          raise RuntimeError(
+            "autonomous approval quarantine compare-and-set failed"
+          )
+        stored = conn.execute(
+          """
+          SELECT * FROM autonomous_approval_delivery_outbox
+          WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
+          """,
+          (
+            normalized_approval_id,
+            normalized_tool_call_id,
+            normalized_nonce,
+          ),
+        ).fetchone()
+        conn.commit()
+    if stored is None:
+      raise RuntimeError(
+        "autonomous approval delivery outbox disappeared"
+      )
+    return _autonomous_approval_delivery_projection(stored)
 
   async def create_persistent_grant(self, grant: PersistentGrant) -> PersistentGrant:
     async with self._lock:

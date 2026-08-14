@@ -48,6 +48,7 @@ async def _dispatch_bundle_tool(
   dispatcher = ToolDispatcher(
     mcp_client=_FakeMcp(),
     local_tool_handlers=bundle.handlers,
+    role="owner",
     needs_approval=lambda _name, _tool_input, _qualifier: False,
     event_log=event_log or EventLog(),
     approval_key_qualifier=bundle.approval_qualifier,

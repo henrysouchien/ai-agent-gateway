@@ -908,6 +908,10 @@ def test_provider_symbol_translation_allows_scalar_symbol_and_ticker_keys(monkey
 
   assert manager._translate_provider_symbol("fetch_financials", {"symbol": "BRKB"}) == {"symbol": "BRK-B"}
   assert manager._translate_provider_symbol("get_filings", {"ticker": "BRKB"}) == {"ticker": "BRK-B"}
+  assert manager._translate_provider_symbol(
+    "get_operational_kpi_driver_rows",
+    {"ticker": "BRKB", "year": 2025, "quarter": 4},
+  ) == {"ticker": "BRK-B", "year": 2025, "quarter": 4}
 
 
 def test_provider_symbol_translation_leaves_non_allowlisted_tool_untouched(monkeypatch) -> None:

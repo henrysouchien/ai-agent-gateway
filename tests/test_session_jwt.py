@@ -1,7 +1,11 @@
+# ruff: noqa: E402
+
 import sys
 from pathlib import Path
 
 import jwt
+import pytest
+from fastapi import HTTPException
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
@@ -9,6 +13,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.session import AuthManager, JWT_ALGORITHM, SessionStore
+from agent_gateway.session_capabilities import TEAM_WORKSPACE_WRITE_CAPABILITY
 
 _JWT_SECRET = "jwt-secret-with-at-least-32-bytes"
 
@@ -22,6 +27,7 @@ def test_session_channel_fields_and_jwt_round_trip_new_claims() -> None:
     user_email="alice@example.com",
     risk_user_id=101,
     role="invite",
+    capabilities=frozenset({TEAM_WORKSPACE_WRITE_CAPABILITY}),
   )
 
   assert session.channel is None
@@ -42,6 +48,7 @@ def test_session_channel_fields_and_jwt_round_trip_new_claims() -> None:
   assert claims["user_email"] == "alice@example.com"
   assert claims["risk_user_id"] == 101
   assert claims["role"] == "invite"
+  assert claims["capabilities"] == [TEAM_WORKSPACE_WRITE_CAPABILITY]
   assert claims["channel"] == "public"
   assert claims["is_public"] is True
   assert session.channel == "public"
@@ -77,28 +84,39 @@ def test_session_store_ttl_override_and_kind_are_store_only() -> None:
   assert "kind" not in claims
 
 
-def test_old_jwt_without_channel_claims_still_validates_with_defaults() -> None:
+@pytest.mark.parametrize(
+  "claim_name",
+  ("risk_user_id", "role", "capabilities", "channel", "is_public", "schema_version"),
+)
+def test_session_jwt_rejects_missing_required_claim(claim_name: str) -> None:
   store = SessionStore(ttl=3600)
   auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
   session = store.create_session(api_key_hash="hash", user_id="alice")
-  session.channel = "excel"
-  session.is_public = True
-  old_payload = {
-    "session_id": session.session_id,
-    "api_key_hash": session.api_key_hash,
-    "created_at": session.created_at,
-    "expires_at": session.expires_at,
-    "user_id": session.user_id,
-    "user_email": session.user_email,
-  }
-  token = jwt.encode(old_payload, _JWT_SECRET, algorithm=JWT_ALGORITHM)
+  claims = jwt.decode(
+    auth.issue_token(session),
+    _JWT_SECRET,
+    algorithms=[JWT_ALGORITHM],
+  )
+  claims.pop(claim_name)
+  token = jwt.encode(claims, _JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-  verified_session, claims = auth.verify_token_with_payload(token)
+  with pytest.raises(HTTPException) as exc_info:
+    auth.verify_token(token)
 
-  assert verified_session is session
-  assert claims["channel"] is None
-  assert claims["is_public"] is False
-  assert claims["risk_user_id"] == 0
-  assert claims["role"] == "owner"
-  assert session.channel is None
-  assert session.is_public is False
+  assert exc_info.value.status_code == 401
+  assert exc_info.value.detail == "Invalid session payload"
+
+
+def test_session_jwt_rejects_capability_claim_mismatch() -> None:
+  store = SessionStore(ttl=3600)
+  auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
+  session = store.create_session(api_key_hash="hash", user_id="alice")
+  claims = jwt.decode(auth.issue_token(session), _JWT_SECRET, algorithms=[JWT_ALGORITHM])
+  claims["capabilities"] = [TEAM_WORKSPACE_WRITE_CAPABILITY]
+  token = jwt.encode(claims, _JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+  with pytest.raises(HTTPException) as exc_info:
+    auth.verify_token(token)
+
+  assert exc_info.value.status_code == 401
+  assert exc_info.value.detail == "Session capabilities mismatch"

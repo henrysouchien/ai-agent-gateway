@@ -42,22 +42,44 @@ def test_dual_key_conflicts_raise(effort, thinking) -> None:
     resolve_effort_pair(effort=effort, thinking=thinking)
 
 
-def test_explicit_thinking_layer_beats_auth_config_effort() -> None:
-  config = resolve_auth_config(auth_config={"api_key": "k", "effort": "medium"}, thinking=False)
-  assert config["effort"] == "none"
-  assert config["thinking_enabled_requested"] is False
-  assert "thinking" not in config
+def test_auth_config_cannot_select_effort_or_thinking() -> None:
+  with pytest.raises(ValueError, match="not model-selection authority"):
+    resolve_auth_config(
+      auth_config={"api_key": "k", "effort": "medium"}
+    )
 
 
-def test_legacy_config_migrates_and_refresh_does_not_self_conflict() -> None:
-  migrated = normalized_run_config(
-    {"api_key": "k", "thinking": True}, default_model="claude-sonnet-5", model_override=None
+def test_legacy_thinking_is_rejected_at_run_and_refresh_boundaries() -> None:
+  with pytest.raises(ValueError, match="must not contain model selection"):
+    normalized_run_config(
+      {"api_key": "k", "thinking": True},
+      upstream_model="claude-sonnet-5",
+      effort="high",
+    )
+
+  credential_config = {
+    "provider": "anthropic",
+    "auth_mode": "api",
+    "api_key": "k",
+    "max_tokens": 16_000,
+  }
+  refreshed = merge_refreshed_auth_config(
+    credential_config,
+    {"api_key": "new"},
   )
-  assert migrated["effort"] == "high"
-  assert "thinking" not in migrated
-  refreshed = merge_refreshed_auth_config(migrated, {"api_key": "new", "thinking": False})
-  assert refreshed["effort"] == "high"
-  assert refreshed["thinking_enabled_requested"] is True
+  assert refreshed["api_key"] == "new"
+  assert {
+    "model",
+    "model_key",
+    "effort",
+    "thinking",
+    "thinking_enabled_requested",
+  }.isdisjoint(refreshed)
+  with pytest.raises(ValueError, match="must not contain model selection"):
+    merge_refreshed_auth_config(
+      credential_config,
+      {"api_key": "new", "thinking": False},
+    )
 
 
 def test_sonnet5_none_always_emits_disabled_below_gate() -> None:
@@ -95,7 +117,7 @@ def test_fable_none_is_effectively_on_and_opus46_xhigh_clamps() -> None:
   ).effective is ThinkingLevel.HIGH
 
 
-def test_openai_runtime_compat_disables_payload_and_long_stall_together() -> None:
+def test_openai_runtime_compat_cannot_disable_responses_effort() -> None:
   provider = OpenAIProvider()
   info = provider.get_model_info("gpt-5.6-terra")
   resolved = provider.resolve_effort(
@@ -105,18 +127,18 @@ def test_openai_runtime_compat_disables_payload_and_long_stall_together() -> Non
     max_tokens=4096,
     compat={"supportsReasoningEffort": False},
   )
-  assert resolved.payload_fragments == {}
-  assert resolved.thinking_enabled_effective is False
+  assert resolved.payload_fragments == {"reasoning": {"effort": "max"}}
+  assert resolved.thinking_enabled_effective is True
   assert effective_stream_stall_timeout(
     None, config={"effort": "max"}, model_info=info, max_tokens=4096, effort_resolution=resolved
-  ) == 60
+  ) == 300
 
   runner = AgentRunner.__new__(AgentRunner)
   runner._effort_resolution = resolved
   assert runner.effort_introspection == {
     "requested": "max",
-    "effective": "none",
-    "thinking_enabled_effective": False,
+    "effective": "max",
+    "thinking_enabled_effective": True,
   }
 
 
@@ -127,7 +149,7 @@ def test_gpt56_specific_rows_and_max_payload_are_distinct() -> None:
   assert all(
     provider.resolve_effort(
       requested=ThinkingLevel.MAX, model=info.id, model_info=info, max_tokens=4096
-    ).payload_fragments == {"reasoning_effort": "max"}
+    ).payload_fragments == {"reasoning": {"effort": "max"}}
     for info in infos
   )
 
@@ -149,16 +171,24 @@ def test_codex_reasoning_deep_merge_preserves_summary() -> None:
 
 
 def test_chat_request_validates_and_canonicalizes_effort() -> None:
-  request = ChatRequest(messages=[], effort=" XHIGH ")
+  request = ChatRequest(
+    messages=[],
+    model_key="openai.gpt-5-6",
+    effort=" XHIGH ",
+  )
   assert request.effort == "xhigh"
   with pytest.raises(ValueError):
-    ChatRequest(messages=[], effort="")
+    ChatRequest(
+      messages=[],
+      model_key="openai.gpt-5-6",
+      effort="",
+    )
 
 
-def test_profile_config_exposes_effort_field() -> None:
+def test_profile_config_does_not_duplicate_effort_authority() -> None:
   from api.agent.profiles import ProfileConfig
 
-  assert "effort" in {field.name for field in fields(ProfileConfig)}
+  assert "effort" not in {field.name for field in fields(ProfileConfig)}
 
 
 def test_skill_effort_conflict_and_positional_boundary(tmp_path: Path) -> None:
@@ -168,13 +198,16 @@ def test_skill_effort_conflict_and_positional_boundary(tmp_path: Path) -> None:
     parse_skill_file(path)
 
 
-def test_provider_env_effort_conflicts_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_provider_env_effort_does_not_enter_credential_config(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
   from api.credentials import get_anthropic_config
 
   monkeypatch.setenv("ANTHROPIC_EFFORT", "medium")
   monkeypatch.setenv("ANTHROPIC_THINKING", "false")
-  with pytest.raises(ValueError, match="conflicting"):
-    get_anthropic_config()
+  config = get_anthropic_config()
+  assert "effort" not in config
+  assert "thinking" not in config
 
 
 def test_anthropic_sdk_floor_is_locked() -> None:

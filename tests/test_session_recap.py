@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 import asyncio
 import json
 import sys
@@ -13,13 +15,24 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.model_registry import (
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
 from agent_gateway.easy import create_agent
+from agent_gateway.capability_binding import CapabilityBind
 from agent_gateway.event_log import EventLog
-from agent_gateway.events import RecapFailure, SessionRecapEvent, event_from_dict
+from agent_gateway.events import (
+  RecapFailure,
+  SessionRecapEvent,
+  event_from_dict,
+  event_to_dict,
+)
 from agent_gateway.multi_user.billing import SessionUsageSummary
 from agent_gateway.providers import ModelProvider, StreamEvent
 from agent_gateway.providers.base import ModelInfo
 from agent_gateway.runner import AgentRunner
+from agent_gateway.secret_boundary import SecretBoundary
 from agent_gateway.sdk_runner import AgentSDKRunner
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.session import SessionStream
@@ -140,6 +153,7 @@ def test_emit_recap_then_terminal_orders_recap_before_stream_complete() -> None:
   assert isinstance(recap, SessionRecapEvent)
   assert recap.artifacts[0].artifact_id == "artifact-1"
   assert recap.seq_range == (1, 1)
+  assert entries[1].event["seq_range"] == [1, 1]
 
 
 def test_emit_recap_then_terminal_captures_terminal_error_as_pending_failure() -> None:
@@ -206,6 +220,7 @@ def test_agent_runner_append_wraps_terminal_events_with_recap() -> None:
   runner._full_session_id = "session-1"
   runner._session_started_at = 1.0
   runner._emit_session_recap = True
+  runner._secret_boundary = SecretBoundary()
 
   AgentRunner._append(runner, {"type": "stream_complete", "usage": {}})
 
@@ -246,6 +261,7 @@ def test_agent_runner_error_event_calls_terminal_aware_hook() -> None:
   runner._role = "writer"
   runner._sub_agent_id = None
   runner._last_durable_seq = 0
+  runner._top_level_skill_lifecycle = None
   captured: dict[str, Any] = {}
 
   async def _hook(active_event_log: EventLog, terminal_event: dict[str, Any]) -> None:
@@ -274,6 +290,7 @@ def test_sdk_runner_append_wraps_terminal_events_with_recap() -> None:
   runner._session_id = "session-1"
   runner._session_started_at = 1.0
   runner._emit_session_recap = True
+  runner._secret_boundary = SecretBoundary()
 
   AgentSDKRunner._append(runner, {"type": "error", "error": "sdk failed"})
 
@@ -286,15 +303,20 @@ def _run(coro):
 
 def _make_recap_app(transcript_dir: Path | None = None):
   async def _build_chat_runtime(session, request, channel, auth_manager):
-    _ = session, request, channel, auth_manager
-    return ChatRuntime(system_prompt="test", build_runner=lambda _event_log, _session_id, _started_at=None: None)
+    _ = session, channel, auth_manager
+    return ChatRuntime(
+      system_prompt="test",
+      build_runner=lambda _event_log, _session_id, _started_at: None,
+      capability_execution=request.capability_execution,
+    )
 
   return create_gateway_app(
     GatewayServerConfig(
       jwt_secret="session-recap-test-secret-0123456789",
-      auth_config={"api_key": "test-key", "model": "test-model", "max_tokens": 256},
       valid_api_keys={"gateway-key"},
-      allowed_models=set(),
+      tenant_id="test-product",
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
       transcript_dir=transcript_dir,
     )
@@ -363,6 +385,24 @@ def _append_transcript_event(transcript_dir: Path, session_id: str, event: dict[
 
 
 def _usage_summary(session_id: str, *, request_id: str = "req-1") -> SessionUsageSummary:
+  entry = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5")
+  bind = CapabilityBind(
+    schema_version="1.0",
+    capability_id="session.driver",
+    model_key=entry.key,
+    provider=entry.provider,
+    upstream_model=entry.upstream_model,
+    adapter=entry.adapter,
+    protocol_profile=entry.protocol_profile,
+    route=entry.route,
+    effort="high",
+    credential_principal="user",
+    credential_ref="test-user:anthropic",
+    run_mode="interactive",
+    registry_revision=INITIAL_MODEL_REGISTRY.revision,
+    policy_revision=INITIAL_MODEL_SELECTION_POLICY.revision,
+    selection_source="capability_default",
+  )
   return SessionUsageSummary(
     user_id="alice",
     session_id=session_id,
@@ -374,9 +414,48 @@ def _usage_summary(session_id: str, *, request_id: str = "req-1") -> SessionUsag
     cost=0.0123,
     turns=1,
     channel="excel",
+    model=bind.upstream_model,
+    provider=bind.provider,
+    usage_event_count=1,
+    usage_event_ids=(f"usage:{session_id}:{request_id}",),
+    capability_bind=bind.receipt(),
+    provider_reported_model="claude-opus-5-20260801",
     started_at=1.0,
     ended_at=2.0,
   )
+
+
+def test_session_recap_usage_identity_survives_event_round_trip() -> None:
+  usage = _usage_summary("session-identity")
+  recap = compute_recap(
+    EventLog(session_id="session-identity"),
+    session_id="session-identity",
+    started_at=1.0,
+    trigger="explicit",
+    usage=usage,
+  )
+
+  restored = event_from_dict(event_to_dict(recap))
+
+  assert isinstance(restored, SessionRecapEvent)
+  assert restored.usage is not None
+  assert restored.usage.capability_bind == usage.capability_bind
+  assert restored.usage.provider_reported_model == "claude-opus-5-20260801"
+  assert restored.usage.capability_bind is not None
+  assert {
+    field: restored.usage.capability_bind[field]
+    for field in (
+      "capability_id",
+      "model_key",
+      "provider",
+      "upstream_model",
+    )
+  } == {
+    "capability_id": "session.driver",
+    "model_key": "anthropic.claude-opus-5",
+    "provider": "anthropic",
+    "upstream_model": "claude-opus-5",
+  }
 
 
 def test_post_chat_recap_appends_to_open_event_log(tmp_path: Path) -> None:
@@ -713,7 +792,7 @@ class _UsageClient:
 
 
 class _UsageProvider(ModelProvider):
-  name = "usage-test"
+  name = "anthropic"
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     _ = config
@@ -727,7 +806,11 @@ class _UsageProvider(ModelProvider):
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(
+      id=model,
+      provider=self.name,
+      supports_thinking=True,
+    )
 
   def build_request_params(
     self,
@@ -756,19 +839,34 @@ def test_create_agent_usage_summary_populates_cached_usage_without_observer() ->
     app = create_agent(
       "test",
       provider=_UsageProvider(),
-      model="usage-model",
+      model_key="anthropic.claude-opus-5",
       valid_api_keys={"gateway-key"},
       jwt_secret="session-recap-create-agent-secret-0123456789",
     )
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
       session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(
+        session_info["session_id"]
+      )
+      assert session is not None
+      session.model_entitled_capabilities = frozenset({"session.driver"})
+      session.model_entitled_keys = frozenset({
+        "anthropic.claude-opus-5"
+      })
+      session_info["session_token"] = app.state.auth.issue_token(session)
       async with client.stream(
         "POST",
         "/api/chat",
         headers=_headers(session_info),
-        json={"messages": [{"role": "user", "content": "hello"}], "context": {}},
+        json={
+          "messages": [{"role": "user", "content": "hello"}],
+          "user_id": "alice",
+          "context": {},
+        },
       ) as response:
+        if response.status_code != 200:
+          await response.aread()
         assert response.status_code == 200, response.text
         async for _line in response.aiter_lines():
           pass

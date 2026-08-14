@@ -9,6 +9,10 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from agent_gateway import session as session_module
+from agent_gateway.model_registry import (
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
 from agent_gateway.control_plane.middleware import CONTROL_PLANE_VERSION_HEADER
 from agent_gateway.control_plane import session as control_session_module
 from agent_gateway.control_plane.session import CONTROL_SESSION_TTL_SECONDS
@@ -81,6 +85,12 @@ def test_control_session_lifecycle_create_use_expire_recreate(
   assert session.risk_user_id == 101
   assert session.user_aliases == ("101", test_user_id, "tui@example.com")
   assert session.expires_at == payload["expires_at"]
+  assert session.tenant_id == "test-product"
+  assert session.session_credential_handle is not None
+  assert session.session_credential_handle.provider == "anthropic"
+  assert session.session_credential_handle.principal == "service"
+  assert session.session_credential_handle.actor_id is None
+  assert session.allow_service_for_interactive is True
 
   verified_session, claims = control_plane_app.state.auth.verify_token_with_payload(payload["session_token"])
   assert verified_session is session
@@ -108,12 +118,19 @@ def test_control_session_lifecycle_create_use_expire_recreate(
 
 def test_control_session_stores_identity_derived_numeric_risk_user_id_without_resolver() -> None:
   async def _build_chat_runtime(_session, _request, _channel, _auth_manager):
-    return ChatRuntime(system_prompt="test", build_runner=lambda *_args: None)
+    return ChatRuntime(
+      system_prompt="test",
+      build_runner=lambda *_args: None,
+      capability_execution=_request.capability_execution,
+    )
 
   app = create_gateway_app(
     GatewayServerConfig(
       jwt_secret="control-plane-test-secret-0123456789",
       valid_api_keys={"legacy-key"},
+      tenant_id="test-product",
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
     )
   )
@@ -151,12 +168,19 @@ def test_control_session_stores_identity_mapped_email_without_resolver(monkeypat
   )
 
   async def _build_chat_runtime(_session, _request, _channel, _auth_manager):
-    return ChatRuntime(system_prompt="test", build_runner=lambda *_args: None)
+    return ChatRuntime(
+      system_prompt="test",
+      build_runner=lambda *_args: None,
+      capability_execution=_request.capability_execution,
+    )
 
   app = create_gateway_app(
     GatewayServerConfig(
       jwt_secret="control-plane-test-secret-0123456789",
       valid_api_keys={"legacy-key"},
+      tenant_id="test-product",
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
     )
   )
@@ -233,6 +257,9 @@ def test_chat_init_still_creates_chat_session(
   assert session.kind == "chat"
   assert session.user_id == test_user_id
   assert session.channel == test_channel
+  assert session.tenant_id == "test-product"
+  assert session.session_credential_handle is not None
+  assert session.session_credential_handle.principal == "service"
 
 
 def test_control_session_token_cannot_dispatch_chat(

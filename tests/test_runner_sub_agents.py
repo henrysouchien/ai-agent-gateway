@@ -1,44 +1,100 @@
 import asyncio
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
-if str(PKG_DIR) not in sys.path:
-  sys.path.insert(0, str(PKG_DIR))
+import pytest
 
-from agent_gateway import AgentRunner  # noqa: E402
-import agent_gateway.runner as gateway_runner  # noqa: E402
-from agent_gateway.runner_sub_agents import RunnerSubAgentMixin  # noqa: E402
-
-
-class _FakeChildRunner:
-  instances: list["_FakeChildRunner"] = []
-
-  def __init__(self, **kwargs: Any) -> None:
-    self.kwargs = kwargs
-    self.run_kwargs: dict[str, Any] | None = None
-    self.closed_timeout: float | None = None
-    self.instances.append(self)
-
-  async def run(self, **kwargs: Any) -> None:
-    self.run_kwargs = kwargs
-    self.kwargs["event_log"].append({"type": "message", "content": "child result"})
-
-  async def force_close(self, timeout: float = 2.0) -> None:
-    self.closed_timeout = timeout
+from agent_gateway import AgentRunner
+from agent_gateway.capability_execution import BoundCapabilityExecution
+from agent_gateway.providers import ModelInfo, ModelProvider
+import agent_gateway.runner as gateway_runner
+from agent_gateway.runner_sub_agents import RunnerSubAgentMixin
+from agent_workflow_contracts import (
+  AgentOperationRef,
+  AttemptRef,
+  OrdinaryDelegationTaskRef,
+  OutcomeRequirement,
+  ResultRequirement,
+  TaskResult,
+  TaskResultProvenance,
+)
+from tests.capability_execution_test_support import (
+  stub_bound_capability_execution,
+)
 
 
-class _FakeEventLog:
-  instances: list["_FakeEventLog"] = []
+class _Provider(ModelProvider):
+  name = "child-provider"
 
+  def has_active_credential(self, config: dict[str, Any]) -> bool:
+    return config.get("api_key") == "child-secret"
+
+  def get_model_info(self, model: str) -> ModelInfo:
+    return ModelInfo(
+      id=model,
+      provider=self.name,
+      max_output_tokens=64_000,
+      supports_thinking=True,
+    )
+
+
+_DIGEST = "sha256:" + "1" * 64
+_OPERATION = AgentOperationRef(
+  namespace="agent-operation",
+  name="test-child",
+  version="1",
+  digest=_DIGEST,
+)
+_LOGICAL_TASK = OrdinaryDelegationTaskRef(
+  delegation_id="delegation:test-child",
+  operation=_OPERATION,
+)
+_ATTEMPT = AttemptRef(
+  attempt_number=1,
+  attempt_id="attempt:test-child:1",
+  physical_task_id="task:test-child",
+)
+_PROVENANCE = TaskResultProvenance(
+  admitted_task_digest=_DIGEST,
+  model_bind_digest=_DIGEST,
+  capability_binding_digest=_DIGEST,
+  tool_grant_digest=_DIGEST,
+)
+_RESULT = ResultRequirement(
+  mode="narrative",
+  terminal_narrative="required",
+  outcome=OutcomeRequirement(required=False, source="none"),
+)
+
+
+def _execution(capability_id: str = "node.explore") -> BoundCapabilityExecution:
+  return stub_bound_capability_execution(
+    provider=_Provider(),
+    model="child-model",
+    effort="medium",
+    capability_id=capability_id,
+    credential_principal="user",
+    auth_config={
+      "api_key": "child-secret",
+    },
+  )
+
+
+class _Dispatcher:
+  def get_tool_definitions(self) -> list[dict[str, Any]]:
+    return [{
+      "name": "web_search",
+      "description": "Search the web",
+      "input_schema": {"type": "object"},
+    }]
+
+
+class _EventLog:
   def __init__(self, *, on_event: Any, session_id: str) -> None:
     self._on_event = on_event
     self.session_id = session_id
     self.entries: list[SimpleNamespace] = []
-    self.instances.append(self)
 
   def append(self, event: dict[str, Any]) -> None:
     self.entries.append(SimpleNamespace(event=event))
@@ -46,19 +102,54 @@ class _FakeEventLog:
       self._on_event(event, self.session_id)
 
 
-def _parent_runner() -> AgentRunner:
+class _ChildRunner:
+  instances: list["_ChildRunner"] = []
+
+  def __init__(self, **kwargs: Any) -> None:
+    self.kwargs = kwargs
+    self._runner_id = f"runner-{kwargs['session_id']}"
+    self.run_kwargs: dict[str, Any] | None = None
+    self.closed = False
+    self.instances.append(self)
+
+  async def run(self, **kwargs: Any) -> None:
+    self.run_kwargs = kwargs
+    self.kwargs["event_log"].append({
+      "type": "stream_complete",
+      "usage": {"input_tokens": 11, "output_tokens": 7},
+    })
+
+  async def force_close(self, timeout: float = 2.0) -> None:
+    assert timeout == 2.0
+    self.closed = True
+
+
+class _SessionLog:
+  def __init__(self, text: str) -> None:
+    self.text = text
+
+  async def query(self, **kwargs: Any) -> tuple[list[Any], None]:
+    assert kwargs["event_types"] == {"assistant_message"}
+    return [SimpleNamespace(seq=41, event={
+      "type": "assistant_message",
+      "stop_reason": "end_turn",
+      "logical_response_id": "logical-test-response",
+      "logical_response_segment_ordinal": 0,
+      "content_blocks": [{"type": "text", "text": self.text}],
+    })], None
+
+
+def _parent(tmp_path: Path, *, session_log: _SessionLog | None) -> AgentRunner:
   runner = object.__new__(AgentRunner)
   runner._sub_agent_config = None
   runner._provider = SimpleNamespace(name="parent-provider")
   runner._auth_config = {"api_key": "parent"}
   runner._full_session_id = "parent-session"
   runner._log = SimpleNamespace(_on_event=None)
-  runner._max_budget_usd = 10.0
-  runner._cost_accumulator = SimpleNamespace(exceeded_reason=None)
   runner._per_turn_timeout = 11.0
   runner._stream_stall_timeout = 12.0
   runner._mcp_client = None
-  runner._loaded_mcp_servers = {"server-a"}
+  runner._loaded_mcp_servers = set()
   runner._get_tool_definitions = lambda: []
   runner._on_tool_result = None
   runner._on_usage = None
@@ -76,217 +167,120 @@ def _parent_runner() -> AgentRunner:
   runner._on_max_turns = None
   runner._aggregator = object()
   runner._max_concurrent_sub_agents = 2
-  runner._agent_session_log = None
+  runner._agent_session_log = session_log
   runner._max_resume_chain_depth = 3
   runner._spill_dir_provider = None
   runner._skill_run_id = "skill-run"
-  runner._workspace_dir = "/workspace"
+  runner._workspace_dir = str(tmp_path)
   runner._context_surfaces_provider = None
-  runner._context_surfaces_static = [{"surface": "test"}]
+  runner._context_surfaces_static = []
+  runner._commercial_usage_producer = None
+  runner._batch_id = None
   return runner
+
+
+def _spawn(parent: AgentRunner, **overrides: Any):
+  kwargs = {
+    "capability_execution": _execution(),
+    "skill_name": "explore",
+    "logical_task": _LOGICAL_TASK,
+    "attempt": _ATTEMPT,
+    "result_requirement": _RESULT,
+    "result_provenance": _PROVENANCE,
+    "dispatcher": _Dispatcher(),
+    "max_turns": 4,
+    "timeout": None,
+  }
+  kwargs.update(overrides)
+  return asyncio.run(parent.spawn_sub_agent("research this", **kwargs))
 
 
 def test_runner_sub_agent_methods_are_inherited_from_mixin() -> None:
   assert issubclass(AgentRunner, RunnerSubAgentMixin)
-  assert gateway_runner.RunnerSubAgentMixin is RunnerSubAgentMixin
-
   for method_name in ("spawn_sub_agent", "resume_sub_agent"):
-    assert getattr(AgentRunner, method_name) is getattr(RunnerSubAgentMixin, method_name)
-
-
-def test_spawn_sub_agent_resolves_parent_module_helpers(monkeypatch: Any) -> None:
-  _FakeChildRunner.instances.clear()
-  result_calls: list[dict[str, Any]] = []
-
-  monkeypatch.setattr(gateway_runner, "AgentRunner", _FakeChildRunner)
-  monkeypatch.setattr(
-    gateway_runner,
-    "_derive_sub_agent_id",
-    lambda session_id, call_index: f"patched-{session_id}-{call_index}",
-  )
-  monkeypatch.setattr(gateway_runner, "_user_turn_message", lambda task: {"role": "patched_user", "content": task})
-  monkeypatch.setattr(
-    gateway_runner,
-    "_sub_agent_result_from_log_entries",
-    lambda entries, **kwargs: result_calls.append({"entries": list(entries), "kwargs": kwargs}) or {"ok": kwargs},
-  )
-
-  result, error = asyncio.run(
-    _parent_runner().spawn_sub_agent(
-      "review this",
-      dispatcher=object(),
-      max_turns=4,
-      timeout=None,
-      call_index=7,
-      parent_turn_id="turn-1",
+    assert getattr(AgentRunner, method_name) is getattr(
+      RunnerSubAgentMixin, method_name
     )
-  )
 
-  child = _FakeChildRunner.instances[0]
+
+def test_spawn_sub_agent_materializes_exact_terminal_message(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  _ChildRunner.instances.clear()
+  terminal = "A complete research report with a material caveat."
+  parent = _parent(tmp_path, session_log=_SessionLog(terminal))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _ChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = _spawn(parent)
+
   assert error is None
-  assert result == {"ok": {"timed_out": False, "timeout": None, "budget_exceeded_reason": None}}
-  assert child.kwargs["session_id"] == "patched-parent-session-7"
-  assert child.kwargs["parent_turn_id"] == "turn-1"
-  assert child.kwargs["context_surfaces"] == [{"surface": "test"}]
+  assert isinstance(result, TaskResult)
+  assert result.execution.status == "succeeded"
+  assert result.logical_task == _LOGICAL_TASK
+  assert result.attempt == _ATTEMPT
+  assert result.values.terminal_narrative is not None
+  assert result.values.terminal_narrative.content_chars == len(terminal)
+  assert result.values.projection is None
+  child = _ChildRunner.instances[0]
+  assert [tool["name"] for tool in child.kwargs["get_tool_definitions"]()] == [
+    "web_search"
+  ]
   assert child.run_kwargs == {
-    "messages": [{"role": "patched_user", "content": "review this"}],
+    "messages": [{"role": "user", "content": "research this"}],
     "system_prompt": None,
-    "model_override": None,
     "max_turns": 4,
   }
-  assert child.closed_timeout == 2.0
-  assert [entry.event for entry in result_calls[0]["entries"]] == [{"type": "message", "content": "child result"}]
+  assert child.closed is True
 
 
-def test_spawn_sub_agent_resolves_progress_eventlog_and_child_budget_aliases(monkeypatch: Any) -> None:
-  _FakeChildRunner.instances.clear()
-  _FakeEventLog.instances.clear()
-  progress_calls: list[tuple[dict[str, Any], str]] = []
-  original_calls: list[tuple[dict[str, Any], str]] = []
-  sub_event_calls: list[tuple[dict[str, Any], str]] = []
-  accumulator_calls: list[tuple[Any, float]] = []
-  task_entry = SimpleNamespace(message_inbox=object())
+def test_spawn_sub_agent_never_injects_a_result_submission_tool(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  parent = _parent(tmp_path, session_log=_SessionLog("Done."))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _ChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
 
-  class _FakeChildAccumulator:
-    def __init__(self, parent: Any, max_budget_usd: float) -> None:
-      accumulator_calls.append((parent, max_budget_usd))
-      self.exceeded_reason = "child_budget"
+  _spawn(parent)
 
-  def _make_progress_tracker(entry: Any):
-    assert entry is task_entry
+  names = {
+    tool["name"]
+    for tool in _ChildRunner.instances[-1].kwargs["get_tool_definitions"]()
+  }
+  assert "submit_report" not in names
 
-    def _progress(event: dict[str, Any], session_id: str) -> None:
-      progress_calls.append((event, session_id))
 
-    return _progress
+def test_spawn_sub_agent_uses_exact_child_skill_run_identity(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  _ChildRunner.instances.clear()
+  parent = _parent(tmp_path, session_log=_SessionLog("Done."))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _ChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
 
-  parent = _parent_runner()
-  parent._log = SimpleNamespace(_on_event=lambda event, session_id: original_calls.append((event, session_id)))
+  result, error = _spawn(parent, skill_run_id="child-skill-run")
 
-  monkeypatch.setattr(gateway_runner, "AgentRunner", _FakeChildRunner)
-  monkeypatch.setattr(gateway_runner, "EventLog", _FakeEventLog)
-  monkeypatch.setattr(gateway_runner, "ChildCostAccumulator", _FakeChildAccumulator)
-  monkeypatch.setattr(gateway_runner, "make_progress_tracker", _make_progress_tracker)
-  monkeypatch.setattr(
-    gateway_runner,
-    "_sub_agent_result_from_log_entries",
-    lambda entries, **kwargs: {"entries": [entry.event for entry in entries], "kwargs": kwargs},
-  )
-
-  result, error = asyncio.run(
-    parent.spawn_sub_agent(
-      "track progress",
-      dispatcher=object(),
-      max_turns=1,
-      timeout=None,
-      task_entry=task_entry,
-      max_budget_usd=1.25,
-      on_sub_event=lambda event, session_id: sub_event_calls.append((event, session_id)),
-    )
-  )
-
-  child = _FakeChildRunner.instances[0]
   assert error is None
-  assert _FakeEventLog.instances[0] is child.kwargs["event_log"]
-  assert child.kwargs["max_budget_usd"] == 1.25
-  assert child.kwargs["_cost_accumulator"].exceeded_reason == "child_budget"
-  assert accumulator_calls == [(parent._cost_accumulator, 1.25)]
-  assert result == {
-    "entries": [{"type": "message", "content": "child result"}],
-    "kwargs": {"timed_out": False, "timeout": None, "budget_exceeded_reason": "child_budget"},
-  }
-  for calls in (progress_calls, original_calls, sub_event_calls):
-    assert calls == [({"type": "message", "content": "child result", "sub_agent_id": "sub0:parent-session"}, "sub0:parent-session")]
+  assert isinstance(result, TaskResult)
+  assert _ChildRunner.instances[0].kwargs["skill_run_id"] == "child-skill-run"
 
 
-def test_spawn_sub_agent_timeout_uses_parent_asyncio_alias(monkeypatch: Any) -> None:
-  _FakeChildRunner.instances.clear()
-  waited: dict[str, float] = {}
+def test_spawn_sub_agent_requires_durable_terminal_message_log(
+  tmp_path: Path,
+) -> None:
+  with pytest.raises(
+    ValueError,
+    match="narrative child execution requires a durable session log",
+  ):
+    _spawn(_parent(tmp_path, session_log=None))
 
-  def _wait_for(coro: Any, *, timeout: float) -> Any:
-    waited["timeout"] = timeout
-    coro.close()
-    raise asyncio.TimeoutError
 
-  monkeypatch.setattr(gateway_runner, "AgentRunner", _FakeChildRunner)
-  monkeypatch.setattr(gateway_runner, "asyncio", SimpleNamespace(wait_for=_wait_for, TimeoutError=asyncio.TimeoutError))
-  monkeypatch.setattr(
-    gateway_runner,
-    "_sub_agent_result_from_log_entries",
-    lambda entries, **kwargs: {"entries": [entry.event for entry in entries], "kwargs": kwargs},
-  )
-
-  result, error = asyncio.run(
-    _parent_runner().spawn_sub_agent(
-      "will timeout",
-      dispatcher=object(),
-      max_turns=1,
-      timeout=2.5,
+def test_spawn_sub_agent_rejects_non_node_capability(tmp_path: Path) -> None:
+  with pytest.raises(ValueError, match=r"requires a node\.\* capability bind"):
+    _spawn(
+      _parent(tmp_path, session_log=_SessionLog("Done.")),
+      capability_execution=_execution("session.driver"),
     )
-  )
-
-  child = _FakeChildRunner.instances[0]
-  assert error is None
-  assert waited == {"timeout": 2.5}
-  assert child.closed_timeout == 2.0
-  assert result == {
-    "entries": [{"type": "error", "error": "Sub-agent timed out after 2.5s"}],
-    "kwargs": {"timed_out": True, "timeout": 2.5, "budget_exceeded_reason": None},
-  }
-
-
-def test_resume_sub_agent_resolves_parent_module_helpers(monkeypatch: Any) -> None:
-  _FakeChildRunner.instances.clear()
-  result_calls: list[dict[str, Any]] = []
-  task_entry = SimpleNamespace(delivered_messages=set(), message_inbox=object())
-  reconstructed_messages = [
-    {"role": "assistant", "content": "previous"},
-    {"role": "user", "content": "continue"},
-  ]
-
-  monkeypatch.setattr(gateway_runner, "AgentRunner", _FakeChildRunner)
-  monkeypatch.setattr(
-    gateway_runner,
-    "_derive_sub_agent_id",
-    lambda session_id, call_index: f"resumed-{session_id}-{call_index}",
-  )
-  monkeypatch.setattr(
-    gateway_runner,
-    "_sub_agent_result_from_log_entries",
-    lambda entries, **kwargs: result_calls.append({"entries": list(entries), "kwargs": kwargs}) or {"ok": kwargs},
-  )
-
-  result, error = asyncio.run(
-    _parent_runner().resume_sub_agent(
-      original_task_id="bg_1",
-      reconstructed_messages=reconstructed_messages,
-      parent_messages=[SimpleNamespace(message_id="pm-1"), SimpleNamespace(message_id="pm-2")],
-      dispatcher=object(),
-      max_turns=5,
-      timeout=None,
-      call_index=8,
-      task_entry=task_entry,
-    )
-  )
-
-  child = _FakeChildRunner.instances[0]
-  assert error is None
-  assert task_entry.delivered_messages == {"pm-1", "pm-2"}
-  assert child.kwargs["session_id"] == "resumed-parent-session-8"
-  assert child.kwargs["message_inbox"] is task_entry.message_inbox
-  assert child.run_kwargs == {
-    "messages": [{"role": "user", "content": "continue"}],
-    "system_prompt": None,
-    "model_override": None,
-    "max_turns": 5,
-    "resume_initial_messages": reconstructed_messages,
-  }
-  assert result == {
-    "ok": {
-      "timed_out": False,
-      "timeout": None,
-      "budget_exceeded_reason": None,
-      "original_task_id": "bg_1",
-    }
-  }
-  assert [entry.event for entry in result_calls[0]["entries"]] == [{"type": "message", "content": "child result"}]

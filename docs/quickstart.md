@@ -173,9 +173,12 @@ Full event and endpoint details: [HTTP API](./http-api.md)
 
 ## Troubleshooting
 
-### The agent returns a stub response
+### The agent refuses to start without a bound credential
 
-`create_agent()` emits a stub response when no provider credential is configured. For Anthropic, set `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. For OpenAI, set `OPENAI_API_KEY` or pass `api_key=...`.
+Live `create_agent()` sessions fail closed when no provider credential can be
+bound. Configure the credential before starting the session; test-only stub
+responses require explicit low-level runner opt-in and are not part of the Easy
+API.
 
 ### My MCP server will not start
 

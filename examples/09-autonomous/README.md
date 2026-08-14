@@ -1,6 +1,11 @@
 # Autonomous Run Example
 
-This example shows the new `run_autonomous_sync()` entry point for a headless run with local tools, state persistence, and optional Telegram delivery.
+This example shows the execution-only `run_autonomous_sync()` entry point for a
+headless run with local tools, state persistence, and optional Telegram
+delivery. `agent.py` constructs an explicit prebound fixture so the executor
+receives one exact `session.driver` bind, provider adapter, and immutable
+credential snapshot. Production callers should obtain those values from the
+server-owned capability resolver rather than construct a bind inline.
 
 ## Run
 
@@ -31,14 +36,30 @@ For persistent agents that check in periodically, wrap `run_autonomous()` with `
 
 ```python
 from functools import partial
-from agent_gateway import run_autonomous, HeartbeatLoop, HeartbeatConfig
+from agent_gateway import (
+    BoundCapabilityExecution,
+    GatewaySession,
+    HeartbeatConfig,
+    HeartbeatLoop,
+    run_autonomous,
+)
+
+# Resolve these once through the server-owned capability resolver. The bind's
+# run_mode must be "autonomous" or "cron", and the transport must be native.
+capability_execution: BoundCapabilityExecution
+session: GatewaySession
+capability_execution, session = prepare_autonomous_execution()
 
 loop = HeartbeatLoop(
     run_fn=partial(run_autonomous,
         system_prompt="Check HEARTBEAT.md. If nothing needs attention, reply HEARTBEAT_OK.",
         initial_message="Check if anything needs attention.",
-        model="claude-sonnet-4-6",
+        capability_execution=capability_execution,
+        session=session,
         tool_handlers={...},
+        user_id="heartbeat-agent",
+        billing_mode="byok",
+        rate_table_version="current",
     ),
     config=HeartbeatConfig(
         interval_seconds=1800,       # 30 minutes

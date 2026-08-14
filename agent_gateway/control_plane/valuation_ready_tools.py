@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Awaitable, Callable
 
 from fastapi import HTTPException
@@ -196,7 +198,12 @@ def _dispatch_spec(tool_input: dict[str, Any]) -> tuple[dict[str, Any] | None, d
 
 
 def _make_dispatch_handler(*, app_state: Any, session: Any) -> ToolHandler:
-  async def _handle(tool_input: dict[str, Any], **_: Any) -> tuple[Any | None, dict[str, Any] | None]:
+  async def _handle(
+    tool_input: dict[str, Any],
+    *,
+    tool_ctx: Any,
+    **_: Any,
+  ) -> tuple[Any | None, dict[str, Any] | None]:
     unsupported = _guard_active_skill()
     if unsupported is not None:
       return None, unsupported
@@ -204,26 +211,54 @@ def _make_dispatch_handler(*, app_state: Any, session: Any) -> ToolHandler:
     if error is not None:
       return None, error
     assert spec is not None
+    session_id = str(getattr(session, "session_id", "") or "").strip()
+    if not session_id:
+      return None, {
+        "code": "batch_dispatch_failed",
+        "message": "valuation-ready dispatch requires a durable session identity",
+      }
+    tool_call_id = str(getattr(tool_ctx, "tool_call_id", "") or "").strip()
+    if not tool_call_id:
+      return None, {
+        "code": "batch_dispatch_failed",
+        "message": "valuation-ready dispatch requires a durable tool-call identity",
+      }
+    try:
+      json.dumps(
+        spec,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+      )
+      dispatch_digest = hashlib.sha256(
+        json.dumps(
+          {
+            "session_id": session_id,
+            "tool_call_id": tool_call_id,
+          },
+          allow_nan=False,
+          separators=(",", ":"),
+          sort_keys=True,
+        ).encode("utf-8")
+      ).hexdigest()
+    except (TypeError, ValueError) as exc:
+      return None, {"code": "invalid_batch_spec", "message": str(exc)}
     try:
       payload = await batches.dispatch_batch_in_process(
         spec,
         app_state=app_state,
         user_id=_session_owner_user_id(session),
+        dispatch_key=f"valuation-ready-{dispatch_digest}",
         user_email=getattr(session, "user_email", None),
-        auth_config=(
-          dict(getattr(session, "auth_config", None) or {})
-          if getattr(session, "auth_config", None) is not None
-          else None
-        ),
+        role=getattr(session, "role", None),
         channel=getattr(session, "channel", None),
+        authenticated_session=session,
       )
     except batches._active_batch_error_type() as exc:
       return None, {"code": "active_batch_conflict", "message": str(exc)}
     except CorpusReadinessGateError as exc:
       return None, exc.to_payload()
     except ValueError as exc:
-      if str(exc) == "authenticated batch credential unavailable":
-        return None, {"code": "credential_unavailable", "message": str(exc)}
       return None, {"code": "invalid_batch_spec", "message": str(exc)}
     except Exception as exc:
       return None, {"code": "batch_dispatch_failed", "message": str(exc)}

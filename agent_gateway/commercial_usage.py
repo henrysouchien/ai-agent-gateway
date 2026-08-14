@@ -12,11 +12,12 @@ from typing import Any, Awaitable, Callable, Literal
 from uuid import NAMESPACE_URL, uuid5
 
 from jsonschema import Draft202012Validator
+from agent_workflow_contracts import CapabilityBind
 
 from .commercial_claims import VerifiedCommercialClaim
 from .commercial_contract import (
   canonical_usage_payload_sha256,
-  packaged_contract_directory,
+  packaged_usage_v3_contract_directory,
 )
 from .commercial_work_start import CommercialWorkStartContext
 from .multi_user.billing import UsageEvent
@@ -57,7 +58,7 @@ class CommercialUsageLineage:
 
 
 class CommercialUsageProducer:
-  """Convert provider-call deltas to V1 or verified-work-start Usage V2."""
+  """Convert provider-call deltas to authoritative commercial Usage V3."""
 
   def __init__(
     self,
@@ -73,7 +74,7 @@ class CommercialUsageProducer:
     self._enabled = enabled
     if work_start is not None:
       if not isinstance(work_start, CommercialWorkStartContext):
-        raise TypeError("commercial Usage V2 requires verified work-start context")
+        raise TypeError("commercial Usage V3 requires verified work-start context")
       authorization = work_start.authorization
       derived_lineage = CommercialUsageLineage(
         source_product="hank-agent-gateway",
@@ -97,11 +98,10 @@ class CommercialUsageProducer:
     self._reconciliation_tracker = reconciliation_tracker
     self._on_reconciliation = on_reconciliation
     self._reconciliation_summary: Any | None = None
-    schema_name = (
-      "commercial-usage-event-v2.schema.json"
-      if work_start is not None else "commercial-usage-event.schema.json"
+    schema = (
+      packaged_usage_v3_contract_directory()
+      / "commercial-usage-event-v3.schema.json"
     )
-    schema = packaged_contract_directory() / schema_name
     self._validator = Draft202012Validator(json.loads(schema.read_text()))
     if enabled and (claim is None or lineage is None or sink is None):
       raise ValueError("enabled commercial usage requires claim, lineage, and durable sink")
@@ -185,6 +185,15 @@ class CommercialUsageProducer:
       raise ValueError("commercial usage source and request identity are required")
     if event.provider is None or not _CODE.fullmatch(event.provider):
       raise ValueError("commercial usage provider is required")
+    if event.capability_bind is None:
+      raise ValueError("commercial Usage V3 requires a capability bind receipt")
+    bind = CapabilityBind.from_receipt(event.capability_bind)
+    if event.provider != bind.provider:
+      raise ValueError("commercial usage provider projection differs from capability bind")
+    if event.model != bind.upstream_model:
+      raise ValueError("commercial usage model projection differs from capability bind")
+    if lineage.capability_id != bind.capability_id:
+      raise ValueError("commercial usage capability projection differs from capability bind")
     if event.channel is None or not _CODE.fullmatch(event.channel):
       raise ValueError("commercial usage channel is required")
     if event.reasoning_tokens_observed is not None and (
@@ -207,6 +216,7 @@ class CommercialUsageProducer:
         or event.session_id != authorization.session_id
         or event.provider != authorization.provider
         or event.billing_mode != authorization.billing_mode
+        or bind.capability_id != authorization.capability_id
       ):
         raise ValueError(
           "commercial usage event differs from verified work-start facts"
@@ -215,7 +225,7 @@ class CommercialUsageProducer:
       "+00:00", "Z"
     )
     payload: dict[str, Any] = {
-      "schema_version": 2 if self._work_start is not None else 1,
+      "schema_version": 3,
       "source_product": lineage.source_product,
       "source_event_id": event.event_id,
       "environment": claim.environment,
@@ -228,10 +238,12 @@ class CommercialUsageProducer:
       "reservation_id": lineage.reservation_id,
       "funding_route_id": lineage.funding_route_id,
       "channel": event.channel,
-      "provider": event.provider,
+      "provider": bind.provider,
       "operation": lineage.operation,
-      "model": event.model or None,
-      "capability_id": lineage.capability_id,
+      "model": bind.upstream_model,
+      "capability_id": bind.capability_id,
+      "capability_bind": bind.receipt(),
+      "provider_reported_model": event.provider_reported_model,
       "usage_state": usage_state,
       "uncached_input_tokens": event.input_tokens,
       "billable_output_tokens": event.output_tokens,
@@ -253,6 +265,11 @@ class CommercialUsageProducer:
       "producer_rate_version": event.rate_table_version,
       "shadow_rate_version": claim.shadow_rate_version,
       "raw_billing_mode": event.billing_mode,
+      "workflow_attempt_group_id": None,
+      "workflow_attempt_number": None,
+      "retry_of_workflow_run_id": None,
+      "workflow_attempt_kind": None,
+      "work_authorization_id": None,
     }
     if self._work_start is not None:
       authorization = self._work_start.authorization

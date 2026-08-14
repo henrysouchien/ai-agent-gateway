@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-agent-gateway"
-version = "0.15.13"
+version = "0.16.0"
 description = "Generic AI agent gateway with MCP tool support and streaming"
 readme = "README.md"
 license = "MIT"
@@ -24,24 +24,38 @@ dependencies = [
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.93.0"]
-openai = ["openai>=1.0.0"]
-all = ["anthropic>=0.93.0", "openai>=1.0.0"]
+openai = ["openai>=2.31.0"]
+all = ["anthropic>=0.93.0", "openai>=2.31.0"]
 dev = ["pytest", "pytest-asyncio"]
 docs = ["mkdocs>=1.6"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent_gateway*"]
+include = ["agent_gateway*", "agent_workflow_contracts*"]
 
 [project.scripts]
 agent = "agent_gateway.cli:main"
 
 [tool.setuptools.package-data]
+agent_workflow_contracts = [
+  "generated/*.d.ts",
+  "generated/*.json",
+  "generated/*.ts",
+]
 agent_gateway = [
   "rates/*.json",
   "dashboard_artifact/*.json",
   "contracts/claim-contract-v1/*.json",
+  "contracts/commercial-usage-v3/*.json",
   "contracts/ui-blocks-v1/**/*.json",
+  "contracts/canvas-kit-v1/**/*.json",
+  "contracts/canvas-kit-v1/**/*.d.ts",
+  "contracts/canvas-kit-v1/**/*.tsx",
+  "canvas_build/.node-version",
+  "canvas_build/*.json",
+  "canvas_build/*.mjs",
+  "canvas_build/*.sh",
   "contracts/usage-reconciliation-v1/*.json",
   "contracts/usage-reconciliation-v2/*.json",
+  "contracts/usage-reconciliation-v3/*.json",
 ]

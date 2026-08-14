@@ -1,7 +1,10 @@
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
@@ -10,13 +13,16 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import AgentRunner, EventLog, ToolDispatcher, ToolResultContext  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
+from agent_gateway.sdk_runner_context import call_on_tool_result  # noqa: E402
 from agent_gateway.runner_callbacks import (  # noqa: E402
   call_before_stream_complete_hook,
   call_metric_hook,
   call_tool_result_hook,
   call_tool_timing_hook,
 )
-from agent_gateway.runner_hooks_lifecycle import RunnerHooksLifecycleMixin  # noqa: E402
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_runner_capability_execution,
+)
 
 
 class _NullMcpClient:
@@ -32,6 +38,15 @@ class _NullMcpClient:
 
 class _StubProvider:
   name = "stub"
+
+
+def _capability_execution():
+  return stub_runner_capability_execution(
+    provider=_StubProvider(),
+    model="stub-model",
+    effort="none",
+    auth_config={"api_key": "k"},
+  )
 
 
 class _Logger:
@@ -53,28 +68,6 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
     event_log=event_log or EventLog(),
     session_id="sess-callback",
   )
-
-
-def test_runner_hooks_lifecycle_methods_are_inherited_from_mixin() -> None:
-  assert issubclass(AgentRunner, RunnerHooksLifecycleMixin)
-  assert gateway_runner.RunnerHooksLifecycleMixin is RunnerHooksLifecycleMixin
-
-  for method_name in (
-    "_call_on_tool_result",
-    "_call_on_before_stream_complete",
-    "_call_on_tool_timing",
-    "_call_metric",
-    "_call_credential_refresher",
-    "_apply_refreshed_auth_config",
-    "_usage_has_tokens",
-    "_usage_delta",
-    "_build_usage_event",
-    "_call_on_usage",
-    "_call_on_late_usage_event",
-    "_call_on_session_summary",
-    "_estimate_usage_cost",
-  ):
-    assert getattr(AgentRunner, method_name) is getattr(RunnerHooksLifecycleMixin, method_name)
 
 
 def test_runner_callback_wrappers_resolve_parent_module_helpers(monkeypatch: Any) -> None:
@@ -157,6 +150,7 @@ def test_tool_timing_helper_passes_optional_user_id_when_supported() -> None:
 def test_tool_timing_helper_supports_legacy_signature_and_swallows_errors() -> None:
   legacy_calls: list[tuple[Any, ...]] = []
   logger = _Logger()
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-tool-timing-8f21d7"
 
   def legacy_callback(session_id, tool_name, server, duration_ms, is_error, result_bytes):
     legacy_calls.append((session_id, tool_name, server, duration_ms, is_error, result_bytes))
@@ -178,7 +172,7 @@ def test_tool_timing_helper_supports_legacy_signature_and_swallows_errors() -> N
   )
 
   def failing_callback(*_args: Any, **_kwargs: Any) -> None:
-    raise RuntimeError("offline")
+    raise RuntimeError(secret)
 
   call_tool_timing_hook(
     failing_callback,
@@ -199,6 +193,7 @@ def test_tool_timing_helper_supports_legacy_signature_and_swallows_errors() -> N
   assert legacy_calls == [("sess-full", "legacy", None, 5, True, 6)]
   assert logger.warnings
   assert "on_tool_timing hook failed" in logger.warnings[0][0]
+  assert secret not in str(logger.warnings)
 
 
 def test_tool_timing_helper_passes_context_surfaces_when_supported() -> None:
@@ -238,6 +233,7 @@ def test_tool_timing_helper_passes_context_surfaces_when_supported() -> None:
 def test_metric_helper_records_and_swallows_errors() -> None:
   calls: list[tuple[str, int]] = []
   logger = _Logger()
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-metric-hook-8f21d7"
 
   call_metric_hook(
     lambda name, value: calls.append((name, value)),
@@ -248,13 +244,14 @@ def test_metric_helper_records_and_swallows_errors() -> None:
   )
 
   def failing_metric(_name: str, _value: int) -> None:
-    raise RuntimeError("offline")
+    raise RuntimeError(secret)
 
   call_metric_hook(failing_metric, name="gateway.fail", value=1, log_session_id="sess", logger=logger)
 
   assert calls == [("gateway.test", 3)]
   assert logger.warnings
   assert "metric hook failed" in logger.warnings[0][0]
+  assert secret not in str(logger.warnings)
 
 
 def test_tool_result_helper_filters_blocks_and_swallows_errors() -> None:
@@ -277,6 +274,39 @@ def test_tool_result_helper_filters_blocks_and_swallows_errors() -> None:
   assert _run(call_tool_result_hook(failing_callback, ctx, log_session_id="sess", logger=logger)) == []
   assert logger.warnings
   assert "on_tool_result hook failed" in logger.warnings[0][0]
+
+
+def test_tool_result_hook_exception_logs_are_value_free_for_native_and_sdk() -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-HOOK-EXCEPTION-8f21d7"
+
+  def native_failure(_ctx: object) -> None:
+    raise RuntimeError(secret)
+
+  native_logger = _Logger()
+  assert _run(
+    call_tool_result_hook(
+      native_failure,
+      object(),
+      log_session_id="sess",
+      logger=native_logger,
+    )
+  ) == []
+
+  async def sdk_failure(_ctx: object) -> None:
+    raise RuntimeError(secret)
+
+  sdk_logger = _Logger()
+  sdk_runner = SimpleNamespace(
+    _on_tool_result=sdk_failure,
+    _sid="sess-sdk",
+  )
+  assert _run(
+    call_on_tool_result(sdk_runner, object(), logger=sdk_logger)
+  ) == []
+
+  serialized_logs = repr(native_logger.warnings + sdk_logger.warnings)
+  assert secret not in serialized_logs
+  assert "RuntimeError" in serialized_logs
 
 
 def test_before_stream_complete_helper_respects_legacy_and_terminal_signatures() -> None:
@@ -327,24 +357,24 @@ def test_before_stream_complete_helper_respects_legacy_and_terminal_signatures()
   assert logger.warnings == []
 
 
-def test_before_stream_complete_helper_swallows_errors() -> None:
+def test_before_stream_complete_helper_propagates_required_hook_errors() -> None:
   logger = _Logger()
 
   def failing_callback(_event_log: EventLog, _terminal_event: dict[str, Any] | None) -> None:
     raise RuntimeError("offline")
 
-  _run(
-    call_before_stream_complete_hook(
-      failing_callback,
-      EventLog(),
-      {"type": "stream_complete"},
-      log_session_id="sess",
-      logger=logger,
+  with pytest.raises(RuntimeError, match="offline"):
+    _run(
+      call_before_stream_complete_hook(
+        failing_callback,
+        EventLog(),
+        {"type": "stream_complete"},
+        log_session_id="sess",
+        logger=logger,
+      )
     )
-  )
 
-  assert logger.warnings
-  assert "on_before_stream_complete hook failed" in logger.warnings[0][0]
+  assert logger.warnings == []
 
 
 def test_runner_callback_delegates_preserve_session_and_user_id() -> None:
@@ -368,8 +398,7 @@ def test_runner_callback_delegates_preserve_session_and_user_id() -> None:
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_StubProvider(),
-    auth_config={"api_key": "k", "model": "stub-model"},
+    capability_execution=_capability_execution(),
     on_tool_timing=timing_callback,
     on_metric=lambda name, value: metric_calls.append((name, value)),
     user_id="alice",
@@ -417,8 +446,7 @@ def test_runner_hook_delegates_preserve_log_and_filter_results() -> None:
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-parent",
-    provider=_StubProvider(),
-    auth_config={"api_key": "k", "model": "stub-model"},
+    capability_execution=_capability_execution(),
     on_tool_result=on_tool_result,
     on_before_stream_complete=on_before_stream_complete,
     user_id="alice",

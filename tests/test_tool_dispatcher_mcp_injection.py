@@ -44,10 +44,20 @@ def test_dispatch_injects_session_id_only_for_configured_mcp_servers() -> None:
   )
 
   browser_result, browser_error = _run(
-    dispatcher.dispatch("tool_1", "browser_snapshot", {"url": "https://example.com"})
+    dispatcher.dispatch(
+      "tool_1",
+      "browser_snapshot",
+      {"url": "https://example.com"},
+      advertised_tool_names=frozenset({"browser_snapshot", "filesystem_read"}),
+    )
   )
   fs_result, fs_error = _run(
-    dispatcher.dispatch("tool_2", "filesystem_read", {"path": "/tmp/example.txt"})
+    dispatcher.dispatch(
+      "tool_2",
+      "filesystem_read",
+      {"path": "/tmp/example.txt"},
+      advertised_tool_names=frozenset({"browser_snapshot", "filesystem_read"}),
+    )
   )
 
   assert browser_error is None
@@ -69,10 +79,20 @@ def test_dispatch_rejects_mcp_tool_outside_scoped_allowlist() -> None:
   )
 
   allowed_result, allowed_error = _run(
-    dispatcher.dispatch("tool_1", "browser_snapshot", {"url": "https://example.com"})
+    dispatcher.dispatch(
+      "tool_1",
+      "browser_snapshot",
+      {"url": "https://example.com"},
+      advertised_tool_names=frozenset({"browser_snapshot", "filesystem_read"}),
+    )
   )
   denied_result, denied_error = _run(
-    dispatcher.dispatch("tool_2", "filesystem_read", {"path": "/tmp/example.txt"})
+    dispatcher.dispatch(
+      "tool_2",
+      "filesystem_read",
+      {"path": "/tmp/example.txt"},
+      advertised_tool_names=frozenset({"browser_snapshot", "filesystem_read"}),
+    )
   )
 
   assert allowed_error is None

@@ -49,7 +49,7 @@ def test_tool_risk_value_returns_side_effecting_when_registry_raises(monkeypatch
   assert get_tool_risk_value("file_read") == "side_effecting"
 
 
-def test_redact_tool_input_falls_back_to_shallow_copy(monkeypatch) -> None:
+def test_redact_tool_input_fails_closed_when_policy_import_fails(monkeypatch) -> None:
   original_import = builtins.__import__
 
   def import_without_redaction(name: str, *args: Any, **kwargs: Any):
@@ -59,9 +59,7 @@ def test_redact_tool_input_falls_back_to_shallow_copy(monkeypatch) -> None:
 
   monkeypatch.setattr(builtins, "__import__", import_without_redaction)
 
-  original = {"secret": "token", "nested": {"kept": True}}
+  original = {"secret": "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"}
   redacted = redact_tool_input_for_event("web_fetch", original)
 
-  assert redacted == original
-  assert redacted is not original
-  assert redacted["nested"] is original["nested"]
+  assert redacted == {"_boundary_error": "<secret-sanitization-failed>"}

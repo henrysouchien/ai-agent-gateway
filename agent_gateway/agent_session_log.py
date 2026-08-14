@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import logging
 import os
+import stat
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
@@ -21,7 +23,6 @@ from .agent_session_log_records import (
   _QuerySpec,
   _REVERSE_SCAN_CHUNK_SIZE,
   _SEGMENT_FILE_RE,
-  _SLUG_RE,  # noqa: F401 - re-exported private compatibility constant
   _Segment,
   _atomic_write_json,
   _atomic_write_sidecar,
@@ -37,8 +38,44 @@ from .agent_session_log_records import (
   resolve_agent_session_id,
   slugify,
 )
+from .events import AgentCompletionEvent, event_from_dict, event_to_dict
+from .openai_history_fence import (
+  DURABLE_HISTORY_VERSION_KEY,
+  RESPONSES_HISTORY_VERSION,
+  contains_openai_responses_history,
+)
+from .session import GatewaySession
+from .secret_boundary import sanitize_tool_event
 
 log = logging.getLogger("agent_gateway.agent_session_log")
+
+
+class ReplayStorageSecurityError(RuntimeError):
+  """Replay storage could not be made private before opaque state persistence."""
+
+
+class IdempotentEventConflictError(RuntimeError):
+  """A durable semantic event identity was reused for another payload."""
+
+
+def _canonical_idempotent_event(
+  event: dict[str, Any],
+) -> tuple[str, str, dict[str, Any]] | None:
+  """Return the typed, timestamp-free identity projection for one event."""
+
+  if event.get("type") != "agent_completion":
+    return None
+  try:
+    typed = event_from_dict(event)
+  except (KeyError, TypeError, ValueError) as exc:
+    raise ValueError(
+      "agent_completion must be a canonical typed durable event"
+    ) from exc
+  if not isinstance(typed, AgentCompletionEvent):  # pragma: no cover
+    raise TypeError("agent_completion parsed as an unexpected event type")
+  canonical = event_to_dict(typed)
+  canonical.pop("ts", None)
+  return typed.event_id, typed.fingerprint, canonical
 
 
 class AgentSessionLog:
@@ -50,7 +87,15 @@ class AgentSessionLog:
     *,
     session_ref: AgentSessionRef | None = None,
     base_dir: str | Path | None = None,
+    gateway_session: GatewaySession | None = None,
   ) -> None:
+    if (
+      gateway_session is not None
+      and type(gateway_session) is not GatewaySession
+    ):
+      raise TypeError(
+        "AgentSessionLog gateway_session must be exact GatewaySession"
+      )
     if path is None:
       if session_ref is None or base_dir is None:
         raise ValueError("Provide either path or both session_ref and base_dir")
@@ -65,6 +110,8 @@ class AgentSessionLog:
     self.segments_dir = self.path.with_name(f"{self.path.stem}.segments")
     self.manifest_path = self.segments_dir / "manifest.json"
     self._max_active_bytes = self._configured_max_active_bytes()
+    self._pending_append_futures: set[asyncio.Future[LogEntry]] = set()
+    self._gateway_session = gateway_session
 
     self.write_lease_path = self.path.with_name(f"{self.path.name}.write_lease")
     self.append_mutex_path = self.path.with_name(f"{self.path.name}.append_mutex")
@@ -75,6 +122,10 @@ class AgentSessionLog:
     if session_ref is not None:
       self._write_meta_sidecar(session_ref)
     self.repair_manifest()
+
+  @property
+  def gateway_session(self) -> GatewaySession | None:
+    return self._gateway_session
 
   @staticmethod
   def path_for_session(base_dir: str | Path, session_ref: AgentSessionRef) -> Path:
@@ -95,7 +146,34 @@ class AgentSessionLog:
     )
 
   async def append(self, event: dict[str, Any]) -> LogEntry:
-    return await asyncio.to_thread(self._append_sync, dict(event))
+    loop = asyncio.get_running_loop()
+    append_future = loop.run_in_executor(
+      None,
+      self._append_sync,
+      dict(event),
+    )
+    self._pending_append_futures.add(append_future)
+    append_future.add_done_callback(
+      self._pending_append_futures.discard
+    )
+    return await asyncio.shield(append_future)
+
+  def append_sync(self, event: dict[str, Any]) -> LogEntry:
+    """Durably append without yielding, for terminal settlement barriers."""
+
+    return self._append_sync(dict(event))
+
+  @property
+  def pending_append_futures(
+    self,
+  ) -> tuple[asyncio.Future[LogEntry], ...]:
+    """Return unsettled synchronous appends for writer-lease fencing."""
+
+    return tuple(
+      future
+      for future in self._pending_append_futures
+      if not future.done()
+    )
 
   async def query(
     self,
@@ -132,6 +210,67 @@ class AgentSessionLog:
     )
     return await asyncio.to_thread(self._query_sync, spec, order, limit, cursor)
 
+  def query_sync(
+    self,
+    *,
+    event_types: set[str] | None = None,
+    tool_name: str | None = None,
+    tool_call_id: str | None = None,
+    sub_agent_id: str | None = None,
+    runner_id: str | None = None,
+    role: str | None = None,
+    after_seq: int | None = None,
+    before_seq: int | None = None,
+    after_ts: float | None = None,
+    before_ts: float | None = None,
+    contains_text: str | None = None,
+    has_error: bool | None = None,
+    order: Literal["asc", "desc"] = "asc",
+    limit: int | None = None,
+    cursor: QueryCursor | None = None,
+  ) -> tuple[list[LogEntry], QueryCursor | None]:
+    """Synchronously read exact durable envelopes during fenced settlement."""
+
+    spec = _QuerySpec(
+      event_types=(
+        set(event_types)
+        if event_types is not None
+        else None
+      ),
+      tool_name=tool_name,
+      tool_call_id=tool_call_id,
+      sub_agent_id=sub_agent_id,
+      runner_id=runner_id,
+      role=role,
+      after_seq=after_seq,
+      before_seq=before_seq,
+      after_ts=after_ts,
+      before_ts=before_ts,
+      contains_text=(
+        contains_text.lower()
+        if contains_text is not None
+        else None
+      ),
+      has_error=has_error,
+    )
+    entries, next_cursor = self._query_sync(
+      spec,
+      order,
+      limit,
+      cursor,
+    )
+    return (
+      [
+        LogEntry(
+          seq=entry.seq,
+          timestamp=entry.timestamp,
+          event=deepcopy(entry.event),
+        )
+        for entry in entries
+      ],
+      next_cursor,
+    )
+
   async def iter_from(self, after_seq: int = 0) -> AsyncIterator[LogEntry]:
     entries, _cursor = await self.query(after_seq=max(after_seq, 0) + 1, order="asc")
     for entry in entries:
@@ -139,6 +278,66 @@ class AgentSessionLog:
 
   async def latest_seq(self) -> int:
     return await asyncio.to_thread(self._latest_seq_sync)
+
+  async def ensure_private_replay_storage(self) -> None:
+    await asyncio.to_thread(self._ensure_private_replay_storage_sync)
+
+  @staticmethod
+  def _secure_replay_path(path: Path, mode: int, *, directory: bool = False) -> None:
+    try:
+      info = path.lstat()
+    except FileNotFoundError:
+      if directory:
+        path.mkdir(parents=True, exist_ok=True, mode=mode)
+      else:
+        path.touch(mode=mode, exist_ok=True)
+      info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+      raise ReplayStorageSecurityError(f"OpenAI replay storage path is a symlink: {path}")
+    if info.st_uid != os.geteuid():
+      raise ReplayStorageSecurityError(f"OpenAI replay storage is not owned by the service user: {path}")
+    if directory and not stat.S_ISDIR(info.st_mode):
+      raise ReplayStorageSecurityError(f"OpenAI replay storage directory is not a directory: {path}")
+    if not directory and not stat.S_ISREG(info.st_mode):
+      raise ReplayStorageSecurityError(f"OpenAI replay storage file is not regular: {path}")
+    try:
+      path.chmod(mode, follow_symlinks=False)
+    except (NotImplementedError, OSError) as exc:
+      raise ReplayStorageSecurityError(f"Unable to secure OpenAI replay storage path: {path}") from exc
+    if stat.S_IMODE(path.lstat().st_mode) != mode:
+      raise ReplayStorageSecurityError(f"OpenAI replay storage permissions remain unsafe: {path}")
+
+  def _replay_storage_files(self) -> list[Path]:
+    candidates = [
+      self.path,
+      self.path.with_suffix(".meta.json"),
+      self.write_lease_path,
+      self.append_mutex_path,
+      self.write_lease_meta_path,
+      self.manifest_path,
+    ]
+    candidates.extend(self.path.parent.glob(f".{self.path.name}*.tmp"))
+    if self.segments_dir.exists():
+      candidates.extend(path for path in self.segments_dir.iterdir())
+    return [path for path in candidates if path.exists()]
+
+  def _ensure_private_replay_storage_locked(self) -> None:
+    self._secure_replay_path(self.path.parent, 0o700, directory=True)
+    self._secure_replay_path(self.segments_dir, 0o700, directory=True)
+    for path in self._replay_storage_files():
+      self._secure_replay_path(path, 0o600)
+
+  def _ensure_private_replay_storage_sync(self) -> None:
+    if self.append_mutex_path.is_symlink():
+      raise ReplayStorageSecurityError(
+        f"OpenAI replay storage path is a symlink: {self.append_mutex_path}"
+      )
+    with self.append_mutex_path.open("a+b") as mutex_file:
+      fcntl.flock(mutex_file.fileno(), fcntl.LOCK_EX)
+      try:
+        self._ensure_private_replay_storage_locked()
+      finally:
+        fcntl.flock(mutex_file.fileno(), fcntl.LOCK_UN)
 
   def repair_manifest(self) -> None:
     with self.append_mutex_path.open("a+b") as mutex_file:
@@ -149,14 +348,68 @@ class AgentSessionLog:
         fcntl.flock(mutex_file.fileno(), fcntl.LOCK_UN)
 
   def _append_sync(self, event: dict[str, Any]) -> LogEntry:
-    event_payload = dict(event)
+    event_payload = sanitize_tool_event(event, sink="session_log")
     event_payload["event_schema_version"] = EVENT_SCHEMA_VERSION
+    idempotent = _canonical_idempotent_event(event_payload)
+    contains_responses_state = contains_openai_responses_history(event_payload)
+    if contains_responses_state:
+      event_payload[DURABLE_HISTORY_VERSION_KEY] = RESPONSES_HISTORY_VERSION
+
+    if contains_responses_state:
+      self._ensure_private_replay_storage_sync()
 
     with self.append_mutex_path.open("a+b") as mutex_file:
       fcntl.flock(mutex_file.fileno(), fcntl.LOCK_EX)
       try:
         self._repair_manifest_locked()
+        if idempotent is not None:
+          event_id, fingerprint, canonical = idempotent
+          candidates = self._query_asc_sync(
+            _QuerySpec(
+              event_types={"agent_completion"},
+              tool_name=None,
+              tool_call_id=None,
+              sub_agent_id=None,
+              runner_id=None,
+              role=None,
+              after_seq=None,
+              before_seq=None,
+              after_ts=None,
+              before_ts=None,
+              contains_text=event_id.lower(),
+              has_error=None,
+            ),
+            None,
+          )
+          matches = [
+            candidate
+            for candidate in candidates
+            if candidate.event.get("event_id") == event_id
+          ]
+          for candidate in matches:
+            try:
+              existing = _canonical_idempotent_event(candidate.event)
+            except (TypeError, ValueError) as exc:
+              raise IdempotentEventConflictError(
+                "stored agent completion has malformed identity payload: "
+                f"{event_id}"
+              ) from exc
+            if (
+              existing is None
+              or existing[1] != fingerprint
+              or existing[2] != canonical
+            ):
+              raise IdempotentEventConflictError(
+                "agent completion event identity conflicts with stored "
+                f"payload: {event_id}"
+              )
+          if matches:
+            return matches[0]
         self._rotate_active_if_needed_locked()
+        if contains_responses_state:
+          # Rotation creates a new active file and metadata. Verify and repair
+          # every resulting path before ciphertext can be appended.
+          self._ensure_private_replay_storage_locked()
         with self.path.open("a+b") as handle:
           handle.seek(0, os.SEEK_END)
           file_size = handle.tell()

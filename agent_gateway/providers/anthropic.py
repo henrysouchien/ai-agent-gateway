@@ -3,9 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from dataclasses import replace
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncIterator, Dict, Literal
 
 from ..rate_limit import get_global_token_bucket
 from ..rates import RateTable, UnknownModelError, load_rate_table
@@ -22,6 +21,7 @@ from .anthropic_helpers import (
   _OAUTH_IDENTITY as _OAUTH_IDENTITY,
   _SENSITIVE_ERROR_KEY_RE as _SENSITIVE_ERROR_KEY_RE,
   _SENSITIVE_ERROR_VALUE_RES as _SENSITIVE_ERROR_VALUE_RES,
+  _STRUCTURED_OUTPUTS_BETA_SLUG as _STRUCTURED_OUTPUTS_BETA_SLUG,
   _TOOL_ID_RE as _TOOL_ID_RE,
   _exception_body as _exception_body,
   _exception_status_code as _exception_status_code,
@@ -42,6 +42,243 @@ from .anthropic_helpers import (
 
 
 log = logging.getLogger("agent_gateway.providers.anthropic")
+_DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+_MESSAGE_CACHE_CONTROL = {"type": "ephemeral"}
+_MESSAGE_CACHEABLE_BLOCK_TYPES = frozenset({
+  "bash_code_execution_tool_result",
+  "code_execution_tool_result",
+  "container_upload",
+  "document",
+  "image",
+  "search_result",
+  "server_tool_use",
+  "text",
+  "text_editor_code_execution_tool_result",
+  "tool_reference",
+  "tool_result",
+  "tool_search_tool_result",
+  "tool_use",
+  "web_fetch_tool_result",
+  "web_search_tool_result",
+})
+_MessageCacheBreakpointMode = Literal["normal", "fork"]
+
+
+def _is_cacheable_message_block(block: Any) -> bool:
+  if not isinstance(block, dict):
+    return False
+  block_type = block.get("type")
+  if block_type not in _MESSAGE_CACHEABLE_BLOCK_TYPES:
+    return False
+  if block_type == "text":
+    return bool(str(block.get("text", "")))
+  return True
+
+
+def _message_cache_marker_locations(
+  messages: list[dict[str, Any]],
+) -> list[tuple[int, int]]:
+  return [
+    (message_index, block_index)
+    for message_index, message in enumerate(messages)
+    for block_index, block in enumerate(
+      message.get("content") if isinstance(message.get("content"), list) else []
+    )
+    if isinstance(block, dict) and "cache_control" in block
+  ]
+
+
+def _assert_message_cache_breakpoint_placement(
+  messages: list[dict[str, Any]],
+  *,
+  expected_location: tuple[int, int] | None,
+  mode: _MessageCacheBreakpointMode,
+) -> None:
+  if messages and mode == "normal":
+    assert messages[-1].get("role") == "user", (
+      "final Anthropic request message must have user role"
+    )
+  marker_locations = _message_cache_marker_locations(messages)
+  if expected_location is None:
+    assert marker_locations == [], (
+      f"expected no message cache marker, found {marker_locations}"
+    )
+    return
+
+  assert marker_locations == [expected_location], (
+    f"expected one message cache marker at {expected_location}, found {marker_locations}"
+  )
+  if mode == "fork":
+    content = messages[expected_location[0]].get("content")
+    assert isinstance(content, list)
+    assert _is_cacheable_message_block(content[expected_location[1]]), (
+      "fork message cache marker must remain on a cacheable pinned block"
+    )
+    return
+
+  final_message_index = len(messages) - 1
+  assert expected_location[0] == final_message_index, (
+    "message cache marker must be on the final message"
+  )
+  final_content = messages[final_message_index].get("content")
+  assert isinstance(final_content, list)
+  cacheable_indices = [
+    index
+    for index, block in enumerate(final_content)
+    if _is_cacheable_message_block(block)
+  ]
+  assert cacheable_indices and expected_location[1] == cacheable_indices[-1], (
+    "message cache marker must be on the final message's last cacheable block"
+  )
+
+
+def _normalize_bare_string_message_content(
+  message: dict[str, Any],
+) -> Any:
+  content = message.get("content")
+  if isinstance(content, str):
+    content = [{"type": "text", "text": content}]
+    message["content"] = content
+  return content
+
+
+def _place_message_cache_breakpoint(
+  messages: list[dict[str, Any]],
+  *,
+  mode: _MessageCacheBreakpointMode,
+  allow_marker: bool = True,
+  pinned_position: tuple[int, int] | None = None,
+) -> tuple[list[dict[str, Any]], tuple[int, int] | None]:
+  """Copy messages and authoritatively place the selected cache marker arm."""
+  if mode not in {"normal", "fork"}:
+    raise ValueError(f"unsupported message cache breakpoint mode: {mode}")
+
+  cleaned_messages: list[dict[str, Any]] = []
+  for message in messages:
+    next_message = dict(message)
+    next_message.pop("cache_control", None)
+    content = message.get("content")
+    if isinstance(content, list):
+      next_content: list[Any] = []
+      for block in content:
+        if isinstance(block, dict):
+          next_block = dict(block)
+          next_block.pop("cache_control", None)
+          next_content.append(next_block)
+        else:
+          next_content.append(block)
+      next_message["content"] = next_content
+    cleaned_messages.append(next_message)
+
+  if mode == "fork":
+    if pinned_position is None:
+      raise ValueError("fork cache breakpoint mode requires a pinned position")
+    message_index, block_index = pinned_position
+    if (
+      not allow_marker
+      or message_index >= len(cleaned_messages)
+      or message_index < 0
+    ):
+      raise ValueError(
+        "fork cache breakpoint cannot place its required pinned marker"
+      )
+    content = _normalize_bare_string_message_content(
+      cleaned_messages[message_index]
+    )
+    if (
+      not isinstance(content, list)
+      or block_index < 0
+      or block_index >= len(content)
+      or not _is_cacheable_message_block(content[block_index])
+    ):
+      raise ValueError(
+        "fork cache breakpoint pinned position is not a cacheable block"
+      )
+    marked_block = dict(content[block_index])
+    marked_block["cache_control"] = dict(_MESSAGE_CACHE_CONTROL)
+    content[block_index] = marked_block
+    return cleaned_messages, pinned_position
+
+  if not cleaned_messages:
+    log.debug("Skipping Anthropic message cache breakpoint: request has no messages")
+    return cleaned_messages, None
+
+  final_message = cleaned_messages[-1]
+  if final_message.get("role") != "user":
+    log.debug(
+      "Skipping Anthropic message cache breakpoint: final message role is not user"
+    )
+    return cleaned_messages, None
+
+  final_content = _normalize_bare_string_message_content(final_message)
+
+  if not isinstance(final_content, list):
+    log.debug(
+      "Skipping Anthropic message cache breakpoint: final message has no cacheable block"
+    )
+    return cleaned_messages, None
+
+  marker_index = next(
+    (
+      index
+      for index in range(len(final_content) - 1, -1, -1)
+      if _is_cacheable_message_block(final_content[index])
+    ),
+    None,
+  )
+  if marker_index is None:
+    log.debug(
+      "Skipping Anthropic message cache breakpoint: final message has no cacheable block"
+    )
+    return cleaned_messages, None
+
+  if not allow_marker:
+    log.debug(
+      "Skipping Anthropic message cache breakpoint: request already carries four "
+      "explicit cache breakpoints"
+    )
+    return cleaned_messages, None
+
+  marked_block = dict(final_content[marker_index])
+  marked_block["cache_control"] = dict(_MESSAGE_CACHE_CONTROL)
+  final_content[marker_index] = marked_block
+  return cleaned_messages, (len(cleaned_messages) - 1, marker_index)
+
+
+def _explicit_cache_breakpoint_count(params: dict[str, Any]) -> int:
+  system = params.get("system")
+  tools = params.get("tools")
+  messages = params.get("messages")
+  return (
+    sum(
+      1
+      for block in system if isinstance(block, dict) and "cache_control" in block
+    )
+    if isinstance(system, list)
+    else 0
+  ) + (
+    sum(
+      1
+      for tool in tools if isinstance(tool, dict) and "cache_control" in tool
+    )
+    if isinstance(tools, list)
+    else 0
+  ) + (
+    len(_message_cache_marker_locations(messages))
+    if isinstance(messages, list)
+    else 0
+  )
+
+
+def _bound_anthropic_base_url(config: dict[str, Any]) -> str:
+  configured = {
+    str(config[key]).strip()
+    for key in ("base_url", "baseURL")
+    if str(config.get(key) or "").strip()
+  }
+  if len(configured) > 1:
+    raise ValueError("conflicting Anthropic base_url and baseURL values")
+  return next(iter(configured), _DEFAULT_ANTHROPIC_BASE_URL)
 
 
 def _server_tool_unit_deltas(usage: Any) -> dict[str, int]:
@@ -89,6 +326,102 @@ def _server_tool_units(usage: Any) -> int:
   return next(iter(deltas.values()), 0)
 
 
+def _usage_int(usage: Any, key: str) -> int:
+  if usage is None:
+    return 0
+  value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, 0)
+  try:
+    return int(value or 0)
+  except (TypeError, ValueError):
+    return 0
+
+
+def _usage_iterations(usage: Any) -> list[Any]:
+  if usage is None:
+    return []
+  iterations = usage.get("iterations") if isinstance(usage, dict) else getattr(usage, "iterations", None)
+  plain = _to_plain_dict(iterations)
+  return plain if isinstance(plain, list) else []
+
+
+def _anthropic_usage_totals(usage: Any) -> dict[str, Any]:
+  iterations = _usage_iterations(usage)
+  if not iterations:
+    return {
+      "input_tokens": _usage_int(usage, "input_tokens"),
+      "output_tokens": _usage_int(usage, "output_tokens"),
+      "cache_creation_input_tokens": _usage_int(usage, "cache_creation_input_tokens"),
+      "cache_read_input_tokens": _usage_int(usage, "cache_read_input_tokens"),
+      "provider_unit_deltas": _server_tool_unit_deltas(usage),
+    }
+
+  provider_unit_deltas: dict[str, int] = {}
+  totals = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "provider_unit_deltas": provider_unit_deltas,
+  }
+  for iteration in iterations:
+    totals["input_tokens"] += _usage_int(iteration, "input_tokens")
+    totals["output_tokens"] += _usage_int(iteration, "output_tokens")
+    totals["cache_creation_input_tokens"] += _usage_int(iteration, "cache_creation_input_tokens")
+    totals["cache_read_input_tokens"] += _usage_int(iteration, "cache_read_input_tokens")
+    for operation, count in _server_tool_unit_deltas(iteration).items():
+      provider_unit_deltas[operation] = int(provider_unit_deltas.get(operation, 0) or 0) + int(count)
+  return totals
+
+
+def _unit_delta(
+  totals: dict[str, int],
+  reported: dict[str, int],
+) -> dict[str, int]:
+  delta = {
+    key: max(0, int(value or 0) - int(reported.get(key, 0) or 0))
+    for key, value in totals.items()
+    if int(value or 0) > int(reported.get(key, 0) or 0)
+  }
+  reported.update(totals)
+  return delta
+
+
+def prepare_anthropic_tools(
+  tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+  """Transform strict tool schemas for Anthropic's constrained decoder."""
+
+  if not any(tool.get("strict") is True for tool in tools):
+    return tools
+
+  try:
+    from anthropic import transform_schema
+  except ImportError as exc:
+    raise RuntimeError(
+      "anthropic dependency is required to prepare strict Anthropic tools"
+    ) from exc
+
+  prepared: list[dict[str, Any]] = []
+  for tool in tools:
+    if tool.get("strict") is not True:
+      prepared.append(tool)
+      continue
+    input_schema = tool.get("input_schema")
+    if not isinstance(input_schema, dict):
+      raise ValueError("Strict Anthropic tools require an object input_schema")
+    strict_tool = dict(tool)
+    strict_tool["input_schema"] = transform_schema(input_schema)
+    prepared.append(strict_tool)
+  return prepared
+
+
+def _prepare_anthropic_tools(
+  tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+  """Backward-compatible private seam used by existing provider callers."""
+  return prepare_anthropic_tools(tools)
+
+
 class AnthropicProvider(ModelProvider):
   """`ModelProvider` implementation for Anthropic's Messages API.
 
@@ -97,7 +430,6 @@ class AnthropicProvider(ModelProvider):
   """
 
   name = "anthropic"
-  supports_compaction = True
 
   def __init__(self, *, rate_table: RateTable | None = None):
     self._rate_table = rate_table or load_rate_table()
@@ -111,23 +443,29 @@ class AnthropicProvider(ModelProvider):
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     if str(config.get("auth_mode", "api")).strip().lower() == "oauth":
-      return bool(config.get("auth_token"))
-    return bool(config.get("api_key"))
+      return bool(str(config.get("auth_token") or "").strip())
+    return bool(str(config.get("api_key") or "").strip())
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
     try:
-      from anthropic import AsyncAnthropic
+      from anthropic import AsyncAnthropic, Omit
       import httpx
     except ImportError as exc:
       raise RuntimeError("anthropic dependency is required to use AnthropicProvider") from exc
 
     mode = str(config.get("auth_mode", "api")).strip().lower()
-    client_kwargs: Dict[str, Any] = {}
+    credential_field = "auth_token" if mode == "oauth" else "api_key"
+    credential = str(config.get(credential_field) or "").strip()
+    if not credential:
+      raise RuntimeError(f"No Anthropic {mode} credential configured")
+
+    client_kwargs: Dict[str, Any] = {
+      "base_url": _bound_anthropic_base_url(config),
+    }
     if timeout is not None:
       client_kwargs["timeout"] = httpx.Timeout(timeout=timeout, connect=5.0)
 
     if mode == "oauth":
-      from anthropic import Omit
       oauth_headers = {
         "X-Api-Key": Omit(),
         "anthropic-beta": ",".join([*_OAUTH_BETA_SLUGS, *_COMMON_BETA_SLUGS]),
@@ -137,24 +475,22 @@ class AnthropicProvider(ModelProvider):
 
       return AsyncAnthropic(
         api_key="",
-        auth_token=str(config.get("auth_token", "")),
+        auth_token=credential,
         default_headers=oauth_headers,
         **client_kwargs,
       )
 
+    api_headers: Dict[str, Any] = {
+      "Authorization": Omit(),
+    }
     if _COMMON_BETA_SLUGS:
-      client_kwargs["default_headers"] = {"anthropic-beta": ",".join(_COMMON_BETA_SLUGS)}
-    # Suppress ANTHROPIC_AUTH_TOKEN env pickup — SDK reads it when auth_token kwarg
-    # is omitted, and auth_token="" causes LocalProtocolError (Bearer with empty token).
-    saved_token = os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-    try:
-      return AsyncAnthropic(
-        api_key=str(config.get("api_key", "")),
-        **client_kwargs,
-      )
-    finally:
-      if saved_token is not None:
-        os.environ["ANTHROPIC_AUTH_TOKEN"] = saved_token
+      api_headers["anthropic-beta"] = ",".join(_COMMON_BETA_SLUGS)
+    return AsyncAnthropic(
+      api_key=credential,
+      auth_token="",
+      default_headers=api_headers,
+      **client_kwargs,
+    )
 
   async def close_client(self, client: Any, timeout: float = 2.0) -> None:
     if client is None:
@@ -227,11 +563,40 @@ class AnthropicProvider(ModelProvider):
         else:
           system_blocks.append(block)
 
+    prepared_tools = _prepare_anthropic_tools(tools)
+    preceding_breakpoint_count = (
+      sum(
+        1
+        for block in system_blocks
+        if isinstance(block, dict) and "cache_control" in block
+      )
+      if system_blocks
+      else 0
+    ) + sum(
+      1
+      for tool in prepared_tools
+      if isinstance(tool, dict) and "cache_control" in tool
+    )
+    fork_mode = bool(kwargs.get("fork_mode", False))
+    raw_fork_marker = kwargs.get("fork_marker_position")
+    fork_marker_position = (
+      tuple(raw_fork_marker)
+      if isinstance(raw_fork_marker, (list, tuple))
+      and len(raw_fork_marker) == 2
+      else None
+    )
+    request_messages, message_marker_location = _place_message_cache_breakpoint(
+      messages,
+      mode="fork" if fork_mode else "normal",
+      allow_marker=preceding_breakpoint_count < 4,
+      pinned_position=fork_marker_position,
+    )
+
     params: Dict[str, Any] = {
       "model": model,
       "max_tokens": max_tokens,
-      "messages": messages,
-      "tools": tools,
+      "messages": request_messages,
+      "tools": prepared_tools,
       "_provider_auth_mode": auth_mode,
     }
     if system_blocks:
@@ -249,7 +614,7 @@ class AnthropicProvider(ModelProvider):
     params.update(effort_resolution.payload_fragments)
 
     compaction_trigger = kwargs.get("compaction_trigger")
-    if compaction_trigger is not None:
+    if compaction_trigger is not None and model_info.supports_native_compaction:
       compact_edit: Dict[str, Any] = {
         "type": "compact_20260112",
         "trigger": {"type": "input_tokens", "value": compaction_trigger},
@@ -259,6 +624,19 @@ class AnthropicProvider(ModelProvider):
       if compaction_instructions is not None:
         compact_edit["instructions"] = compaction_instructions
       params["context_management"] = {"edits": [compact_edit]}
+
+    if __debug__:
+      try:
+        _assert_message_cache_breakpoint_placement(
+          request_messages,
+          expected_location=message_marker_location,
+          mode="fork" if fork_mode else "normal",
+        )
+        assert _explicit_cache_breakpoint_count(params) <= 4, (
+          "Anthropic requests may carry at most four explicit cache breakpoints"
+        )
+      except AssertionError as exc:
+        log.error("Anthropic cache breakpoint invariant failed: %s", exc)
 
     return params
 
@@ -489,7 +867,10 @@ class AnthropicProvider(ModelProvider):
       if missing:
         result.append({"role": "user", "content": missing})
 
-    return truncate_to_last_compaction(result)
+    return truncate_to_last_compaction(
+      result,
+      compaction_as_text=not model_info.supports_native_compaction,
+    )
 
   async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
     bucket = get_global_token_bucket()
@@ -499,6 +880,14 @@ class AnthropicProvider(ModelProvider):
     stream_params = dict(params)
     auth_mode = str(stream_params.pop("_provider_auth_mode", "api")).strip().lower()
     use_compaction = "context_management" in stream_params
+    request_tools = stream_params.get("tools")
+    use_structured_outputs = (
+      isinstance(request_tools, list)
+      and any(
+        isinstance(tool, dict) and tool.get("strict") is True
+        for tool in request_tools
+      )
+    )
     betas: list[str] = []
     stop_reason = ""
     current_block_type: str | None = None
@@ -510,12 +899,28 @@ class AnthropicProvider(ModelProvider):
     current_thinking = ""
     current_signature = ""
     current_compaction: Any = None
+    message_start_usage = {
+      "input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+    }
+    reported_usage_update = {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+    }
+    reported_provider_unit_deltas: dict[str, int] = {}
 
     try:
-      if use_compaction:
-        betas = [*_COMMON_BETA_SLUGS, _COMPACTION_BETA_SLUG]
+      if use_compaction or use_structured_outputs:
+        betas = list(_COMMON_BETA_SLUGS)
         if auth_mode == "oauth":
-          betas = [*_OAUTH_BETA_SLUGS, *_COMMON_BETA_SLUGS, _COMPACTION_BETA_SLUG]
+          betas = [*_OAUTH_BETA_SLUGS, *betas]
+        if use_structured_outputs:
+          betas.append(_STRUCTURED_OUTPUTS_BETA_SLUG)
+        if use_compaction:
+          betas.append(_COMPACTION_BETA_SLUG)
         stream_cm = client.beta.messages.stream(**stream_params, betas=betas)
       else:
         stream_cm = client.messages.stream(**stream_params)
@@ -531,12 +936,24 @@ class AnthropicProvider(ModelProvider):
           if event_type == "message_start":
             message = getattr(event, "message", None)
             usage = getattr(message, "usage", None) if message is not None else None
+            reported_model = str(
+              (getattr(message, "model", "") if message is not None else "")
+              or ""
+            ).strip() or None
+            message_start_usage = {
+              "input_tokens": getattr(usage, "input_tokens", 0) if usage is not None else 0,
+              "cache_creation_input_tokens": (
+                getattr(usage, "cache_creation_input_tokens", 0) if usage is not None else 0
+              ),
+              "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", 0) if usage is not None else 0,
+            }
             yield StreamEvent(
               type="message_start",
-              input_tokens=getattr(usage, "input_tokens", 0) if usage is not None else 0,
+              provider_reported_model=reported_model,
+              input_tokens=message_start_usage["input_tokens"],
               output_tokens=getattr(usage, "output_tokens", 0) if usage is not None else 0,
-              cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) if usage is not None else 0,
-              cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) if usage is not None else 0,
+              cache_creation_tokens=message_start_usage["cache_creation_input_tokens"],
+              cache_read_tokens=message_start_usage["cache_read_input_tokens"],
               # Anthropic reports separately billed server-tool units on the
               # final usage snapshot; avoid counting the same call twice.
               provider_units=0,
@@ -642,7 +1059,9 @@ class AnthropicProvider(ModelProvider):
                   deployment_secret=get_audit_hmac_secret(),
                 )
               except Exception:
-                block["input"] = tool_input
+                from ..secret_boundary import sanitization_failure_tool_input
+
+                block["input"] = sanitization_failure_tool_input()
               yield StreamEvent(
                 type="tool_use_end",
                 tool_id=str(current_tool_id),
@@ -672,13 +1091,40 @@ class AnthropicProvider(ModelProvider):
             stop_reason = str(getattr(delta, "stop_reason", "") or "")
             usage = getattr(event, "usage", None)
             if usage is not None:
+              usage_totals = _anthropic_usage_totals(usage)
+              current_totals = {
+                "input_tokens": max(
+                  0,
+                  int(usage_totals["input_tokens"])
+                  - int(message_start_usage["input_tokens"]),
+                ),
+                "output_tokens": int(usage_totals["output_tokens"]),
+                "cache_creation_input_tokens": max(
+                  0,
+                  int(usage_totals["cache_creation_input_tokens"])
+                  - int(message_start_usage["cache_creation_input_tokens"]),
+                ),
+                "cache_read_input_tokens": max(
+                  0,
+                  int(usage_totals["cache_read_input_tokens"])
+                  - int(message_start_usage["cache_read_input_tokens"]),
+                ),
+              }
+              usage_delta = _unit_delta(current_totals, reported_usage_update)
+              provider_unit_deltas = _unit_delta(
+                {
+                  str(operation): int(count)
+                  for operation, count in dict(usage_totals.get("provider_unit_deltas") or {}).items()
+                },
+                reported_provider_unit_deltas,
+              )
               yield StreamEvent(
                 type="usage_update",
-                input_tokens=getattr(usage, "input_tokens", 0) or 0,
-                output_tokens=getattr(usage, "output_tokens", 0) or 0,
-                cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
-                cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-                provider_unit_deltas=_server_tool_unit_deltas(usage),
+                input_tokens=usage_delta.get("input_tokens", 0),
+                output_tokens=usage_delta.get("output_tokens", 0),
+                cache_creation_tokens=usage_delta.get("cache_creation_input_tokens", 0),
+                cache_read_tokens=usage_delta.get("cache_read_input_tokens", 0),
+                provider_unit_deltas=provider_unit_deltas,
               )
     except Exception as exc:
       if self.is_retryable_error(exc):

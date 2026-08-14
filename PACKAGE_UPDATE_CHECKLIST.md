@@ -48,8 +48,25 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 ## Publish
 
 - [ ] **Commit** the feature + doc updates together
-- [ ] **Bump version** — patch for fixes, minor for features, major for breaking changes
-- [ ] **`scripts/publish_agent_gateway.sh --patch|--minor|--major --yes`**
+- [ ] **Identify the immutable public baseline** — read the exact
+  `Source-Commit` trailer from the latest dist sync commit (for releases before
+  that trailer existed, establish and record the exact source commit by
+  byte-for-byte comparison); do not infer the boundary from dates or the most
+  recent version-looking source commit
+- [ ] **Review the complete public delta** — inspect commits, public exports,
+  added/changed/deleted files, dependencies, examples, and migrations from that
+  immutable source commit through the release candidate
+- [ ] **Bump version** — while the package is `0.x`, use a patch for compatible
+  fixes and a minor for features or breaking changes; from `1.0` onward, use a
+  major for breaking changes
+- [ ] **Write truthful release notes** — categorize the complete public delta,
+  call out breaking changes and executable migrations, and retain explicit
+  validation qualifications and operational residuals
+- [ ] **Run the publisher** — `scripts/publish_agent_gateway.sh --yes`; the
+  optional `--minor` or `--major` flag only selects the suggested next version
+  when the source-owned version is already present on PyPI
+- [ ] **Verify dist provenance** — the dist sync commit must contain the exact
+  40-hex `Source-Commit` captured by the publisher before sync
 - [ ] **`pip install --upgrade ai-agent-gateway`** locally after publish
 
 ### Publish-script notes

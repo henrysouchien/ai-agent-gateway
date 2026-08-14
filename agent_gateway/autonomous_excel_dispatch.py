@@ -37,6 +37,11 @@ def _fallback_classify_addin_dispatch_error(error: BaseException | str) -> str:
     return "taskpane_disconnected"
   if "chat_relay_disabled" in message or "chat relay is disabled" in message:
     return "chat_relay_disabled"
+  if (
+    "relay_restart_in_progress" in message
+    or "relay restart in progress" in message
+  ):
+    return "relay_restart_in_progress"
   if "focus_lost" in message or (
     "lost focus" in message and ("workbook" in message or "multiple workbooks" in message)
   ):
@@ -103,6 +108,11 @@ def _classified_error(
 ) -> dict[str, Any]:
   classification_source = message if payload is None else f"{message} {payload}"
   reason = _classify_addin_dispatch_error(classification_source)
+  payload_code = None
+  if isinstance(payload, dict):
+    candidate = payload.get("code")
+    if isinstance(candidate, str) and candidate.strip():
+      payload_code = candidate.strip()
   details: dict[str, Any] = {"reason": reason}
   if status_code is not None:
     details["status_code"] = status_code
@@ -114,7 +124,7 @@ def _classified_error(
     details["state"] = state
   if payload is not None:
     details["payload"] = payload
-  return _error(code or reason, message, **details)
+  return _error(code or payload_code or reason, message, **details)
 
 
 def _is_positive_number(value: Any) -> bool:

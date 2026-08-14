@@ -2,16 +2,25 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Tuple, Union
 
+from .child_result_trust import UNTRUSTED_CHILD_RESULTS_POLICY
+
 
 def build_notification_reminder(notification_queue: Any, *, max_count: int) -> str:
-  """Peek notifications into system prompt text. Non-destructive."""
-  if notification_queue.pending_count == 0:
-    return ""
-  notifications = notification_queue.peek(max_count=max_count)
-  parts = [notification.format_xml() for notification in notifications]
+  """Return the resident child-result trust policy and queued notifications."""
+  notifications = (
+    notification_queue.peek(max_count=max_count)
+    if notification_queue.pending_count > 0
+    else []
+  )
+  parts = [
+    '<untrusted-child-results trust="untrusted-data">',
+    f"  <handling-policy>{UNTRUSTED_CHILD_RESULTS_POLICY}</handling-policy>",
+    *(notification.format_xml() for notification in notifications),
+  ]
   remaining = notification_queue.pending_count - len(notifications)
   if remaining > 0:
     parts.append(f"[{remaining} more task notification(s) pending]")
+  parts.append("</untrusted-child-results>")
   return "\n".join(parts)
 
 

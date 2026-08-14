@@ -3,10 +3,25 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from .artifact_paths import canonicalize_ticker
+from agent_workflow_contracts import TaskResult
+from pydantic import ValidationError
+
+from .skill_lifecycle import (
+  SkillLifecycleArtifactIdentity,
+  SkillLifecycleScope,
+  TopLevelSkillLifecycleMetadata,
+)
+from .sub_agent_skill_state import classify_child_outcome
 
 
 FMS_DOOR_PREFIX = "fms_"
+_FAILURE_FMS_STATUSES = frozenset({
+  "error",
+  "failed",
+  "failure",
+  "invalid",
+  "rejected",
+})
 
 
 def build_skill_result_captured_event(
@@ -14,28 +29,54 @@ def build_skill_result_captured_event(
   skill_run_id: str,
   skill: str,
   ticker: str | None,
+  scope: SkillLifecycleScope,
+  portfolio_id: str | None,
   entries: Iterable[Any],
   result: Any | None,
   error: dict[str, Any] | None,
   output_memory_file: str | None = None,
   cost_usd: float | None = None,
   duration_s: float | None = None,
+  canonical_result_evidence_authoritative: bool = False,
 ) -> dict[str, Any]:
+  artifact_identity = SkillLifecycleArtifactIdentity(
+    scope=scope,
+    ticker=ticker,
+    portfolio_id=portfolio_id,
+  )
+  lifecycle = TopLevelSkillLifecycleMetadata(
+    skill_run_id=skill_run_id,
+    skill=skill,
+    **artifact_identity.identity_fields(),
+  )
   entry_list = list(entries)
   fms_results = extract_fms_results(entry_list)
   artifact_events = extract_artifact_events(entry_list)
+  canonical_evidence = _canonical_task_result_evidence(result)
+  if (
+    canonical_result_evidence_authoritative
+    and canonical_evidence is not None
+  ):
+    fms_results, artifact_events = canonical_evidence
   primary_fms = _primary_fms(fms_results)
-  has_error = error is not None
-  outcome = "error" if has_error else "success"
+  classification = classify_child_outcome(result, error)
   raw_status = primary_fms.get("status") if isinstance(primary_fms, dict) else None
-  return {
+  normalized_fms_status = str(raw_status or "").strip().lower()
+  has_error = (
+    not classification.succeeded
+    or normalized_fms_status in _FAILURE_FMS_STATUSES
+  )
+  outcome = "error" if has_error else "success"
+  event = {
     "type": "skill_result_captured",
-    "skill_run_id": skill_run_id,
-    "skill": skill,
-    "ticker": _result_ticker(ticker, fms_results, artifact_events),
+    **lifecycle.identity_fields(),
     "exit_code": 1 if has_error else 0,
     "outcome": outcome,
-    "status": str(raw_status) if raw_status is not None else outcome,
+    "status": (
+      str(raw_status)
+      if raw_status is not None
+      else classification.outcome
+    ),
     "gate_code": _gate_code(primary_fms),
     "artifact_refs": _artifact_refs(fms_results, artifact_events),
     "proposal_ids": _proposal_ids(fms_results),
@@ -45,9 +86,43 @@ def build_skill_result_captured_event(
     "output_memory_file": output_memory_file,
     "cost_usd": cost_usd,
     "duration_s": duration_s,
-    "error": _result_error(error, fms_results),
+    "compaction_count": _compaction_count(entry_list),
+    "error": _result_error(
+      classification.error,
+      fms_results,
+      fallback_status=(normalized_fms_status if has_error else None),
+    ),
     "warnings": _warnings(result, fms_results),
+    "approval_outcome": None,
+    "approval_id": None,
+    "approval_tool_name": None,
   }
+  return lifecycle.normalize_result_event(event)
+
+
+def _canonical_task_result_evidence(
+  result: Any | None,
+) -> tuple[
+  list[dict[str, Any]],
+  list[dict[str, Any]],
+] | None:
+  """Recover only durable artifacts published by canonical TaskResult."""
+
+  try:
+    task_result = TaskResult.model_validate(result)
+  except ValidationError:
+    return None
+  return (
+    [],
+    [
+      {
+        "type": "artifact_ready",
+        "artifact_name": artifact.name,
+        "artifact_ref": artifact.content.content_id,
+      }
+      for artifact in task_result.values.artifacts
+    ]
+  )
 
 
 def extract_fms_results(
@@ -98,6 +173,15 @@ def _is_fms_door_event(
 def _entry_event(entry: Any) -> dict[str, Any] | None:
   event = getattr(entry, "event", entry)
   return event if isinstance(event, dict) else None
+
+
+def _compaction_count(entries: Iterable[Any]) -> int:
+  return sum(
+    1
+    for entry in entries
+    if (event := _entry_event(entry)) is not None
+    and event.get("type") == "compaction"
+  )
 
 
 def _primary_fms(fms_results: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -178,34 +262,27 @@ def _warnings(result: Any | None, fms_results: Iterable[dict[str, Any]]) -> list
   return warnings
 
 
-def _result_error(error: dict[str, Any] | None, fms_results: Iterable[dict[str, Any]]) -> str | None:
+def _result_error(
+  error: dict[str, Any] | None,
+  fms_results: Iterable[dict[str, Any]],
+  *,
+  fallback_status: str | None = None,
+) -> str | None:
   if isinstance(error, dict):
     message = error.get("message") or error.get("error") or error.get("code")
     if message:
       return str(message)
   primary_fms = _primary_fms(fms_results)
   raw_error = primary_fms.get("error") if isinstance(primary_fms, dict) else None
-  return str(raw_error) if raw_error else None
-
-
-def _result_ticker(
-  context_ticker: str | None,
-  fms_results: Iterable[dict[str, Any]],
-  artifact_events: Iterable[dict[str, Any]],
-) -> str | None:
-  for item in fms_results:
-    if not isinstance(item, dict):
-      continue
-    raw = item.get("ticker")
-    if raw is not None and str(raw).strip():
-      return canonicalize_ticker(raw)
-  for event in artifact_events:
-    if not isinstance(event, dict):
-      continue
-    raw = event.get("ticker")
-    if raw is not None and str(raw).strip():
-      return canonicalize_ticker(raw)
-  return canonicalize_ticker(context_ticker) if context_ticker else None
+  if isinstance(raw_error, dict):
+    message = raw_error.get("message") or raw_error.get("type")
+    if message:
+      return str(message)
+  if raw_error:
+    return str(raw_error)
+  if fallback_status:
+    return f"FMS returned {fallback_status}"
+  return None
 
 
 __all__ = [

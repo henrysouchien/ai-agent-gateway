@@ -43,9 +43,11 @@ def build_autonomous_cmd(
   python_executable: str,
   profile: str,
   mode: str,
-  task: str | None,
-  skill: str | None,
-  context: str | None,
+  task: str | None = None,
+  skill: str | None = None,
+  pack: str | None = None,
+  deliver: bool = True,
+  context: str | None = None,
   ticker: str | None = None,
   dev_mode: bool = False,
   max_budget_usd: float | None = None,
@@ -59,15 +61,19 @@ def build_autonomous_cmd(
     require_fixture_provider_available_func("fixture profile dispatch", error_type=ValueError)
 
   normalized_mode = mode.strip().lower()
-  if normalized_mode not in {"once", "task", "skill"}:
-    raise ValueError("mode must be once, task, or skill")
+  if normalized_mode not in {"once", "task", "skill", "pack"}:
+    raise ValueError("mode must be once, task, skill, or pack")
+  if type(deliver) is not bool:
+    raise ValueError("deliver must be a boolean")
   normalized_max_budget_usd = normalize_max_budget_usd(max_budget_usd)
   if normalized_max_budget_usd is not None and normalized_mode != "skill":
     raise ValueError("max_budget_usd requires mode='skill'")
+  if not deliver and normalized_mode != "skill":
+    raise ValueError("deliver=False requires mode='skill'")
 
   if dev_mode and normalized_mode == "task":
     raise ValueError("dev_mode is implicit for mode='task'; do not pass dev_mode=True")
-  if dev_mode and normalized_mode == "once":
+  if dev_mode and normalized_mode in {"once", "pack"}:
     raise ValueError("dev_mode requires mode='skill'; use mode='task' for dev tasks instead")
 
   cmd = [python_executable, "-m", "agent.autonomous", "--profile", normalized_profile]
@@ -75,25 +81,35 @@ def build_autonomous_cmd(
     cmd.append("--dev")
 
   if normalized_mode == "once":
-    if task or skill or context:
-      raise ValueError("mode='once' does not accept task, skill, or context")
+    if task or skill or pack or context or ticker:
+      raise ValueError("mode='once' does not accept task, skill, pack, context, or ticker")
     return cmd
 
   if normalized_mode == "task":
     if not task or not task.strip():
       raise ValueError("task is required when mode='task'")
-    if skill or context:
+    if skill or pack or context or ticker:
       raise ValueError("mode='task' only accepts the task parameter")
     cmd.extend(["--task", task.strip()])
+    return cmd
+
+  if normalized_mode == "pack":
+    if not pack or not pack.strip():
+      raise ValueError("pack is required when mode='pack'")
+    if task or skill or context or ticker:
+      raise ValueError("mode='pack' only accepts the pack parameter")
+    cmd.extend(["--pack", pack.strip()])
     return cmd
 
   if not skill or not skill.strip():
     raise ValueError("skill is required when mode='skill'")
   if is_fixture_skill_name_func(skill):
     require_fixture_provider_available_func("fixture skill dispatch", error_type=ValueError)
-  if task:
-    raise ValueError("mode='skill' does not accept task")
+  if task or pack:
+    raise ValueError("mode='skill' does not accept task or pack")
   cmd.extend(["--skill", skill.strip()])
+  if not deliver:
+    cmd.append("--no-deliver")
   if normalized_max_budget_usd is not None:
     cmd.extend(["--max-budget-usd", str(normalized_max_budget_usd)])
   if ticker and ticker.strip():

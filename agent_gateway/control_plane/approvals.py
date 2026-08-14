@@ -21,7 +21,21 @@ from agent_gateway.batch_approval_projection import (
 )
 from agent_gateway.session import AuthManager, GatewaySession
 
-from .runs_helpers import _session_owner_user_id
+from .runs_helpers import (
+  _record_owner_user_id,
+  _session_matches_owner,
+  _session_owner_user_id,
+)
+from .autonomous_approval_delivery import (
+  autonomous_approval_authoritative_identity,
+  autonomous_approval_delivery_context,
+  autonomous_decision_unavailable,
+  autonomous_run_accepts_approval_decisions,
+  deliver_autonomous_approval_outbox,
+)
+from .autonomous_approval_drainer import (
+  wake_autonomous_approval_delivery,
+)
 
 
 class ControlApprovalDecisionRequest(BaseModel):
@@ -51,7 +65,7 @@ def _target_chat_session_for_user(
   channel: str | None,
 ) -> GatewaySession | None:
   session = auth.session_store.get_session(run_id)
-  if session is None or session.kind != "chat" or session.user_id != user_id:
+  if session is None or session.kind != "chat" or not _session_matches_owner(session, user_id):
     return None
   if not _channel_matches(session.channel, channel):
     return None
@@ -78,33 +92,11 @@ def _autonomous_record_for_user(
   if registry is None:
     return None
   record = registry._find_by_control_run_id(run_id)
-  if record is None or record.user_id != user_id:
+  if record is None or _record_owner_user_id(record) != user_id:
     return None
   if not _channel_matches(record.channel, channel):
     return None
   return record
-
-
-def _autonomous_run_accepts_approval_decisions(record: AutonomousTask) -> bool:
-  if record.state not in {"running", "approval_pending"}:
-    return False
-  if record.proc is not None and record.proc.returncode is not None:
-    return False
-  return True
-
-
-def _autonomous_decision_unavailable(record: AutonomousTask) -> str | None:
-  if not _autonomous_run_accepts_approval_decisions(record):
-    return "Autonomous run is not running"
-  if record.approval_decisions_path is None:
-    return "Autonomous approval inbox unavailable"
-  try:
-    record.approval_decisions_path.parent.mkdir(parents=True, exist_ok=True)
-    with record.approval_decisions_path.open("a", encoding="utf-8"):
-      pass
-  except OSError as exc:
-    return f"Autonomous approval inbox unavailable: {exc}"
-  return None
 
 
 def _autonomous_pending_event(record: AutonomousTask, approval_id: str) -> dict[str, Any] | None:
@@ -205,7 +197,7 @@ async def _delegated_pending_approval_for_user(
   delegation_grant_cache: dict[str, Any | None],
 ) -> tuple[GatewaySession, str, dict[str, Any]] | None:
   session = auth.session_store.get_session(run_id)
-  if session is None or session.kind != "chat" or session.user_id != user_id:
+  if session is None or session.kind != "chat" or not _session_matches_owner(session, user_id):
     return None
   if _channel_matches(session.channel, channel):
     return None
@@ -222,7 +214,7 @@ async def _delegated_pending_approval_for_user(
 
 
 async def _approval_records_for_autonomous_task(store: Any, record: AutonomousTask) -> list[dict[str, Any]]:
-  if not _autonomous_run_accepts_approval_decisions(record):
+  if not autonomous_run_accepts_approval_decisions(record):
     return []
   approvals: list[dict[str, Any]] = []
   seen: set[str] = set()
@@ -238,8 +230,21 @@ async def _approval_records_for_autonomous_task(store: Any, record: AutonomousTa
     seen.add(approval_id_text)
     request_record = await store.get(approval_id_text)
     if request_record is not None and request_record.state == "pending_user":
+      tool_call_id = str(event.get("tool_call_id") or "")
+      if not tool_call_id:
+        continue
+      expected_identity = autonomous_approval_authoritative_identity(
+        record,
+        approval_id=approval_id_text,
+        tool_call_id=tool_call_id,
+      )
+      if any(
+        getattr(request_record, field_name, None) != expected
+        for field_name, expected in expected_identity.items()
+      ):
+        continue
       approval = _approval_request_to_dict(request_record)
-      approval["session_id"] = record.control_run_id
+      approval["session_id"] = record.session_id
       approval["run_id"] = record.control_run_id
       approvals.append(approval)
   return approvals
@@ -317,7 +322,8 @@ async def _visible_pending_approval_for_run(
   authenticated: GatewaySession,
   batch_task_registry: Any = None,
 ) -> tuple[Any, Any] | None:
-  target_session = _target_chat_session_for_user(auth, run_id, authenticated.user_id, authenticated.channel)
+  owner_user_id = _session_owner_user_id(authenticated)
+  target_session = _target_chat_session_for_user(auth, run_id, owner_user_id, authenticated.channel)
   if target_session is not None and store is not None:
     pending = _find_pending_approval(target_session, approval_id)
     if pending is not None:
@@ -330,7 +336,7 @@ async def _visible_pending_approval_for_run(
       store,
       run_id,
       approval_id,
-      authenticated.user_id,
+      owner_user_id,
       authenticated.channel,
       {},
     )
@@ -342,7 +348,7 @@ async def _visible_pending_approval_for_run(
     batch_task_registry,
     run_id=run_id,
     approval_id=approval_id,
-    owner_user_id=_session_owner_user_id(authenticated),
+    owner_user_id=owner_user_id,
     channel=authenticated.channel,
   )
   validated = await _validated_batch_projection(batch_projection)
@@ -353,12 +359,12 @@ async def _visible_pending_approval_for_run(
   record = _autonomous_record_for_user(
     autonomous_registry,
     run_id,
-    authenticated.user_id,
+    owner_user_id,
     authenticated.channel,
   )
   if record is None:
     return None
-  if not _autonomous_run_accepts_approval_decisions(record):
+  if not autonomous_run_accepts_approval_decisions(record):
     return None
   if _autonomous_pending_event(record, approval_id) is None:
     return None
@@ -397,6 +403,7 @@ def build_approvals_router(
   async def list_approvals(request: Request) -> JSONResponse:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
+    owner_user_id = _session_owner_user_id(authenticated)
     auth.session_store.cleanup_expired()
     store = getattr(request.app.state, "gateway_approval_store", None)
 
@@ -404,7 +411,7 @@ def build_approvals_router(
     delegation_grant_cache: dict[str, Any | None] = {}
     if store is not None:
       for session in auth.session_store.sessions.values():
-        if session.kind != "chat" or session.user_id != authenticated.user_id:
+        if session.kind != "chat" or not _session_matches_owner(session, owner_user_id):
           continue
         if _channel_matches(session.channel, authenticated.channel):
           approvals.extend(await _approval_records_for_session(store, session))
@@ -413,13 +420,13 @@ def build_approvals_router(
           await _approval_records_for_session(
             store,
             session,
-            delegated_to_user_id=authenticated.user_id,
+            delegated_to_user_id=owner_user_id,
             delegation_grant_cache=delegation_grant_cache,
           )
         )
     if store is not None and autonomous_registry is not None:
       for record in autonomous_registry._tasks.values():
-        if record.user_id != authenticated.user_id:
+        if _record_owner_user_id(record) != owner_user_id:
           continue
         if not _channel_matches(record.channel, authenticated.channel):
           continue
@@ -427,7 +434,7 @@ def build_approvals_router(
     approvals.extend(
       await _approval_records_for_batches(
         getattr(request.app.state, "batch_task_registry", None),
-        owner_user_id=_session_owner_user_id(authenticated),
+        owner_user_id=owner_user_id,
         channel=authenticated.channel,
       )
     )
@@ -491,7 +498,8 @@ def build_approvals_router(
   ) -> JSONResponse:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
-    target_session = _target_chat_session_for_user(auth, run_id, authenticated.user_id, authenticated.channel)
+    owner_user_id = _session_owner_user_id(authenticated)
+    target_session = _target_chat_session_for_user(auth, run_id, owner_user_id, authenticated.channel)
     batch_request_record = None
     batch_projection = None
     if target_session is None:
@@ -499,7 +507,7 @@ def build_approvals_router(
         getattr(request.app.state, "batch_task_registry", None),
         run_id=run_id,
         approval_id=approval_id,
-        owner_user_id=_session_owner_user_id(authenticated),
+        owner_user_id=owner_user_id,
         channel=authenticated.channel,
       )
       validated = await _validated_batch_projection(projection)
@@ -515,7 +523,7 @@ def build_approvals_router(
           store,
           run_id,
           approval_id,
-          authenticated.user_id,
+          owner_user_id,
           authenticated.channel,
           {},
         )
@@ -526,7 +534,7 @@ def build_approvals_router(
         record = _autonomous_record_for_user(
           autonomous_registry,
           run_id,
-          authenticated.user_id,
+          owner_user_id,
           authenticated.channel,
         )
         if record is None:
@@ -539,7 +547,61 @@ def build_approvals_router(
         nonce = str(pending_event.get("nonce") or "")
         if not tool_call_id or not nonce:
           return _json_error(409, "Approval request is missing routing metadata")
-        unavailable = _autonomous_decision_unavailable(record)
+        if store is None:
+          return _json_error(
+            503,
+            "Autonomous approval delivery outbox unavailable",
+          )
+        get_delivery = getattr(
+          store,
+          "get_autonomous_approval_delivery",
+          None,
+        )
+        if not callable(get_delivery):
+          return _json_error(
+            503,
+            "Autonomous approval delivery outbox unavailable",
+          )
+        existing_delivery = await get_delivery(
+          approval_id,
+          tool_call_id=tool_call_id,
+          nonce=nonce,
+        )
+        if existing_delivery is not None:
+          wake_autonomous_approval_delivery(request.app.state)
+          request_record = await store.get(approval_id)
+          if request_record is None:
+            return _json_error(
+              409,
+              "Autonomous approval delivery has no durable request",
+            )
+          try:
+            await deliver_autonomous_approval_outbox(
+              registry=autonomous_registry,
+              store=store,
+              record=record,
+              request_record=request_record,
+              delivery=existing_delivery,
+              approval_id=approval_id,
+              tool_call_id=tool_call_id,
+              nonce=nonce,
+              approved=payload.approved,
+              user_id=owner_user_id,
+              channel=authenticated.channel,
+            )
+          except PermissionError:
+            return _json_error(404, "Run approval not found")
+          except OSError as exc:
+            return _json_error(
+              409,
+              f"Autonomous approval inbox unavailable: {exc}",
+            )
+          except (RuntimeError, ValueError) as exc:
+            return _json_error(409, str(exc))
+          return JSONResponse({
+            "approval": _approval_request_to_dict(request_record),
+          })
+        unavailable = autonomous_decision_unavailable(record)
         if unavailable is not None:
           return _json_error(409, unavailable)
         pending_entry = {
@@ -555,16 +617,18 @@ def build_approvals_router(
         }
         approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
         shim_session = GatewaySession(
-          session_id=record.control_run_id,
+          session_id=record.session_id,
           api_key_hash="control-autonomous",
           created_at=int(record.started_at),
           expires_at=int(time.time()) + 600,
-          user_id=record.user_id,
+          user_id=owner_user_id,
           user_email=record.user_email,
           role=authenticated.role,
           kind="chat",
           channel=record.channel,
         )
+        shim_session.owner_user_id = owner_user_id
+        shim_session.raw_user_id = getattr(record, "raw_user_id", None) or record.user_id
         shim_session.approval_store = getattr(request.app.state, "gateway_approval_store", None)
         shim_session.approval_policy = getattr(request.app.state, "gateway_approval_policy", None)
         shim_session.pending_tools[tool_call_id] = pending_entry
@@ -575,27 +639,58 @@ def build_approvals_router(
             pending_entry=pending_entry,
             tool_call_id=tool_call_id,
             nonce=nonce,
-            decider_id=authenticated.user_id,
+            decider_id=_session_owner_user_id(authenticated),
             decider_role=getattr(authenticated, "role", None),
             approved=payload.approved,
             allow_tool_type=payload.allow_tool_type,
             reason=payload.reason,
             app_state=request.app.state,
+            authoritative_store=store,
+            authoritative_policy=getattr(
+              request.app.state,
+              "gateway_approval_policy",
+              None,
+            ),
+            authoritative_identity=autonomous_approval_authoritative_identity(
+              record,
+              approval_id=approval_id,
+              tool_call_id=tool_call_id,
+            ),
+            autonomous_delivery=autonomous_approval_delivery_context(
+              record,
+              tool_call_id=tool_call_id,
+              nonce=nonce,
+            ),
           )
         except ApprovalActionError as exc:
           return JSONResponse(exc.payload, status_code=exc.status_code)
+        finally:
+          wake_autonomous_approval_delivery(request.app.state)
         if "approval" in result:
+          delivery = await get_delivery(
+            approval_id,
+            tool_call_id=tool_call_id,
+            nonce=nonce,
+          )
+          request_record = await store.get(approval_id)
+          if delivery is None or request_record is None:
+            return _json_error(
+              503,
+              "Autonomous approval delivery outbox commit unavailable",
+            )
           try:
-            await autonomous_registry.send_approval_decision(
-              record.control_run_id,
-              user_id=authenticated.user_id,
-              channel=authenticated.channel,
+            await deliver_autonomous_approval_outbox(
+              registry=autonomous_registry,
+              store=store,
+              record=record,
+              request_record=request_record,
+              delivery=delivery,
               approval_id=approval_id,
               tool_call_id=tool_call_id,
               nonce=nonce,
               approved=payload.approved,
-              allow_tool_type=payload.allow_tool_type,
-              reason=payload.reason,
+              user_id=owner_user_id,
+              channel=authenticated.channel,
             )
           except PermissionError:
             return _json_error(404, "Run approval not found")
@@ -627,7 +722,7 @@ def build_approvals_router(
         pending_entry=pending_entry,
         tool_call_id=tool_call_id,
         nonce=str(pending_entry.get("nonce") or ""),
-        decider_id=authenticated.user_id,
+        decider_id=_session_owner_user_id(authenticated),
         decider_role=getattr(authenticated, "role", None),
         approved=payload.approved,
         allow_tool_type=payload.allow_tool_type,

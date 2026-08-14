@@ -15,12 +15,19 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import (  # noqa: E402
   AgentRunner,
+  AgentSessionLog,
   CostEstimate,
   EventLog,
   ModelInfo,
   ToolDispatcher,
 )
 from agent_gateway.runner import _MAX_TOKENS_CONTINUATIONS, _MAX_TOKENS_NUDGE, StreamTurnResult  # noqa: E402
+from agent_gateway.final_narrative_artifact import read_final_narrative  # noqa: E402
+from agent_gateway.sub_agent_narrative_result import final_child_visible_text  # noqa: E402
+from agent_gateway.task_registry import ParentMessage  # noqa: E402
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_runner_capability_execution,
+)
 
 
 def _run(coro):
@@ -67,6 +74,9 @@ def _make_runner(
   *,
   auth_config: dict[str, Any] | None = None,
   final_answer_guard: Any | None = None,
+  session_id: str = "sess-max-tokens",
+  agent_session_log: AgentSessionLog | None = None,
+  message_inbox: asyncio.Queue[ParentMessage] | None = None,
 ) -> AgentRunner:
   event_log = EventLog()
   return AgentRunner(
@@ -75,13 +85,19 @@ def _make_runner(
       mcp_client=_NullMcpClient(),
       local_tool_handlers={},
       event_log=event_log,
-      session_id="sess-max-tokens",
+      session_id=session_id,
     ),
-    session_id="sess-max-tokens",
-    provider=provider,
-    auth_config=auth_config or {"api_key": "k", "model": "stub-model"},
+    session_id=session_id,
+    capability_execution=stub_runner_capability_execution(
+      provider=provider,
+      model="stub-model",
+      effort="none",
+      auth_config=auth_config,
+    ),
     get_tool_definitions=lambda: [],
     final_answer_guard=final_answer_guard,
+    agent_session_log=agent_session_log,
+    message_inbox=message_inbox,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -163,6 +179,69 @@ def test_max_tokens_turn_bypasses_final_answer_guard_until_continuation() -> Non
   _run(_case())
 
 
+def test_final_answer_guard_starts_new_logical_response_lineage(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    guard_calls = 0
+
+    def guard(*_args: Any) -> str | None:
+      nonlocal guard_calls
+      guard_calls += 1
+      return "revise the draft" if guard_calls == 1 else None
+
+    durable_log = AgentSessionLog(tmp_path / "guard.jsonl")
+    runner = _make_runner(
+      _StubProvider(),
+      final_answer_guard=guard,
+      agent_session_log=durable_log,
+    )
+    calls = 0
+
+    async def _fake_stream_turn(**_kwargs: Any):
+      nonlocal calls
+      calls += 1
+      if calls == 1:
+        return object(), StreamTurnResult(
+          full_text="prefix",
+          stop_reason="max_tokens",
+          content_blocks=[{"type": "text", "text": "prefix"}],
+        )
+      if calls == 2:
+        return object(), StreamTurnResult(
+          full_text="rejected draft",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "rejected draft"}],
+        )
+      return object(), StreamTurnResult(
+        full_text="revised final",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "revised final"}],
+      )
+
+    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "Start"}],
+      system_prompt="x",
+    )
+
+    entries, _ = await durable_log.query(
+      event_types={"assistant_message"},
+      runner_id=runner._runner_id,
+      order="asc",
+    )
+    assert len(entries) == 2
+    assert entries[0].event["stop_reason"] == "max_tokens"
+    assert entries[1].event["stop_reason"] == "end_turn"
+    assert entries[0].event["logical_response_id"] != (
+      entries[1].event["logical_response_id"]
+    )
+    assert entries[1].event["logical_response_segment_ordinal"] == 0
+    assert "continued_from_assistant_message_seq" not in entries[1].event
+
+  _run(_case())
+
+
 def test_max_tokens_continuation_is_bounded(caplog) -> None:
   async def _case() -> None:
     runner = _make_runner(_StubProvider())
@@ -185,6 +264,172 @@ def test_max_tokens_continuation_is_bounded(caplog) -> None:
     assert f"continuing with truncation nudge (1/{_MAX_TOKENS_CONTINUATIONS})" in caplog.text
     assert f"continuing with truncation nudge ({_MAX_TOKENS_CONTINUATIONS}/{_MAX_TOKENS_CONTINUATIONS})" in caplog.text
     assert f"after {_MAX_TOKENS_CONTINUATIONS} continuation attempts" in caplog.text
+
+  _run(_case())
+
+
+def test_child_max_tokens_segments_are_unbounded_and_do_not_consume_max_turns(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "child.jsonl")
+    runner = _make_runner(
+      _StubProvider(),
+      session_id="sub_parent:1",
+      agent_session_log=durable_log,
+    )
+    calls = 0
+
+    async def _fake_stream_turn(**_kwargs: Any):
+      nonlocal calls
+      calls += 1
+      if calls <= 5:
+        return object(), StreamTurnResult(
+          full_text="repeated provider segment",
+          stop_reason="max_tokens",
+          content_blocks=[{
+            "type": "text",
+            "text": "repeated provider segment",
+          }],
+        )
+      return object(), StreamTurnResult(
+        full_text="terminal segment",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "terminal segment"}],
+      )
+
+    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "Start"}],
+      system_prompt="x",
+      max_turns=1,
+    )
+
+    assert calls == 6
+    entries, _ = await durable_log.query(
+      event_types={"assistant_message"},
+      sub_agent_id="sub_parent:1",
+      runner_id=runner._runner_id,
+      order="asc",
+    )
+    assert len(entries) == 6
+    assert {
+      entry.event["logical_response_id"] for entry in entries
+    } == {entries[0].event["logical_response_id"]}
+    assert [
+      entry.event["logical_response_segment_ordinal"]
+      for entry in entries
+    ] == list(range(6))
+    assert [
+      entry.event.get("continued_from_assistant_message_seq")
+      for entry in entries
+    ] == [None, *[entry.seq for entry in entries[:-1]]]
+    assert not any(
+      entry.event.get("type") == "max_turns_reached"
+      for entry in runner._log.entries
+    )
+
+  _run(_case())
+
+
+def test_parent_message_breaks_child_max_tokens_logical_response(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    durable_log = AgentSessionLog(tmp_path / "steered-child.jsonl")
+    inbox: asyncio.Queue[ParentMessage] = asyncio.Queue()
+    runner = _make_runner(
+      _StubProvider(),
+      session_id="sub_parent:1",
+      agent_session_log=durable_log,
+      message_inbox=inbox,
+    )
+    seen_messages: list[list[dict[str, Any]]] = []
+
+    async def _fake_stream_turn(**kwargs: Any):
+      seen_messages.append(list(kwargs["current_messages"]))
+      if len(seen_messages) == 1:
+        sent = await durable_log.append({
+          "type": "parent_message_sent",
+          "runner_id": "runner-parent",
+          "role": "writer",
+          "task_id": "bg-steered",
+          "message_id": "msg-steer",
+          "message": "Discard the prior draft. Return only X.",
+          "sub_agent_id": "sub_parent:1",
+        })
+        await inbox.put(ParentMessage(
+          message_id="msg-steer",
+          text="Discard the prior draft. Return only X.",
+          sent_at=1.0,
+          task_id="bg-steered",
+          sent_seq=sent.seq,
+        ))
+        return object(), StreamTurnResult(
+          full_text="discarded prefix ",
+          stop_reason="max_tokens",
+          content_blocks=[{
+            "type": "text",
+            "text": "discarded prefix ",
+          }],
+        )
+      return object(), StreamTurnResult(
+        full_text="X",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "X"}],
+      )
+
+    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "Start"}],
+      system_prompt="x",
+      max_turns=2,
+    )
+
+    assert len(seen_messages) == 2
+    assert seen_messages[1][-1] == {
+      "role": "user",
+      "content": (
+        "Operator update for this task:\n"
+        "- id=msg-steer: Discard the prior draft. Return only X."
+      ),
+    }
+    assistant_entries, _ = await durable_log.query(
+      event_types={"assistant_message"},
+      sub_agent_id="sub_parent:1",
+      runner_id=runner._runner_id,
+      order="asc",
+    )
+    assert len(assistant_entries) == 2
+    assert assistant_entries[0].event["logical_response_id"] != (
+      assistant_entries[1].event["logical_response_id"]
+    )
+    assert [
+      entry.event["logical_response_segment_ordinal"]
+      for entry in assistant_entries
+    ] == [0, 0]
+    visible = await final_child_visible_text(
+      durable_log,
+      sub_session_id="sub_parent:1",
+      workspace_dir=str(tmp_path),
+      runner_id=runner._runner_id,
+    )
+    assert visible.text == "X"
+    assert visible.final_narrative is not None
+    assert read_final_narrative(
+      workspace_dir=tmp_path,
+      reference=visible.final_narrative,
+    ) == "X"
+    consumed_entries, _ = await durable_log.query(
+      event_types={"parent_message_consumed"},
+      order="asc",
+    )
+    assert len(consumed_entries) == 1
+    assert consumed_entries[0].event["message_id"] == "msg-steer"
+    assert consumed_entries[0].event["assistant_message_seq"] == (
+      assistant_entries[1].seq
+    )
+    assert consumed_entries[0].event["consumer_turn"] == 2
 
   _run(_case())
 
@@ -225,7 +470,7 @@ def test_request_max_tokens_clamped_to_model_max_output() -> None:
   async def _case() -> None:
     runner = _make_runner(
       _StubProvider(max_output_tokens=16_384),
-      auth_config={"api_key": "k", "model": "stub-model", "max_tokens": 64_000},
+      auth_config={"api_key": "k", "max_tokens": 64_000},
     )
     seen: dict[str, Any] = {}
 

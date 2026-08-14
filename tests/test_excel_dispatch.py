@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
@@ -16,6 +18,24 @@ from agent_gateway.excel_dispatch import (
   mint_and_submit,
   poll_result,
   validate_requested_ceiling,
+)
+
+
+class _RelayRestartInProgress(RuntimeError):
+  pass
+
+
+class _RelayRestartLockUnavailable(RuntimeError):
+  pass
+
+
+class _RestartMessageLookalike(RuntimeError):
+  pass
+
+
+_RELAY_RESTART_EXCEPTIONS = (
+  _RelayRestartInProgress,
+  _RelayRestartLockUnavailable,
 )
 
 
@@ -101,6 +121,23 @@ class FakeRelay:
     return "ok", {"state": "pending"}
 
 
+class RestartBlockedRelay(FakeRelay):
+  def __init__(
+    self,
+    *args: Any,
+    exception_type: type[Exception],
+    exception_message: str = "relay_restart_in_progress",
+    **kwargs: Any,
+  ) -> None:
+    super().__init__(*args, **kwargs)
+    self.exception_type = exception_type
+    self.exception_message = exception_message
+
+  async def submit(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    await super().submit(*args, **kwargs)
+    raise self.exception_type(self.exception_message)
+
+
 def _handler(relay: FakeRelay, store: SQLiteApprovalStore, *, poll_interval_seconds: float = 0.001):
   return make_message_excel_agent_handler(
     relay=relay,
@@ -110,6 +147,7 @@ def _handler(relay: FakeRelay, store: SQLiteApprovalStore, *, poll_interval_seco
     delegator_profile="orchestrator",
     delegator_run_id="run-1",
     poll_interval_seconds=poll_interval_seconds,
+    relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
   )
 
 
@@ -142,6 +180,7 @@ def test_mint_and_submit_happy_path_returns_ids_and_bound_grant(tmp_path: Path) 
       default_ceiling=frozenset({"read", "pure_transform"}),
       relay_timeout_seconds=42,
       seed_history=[{"role": "user", "content": "seed"}],
+      relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
     )
 
     assert error is None
@@ -186,6 +225,185 @@ def test_mint_and_submit_happy_path_returns_ids_and_bound_grant(tmp_path: Path) 
   _run(_case())
 
 
+@pytest.mark.parametrize("restart_exception_type", _RELAY_RESTART_EXCEPTIONS)
+def test_mint_and_submit_returns_typed_restart_error_and_revokes_grant(
+  tmp_path: Path,
+  restart_exception_type: type[Exception],
+) -> None:
+  async def _case() -> None:
+    store = _store(tmp_path)
+    relay = RestartBlockedRelay(
+      workbooks=[
+        {
+          "name": "Budget.xlsx",
+          "session": "workbook-session-1",
+          "gateway_session_id": "excel-session-1",
+          "detached": False,
+        }
+      ],
+      exception_type=restart_exception_type,
+    )
+
+    submitted, error = await mint_and_submit(
+      relay=relay,
+      approval_store=store,
+      user_id="alice",
+      gateway_session_id="orchestrator-session-1",
+      text="Update the model",
+      relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
+    )
+
+    assert submitted is None
+    assert error == {
+      "code": "relay_restart_in_progress",
+      "message": "Excel MCP relay restart in progress; retry after gateway restart",
+    }
+    assert len(relay.submissions) == 1
+    delegation_id = relay.submissions[0]["tool_input"]["delegation_id"]
+    grant = await store.get_delegation_grant(delegation_id)
+    assert grant is not None
+    assert grant.revoked_at is not None
+
+  _run(_case())
+
+
+def test_mint_and_submit_does_not_classify_restart_message_lookalike(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    secret = "CUSTOM-ACTIVE-CREDENTIAL-excel-submit-8f21d7"
+    store = _store(tmp_path)
+    relay = RestartBlockedRelay(
+      workbooks=[
+        {
+          "name": "Budget.xlsx",
+          "session": "workbook-session-1",
+          "gateway_session_id": "excel-session-1",
+          "detached": False,
+        }
+      ],
+      exception_type=_RestartMessageLookalike,
+      exception_message=f"relay_restart_in_progress {secret}",
+    )
+
+    submitted, error = await mint_and_submit(
+      relay=relay,
+      approval_store=store,
+      user_id="alice",
+      gateway_session_id="orchestrator-session-1",
+      text="Update the model",
+      relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
+    )
+
+    assert submitted is None
+    assert error == {
+      "code": "internal_error",
+      "message": "Excel relay submission failed",
+    }
+    assert secret not in str(error)
+    delegation_id = relay.submissions[0]["tool_input"]["delegation_id"]
+    grant = await store.get_delegation_grant(delegation_id)
+    assert grant is not None
+    assert grant.revoked_at is not None
+
+  _run(_case())
+
+
+def test_mint_and_submit_revoke_failure_response_is_value_free(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    secret = "CUSTOM-ACTIVE-CREDENTIAL-excel-revoke-8f21d7"
+    store = _store(tmp_path)
+    relay = RestartBlockedRelay(
+      workbooks=[{
+        "name": "Budget.xlsx",
+        "gateway_session_id": "excel-session-1",
+      }],
+      exception_type=_RestartMessageLookalike,
+      exception_message="submit failed",
+    )
+
+    async def fail_revoke(_delegation_id: str) -> None:
+      raise RuntimeError(secret)
+
+    monkeypatch.setattr(store, "revoke_delegation_grant", fail_revoke)
+    submitted, error = await mint_and_submit(
+      relay=relay,
+      approval_store=store,
+      user_id="alice",
+      gateway_session_id="orchestrator-session-1",
+      text="Update the model",
+      relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
+    )
+
+    assert submitted is None
+    assert error == {
+      "code": "internal_error",
+      "message": "Failed to revoke unsubmitted delegation grant",
+    }
+    assert secret not in str(error)
+
+  _run(_case())
+
+
+@pytest.mark.parametrize(
+  "restart_exceptions",
+  [(), (RuntimeError("not-a-type"),), (KeyboardInterrupt,)],
+)
+def test_excel_dispatch_requires_explicit_exception_type_binding(
+  restart_exceptions: tuple[Any, ...],
+) -> None:
+  with pytest.raises(
+    TypeError,
+    match="relay_restart_exceptions must contain only Exception types",
+  ):
+    make_message_excel_agent_handler(
+      relay=object(),
+      approval_store=object(),
+      user_id="alice",
+      gateway_session_id="session-1",
+      relay_restart_exceptions=restart_exceptions,
+    )
+
+
+@pytest.mark.parametrize("restart_exception_type", _RELAY_RESTART_EXCEPTIONS)
+def test_message_handler_preserves_typed_restart_error_and_revocation(
+  tmp_path: Path,
+  restart_exception_type: type[Exception],
+) -> None:
+  async def _case() -> None:
+    store = _store(tmp_path)
+    relay = RestartBlockedRelay(
+      workbooks=[
+        {
+          "name": "Budget.xlsx",
+          "session": "workbook-session-1",
+          "gateway_session_id": "excel-session-1",
+          "detached": False,
+        }
+      ],
+      exception_type=restart_exception_type,
+    )
+    handler = _handler(relay, store)
+
+    result, error = await handler({"text": "Update the model"})
+
+    assert result is None
+    assert error == {
+      "code": "relay_restart_in_progress",
+      "message": "Excel MCP relay restart in progress; retry after gateway restart",
+    }
+    delegation_id = relay.submissions[0]["tool_input"]["delegation_id"]
+    grant = await store.get_delegation_grant(delegation_id)
+    assert grant is not None
+    assert grant.revoked_at is not None
+    assert relay.result_calls == []
+
+  _run(_case())
+
+
 def test_validate_requested_ceiling_accepts_allowed_subset() -> None:
   ceiling, error = validate_requested_ceiling(["state_write", "read", "read"])
 
@@ -214,6 +432,7 @@ def test_mint_and_submit_rejects_disallowed_ceiling_without_grant_or_submit(tmp_
       gateway_session_id="orchestrator-session-1",
       text="Update the model",
       default_ceiling=default_ceiling,
+      relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
     )
 
     assert submitted is None
@@ -242,6 +461,7 @@ def test_mint_and_submit_ambiguous_target_returns_error_without_grant_or_submit(
       user_id="alice",
       gateway_session_id="orchestrator-session-1",
       text="Summarize the workbook",
+      relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
     )
 
     assert submitted is None
@@ -275,6 +495,7 @@ def test_mint_and_submit_ignores_explicitly_non_live_workbooks(tmp_path: Path) -
       user_id="alice",
       gateway_session_id="orchestrator-session-1",
       text="Summarize the workbook",
+      relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
     )
 
     assert submitted is None
@@ -303,6 +524,7 @@ def test_mint_and_submit_not_connected_returns_error_without_grant_or_submit(tmp
       gateway_session_id="orchestrator-session-1",
       text="Summarize",
       workbook="Missing.xlsx",
+      relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
     )
 
     assert submitted is None
@@ -357,9 +579,10 @@ def test_poll_result_done_returns_payload_and_polls_as_excel_session() -> None:
 
 def test_poll_result_failed_returns_error() -> None:
   async def _case() -> None:
+    secret = "CUSTOM-ACTIVE-CREDENTIAL-excel-result-8f21d7"
     relay = FakeRelay(
       workbooks=[],
-      results=[("ok", {"state": "failed", "error": {"message": "approval denied"}})],
+      results=[("ok", {"state": "failed", "error": {"message": secret}})],
     )
     relay.owner_session = "excel-session-1"
 
@@ -375,11 +598,36 @@ def test_poll_result_failed_returns_error() -> None:
     assert result is None
     assert error is not None
     assert error["code"] == "excel_agent_failed"
-    assert error["message"] == "approval denied"
+    assert error["message"] == "Excel agent request failed"
     assert error["request_id"] == "request-1"
     assert "delegation_id" not in error
+    assert secret not in str(error)
 
   _run(_case())
+
+
+def test_poll_result_exception_is_value_free_and_keeps_request_id() -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-excel-poll-8f21d7"
+
+  class ExplodingRelay(FakeRelay):
+    async def result(self, *_args: Any, **_kwargs: Any):
+      raise RuntimeError(secret)
+
+  result, error = _run(poll_result(
+    relay=ExplodingRelay(workbooks=[]),
+    request_id="request-canary",
+    excel_session_id="excel-session-1",
+    user_id="alice",
+    timeout_s=1.0,
+  ))
+
+  assert result is None
+  assert error == {
+    "code": "internal_error",
+    "message": "Excel relay result polling failed",
+    "request_id": "request-canary",
+  }
+  assert secret not in str(error)
 
 
 def test_poll_result_pending_until_deadline_returns_timeout_error() -> None:
@@ -543,7 +791,7 @@ def test_failed_relay_result_returns_error(tmp_path: Path) -> None:
     assert result is None
     assert error is not None
     assert error["code"] == "excel_agent_failed"
-    assert error["message"] == "approval denied"
+    assert error["message"] == "Excel agent request failed"
     assert len(relay.submissions) == 1
 
   _run(_case())

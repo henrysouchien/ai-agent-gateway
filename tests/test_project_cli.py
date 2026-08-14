@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
+import httpx
 import yaml
 
 from agent_gateway import cli as agent_cli
@@ -23,7 +26,8 @@ def test_agent_init_writes_working_project(tmp_path: Path) -> None:
   root = tmp_path / "demo"
   payload = yaml.safe_load((root / "agent.yaml").read_text(encoding="utf-8"))
   assert payload["name"] == "demo-agent"
-  assert payload["provider"] == "anthropic"
+  assert "provider" not in payload
+  assert "model" not in payload
   assert payload["skills_dir"] == "skills"
   assert payload["skill_state_file"] == "skill_state.json"
   assert (root / "agent.py").read_text(encoding="utf-8") == (
@@ -57,8 +61,8 @@ def test_create_agent_from_yaml_forwards_resolved_config(
       {
         "name": "demo",
         "system_prompt": "Use tools carefully.",
-        "provider": "openai",
-        "model": "gpt-4o-mini",
+        "model_key": "openai.gpt-5-6",
+        "effort": "high",
         "host": "localhost",
         "port": 9000,
         "api_prefix": "v2",
@@ -91,8 +95,8 @@ def test_create_agent_from_yaml_forwards_resolved_config(
   assert calls == [
     {
       "system_prompt": "Use tools carefully.",
-      "provider": "openai",
-      "model": "gpt-4o-mini",
+      "model_key": "openai.gpt-5-6",
+      "effort": "high",
       "max_tokens": 2048,
       "mcp_servers": {"fs": {"command": "npx", "args": ["-y", "server", "."]}},
       "skills_dir": tmp_path / "skills",
@@ -107,7 +111,7 @@ def test_create_agent_from_yaml_forwards_resolved_config(
   ]
 
 
-def test_agent_add_mcp_and_provider_update_config(tmp_path: Path) -> None:
+def test_agent_add_mcp_and_stable_model_update_config(tmp_path: Path) -> None:
   config_path = tmp_path / "agent.yaml"
   project.save_agent_project_payload(
     project.default_agent_config_payload(name="demo"),
@@ -115,7 +119,7 @@ def test_agent_add_mcp_and_provider_update_config(tmp_path: Path) -> None:
   )
 
   mcp_stdout = io.StringIO()
-  provider_stdout = io.StringIO()
+  model_stdout = io.StringIO()
   mcp_code = agent_cli.main(
     [
       "add",
@@ -130,16 +134,26 @@ def test_agent_add_mcp_and_provider_update_config(tmp_path: Path) -> None:
     ],
     stdout=mcp_stdout,
   )
-  provider_code = agent_cli.main(
-    ["add", "provider", "openai", "--model", "gpt-4o-mini", "--config", str(config_path)],
-    stdout=provider_stdout,
+  model_code = agent_cli.main(
+    [
+      "add",
+      "model",
+      "openai.gpt-5-6",
+      "--effort",
+      "high",
+      "--config",
+      str(config_path),
+    ],
+    stdout=model_stdout,
   )
 
   assert mcp_code == 0
-  assert provider_code == 0
+  assert model_code == 0
   payload = project.load_agent_project_payload(config_path)
-  assert payload["provider"] == "openai"
-  assert payload["model"] == "gpt-4o-mini"
+  assert payload["model_key"] == "openai.gpt-5-6"
+  assert payload["effort"] == "high"
+  assert "provider" not in payload
+  assert "model" not in payload
   assert payload["mcp_servers"]["filesystem"] == {
     "command": "npx",
     "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
@@ -224,11 +238,106 @@ def test_agent_xai_auth_login_status_and_logout(monkeypatch: pytest.MonkeyPatch,
 
   status = io.StringIO()
   assert agent_cli.main(["auth", "status", "xai", "--store", str(store)], stdout=status) == 0
-  assert "active" in status.getvalue()
+  # `auth status` is a local-only read that never contacts xAI, so it reports what it verified
+  # (a stored, unexpired record) — not "active", which would over-claim a credential the server
+  # may have revoked. See cli.py _auth_status_xai.
+  assert "stored; not server-validated" in status.getvalue()
   assert "permissions=0600" in status.getvalue()
 
   logout = io.StringIO()
   assert agent_cli.main(["auth", "logout", "xai", "--store", str(store)], stdout=logout) == 0
+  assert store.exists()
+  assert xai_oauth.load_xai_token_record(store) == {"reauth_required": True}
+  logged_out_status = io.StringIO()
+  assert agent_cli.main(
+    ["auth", "status", "xai", "--store", str(store)],
+    stdout=logged_out_status,
+  ) == 1
+  assert "re-authentication required" in logged_out_status.getvalue()
+
+
+def test_xai_auth_status_refresh_pending_is_nonzero(tmp_path: Path) -> None:
+  store = tmp_path / "oauth.json"
+  xai_oauth.save_xai_token_record(store, {
+    "access_token": "access-1",
+    "refresh_token": "refresh-1",
+    "expires_at": 4_000_000_000,
+    "scope": xai_oauth.DEFAULT_XAI_OAUTH_SCOPE,
+    "issuer": xai_oauth.DEFAULT_XAI_OAUTH_ISSUER,
+    "client_id": xai_oauth.DEFAULT_XAI_OAUTH_CLIENT_ID,
+    "refresh_pending": True,
+  })
+
+  status = io.StringIO()
+  assert agent_cli.main(
+    ["auth", "status", "xai", "--store", str(store)],
+    stdout=status,
+  ) == 1
+  assert "previous refresh did not complete" in status.getvalue()
+  assert "re-authentication required" in status.getvalue()
+
+
+def test_xai_logout_uses_store_lock_and_writes_tombstone(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  store = tmp_path / "oauth.json"
+  cached_record = {
+    "access_token": "access-1",
+    "refresh_token": "refresh-1",
+    "expires_at": 4_000_000_000,
+    "scope": xai_oauth.DEFAULT_XAI_OAUTH_SCOPE,
+    "issuer": xai_oauth.DEFAULT_XAI_OAUTH_ISSUER,
+    "client_id": xai_oauth.DEFAULT_XAI_OAUTH_CLIENT_ID,
+    "token_endpoint": "https://auth.x.ai/oauth2/token",
+  }
+  xai_oauth.save_xai_token_record(store, cached_record)
+  real_lock = xai_oauth._store_lock
+  lock_entries: list[Path] = []
+
+  @asynccontextmanager
+  async def observed_lock(path: Path):
+    lock_entries.append(path)
+    async with real_lock(path):
+      yield
+
+  monkeypatch.setattr(xai_oauth, "_store_lock", observed_lock)
+  assert agent_cli.main(
+    ["auth", "logout", "xai", "--store", str(store)],
+    stdout=io.StringIO(),
+  ) == 0
+  assert lock_entries == [store]
+  assert xai_oauth.load_xai_token_record(store) == {"reauth_required": True}
+  assert store.stat().st_mode & 0o777 == 0o600
+  posts: list[str] = []
+
+  async def handler(request: httpx.Request) -> httpx.Response:
+    posts.append("unexpected")
+    return httpx.Response(500)
+
+  async def refresh_cached() -> None:
+    settings = xai_oauth.resolve_xai_oauth_settings({"auth_store_path": str(store)})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+      await xai_oauth.refresh_xai_oauth_token(
+        cached_record,
+        settings=settings,
+        client=client,
+        force=True,
+      )
+
+  with pytest.raises(RuntimeError, match="refresh did not complete previously"):
+    asyncio.run(refresh_cached())
+  assert posts == []
+
+
+def test_anthropic_logout_still_unlinks_store(tmp_path: Path) -> None:
+  store = tmp_path / "anthropic-oauth.json"
+  store.write_text('{"access_token": "token"}\n', encoding="utf-8")
+
+  assert agent_cli.main(
+    ["auth", "logout", "anthropic", "--store", str(store)],
+    stdout=io.StringIO(),
+  ) == 0
   assert not store.exists()
 
 

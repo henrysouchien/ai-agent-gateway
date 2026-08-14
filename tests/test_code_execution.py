@@ -40,6 +40,7 @@ async def _dispatch_bundle_tool(
   dispatcher = ToolDispatcher(
     mcp_client=_FakeMcp(),
     local_tool_handlers=bundle.handlers,
+    role="owner",
     needs_approval=needs_approval or (lambda _name, _tool_input, _qualifier: False),
     approved_tool_types=approved_tool_types,
     event_log=event_log or EventLog(),
@@ -417,13 +418,13 @@ def test_code_execute_respects_image_base64_limit() -> None:
       session,
       bundle,
       "code_execute",
-      {"code": 'from pathlib import Path\nPath("large.png").write_bytes(b"x" * 64)'},
+      {"code": 'from pathlib import Path\nPath("_plot_large.png").write_bytes(b"x" * 64)'},
     )
 
     assert error is None
     assert result is not None
     assert len(result["images"]) == 1
-    assert result["images"][0]["filename"] == "large.png"
+    assert result["images"][0]["filename"] == "_plot_large.png"
     assert result["images"][0]["skipped"] is True
     assert "exceeds" in result["images"][0]["reason"]
 

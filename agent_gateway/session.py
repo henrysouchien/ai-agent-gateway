@@ -4,17 +4,27 @@ import asyncio
 import hashlib
 import inspect
 import shutil
+from threading import Lock
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Literal, Optional, Set
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Set
 
 import jwt
 from fastapi import HTTPException
 
+from .capability_binding import (
+  CAPABILITY_IDS,
+  CapabilityId,
+  CredentialHandle,
+  CredentialPrincipal,
+  ModelSelectionIntent,
+)
 from .events import DEFAULT_SCHEMA_VERSION
 from .event_log import EventLog
 from .session_event_history import SessionEventHistory
+from .session_capabilities import normalize_session_capabilities
 
 if TYPE_CHECKING:
   from .multi_user.billing import SessionUsageSummary
@@ -24,6 +34,8 @@ JWT_ALGORITHM = "HS256"
 JWT_HS256_MIN_SECRET_BYTES = 32
 OnSessionExpiry = Callable[["GatewaySession"], Awaitable[None] | None]
 _RESERVED_USER_IDS = {"_default"}
+EventDeliveryDomain = Literal["ordinary", "proof"]
+WorkflowOutputReader = Callable[[str, str, int], Awaitable[object]]
 
 
 def _normalize_required_user_id(user_id: str | None) -> str:
@@ -38,6 +50,71 @@ def _normalize_required_user_id(user_id: str | None) -> str:
 def _normalize_optional_identity_value(value: str | None) -> str | None:
   normalized = value.strip() if isinstance(value, str) else value
   return normalized or None
+
+
+def session_owner_user_id(session: "GatewaySession") -> str:
+  """Return the canonical event-bus owner for a trusted session."""
+
+  owner_user_id = str(
+    getattr(session, "owner_user_id", None)
+    or getattr(session, "user_id", None)
+    or ""
+  ).strip()
+  if not owner_user_id:
+    raise ValueError("session owner_user_id is required")
+  return owner_user_id
+
+
+def bind_session_event_delivery(
+  session: "GatewaySession",
+  *,
+  proof: bool,
+) -> EventDeliveryDomain:
+  """Freeze one session onto exactly one event-delivery domain."""
+
+  domain: EventDeliveryDomain = "proof" if proof else "ordinary"
+  with session._event_delivery_lock:
+    current = session._event_delivery_domain
+    if current is None:
+      session._event_delivery_domain = domain
+    elif current != domain:
+      raise RuntimeError(
+        "session event delivery domain cannot change after binding"
+      )
+    return domain
+
+
+def _normalize_required_tenant_id(tenant_id: str | None) -> str:
+  normalized = str(tenant_id or "").strip()
+  if not normalized:
+    raise ValueError("tenant_id is required to bind session credentials")
+  return normalized
+
+
+def _session_credential_provider(
+  session: "GatewaySession",
+  provider: str | None,
+) -> str:
+  normalized = str(provider or "").strip().lower()
+  configured = ""
+  if isinstance(session.auth_config, dict):
+    configured = str(session.auth_config.get("provider") or "").strip().lower()
+  if normalized and configured and normalized != configured:
+    raise ValueError("credential provider does not match session auth_config")
+  if not normalized:
+    normalized = configured
+  if not normalized:
+    raise ValueError("credential provider is required to bind session credentials")
+  return normalized
+
+
+def _session_actor_id(session: "GatewaySession") -> str:
+  owner_user_id = getattr(session, "owner_user_id", None)
+  user_id = getattr(session, "user_id", None)
+  normalized = str(owner_user_id or user_id or "").strip()
+  if not normalized:
+    raise ValueError("session owner identity is required to bind user credentials")
+  return normalized
 
 
 def _normalize_session_aliases(
@@ -109,9 +186,18 @@ class GatewaySession:
   user_id: str
   user_email: str | None = None
   risk_user_id: int = 0
-  role: Literal["owner", "invite"] = "owner"
+  role: Literal["owner", "invite"] = "invite"
+  capabilities: frozenset[str] = field(default_factory=frozenset)
+  model_entitled_capabilities: frozenset[str] = field(default_factory=frozenset)
+  model_entitled_keys: frozenset[str] = field(default_factory=frozenset)
   kind: Literal["chat", "control"] = "chat"
-  auth_config: dict[str, Any] | None = None
+  auth_config: dict[str, Any] | None = field(default=None, repr=False)
+  tenant_id: str | None = None
+  session_credential_handle: CredentialHandle | None = None
+  allow_service_for_interactive: bool = False
+  capability_run_overrides: Mapping[CapabilityId, ModelSelectionIntent] = field(
+    default_factory=lambda: MappingProxyType({})
+  )
   channel: Optional[str] = None
   owner_user_id: str | None = None
   raw_user_id: str | None = None
@@ -130,6 +216,7 @@ class GatewaySession:
   approval_queues: Dict[str, asyncio.Queue] = field(default_factory=dict)
   approval_store: Any | None = None
   approval_policy: Any | None = None
+  max_budget_usd: float | None = None
   approval_expire_pending_task: asyncio.Task[Any] | None = None
   tool_sequence: int = 0
   result_queue: Optional[asyncio.Queue] = None
@@ -139,8 +226,116 @@ class GatewaySession:
   event_history: SessionEventHistory = field(default_factory=SessionEventHistory)
   initial_message: str = ""
   dispatch_scope: dict[str, Any] | None = None
+  stage_skill_route: dict[str, str] | None = None
+  purpose: str | None = None
+  learn_memory_nudge_turns: int = 0
+  learn_skill_nudge_iters: int = 0
+  learning_fork_ledger: Any | None = field(default=None, repr=False)
+  learning_fork_registry: Any | None = field(default=None, repr=False)
+  workflow_output_reader: WorkflowOutputReader | None = field(
+    default=None,
+    repr=False,
+  )
+  _event_delivery_domain: EventDeliveryDomain | None = field(
+    default=None,
+    repr=False,
+  )
+  _event_delivery_lock: Any = field(
+    default_factory=Lock,
+    init=False,
+    repr=False,
+    compare=False,
+  )
   _commercial_dispatch_owner: object | None = field(default=None, repr=False)
+  _capability_selections_bound: bool = field(default=False, repr=False)
   _expiring: bool = False
+
+
+def bind_session_capability_selections(
+  session: GatewaySession,
+  *,
+  run_overrides: Mapping[CapabilityId, ModelSelectionIntent],
+) -> None:
+  """Freeze normalized role selections onto one gateway session exactly once."""
+
+  if session._capability_selections_bound:
+    raise ValueError("session capability selections are already bound")
+  normalized = dict(run_overrides)
+  for capability_id in normalized:
+    if capability_id not in CAPABILITY_IDS:
+      raise ValueError(f"unknown capability_id: {capability_id!r}")
+    if capability_id in {"session.driver", "node.fork"}:
+      raise ValueError(f"{capability_id} cannot be selected at session init")
+  for capability_id, intent in normalized.items():
+    if not isinstance(intent, ModelSelectionIntent):
+      raise TypeError(
+        f"{capability_id} model override must be stable-key selection intent"
+      )
+  session.capability_run_overrides = MappingProxyType(normalized)
+  session._capability_selections_bound = True
+
+
+def bind_session_credentials(
+  session: GatewaySession,
+  *,
+  tenant_id: str,
+  credential_principal: CredentialPrincipal,
+  provider: str | None = None,
+  allow_service_for_interactive: bool = False,
+  handle_id: str | None = None,
+) -> CredentialHandle:
+  """Attach secret-free credential provenance to a gateway session.
+
+  The principal must come from a trusted resolver or server-owned policy. It is
+  never inferred from the credential payload, billing mode, or channel.
+  """
+
+  normalized_tenant_id = _normalize_required_tenant_id(tenant_id)
+  if getattr(session, "session_credential_handle", None) is not None:
+    raise ValueError("session credentials are already bound")
+  existing_tenant_id = getattr(session, "tenant_id", None)
+  if existing_tenant_id is not None and existing_tenant_id != normalized_tenant_id:
+    raise ValueError("credential tenant does not match existing session tenant_id")
+  actor_id = (
+    _session_actor_id(session)
+    if credential_principal == "user"
+    else None
+  )
+  handle = CredentialHandle(
+    handle_id=handle_id or f"cred_{uuid.uuid4().hex}",
+    provider=_session_credential_provider(session, provider),
+    principal=credential_principal,
+    tenant_id=normalized_tenant_id,
+    actor_id=actor_id,
+  )
+  session.tenant_id = normalized_tenant_id
+  session.session_credential_handle = handle
+  session.allow_service_for_interactive = bool(allow_service_for_interactive)
+  return handle
+
+
+def attach_session_credential_handle(
+  session: GatewaySession,
+  handle: CredentialHandle,
+  *,
+  allow_service_for_interactive: bool = False,
+) -> None:
+  """Attach an existing immutable handle, preserving its opaque identity."""
+
+  if getattr(session, "session_credential_handle", None) is not None:
+    raise ValueError("session credentials are already bound")
+  provider = _session_credential_provider(session, None)
+  if handle.provider != provider:
+    raise ValueError("credential handle provider does not match session auth_config")
+  existing_tenant_id = getattr(session, "tenant_id", None)
+  if existing_tenant_id is not None and existing_tenant_id != handle.tenant_id:
+    raise ValueError("credential handle tenant does not match session tenant_id")
+  expected_actor = _session_actor_id(session)
+  if handle.principal == "user" and handle.actor_id != expected_actor:
+    raise ValueError("user credential handle actor does not match session owner")
+  session.tenant_id = handle.tenant_id
+  session.session_credential_handle = handle
+  session.allow_service_for_interactive = bool(allow_service_for_interactive)
 
 
 class SessionStore:
@@ -149,6 +344,7 @@ class SessionStore:
   def __init__(self, ttl: int = 3600) -> None:
     self.ttl = ttl
     self.sessions: Dict[str, GatewaySession] = {}
+    self._session_kinds: Dict[str, Literal["chat", "control"]] = {}
     self._on_expiry: OnSessionExpiry | None = None
     self._on_expiry_hooks: list[OnSessionExpiry] = []
 
@@ -171,7 +367,10 @@ class SessionStore:
     user_id: str,
     user_email: str | None = None,
     risk_user_id: int = 0,
-    role: Literal["owner", "invite"] = "owner",
+    role: Literal["owner", "invite"] = "invite",
+    capabilities: frozenset[str] | set[str] | tuple[str, ...] | list[str] = frozenset(),
+    model_entitled_capabilities: frozenset[str] = frozenset(),
+    model_entitled_keys: frozenset[str] = frozenset(),
     kind: Literal["chat", "control"] = "chat",
     auth_config: dict[str, Any] | None = None,
     ttl_seconds: int | None = None,
@@ -181,6 +380,10 @@ class SessionStore:
     user_slug: str | None = None,
     user_aliases: tuple[str, ...] | list[str] | None = None,
     identity_status: str | None = None,
+    tenant_id: str | None = None,
+    credential_principal: CredentialPrincipal | None = None,
+    session_credential_handle: CredentialHandle | None = None,
+    allow_service_for_interactive: bool = False,
   ) -> GatewaySession:
     now = int(time.time())
     ttl = self.ttl if ttl_seconds is None else int(ttl_seconds)
@@ -215,6 +418,9 @@ class SessionStore:
       user_email=user_email,
       risk_user_id=normalized_risk_user_id,
       role=role,
+      capabilities=normalize_session_capabilities(capabilities),
+      model_entitled_capabilities=frozenset(model_entitled_capabilities),
+      model_entitled_keys=frozenset(model_entitled_keys),
       kind=kind,
       auth_config=dict(auth_config) if auth_config is not None else None,
       owner_user_id=normalized_owner_user_id,
@@ -228,10 +434,36 @@ class SessionStore:
         user_aliases=user_aliases,
       ),
       identity_status=normalized_identity_status,
+      tenant_id=(
+        _normalize_required_tenant_id(tenant_id)
+        if tenant_id is not None
+        else None
+      ),
+      allow_service_for_interactive=bool(allow_service_for_interactive),
       schema_version=int(schema_version),
       result_queue=asyncio.Queue(),
     )
+    if credential_principal is not None and session_credential_handle is not None:
+      raise ValueError(
+        "provide credential_principal or session_credential_handle, not both"
+      )
+    if credential_principal is not None:
+      bind_session_credentials(
+        session,
+        tenant_id=_normalize_required_tenant_id(tenant_id),
+        credential_principal=credential_principal,
+        allow_service_for_interactive=allow_service_for_interactive,
+      )
+    elif session_credential_handle is not None:
+      if tenant_id is not None and session_credential_handle.tenant_id != session.tenant_id:
+        raise ValueError("credential handle tenant does not match session tenant_id")
+      attach_session_credential_handle(
+        session,
+        session_credential_handle,
+        allow_service_for_interactive=allow_service_for_interactive,
+      )
     self.sessions[session_id] = session
+    self._session_kinds[session_id] = kind
     return session
 
   def get_session(self, session_id: str) -> Optional[GatewaySession]:
@@ -243,6 +475,7 @@ class SessionStore:
       return
     session._expiring = True
     self.sessions.pop(session_id, None)
+    self._session_kinds.pop(session_id, None)
     if self._on_expiry_hooks or self._on_expiry is not None:
       try:
         loop = asyncio.get_running_loop()
@@ -265,6 +498,7 @@ class SessionStore:
       return
     session._expiring = True
     self.sessions.pop(session_id, None)
+    self._session_kinds.pop(session_id, None)
     await self._safe_on_expiry(session)
 
   async def cleanup_expired_async(self) -> None:
@@ -332,6 +566,9 @@ class AuthManager:
       "user_email": session.user_email,
       "risk_user_id": session.risk_user_id,
       "role": session.role,
+      "capabilities": sorted(session.capabilities),
+      "model_entitled_capabilities": sorted(session.model_entitled_capabilities),
+      "model_entitled_keys": sorted(session.model_entitled_keys),
       "channel": session.channel,
       "is_public": session.is_public,
       "schema_version": session.schema_version,
@@ -344,11 +581,29 @@ class AuthManager:
     except jwt.PyJWTError as exc:
       raise HTTPException(status_code=401, detail="Invalid session token") from exc
 
+    if "kind" in payload or "session_class" in payload:
+      raise HTTPException(status_code=401, detail="Session class claims are forbidden")
+
     session_id = payload.get("session_id")
     api_key_hash = payload.get("api_key_hash")
     expires_at = payload.get("expires_at")
 
-    if not session_id or not api_key_hash or not expires_at:
+    required_claims = (
+      "risk_user_id",
+      "role",
+      "capabilities",
+      "model_entitled_capabilities",
+      "model_entitled_keys",
+      "channel",
+      "is_public",
+      "schema_version",
+    )
+    if (
+      not session_id
+      or not api_key_hash
+      or not expires_at
+      or any(claim not in payload for claim in required_claims)
+    ):
       raise HTTPException(status_code=401, detail="Invalid session payload")
 
     now = int(time.time())
@@ -359,6 +614,12 @@ class AuthManager:
     session = self.session_store.get_session(session_id)
     if not session or session.api_key_hash != api_key_hash:
       raise HTTPException(status_code=401, detail="Unknown session")
+    stored_kind = self.session_store._session_kinds.get(session_id)
+    if (
+      stored_kind not in {"chat", "control"}
+      or session.kind != stored_kind
+    ):
+      raise HTTPException(status_code=401, detail="Session kind integrity check failed")
 
     token_user_id = str(payload.get("user_id") or "").strip()
     if not token_user_id:
@@ -373,7 +634,7 @@ class AuthManager:
     if token_user_email != session.user_email:
       raise HTTPException(status_code=401, detail="Session user email mismatch")
 
-    token_risk_user_id = payload.get("risk_user_id", session.risk_user_id)
+    token_risk_user_id = payload["risk_user_id"]
     try:
       token_risk_user_id = int(token_risk_user_id)
     except (TypeError, ValueError) as exc:
@@ -381,21 +642,45 @@ class AuthManager:
     if token_risk_user_id != session.risk_user_id:
       raise HTTPException(status_code=401, detail="Session risk user mismatch")
 
-    token_role = payload.get("role", session.role)
+    token_role = payload["role"]
     if token_role not in {"owner", "invite"}:
       raise HTTPException(status_code=401, detail="Invalid session role")
     if token_role != session.role:
       raise HTTPException(status_code=401, detail="Session role mismatch")
 
-    channel = payload.get("channel")
-    is_public = payload.get("is_public", False)
+    try:
+      token_capabilities = normalize_session_capabilities(payload["capabilities"])
+    except ValueError as exc:
+      raise HTTPException(status_code=401, detail="Invalid session capabilities") from exc
+    if token_capabilities != session.capabilities:
+      raise HTTPException(status_code=401, detail="Session capabilities mismatch")
+    token_model_capabilities = frozenset(
+      str(value or "").strip()
+      for value in payload["model_entitled_capabilities"]
+      if str(value or "").strip()
+    )
+    token_model_keys = frozenset(
+      str(value or "").strip()
+      for value in payload["model_entitled_keys"]
+      if str(value or "").strip()
+    )
+    if token_model_capabilities != session.model_entitled_capabilities:
+      raise HTTPException(status_code=401, detail="Session model capability entitlements mismatch")
+    if token_model_keys != session.model_entitled_keys:
+      raise HTTPException(status_code=401, detail="Session model key entitlements mismatch")
+
+    channel = payload["channel"]
+    is_public = payload["is_public"]
     payload["risk_user_id"] = token_risk_user_id
     payload["role"] = token_role
+    payload["capabilities"] = sorted(token_capabilities)
+    payload["model_entitled_capabilities"] = sorted(token_model_capabilities)
+    payload["model_entitled_keys"] = sorted(token_model_keys)
     payload["channel"] = channel if isinstance(channel, str) else None
     payload["is_public"] = is_public if isinstance(is_public, bool) else False
     session.channel = payload["channel"]
     session.is_public = payload["is_public"]
-    token_schema_version = payload.get("schema_version", session.schema_version)
+    token_schema_version = payload["schema_version"]
     try:
       token_schema_version = int(token_schema_version)
     except (TypeError, ValueError) as exc:
@@ -420,4 +705,12 @@ class AuthManager:
     return session
 
 
-__all__ = ["AuthManager", "GatewaySession", "SessionStore"]
+__all__ = [
+  "AuthManager",
+  "EventDeliveryDomain",
+  "GatewaySession",
+  "SessionStore",
+  "bind_session_capability_selections",
+  "bind_session_event_delivery",
+  "session_owner_user_id",
+]

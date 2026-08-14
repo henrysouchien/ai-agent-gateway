@@ -779,14 +779,32 @@ def _scan_existing_spill_bytes(root: Path, lane: str) -> int:
     return _scan_canonical_spill_bytes(root)
 
   committed: set[str] = set()
+  # Anything a manifest CLAIMS, even one we could not fully validate. The
+  # reconcile pass never deletes these: an unreadable manifest is a reason to
+  # leave bytes alone, not a licence to garbage-collect a live tool result.
+  protected: set[str] = set()
   total = 0
   for manifest_path in root.glob("*.manifest.json"):
     if manifest_path.is_symlink() or not _is_regular_file(manifest_path):
       continue
+    protected.add(manifest_path.name)
+    try:
+      claimed = json.loads(manifest_path.read_text(encoding="utf-8"))
+      for entry in claimed.get("members") or ():
+        name = entry.get("filename") if isinstance(entry, dict) else None
+        if isinstance(name, str) and Path(name).name == name:
+          protected.add(name)
+    except Exception:
+      pass
     try:
       payload = json.loads(manifest_path.read_text(encoding="utf-8"))
       entries = payload["members"]
-      if payload.get("schema_version") != SPILL_MANIFEST_VERSION or not isinstance(entries, list):
+      # Version floor, never equality: an unrecognized (newer or older) manifest
+      # must not make its members look uncommitted — the reconcile pass below
+      # unlinks anything absent from `committed`, so exact-version matching here
+      # silently DELETES every spill written under a different version.
+      version = payload.get("schema_version")
+      if not isinstance(version, int) or version < 1 or not isinstance(entries, list):
         raise ValueError("invalid manifest")
       names = [entry["filename"] for entry in entries]
       if not all(isinstance(name, str) and Path(name).name == name for name in names):
@@ -801,7 +819,12 @@ def _scan_existing_spill_bytes(root: Path, lane: str) -> int:
     total += manifest_path.stat().st_size + sum(path.stat().st_size for path in paths)
 
   for path in root.iterdir():
-    if path.name in SPILL_ROOT_CONTROL_FILES or path.name in committed or path.is_dir():
+    if (
+      path.name in SPILL_ROOT_CONTROL_FILES
+      or path.name in committed
+      or path.name in protected
+      or path.is_dir()
+    ):
       continue
     if path.is_symlink() or not _is_regular_file(path):
       continue

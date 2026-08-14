@@ -1,5 +1,7 @@
 # Architecture
 
+**Last verified:** 2026-08-05 (docs-program unit pass against package source)
+
 `ai-agent-gateway` is a server runtime for tool-using agents. It combines session management, SSE streaming, tool dispatch, approval handling, and provider abstraction in one package so you can ship an agent backend without rebuilding that infrastructure yourself.
 
 ## Request Lifecycle
@@ -9,6 +11,8 @@ Client
   -> POST /api/chat/init
   -> session token
   -> POST /api/chat
+      -> build server-owned AuthContext
+      -> resolve + materialize session.driver once
       -> build_chat_runtime(...)
       -> ChatRuntime
       -> AgentRunner or AgentSDKRunner
@@ -25,10 +29,17 @@ A single request usually moves through these stages:
 
 1. The client exchanges an API key for a JWT session token.
 2. The client sends a chat request plus optional `context`, including `context.channel`.
-3. The server calls `build_chat_runtime(session, request, channel, auth_manager)`.
-4. `ChatRuntime.build_runner()` constructs the runner for this request.
-5. The runner streams model output, dispatches tools, and appends events to `EventLog`.
-6. The server forwards those events to the client as SSE until `stream_complete` or `error`.
+3. The server constructs `AuthContext` from the authenticated session and
+   server-owned credential handles, then resolves and materializes one
+   immutable `session.driver` execution.
+4. The server calls `build_chat_runtime(session, request, channel, auth_manager)`.
+5. `ChatRuntime.build_runner()` constructs the runner with that exact bind,
+   admitting registry, provider adapter, and credential snapshot.
+6. The runner streams model output, dispatches tools, and appends events to `EventLog`.
+7. The server forwards those events to the client as SSE until `stream_complete`
+   or `error`. `stream_complete.terminal_disposition` distinguishes successful
+   completion from an intentional interruption while preserving one canonical
+   transport-closing event.
 
 ## Core Concepts
 
@@ -39,6 +50,7 @@ A single request usually moves through these stages:
 It wires together:
 
 - a resolved `ModelProvider` (`AnthropicProvider`, `OpenAIProvider`, or your own instance)
+- a server-owned model registry, selection policy, and credential provenance
 - `GatewayServerConfig`
 - `ChatRuntime`
 - `AgentRunner`
@@ -50,11 +62,42 @@ Use it when you want the shortest path to a working Anthropic- or OpenAI-backed 
 
 ### `run_autonomous()`
 
-`run_autonomous()` is the headless entry point for one-shot agent runs.
+`run_autonomous()` is the execution-only headless entry point for one-shot
+autonomous/cron agent runs.
 
-It wires together the same components as `create_agent()` — provider, MCP, tools, skills — but without the HTTP server. Returns `RunOutput` directly. Handles its own MCP startup/shutdown lifecycle.
+The application supplies an immutable `session.driver` capability bind, its
+admitting registry, the exact provider adapter, and its bound credential
+snapshot. The function verifies those inputs before session/MCP/client setup,
+then wires together MCP, tools, skills, and `AgentRunner` without the HTTP
+server. It returns `RunOutput` directly and handles its own MCP
+startup/shutdown lifecycle. Provider/model/credential selection is deliberately
+outside this boundary.
 
-Use it for cron jobs, batch tasks, or as the building block for `HeartbeatLoop`.
+Use it for cron jobs, autonomous tasks, or as the building block for
+`HeartbeatLoop`.
+
+### Capability binding
+
+`CapabilityExecutionResolver` is the single selection and credential
+materialization boundary. It combines a versioned
+`ProductModelSelectionPolicy`, server-owned `AuthContext`, versioned
+`ProductModelRegistry`, credential materializer, and adapter resolver. A
+successful resolution returns `BoundCapabilityExecution`: the immutable bind,
+exact admitting registry, provider adapter, and credential snapshot consumed by
+the runner.
+
+Bindings are capability-specific. `session.driver` uses a trusted session
+selection followed by its policy default; `plan.author` is policy-owned; and
+`node.*` capabilities use their request/skill/role/parent-worker/policy
+precedence. Credential principal and run mode are recorded in every
+`CapabilityBind`. Retries reuse and reauthorize the same execution.
+
+The production autonomous launcher uses the same boundary before subprocess
+creation. It persists the complete secret-free bind in the task manifest,
+then signs a short-lived launch envelope bound to task, control-run, and owner
+identity. The child verifies and removes the envelope, materializes the exact
+bind, and never re-selects a model or credential. Resume requires the persisted
+bind; a scheduled run receives a fresh `cron` bind.
 
 ### `HeartbeatLoop`
 
@@ -101,8 +144,7 @@ Use it when you need:
 - the system prompt
 - a `build_runner` callback
 - a tool-definition callback
-- provider metadata
-- model override
+- the exact `session.driver` `BoundCapabilityExecution`
 - request-scoped limits such as `max_turns`
 
 ### `AgentRunner`
@@ -148,7 +190,7 @@ Good fit when:
 
 - you already have an MCP ecosystem
 - the tool runtime is external
-- you want server discovery from inline config or `~/.claude.json`
+- you want server discovery from inline config, an explicit config path, or `MCP_CONFIG_PATH` (with none configured, no file-backed MCP servers are loaded)
 
 ### Local Tools
 
@@ -206,7 +248,7 @@ Adding a default TTL to grants or all reminted approvals would be a product-poli
 
 Sessions are first-class runtime state.
 
-`Session` currently tracks:
+`GatewaySession` (module `agent_gateway.session`) currently tracks:
 
 - `pending_tools`
 - `approved_tool_types`
@@ -214,7 +256,8 @@ Sessions are first-class runtime state.
 - `approval_queues`
 - code execution work directory
 - background code execution tasks
-- whether a stream is already active
+- whether a stream is already active (`stream_active` / `active_turn`)
+- session kind (`chat` vs `control`)
 
 `AuthManager` issues and verifies JWT session tokens. `SessionStore` owns TTL, cleanup, and expiry hooks.
 
@@ -302,17 +345,17 @@ When `skills_dir` is configured:
 Sub-agents are intentionally constrained:
 
 - they get their own runner and event log
-- they inherit provider and budget context
+- they use one immutable capability bind and an explicit child budget resolved from call, profile, or configured default
 - they cannot recursively spawn more sub-agents because `run_agent` is excluded by default
 
 ### Background Sub-Agents
 
-The agent can run sub-agents in the background for parallel research by passing `background=true` to `run_agent`. This returns immediately with a `task_id` so the parent agent can continue working, then collect results later with `get_background_result`.
+The agent runs sub-agents in the background by default. `run_agent` returns immediately with a `task_id`; pass `background=false` only when the current turn must wait for the validated `ChildReturn`. With automatic notifications enabled, current-run results arrive through typed notifications and must not be polled. `get_background_result` is reserved for historical tasks and current-run payloads explicitly omitted from a notification; notification-disabled channels may make one exact bounded wait.
 
 Key details:
 
 - background tasks are stored on the `AgentRunner`, not the session
-- a concurrency semaphore limits parallel sub-agents (default 3)
+- a universal concurrency semaphore limits parallel sub-agents (default 4)
 - the runner injects a system prompt reminder listing active background tasks after compaction pauses, so the model stays aware of pending work
 - on runner shutdown, pending background tasks are awaited (up to 30 seconds) or cancelled
 - `on_before_background` and `on_background_complete` callbacks let consumers hook into the lifecycle

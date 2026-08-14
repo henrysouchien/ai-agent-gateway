@@ -76,9 +76,9 @@ def _review_reference(
 _CANONICAL_REVIEW_REFERENCE_JSON = json.dumps(
   _review_reference(
     authority="advisory",
-    review_domain="platform.diligence_pr.review_snapshot.v1",
+    review_domain="platform.reviewed_change.snapshot.v1",
     snapshot_digest=_REVIEWED_DIGEST_A,
-    review_binding_id="diligence-review-417",
+    review_binding_id="review-417",
     bundle_manifest_digest=_REVIEWED_DIGEST_B,
   ),
   sort_keys=True,
@@ -121,9 +121,9 @@ def _request(
       "reviewed_change_binding_digest": _REVIEWED_DIGEST_D,
       "review_reference": _review_reference(
         authority="advisory",
-        review_domain="platform.diligence_pr.review_snapshot.v1",
+        review_domain="platform.reviewed_change.snapshot.v1",
         snapshot_digest=_REVIEWED_DIGEST_A,
-        review_binding_id="diligence-review-417",
+        review_binding_id="review-417",
         bundle_manifest_digest=_REVIEWED_DIGEST_B,
       ),
       "execution_semantics_digest": _REVIEWED_DIGEST_E,
@@ -723,7 +723,7 @@ def test_review_reference_rejects_untyped_plain_json() -> None:
     identity_source="reviewed_change_binding",
   )
   with pytest.raises(ValueError, match="typed review contract"):
-    replace(request, review_reference={"kind": "diligence_pr"})
+    replace(request, review_reference={"kind": "reviewed_change"})
 
 
 def test_reviewed_binding_constructor_rejects_each_cross_field_mismatch() -> None:
@@ -761,7 +761,7 @@ def test_update_request_rejects_coherent_identity_replacement(
     reviewed_change_binding_digest=_REVIEWED_DIGEST_A,
     review_reference=_review_reference(
       authority="advisory",
-      review_domain="platform.diligence_pr.review_snapshot.v1",
+      review_domain="platform.reviewed_change.snapshot.v1",
       snapshot_digest=_REVIEWED_DIGEST_B,
       review_binding_id="different-review",
       bundle_manifest_digest=_REVIEWED_DIGEST_C,

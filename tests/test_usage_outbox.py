@@ -7,6 +7,7 @@ import sqlite3
 import stat
 
 import pytest
+from agent_workflow_contracts import CapabilityBind
 
 from agent_gateway import usage_outbox as usage_outbox_module
 from agent_gateway.commercial_contract import canonical_usage_payload_sha256
@@ -53,11 +54,11 @@ def test_outbox_hardens_sqlite_main_wal_and_shm_files(tmp_path) -> None:
   assert _mode(outbox.path.parent) == 0o700
 
 
-def test_reconciliation_v2_schema_is_declared_as_package_data() -> None:
+def test_reconciliation_schemas_are_declared_as_package_data() -> None:
   pyproject = Path(__file__).parents[1] / "pyproject.toml"
-  assert '"contracts/usage-reconciliation-v2/*.json"' in pyproject.read_text(
-    encoding="utf-8"
-  )
+  contents = pyproject.read_text(encoding="utf-8")
+  assert '"contracts/usage-reconciliation-v2/*.json"' in contents
+  assert '"contracts/usage-reconciliation-v3/*.json"' in contents
 
 
 def _payload(event_id: str, *, request_id: str = "req_001") -> dict:
@@ -111,6 +112,60 @@ def _v2_payload(event_id: str) -> dict:
   }
   payload["source_payload_sha256"] = canonical_usage_payload_sha256(payload)
   return payload
+
+
+def _v3_payload(event_id: str) -> dict:
+  bind = CapabilityBind(
+    schema_version="1.0",
+    capability_id="portfolio.review",
+    model_key="anthropic.claude-sonnet-test",
+    provider="anthropic",
+    upstream_model="claude-sonnet-test",
+    adapter="anthropic.sdk.messages",
+    protocol_profile="anthropic.messages",
+    route="direct",
+    effort="none",
+    credential_principal="user",
+    credential_ref="test-credential",
+    run_mode="interactive",
+    registry_revision="test-v1",
+    policy_revision="test-v1",
+    selection_source="explicit_user",
+  ).receipt()
+  payload = {
+    **_payload(event_id),
+    "schema_version": 3,
+    "capability_bind": bind,
+    "provider_reported_model": "claude-sonnet-test-20260801",
+    "workflow_attempt_group_id": None,
+    "workflow_attempt_number": None,
+    "retry_of_workflow_run_id": None,
+    "workflow_attempt_kind": None,
+    "work_authorization_id": None,
+  }
+  payload["source_payload_sha256"] = canonical_usage_payload_sha256(payload)
+  return payload
+
+
+def test_outbox_preserves_exact_v3_bind_and_reported_identity_bytes(tmp_path) -> None:
+  outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
+  payload = _v3_payload("evt_v3")
+  outbox.enqueue_batch([payload], created_at=NOW)
+
+  stored = outbox.get("evt_v3")
+  assert stored is not None
+  assert stored.payload == payload
+  assert stored.payload_json == json.dumps(
+    payload,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+    allow_nan=False,
+  )
+  assert stored.payload["capability_bind"] == payload["capability_bind"]
+  assert stored.payload["provider_reported_model"] == (
+    "claude-sonnet-test-20260801"
+  )
 
 
 def test_outbox_migration_pragmas_and_health(tmp_path) -> None:
@@ -446,6 +501,7 @@ def test_reconciliation_reports_are_append_only_replay_safe_revisions(tmp_path) 
     cache_creation_tokens=0, cost=0.002, turns=1, channel="mcp",
     started_at=NOW.timestamp() - 60, ended_at=NOW.timestamp(),
     usage_event_count=1, usage_event_ids=("evt_001",),
+    capability_bind=_v3_payload("bind")["capability_bind"],
   )
   report = tracker.compare(summary)
   first, replayed = outbox.record_reconciliation_report(report, recorded_at=NOW)
@@ -517,6 +573,7 @@ def test_reconciliation_v2_is_validated_and_persisted_with_attempt_lineage(
     cache_creation_tokens=0, cost=0.002, turns=1, channel="mcp",
     started_at=NOW.timestamp() - 60, ended_at=NOW.timestamp(),
     usage_event_count=1, usage_event_ids=("evt_v2_001",),
+    capability_bind=_v3_payload("bind")["capability_bind"],
   )
 
   stored, replayed = outbox.record_reconciliation_report(
@@ -579,6 +636,7 @@ def test_reconciliation_v2_rejects_noncanonical_manifest_order(tmp_path) -> None
     cache_creation_tokens=0, cost=0.002, turns=1, channel="mcp",
     started_at=NOW.timestamp() - 60, ended_at=NOW.timestamp(),
     usage_event_count=1, usage_event_ids=("evt_v2_a",),
+    capability_bind=_v3_payload("bind")["capability_bind"],
   )
   reversed_manifest = tracker.compare(summary).as_dict()
   reversed_manifest["event_lines"] = list(
@@ -608,6 +666,7 @@ def test_reconciliation_report_rejects_self_inconsistent_totals_and_status(tmp_p
     cache_creation_tokens=0, cost=0.002, turns=1, channel="mcp",
     started_at=NOW.timestamp() - 60, ended_at=NOW.timestamp(),
     usage_event_count=1, usage_event_ids=("evt_001",),
+    capability_bind=_v3_payload("bind")["capability_bind"],
   )).as_dict()
   report.update(commercial_event_count=999, input_token_delta=123, status="match")
 
@@ -619,6 +678,7 @@ def test_reconciliation_report_rejects_self_inconsistent_totals_and_status(tmp_p
     cache_creation_tokens=0, cost=0.002, turns=1, channel="mcp",
     started_at=NOW.timestamp() - 60, ended_at=NOW.timestamp(),
     usage_event_count=1, usage_event_ids=("evt_001",),
+    capability_bind=_v3_payload("bind")["capability_bind"],
   )).as_dict()
   invalid_conflict.update(
     conflicting_event_id_count=1,
@@ -633,6 +693,7 @@ def test_reconciliation_report_rejects_self_inconsistent_totals_and_status(tmp_p
     cache_creation_tokens=0, cost=0.002, turns=1, channel="mcp",
     started_at=float("nan"), ended_at=NOW.timestamp(),
     usage_event_count=1, usage_event_ids=("evt_001",),
+    capability_bind=_v3_payload("bind")["capability_bind"],
   ))
   with pytest.raises(ValueError, match="inconsistent"):
     outbox.record_reconciliation_report(non_finite_time)
@@ -656,6 +717,7 @@ def test_reconciliation_shipments_are_fenced_ordered_and_terminal(tmp_path) -> N
     cache_creation_tokens=0, cost=0.002, turns=1, channel="mcp",
     started_at=NOW.timestamp() - 60, ended_at=NOW.timestamp(),
     usage_event_count=1, usage_event_ids=("evt_001",),
+    capability_bind=_v3_payload("bind")["capability_bind"],
   )
   first, _ = outbox.record_reconciliation_report(tracker.compare(summary), recorded_at=NOW)
   tracker.mark_late("evt_001")
@@ -715,6 +777,7 @@ def test_v2_upgrade_backfills_pending_reconciliation_shipments(tmp_path) -> None
       cache_creation_tokens=0, cost=0.002, turns=1, channel="mcp",
       started_at=NOW.timestamp() - 60, ended_at=NOW.timestamp(),
       usage_event_count=1, usage_event_ids=("evt_001",),
+      capability_bind=_v3_payload("bind")["capability_bind"],
     )),
     recorded_at=NOW,
   )

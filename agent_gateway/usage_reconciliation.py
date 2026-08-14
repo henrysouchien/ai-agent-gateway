@@ -8,6 +8,8 @@ import threading
 from typing import Any, Literal
 from uuid import UUID
 
+from agent_workflow_contracts import CapabilityBind
+
 from .multi_user.billing import SessionUsageSummary
 
 
@@ -64,9 +66,12 @@ class CommercialUsageReconciliationReport:
   retry_of_workflow_run_id: str | None = None
   workflow_attempt_kind: str | None = None
   work_authorization_id: str | None = None
+  source_usage_schema_version: Literal[1, 2, 3] = 1
 
   @property
-  def evidence_schema_version(self) -> Literal[1, 2]:
+  def evidence_schema_version(self) -> Literal[1, 2, 3]:
+    if self.source_usage_schema_version == 3:
+      return 3
     return 2 if self.workflow_attempt_group_id is not None else 1
 
   def as_dict(self) -> dict[str, Any]:
@@ -82,6 +87,8 @@ class CommercialUsageReconciliationReport:
       "summary_usage_event_ids", "event_lines",
     ):
       value[field] = list(value[field])
+    if self.evidence_schema_version != 3:
+      value.pop("source_usage_schema_version")
     if self.evidence_schema_version == 1:
       for field in (
         "workflow_attempt_group_id", "workflow_attempt_number",
@@ -121,8 +128,10 @@ class CommercialUsageReconciliationTracker:
     self._durability: dict[str, str] = {}
     self._parent_ids: set[str] = set()
     self._unit_ids: set[str] = set()
-    self._source_schema_version: Literal[1, 2] | None = None
-    self._attempt_identity: tuple[str, int, str | None, str, str] | None = None
+    self._source_schema_version: Literal[1, 2, 3] | None = None
+    self._attempt_identity: tuple[
+      str, int, str | None, str, str | None
+    ] | None = None
 
   def record_batch(
     self,
@@ -170,27 +179,86 @@ class CommercialUsageReconciliationTracker:
         if any(configured) and configured != source_identity:
           raise ValueError("commercial reconciliation source lineage mismatch")
         source_schema_version = int(payload.get("schema_version") or 1)
-        if source_schema_version not in {1, 2}:
+        if source_schema_version not in {1, 2, 3}:
           raise ValueError("commercial reconciliation source schema is unsupported")
         if (
           staged_schema_version is not None
           and staged_schema_version != source_schema_version
         ):
           raise ValueError("commercial reconciliation cannot mix usage schema versions")
+        if source_schema_version == 3:
+          try:
+            bind = CapabilityBind.from_receipt(payload.get("capability_bind"))
+          except (TypeError, ValueError) as exc:
+            raise ValueError(
+              "commercial reconciliation capability bind is invalid"
+            ) from exc
+          if payload.get("capability_bind") != bind.receipt():
+            raise ValueError(
+              "commercial reconciliation capability bind is not canonical"
+            )
+          if (
+            payload.get("provider") != bind.provider
+            or payload.get("model") != bind.upstream_model
+            or payload.get("capability_id") != bind.capability_id
+          ):
+            raise ValueError(
+              "commercial reconciliation identity projection mismatch"
+            )
+          reported = payload.get("provider_reported_model")
+          if reported is not None and (
+            not isinstance(reported, str) or not reported.strip()
+          ):
+            raise ValueError(
+              "commercial reconciliation provider-reported model is invalid"
+            )
+        attempt_fields = (
+          "workflow_attempt_group_id",
+          "workflow_attempt_number",
+          "retry_of_workflow_run_id",
+          "workflow_attempt_kind",
+          "work_authorization_id",
+        )
+        attempt_field_count = sum(field in payload for field in attempt_fields)
+        if source_schema_version == 2 and attempt_field_count != len(attempt_fields):
+          raise ValueError("commercial reconciliation attempt identity is incomplete")
+        if source_schema_version == 3 and attempt_field_count != len(attempt_fields):
+          raise ValueError("commercial reconciliation attempt identity is incomplete")
         attempt_identity = None
-        if source_schema_version == 2:
+        group_value = payload.get("workflow_attempt_group_id")
+        if source_schema_version == 3 and group_value is None:
+          if any(payload.get(field) is not None for field in attempt_fields):
+            raise ValueError("commercial reconciliation attempt identity is invalid")
+        elif attempt_field_count:
           group_id = str(payload.get("workflow_attempt_group_id") or "").strip()
-          work_authorization_id = str(
-            payload.get("work_authorization_id") or ""
-          ).strip()
+          work_authorization_value = payload.get("work_authorization_id")
+          work_authorization_id = (
+            str(work_authorization_value).strip()
+            if work_authorization_value is not None else None
+          )
           attempt_kind = str(payload.get("workflow_attempt_kind") or "").strip()
           attempt_number = payload.get("workflow_attempt_number")
           retry_value = payload.get("retry_of_workflow_run_id")
           retry_of = str(retry_value).strip() if retry_value is not None else None
           try:
             canonical_group = str(UUID(group_id))
-            canonical_authorization = str(UUID(work_authorization_id))
+            canonical_authorization = (
+              str(UUID(work_authorization_id))
+              if work_authorization_id is not None else None
+            )
             canonical_retry = str(UUID(retry_of)) if retry_of is not None else None
+            if source_schema_version == 3:
+              for field in (
+                "execution_context_id", "workflow_run_id", "funding_route_id",
+              ):
+                value = str(payload.get(field) or "").strip()
+                if value != str(UUID(value)):
+                  raise ValueError
+              reservation_value = payload.get("reservation_id")
+              if reservation_value is not None:
+                reservation = str(reservation_value).strip()
+                if reservation != str(UUID(reservation)):
+                  raise ValueError
           except (ValueError, AttributeError, TypeError):
             raise ValueError(
               "commercial reconciliation attempt identity is invalid"
@@ -202,6 +270,16 @@ class CommercialUsageReconciliationTracker:
             or type(attempt_number) is not int
             or attempt_number <= 0
             or attempt_kind not in {"initial", "user_retry", "automatic_retry"}
+            or (
+              source_schema_version == 3
+              and source_identity[1] == "hank-agent-gateway"
+              and work_authorization_id is None
+            )
+            or (
+              source_schema_version == 3
+              and source_identity[1] == "risk-module-direct"
+              and work_authorization_id is not None
+            )
             or (
               attempt_kind == "initial"
               and (
@@ -232,6 +310,12 @@ class CommercialUsageReconciliationTracker:
             and staged_attempt_identity != attempt_identity
           ):
             raise ValueError("commercial reconciliation attempt identity mismatch")
+        if (
+          source_schema_version == 3
+          and staged_schema_version == 3
+          and (staged_attempt_identity is None) != (attempt_identity is None)
+        ):
+          raise ValueError("commercial reconciliation attempt identity mismatch")
         (
           staged_environment,
           staged_source_product,
@@ -400,18 +484,37 @@ class CommercialUsageReconciliationTracker:
         ),
         **(
           {
-            "source_schema_version": 2,
+            "source_schema_version": source_schema_version,
             "workflow_attempt_group_id": str(
               payload.get("workflow_attempt_group_id")
-            ),
-            "workflow_attempt_number": int(
-              payload.get("workflow_attempt_number")
+            ) if payload.get("workflow_attempt_group_id") is not None else None,
+            "workflow_attempt_number": (
+              int(payload["workflow_attempt_number"])
+              if payload.get("workflow_attempt_number") is not None else None
             ),
             "retry_of_workflow_run_id": payload.get("retry_of_workflow_run_id"),
-            "workflow_attempt_kind": str(payload.get("workflow_attempt_kind")),
-            "work_authorization_id": str(payload.get("work_authorization_id")),
+            "workflow_attempt_kind": (
+              str(payload["workflow_attempt_kind"])
+              if payload.get("workflow_attempt_kind") is not None else None
+            ),
+            "work_authorization_id": (
+              str(payload["work_authorization_id"])
+              if payload.get("work_authorization_id") is not None else None
+            ),
+            **(
+              {
+                "capability_bind": dict(payload["capability_bind"]),
+                "provider_reported_model": payload.get(
+                  "provider_reported_model"
+                ),
+                "provider": str(payload["provider"]),
+                "model": str(payload["model"]),
+                "capability_id": str(payload["capability_id"]),
+              }
+              if source_schema_version == 3 else {}
+            ),
           }
-          if source_schema_version == 2 else {}
+          if source_schema_version in {2, 3} else {}
         ),
       }
       for payload in sorted(payloads, key=lambda value: str(value.get("source_event_id")))
@@ -467,4 +570,5 @@ class CommercialUsageReconciliationTracker:
       retry_of_workflow_run_id=(attempt_identity[2] if attempt_identity else None),
       workflow_attempt_kind=(attempt_identity[3] if attempt_identity else None),
       work_authorization_id=(attempt_identity[4] if attempt_identity else None),
+      source_usage_schema_version=source_schema_version or 1,
     )

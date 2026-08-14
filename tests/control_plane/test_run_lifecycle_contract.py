@@ -58,7 +58,7 @@ def test_control_run_response_models_expose_only_contract_states() -> None:
 
   assert set(get_args(ChatRunState)) == contract_states
   assert set(get_args(AutonomousRunState)) == contract_states
-  assert "budget_limited" not in contract_states
+  assert "budget_limited" in contract_states
   assert "blocked" not in contract_states
   assert "remediating" not in contract_states
 

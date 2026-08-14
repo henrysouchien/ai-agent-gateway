@@ -39,6 +39,99 @@ def load_server_policy_helpers(*, require_tool_class: bool = False) -> tuple[Any
   )
 
 
+def resolve_effective_role(role: str | None) -> str:
+  """Normalize authority without allowing owner-by-omission."""
+  policy_module = load_server_policy_module()
+  if policy_module is not None:
+    resolver = getattr(policy_module, "resolve_effective_role", None)
+    if resolver is not None:
+      return str(resolver(role))
+  return "owner" if (role or "").strip().lower() == "owner" else "invite"
+
+
+def require_inherited_role(parent_session: Any | None) -> str:
+  """Inherit an exact valid role; a null legacy parent remains invite."""
+  if parent_session is None:
+    return "invite"
+  raw_role = getattr(parent_session, "role", None)
+  normalized = (
+    raw_role.strip().lower()
+    if isinstance(raw_role, str)
+    else ""
+  )
+  if normalized not in {"owner", "invite"}:
+    raise ValueError("parent session must carry an explicit valid role")
+  return normalized
+
+
+def role_denied_tools_for_session(session: Any | None) -> frozenset[str]:
+  """Return enumerable role denials; execution still fails closed if unavailable."""
+  policy_module = load_server_policy_module()
+  if policy_module is None:
+    return frozenset()
+  forbidden_for_session = getattr(
+    policy_module,
+    "get_forbidden_tools_for_session",
+    None,
+  )
+  if forbidden_for_session is None:
+    return frozenset()
+  return frozenset(forbidden_for_session(session))
+
+
+def role_policy_denies_tool(
+  *,
+  role: str | None,
+  tool_name: str,
+  is_local: bool,
+) -> bool:
+  """Return the canonical role decision, failing closed for invite authority."""
+  if resolve_effective_role(role) == "owner":
+    return False
+  policy_module = load_server_policy_module()
+  if policy_module is None:
+    return True
+  forbidden_for_session = getattr(
+    policy_module,
+    "get_forbidden_tools_for_session",
+    None,
+  )
+  invite_denies_local = getattr(
+    policy_module,
+    "invite_denies_local_tool",
+    None,
+  )
+  if forbidden_for_session is None or invite_denies_local is None:
+    return True
+  if is_local:
+    return bool(invite_denies_local(tool_name))
+  return tool_name in forbidden_for_session({"role": "invite"})
+
+
+def authority_policy_denies_tool(
+  *,
+  session: Any | None,
+  role: str | None,
+  tool_name: str,
+  is_local: bool,
+  profile_name: str | None = None,
+) -> bool:
+  """Evaluate authenticated role and scoped session capabilities together."""
+  policy_module = load_server_policy_module()
+  if policy_module is None:
+    return True
+  evaluator = getattr(policy_module, "authority_denies_tool", None)
+  if evaluator is None:
+    return True
+  authority_session = session if session is not None else {"role": role}
+  return bool(evaluator(
+    authority_session,
+    tool_name,
+    is_local=is_local,
+    profile_name=profile_name,
+  ))
+
+
 def resolve_server_policy_tool_class(
   tool_name: str,
   *,

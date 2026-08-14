@@ -20,8 +20,11 @@ from agent_gateway.skills import (
   SKILL_STATE_CLASSES,
   SkillLoader,
   SkillProfile,
+  compile_agent_operation,
+  operation_tool_ids,
   parse_skill_file,
   resolve_blocks,
+  validate_operation_tool_coherence,
 )
 from agent.skills.loader import resolve_blocks as api_resolve_blocks
 from agent.shared.tool_handlers import _skill_memory_write_allowed_files
@@ -198,6 +201,57 @@ def test_parse_max_structured_reads_rejects_non_integer(tmp_path: Path) -> None:
   skill_path = _write_skill(tmp_path, "max_structured_reads: nope")
 
   with pytest.raises(ValueError, match="must be an integer"):
+    parse_skill_file(skill_path)
+
+
+def test_parse_subagent_return_contract_is_rejected(tmp_path: Path) -> None:
+  skill_path = _write_skill(tmp_path, "subagent_return_contract: verify-finding-v1")
+
+  with pytest.raises(ValueError, match="not supported"):
+    parse_skill_file(skill_path)
+
+
+@pytest.mark.parametrize("raw", ["''", "'   '", "[]", "{}"])
+def test_parse_subagent_return_contract_rejects_invalid_value(
+  tmp_path: Path,
+  raw: str,
+) -> None:
+  skill_path = _write_skill(tmp_path, f"subagent_return_contract: {raw}")
+
+  with pytest.raises(ValueError, match="subagent_return_contract"):
+    parse_skill_file(skill_path)
+
+
+def test_parse_delegation_role(tmp_path: Path) -> None:
+  skill_path = _write_skill(tmp_path, "delegation_role: verify-finding")
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.delegation_role == "verify-finding"
+  assert profile.metadata is None
+
+
+def test_parse_unmapped_delegation_role_warns_without_redefining_dispatch_policy(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  skill_path = _write_skill(tmp_path, "delegation_role: typo-role")
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.delegation_role == "typo-role"
+  assert "delegation_role 'typo-role' is not mapped" in caplog.text
+  assert "will be rejected at dispatch" in caplog.text
+
+
+@pytest.mark.parametrize("raw", ["''", "'   '", "[]", "{}"])
+def test_parse_delegation_role_rejects_invalid_value(
+  tmp_path: Path,
+  raw: str,
+) -> None:
+  skill_path = _write_skill(tmp_path, f"delegation_role: {raw}")
+
+  with pytest.raises(ValueError, match="delegation_role"):
     parse_skill_file(skill_path)
 
 
@@ -583,6 +637,7 @@ def test_none_defaults(tmp_path: Path) -> None:
   assert profile.state_class is None
   assert profile.data_requirements == ()
   assert profile.max_structured_reads is None
+  assert profile.delegation_role is None
 
 
 def test_dataclass_construction_defaults() -> None:
@@ -605,14 +660,16 @@ def test_dataclass_construction_defaults() -> None:
   assert profile.state_class is None
   assert profile.data_requirements == ()
   assert profile.max_structured_reads is None
+  assert profile.delegation_role is None
 
 
 def test_positional_construction_compat() -> None:
   profile = SkillProfile("name", "prompt", None, None, None, None, None, False, None, False, {"custom": 1})
 
-  assert [field.name for field in fields(SkillProfile)][-2:] == [
+  assert [field.name for field in fields(SkillProfile)][-3:] == [
     "data_requirements",
     "max_structured_reads",
+    "delegation_role",
   ]
   assert profile.name == "name"
   assert profile.system_prompt == "prompt"
@@ -625,6 +682,7 @@ def test_positional_construction_compat() -> None:
   assert profile.tool_packs_enabled is True
   assert profile.data_requirements == ()
   assert profile.max_structured_reads is None
+  assert profile.delegation_role is None
 
 
 def test_agent_profile_subclass_compat() -> None:
@@ -788,7 +846,7 @@ def test_fundamental_research_typed_contract_scopes_memory_write_to_standard_art
   profile = SkillLoader(SKILLS_DIR).load("fundamental-research")
 
   assert profile.metadata is not None
-  assert profile.metadata.get("typed_outputs_contract") == {}
+  assert profile.metadata.get("typed_outputs_contract") is not None
   assert _skill_memory_write_allowed_files(
     profile,
     "skills/fundamental-research/2026-06-11T120000.000Z-run123-MSFT.md",
@@ -823,3 +881,166 @@ def test_compact_rollout_skill_timeout_frontmatter(skill_name: str, expected_tim
   profile = SkillLoader(SKILLS_DIR).load(skill_name)
 
   assert profile.timeout == expected_timeout
+
+
+# --- PN-E2E-01: typed operation tool-coherence -------------------------------
+
+_PEER_COMPARISON_TOOLS_BY_SERVER = {
+  "edgar-parser-mcp": {"get_filing_sections", "get_filings"},
+  "market-data-mcp": {"compare_peers", "fetch_company_profile", "fetch_financials"},
+  "research-corpus-mcp": {"filings_read", "filings_search", "filings_source_excerpt"},
+}
+_PEER_COMPARISON_DECLARED_TOOLS = frozenset(
+  tool
+  for tools in _PEER_COMPARISON_TOOLS_BY_SERVER.values()
+  for tool in tools
+)
+
+
+class _StaticMcpClient:
+  def __init__(self, tools_by_server: dict[str, set[str]]) -> None:
+    self._server_by_tool = {
+      tool: server
+      for server, tools in tools_by_server.items()
+      for tool in tools
+    }
+
+  def is_mcp_tool(self, name: str) -> bool:
+    return name in self._server_by_tool
+
+  def get_server_for_tool(self, name: str) -> str | None:
+    return self._server_by_tool.get(name)
+
+  def get_original_tool_name(self, name: str) -> str:
+    return name
+
+
+def test_peer_comparison_analysis_declares_evidence_capability_and_ceiling() -> None:
+  profile = SkillLoader(SKILLS_DIR).load("peer-comparison-analysis")
+
+  assert operation_tool_ids(profile) == _PEER_COMPARISON_DECLARED_TOOLS
+
+  operation = compile_agent_operation(profile, execution_class="node.explore")
+
+  assert [item.name for item in operation.required_capabilities] == [
+    "research-evidence.read/v1"
+  ]
+  assert all(
+    "live_tool" in item.binding_modes for item in operation.required_capabilities
+  )
+
+
+def test_peer_comparison_analysis_compiles_non_empty_tool_grant() -> None:
+  from agent_gateway.sub_agent_scope_receipt import admit_operation_tools
+
+  profile = SkillLoader(SKILLS_DIR).load("peer-comparison-analysis")
+  operation = compile_agent_operation(profile, execution_class="node.explore")
+  declared = operation_tool_ids(profile)
+
+  admission = admit_operation_tools(
+    operation,
+    grant_id="grant:test-peer-comparison",
+    operation_tool_ids=declared,
+    definitions=[{"name": name} for name in sorted(declared)],
+    local_tool_handlers={},
+    mcp_client=_StaticMcpClient(_PEER_COMPARISON_TOOLS_BY_SERVER),
+    effect_resolver=lambda tool_id, server_id, is_local: "read",
+  )
+
+  assert admission.tool_grant.tools
+  assert {
+    entry.tool_id for entry in admission.tool_grant.tools
+  } == _PEER_COMPARISON_DECLARED_TOOLS
+
+
+def test_operation_tool_coherence_rejects_requirements_without_ceiling(
+  tmp_path: Path,
+) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    name: contradictory-skill
+    agent_callable: true
+    agent_description: Fixture profile with data needs but no tool ceiling.
+    mutation_mode: read_only
+    data_requirements:
+      - endpoint: key_metrics
+        symbol: "{ticker}"
+        params:
+          period: annual
+        required: true
+        freshness: immutable_history
+    semantic_metadata:
+      tool_refs: []
+    """,
+  )
+  profile = parse_skill_file(skill_path)
+
+  with pytest.raises(ValueError, match="empty\\s+declared tool ceiling"):
+    validate_operation_tool_coherence(profile)
+  with pytest.raises(ValueError, match="research-evidence.read/v1"):
+    compile_agent_operation(profile, execution_class="node.explore")
+
+
+def test_operation_tool_coherence_accepts_tool_free_and_tool_backed_profiles(
+  tmp_path: Path,
+) -> None:
+  tool_free = parse_skill_file(
+    _write_skill(
+      tmp_path,
+      """
+      name: tool-free-skill
+      agent_callable: true
+      agent_description: Genuinely tool-free advisory profile.
+      mutation_mode: read_only
+      semantic_metadata:
+        tool_refs: []
+      """,
+    )
+  )
+  validate_operation_tool_coherence(tool_free)
+  assert compile_agent_operation(
+    tool_free,
+    execution_class="node.explore",
+  ).required_capabilities == ()
+
+  backed = SkillLoader(SKILLS_DIR).load("filing-extractor")
+  validate_operation_tool_coherence(backed)
+
+
+def test_operation_tool_coherence_holds_for_all_callable_catalog_skills() -> None:
+  loader = SkillLoader(SKILLS_DIR)
+  for name in loader.list_skills():
+    profile = loader.load(name)
+    if not profile.agent_callable:
+      continue
+    validate_operation_tool_coherence(profile)
+
+
+def test_operation_tool_coherence_exempts_name_shim_only_profiles(
+  tmp_path: Path,
+) -> None:
+  # The research-evidence requirement here comes only from the explore /
+  # verify-finding name-based migration fallback, not from declared typed
+  # metadata; live catalog assembly separately rejects those names when no
+  # evidence-tool route exists.
+  profile = parse_skill_file(
+    _write_skill(
+      tmp_path,
+      """
+      name: verify-finding
+      agent_callable: true
+      agent_description: Shim-named fixture without declared tool metadata.
+      mutation_mode: read_only
+      semantic_metadata:
+        tool_refs: []
+      """,
+    )
+  )
+
+  validate_operation_tool_coherence(profile)
+  operation = compile_agent_operation(profile, execution_class="node.verify")
+
+  assert [item.name for item in operation.required_capabilities] == [
+    "research-evidence.read/v1"
+  ]

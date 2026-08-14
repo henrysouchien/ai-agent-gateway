@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence, SupportsFloat
@@ -34,16 +35,25 @@ class JsonFileKeyValue:
 
   def _save(self, data: dict[str, dict[str, dict[str, Any]]]) -> None:
     self._path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = self._path.with_suffix(f"{self._path.suffix}.tmp")
-    tmp_path.write_text(
-      json.dumps(data, indent=2, sort_keys=True) + "\n",
-      encoding="utf-8",
+    descriptor, raw_tmp_path = tempfile.mkstemp(
+      prefix=f".{self._path.name}.",
+      suffix=".tmp",
+      dir=self._path.parent,
     )
+    tmp_path = Path(raw_tmp_path)
     try:
+      with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
       tmp_path.chmod(0o600)
-    except OSError:
-      pass
-    self._replace_file(tmp_path, self._path)
+      self._replace_file(tmp_path, self._path)
+      self._path.chmod(0o600)
+    finally:
+      try:
+        tmp_path.unlink()
+      except FileNotFoundError:
+        pass
 
   def _active_value(self, entry: Any) -> dict[str, Any] | None:
     if not isinstance(entry, dict):

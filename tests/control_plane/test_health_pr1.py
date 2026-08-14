@@ -33,3 +33,36 @@ def test_control_version_header_is_control_prefix_only(
   assert CONTROL_PLANE_VERSION_HEADER not in root_health.headers
   assert root_health.json()["status"] == "ok"
   assert "package" in root_health.json()
+
+
+def test_approval_delivery_fatal_state_fails_health(
+  client: TestClient,
+  control_health_url: str,
+) -> None:
+  coordinator = (
+    client.app.state.autonomous_approval_delivery_coordinator
+  )
+  coordinator._fatal_error = "injected approval recovery failure"
+
+  control_health = client.get(control_health_url)
+  root_health = client.get("/api/health")
+
+  assert control_health.status_code == 200
+  assert control_health.json()["status"] == "error"
+  assert root_health.status_code == 503
+  assert root_health.json()["status"] == "error"
+
+
+def test_approval_delivery_coordinator_follows_app_lifespan(
+  control_plane_app,
+) -> None:
+  coordinator = (
+    control_plane_app.state.autonomous_approval_delivery_coordinator
+  )
+  assert coordinator._task is None
+
+  with TestClient(control_plane_app):
+    assert coordinator._task is not None
+    assert not coordinator._task.done()
+
+  assert coordinator._task is None

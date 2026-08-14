@@ -52,12 +52,8 @@ _UNSET = object()
 
 @dataclass
 class AgentSDKConfig:
-  """Configuration for the optional Anthropic agent SDK runner."""
+  """Non-routing configuration for the optional Anthropic agent SDK runner."""
 
-  api_key: str
-  auth_mode: str | None = None
-  auth_token: str | None = None
-  model: str | None = None
   max_budget_usd: float | None = None
   cwd: str | Path | None = None
   disallowed_tools: list[str] = field(default_factory=list)
@@ -87,7 +83,7 @@ def _resolve_channel_tier(
 def _resolve_mcp_config_path(config_path: Path | str | None | object = _UNSET) -> Path | None:
   if config_path is _UNSET:
     env_path = os.getenv("MCP_CONFIG_PATH", "").strip()
-    return Path(env_path).expanduser() if env_path else Path.home() / ".claude.json"
+    return Path(env_path).expanduser() if env_path else None
   if config_path is None:
     return None
   return Path(config_path).expanduser()
@@ -105,22 +101,18 @@ def build_disallowed_tools(
     allowed |= SDK_WEB_BUILTINS
 
   blocked = set(SDK_KNOWN_BUILTINS) - allowed
-  # NOTE (deferred-tier limitation, agent-sdk only): the SDK fixes its MCP server
-  # set at session start and has no mid-session `load_tools`, so deferred-tier
-  # servers are hard-blocked here and never started by load_mcp_config_for_sdk
-  # (always-only, below). A server placed in a channel's `defer` set (e.g.
-  # fred-mcp, macro-mcp) is therefore unreachable under AGENT_PROVIDER=agent-sdk.
-  # The `anthropic` provider does NOT have this limitation — it honors load_tools,
-  # so `defer` works there. To make a deferred server usable under agent-sdk,
-  # promote it to the channel's `always` tier in CHANNEL_TIERS, or add
-  # deferred-loading support to this provider.
+  # Deferred servers stay blocked in the initial SDK query. The interactive SDK
+  # runtime retains their configs separately and rebuilds the query after its
+  # in-process load_tools bridge admits a server or pack.
   for server_name in tier.get("defer", set()):
     blocked.add(f"mcp__{server_name}__*")
   if extra_blocked:
     blocked |= extra_blocked
   get_forbidden_tools_for_session, get_server_for_policy_tool, _get_tool_class = load_server_policy_helpers()
 
-  if get_forbidden_tools_for_session is not None and get_server_for_policy_tool is not None:
+  if get_forbidden_tools_for_session is None or get_server_for_policy_tool is None:
+    blocked.add("mcp__*")
+  else:
     for tool_name in get_forbidden_tools_for_session(session):
       server_name = get_server_for_policy_tool(tool_name)
       if server_name is None:
@@ -156,8 +148,8 @@ def load_mcp_config_for_sdk(
     return {}
 
   tier = _resolve_channel_tier(channel, channel_tiers)
-  # always-only: the SDK has no mid-session load_tools, so deferred-tier servers
-  # are not started here (and are blocked in build_disallowed_tools — see note there).
+  # Initial-query configs are always-only. The interactive runtime makes a
+  # separate all-eligible call to retain deferred configs for query rebuilds.
   allowed_servers = tier.get("always", set())
   sdk_configs: Dict[str, Dict[str, Any]] = {}
 
@@ -205,7 +197,7 @@ def _validate_sdk_version() -> None:
   try:
     import claude_agent_sdk
   except ImportError as exc:
-    raise RuntimeError("claude-agent-sdk dependency is required when AGENT_PROVIDER=agent-sdk") from exc
+    raise RuntimeError("claude-agent-sdk dependency is required for the selected SDK adapter") from exc
 
   installed = str(getattr(claude_agent_sdk, "__version__", "") or "")
   if installed != SDK_PINNED_VERSION:
@@ -213,10 +205,6 @@ def _validate_sdk_version() -> None:
       f"claude-agent-sdk {installed or '<unknown>'} != pinned {SDK_PINNED_VERSION}. "
       "Review new built-in tools, update SDK_KNOWN_BUILTINS, then bump SDK_PINNED_VERSION."
     )
-
-
-def has_active_credential() -> bool:
-  return bool(os.getenv("AGENT_SDK_API_KEY", "").strip())
 
 
 def estimate_cost(
@@ -245,6 +233,5 @@ __all__ = [
   "SDK_WEB_BUILTINS",
   "build_disallowed_tools",
   "estimate_cost",
-  "has_active_credential",
   "load_mcp_config_for_sdk",
 ]

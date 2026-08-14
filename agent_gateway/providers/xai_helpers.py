@@ -17,7 +17,6 @@ from .codex_helpers import (
 
 
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
-DEFAULT_XAI_MODEL = "grok-4.5"
 DEFAULT_INSTRUCTIONS = "Follow the user's instructions."
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 
@@ -100,7 +99,6 @@ async def parse_error_response(response: httpx.Response) -> str:
 __all__ = [
   "DEFAULT_INSTRUCTIONS",
   "DEFAULT_XAI_BASE_URL",
-  "DEFAULT_XAI_MODEL",
   "RETRYABLE_STATUSES",
   "_ResponsesStreamState",
   "_convert_messages",

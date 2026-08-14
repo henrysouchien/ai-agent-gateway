@@ -3,40 +3,61 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable
 from typing import Any, Dict
-from .thinking import canonical_effort_config
-
 
 MetricEmitter = Callable[[str, int], None]
+_SELECTION_AUTH_CONFIG_FIELDS = frozenset({
+  "effort",
+  "execution_transport",
+  "model",
+  "model_key",
+  "thinking",
+  "thinking_enabled_requested",
+})
 
 
-def merge_refreshed_auth_config(config: Dict[str, Any], refreshed: Dict[str, Any]) -> Dict[str, Any]:
-  # Preserve request-scoped model/runtime controls. The refresh hook rotates
-  # credentials for the already-selected provider; model changes belong to a
-  # new session/init handshake.
-  canonical_config = canonical_effort_config(config)
-  preserved = {
-    "model": canonical_config.get("model"),
-    "max_tokens": canonical_config.get("max_tokens"),
-    "effort": canonical_config.get("effort"),
+def merge_refreshed_auth_config(
+  config: Dict[str, Any],
+  refreshed: Dict[str, Any],
+) -> Dict[str, Any]:
+  """Rotate credential material without reopening execution selection."""
+
+  duplicated = sorted(
+    _SELECTION_AUTH_CONFIG_FIELDS & (set(config) | set(refreshed))
+  )
+  if duplicated:
+    raise ValueError(
+      "credential refresh material must not contain model selection: "
+      + ", ".join(duplicated)
+    )
+  provider = str(config.get("provider") or "").strip().lower()
+
+  immutable_values = {
+    "auth_mode": str(config.get("auth_mode", "api")).strip().lower(),
+    "max_tokens": int(config.get("max_tokens", 16000)),
   }
-  merged = dict(canonical_config)
+  if provider:
+    immutable_values["provider"] = provider
+  for key, expected in immutable_values.items():
+    if key not in refreshed:
+      continue
+    candidate = refreshed[key]
+    if key in {"provider", "auth_mode"}:
+      candidate = str(candidate or "").strip().lower()
+    elif key == "max_tokens":
+      candidate = int(candidate)
+    if candidate != expected:
+      raise ValueError(
+        f"credential refresh cannot change bound {key}"
+      )
+  merged = dict(config)
   merged.update(refreshed)
-  for key, value in preserved.items():
-    if value is not None:
-      merged[key] = value
-  # Refreshed credentials may come from an older resolver that still emits
-  # the deprecated boolean alias. The persisted canonical effort wins and
-  # must not be reinterpreted as a same-layer dual-key pair.
-  merged.pop("thinking", None)
+  merged.update(immutable_values)
   for key in ("billing_mode", "rate_table_version"):
     if config.get(key):
       merged[key] = config[key]
-  merged["auth_mode"] = str(merged.get("auth_mode", "api")).strip().lower()
   merged["api_key"] = str(merged.get("api_key", ""))
   merged["auth_token"] = str(merged.get("auth_token", ""))
-  merged["model"] = str(merged.get("model") or "")
-  merged["max_tokens"] = int(merged.get("max_tokens", 16000))
-  return canonical_effort_config(merged)
+  return merged
 
 
 async def call_credential_refresher(

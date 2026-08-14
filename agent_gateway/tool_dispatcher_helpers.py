@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
 import importlib
 import json
 import logging
@@ -49,7 +52,6 @@ class PlannedWritePlanningRejected(RuntimeError):
 
 
 _MODEL_STATE_STORE_IDS = frozenset({
-  "projection_override",
   "valuation_override",
   "workbook",
 })
@@ -121,15 +123,54 @@ def _workbook_write_review(
     ) from exc
   if not isinstance(execution, dict):
     raise TrustedToolPlanError("workbook write approval payload must be an object")
-  operations = execution.get("operations")
+  if execution.get("execution_kind") != "canonical_normal_workbook_bundle_v1":
+    raise TrustedToolPlanError(
+      "workbook write approval requires the canonical staged workbook bundle"
+    )
+  if execution.get("workbook_source_target_hash") != payload.target_hash:
+    raise TrustedToolPlanError(
+      "workbook write approval source target does not match the write target"
+    )
+  compute_engine_version = execution.get("compute_engine_version")
+  if not isinstance(compute_engine_version, str) or not compute_engine_version:
+    raise TrustedToolPlanError(
+      "workbook write approval requires a compute engine version"
+    )
+  mutation = execution.get("mutation")
+  if not isinstance(mutation, dict):
+    raise TrustedToolPlanError(
+      "workbook write approval requires an exact mutation object"
+    )
+  operations = mutation.get("operations")
   if not isinstance(operations, list) or not all(
     isinstance(operation, dict) for operation in operations
   ):
     raise TrustedToolPlanError(
-      "workbook write approval payload lacks exact operations"
+      "workbook write approval mutation lacks exact operations"
     )
-  mutation_execution = dict(execution)
-  expected_readback = mutation_execution.pop("expected_readback", None)
+  if "expected_readback" in mutation:
+    raise TrustedToolPlanError(
+      "workbook write approval mutation must not duplicate expected readback"
+    )
+  expected_readback = execution.get("expected_readback")
+  if not isinstance(expected_readback, dict):
+    raise TrustedToolPlanError(
+      "workbook write approval requires exact expected readback"
+    )
+
+  exact_bundle: dict[str, str] = {
+    "execution_kind": "canonical_normal_workbook_bundle_v1",
+    "workbook_content_sha256": _verified_bundle_member_sha256(
+      execution,
+      member_name="workbook",
+    ),
+    "sidecar_content_sha256": _verified_bundle_member_sha256(
+      execution,
+      member_name="sidecar",
+    ),
+    "workbook_source_target_hash": payload.target_hash,
+    "compute_engine_version": compute_engine_version,
+  }
   return {
     "effect_id": effect.effect_id,
     "target_key": payload.target_key,
@@ -137,14 +178,37 @@ def _workbook_write_review(
     "target_hash": payload.target_hash,
     "precommit_snapshot_present": payload.store_id in snapshot_store_ids,
     "operation_count": len(operations),
-    "execution": mutation_execution,
+    "mutation": dict(mutation),
+    "exact_bundle": exact_bundle,
     "execution_payload_digest": content.content_digest,
-    "expected_readback_digest": (
-      contract.CanonicalPayload.from_value(expected_readback).content_digest
-      if expected_readback is not None
-      else None
-    ),
+    "expected_readback_digest": contract.CanonicalPayload.from_value(
+      expected_readback
+    ).content_digest,
   }
+
+
+def _verified_bundle_member_sha256(
+  execution: Mapping[str, Any],
+  *,
+  member_name: Literal["workbook", "sidecar"],
+) -> str:
+  encoded = execution.get(f"{member_name}_content_base64")
+  declared_sha256 = execution.get(f"{member_name}_content_sha256")
+  if not isinstance(encoded, str) or not isinstance(declared_sha256, str):
+    raise TrustedToolPlanError(
+      f"workbook write approval lacks exact {member_name} bytes and digest"
+    )
+  try:
+    member_bytes = base64.b64decode(encoded, validate=True)
+  except (binascii.Error, ValueError) as exc:
+    raise TrustedToolPlanError(
+      f"workbook write approval {member_name} bytes are not valid base64"
+    ) from exc
+  if hashlib.sha256(member_bytes).hexdigest() != declared_sha256:
+    raise TrustedToolPlanError(
+      f"workbook write approval {member_name} bytes do not match their digest"
+    )
+  return declared_sha256
 
 
 def _model_writer_undo_review(
@@ -154,12 +218,12 @@ def _model_writer_undo_review(
   snapshot_store_ids: frozenset[str],
   model_write_store_ids: frozenset[str],
 ) -> dict[str, Any]:
-  scope = "workbook_and_projection_state"
+  scope = "workbook_and_ticker_override_state"
   if not model_write_store_ids:
     return {
       "scope": scope,
       "status": "not_required",
-      "reason": "plan_has_no_workbook_or_projection_state_write",
+      "reason": "plan_has_no_workbook_or_ticker_override_state_write",
     }
 
   persist_runner_module = f"{contract.__name__.rsplit('.', 1)[0]}.persist_runner"
@@ -270,7 +334,7 @@ class TrustedToolPlan:
       contract = _planning_contract_module_for_identity(
         identity,
         "research.reviewed_change_binding",
-        "api.research.reviewed_change_binding",
+        "research.reviewed_change_binding",
       )
       if type(identity) is not contract.ReviewedChangeBinding:
         raise TrustedToolPlanError(
@@ -604,13 +668,23 @@ def validate_local_tool_input(
   if tool_name not in local_tool_handlers or get_tool_definitions is None:
     return None
 
+  local_handler = local_tool_handlers[tool_name]
+  validation_owner = getattr(local_handler, "__self__", local_handler)
+  handler_validates_input = (
+    getattr(
+      validation_owner,
+      "__gateway_authoritative_input_validation__",
+      False,
+    )
+    is True
+  )
   schema, schema_error = (
     active_local_tool_schema_fn(tool_name)
     if active_local_tool_schema_fn is not None
     else active_local_tool_schema(get_tool_definitions, tool_name)
   )
   error = schema_error
-  if error is None and schema is not None:
+  if error is None and schema is not None and not handler_validates_input:
     validate_schema = validate_against_local_schema_fn or validate_against_local_schema
     error = validate_schema(tool_name, tool_input, schema)
   if error is not None and event_log is not None:
@@ -750,7 +824,10 @@ async def run_interceptors(
     except Exception as exc:
       is_critical = getattr(interceptor, "__intercept_critical__", False)
       if is_critical:
-        log.error("Critical interceptor %s failed: %s — denying", interceptor, exc)
+        log.error(
+          "Critical interceptor failed; denying | exception_type=%s",
+          type(exc).__name__,
+        )
         if event_log is not None:
           event_log.append(
             {
@@ -759,7 +836,7 @@ async def run_interceptors(
               "tool_name": tool_name,
               "action": "deny",
               "code": "interceptor_error",
-              "message": f"Critical safety interceptor failed: {exc}",
+              "message": "Critical safety interceptor failed",
             }
           )
         return InterceptResult(
@@ -769,7 +846,10 @@ async def run_interceptors(
             "message": f"Safety check failed due to an internal error. Tool '{tool_name}' was blocked.",
           },
         )
-      log.warning("Interceptor %s error (non-fatal): %s", interceptor, exc)
+      log.warning(
+        "Interceptor error (non-fatal) | exception_type=%s",
+        type(exc).__name__,
+      )
       continue
 
     if decision.action == "deny":

@@ -8,10 +8,10 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from ..fixture_gate import (
-  FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME,
+  FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME,
+  FIXTURE_CANVAS_ARTIFACT_SKILL_NAME,
   FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME,
   FIXTURE_APPROVAL_TOOL_NAME,
-  FIXTURE_HTML_ARTIFACT_SKILL_NAME,
   FIXTURE_MODEL_ID,
   FIXTURE_TERMINAL_FAILURE_SKILL_NAME,
 )
@@ -112,24 +112,24 @@ class FixtureProvider(ModelProvider):
       async for event in self._stream_dashboard_artifact_turn_two(turn=client.turn):
         yield event
       return
-    if requested_skill == FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME:
+    if requested_skill == FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME:
       if client.turn == 1:
-        async for event in self._stream_html_artifact_turn_one():
+        async for event in self._stream_canvas_artifact_turn_one():
           yield event
         return
       if client.turn == 2:
-        async for event in self._stream_html_artifact_approval_turn(params):
+        async for event in self._stream_canvas_artifact_approval_turn(params):
           yield event
         return
-      async for event in self._stream_html_artifact_approval_complete(turn=client.turn):
+      async for event in self._stream_canvas_artifact_approval_complete(turn=client.turn):
         yield event
       return
-    if requested_skill == FIXTURE_HTML_ARTIFACT_SKILL_NAME:
+    if requested_skill == FIXTURE_CANVAS_ARTIFACT_SKILL_NAME:
       if client.turn == 1:
-        async for event in self._stream_html_artifact_turn_one():
+        async for event in self._stream_canvas_artifact_turn_one():
           yield event
         return
-      async for event in self._stream_html_artifact_turn_two(turn=client.turn):
+      async for event in self._stream_canvas_artifact_turn_two(turn=client.turn):
         yield event
       return
     if client.turn == 1:
@@ -196,32 +196,39 @@ class FixtureProvider(ModelProvider):
     await asyncio.sleep(_fixture_run_seconds())
     yield StreamEvent(type="message_end", stop_reason="end_turn")
 
-  async def _stream_html_artifact_turn_one(self) -> AsyncIterator[StreamEvent]:
-    text = "Fixture HTML artifact turn 1 emitting deterministic artifact.\n"
+  async def _stream_canvas_artifact_turn_one(self) -> AsyncIterator[StreamEvent]:
+    text = "Fixture Canvas artifact turn 1 emitting deterministic artifact.\n"
     yield StreamEvent(type="text_delta", text=text)
     yield StreamEvent(type="text_end", text=text, raw_block={"type": "text", "text": text})
     await asyncio.sleep(_fixture_run_seconds())
 
-    tool_id = "fixture_html_artifact_1"
+    tool_id = "fixture_canvas_artifact_1"
     tool_input = {
-      "title": "Fixture HTML Artifact",
-      "purpose": "report",
-      "summary": "Deterministic dev-only HTML artifact fixture for Hank web live QA.",
-      "html": (
-        '<section class="ha-section">'
-        '<h1 class="ha-title">Fixture HTML Artifact</h1>'
-        '<p class="ha-lede">This deterministic artifact verifies the HtmlArtifact live path.</p>'
-        '<div class="ha-callout"><strong>Status:</strong> fixture emitted successfully.</div>'
-        "</section>"
+      "title": "Fixture Canvas Artifact",
+      "purpose": "exploration",
+      "summary": "Deterministic dev-only Canvas artifact fixture for Hank web live QA.",
+      "tsx_source": (
+        "import React from 'react';\n"
+        "import { Canvas, InsightBanner, Prose, SectionHeader } from '@hank/canvas-kit';\n\n"
+        "export default function FixtureCanvasArtifact() {\n"
+        "  return (\n"
+        "    <Canvas title=\"Fixture Canvas Artifact\" generatedAt=\"2026-07-22\">\n"
+        "      <InsightBanner title=\"Canvas fixture emitted\" tone=\"positive\">\n"
+        "        <Prose>This deterministic artifact verifies the CanvasArtifact live path.</Prose>\n"
+        "      </InsightBanner>\n"
+        "      <SectionHeader title=\"Status\" description=\"Fixture emitted successfully.\" />\n"
+        "    </Canvas>\n"
+        "  );\n"
+        "}\n"
       ),
-      "copy_as_prompt": "Review the deterministic HtmlArtifact fixture output.",
+      "copy_as_prompt": "Review the deterministic CanvasArtifact fixture output.",
       "copy_as_markdown": (
-        "## Fixture HTML Artifact\n\n"
-        "Deterministic dev-only HTML artifact fixture for Hank web live QA."
+        "## Fixture Canvas Artifact\n\n"
+        "Deterministic dev-only Canvas artifact fixture for Hank web live QA."
       ),
       "copy_as_json": {
-        "fixture": "fixture-html-artifact",
-        "contract_name": "HtmlArtifact",
+        "fixture": "fixture-canvas-artifact",
+        "contract_name": "CanvasArtifact",
       },
       "sources": [],
     }
@@ -229,20 +236,20 @@ class FixtureProvider(ModelProvider):
     raw_block = {
       "type": "tool_use",
       "id": tool_id,
-      "name": "emit_html_artifact",
+      "name": "emit_canvas_artifact",
       "input": tool_input,
     }
     yield StreamEvent(
       type="tool_use_start",
       tool_id=tool_id,
-      tool_name="emit_html_artifact",
-      raw_block={"type": "tool_use", "id": tool_id, "name": "emit_html_artifact"},
+      tool_name="emit_canvas_artifact",
+      raw_block={"type": "tool_use", "id": tool_id, "name": "emit_canvas_artifact"},
     )
     yield StreamEvent(type="tool_use_delta", tool_input_json=tool_input_json)
     yield StreamEvent(
       type="tool_use_end",
       tool_id=tool_id,
-      tool_name="emit_html_artifact",
+      tool_name="emit_canvas_artifact",
       tool_input_json=tool_input_json,
       tool_input=tool_input,
       raw_block=raw_block,
@@ -292,31 +299,31 @@ class FixtureProvider(ModelProvider):
     await asyncio.sleep(_fixture_run_seconds())
     yield StreamEvent(type="message_end", stop_reason="end_turn")
 
-  async def _stream_html_artifact_turn_two(self, *, turn: int) -> AsyncIterator[StreamEvent]:
-    text = f"Fixture HTML artifact turn {turn} completed after artifact emission.\n"
+  async def _stream_canvas_artifact_turn_two(self, *, turn: int) -> AsyncIterator[StreamEvent]:
+    text = f"Fixture Canvas artifact turn {turn} completed after artifact emission.\n"
     yield StreamEvent(type="text_delta", text=text)
     yield StreamEvent(type="text_end", text=text, raw_block={"type": "text", "text": text})
     await asyncio.sleep(_fixture_run_seconds())
     yield StreamEvent(type="message_end", stop_reason="end_turn")
 
-  async def _stream_html_artifact_approval_turn(self, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
-    text = "Fixture HTML artifact turn 2 requesting approval with artifact evidence.\n"
+  async def _stream_canvas_artifact_approval_turn(self, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
+    text = "Fixture Canvas artifact turn 2 requesting approval with artifact evidence.\n"
     yield StreamEvent(type="text_delta", text=text)
     yield StreamEvent(type="text_end", text=text, raw_block={"type": "text", "text": text})
     await asyncio.sleep(_fixture_run_seconds())
 
-    artifact_id = _extract_html_artifact_id(params.get("messages")) or "fixture-html-artifact-missing"
-    artifact_path = f"artifacts/_html/{artifact_id}.json"
-    binary_artifact_path = f"artifacts/_html/{artifact_id}.html"
-    tool_id = "fixture_html_artifact_approval_1"
+    artifact_id = _extract_artifact_id(params.get("messages")) or "fixture-canvas-artifact-missing"
+    artifact_path = f"artifacts/_canvas/{artifact_id}.json"
+    binary_artifact_path = f"artifacts/_canvas/{artifact_id}.bundle.js"
+    tool_id = "fixture_canvas_artifact_approval_1"
     tool_input = {
-      "reason": "deterministic fixture approval gate with HtmlArtifact evidence",
+      "reason": "deterministic fixture approval gate with CanvasArtifact evidence",
       "side_effect": "none",
       "evidence_artifact": {
         "artifact_id": artifact_id,
-        "title": "Fixture HTML Approval Evidence",
-        "skill": "_html",
-        "contract_name": "HtmlArtifact",
+        "title": "Fixture Canvas Approval Evidence",
+        "skill": "_canvas",
+        "contract_name": "CanvasArtifact",
         "artifact_path": artifact_path,
         "binary_artifact_path": binary_artifact_path,
         "data_source": "fixture",
@@ -346,8 +353,8 @@ class FixtureProvider(ModelProvider):
     )
     yield StreamEvent(type="message_end", stop_reason="tool_use")
 
-  async def _stream_html_artifact_approval_complete(self, *, turn: int) -> AsyncIterator[StreamEvent]:
-    text = f"Fixture HTML artifact approval turn {turn} completed after approval.\n"
+  async def _stream_canvas_artifact_approval_complete(self, *, turn: int) -> AsyncIterator[StreamEvent]:
+    text = f"Fixture Canvas artifact approval turn {turn} completed after approval.\n"
     yield StreamEvent(type="text_delta", text=text)
     yield StreamEvent(type="text_end", text=text, raw_block={"type": "text", "text": text})
     await asyncio.sleep(_fixture_run_seconds())
@@ -382,7 +389,7 @@ def _extract_operator_steering(messages: Any) -> str:
   return ""
 
 
-def _extract_html_artifact_id(messages: Any) -> str:
+def _extract_artifact_id(messages: Any) -> str:
   if not isinstance(messages, list):
     return ""
   for message in reversed(messages):
@@ -427,10 +434,10 @@ def _requested_fixture_skill(params: dict[str, Any]) -> str:
   combined = "\n".join(haystack)
   if FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME in combined:
     return FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME
-  if FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME in combined:
-    return FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME
-  if FIXTURE_HTML_ARTIFACT_SKILL_NAME in combined:
-    return FIXTURE_HTML_ARTIFACT_SKILL_NAME
+  if FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME in combined:
+    return FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME
+  if FIXTURE_CANVAS_ARTIFACT_SKILL_NAME in combined:
+    return FIXTURE_CANVAS_ARTIFACT_SKILL_NAME
   if FIXTURE_TERMINAL_FAILURE_SKILL_NAME in combined:
     return FIXTURE_TERMINAL_FAILURE_SKILL_NAME
   return ""

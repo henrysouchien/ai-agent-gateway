@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from .secret_boundary import sanitization_failure_tool_input
+
 
 def get_tool_risk_value(tool_name: str) -> str:
   normalized = str(tool_name or "").strip()
@@ -45,4 +47,4 @@ def redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> D
 
     return redact_tool_input(tool_name, tool_input, deployment_secret=get_audit_hmac_secret())
   except Exception:
-    return dict(tool_input)
+    return sanitization_failure_tool_input()

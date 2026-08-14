@@ -4,31 +4,77 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
+from agent_gateway.capability_binding import (
+  CredentialHandle,
+)
+from agent_gateway.model_registry import (
+  CAPABILITY_IDS,
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
 from agent_gateway.event_log import EventLog
-from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.server import (
+  ChatRuntime,
+  GatewayServerConfig,
+  MaterializedCredential,
+  create_gateway_app,
+)
 
 
 API_KEY = "dispatch-pr5b-key"
+_SERVICE_HANDLE = CredentialHandle(
+  handle_id="service:dispatch-pr5b:anthropic",
+  provider="anthropic",
+  principal="service",
+  tenant_id="dispatch-pr5b",
+  actor_id=None,
+)
+_SERVICE_MATERIAL = MaterializedCredential(
+  handle=_SERVICE_HANDLE,
+  auth_config={
+    "provider": "anthropic",
+    "api_key": "test-key",
+    "billing_mode": "byok",
+    "rate_table_version": "test",
+  },
+)
+
+
+def _materialize_service_credential(
+  handle: CredentialHandle,
+) -> MaterializedCredential:
+  if handle is not _SERVICE_HANDLE:
+    raise RuntimeError("unknown test credential handle")
+  return _SERVICE_MATERIAL
 
 
 class _EchoRunner:
-  def __init__(self, event_log: EventLog, captured: dict[str, Any]) -> None:
+  def __init__(
+    self,
+    event_log: EventLog,
+    captured: dict[str, Any],
+    capability_execution: Any,
+  ) -> None:
     self._event_log = event_log
     self._captured = captured
+    self.capability_execution = capability_execution
 
   async def run(
     self,
     *,
     messages: list[dict[str, Any]],
     system_prompt: str | None = None,
-    model_override: str | None = None,
     max_turns: int | None = None,
   ) -> None:
-    _ = system_prompt, model_override, max_turns
+    _ = system_prompt, max_turns
     self._captured["messages"] = messages
     last_user = next((message["content"] for message in reversed(messages) if message.get("role") == "user"), "")
     self._event_log.append({"type": "text_delta", "text": f"echo:{last_user}"})
-    self._event_log.append({"type": "stream_complete", "usage": {}})
+    self._event_log.append({
+      "type": "stream_complete",
+      "terminal_disposition": "completed",
+      "usage": {},
+    })
 
 
 def _make_app(captured: dict[str, Any] | None = None):
@@ -41,15 +87,24 @@ def _make_app(captured: dict[str, Any] | None = None):
     captured["session_id"] = session.session_id
     return ChatRuntime(
       system_prompt="system",
-      build_runner=lambda event_log, _sid: _EchoRunner(event_log, captured),
+      build_runner=lambda event_log, _sid, _started_at: _EchoRunner(
+        event_log,
+        captured,
+        request.capability_execution,
+      ),
+      capability_execution=request.capability_execution,
     )
 
   return create_gateway_app(
     GatewayServerConfig(
       jwt_secret="dispatch-pr5b-test-secret-0123456789",
       valid_api_keys={API_KEY},
-      auth_config={"model": "test-model"},
-      allowed_models=set(),
+      tenant_id="dispatch-pr5b",
+      allow_service_credentials_for_interactive=True,
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      service_provider_handles={"anthropic": _SERVICE_HANDLE},
+      service_auth_config_resolver=_materialize_service_credential,
       build_chat_runtime=_build_chat_runtime,
     )
   )
@@ -61,7 +116,7 @@ def _control_session(client: TestClient, user_id: str) -> dict[str, Any]:
     json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": "tui"}},
   )
   assert response.status_code == 200, response.text
-  return response.json()
+  return _with_model_entitlements(client, response.json())
 
 
 def _chat_session(client: TestClient, user_id: str) -> dict[str, Any]:
@@ -70,7 +125,22 @@ def _chat_session(client: TestClient, user_id: str) -> dict[str, Any]:
     json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": "tui"}},
   )
   assert response.status_code == 200, response.text
-  return response.json()
+  return _with_model_entitlements(client, response.json())
+
+
+def _with_model_entitlements(
+  client: TestClient,
+  session_payload: dict[str, Any],
+) -> dict[str, Any]:
+  session = client.app.state.auth.session_store.get_session(
+    session_payload["session_id"]
+  )
+  assert session is not None
+  session.model_entitled_capabilities = CAPABILITY_IDS
+  session.model_entitled_keys = frozenset(INITIAL_MODEL_REGISTRY.models)
+  payload = dict(session_payload)
+  payload["session_token"] = client.app.state.auth.issue_token(session)
+  return payload
 
 
 def _headers(session_payload: dict[str, Any]) -> dict[str, str]:

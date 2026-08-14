@@ -241,7 +241,13 @@ def emit_recap_then_terminal(
 def _recap_payload(recap: SessionRecapEvent) -> dict[str, Any]:
   from .events import event_to_dict
 
-  return event_to_dict(recap)
+  payload = event_to_dict(recap)
+  # ``SessionRecapEvent`` keeps its domain-level range as a tuple, while the
+  # autonomous event channel intentionally accepts only exact JSON values.
+  # Project the range to its wire representation before EventLog delivery so
+  # an optional recap can never prevent the final terminal EVENT + END.
+  payload["seq_range"] = list(recap.seq_range)
+  return payload
 
 
 def _terminal_failure(event: dict[str, Any], emitted_at_seq: int) -> RecapFailure | None:

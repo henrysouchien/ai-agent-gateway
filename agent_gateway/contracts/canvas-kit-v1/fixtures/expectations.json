@@ -1,0 +1,29 @@
+{
+  "valid-canvas.tsx": {
+    "accepted": true
+  },
+  "forbidden-import.tsx": {
+    "stage": "module_policy",
+    "code": "import_allowlist"
+  },
+  "type-error.tsx": {
+    "stage": "typecheck",
+    "code": "TS2322"
+  },
+  "module-scope-side-effect.tsx": {
+    "stage": "module_policy",
+    "code": "module_scope_side_effect"
+  },
+  "forbidden-identifier.tsx": {
+    "stage": "module_policy",
+    "code": "forbidden_identifier"
+  },
+  "oversize-source.tsx": {
+    "stage": "size_cap",
+    "code": "source_size_cap_exceeded"
+  },
+  "oversize-bundle.tsx": {
+    "stage": "bundle_size_cap",
+    "code": "bundle_size_cap_exceeded"
+  }
+}

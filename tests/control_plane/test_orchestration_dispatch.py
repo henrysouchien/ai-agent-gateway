@@ -6,12 +6,27 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
 from agent_gateway.approval_policy import DelegationGrant, utc_now
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.control_plane.orchestration import build_orchestration_router
+
+
+class _RelayRestartInProgress(RuntimeError):
+  pass
+
+
+class _RelayRestartLockUnavailable(RuntimeError):
+  pass
+
+
+_RELAY_RESTART_EXCEPTIONS = (
+  _RelayRestartInProgress,
+  _RelayRestartLockUnavailable,
+)
 
 
 @dataclass(frozen=True)
@@ -83,6 +98,28 @@ class _FakeRelay:
     return self.result_status, dict(self.result_response)
 
 
+class _RestartBlockedRelay(_FakeRelay):
+  def __init__(self, exception_type: type[Exception], **kwargs: Any) -> None:
+    super().__init__(**kwargs)
+    self.exception_type = exception_type
+
+  async def submit(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    await super().submit(*args, **kwargs)
+    raise self.exception_type("relay_restart_in_progress")
+
+
+class _ExplodingResultRelay(_FakeRelay):
+  def __init__(self, secret: str, *, permission_error: bool = False) -> None:
+    super().__init__()
+    self.secret = secret
+    self.permission_error = permission_error
+
+  async def result(self, *args: Any, **kwargs: Any):
+    await super().result(*args, **kwargs)
+    exception_type = PermissionError if self.permission_error else RuntimeError
+    raise exception_type(self.secret)
+
+
 def _run(awaitable: Any) -> Any:
   return asyncio.run(awaitable)
 
@@ -109,8 +146,26 @@ def _make_app(tmp_path: Path, relay: _FakeRelay) -> tuple[FastAPI, SQLiteApprova
       profile=request.headers.get("x-profile"),
     )
 
-  app.include_router(build_orchestration_router(relay=relay, authenticate=_authenticate))
+  app.include_router(
+    build_orchestration_router(
+      relay=relay,
+      authenticate=_authenticate,
+      relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
+    )
+  )
   return app, store
+
+
+def test_router_requires_explicit_restart_exception_binding() -> None:
+  with pytest.raises(
+    TypeError,
+    match="relay_restart_exceptions must contain only Exception types",
+  ):
+    build_orchestration_router(
+      relay=_FakeRelay(),
+      authenticate=lambda _request: None,
+      relay_restart_exceptions=(),
+    )
 
 
 def _create_delegation_grant(
@@ -205,6 +260,44 @@ def test_post_dev_gate_mints_grant_and_submits(monkeypatch, tmp_path: Path) -> N
   assert relay.result_calls == []
 
 
+@pytest.mark.parametrize("exception_type", _RELAY_RESTART_EXCEPTIONS)
+def test_post_restart_barriers_return_retryable_503_and_revoke_grant(
+  monkeypatch,
+  tmp_path: Path,
+  exception_type: type[Exception],
+) -> None:
+  monkeypatch.setenv("EXCEL_ORCHESTRATION_DEV", "1")
+  relay = _RestartBlockedRelay(
+    exception_type,
+    workbooks=[
+      {
+        "name": "Budget.xlsx",
+        "session": "workbook-session-1",
+        "gateway_session_id": "excel-session-1",
+        "detached": False,
+      }
+    ]
+  )
+  app, store = _make_app(tmp_path, relay)
+
+  with TestClient(app) as client:
+    response = client.post(
+      "/api/orchestration/excel-dispatch",
+      headers=_headers(user_id="alice"),
+      json={"text": "Update the model", "workbook": "Budget.xlsx"},
+    )
+
+  assert response.status_code == 503
+  assert response.json() == {
+    "code": "relay_restart_in_progress",
+    "message": "Excel MCP relay restart in progress; retry after gateway restart",
+  }
+  delegation_id = relay.submissions[0]["tool_input"]["delegation_id"]
+  grant = _run(store.get_delegation_grant(delegation_id))
+  assert grant is not None
+  assert grant.revoked_at is not None
+
+
 def test_post_gate_off_returns_403(monkeypatch, tmp_path: Path) -> None:
   monkeypatch.delenv("EXCEL_ORCHESTRATION_DEV", raising=False)
   relay = _FakeRelay(
@@ -282,6 +375,85 @@ def test_get_authorizes_by_delegation_chain_and_polls_bound_excel_session(monkey
   assert relay.result_calls == [
     {"request_id": "request-1", "gateway_session_id": "excel-session-1", "user_id": "alice"}
   ]
+
+
+def test_get_failed_relay_response_omits_raw_error_payload(
+  monkeypatch,
+  tmp_path: Path,
+) -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-orchestration-result-8f21d7"
+  monkeypatch.setenv("EXCEL_ORCHESTRATION_DEV", "1")
+  relay = _FakeRelay(result_response={
+    "state": "failed",
+    "error": {"message": secret},
+  })
+  app, store = _make_app(tmp_path, relay)
+  _create_delegation_grant(
+    store,
+    delegation_id="delegation-1",
+    request_id="request-1",
+  )
+
+  with TestClient(app) as client:
+    response = client.get(
+      "/api/orchestration/excel-dispatch/request-1",
+      params={"delegation_id": "delegation-1"},
+      headers=_headers(user_id="alice"),
+    )
+
+  assert response.status_code == 200
+  assert response.json() == {
+    "state": "failed",
+    "error": {"message": "Excel agent request failed"},
+  }
+  assert secret not in response.text
+
+
+@pytest.mark.parametrize(
+  ("permission_error", "status_code", "code", "message"),
+  [
+    (
+      False,
+      502,
+      "relay_error",
+      "Excel relay result polling failed",
+    ),
+    (
+      True,
+      409,
+      "relay_owner_mismatch",
+      "Bound Excel session cannot poll this relay request",
+    ),
+  ],
+)
+def test_get_relay_exception_response_is_value_free(
+  monkeypatch,
+  tmp_path: Path,
+  permission_error: bool,
+  status_code: int,
+  code: str,
+  message: str,
+) -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-orchestration-poll-8f21d7"
+  monkeypatch.setenv("EXCEL_ORCHESTRATION_DEV", "1")
+  relay = _ExplodingResultRelay(secret, permission_error=permission_error)
+  app, store = _make_app(tmp_path, relay)
+  _create_delegation_grant(
+    store,
+    delegation_id="delegation-1",
+    request_id="request-1",
+  )
+
+  with TestClient(app) as client:
+    response = client.get(
+      "/api/orchestration/excel-dispatch/request-1",
+      params={"delegation_id": "delegation-1"},
+      headers=_headers(user_id="alice"),
+    )
+
+  assert response.status_code == status_code
+  assert response.json() == {"code": code, "message": message}
+  assert secret not in response.text
 
 
 def test_get_rejects_wrong_delegator(monkeypatch, tmp_path: Path) -> None:

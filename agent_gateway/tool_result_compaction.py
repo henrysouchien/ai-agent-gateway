@@ -19,6 +19,8 @@ MODEL_TOOL_RESULT_MAX_CHARS = 60_000
 MODEL_TOOL_RESULT_MAX_CHARS_ENV = "AGENT_GATEWAY_MAX_MODEL_TOOL_RESULT_CHARS"
 MODEL_TOOL_RESULT_MIN_CHARS = 4_000
 SPILL_TRUNCATED_TOOL_RESULTS_ENV = "AGENT_GATEWAY_SPILL_TRUNCATED_TOOL_RESULTS"
+_BUSINESS_MODEL_TERMINAL_TOOL = "fms_persist_business_model"
+_ERROR_STATUSES = frozenset({"error", "failed", "failure"})
 
 
 def model_tool_result_max_chars() -> int:
@@ -53,6 +55,130 @@ def scalar_preview_fields(value: Any) -> Dict[str, Any]:
     if len(preview) >= 24:
       break
   return preview
+
+
+def _bounded_projection_text(value: Any, *, limit: int) -> str | None:
+  if not isinstance(value, str) or not value.strip():
+    return None
+  normalized = value.strip()
+  return normalized if len(normalized) <= limit else normalized[:limit] + "...<truncated>"
+
+
+def _business_model_data_gaps(value: Any) -> list[Any]:
+  if not isinstance(value, list):
+    return []
+  projected: list[Any] = []
+  for gap in value[:20]:
+    if isinstance(gap, str):
+      text = _bounded_projection_text(gap, limit=1_000)
+      if text is not None:
+        projected.append(text)
+      continue
+    if not isinstance(gap, dict):
+      continue
+    row: dict[str, Any] = {}
+    for field, limit in (("key", 256), ("text", 1_000)):
+      text = _bounded_projection_text(gap.get(field), limit=limit)
+      if text is not None:
+        row[field] = text
+    claim_keys = gap.get("claim_keys")
+    if isinstance(claim_keys, list):
+      bounded_claims = [
+        text
+        for item in claim_keys[:20]
+        if (text := _bounded_projection_text(item, limit=256)) is not None
+      ]
+      if bounded_claims:
+        row["claim_keys"] = bounded_claims
+    if row:
+      projected.append(row)
+  return projected
+
+
+def _business_model_terminal_success_projection(
+  content: str,
+  *,
+  tool_name: str,
+) -> str | None:
+  """Return the bounded model-facing receipt for an accepted BM terminal call.
+
+  The runner's tool-complete event retains the original result separately.  This
+  projection therefore removes materialized BusinessModel/readback payloads only
+  from the provider conversation, where they add no value after persistence.
+  """
+
+  if tool_name != _BUSINESS_MODEL_TERMINAL_TOOL:
+    return None
+  try:
+    result = json.loads(content)
+  except Exception:
+    return None
+  if not isinstance(result, dict) or bool(result.get("error")):
+    return None
+  status = _bounded_projection_text(result.get("status"), limit=128)
+  if status is None or status.lower() in _ERROR_STATUSES:
+    return None
+
+  readback = result.get("readback") if isinstance(result.get("readback"), dict) else {}
+  verdict_candidates = (
+    result.get("verdict"),
+    result.get("verdict_echo"),
+    readback.get("verdict"),
+  )
+  verdict_payload = next(
+    (
+      candidate
+      for candidate in verdict_candidates
+      if isinstance(candidate, dict)
+      and _bounded_projection_text(candidate.get("verdict"), limit=128) is not None
+    ),
+    {},
+  )
+  verdict = _bounded_projection_text(verdict_payload.get("verdict"), limit=128)
+  if verdict is None:
+    return None
+
+  typed_outputs = (
+    readback.get("typed_outputs")
+    if isinstance(readback.get("typed_outputs"), dict)
+    else {}
+  )
+  stage_receipt = (
+    typed_outputs.get("business_model_stage_receipt")
+    if isinstance(typed_outputs.get("business_model_stage_receipt"), dict)
+    else {}
+  )
+  data_gaps = next(
+    (
+      candidate.get("data_gaps")
+      for candidate in verdict_candidates
+      if isinstance(candidate, dict) and isinstance(candidate.get("data_gaps"), list)
+    ),
+    [],
+  )
+  recommended_next_action = next(
+    (
+      candidate.get("recommended_next_action")
+      for candidate in verdict_candidates
+      if isinstance(candidate, dict)
+      and isinstance(candidate.get("recommended_next_action"), str)
+    ),
+    None,
+  )
+
+  projection = {
+    "status": status,
+    "gate_code": _bounded_projection_text(result.get("gate_code"), limit=128),
+    "artifact_ref": _bounded_projection_text(result.get("artifact_ref"), limit=2_000),
+    "proposal_id": _bounded_projection_text(result.get("proposal_id"), limit=256),
+    "verdict": verdict,
+    "confidence": _bounded_projection_text(verdict_payload.get("confidence"), limit=128),
+    "revision": _bounded_projection_text(verdict_payload.get("revision"), limit=256),
+    "stage_receipt_status": _bounded_projection_text(stage_receipt.get("status"), limit=128),
+    "data_gaps": _business_model_data_gaps(data_gaps),
+    "recommended_next_action": _bounded_projection_text(recommended_next_action, limit=2_000),
+  }
+  return json.dumps(projection, default=str)
 
 
 def annotate_result(result: Any, tool_name: str = "") -> Any:
@@ -283,6 +409,35 @@ def compact_model_tool_result_entry(
   content = result_entry.get("content")
   if not isinstance(content, str):
     return result_entry, result_entry
+
+  terminal_projection = (
+    None
+    if is_error_tool_result_entry(result_entry, content)
+    else _business_model_terminal_success_projection(
+      content,
+      tool_name=tool_name,
+    )
+  )
+  if terminal_projection is not None:
+    projected_entry = dict(result_entry)
+    projected_entry["content"] = terminal_projection
+    logger.info(
+      "[%s] Tool %s result projected for model context | original_chars=%d projected_chars=%d",
+      log_session_id,
+      tool_name,
+      len(content),
+      len(terminal_projection),
+      extra={
+        "data": {
+          "event": "tool_result_semantically_compacted",
+          "session_id": log_session_id,
+          "tool": tool_name,
+          "original_chars": len(content),
+          "compacted_chars": len(terminal_projection),
+        }
+      },
+    )
+    return projected_entry, projected_entry
 
   max_chars = model_tool_result_max_chars()
   plain_compacted_content, was_truncated = truncate_model_tool_result_content(

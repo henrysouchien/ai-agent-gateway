@@ -11,11 +11,48 @@ from agent_gateway.approval_audit import ApprovalAuditEmitter
 from agent_gateway.approval_policy import ApprovalRequest, ApprovalRequestPayload, RunContext, utc_now
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.audit_writer import JSONLAuditWriter
+from agent_gateway.capability_binding import (
+  CredentialHandle,
+)
+from agent_gateway.model_registry import (
+  CAPABILITY_IDS,
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
 from agent_gateway.event_log import EventLog
-from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.server import (
+  ChatRuntime,
+  GatewayServerConfig,
+  MaterializedCredential,
+  create_gateway_app,
+)
 
 
 API_KEY = "chat-delete-pr5b-key"
+_SERVICE_HANDLE = CredentialHandle(
+  handle_id="service:chat-delete-pr5b:anthropic",
+  provider="anthropic",
+  principal="service",
+  tenant_id="chat-delete-pr5b",
+  actor_id=None,
+)
+_SERVICE_MATERIAL = MaterializedCredential(
+  handle=_SERVICE_HANDLE,
+  auth_config={
+    "provider": "anthropic",
+    "api_key": "test-key",
+    "billing_mode": "byok",
+    "rate_table_version": "test",
+  },
+)
+
+
+def _materialize_service_credential(
+  handle: CredentialHandle,
+) -> MaterializedCredential:
+  if handle is not _SERVICE_HANDLE:
+    raise RuntimeError("unknown test credential handle")
+  return _SERVICE_MATERIAL
 
 
 def _run(coro):
@@ -57,21 +94,22 @@ class _ApprovalHoldingRunner:
     session,
     store: SQLiteApprovalStore,
     approval_id_holder: list[str],
+    capability_execution: Any,
   ) -> None:
     self._event_log = event_log
     self._session = session
     self._store = store
     self._approval_id_holder = approval_id_holder
+    self.capability_execution = capability_execution
 
   async def run(
     self,
     *,
     messages: list[dict[str, Any]],
     system_prompt: str | None = None,
-    model_override: str | None = None,
     max_turns: int | None = None,
   ) -> None:
-    _ = messages, system_prompt, model_override, max_turns
+    _ = messages, system_prompt, max_turns
     tool_call_id = f"tool-{uuid.uuid4().hex}"
     approval_id = f"appr-{uuid.uuid4().hex}"
     self._approval_id_holder.append(approval_id)
@@ -153,15 +191,17 @@ def _make_app(tmp_path):
   app_holder: dict[str, Any] = {}
 
   async def _build_chat_runtime(*, session, request, channel, auth_manager):
-    _ = request, channel, auth_manager
+    _ = channel, auth_manager
     return ChatRuntime(
       system_prompt="system",
-      build_runner=lambda event_log, _sid: _ApprovalHoldingRunner(
+      build_runner=lambda event_log, _sid, _started_at: _ApprovalHoldingRunner(
         event_log=event_log,
         session=session,
         store=app_holder["app"].state.gateway_approval_store,
         approval_id_holder=approval_ids,
+        capability_execution=request.capability_execution,
       ),
+      capability_execution=request.capability_execution,
     )
 
   def _on_event(event: dict[str, Any], _session_id: str) -> None:
@@ -171,8 +211,12 @@ def _make_app(tmp_path):
     GatewayServerConfig(
       jwt_secret="chat-delete-pr5b-test-secret-0123456789",
       valid_api_keys={API_KEY},
-      auth_config={"model": "test-model"},
-      allowed_models=set(),
+      tenant_id="chat-delete-pr5b",
+      allow_service_credentials_for_interactive=True,
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      service_provider_handles={"anthropic": _SERVICE_HANDLE},
+      service_auth_config_resolver=_materialize_service_credential,
       build_chat_runtime=_build_chat_runtime,
       on_event=_on_event,
     )
@@ -199,7 +243,13 @@ def _control_session(client: TestClient, user_id: str) -> dict[str, Any]:
     json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": "tui"}},
   )
   assert response.status_code == 200, response.text
-  return response.json()
+  payload = response.json()
+  session = client.app.state.auth.session_store.get_session(payload["session_id"])
+  assert session is not None
+  session.model_entitled_capabilities = CAPABILITY_IDS
+  session.model_entitled_keys = frozenset(INITIAL_MODEL_REGISTRY.models)
+  payload["session_token"] = client.app.state.auth.issue_token(session)
+  return payload
 
 
 def _headers(session_payload: dict[str, Any]) -> dict[str, str]:
@@ -229,6 +279,7 @@ def test_chat_delete_denies_pending_approval_unblocks_loop_and_expires_session(t
     assert run_payload["run"]["state"] == "approval_pending"
     assert run_payload["run"]["pending_approval"] is not None
     assert approval_ids
+    assert run_payload["run"]["pending_approval"]["approval_id"] == approval_ids[0]
     session = app.state.auth.session_store.get_session(run_payload["chat_session_id"])
     assert session is not None
 

@@ -2,10 +2,8 @@
 
 This example serves the same gateway shape through `provider="openai"` on `create_agent()`.
 
-It shows two paths:
-
-- Simple OpenAI setup: `create_agent(..., provider="openai", model="gpt-4o")`
-- OpenAI-compatible endpoint: add `provider_config={"base_url": "..."}`
+It shows the first-party, Responses-only OpenAI setup:
+`create_agent(..., provider="openai", model="gpt-5.6")`.
 
 ## Install
 
@@ -14,13 +12,8 @@ pip install "ai-agent-gateway[openai]" uvicorn
 export OPENAI_API_KEY="your-openai-api-key"
 ```
 
-Optional: point the OpenAI-compatible client at another base URL.
-
-```bash
-export OPENAI_BASE_URL="https://api.openai.com/v1"
-```
-
-When `OPENAI_BASE_URL` is set, `agent.py` forwards it as `provider_config={"base_url": OPENAI_BASE_URL}`.
+`OpenAIProvider` uses `POST /v1/responses` at the official OpenAI API. Other
+vendors should use a first-class provider with its own protocol and credentials.
 
 ## Run
 
@@ -46,7 +39,7 @@ curl -N http://127.0.0.1:8000/api/chat \
       {"role": "user", "content": "Explain in two sentences why provider abstractions matter."}
     ],
     "context": {"channel": "web"},
-    "model": "gpt-4o"
+    "model": "gpt-5.6"
   }'
 ```
 
@@ -54,4 +47,4 @@ curl -N http://127.0.0.1:8000/api/chat \
 
 - The HTTP surface does not change when you switch providers.
 - `create_agent()` can switch to OpenAI without dropping to `create_gateway_app()`.
-- `provider_config` can pass OpenAI-compatible settings like `base_url`.
+- OpenAI requests use the Responses API without a Chat Completions fallback.

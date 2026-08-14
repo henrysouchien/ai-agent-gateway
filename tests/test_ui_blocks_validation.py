@@ -59,6 +59,36 @@ def test_failure_classes(payload: dict, code: str) -> None:
   assert code in {failure["code"] for failure in validate_payload(payload)}
 
 
+@pytest.mark.parametrize(
+  "field",
+  [
+    "summary",
+    {"key": "summary", "label": "Summary"},
+  ],
+)
+def test_metric_grid_rejects_object_valued_fields(field: object) -> None:
+  payload = _payload({
+    "block": "sdk:metric-grid",
+    "props": {"source": "portfolio-summary", "fields": [field]},
+  })
+
+  assert "field_mapping_invalid" in {
+    failure["code"] for failure in validate_payload(payload)
+  }
+
+
+def test_metric_grid_accepts_scalar_portfolio_value_field() -> None:
+  payload = _payload({
+    "block": "sdk:metric-grid",
+    "props": {
+      "source": "positions",
+      "fields": [{"key": "totalPortfolioValue", "label": "Portfolio Value", "format": "currency"}],
+    },
+  })
+
+  assert validate_payload(payload) == []
+
+
 def test_handler_stage_code_vocabulary_has_one_home() -> None:
   assert {code.value for code in FailureCode} >= {
     "view_artifact_missing",

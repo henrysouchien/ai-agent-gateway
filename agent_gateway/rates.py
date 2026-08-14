@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 _DEFAULT_RATE_TABLE_PATH = Path(__file__).with_name("rates") / "anthropic.json"
@@ -135,11 +135,27 @@ def _parse_model_rates(path: Path, provider: str, model: str, raw_model: Any) ->
   )
 
 
+def resolve_configured_rates_file(
+  env: Mapping[str, str] | None = None,
+) -> Path | None:
+  """Resolve the configured rates file without cwd-dependent behavior."""
+
+  environ = os.environ if env is None else env
+  raw_path = str(environ.get(_RATES_FILE_ENV_VAR) or "").strip()
+  if not raw_path:
+    return None
+  path = Path(raw_path).expanduser()
+  if not path.is_absolute():
+    raise ValueError(
+      f"{_RATES_FILE_ENV_VAR} must configure an absolute path: {path}"
+    )
+  return path
+
+
 def load_rate_table(path: Path | None = None) -> RateTable:
   selected_path = path
   if selected_path is None:
-    env_path = os.environ.get(_RATES_FILE_ENV_VAR, "").strip()
-    selected_path = Path(env_path) if env_path else _DEFAULT_RATE_TABLE_PATH
+    selected_path = resolve_configured_rates_file() or _DEFAULT_RATE_TABLE_PATH
 
   try:
     raw_payload = json.loads(selected_path.read_text(encoding="utf-8"))
@@ -181,4 +197,10 @@ def load_rate_table(path: Path | None = None) -> RateTable:
   return RateTable(version=version, source=source, providers=providers, _path=selected_path)
 
 
-__all__ = ["ModelRates", "RateTable", "UnknownModelError", "load_rate_table"]
+__all__ = [
+  "ModelRates",
+  "RateTable",
+  "UnknownModelError",
+  "load_rate_table",
+  "resolve_configured_rates_file",
+]

@@ -117,7 +117,7 @@ def _reviewed_change_contract() -> Any:
   errors: list[ModuleNotFoundError] = []
   for module_name in (
     "research.reviewed_change_binding",
-    "api.research.reviewed_change_binding",
+    "research.reviewed_change_binding",
   ):
     try:
       return importlib.import_module(module_name)
@@ -227,6 +227,11 @@ class RunContext:
   profile: str = "chat"
   channel: str = "web"
   skill: str | None = None
+  research_file_id: int | None = None
+  scheduled_investment_authority: object | None = field(
+    default=None,
+    repr=False,
+  )
   decider_role: str | None = None
   tenant_id: str | None = None
   parent_approval_id: str | None = None

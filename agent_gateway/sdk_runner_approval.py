@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import timedelta
 import time
 from typing import Any, Callable
@@ -23,7 +24,12 @@ from .batch_approval_projection import (
   acquire_batch_approval_admission,
   require_batch_stage_run_seq,
 )
-from .policy_imports import resolve_server_policy_tool_class
+from .policy_imports import resolve_effective_role, resolve_server_policy_tool_class
+from .secret_boundary import (
+  sanitize_approval_decision_projection,
+  sanitize_boundary_value,
+  sanitization_failure_tool_input,
+)
 
 
 def approval_queue_timeout_seconds(
@@ -41,6 +47,7 @@ def approval_lifecycle_configured(*, store: Any | None, policy: Any | None, sess
 def resolve_run_context(
   *,
   run_context: RunContext | None,
+  run_id: str | None = None,
   usage_user_id: str,
   session: Any | None,
   approval_policy: Any | None,
@@ -50,16 +57,25 @@ def resolve_run_context(
   effective_model: str,
 ) -> RunContext:
   if run_context is not None:
+    owner_user_id = str(getattr(session, "owner_user_id", None) or "").strip()
+    if owner_user_id and run_context.user_id != owner_user_id:
+      return replace(run_context, user_id=owner_user_id)
     return run_context
   return RunContext(
-    user_id=str(usage_user_id or getattr(session, "user_id", "") or "unknown"),
+    user_id=str(
+      getattr(session, "owner_user_id", None)
+      or usage_user_id
+      or getattr(session, "user_id", "")
+      or "unknown"
+    ),
     request_id=request_id,
     session_id=session_id,
     profile="chat",
     channel=str(channel or getattr(session, "channel", None) or "web"),
-    decider_role=str(getattr(session, "role", "owner") or "owner"),
+    decider_role=resolve_effective_role(getattr(session, "role", None)),
     policy_bundle_hash=str(getattr(approval_policy, "policy_bundle_hash", "unknown")),
     model_id=effective_model,
+    run_id=run_id,
   )
 
 
@@ -154,7 +170,10 @@ async def await_user_approval_via_pending_tools(
     try:
       await session_log.append(approval_event)
     except Exception:
-      log.warning("Failed to persist approval request event for %s", request.tool_call_id, exc_info=True)
+      log.warning(
+        "Failed to persist approval request event for %s | failure=true",
+        request.tool_call_id,
+      )
   try:
     return await wait_for_fn(
       approval_queue.get(),
@@ -172,7 +191,10 @@ async def await_user_approval_via_pending_tools(
             decision_reason="Timed out waiting for user approval",
           )
       except Exception:
-        log.warning("Failed to expire timed-out approval request %s", request.approval_id, exc_info=True)
+        log.warning(
+          "Failed to expire timed-out approval request %s | failure=true",
+          request.approval_id,
+        )
     return None
   finally:
     session.pending_tools.pop(request.tool_call_id, None)
@@ -281,6 +303,13 @@ async def _can_use_tool_callback_impl(
     run_context = replace_fn(run_context, skill=active_skill)
   redacted, args_hash = runner._redact_for_approval_request(tool_name, input_data)
   redacted = enrich_trade_approval_args_fn(policy_tool, redacted, event_log=runner._log)
+  redacted = sanitize_boundary_value(
+    redacted,
+    sink="approval_request",
+    boundary=getattr(runner, "_secret_boundary", None),
+  )
+  if not isinstance(redacted, dict):
+    redacted = sanitization_failure_tool_input()
   request = build_approval_request_fn(
     tool_call_id=f"sdk-{uuid_hex_fn()}",
     tool_name=policy_tool,
@@ -308,14 +337,19 @@ async def _can_use_tool_callback_impl(
   )
   if expiry_seconds != decision.expiry_seconds:
     decision = replace_fn(decision, expiry_seconds=expiry_seconds)
+  decision, raw_modified_tool_args = sanitize_approval_decision_projection(
+    decision,
+    sink="approval_decision",
+    boundary=getattr(runner, "_secret_boundary", None),
+  )
   request = apply_decision_to_request_fn(request, decision)
   await store.update_request(request)
 
   if decision.outcome == "auto_approve":
     request = await store.transition_state(request.approval_id, "auto_approved", expected_state_version=request.state_version)
     await policy.on_resolve(request=request)
-    if decision.modified_tool_args is not None:
-      return allow_cls(updated_input=decision.modified_tool_args)
+    if raw_modified_tool_args is not None:
+      return allow_cls(updated_input=raw_modified_tool_args)
     return allow_cls()
   if decision.outcome == "auto_deny":
     request = await store.transition_state(request.approval_id, "auto_denied", expected_state_version=request.state_version)
@@ -346,8 +380,8 @@ async def _can_use_tool_callback_impl(
     batch_admission=batch_admission,
   )
   if approval and approval.get("approved"):
-    if decision.modified_tool_args is not None:
-      return allow_cls(updated_input=decision.modified_tool_args)
+    if raw_modified_tool_args is not None:
+      return allow_cls(updated_input=raw_modified_tool_args)
     return allow_cls()
   if approval and approval.get("denied_by") == "relay_policy":
     return deny_cls(message=f"[{relay_policy_denied_sub_code}] {relay_policy_denied_message}")

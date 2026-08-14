@@ -1,0 +1,297 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hank.internal/contracts/gateway-usage-reconciliation-evidence-v3",
+  "title": "Gateway Usage Reconciliation Evidence V3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evidence_schema_version",
+    "evidence_revision",
+    "supersedes_report_sha256",
+    "content_sha256",
+    "source_usage_schema_version",
+    "environment",
+    "source_product",
+    "request_id",
+    "session_id",
+    "execution_context_id",
+    "workflow_run_id",
+    "workflow_attempt_group_id",
+    "workflow_attempt_number",
+    "retry_of_workflow_run_id",
+    "workflow_attempt_kind",
+    "work_authorization_id",
+    "status",
+    "commercial_event_count",
+    "provider_call_event_count",
+    "durable_provider_call_event_count",
+    "separate_unit_event_count",
+    "expected_provider_call_count",
+    "provider_call_count_delta",
+    "missing_event_id_count",
+    "missing_source_event_ids",
+    "emergency_spooled_event_count",
+    "durability_lost_event_count",
+    "conflicting_event_id_count",
+    "conflicting_source_event_ids",
+    "late_event_count",
+    "late_source_event_ids",
+    "observed_source_event_ids",
+    "summary_usage_event_ids",
+    "event_lines",
+    "commercial_input_tokens",
+    "summary_input_tokens",
+    "input_token_delta",
+    "commercial_output_tokens",
+    "summary_output_tokens",
+    "output_token_delta",
+    "commercial_cache_read_tokens",
+    "summary_cache_read_tokens",
+    "cache_read_token_delta",
+    "commercial_cache_write_tokens",
+    "summary_cache_write_tokens",
+    "cache_write_token_delta",
+    "reasoning_tokens_observed",
+    "provider_units",
+    "commercial_producer_estimate_usd",
+    "summary_estimate_usd",
+    "estimate_delta_usd",
+    "drain_complete",
+    "in_flight_task_count",
+    "summary_started_at",
+    "summary_ended_at",
+    "summary_emitted_as_cost_event"
+  ],
+  "properties": {
+    "evidence_schema_version": {"const": 3},
+    "evidence_revision": {"type": "integer", "minimum": 1},
+    "supersedes_report_sha256": {"$ref": "#/$defs/nullableDigest"},
+    "content_sha256": {"$ref": "#/$defs/digest"},
+    "source_usage_schema_version": {"const": 3},
+    "environment": {"enum": ["dev", "staging", "prod"]},
+    "source_product": {"$ref": "#/$defs/code"},
+    "request_id": {"$ref": "#/$defs/id"},
+    "session_id": {"$ref": "#/$defs/id"},
+    "execution_context_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "workflow_run_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "workflow_attempt_group_id": {"$ref": "#/$defs/nullableUuid"},
+    "workflow_attempt_number": {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]},
+    "retry_of_workflow_run_id": {"$ref": "#/$defs/nullableUuid"},
+    "workflow_attempt_kind": {
+      "anyOf": [{"type": "null"}, {"enum": ["initial", "user_retry", "automatic_retry"]}]
+    },
+    "work_authorization_id": {"$ref": "#/$defs/nullableUuid"},
+    "status": {"enum": ["match", "mismatch", "incomplete"]},
+    "commercial_event_count": {"$ref": "#/$defs/count"},
+    "provider_call_event_count": {"$ref": "#/$defs/count"},
+    "durable_provider_call_event_count": {"$ref": "#/$defs/count"},
+    "separate_unit_event_count": {"$ref": "#/$defs/count"},
+    "expected_provider_call_count": {"$ref": "#/$defs/count"},
+    "provider_call_count_delta": {"type": "integer"},
+    "missing_event_id_count": {"$ref": "#/$defs/count"},
+    "missing_source_event_ids": {"$ref": "#/$defs/idList"},
+    "emergency_spooled_event_count": {"$ref": "#/$defs/count"},
+    "durability_lost_event_count": {"$ref": "#/$defs/count"},
+    "conflicting_event_id_count": {"$ref": "#/$defs/count"},
+    "conflicting_source_event_ids": {"$ref": "#/$defs/idList"},
+    "late_event_count": {"$ref": "#/$defs/count"},
+    "late_source_event_ids": {"$ref": "#/$defs/idList"},
+    "observed_source_event_ids": {"$ref": "#/$defs/idList"},
+    "summary_usage_event_ids": {"$ref": "#/$defs/idList"},
+    "event_lines": {"type": "array", "items": {"$ref": "#/$defs/eventLine"}, "maxItems": 10000},
+    "commercial_input_tokens": {"$ref": "#/$defs/count"},
+    "summary_input_tokens": {"$ref": "#/$defs/count"},
+    "input_token_delta": {"type": "integer"},
+    "commercial_output_tokens": {"$ref": "#/$defs/count"},
+    "summary_output_tokens": {"$ref": "#/$defs/count"},
+    "output_token_delta": {"type": "integer"},
+    "commercial_cache_read_tokens": {"$ref": "#/$defs/count"},
+    "summary_cache_read_tokens": {"$ref": "#/$defs/count"},
+    "cache_read_token_delta": {"type": "integer"},
+    "commercial_cache_write_tokens": {"$ref": "#/$defs/count"},
+    "summary_cache_write_tokens": {"$ref": "#/$defs/count"},
+    "cache_write_token_delta": {"type": "integer"},
+    "reasoning_tokens_observed": {"$ref": "#/$defs/count"},
+    "provider_units": {"$ref": "#/$defs/decimal"},
+    "commercial_producer_estimate_usd": {"$ref": "#/$defs/decimal"},
+    "summary_estimate_usd": {"$ref": "#/$defs/decimal"},
+    "estimate_delta_usd": {"$ref": "#/$defs/signedDecimal"},
+    "drain_complete": {"type": "boolean"},
+    "in_flight_task_count": {"$ref": "#/$defs/count"},
+    "summary_started_at": {"type": "number"},
+    "summary_ended_at": {"type": "number"},
+    "summary_emitted_as_cost_event": {"const": false}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"workflow_attempt_group_id": {"type": "null"}}},
+      "then": {
+        "properties": {
+          "workflow_attempt_number": {"type": "null"},
+          "retry_of_workflow_run_id": {"type": "null"},
+          "workflow_attempt_kind": {"type": "null"},
+          "work_authorization_id": {"type": "null"}
+        }
+      },
+      "else": {
+        "properties": {
+          "execution_context_id": {"$ref": "#/$defs/uuid"},
+          "workflow_run_id": {"$ref": "#/$defs/uuid"},
+          "workflow_attempt_number": {"type": "integer", "minimum": 1},
+          "workflow_attempt_kind": {"enum": ["initial", "user_retry", "automatic_retry"]}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"workflow_attempt_kind": {"const": "initial"}}},
+      "then": {
+        "properties": {
+          "workflow_attempt_number": {"const": 1},
+          "retry_of_workflow_run_id": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "workflow_attempt_kind": {"enum": ["user_retry", "automatic_retry"]}
+        }
+      },
+      "then": {
+        "properties": {
+          "workflow_attempt_number": {"type": "integer", "minimum": 2},
+          "retry_of_workflow_run_id": {"$ref": "#/$defs/uuid"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "workflow_attempt_group_id": {"not": {"type": "null"}},
+          "source_product": {"const": "hank-agent-gateway"}
+        }
+      },
+      "then": {"properties": {"work_authorization_id": {"$ref": "#/$defs/uuid"}}}
+    },
+    {
+      "if": {
+        "properties": {
+          "workflow_attempt_group_id": {"not": {"type": "null"}},
+          "source_product": {"const": "risk-module-direct"}
+        }
+      },
+      "then": {"properties": {"work_authorization_id": {"type": "null"}}}
+    }
+  ],
+  "$defs": {
+    "code": {"type": "string", "pattern": "^[a-z][a-z0-9._:-]{0,127}$"},
+    "id": {"type": "string", "minLength": 1, "maxLength": 255},
+    "count": {"type": "integer", "minimum": 0},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "nullableDigest": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]},
+    "uuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "nullableUuid": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/uuid"}]},
+    "idList": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/id"},
+      "uniqueItems": true,
+      "maxItems": 10000
+    },
+    "decimal": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]+)?$"},
+    "signedDecimal": {"type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]+)?$"},
+    "capabilityBind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "capability_id",
+        "model_key",
+        "provider",
+        "upstream_model",
+        "adapter",
+        "protocol_profile",
+        "route",
+        "effort",
+        "credential_principal",
+        "credential_ref",
+        "run_mode",
+        "registry_revision",
+        "policy_revision",
+        "selection_source"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "capability_id": {"type": "string", "minLength": 1, "maxLength": 512},
+        "model_key": {"type": "string", "minLength": 1, "maxLength": 512},
+        "provider": {"type": "string", "minLength": 1, "maxLength": 512},
+        "upstream_model": {"type": "string", "minLength": 1, "maxLength": 512},
+        "adapter": {"type": "string", "minLength": 1, "maxLength": 512},
+        "protocol_profile": {"type": "string", "minLength": 1, "maxLength": 512},
+        "route": {"type": "string", "minLength": 1, "maxLength": 512},
+        "effort": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]},
+        "credential_principal": {"enum": ["user", "service"]},
+        "credential_ref": {"type": "string", "minLength": 1, "maxLength": 512},
+        "run_mode": {"enum": ["interactive", "fleet", "batch", "autonomous", "cron"]},
+        "registry_revision": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"},
+        "policy_revision": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"},
+        "selection_source": {"enum": ["explicit_user", "saved_preference", "channel_default", "capability_default", "internal_policy", "parent_binding"]}
+      }
+    },
+    "eventLine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_event_id",
+        "source_payload_sha256",
+        "source_schema_version",
+        "workflow_attempt_group_id",
+        "workflow_attempt_number",
+        "retry_of_workflow_run_id",
+        "workflow_attempt_kind",
+        "work_authorization_id",
+        "capability_bind",
+        "provider_reported_model",
+        "provider",
+        "model",
+        "capability_id",
+        "event_kind",
+        "durability",
+        "late",
+        "occurred_at",
+        "uncached_input_tokens",
+        "billable_output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens_observed",
+        "provider_units",
+        "producer_estimated_cost_usd"
+      ],
+      "properties": {
+        "source_event_id": {"$ref": "#/$defs/id"},
+        "source_payload_sha256": {"$ref": "#/$defs/digest"},
+        "source_schema_version": {"const": 3},
+        "workflow_attempt_group_id": {"$ref": "#/$defs/nullableUuid"},
+        "workflow_attempt_number": {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]},
+        "retry_of_workflow_run_id": {"$ref": "#/$defs/nullableUuid"},
+        "workflow_attempt_kind": {"anyOf": [{"type": "null"}, {"enum": ["initial", "user_retry", "automatic_retry"]}]},
+        "work_authorization_id": {"$ref": "#/$defs/nullableUuid"},
+        "capability_bind": {"$ref": "#/$defs/capabilityBind"},
+        "provider_reported_model": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 512}]},
+        "provider": {"$ref": "#/$defs/code"},
+        "model": {"type": "string", "minLength": 1, "maxLength": 512},
+        "capability_id": {"type": "string", "minLength": 1, "maxLength": 512},
+        "event_kind": {"enum": ["provider_call", "separate_unit"]},
+        "durability": {"enum": ["outbox", "emergency_spool", "lost"]},
+        "late": {"type": "boolean"},
+        "occurred_at": {"type": "string", "minLength": 1},
+        "uncached_input_tokens": {"$ref": "#/$defs/count"},
+        "billable_output_tokens": {"$ref": "#/$defs/count"},
+        "cache_read_tokens": {"$ref": "#/$defs/count"},
+        "cache_write_tokens": {"$ref": "#/$defs/count"},
+        "reasoning_tokens_observed": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/count"}]},
+        "provider_units": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/decimal"}]},
+        "producer_estimated_cost_usd": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/decimal"}]}
+      }
+    }
+  }
+}

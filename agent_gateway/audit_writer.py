@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import fcntl
 import hashlib
 import json
+import logging
 import os
+import stat
 import tarfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from .approval_audit import ApprovalAuditEntry
+
+
+APPROVAL_AUDIT_MAX_FILE_BYTES = 16 * 1024 * 1024
+APPROVAL_AUDIT_MAX_RECORD_BYTES = 512 * 1024
+APPROVAL_AUDIT_MAX_RECORDS = 32_768
+_APPROVAL_AUDIT_CAPACITY_WARNING_BYTES = (
+  APPROVAL_AUDIT_MAX_FILE_BYTES * 4 // 5
+)
+log = logging.getLogger("agent_gateway.audit_writer")
 
 
 class AuditWriter(Protocol):
@@ -40,25 +52,217 @@ class AuditWriter(Protocol):
 
 class JSONLAuditWriter:
   def __init__(self, root: str | os.PathLike[str] = "data/audit/approvals") -> None:
-    self.root = Path(root)
-    self.root.mkdir(parents=True, exist_ok=True)
+    self.root = Path(os.path.abspath(os.fspath(root)))
+    self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    self._require_private_directory(self.root)
+
+  @staticmethod
+  def _require_private_directory(path: Path) -> os.stat_result:
+    directory_stat = os.lstat(path)
+    return JSONLAuditWriter._require_private_directory_stat(
+      directory_stat,
+      path=path,
+    )
+
+  @staticmethod
+  def _require_private_directory_stat(
+    directory_stat: os.stat_result,
+    *,
+    path: Path,
+  ) -> os.stat_result:
+    if (
+      not stat.S_ISDIR(directory_stat.st_mode)
+      or directory_stat.st_uid != os.geteuid()
+      or stat.S_IMODE(directory_stat.st_mode) & 0o022
+    ):
+      raise RuntimeError(
+        f"approval audit directory has unsafe identity: {path}"
+      )
+    return directory_stat
 
   async def write(self, entry: ApprovalAuditEntry) -> None:
+    await asyncio.to_thread(self._write_sync, entry)
+
+  def _write_sync(self, entry: ApprovalAuditEntry) -> None:
     path = self._path_for_ts(entry.ts)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    parent_stat = self._require_private_directory(path.parent)
+    directory_fd = os.open(
+      path.parent,
+      os.O_RDONLY
+      | getattr(os, "O_DIRECTORY", 0)
+      | getattr(os, "O_CLOEXEC", 0),
+    )
+    fd = -1
     try:
-      os.fchmod(fd, 0o600)
-      with os.fdopen(fd, "a", encoding="utf-8") as handle:
+      opened_parent_stat = self._require_private_directory_stat(
+        os.fstat(directory_fd),
+        path=path.parent,
+      )
+      if (
+        opened_parent_stat.st_dev != parent_stat.st_dev
+        or opened_parent_stat.st_ino != parent_stat.st_ino
+      ):
+        raise RuntimeError(
+          f"approval audit directory identity changed: {path.parent}"
+        )
+      fd = os.open(
+        path.name,
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_APPEND
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=directory_fd,
+      )
+      file_stat = os.fstat(fd)
+      if (
+        not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_nlink != 1
+        or file_stat.st_uid != os.geteuid()
+      ):
+        raise RuntimeError(
+          f"approval audit file has unsafe identity: {path}"
+        )
+      if stat.S_IMODE(file_stat.st_mode) != 0o600:
+        os.fchmod(fd, 0o600)
+        file_stat = os.fstat(fd)
+      payload = entry.to_json_dict()
+      encoded = (
+        json.dumps(
+          payload,
+          sort_keys=True,
+          default=str,
+        )
+        + "\n"
+      ).encode("utf-8")
+      if len(encoded) > APPROVAL_AUDIT_MAX_RECORD_BYTES:
+        raise RuntimeError(
+          "approval audit record exceeds its byte limit"
+        )
+
+      def require_bound_state(file_fd: int) -> None:
+        current_parent_stat = self._require_private_directory_stat(
+          os.fstat(directory_fd),
+          path=path.parent,
+        )
+        visible_parent_stat = self._require_private_directory(
+          path.parent
+        )
+        current_file_stat = os.fstat(file_fd)
+        visible_file_stat = os.stat(
+          path.name,
+          dir_fd=directory_fd,
+          follow_symlinks=False,
+        )
+        if (
+          current_parent_stat.st_dev != parent_stat.st_dev
+          or current_parent_stat.st_ino != parent_stat.st_ino
+          or visible_parent_stat.st_dev != parent_stat.st_dev
+          or visible_parent_stat.st_ino != parent_stat.st_ino
+          or not stat.S_ISREG(current_file_stat.st_mode)
+          or current_file_stat.st_dev != file_stat.st_dev
+          or current_file_stat.st_ino != file_stat.st_ino
+          or current_file_stat.st_uid != os.geteuid()
+          or current_file_stat.st_nlink != 1
+          or stat.S_IMODE(current_file_stat.st_mode) != 0o600
+          or not stat.S_ISREG(visible_file_stat.st_mode)
+          or visible_file_stat.st_dev != file_stat.st_dev
+          or visible_file_stat.st_ino != file_stat.st_ino
+          or visible_file_stat.st_uid != os.geteuid()
+          or visible_file_stat.st_nlink != 1
+          or stat.S_IMODE(visible_file_stat.st_mode) != 0o600
+        ):
+          raise RuntimeError(
+            f"approval audit file identity changed: {path}"
+          )
+
+      require_bound_state(fd)
+      with os.fdopen(fd, "r+b") as handle:
         fd = -1
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        handle.write(json.dumps(entry.to_json_dict(), sort_keys=True, default=str) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+        original_size = os.fstat(handle.fileno()).st_size
+        if original_size > APPROVAL_AUDIT_MAX_FILE_BYTES:
+          raise RuntimeError(
+            "approval audit file exceeds its byte limit"
+          )
+        handle.seek(0)
+        record_count = 0
+        while True:
+          line = handle.readline(
+            APPROVAL_AUDIT_MAX_RECORD_BYTES + 1
+          )
+          if not line:
+            break
+          record_count += 1
+          if record_count > APPROVAL_AUDIT_MAX_RECORDS:
+            raise RuntimeError(
+              "approval audit file exceeds its record limit"
+            )
+          if len(line) > APPROVAL_AUDIT_MAX_RECORD_BYTES:
+            raise RuntimeError(
+              "approval audit record exceeds its byte limit"
+            )
+          if not line.endswith(b"\n"):
+            raise RuntimeError(
+              "approval audit file has an incomplete record"
+            )
+          if not line.strip():
+            continue
+          existing = json.loads(line)
+          if not isinstance(existing, dict):
+            raise RuntimeError(
+              "approval audit file contains a non-object record"
+            )
+          if existing.get("entry_id") != entry.entry_id:
+            continue
+          if existing != payload:
+            raise RuntimeError(
+              "approval audit entry_id was reused with different content"
+            )
+          os.fsync(handle.fileno())
+          require_bound_state(handle.fileno())
+          os.fsync(directory_fd)
+          fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+          return
+        if original_size + len(encoded) > APPROVAL_AUDIT_MAX_FILE_BYTES:
+          raise RuntimeError(
+            "approval audit file reached its byte capacity"
+          )
+        if record_count >= APPROVAL_AUDIT_MAX_RECORDS:
+          raise RuntimeError(
+            "approval audit file reached its record capacity"
+          )
+        if (
+          original_size + len(encoded)
+          >= _APPROVAL_AUDIT_CAPACITY_WARNING_BYTES
+        ):
+          log.warning(
+            "Approval audit file is above 80%% capacity: %s",
+            path,
+          )
+        handle.seek(0, os.SEEK_END)
+        try:
+          handle.write(encoded)
+          handle.flush()
+          os.fsync(handle.fileno())
+          require_bound_state(handle.fileno())
+          os.fsync(directory_fd)
+        except BaseException:
+          try:
+            handle.seek(original_size)
+            handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fsync(directory_fd)
+          except BaseException:
+            pass
+          raise
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:
       if fd != -1:
         os.close(fd)
+      os.close(directory_fd)
 
   async def flush(self) -> None:
     return None

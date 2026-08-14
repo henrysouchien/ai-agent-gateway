@@ -26,6 +26,10 @@ from agent_gateway.server import ChatRuntime
 from agent_gateway.session import SessionStream
 from agent_gateway.tool_dispatcher import ToolDispatcher
 from starlette.requests import ClientDisconnect
+from tests.capability_execution_test_support import (
+  stub_bound_capability_execution,
+)
+from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution
 
 
 def _run(coro):
@@ -33,7 +37,28 @@ def _run(coro):
 
 
 def _chat_payload() -> dict[str, Any]:
-  return {"messages": [{"role": "user", "content": "hello"}], "context": {}}
+  return {
+    "user_id": "alice",
+    "messages": [{"role": "user", "content": "hello"}],
+    "context": {},
+  }
+
+
+def _native_execution(
+  provider: ModelProvider | None = None,
+  *,
+  api_key: str = "test-key",
+):
+  active_provider = provider or AnthropicProvider()
+  return stub_bound_capability_execution(
+    provider=active_provider,
+    model="claude-sonnet-4-6",
+    effort="none",
+    auth_config={
+      "api_key": api_key,
+      "max_tokens": 256,
+    },
+  )
 
 
 @pytest.fixture(autouse=True)
@@ -295,14 +320,12 @@ class _ObservedAgentRunner(AgentRunner):
     self,
     messages: list[dict[str, Any]],
     system_prompt: str | list[tuple[str, bool]] | None = None,
-    model_override: str | None = None,
     max_turns: int | None = None,
   ) -> None:
     try:
       await super().run(
         messages=messages,
         system_prompt=system_prompt,
-        model_override=model_override,
         max_turns=max_turns,
       )
     except asyncio.CancelledError:
@@ -411,6 +434,32 @@ class _CompletingProvider(ModelProvider):
     yield StreamEvent(type="text_end", raw_block={"type": "text", "text": self.text})
     yield StreamEvent(type="usage_update", output_tokens=1)
     yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+
+class _ToolCaptureCompletingProvider(_CompletingProvider):
+  def __init__(self) -> None:
+    super().__init__()
+    self.tool_names: list[str] = []
+
+  def build_request_params(
+    self,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    system_prompt: str | list[tuple[str, bool]] | None,
+    tools: list[dict[str, Any]],
+    max_tokens: int,
+    **kwargs: Any,
+  ) -> dict[str, Any]:
+    self.tool_names = [str(tool["name"]) for tool in tools]
+    return super().build_request_params(
+      model=model,
+      messages=messages,
+      system_prompt=system_prompt,
+      tools=tools,
+      max_tokens=max_tokens,
+      **kwargs,
+    )
 
 
 class _ReleaseCompletingProvider(_CompletingProvider):
@@ -756,7 +805,11 @@ def test_no_double_disconnect_firing(make_test_app) -> None:
 
 
 def test_on_disconnect_default_no_op() -> None:
-  runtime = ChatRuntime(system_prompt="test", build_runner=lambda _event_log, _sid: None)
+  runtime = ChatRuntime(
+    system_prompt="test",
+    build_runner=lambda _event_log, _sid, _started_at: None,
+    capability_execution=_native_execution(),
+  )
 
   _run(runtime.on_disconnect())
   _run(runtime.on_disconnect())
@@ -771,8 +824,7 @@ def test_on_disconnect_agent_runner_closes_client() -> None:
       event_log=EventLog(),
       dispatcher=_make_dispatcher(),
       session_id="sess-disconnect",
-      provider=provider,
-      auth_config={"api_key": "test-key", "model": "claude-sonnet-4-6"},
+      capability_execution=_native_execution(provider),
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
@@ -781,7 +833,8 @@ def test_on_disconnect_agent_runner_closes_client() -> None:
     runner._set_client(client)
     runtime = ChatRuntime(
       system_prompt="test",
-      build_runner=lambda _event_log, _sid: runner,
+      build_runner=lambda _event_log, _sid, _started_at: runner,
+      capability_execution=runner.capability_execution,
       disconnect_handler=runner.on_disconnect,
     )
 
@@ -797,23 +850,24 @@ def test_on_disconnect_agent_runner_closes_client() -> None:
 
 def test_on_disconnect_sdk_runner_closes_iterator() -> None:
   async def case() -> None:
+    capability_execution = stub_sdk_capability_execution()
     runner = AgentSDKRunner(
       event_log=EventLog(),
       session_id="sess-sdk",
       sdk_config=AgentSDKConfig(
-        api_key="test-key",
-        model="claude-sonnet-4-6",
         user_id="alice",
         billing_mode="byok",
         rate_table_version="unknown",
       ),
+      capability_execution=capability_execution,
       system_prompt="test",
     )
     iterator = _ManualAsyncIterator()
     runner._query_iter = iterator
     runtime = ChatRuntime(
       system_prompt="test",
-      build_runner=lambda _event_log, _sid: runner,
+      build_runner=lambda _event_log, _sid, _started_at: runner,
+      capability_execution=capability_execution,
       disconnect_handler=runner.on_disconnect,
     )
 
@@ -834,7 +888,8 @@ def test_on_disconnect_idempotent() -> None:
 
   runtime = ChatRuntime(
     system_prompt="test",
-    build_runner=lambda _event_log, _sid: None,
+    build_runner=lambda _event_log, _sid, _started_at: None,
+    capability_execution=_native_execution(),
     disconnect_handler=_handler,
   )
 
@@ -1131,6 +1186,60 @@ def test_normal_stream_completion_unchanged(make_test_app) -> None:
   _run(case())
 
 
+def test_normalizer_purpose_excludes_trade_tools_from_model_definitions(
+  make_test_app,
+) -> None:
+  async def case() -> None:
+    provider = _ToolCaptureCompletingProvider()
+    trade_tools = [
+      "execute_trade",
+      "execute_basket_trade",
+      "execute_futures_roll",
+      "execute_option_trade",
+    ]
+    tool_names = [*trade_tools, "memory_write", "normalizer_stage", "get_quote"]
+    tool_definitions = [
+      {
+        "name": tool_name,
+        "description": tool_name,
+        "input_schema": {"type": "object", "properties": {}},
+      }
+      for tool_name in tool_names
+    ]
+    app = make_test_app(
+      provider=provider,
+      tool_definitions=tool_definitions,
+    )
+
+    async with httpx.AsyncClient(
+      transport=httpx.ASGITransport(app=app),
+      base_url="http://test",
+    ) as client:
+      session_info = await _init_session(client)
+      payload = _chat_payload()
+      payload["context"]["purpose"] = "normalizer"
+
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=payload,
+      ) as response:
+        assert response.status_code == 200
+        await _collect_sse_events(response)
+
+    session = app.state.test_state.session
+    assert session.purpose == "normalizer"
+    assert app.state.test_state.runtime.purpose == "normalizer"
+    assert app.state.test_state.runner._purpose == "normalizer"
+    assert set(trade_tools).isdisjoint(provider.tool_names)
+    assert "memory_write" not in provider.tool_names
+    assert "normalizer_stage" in provider.tool_names
+    assert "get_quote" in provider.tool_names
+
+  _run(case())
+
+
 def test_chat_stream_emits_wire_envelope(make_test_app) -> None:
   async def case() -> None:
     app = make_test_app(provider=_CompletingProvider(text="done"))
@@ -1418,8 +1527,10 @@ def test_credential_refresh_retries_stream_with_new_auth_config(monkeypatch: pyt
         session_id="sess-refresh",
       ),
       session_id="sess-refresh",
-      provider=provider,
-      auth_config={"api_key": "old-key", "model": "claude-sonnet-4-6", "max_tokens": 256},
+      capability_execution=_native_execution(
+        provider,
+        api_key="old-key",
+      ),
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
@@ -1435,7 +1546,6 @@ def test_credential_refresh_retries_stream_with_new_auth_config(monkeypatch: pyt
     await runner.run(
       messages=[{"role": "user", "content": "hello"}],
       system_prompt="test",
-      model_override="claude-sonnet-4-6",
       max_turns=1,
     )
 
@@ -1455,29 +1565,31 @@ def test_merge_refreshed_auth_config_preserves_runtime_controls_and_normalizes()
       "auth_mode": " api ",
       "api_key": "old-key",
       "auth_token": "old-token",
-      "model": "claude-sonnet-4-6",
+      "provider": "anthropic",
       "max_tokens": 256,
-      "thinking": False,
     },
     {
-      "auth_mode": " OAUTH ",
+      "auth_mode": "api",
       "api_key": "new-key",
       "auth_token": 123,
-      "model": "should-not-win",
-      "max_tokens": 999,
-      "thinking": True,
     },
   )
 
   assert merged == {
-    "auth_mode": "oauth",
+    "auth_mode": "api",
     "api_key": "new-key",
     "auth_token": "123",
-    "model": "claude-sonnet-4-6",
+    "provider": "anthropic",
     "max_tokens": 256,
-    "effort": "none",
-    "thinking_enabled_requested": False,
   }
+
+
+def test_merge_refreshed_auth_config_rejects_selection_material() -> None:
+  with pytest.raises(ValueError, match="must not contain model selection"):
+    merge_refreshed_auth_config(
+      {"api_key": "old-key", "provider": "anthropic"},
+      {"api_key": "new-key", "model_key": "anthropic.claude-opus-5"},
+    )
 
 
 def test_runner_apply_refreshed_auth_config_updates_request_and_runner_config() -> None:
@@ -1491,17 +1603,19 @@ def test_runner_apply_refreshed_auth_config_updates_request_and_runner_config() 
       session_id="sess-refresh",
     ),
     session_id="sess-refresh",
-    provider=_CompletingProvider(),
-    auth_config={"api_key": "old-key", "model": "claude-sonnet-4-6", "max_tokens": 256, "thinking": False},
+    capability_execution=_native_execution(
+      _CompletingProvider(),
+      api_key="old-key",
+    ),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
   )
   request_config = {
     "api_key": "old-key",
-    "model": "claude-sonnet-4-6",
+    "auth_mode": "api",
+    "provider": "complete",
     "max_tokens": 256,
-    "thinking": False,
     "billing_mode": "",
     "rate_table_version": None,
   }
@@ -1510,10 +1624,7 @@ def test_runner_apply_refreshed_auth_config_updates_request_and_runner_config() 
     request_config,
     {
       "api_key": "new-key",
-      "model": "ignored-model",
-      "max_tokens": 4096,
-      "thinking": True,
-      "auth_mode": " oauth ",
+      "auth_mode": "api",
       "auth_token": "tok",
       "billing_mode": "metered",
       "rate_table_version": "2026-04-08",
@@ -1521,17 +1632,20 @@ def test_runner_apply_refreshed_auth_config_updates_request_and_runner_config() 
   )
 
   expected = {
-    "auth_mode": "oauth",
+    "auth_mode": "api",
     "api_key": "new-key",
     "auth_token": "tok",
-    "model": "claude-sonnet-4-6",
+    "provider": "complete",
     "max_tokens": 256,
-    "effort": "none",
-    "thinking_enabled_requested": False,
     "billing_mode": "byok",
     "rate_table_version": "unknown",
   }
-  assert request_config == expected
+  assert request_config == {
+    **expected,
+    "model": "claude-sonnet-4-6",
+    "effort": "none",
+    "thinking_enabled_requested": False,
+  }
   assert runner._auth_config == expected
   assert runner._billing_mode == "byok"
   assert runner._rate_table_version == "unknown"
@@ -1589,8 +1703,6 @@ def test_sdk_runner_client_disconnect_keeps_turn_running(make_test_app, monkeypa
       provider=None,
       runner_class=AgentSDKRunner,
       sdk_config=AgentSDKConfig(
-        api_key="test-key",
-        model="claude-sonnet-4-6",
         user_id="alice",
         billing_mode="byok",
         rate_table_version="unknown",
@@ -1637,8 +1749,6 @@ def test_sdk_runner_second_request_after_disconnect_gets_409(make_test_app, monk
       provider=None,
       runner_class=AgentSDKRunner,
       sdk_config=AgentSDKConfig(
-        api_key="test-key",
-        model="claude-sonnet-4-6",
         user_id="alice",
         billing_mode="byok",
         rate_table_version="unknown",

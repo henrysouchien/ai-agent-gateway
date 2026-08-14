@@ -46,6 +46,10 @@ _CORRUPTION_SIGNATURES = (
 )
 
 
+class MemoryUnavailableError(RuntimeError):
+  """Raised when durable memory cannot be opened without risking user data."""
+
+
 @runtime_checkable
 class EmbeddingProvider(Protocol):
   """Protocol for pluggable embedding backends used by `MemoryStore`."""
@@ -107,15 +111,10 @@ class MemoryStore:
     self._db_path = Path(db_path)
     self._conn: sqlite3.Connection | None = None
     self._db_lock = threading.RLock()
-    self._quarantined = False
     self._startup_diagnostics: dict[str, Any] = {
       "status": "not_started",
       "db_path": str(self._db_path),
-      "recovery_count": 0,
-      "quarantine_paths": [],
     }
-    self._recovery_count = 0
-    self._last_quarantine_paths: list[str] = []
     self._embedding_fn = embedding_fn
     self._ensure_db()
 
@@ -139,19 +138,6 @@ class MemoryStore:
     msg = str(exc).lower()
     return any(signature in msg for signature in _CORRUPTION_SIGNATURES)
 
-  def _quarantine_db(self) -> list[Path]:
-    suffix = f".corrupted.{int(time.time())}"
-    quarantined: list[Path] = []
-    for ext in ("", "-wal", "-shm"):
-      src = self._db_path.parent / f"{self._db_path.name}{ext}"
-      if not src.exists():
-        continue
-      dst = src.with_suffix(src.suffix + suffix)
-      src.rename(dst)
-      quarantined.append(dst)
-      log.warning("Quarantined %s -> %s", src, dst)
-    return quarantined
-
   def startup_diagnostics(self) -> dict[str, Any]:
     with self._db_lock:
       return copy.deepcopy(self._startup_diagnostics)
@@ -164,6 +150,15 @@ class MemoryStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = None
         try:
+          quick_check_ms = 0.0
+          if self._db_path.exists():
+            quick_check_perf = time.perf_counter()
+            readonly_uri = f"file:{self._db_path.resolve()}?mode=ro"
+            with sqlite3.connect(readonly_uri, uri=True) as readonly:
+              result = readonly.execute("PRAGMA quick_check(1)").fetchone()
+            quick_check_ms = round((time.perf_counter() - quick_check_perf) * 1000, 1)
+            if not result or result[0] != "ok":
+              raise sqlite3.DatabaseError("quick_check failed")
           connect_perf = time.perf_counter()
           conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
           conn.row_factory = sqlite3.Row
@@ -171,11 +166,6 @@ class MemoryStore:
           conn.execute("PRAGMA busy_timeout=5000")
           conn.execute("PRAGMA foreign_keys=ON")
           connect_ms = round((time.perf_counter() - connect_perf) * 1000, 1)
-          quick_check_perf = time.perf_counter()
-          result = conn.execute("PRAGMA quick_check(1)").fetchone()
-          quick_check_ms = round((time.perf_counter() - quick_check_perf) * 1000, 1)
-          if not result or result[0] != "ok":
-            raise sqlite3.DatabaseError("quick_check failed")
           self._conn = conn
           migrate_perf = time.perf_counter()
           self._maybe_migrate()
@@ -189,11 +179,7 @@ class MemoryStore:
             "connect_ms": connect_ms,
             "quick_check_ms": quick_check_ms,
             "migration_ms": migrate_ms,
-            "recovery_count": self._recovery_count,
-            "quarantined": self._recovery_count > 0,
-            "quarantine_paths": list(self._last_quarantine_paths),
           }
-          self._quarantined = False
         except sqlite3.DatabaseError as exc:
           if conn is not None:
             try:
@@ -201,32 +187,28 @@ class MemoryStore:
             except Exception:
               pass
           self._conn = None
-          if self._is_corruption(exc) and self._db_path.exists() and not self._quarantined:
-            log.error("Memory DB corruption detected, quarantining: %s", self._db_path)
-            self._quarantined = True
-            quarantined = self._quarantine_db()
-            self._recovery_count += 1
-            self._last_quarantine_paths = [str(path) for path in quarantined]
+          if self._is_corruption(exc) and self._db_path.exists():
+            log.error(
+              "Memory DB corruption detected; refusing to replace or move user data: %s",
+              self._db_path,
+            )
             self._startup_diagnostics = {
-              "status": "recovering",
+              "status": "unavailable",
               "db_path": str(self._db_path),
               "started_at": started_at,
               "duration_ms": round((time.perf_counter() - started_perf) * 1000, 1),
               "error": str(exc),
-              "recovery_count": self._recovery_count,
-              "quarantined": True,
-              "quarantine_paths": list(self._last_quarantine_paths),
+              "preserved_in_place": True,
             }
-            return self._ensure_db()
+            raise MemoryUnavailableError(
+              f"memory store is unavailable; corrupt data was preserved in place at {self._db_path}"
+            ) from exc
           self._startup_diagnostics = {
             "status": "failed",
             "db_path": str(self._db_path),
             "started_at": started_at,
             "duration_ms": round((time.perf_counter() - started_perf) * 1000, 1),
             "error": str(exc),
-            "recovery_count": self._recovery_count,
-            "quarantined": self._recovery_count > 0,
-            "quarantine_paths": list(self._last_quarantine_paths),
           }
           raise
       return self._conn

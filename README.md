@@ -9,7 +9,11 @@ Start with a system prompt. Add MCP tools, local Python tools, skills, and code 
 
 ## Install + Quick Start
 
-`create_agent()` is the fastest path to a working agent server. It uses Anthropic by default, and you can switch to OpenAI with `provider="openai"`. Use [`create_gateway_app()`](./docs/api-reference.md#server) when you need lower-level runtime control.
+`create_agent()` is the fastest path to a working agent server. Its default is
+the stable `session.driver` key in the product model registry. Select another
+eligible entry with a stable key such as `model_key="openai.gpt-5-6"`. Use
+[`create_gateway_app()`](./docs/api-reference.md#server) when you need
+lower-level runtime control.
 
 Install the package:
 
@@ -25,9 +29,9 @@ pip install "ai-agent-gateway[openai]"
 export OPENAI_API_KEY="your-openai-api-key"
 ```
 
-The public OpenAI API does not use ChatGPT subscription OAuth. For ChatGPT
-subscription authentication, use `provider="codex"` and run
-`agent auth login codex`. The command preserves an existing Codex login and
+The public OpenAI API does not use ChatGPT subscription OAuth. For a registry
+entry routed through the managed Codex adapter, run `agent auth login codex`.
+The command preserves an existing Codex login and
 does nothing when one is active. On a logged-out machine, enroll transactionally
 with `agent auth login codex --profile <name> --email <exact-email>`; this delegates
 to `cx enroll` so CAAM can protect and restore vaulted credentials. The gateway
@@ -40,7 +44,6 @@ Create a separate, one-year inference token for new gateway sessions:
 ```bash
 agent auth login anthropic
 export ANTHROPIC_AUTH_MODE=oauth
-export AGENT_PROVIDER=anthropic
 ```
 
 The command delegates authorization to Anthropic's official `claude setup-token`
@@ -56,10 +59,8 @@ credentials are unaffected. Use `agent auth status anthropic` and
 Use an xAI developer API key:
 
 ```bash
-export AGENT_PROVIDER=xai
 export XAI_AUTH_MODE=api
 export XAI_API_KEY="your-xai-api-key"
-export XAI_MODEL=grok-4.5
 ```
 
 Or sign in with an eligible Grok subscription using the remote-friendly device flow:
@@ -67,7 +68,6 @@ Or sign in with an eligible Grok subscription using the remote-friendly device f
 ```bash
 agent auth login xai
 unset XAI_AUTH_MODE  # auto-detect the persisted refreshable token
-export AGENT_PROVIDER=xai
 ```
 
 OAuth tokens are stored under `$USER_DATA_DIR/xai/oauth.json` (or
@@ -84,8 +84,8 @@ agent run
 
 The generated project is a small `agent.yaml`, an `agent.py` compatibility
 module, a callable starter skill, and a `skill_state.json` path for skills that
-emit `## STATE_UPDATE_JSON`. Edit `agent.yaml` to change the prompt, provider,
-MCP servers, skills, or local port.
+emit `## STATE_UPDATE_JSON`. Edit `agent.yaml` to change the prompt, stable
+model key, MCP servers, skills, or local port.
 
 Create `agent.py`:
 
@@ -141,12 +141,12 @@ Project examples:
 - FastAPI server factory with `/api/chat/init`, `/api/chat`, `/api/chat/tool-result`, `/api/chat/tool-approval`, and `/api/health`
 - SSE event stream for text deltas, thinking deltas, tool calls, approval requests, tool output chunks, retries, and completion
 - JWT sessions with scoped approvals and isolated code execution directories
-- MCP tool discovery from inline config or `~/.claude.json`
+- MCP tool discovery from inline config, an explicit config path, or `MCP_CONFIG_PATH`; with none configured, no file-backed MCP servers are loaded
 - Local Python tool handlers with the same dispatch loop as MCP tools
 - Code execution with Docker preferred and subprocess fallback
 - Markdown skill files (prompt + config per task) and sub-agents via the built-in `run_agent` tool
 - Anthropic and OpenAI providers through `create_agent()` or `create_gateway_app()`
-- **Headless execution** via `run_autonomous()` for cron jobs and batch agents — same tool/MCP/skill infrastructure, no HTTP server
+- **Headless execution** via execution-only `run_autonomous()` for prebound cron and autonomous agents — same tool/MCP/skill infrastructure, no HTTP server
 - **Heartbeat loop** via `HeartbeatLoop` for persistent agents that check in periodically with quiet suppression, active hours, and backoff
 
 You bring your system prompt, your tools (MCP servers, local Python handlers, or both), and your runtime policy. The gateway handles everything else.
@@ -225,18 +225,39 @@ app = create_agent(
 
 ### Tier 5: Headless / Autonomous
 
-Run the same agent loop without an HTTP server — for cron jobs, batch tasks, or persistent daemons.
+Run the same agent loop without an HTTP server — for cron jobs, autonomous
+tasks, or persistent daemons. Resolve capability policy and credential handles
+before calling the executor. The executor accepts one exact
+`BoundCapabilityExecution` for `session.driver` and one exact `GatewaySession`;
+it does not select provider, model, effort, transport, credentials, or runtime
+identity.
 
 ```python
-from agent_gateway import run_autonomous_sync, DeliveryConfig
+from agent_gateway import (
+  BoundCapabilityExecution,
+  DeliveryConfig,
+  GatewaySession,
+  run_autonomous_sync,
+)
+
+# Application/server-owned preparation step. See examples/09-autonomous for a
+# complete standalone fixture.
+capability_execution: BoundCapabilityExecution
+session: GatewaySession
+capability_execution, session = prepare_autonomous_execution()
 
 result = run_autonomous_sync(
   "You are an operations monitor. Call check_status before replying.",
   "Check the current status and send a summary.",
+  capability_execution=capability_execution,
+  session=session,
   tool_handlers={"check_status": check_status},
   tool_definitions=[...],
   state_dir="./state",
   delivery=DeliveryConfig(telegram_bot_token="...", telegram_chat_id="..."),
+  user_id="operations-monitor",
+  billing_mode="byok",
+  rate_table_version="current",
 )
 ```
 
@@ -244,10 +265,30 @@ For persistent agents that check in periodically, wrap with `HeartbeatLoop`:
 
 ```python
 from functools import partial
-from agent_gateway import run_autonomous, HeartbeatLoop, HeartbeatConfig
+from agent_gateway import (
+  BoundCapabilityExecution,
+  GatewaySession,
+  HeartbeatConfig,
+  HeartbeatLoop,
+  run_autonomous,
+)
+
+# Reuse the same prebound execution and session identity for each tick.
+capability_execution: BoundCapabilityExecution
+session: GatewaySession
+capability_execution, session = prepare_autonomous_execution()
 
 loop = HeartbeatLoop(
-  run_fn=partial(run_autonomous, system_prompt="...", initial_message="...", ...),
+  run_fn=partial(
+    run_autonomous,
+    system_prompt="...",
+    initial_message="...",
+    capability_execution=capability_execution,
+    session=session,
+    user_id="operations-monitor",
+    billing_mode="byok",
+    rate_table_version="current",
+  ),
   config=HeartbeatConfig(interval_seconds=1800, active_hours=(6, 22), timezone="America/New_York"),
   on_alert=my_delivery_callback,  # called only when agent has something to report
 )
@@ -258,22 +299,15 @@ await loop.start()
 
 Use `create_gateway_app()` when you need custom approval logic, channel-aware runtimes, interceptors, multiple runtime profiles, or deeper production hooks.
 
-```python
-from agent_gateway import (
-  AnthropicProvider, ChatRuntime, GatewayServerConfig, create_gateway_app,
-)
+A custom gateway must configure a tenant-scoped `ProductModelRegistry` and
+`ProductModelSelectionPolicy`, opaque credential handles plus their trusted
+materializer, and an adapter resolver.
+Each runtime factory then consumes the request's exact
+`BoundCapabilityExecution`; it must not reselect any part of that bundle.
 
-# Full control: custom providers, approval logic, channel routing, interceptors.
-# See examples/07-full-production/ for the complete version.
-app = create_gateway_app(
-  GatewayServerConfig(
-    build_chat_runtime=my_runtime_factory,
-    default_provider=AnthropicProvider(),
-  )
-)
-```
-
-Runnable versions of these examples live in [`examples/`](./examples/).
+See the runnable [tool-approval gateway](./examples/06-tool-approval/) for the
+approval flow and the [full production gateway](./examples/07-full-production/)
+for the complete canonical configuration.
 
 ## Architecture
 
@@ -281,7 +315,7 @@ Three entry points share the same agent core:
 
 ```text
 create_agent()         --> FastAPI HTTP server (interactive chat)
-run_autonomous()       --> Headless one-shot (cron / batch)
+run_autonomous()       --> Prebound headless one-shot (cron / autonomous)
 HeartbeatLoop          --> Persistent daemon (periodic check-in)
         |
         v

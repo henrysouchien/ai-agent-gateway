@@ -10,6 +10,7 @@ import pytest
 from starlette.requests import Request
 
 from agent_gateway.control_plane import events as events_module
+from agent_gateway.control_plane import batches as batches_module
 from agent_gateway.control_plane.events import build_events_router
 from agent_gateway.event_adapter import adapt_control_event, adapt_event
 from agent_gateway.event_log import UserEventBus
@@ -42,8 +43,17 @@ def _session(
   user_id: str = "alice",
   session_id: str = "control-1",
   channel: str = "tui",
+  purpose: str | None = None,
+  owner_user_id: str | None = None,
 ) -> _FakeSession:
-  return _FakeSession(kind=kind, user_id=user_id, session_id=session_id, channel=channel)
+  return _FakeSession(
+    kind=kind,
+    user_id=user_id,
+    session_id=session_id,
+    channel=channel,
+    purpose=purpose,
+    owner_user_id=owner_user_id,
+  )
 
 
 def _request(app: Any, token: str) -> Request:
@@ -59,9 +69,19 @@ def _request(app: Any, token: str) -> Request:
   )
 
 
-def _route(auth: _FakeAuth):
-  router = build_events_router(auth=auth)  # type: ignore[arg-type]
-  return next(route for route in router.routes if getattr(route, "path", None) == "/events")
+def _route(
+  auth: _FakeAuth,
+):
+  route_path = "/events"
+  router = build_events_router(  # type: ignore[arg-type]
+    auth=auth,
+    route_path=route_path,
+  )
+  return next(
+    route
+    for route in router.routes
+    if getattr(route, "path", None) == route_path
+  )
 
 
 async def _open_events(
@@ -73,7 +93,24 @@ async def _open_events(
   schema_version: str | None = None,
   after_seq: int = 0,
   tasks: dict[str, Any] | None = None,
+  run_id: str | None = None,
 ):
+  if (
+    tasks is None
+    and control_run_id is not None
+    and not control_run_id.startswith("batch_")
+  ):
+    tasks = {
+      control_run_id: SimpleNamespace(
+        task_id=control_run_id,
+        control_run_id=control_run_id,
+        owner_user_id="alice",
+        channel="tui",
+        state="running",
+        proc=None,
+        event_lines=[],
+      )
+    }
   app = SimpleNamespace(
     state=SimpleNamespace(
       user_event_bus=bus,
@@ -83,7 +120,7 @@ async def _open_events(
   response = await _route(auth).endpoint(
     _request(app, token),
     control_run_id=control_run_id,
-    run_id=None,
+    run_id=run_id,
     schema_version=schema_version,
     after_seq=after_seq,
   )
@@ -317,6 +354,7 @@ def test_projected_stream_replays_rehydrated_autonomous_events_after_restart() -
       task_id="bg_7",
       control_run_id="run-1",
       user_id="alice",
+      owner_user_id="alice",
       channel="tui",
       state="completed",
       proc=None,
@@ -382,10 +420,106 @@ def test_projected_stream_replays_rehydrated_autonomous_events_after_restart() -
   _run(case())
 
 
+def test_projected_stream_rehydrates_terminal_batch_event_after_restart(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def case() -> None:
+    auth = _FakeAuth({"control-token": _session()})
+    bus = UserEventBus()
+    calls: list[tuple[str, str]] = []
+
+    def terminal_event(run_id: str, *, user_id: str) -> dict[str, Any]:
+      calls.append((run_id, user_id))
+      return {
+        "type": "run_state_changed",
+        "run_id": run_id,
+        "control_run_id": run_id,
+        "batch_id": 17,
+        "state": "completed",
+        "status": "completed",
+        "user_id": user_id,
+        "ts": 100.0,
+      }
+
+    monkeypatch.setattr(
+      batches_module,
+      "terminal_batch_event_for_user",
+      terminal_event,
+    )
+    response = await _open_events(
+      bus=bus,
+      auth=auth,
+      control_run_id="batch_17",
+      schema_version="v1",
+    )
+
+    assert await _read_data(response, 1) == [
+      {
+        "run_id": "batch_17",
+        "seq": 1,
+        "event": {
+          "type": "run_state_changed",
+          "run_id": "batch_17",
+          "control_run_id": "batch_17",
+          "state": "completed",
+          "ts": 100.0,
+        },
+      }
+    ]
+    assert calls == [("batch_17", "alice")]
+    await bus.shutdown()
+
+  _run(case())
+
+
+def test_batch_terminal_rehydrate_wakes_already_subscribed_follower(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def case() -> None:
+    bus = UserEventBus()
+    subscriber = await bus.subscribe_entries(
+      "alice",
+      control_run_id="batch_17",
+    )
+
+    monkeypatch.setattr(
+      batches_module,
+      "terminal_batch_event_for_user",
+      lambda run_id, *, user_id: {
+        "type": "run_state_changed",
+        "run_id": run_id,
+        "control_run_id": run_id,
+        "batch_id": 17,
+        "state": "completed",
+        "status": "completed",
+        "user_id": user_id,
+        "ts": 100.0,
+      },
+    )
+    assert await events_module._seed_batch_replay_buffer(
+      user_event_bus=bus,
+      run_id="batch_17",
+      user_id="alice",
+    ) == "batch_17"
+
+    entry = await asyncio.wait_for(
+      subscriber.__anext__(),
+      timeout=0.5,
+    )
+    assert entry.seq == 1
+    assert entry.event["state"] == "completed"
+    with pytest.raises(StopAsyncIteration):
+      await subscriber.__anext__()
+    await subscriber.aclose()
+    await bus.shutdown()
+
+  _run(case())
+
+
 def test_projected_bus_events_dropped_sentinel_has_null_seq_and_drop_cursor() -> None:
   async def case() -> None:
     bus = UserEventBus(subscriber_queue_max=1)
-    subscriber = bus.subscribe_entries("alice", control_run_id="run-1")
+    subscriber = await bus.subscribe_entries("alice", control_run_id="run-1")
     first_task = asyncio.create_task(subscriber.__anext__())
     await asyncio.sleep(0)
 
@@ -527,23 +661,91 @@ def test_projected_coalescing_merges_adjacent_deltas_and_flushes_before_non_delt
 
 def test_projected_coalescing_flushes_on_timeout_and_keepalive(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
+    # The windows are deliberately asymmetric: with equal 0.01s windows a
+    # CPU-starved scheduler can let the keepalive deadline expire before the
+    # already-published deltas are even consumed, so the first SSE line is
+    # ':keepalive' instead of the coalesced flush. A keepalive window orders of
+    # magnitude above the coalesce window makes the flush structurally win;
+    # the generous wait_for bounds only cap how long the test waits.
     monkeypatch.setattr(events_module, "_PROJECTED_COALESCE_SECONDS", 0.01)
-    monkeypatch.setattr(events_module, "_PROJECTED_KEEPALIVE_SECONDS", 0.01)
+    monkeypatch.setattr(events_module, "_PROJECTED_KEEPALIVE_SECONDS", 2.0)
     auth = _FakeAuth({"control-token": _session()})
 
     bus = UserEventBus()
     await bus.publish("alice", "run-1", {"type": "text_delta", "text": "a", "run_id": "run-1"})
     await bus.publish("alice", "run-1", {"type": "text_delta", "text": "b", "run_id": "run-1"})
     response = await _open_events(bus=bus, auth=auth, schema_version="v1")
-    assert await _read_data(response, 1, timeout=0.2) == [
-      {"run_id": "run-1", "seq": 2, "event": {"type": "text_delta", "text": "ab", "run_id": "run-1"}}
-    ]
+    assert _decode_data(
+      await asyncio.wait_for(
+        response.body_iterator.__anext__(),
+        timeout=10.0,
+      )
+    ) == {
+      "run_id": "run-1",
+      "seq": 2,
+      "event": {
+        "type": "text_delta",
+        "text": "ab",
+        "run_id": "run-1",
+      },
+    }
+    await bus.publish(
+      "alice",
+      "run-1",
+      {
+        "type": "tool_call_start",
+        "tool_call_id": "after-coalesce",
+        "tool_name": "read",
+        "tool_input": {},
+        "run_id": "run-1",
+      },
+    )
+    assert await _read_data(response, 1, timeout=10.0) == [{
+      "run_id": "run-1",
+      "seq": 3,
+      "event": {
+        "type": "tool_call_start",
+        "tool_call_id": "after-coalesce",
+        "tool_name": "read",
+        "tool_input": {},
+        "run_id": "run-1",
+      },
+    }]
     await bus.shutdown()
 
     empty_bus = UserEventBus()
     keepalive_response = await _open_events(bus=empty_bus, auth=auth, schema_version="v1")
     try:
-      assert await asyncio.wait_for(keepalive_response.body_iterator.__anext__(), timeout=0.2) == b":keepalive\n\n"
+      # The keepalive path still gets exercised: with no pending events the
+      # stream idles for the (now 2.0s) keepalive window and must emit the
+      # comment line; the bound is generous so starvation cannot expire it.
+      assert await asyncio.wait_for(keepalive_response.body_iterator.__anext__(), timeout=30.0) == b":keepalive\n\n"
+      await empty_bus.publish(
+        "alice",
+        "run-1",
+        {
+          "type": "tool_call_start",
+          "tool_call_id": "after-keepalive",
+          "tool_name": "read",
+          "tool_input": {},
+          "run_id": "run-1",
+        },
+      )
+      assert await _read_data(
+        keepalive_response,
+        1,
+        timeout=10.0,
+      ) == [{
+        "run_id": "run-1",
+        "seq": 1,
+        "event": {
+          "type": "tool_call_start",
+          "tool_call_id": "after-keepalive",
+          "tool_name": "read",
+          "tool_input": {},
+          "run_id": "run-1",
+        },
+      }]
     finally:
       await _close_response(keepalive_response)
       await empty_bus.shutdown()

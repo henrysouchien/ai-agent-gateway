@@ -1,0 +1,39 @@
+{
+  "contract_version": 1,
+  "externals": {
+    "react": "HankCanvasRuntime.React",
+    "recharts": "HankCanvasRuntime.Recharts",
+    "@hank/canvas-kit": "HankCanvasRuntime.Kit"
+  },
+  "bundle_format": {
+    "format": "iife",
+    "registration": "HankCanvasRuntime.register(<default export>)",
+    "single_file": true,
+    "bare_imports": false,
+    "case_insensitive_script_end_forbidden": true,
+    "compiler": {
+      "jsx": "transform",
+      "target": "es2020",
+      "charset": "ascii",
+      "legalComments": "none",
+      "minify": true,
+      "format": "iife"
+    }
+  },
+  "pinned_versions": {
+    "react": "19.2.4",
+    "recharts": "2.15.4",
+    "typescript": "5.9.3",
+    "esbuild": "0.27.3"
+  },
+  "limits": {
+    "mount_deadline_ms": 10000,
+    "render_error_reports_max_per_render": 3,
+    "render_error_message_max_chars": 2000,
+    "render_error_component_stack_max_chars": 8000,
+    "source_max_bytes": 262144,
+    "bundle_max_bytes": 524288,
+    "render_failure_post_body_max_bytes": 32768,
+    "render_failure_stored_max_per_artifact": 20
+  }
+}

@@ -31,6 +31,9 @@ def package_health() -> dict[str, Any]:
     "name": PACKAGE_NAME,
     "version": __version__,
     "source_commit": SOURCE_COMMIT,
+    "source_commit_provenance": (
+      "deployment_environment" if SOURCE_COMMIT is not None else None
+    ),
     "contracts": sorted(CONTRACTS),
   }
 

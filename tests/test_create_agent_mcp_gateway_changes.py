@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import asyncio
 import sys
 from pathlib import Path
@@ -11,7 +13,8 @@ if str(PKG_DIR) not in sys.path:
 import agent_gateway.easy as easy_module
 import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway import EventLog, McpClientManager, create_agent
-from agent_gateway.server import ChatRequest
+from agent_gateway.server import ChatTurnInputs
+from agent_gateway.server_chat_helpers import prepare_session_driver_turn
 
 
 def _run(coro):
@@ -19,12 +22,33 @@ def _run(coro):
 
 
 def _build_runtime(app):
-  session = app.state.auth.session_store.create_session(api_key_hash="hash", user_id="alice")
+  config = app.state.gateway_config
+  session = app.state.auth.session_store.create_session(
+    api_key_hash="hash",
+    user_id="alice",
+    tenant_id=config.tenant_id,
+    allow_service_for_interactive=config.allow_service_credentials_for_interactive,
+    model_entitled_capabilities=frozenset({"session.driver"}),
+    model_entitled_keys=config.model_selection_policy.capabilities[
+      "session.driver"
+    ].allowed_model_keys,
+  )
+  prepared = prepare_session_driver_turn(
+    session,
+    ChatTurnInputs(
+      messages=[{"role": "user", "content": "hello"}],
+      request_id=None,
+      context={},
+      metadata={},
+      model_key=None,
+    ),
+    build_chat_runtime=app.state.gateway_build_chat_runtime,
+  )
   runtime = _run(
-    app.state.gateway_config.build_chat_runtime(
+    app.state.gateway_build_chat_runtime(
       session=session,
-      request=ChatRequest(messages=[{"role": "user", "content": "hello"}], context={}),
-      channel=None,
+      request=prepared.request,
+      channel=prepared.channel,
       auth_manager=app.state.auth,
     )
   )
@@ -39,6 +63,7 @@ def _write_skill(skills_dir: Path, name: str, body: str) -> None:
 def test_create_agent_forwards_new_mcp_options_to_manager_and_dispatcher() -> None:
   app = create_agent(
     "test",
+    api_key="test-anthropic-key",
     mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
     mcp_timeout_overrides={"browser": 90},
     mcp_default_tool_timeout=45,
@@ -78,6 +103,7 @@ def test_create_agent_forwards_mcp_session_inject_servers_to_run_agent(
 
   app = create_agent(
     "test",
+    api_key="test-anthropic-key",
     skills_dir=skills_dir,
     mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
     mcp_session_inject_servers={"browser"},

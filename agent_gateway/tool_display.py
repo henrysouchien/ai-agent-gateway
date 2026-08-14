@@ -47,7 +47,6 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   "get_estimate_revisions": _spec("Pulling {ticker} estimate revisions", "period"),
   # Model / spreadsheet work.
   "build_model": _spec("Building a model", "ticker", "model"),
-  "model_build": _spec("Building a model", "ticker", "model"),
   "model_forecast": _spec("Forecasting model values", "ticker", "scenario"),
   "model_find": _spec("Finding model items", "ticker", "query"),
   "model_values": _spec("Reading model values", "ticker", "range"),
@@ -66,6 +65,8 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   # Local / orchestration / memory.
   "code_execute": _spec("Running a calculation"),
   "run_agent": _spec("Delegating to {agent}", "task"),
+  "get_agent_result_content": _spec("Reading agent result", "content_id"),
+  "get_workflow_input_content": _spec("Reading workflow input", "input_name"),
   "session_query": _spec("Searching the session", "query"),
   "memory_write": _spec("Writing {file}", "mode"),
   "memory_read": _spec("Reading {file}"),

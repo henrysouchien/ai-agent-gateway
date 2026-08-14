@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import re
 import random
+import shutil
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 
 UNSET = object()
@@ -41,6 +42,10 @@ MCP_STDIO_RETRYABLE_MESSAGE_MARKERS = (
   "broken pipe",
   "connection reset",
 )
+STDIO_SHELL_COMMAND_NAMES = {"bash", "sh", "zsh"}
+STDIO_SHELL_EXEC_ENV_RE = re.compile(
+  r'^\s*exec\s+"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"(?:\s|$)'
+)
 
 
 def resolve_mcp_config_path(
@@ -48,14 +53,13 @@ def resolve_mcp_config_path(
   *,
   unset: object = UNSET,
   environ: Mapping[str, str] | None = None,
-  home_factory: Callable[[], Path] | None = None,
 ) -> Path | None:
   env = os.environ if environ is None else environ
   if config_path is unset:
     env_path = env.get("MCP_CONFIG_PATH", "").strip()
     if env_path:
       return Path(env_path).expanduser()
-    return (home_factory or Path.home)() / ".claude.json"
+    return None
   if config_path is None:
     return None
   return Path(config_path).expanduser()
@@ -243,6 +247,67 @@ def is_retryable_stdio_startup_error(exc: BaseException) -> bool:
   return any(isinstance(candidate, TimeoutError) for candidate in iter_exception_tree(exc))
 
 
+def resolve_missing_stdio_executable(
+  command: str,
+  args: Sequence[str],
+  env: Mapping[str, str],
+) -> str | None:
+  """Pre-spawn check: return a message naming a decisively missing stdio
+  executable, or ``None`` when the target exists or cannot be decisively
+  resolved.
+
+  Two decisively resolvable shapes are covered:
+
+  - direct argv: the configured command itself, either as an absolute path or
+    via PATH lookup against the spawn env (mirroring ``os.get_exec_path``);
+  - ``bash -c 'exec "$VAR" ...'``: ``$VAR`` is resolved from the spawn env and
+    its target is checked the same way.
+
+  Anything else (relative paths, unrecognized shell scripts, further
+  indirection) returns ``None`` so spawn behavior is unchanged.  This keeps a
+  deleted server executable (e.g. an out-of-band-removed venv) from being
+  misclassified as a retryable transient transport failure.
+  """
+  target = str(command).strip()
+  if not target:
+    return None
+  source = f"command {target!r}"
+
+  if (
+    os.path.basename(target) in STDIO_SHELL_COMMAND_NAMES
+    and len(args) >= 2
+    and str(args[0]) == "-c"
+  ):
+    match = STDIO_SHELL_EXEC_ENV_RE.match(str(args[1]))
+    if match is None:
+      return None
+    var_name = match.group(1)
+    resolved = str(env.get(var_name, "")).strip()
+    if not resolved:
+      return (
+        f"stdio executable reference ${{{var_name}}} is unset or empty in the "
+        "spawn environment"
+      )
+    target = resolved
+    source = f"${{{var_name}}}"
+
+  if os.sep in target:
+    if not os.path.isabs(target):
+      return None
+    path = Path(target)
+    if not path.exists():
+      return f"stdio executable does not exist: {target} (from {source})"
+    if not path.is_file() or not os.access(target, os.X_OK):
+      return (
+        f"stdio executable is not an executable file: {target} (from {source})"
+      )
+    return None
+
+  if shutil.which(target, path=env.get("PATH") or os.defpath) is None:
+    return f"stdio executable {target!r} not found on spawn PATH (from {source})"
+  return None
+
+
 def safe_cache_name(name: str) -> str:
   return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "server"
 
@@ -260,6 +325,8 @@ __all__ = [
   "MCP_STDIO_CONNECT_STABILIZE_ENV",
   "MCP_STDIO_RETRYABLE_EXCEPTION_NAMES",
   "MCP_STDIO_RETRYABLE_MESSAGE_MARKERS",
+  "STDIO_SHELL_COMMAND_NAMES",
+  "STDIO_SHELL_EXEC_ENV_RE",
   "STREAMABLE_HTTP_TYPES",
   "SUPPORTED_SERVER_TYPES",
   "UNSET",
@@ -272,6 +339,7 @@ __all__ = [
   "is_retryable_stdio_startup_error",
   "iter_exception_tree",
   "resolve_mcp_config_path",
+  "resolve_missing_stdio_executable",
   "safe_cache_name",
   "startup_concurrency_limit",
   "stdio_connect_retries",

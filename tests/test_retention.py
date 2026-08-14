@@ -19,6 +19,7 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway.autonomous_run_lock import AutonomousRunMutationLock
 from agent_gateway.retention import (
   FileAgeAdapter,
+  _is_broad_root,
   KeepForeverAdapter,
   RetentionCatalog,
   RetentionCatalogEntry,
@@ -248,3 +249,58 @@ async def test_run_mutation_lock_serializes_resume_publication_window(tmp_path: 
     assert not second_entered.is_set()
   await task
   assert second_entered.is_set()
+
+
+def test_runtime_version_repo_root_does_not_starve_adapter_owning_its_roots(tmp_path):
+  """Regression: runtime-version GC was refused as a "broad root" on EVERY sweep.
+
+  A gateway running out of a runtime version has
+  repo_root = <RUNTIME_ROOT>/versions/<VER>/ai-excel-addin, so the runtime-GC root
+  (<RUNTIME_ROOT>/versions) is structurally a PARENT of repo_root and _is_broad_root
+  rejects it. The sweep loop pre-computed authorized_roots for EVERY entry, so the
+  refusal killed an adapter that never reads authorized_roots (it delegates to
+  local_gateway_runtime.gc_runtime, which owns its own keep-set). Silent, because the
+  per-adapter isolation handler turned it into a logged error report — 354 occurrences
+  and 1.5 GB leaked on the real host before anyone noticed.
+  """
+  runtime_root = tmp_path / "local-gateway-runtime"
+  versions = runtime_root / "versions"
+  repo_root = versions / "ai-abc_risk-def" / "ai-excel-addin"
+  repo_root.mkdir(parents=True)
+  state = tmp_path / "state"
+  state.mkdir()
+
+  # the guard itself must NOT be weakened: that root is still "broad" for this repo_root
+  assert _is_broad_root(versions, repo_root=repo_root) is True
+  with pytest.raises(RetentionSafetyError):
+    resolve_safe_root(versions, repo_root=repo_root)
+
+  policy = RetentionPolicy("age_or_keep_n", "platform", "runtime snapshots", max_age_days=7, keep_n=2)
+
+  # WITHOUT the opt-out: reproduces the exact production signature
+  starved = RetentionSweeper(RetentionCatalog(
+    (RetentionCatalogEntry("rv", policy, KeepForeverAdapter("rv"), (versions,)),),
+    state,
+    repo_root=repo_root,
+  )).sweep("dry_run", now=datetime.now(timezone.utc))
+  assert starved[0].errors, "expected the pre-fix starvation"
+  assert "refusing broad retention root" in starved[0].errors[0]
+
+  # WITH it: the adapter runs; its own owner (gc_runtime) enforces the keep-set
+  ok = RetentionSweeper(RetentionCatalog(
+    (RetentionCatalogEntry(
+      "rv", policy, KeepForeverAdapter("rv"), (versions,), adapter_owns_root_validation=True,
+    ),),
+    state,
+    repo_root=repo_root,
+  )).sweep("dry_run", now=datetime.now(timezone.utc))
+  assert ok[0].errors == (), f"adapter owning its roots must sweep cleanly, got {ok[0].errors}"
+
+
+def test_only_runtime_versions_opts_out_of_generic_root_validation():
+  """The opt-out must stay narrow — a blanket exemption would weaken the guard."""
+  from api.retention import build_default_catalog
+
+  catalog = build_default_catalog()
+  opted_out = {e.key for e in catalog.entries if e.adapter_owns_root_validation}
+  assert opted_out == {"runtime_versions"}, f"unexpected opt-outs: {opted_out}"

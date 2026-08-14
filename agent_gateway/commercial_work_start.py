@@ -185,6 +185,24 @@ class CommercialWorkStartGate:
       )
     try:
       claim = claim_verifier.verify_for_work_start(claim_token)
+    except CommercialClaimError as exc:
+      raise CommercialWorkStartError(
+        "commercial_work_authority_invalid",
+        "Commercial work-start authority is invalid or expired.",
+        status_code=403,
+      ) from exc
+    owner_user_id = str(getattr(session, "owner_user_id", "") or "").strip()
+    if (
+      not owner_user_id.isdecimal()
+      or owner_user_id.startswith("0")
+      or claim.subject != f"user:{owner_user_id}"
+    ):
+      raise CommercialWorkStartError(
+        "commercial_work_subject_mismatch",
+        "Commercial work-start authority is bound to a different session owner.",
+        status_code=403,
+      )
+    try:
       authorization = authorization_verifier.verify_for_attach(
         authorization_token,
         execution_claim=claim,
@@ -195,7 +213,7 @@ class CommercialWorkStartGate:
         billing_mode=facts.billing_mode,
         capability_id=facts.capability_id,
       )
-    except (CommercialClaimError, WorkAuthorizationError) as exc:
+    except WorkAuthorizationError as exc:
       raise CommercialWorkStartError(
         "commercial_work_authority_invalid",
         "Commercial work-start authority is invalid or expired.",

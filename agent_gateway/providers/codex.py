@@ -7,7 +7,14 @@ from weakref import WeakKeyDictionary
 
 import httpx
 
-from .base import ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
+from .base import (
+  ModelInfo,
+  ModelProvider,
+  StreamEvent,
+  ThinkingLevel,
+  _is_context_length_exception,
+  truncate_to_last_compaction,
+)
 from ..thinking import EffortResolution, clamp_effort
 from .codex_helpers import (
   DEFAULT_CODEX_BASE_URL as DEFAULT_CODEX_BASE_URL,
@@ -406,6 +413,9 @@ class CodexProvider(ModelProvider):
     if isinstance(exc, (httpx.TransportError, httpx.StreamError)):
       return True
     return bool(_RETRYABLE_RE.search(str(exc)))
+
+  def is_context_length_error(self, exc: Exception) -> bool:
+    return _is_context_length_exception(exc)
 
 
 __all__ = [

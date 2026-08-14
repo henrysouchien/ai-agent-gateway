@@ -18,7 +18,6 @@ from agent_gateway import tool_dispatcher_source_pack as source_pack_helpers
 def _planner_payload(**overrides):
   payload = {
     "matched_intent": "revenue",
-    "source_pack_sha256": "abc123",
     "required_reads": ["10-K"],
     "rationale": "matched filing evidence",
   }

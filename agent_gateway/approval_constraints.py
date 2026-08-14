@@ -7,7 +7,6 @@ from .approval_policy import ApprovalConstraint, ApprovalConstraintError
 
 
 _SUPPORTED_COMMIT_STRATEGIES = frozenset({
-  "JOURNALED_CAS",
   "ARTIFACT_ONLY",
   "PROPOSAL_STAGE",
   "THESIS_TRANSACTION",

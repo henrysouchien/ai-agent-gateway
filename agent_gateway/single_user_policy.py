@@ -14,6 +14,7 @@ from .approval_policy import (
   ToolClass,
   utc_now,
 )
+from .policy_imports import resolve_effective_role
 
 
 class SingleUserApprovalPolicy:
@@ -103,7 +104,7 @@ class SingleUserApprovalPolicy:
       await self._store.revoke_persistent_grant(grant_id)
 
   def role_authorized_for_class(self, *, decider_role: str | None, tool_class: str) -> bool:
-    role = str(decider_role or "owner")
+    role = resolve_effective_role(decider_role)
     if tool_class == "irreversible":
       return role == "owner"
     return role in {"owner", "invite", "approver", "compliance", "pm"}

@@ -16,12 +16,49 @@ if str(PKG_DIR) not in sys.path:
 
 import agent_gateway.mcp_client as mcp_client_module
 from agent_gateway import AgentRunner, EventLog
+from agent_gateway.approval_policy import RunContext
 from agent_gateway.mcp_client import McpClientManager
+from agent_gateway.session import GatewaySession
+from agent_gateway.session_capabilities import TEAM_WORKSPACE_WRITE_CAPABILITY
 from agent_gateway.tool_dispatcher import ToolDispatcher
+from tests.capability_execution_test_support import (
+  stub_runner_capability_execution,
+)
 
 
 def _run(coro):
   return asyncio.run(coro)
+
+
+def _dispatch(
+  dispatcher: ToolDispatcher,
+  tool_call_id: str,
+  tool_name: str,
+  tool_input: dict[str, Any],
+  **kwargs: Any,
+):
+  return dispatcher.dispatch(
+    tool_call_id,
+    tool_name,
+    tool_input,
+    advertised_tool_names=frozenset({tool_name}),
+    **kwargs,
+  )
+
+
+def _community_session(*, risk_user_id: int = 900001) -> GatewaySession:
+  now = int(time.time())
+  return GatewaySession(
+    session_id="sess-community",
+    api_key_hash="hash-community",
+    created_at=now,
+    expires_at=now + 300,
+    user_id="sia-community",
+    risk_user_id=risk_user_id,
+    role="invite",
+    capabilities=frozenset({TEAM_WORKSPACE_WRITE_CAPABILITY}),
+    channel="discord",
+  )
 
 
 class _FakeMcpClient:
@@ -153,7 +190,7 @@ def test_tool_dispatcher_injects_user_id_into_mcp_meta(server_name: str) -> None
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp", "research-corpus-mcp"}),
   )
 
-  result, error = _run(dispatcher.dispatch("call-1", "portfolio_tool", {"ticker": "AAPL"}))
+  result, error = _run(_dispatch(dispatcher, "call-1", "portfolio_tool", {"ticker": "AAPL"}))
 
   assert error is None
   assert result == {"ok": True}
@@ -180,7 +217,7 @@ def test_tool_dispatcher_mcp_identity_override_applies_to_matching_server_only()
     mcp_identity_overrides={"research-corpus-mcp": 1},
   )
 
-  result, error = _run(corpus_dispatcher.dispatch("call-1", "portfolio_tool", {"ticker": "MSFT"}))
+  result, error = _run(_dispatch(corpus_dispatcher, "call-1", "portfolio_tool", {"ticker": "MSFT"}))
 
   assert error is None
   assert result == {"ok": True}
@@ -199,7 +236,7 @@ def test_tool_dispatcher_mcp_identity_override_applies_to_matching_server_only()
     mcp_identity_overrides={"research-corpus-mcp": 1},
   )
 
-  result, error = _run(portfolio_dispatcher.dispatch("call-2", "portfolio_tool", {"ticker": "MSFT"}))
+  result, error = _run(_dispatch(portfolio_dispatcher, "call-2", "portfolio_tool", {"ticker": "MSFT"}))
 
   assert error is None
   assert result == {"ok": True}
@@ -218,19 +255,37 @@ def test_community_write_mcp_meta_uses_team_identity_without_user1_override(
   tool_name: str,
 ) -> None:
   mcp = _FakeMcpClient(server_name=server_name, tool_name=tool_name)
+  session = _community_session()
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
     local_tool_handlers={},
-    session_id="sess-community",
-    user_id="900001",
-    risk_user_id=900001,
-    channel="discord",
-    role="invite",
+    session_id=session.session_id,
+    user_id=session.user_id,
+    risk_user_id=session.risk_user_id,
+    channel=session.channel,
+    role=session.role,
+    session=session,
+    run_context=RunContext(
+      user_id=session.user_id,
+      request_id="request-community-write",
+      session_id=session.session_id,
+      profile="community",
+      channel="discord",
+      run_id="skill-run-community-write",
+    ),
     mcp_meta_inject_servers=frozenset({"portfolio-producers-mcp", "portfolio-writes-mcp"}),
     mcp_identity_overrides={},
   )
 
-  result, error = _run(dispatcher.dispatch("call-1", tool_name, {"ticker": "MSFT"}))
+  result, error = _run(_dispatch(
+    dispatcher,
+    "call-1",
+    tool_name,
+    {"ticker": "MSFT"},
+    skill_run_id=(
+      "skill-run-community-write" if tool_name == "build_model" else None
+    ),
+  ))
 
   assert error is None
   assert result == {"ok": True}
@@ -240,14 +295,23 @@ def test_community_write_mcp_meta_uses_team_identity_without_user1_override(
 
 def test_community_thesis_create_then_read_uses_team_store_identity() -> None:
   mcp = _RoundTripResearchMcpClient()
+  session = _community_session()
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
     local_tool_handlers={},
-    session_id="sess-community",
-    user_id="900001",
-    risk_user_id=900001,
-    channel="discord",
-    role="invite",
+    session_id=session.session_id,
+    user_id=session.user_id,
+    risk_user_id=session.risk_user_id,
+    channel=session.channel,
+    role=session.role,
+    session=session,
+    run_context=RunContext(
+      user_id=session.user_id,
+      request_id="request-community-round-trip",
+      session_id=session.session_id,
+      profile="community",
+      channel="discord",
+    ),
     mcp_meta_inject_servers=frozenset({"portfolio-writes-mcp", "research-corpus-mcp"}),
     mcp_identity_overrides={},
     allowed_mcp_tools_by_server={
@@ -257,13 +321,14 @@ def test_community_thesis_create_then_read_uses_team_store_identity() -> None:
   )
 
   created, create_error = _run(
-    dispatcher.dispatch(
+    _dispatch(
+      dispatcher,
       "call-1",
       "thesis_create",
       {"research_file_id": 101, "statement": "Team thesis."},
     )
   )
-  read, read_error = _run(dispatcher.dispatch("call-2", "thesis_read", {"research_file_id": 101}))
+  read, read_error = _run(_dispatch(dispatcher, "call-2", "thesis_read", {"research_file_id": 101}))
 
   assert create_error is None
   assert read_error is None
@@ -285,7 +350,8 @@ def test_tool_dispatcher_injects_run_context_into_mcp_meta_when_present() -> Non
   )
 
   result, error = _run(
-    dispatcher.dispatch(
+    _dispatch(
+      dispatcher,
       "call-1",
       "portfolio_tool",
       {"ticker": "AAPL"},
@@ -327,7 +393,8 @@ def test_tool_dispatcher_omits_run_context_from_mcp_meta_when_absent() -> None:
   )
 
   result, error = _run(
-    dispatcher.dispatch(
+    _dispatch(
+      dispatcher,
       "call-1",
       "portfolio_tool",
       {"ticker": "AAPL"},
@@ -360,7 +427,7 @@ def test_tool_dispatcher_defaults_portfolio_scope_for_portfolio_mcp_tool() -> No
     get_tool_definitions=lambda: [_portfolio_tool_def()],
   )
 
-  result, error = _run(dispatcher.dispatch("call-1", "portfolio_tool", {"format": "agent"}))
+  result, error = _run(_dispatch(dispatcher, "call-1", "portfolio_tool", {"format": "agent"}))
 
   assert error is None
   assert result == {"ok": True}
@@ -385,7 +452,7 @@ def test_tool_dispatcher_defaults_portfolio_scope_for_split_portfolio_mcp_tool()
     get_tool_definitions=lambda: [_portfolio_tool_def()],
   )
 
-  result, error = _run(dispatcher.dispatch("call-1", "portfolio_tool", {"format": "agent"}))
+  result, error = _run(_dispatch(dispatcher, "call-1", "portfolio_tool", {"format": "agent"}))
 
   assert error is None
   assert result == {"ok": True}
@@ -408,7 +475,7 @@ def test_tool_dispatcher_preserves_explicit_portfolio_tool_input() -> None:
   )
 
   result, error = _run(
-    dispatcher.dispatch("call-1", "portfolio_tool", {"portfolio_name": "explicit_portfolio"})
+    _dispatch(dispatcher, "call-1", "portfolio_tool", {"portfolio_name": "explicit_portfolio"})
   )
 
   assert error is None
@@ -427,7 +494,8 @@ def test_tool_dispatcher_defaults_when_portfolio_tool_input_is_null_or_blank() -
   )
 
   result, error = _run(
-    dispatcher.dispatch(
+    _dispatch(
+      dispatcher,
       "call-1",
       "portfolio_tool",
       {"format": "agent", "portfolio_id": None, "portfolio_name": ""},
@@ -455,7 +523,7 @@ def test_tool_dispatcher_skips_portfolio_default_when_schema_does_not_accept_it(
     ],
   )
 
-  result, error = _run(dispatcher.dispatch("call-1", "portfolio_tool", {"format": "agent"}))
+  result, error = _run(_dispatch(dispatcher, "call-1", "portfolio_tool", {"format": "agent"}))
 
   assert error is None
   assert result == {"ok": True}
@@ -484,7 +552,7 @@ def test_tool_dispatcher_uses_original_tool_name_for_prefixed_portfolio_default(
     ],
   )
 
-  result, error = _run(dispatcher.dispatch("call-1", tool_name, {"format": "agent"}))
+  result, error = _run(_dispatch(dispatcher, "call-1", tool_name, {"format": "agent"}))
 
   assert error is None
   assert result == {"ok": True}
@@ -508,8 +576,12 @@ def test_runner_tool_start_event_uses_effective_dispatch_scope_input() -> None:
     event_log=event_log,
     dispatcher=dispatcher,
     session_id="sess-1",
-    provider=SimpleNamespace(name="stub"),
-    auth_config={},
+    capability_execution=stub_runner_capability_execution(
+      provider=SimpleNamespace(name="stub"),
+      auth_config={"api_key": "test-secret"},
+      model="stub-model",
+      effort="none",
+    ),
     mcp_client=mcp,
     get_tool_definitions=lambda: [_portfolio_tool_def()],
     user_id="alice",
@@ -517,7 +589,12 @@ def test_runner_tool_start_event_uses_effective_dispatch_scope_input() -> None:
     rate_table_version="unknown",
   )
 
-  _run(runner._execute_single_tool("call-1", "portfolio_tool", {"format": "agent"}, {"tools": []}))
+  _run(runner._execute_single_tool(
+    "call-1",
+    "portfolio_tool",
+    {"format": "agent"},
+    {"_request_advertised_tool_names": frozenset({"portfolio_tool"})},
+  ))
 
   start_events = [entry.event for entry in event_log.entries if entry.event.get("type") == "tool_call_start"]
   assert start_events
@@ -538,7 +615,7 @@ def test_tool_dispatcher_session_param_injection_still_works() -> None:
     mcp_session_inject_servers={"session-param-server"},
   )
 
-  result, error = _run(dispatcher.dispatch("call-1", "portfolio_tool", {"ticker": "AAPL"}))
+  result, error = _run(_dispatch(dispatcher, "call-1", "portfolio_tool", {"ticker": "AAPL"}))
 
   assert error is None
   assert result == {"ok": True}
@@ -559,7 +636,7 @@ def test_tool_dispatcher_fails_closed_without_user_id_in_strict_mode() -> None:
   )
 
   with pytest.raises(RuntimeError, match="MCP meta user_id is required in strict mode"):
-    _run(dispatcher.dispatch("call-1", "portfolio_tool", {"ticker": "AAPL"}))
+    _run(_dispatch(dispatcher, "call-1", "portfolio_tool", {"ticker": "AAPL"}))
 
   assert mcp.calls == []
 

@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+try:
+  from agent.shared.capability_plan import (
+    CapabilityPlanSchemaError,
+    PlanExecutionContext,
+  )
+except ImportError:  # standalone gateway: no api capability-plan layer
+  class CapabilityPlanSchemaError(Exception):  # type: ignore[no-redef]
+    """Placeholder; never raised without the api capability-plan layer."""
+
+  PlanExecutionContext = None  # type: ignore[assignment]
+
 from .auth import ProviderCredentialFailure
+from .capability_binding import validate_reported_identity
 from .providers import ModelInfo, ThinkingLevel
 from .thinking import EffortResolution, parse_effort
 from .runner_introspection import format_exc as _format_exc
@@ -18,8 +31,9 @@ from .runner_prompt_rules import (
   messages_require_tool_only_turns as _messages_require_tool_only_turns,
   system_prompt_requires_tool_only_turns as _system_prompt_requires_tool_only_turns,
 )
+from .runner_cleanup import attach_cleanup_failure
 from .runner_session_lifecycle import _runner_attr
-from .runner_state import StreamTurnResult
+from .runner_state import StreamTurnFailure, StreamTurnResult
 from .runner_streaming import (
   STREAM_STALL_TIMEOUT,
   STREAM_THINKING_STALL_TIMEOUT,
@@ -31,6 +45,7 @@ from .runner_streaming import (
 from .runner_usage import (
   apply_message_start_usage as _apply_message_start_usage,
   apply_usage_update as _apply_usage_update,
+  usage_snapshot,
   usage_delta_state as _usage_delta_state,
 )
 
@@ -108,8 +123,9 @@ class RunnerStreamTurnMixin:
     turn_t0_mono: float,
     system_chars: int,
     tools_chars: int,
-    usage_totals: Dict[str, int],
-  ) -> Tuple[Any, StreamTurnResult] | None:
+    usage_totals: Dict[str, Any],
+    plan_execution_context: PlanExecutionContext | None = None,
+  ) -> Tuple[Any, StreamTurnResult] | StreamTurnFailure | None:
     asyncio_module = _runner_attr(self, "asyncio", asyncio)
     time_module = _runner_attr(self, "time", time)
     logger = _runner_attr(self, "log", log)
@@ -119,10 +135,21 @@ class RunnerStreamTurnMixin:
     stream_retry_delay = _runner_attr(self, "STREAM_RETRY_DELAY", STREAM_RETRY_DELAY)
     stream_retry_backoff = _runner_attr(self, "STREAM_RETRY_BACKOFF", STREAM_RETRY_BACKOFF)
     stream_guard_poll_interval = _runner_attr(self, "STREAM_GUARD_POLL_INTERVAL", STREAM_GUARD_POLL_INTERVAL)
-
     last_progress_at = time_module.monotonic()
     guard_reason: tuple[str, str] | None = None
-    requested_effort = parse_effort(config.get("effort")) or ThinkingLevel.HIGH
+    requested_effort = parse_effort(
+      config.get("effort"),
+      field_name="capability_execution.effort",
+    )
+    if requested_effort is None:
+      raise ValueError(
+        "native execution requires an explicitly bound effort"
+      )
+    bound_effort = self._capability_execution.bind.effort
+    if requested_effort.value != bound_effort:
+      raise ValueError(
+        "runtime effort does not match the immutable capability bind"
+      )
     effort_resolution = self._provider.resolve_effort(
       requested=requested_effort,
       model=config["model"],
@@ -132,6 +159,19 @@ class RunnerStreamTurnMixin:
       base_url=config.get("base_url") or config.get("baseURL"),
       compat=config.get("compat"),
     )
+    if (
+      effort_resolution.requested != requested_effort
+      or effort_resolution.effective != requested_effort
+    ):
+      raise ValueError(
+        (
+          f"native execution cannot preserve bound effort "
+          f"{requested_effort.value!r} for "
+          f"{self._capability_execution.bind.provider}:"
+          f"{self._capability_execution.bind.upstream_model} "
+          f"with max_tokens={max_tokens}"
+        )
+      )
     self._effort_resolution = effort_resolution
     _effective_stall_timeout = self._effective_stream_stall_timeout(
       config=config,
@@ -141,13 +181,30 @@ class RunnerStreamTurnMixin:
       effort_resolution=effort_resolution,
     )
 
-    def _make_params() -> Dict[str, Any]:
+    def _make_params() -> tuple[Dict[str, Any], frozenset[str]]:
       normalized_messages = self._provider.normalize_messages(current_messages, model_info)
-      return self._provider.build_request_params(
+      request_tools = copy.deepcopy(base_kwargs.get("tools") or [])
+      advertised_tool_names = frozenset(
+        str(definition.get("name") or "").strip()
+        for definition in request_tools
+        if isinstance(definition, dict)
+        and str(definition.get("name") or "").strip()
+      )
+      fork_kwargs: Dict[str, Any] = {}
+      if getattr(self._provider, "name", None) == "anthropic":
+        fork_kwargs = {
+          "fork_mode": bool(getattr(self, "_fork_mode", False)),
+          "fork_marker_position": getattr(
+            self,
+            "_fork_marker_position",
+            None,
+          ),
+        }
+      params = self._provider.build_request_params(
         model=config["model"],
         messages=normalized_messages,
         system_prompt=system_prompt,
-        tools=base_kwargs.get("tools") or [],
+        tools=request_tools,
         max_tokens=max_tokens,
         thinking_level=requested_effort,
         effort_resolution=effort_resolution,
@@ -159,7 +216,39 @@ class RunnerStreamTurnMixin:
           model_info,
         ),
         compaction_instructions=self._compaction_instructions,
+        **fork_kwargs,
       )
+      rendered_system_blocks: list[tuple[str, bool]] = []
+      for block in params.get("system") or []:
+        if not isinstance(block, dict):
+          continue
+        text = str(block.get("text") or "")
+        if text:
+          rendered_system_blocks.append(
+            (text, "cache_control" in block)
+          )
+      marker_locations = [
+        (message_index, block_index)
+        for message_index, message in enumerate(params.get("messages") or [])
+        for block_index, block in enumerate(
+          message.get("content")
+          if isinstance(message, dict)
+          and isinstance(message.get("content"), list)
+          else []
+        )
+        if isinstance(block, dict) and "cache_control" in block
+      ]
+      self._last_request_system_blocks = tuple(
+        rendered_system_blocks
+      )
+      self._last_request_wire_tools = copy.deepcopy(
+        params.get("tools") or []
+      )
+      self._last_request_message_marker_position = (
+        marker_locations[0] if len(marker_locations) == 1 else None
+      )
+      self._last_request_max_tokens = max_tokens
+      return params, advertised_tool_names
 
     suppress_tool_turn_text = (
       _runner_attr(self, "_system_prompt_requires_tool_only_turns", _system_prompt_requires_tool_only_turns)(
@@ -179,6 +268,16 @@ class RunnerStreamTurnMixin:
           last_progress_at = time_module.monotonic()
 
         if event_type == "message_start":
+          bind = self._capability_execution.bind
+          usage_totals.update({
+            "capability_bind": bind.receipt(),
+          })
+          if event.provider_reported_model is not None:
+            usage_totals["provider_reported_model"] = validate_reported_identity(
+              bind,
+              event.provider_reported_model,
+              registry=self._capability_execution.registry,
+            )
           _runner_attr(self, "_apply_message_start_usage", _apply_message_start_usage)(
             usage_totals,
             input_tokens=event.input_tokens,
@@ -282,9 +381,13 @@ class RunnerStreamTurnMixin:
         if event_type == "usage_update":
           _runner_attr(self, "_apply_usage_update", _apply_usage_update)(
             usage_totals,
+            input_tokens=event.input_tokens,
             output_tokens=event.output_tokens,
             reasoning_tokens=event.reasoning_tokens,
+            cache_creation_tokens=event.cache_creation_tokens,
+            cache_read_tokens=event.cache_read_tokens,
             provider_units=event.provider_units,
+            provider_unit_deltas=event.provider_unit_deltas,
           )
           continue
 
@@ -348,9 +451,10 @@ class RunnerStreamTurnMixin:
       commercial_guard = getattr(commercial_producer, "assert_work_allowed", None)
       if callable(commercial_guard):
         commercial_guard(self._billing_mode)
-      params = _make_params()
+      params, advertised_tool_names = _make_params()
       result = _runner_attr(self, "StreamTurnResult", StreamTurnResult)()
-      tokens_snapshot = dict(usage_totals)
+      result.advertised_tool_names = advertised_tool_names
+      usage_before_attempt = usage_snapshot(usage_totals)
       guard_reason = None
       stream_task = asyncio_module.create_task(_consume_stream(params, result))
       guard_task = asyncio_module.create_task(_stream_guard(stream_task, turn_t0_mono))
@@ -368,26 +472,61 @@ class RunnerStreamTurnMixin:
           exc = stream_task.exception()
           if exc is not None:
             raise exc
-      except cancelled_error_type:
+      except cancelled_error_type as primary_cancel:
         guard_task.cancel()
         stream_task.cancel()
-        partial_usage_state = _runner_attr(self, "_usage_delta_state", _usage_delta_state)(tokens_snapshot, usage_totals)
+        primary_error = primary_cancel
+
+        def _record_cancellation_cleanup_failure(
+          phase: str,
+          cleanup_exc: BaseException,
+        ) -> None:
+          cleanup_detail = attach_cleanup_failure(
+            primary_error,
+            cleanup_exc,
+          )
+          try:
+            self._append({
+              "type": "run_error",
+              "phase": phase,
+              "error_type": type(cleanup_exc).__name__,
+              "error": cleanup_detail,
+              "message": cleanup_detail,
+            })
+          except Exception:
+            pass
+
+        partial_usage_state = _runner_attr(self, "_usage_delta_state", _usage_delta_state)(usage_before_attempt, usage_totals)
         partial_usage = partial_usage_state.usage
         usage_totals.clear()
-        usage_totals.update(tokens_snapshot)
+        usage_totals.update(usage_before_attempt)
         if partial_usage_state.has_tokens:
-          await self._call_on_usage(
-            self._build_usage_event(model=config["model"], usage_totals=partial_usage),
-            usage_state="canceled",
+          try:
+            await self._call_on_usage(
+              self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+              usage_state="canceled",
+            )
+          except BaseException as cleanup_exc:
+            _record_cancellation_cleanup_failure(
+              "stream_cancellation_usage",
+              cleanup_exc,
+            )
+        try:
+          await self.force_close()
+        except BaseException as cleanup_exc:
+          _record_cancellation_cleanup_failure(
+            "stream_cancellation_cleanup",
+            cleanup_exc,
           )
-        await self.force_close()
         raise
       except Exception as exc:
+        if isinstance(exc, CapabilityPlanSchemaError):
+          raise
         stream_error = exc
-        partial_usage_state = _runner_attr(self, "_usage_delta_state", _usage_delta_state)(tokens_snapshot, usage_totals)
+        partial_usage_state = _runner_attr(self, "_usage_delta_state", _usage_delta_state)(usage_before_attempt, usage_totals)
         partial_usage = partial_usage_state.usage
         usage_totals.clear()
-        usage_totals.update(tokens_snapshot)
+        usage_totals.update(usage_before_attempt)
 
         action, guard_error, guard_kind = self._classify_guard_outcome(
           guard_reason,
@@ -443,33 +582,48 @@ class RunnerStreamTurnMixin:
           refreshed_config = await self._call_credential_refresher(credential_failure)
           if refreshed_config is not None:
             self._apply_refreshed_auth_config(config, refreshed_config)
-            if not self._provider.has_active_credential(config):
-              logger.warning("[%s] credential refresh returned inactive credentials; falling back to normal error path", self._sid)
-            else:
-              usage_totals.clear()
-              usage_totals.update(tokens_snapshot)
-              stream_error = RuntimeError(f"credential refreshed after {credential_failure.kind}")
-              self._call_metric("gateway.credential_refresh_success", 1)
-              self._append(
-                {
-                  "type": "credential_refreshed",
-                  "provider": credential_failure.provider,
-                  "kind": credential_failure.kind,
-                  "status_code": credential_failure.status_code,
-                }
+            usage_totals.clear()
+            usage_totals.update(usage_before_attempt)
+            stream_error = RuntimeError(f"credential refreshed after {credential_failure.kind}")
+            self._call_metric("gateway.credential_refresh_success", 1)
+            self._append(
+              {
+                "type": "credential_refreshed",
+                "provider": credential_failure.provider,
+                "kind": credential_failure.kind,
+                "status_code": credential_failure.status_code,
+              }
+            )
+            await self._emit_stream_retry_event(
+              attempt=attempt,
+              error=f"credential refreshed after provider {credential_failure.kind} failure",
+            )
+            if partial_usage_state.has_tokens:
+              await self._call_on_usage(
+                self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+                usage_state="failed_billable",
               )
-              await self._emit_stream_retry_event(
-                attempt=attempt,
-                error=f"credential refreshed after provider {credential_failure.kind} failure",
-              )
-              if partial_usage_state.has_tokens:
-                await self._call_on_usage(
-                  self._build_usage_event(model=config["model"], usage_totals=partial_usage),
-                  usage_state="failed_billable",
-                )
-              continue
+            continue
 
         formatted_exc = _runner_attr(self, "_format_exc", _format_exc)(exc)
+        if self._provider.is_context_length_error(exc):
+          logger.error(
+            "[%s] Stream error on turn %d after %.1fs (context length): %s",
+            self._sid,
+            turn_count,
+            time_module.time() - turn_t0,
+            formatted_exc,
+          )
+          if partial_usage_state.has_tokens:
+            await self._call_on_usage(
+              self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+              usage_state="failed_billable",
+            )
+          return StreamTurnFailure(
+            error=exc,
+            formatted_error=formatted_exc,
+            is_context_length=True,
+          )
         if not self._provider.is_retryable_error(exc):
           logger.error(
             "[%s] Stream error on turn %d after %.1fs (non-retryable): %s",
@@ -518,10 +672,10 @@ class RunnerStreamTurnMixin:
         )
         if action != "not_guard":
           guard_message = guard_reason[1] if guard_reason else ""
-          partial_usage_state = _runner_attr(self, "_usage_delta_state", _usage_delta_state)(tokens_snapshot, usage_totals)
+          partial_usage_state = _runner_attr(self, "_usage_delta_state", _usage_delta_state)(usage_before_attempt, usage_totals)
           partial_usage = partial_usage_state.usage
           usage_totals.clear()
-          usage_totals.update(tokens_snapshot)
+          usage_totals.update(usage_before_attempt)
           if action == "retry":
             stream_error = RuntimeError(guard_error)
             if partial_usage_state.has_tokens:
@@ -570,6 +724,19 @@ class RunnerStreamTurnMixin:
 
     if stream_error is not None:
       formatted_exc = _runner_attr(self, "_format_exc", _format_exc)(stream_error)
+      if self._provider.is_context_length_error(stream_error):
+        logger.error(
+          "[%s] Stream failed on turn %d after %d retries (context length): %s",
+          self._sid,
+          turn_count,
+          stream_retry_max,
+          formatted_exc,
+        )
+        return StreamTurnFailure(
+          error=stream_error,
+          formatted_error=formatted_exc,
+          is_context_length=True,
+        )
       logger.error(
         "[%s] Stream failed on turn %d after %d retries: %s",
         self._sid,

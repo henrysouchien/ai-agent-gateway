@@ -59,10 +59,28 @@ Response body:
   "session_id": "sess_1234abcd5678",
   "expires_at": 1770000000,
   "schema_version": 1,
-  "model_catalog": {
-    "default_model": "claude-opus-4-7",
-    "allowed_models": ["claude-opus-4-7", "claude-sonnet-4-6"],
-    "display_names": {"claude-opus-4-7": "Opus 4.7"}
+  "capability_choices": {
+    "session.driver": {
+      "capability": "session.driver",
+      "catalog_revision": "registry-r7",
+      "policy_revision": "policy-r4",
+      "selected": {
+        "model_key": "anthropic.claude-opus-5",
+        "label": "Opus 5",
+        "effort": "high",
+        "reason": "platform_default"
+      },
+      "notices": [],
+      "choices": [
+        {
+          "model_key": "anthropic.claude-opus-5",
+          "label": "Opus 5",
+          "supported_efforts": ["none", "low", "medium", "high"],
+          "default_effort": "high",
+          "lifecycle": "active"
+        }
+      ]
+    }
   }
 }
 ```
@@ -76,7 +94,7 @@ Schema:
 | `session_id` | string | Server-generated session id |
 | `expires_at` | integer | Unix timestamp |
 | `schema_version` | integer | Negotiated wire schema version for this session. Every `/chat` and `/chat/subscribe` SSE envelope echoes this value. |
-| `model_catalog` | object, optional | Optional model discovery metadata. Present only when `GatewayServerConfig.model_catalog` is configured. Clients tolerate absence. Contains `default_model` (string), `allowed_models` (array of strings), and `display_names` (object mapping model id to display label). |
+| `capability_choices` | object | Required authenticated, session-executable choices keyed by capability id. Each entry includes exact registry/policy revisions, the selected stable key or `null`, notices, and eligible stable-key choices. Clients must not synthesize catalogs, aliases, or defaults. |
 
 Example:
 
@@ -106,7 +124,9 @@ Request body:
     "channel": "web"
   },
   "user_id": "alice",
-  "model": "claude-sonnet-4-6"
+  "model_key": "anthropic.claude-sonnet-5",
+  "effort": "high",
+  "catalog_revision": "registry-r7"
 }
 ```
 
@@ -117,7 +137,9 @@ Schema:
 | `messages` | array of `ChatMessage` | yes | Full message list for the current turn |
 | `context` | object | no | Free-form request context; `channel` is commonly used |
 | `user_id` | string | no | If sent, the value is used as the request identity. In strict multi-user mode (resolver configured), it must match the session's JWT identity; mismatch returns an HTTP error. In non-strict mode, the supplied value is accepted as-is. If absent: strict mode rejects the request; non-strict mode falls back to the JWT identity. Reference clients should always send `user_id` to be forward-compatible with strict mode. |
-| `model` | string or null | no | Per-request model override |
+| `model_key` | string or null | no | Authenticated stable-key override. Omit to use the saved preference or product default. |
+| `effort` | string or null | no | Explicit effort. Requires `model_key`. |
+| `catalog_revision` | string or null | no | Concurrency context presented with the authenticated choice. Requires `model_key`. It is not selection authority: the server rechecks current eligibility, so harmless registry refreshes do not invalidate a still-eligible stable key. |
 
 `ChatMessage` schema:
 
@@ -130,7 +152,8 @@ Notes:
 
 - One active stream is allowed per session. A second concurrent `POST /api/chat` returns HTTP `409`.
 - Stream envelopes have the shape `{seq, session_id, schema_version, event}`. For schema v1, the server projects each event through the v1 adapter, strips fields added after the v1 freeze, and skips event types not in the v1 wire contract while preserving cursor sequence gaps.
-- The server verifies that `model` is in `GatewayServerConfig.allowed_models` when an allowlist is configured.
+- The server resolves only eligible stable keys from its exact model registry and
+  selection policy. Raw upstream model names are rejected.
 - Recommended `context.channel` values: `web`, `cli`, `telegram`, `bot`. The field is free-form; gateways may route or scope behavior on the channel value, and analytics commonly use it. Planned reference dev clients (the in-flight `@ai-agent-gateway/tui` and `ai-agent-gateway-cli` packages) will send `"cli"` as the canonical dev-surface value.
 - `create_agent()` resolves the runtime for you. `create_gateway_app()` calls your `build_chat_runtime(session, request, channel, auth_manager)`.
 
@@ -148,6 +171,41 @@ curl -N http://127.0.0.1:8000/api/chat \
     "user_id": "alice"
   }'
 ```
+
+### PUT /api/model-preferences/{capability_id}
+
+Save an authenticated stable-key preference for a capability whose product
+policy permits saved preferences. The bearer token must name a chat session.
+
+```json
+{
+  "model_key": "anthropic.claude-opus-5",
+  "effort": "high",
+  "catalog_revision": "registry-r7"
+}
+```
+
+The response is the stored receipt:
+
+```json
+{
+  "capability": "session.driver",
+  "model_key": "anthropic.claude-opus-5",
+  "effort": "high"
+}
+```
+
+The server validates the key and effort against the authenticated session's
+current eligible choices. Clients should submit the `catalog_revision` supplied
+in `capability_choices` as concurrency context and must not substitute aliases
+or raw upstream names. Revision inequality alone does not reject a still-valid
+key; a key or effort that is no longer eligible does fail closed.
+
+### DELETE /api/model-preferences/{capability_id}
+
+Clear the authenticated saved preference. The response contains the capability
+with `model_key` and `effort` set to `null`. A subsequent turn that omits
+selection uses the product policy default.
 
 ### POST /api/chat/cancel
 
@@ -455,7 +513,8 @@ Fields:
 
 #### `tool_call_interrupted`
 
-Synthesized when recovery finds a tool call that started but never emitted a completion event.
+Emitted when a runtime knows that a started tool call will not produce a
+completion, or synthesized when recovery finds such an unresolved call.
 
 Schema:
 
@@ -467,6 +526,7 @@ Schema:
   "tool_input": {"code": "print(1 + 1)"},
   "original_started_at": 1770000000.1,
   "discovered_at": 1770000060.2,
+  "reason": "cancelled",
   "tool_risk": "dangerous",
   "runner_id": "runner_abc",
   "role": "writer",
@@ -480,9 +540,10 @@ Fields:
 | --- | --- | --- |
 | `tool_call_id` | string | Provider tool call id from the original `tool_call_start` |
 | `tool_name` | string or null | Original tool name |
-| `tool_input` | object or null | Original tool payload |
+| `tool_input` | object or null | Redacted original tool payload |
 | `original_started_at` | number or null | Original `tool_call_start.started_at` timestamp |
-| `discovered_at` | number | Unix timestamp when recovery synthesized this event |
+| `discovered_at` | number | Unix timestamp when the runtime or recovery recorded this event |
+| `reason` | string, optional | Immediate runtime reason such as `cancelled` or `tool_error`; absent when recovery cannot know the cause |
 | `tool_risk` | string | Risk classification for the tool name |
 | `runner_id` | string or null | Runner that originally started the tool |
 | `role` | string | Runner role from the original tool start event. Defaults to `writer` when absent. |
@@ -490,13 +551,17 @@ Fields:
 
 #### `stream_complete`
 
-Terminal success event for the SSE stream.
+Terminal transport-closure event for the SSE stream. `terminal_disposition`
+distinguishes a successfully completed run from an intentional interruption.
+Clients must close the stream for either disposition, but must not persist or
+present an interrupted run as successful.
 
 Schema:
 
 ```json
 {
   "type": "stream_complete",
+  "terminal_disposition": "completed",
   "usage": {
     "input_tokens": 123,
     "output_tokens": 45,
@@ -507,9 +572,18 @@ Schema:
 }
 ```
 
+`terminal_disposition` is `"completed"` or `"interrupted"`. Interrupted
+closures also carry a machine-readable `reason`, such as `"operator_pause"`,
+`"budget_exceeded"`, or `"max_turns_reached"`.
+
+Consumers must stop at the first terminal event. An unknown non-null
+`terminal_disposition` is a protocol error and must fail closed; it must never
+be projected as successful completion. A missing disposition is interpreted
+as completed only when reading pre-cutover event history.
+
 #### `turn_complete`
 
-Emitted at the end of each agent turn within a stream. This is a per-turn lifecycle event and is distinct from `stream_complete`, which is the final success event for the whole stream.
+Emitted at the end of each agent turn within a stream. This is a per-turn lifecycle event and is distinct from `stream_complete`, which closes the whole stream.
 
 Schema:
 
@@ -656,7 +730,10 @@ Schema:
 
 #### `interrupted`
 
-Emitted on runner-level interruption paths, including max-turns, budget limits, graceful shutdown, sub-agent cancellation, and recovery after a writer attach.
+Lifecycle audit event emitted when a runner is interrupted or recovered. This
+event may occur before later stream activity and is therefore not a transport
+terminal. A run that ultimately closes as interrupted does so with
+`stream_complete.terminal_disposition = "interrupted"`.
 
 Schema:
 
@@ -725,7 +802,8 @@ Schema:
 
 #### `max_turns_reached`
 
-Emitted when the runner stops because it exceeded `max_turns`.
+Nonterminal reason marker emitted when the runner stops because it exceeded
+`max_turns`. The stream then closes with an interrupted `stream_complete`.
 
 Schema:
 
@@ -739,7 +817,9 @@ Schema:
 
 #### `budget_exceeded`
 
-Emitted when the accumulated estimated cost crosses `max_budget_usd`.
+Nonterminal reason marker emitted when the accumulated estimated cost crosses
+`max_budget_usd`. The stream then closes with an interrupted
+`stream_complete`.
 
 Schema:
 
@@ -835,7 +915,21 @@ Schema:
   "model": "claude-sonnet-4-6",
   "final_state": "completed",
   "completed_at": 1770000030.2,
-  "result": {"response": "done"},
+  "result": {
+    "kind": "report",
+    "version": "1",
+    "report": {
+      "summary": "done",
+      "findings": [],
+      "artifacts": [],
+      "caveats": []
+    },
+    "usage": {"input_tokens": 120, "output_tokens": 24},
+    "tools_used": ["memory_recall"],
+    "fms_results": null,
+    "artifact_events": null,
+    "warning": null
+  },
   "error": null
 }
 ```
@@ -844,9 +938,9 @@ Additional fields:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `final_state` | string | Final task state. Current runner emission uses `completed` or `failed`. |
+| `final_state` | string | Final task state. Current runner emission uses `completed`, `failed`, or `killed`. |
 | `completed_at` | number | Unix timestamp when the completion event was appended |
-| `result` | object or null | Background task result payload |
+| `result` | `ChildReturn v1` object or null | Canonical background child result. `kind: report` is authoritative; `kind: unstructured` carries a typed terminal failure reason. |
 | `error` | object or null | Background task error payload |
 
 #### `parent_message_sent`
@@ -930,12 +1024,13 @@ Emitted when the runtime captures a structured skill result envelope.
   "output_memory_file": null,
   "cost_usd": 0.12,
   "duration_s": 18.4,
+  "compaction_count": 1,
   "error": null,
   "warnings": []
 }
 ```
 
-`verdict_echo` is optional; when present it is the UI/control-plane verdict summary source. It is produced by structured tools and FMS envelopes, not by parsing final markdown.
+`compaction_count` is the non-negative number of context-compaction events observed during the skill run; legacy captures that omit it decode as zero. `verdict_echo` is optional; when present it is the UI/control-plane verdict summary source. It is produced by structured tools and FMS envelopes, not by parsing final markdown.
 
 #### `artifact_ready`
 
@@ -1041,6 +1136,7 @@ When the configured policy permits it, the same approval can also mint a durable
 ## Notes For Frontend Clients
 
 - Treat `stream_complete`, `error`, and `stream_error` as terminal events.
+- On `stream_complete`, use `terminal_disposition` to distinguish success from interruption; both close the transport.
 - Do not treat lifecycle and background-task events such as `turn_complete`, `interrupted`, `task_registered`, or `task_completed` as terminal.
 - Ignore `heartbeat` for rendering; it exists to keep the connection warm.
 - Do not assume every stream has `thinking_delta`, `tool_output_chunk`, or `tool_approval_request`.

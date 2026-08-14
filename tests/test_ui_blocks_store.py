@@ -48,8 +48,7 @@ def _envelope(ui_blocks_id: str = UI_BLOCKS_ID, *, ts: float = 1_700_000_000.25)
     "turn_key": "turn-1",
     "emission_index": 2,
     "skill_run_id": None,
-    "manifest_digest": "sha256:manifest",
-    "contract_version": "1.0.0",
+    "contract_version": 1,
     "payload": {"lead_text": "Overview", "blocks": []},
     "text_fallback": "Overview",
     "ts": ts,
@@ -333,7 +332,6 @@ def test_ui_blocks_envelope_age_uses_ts_falls_back_to_mtime_and_reconciles(
     turn_key="turn-1",
     emission_index=2,
     ts=now - 10 * 86_400,
-    manifest_digest="sha256:manifest",
   )
   policy = RetentionPolicy(
     "age",

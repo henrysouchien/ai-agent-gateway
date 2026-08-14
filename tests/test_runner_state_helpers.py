@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
@@ -10,6 +12,7 @@ from agent_gateway import SubAgentConfig as PackageSubAgentConfig, ToolResultCon
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_state import (  # noqa: E402
   BackgroundTask,
+  admit_provider_request_budget,
   budget_cost_progress,
   budget_exceeded_state,
   ChildCostAccumulator,
@@ -18,6 +21,9 @@ from agent_gateway.runner_state import (  # noqa: E402
   SubAgentConfig,
   ToolResultContext,
   budget_reason_suffix,
+)
+from agent_gateway.runner_budget import (  # noqa: E402
+  ObservationOnlyCostAccumulator,
 )
 
 
@@ -32,7 +38,6 @@ def test_runner_preserves_state_helper_aliases() -> None:
   assert gateway_runner.ChildCostAccumulator is ChildCostAccumulator
   assert gateway_runner._budget_cost_progress is budget_cost_progress
   assert gateway_runner._budget_exceeded_state is budget_exceeded_state
-  assert gateway_runner._budget_reason_suffix is budget_reason_suffix
 
 
 def test_tool_result_context_defaults_are_optional() -> None:
@@ -133,6 +138,62 @@ def test_child_cost_accumulator_reports_parent_limit() -> None:
   assert state.reason == "parent_budget"
   assert state.reason_suffix == " (parent budget)"
 
+
+def test_observation_only_cost_accumulator_records_without_enforcing() -> None:
+  accumulator = ObservationOnlyCostAccumulator(1.0)
+
+  accumulator.add(2.5)
+
+  assert accumulator.total == 2.5
+  assert accumulator.budget is None
+  assert accumulator.observation_threshold_usd == 1.0
+  assert accumulator.observation_threshold_crossed is True
+  assert accumulator.exceeded is False
+  assert accumulator.exceeded_reason is None
+  assert budget_exceeded_state(accumulator) is None
+
+  unestimated = ObservationOnlyCostAccumulator()
+  progress = budget_cost_progress(
+    unestimated,
+    running_total=3.0,
+    last_reported_cost=0.0,
+  )
+  assert unestimated.total == 3.0
+  assert unestimated.budget is None
+  assert unestimated.observation_threshold_usd is None
+  assert unestimated.observation_threshold_crossed is False
+  assert unestimated.exceeded is False
+  assert progress.exceeded_state is None
+  assert budget_exceeded_state(unestimated) is None
+
+
+def test_cost_observation_threshold_never_gates_provider_admission() -> None:
+  class Provider:
+    @staticmethod
+    def estimate_cost(*_args, **_kwargs):
+      return type("Estimate", (), {"total": 100.0})()
+
+  accumulator = ObservationOnlyCostAccumulator(0.5)
+  accumulator.add(2.0)
+  admission = admit_provider_request_budget(
+    accumulator,
+    provider=Provider(),
+    model="test-model",
+    estimated_input_tokens=1_000,
+    requested_max_output_tokens=8_000,
+  )
+
+  assert accumulator.observation_threshold_crossed is True
+  assert admission.max_output_tokens == 8_000
+  assert admission.denied_state is None
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, float("inf"), "1"])
+def test_observation_only_cost_accumulator_rejects_invalid_threshold(
+  value: object,
+) -> None:
+  with pytest.raises(ValueError, match="cost_observation_threshold_usd"):
+    ObservationOnlyCostAccumulator(value)  # type: ignore[arg-type]
 
 def test_budget_exceeded_state_handles_plain_accumulator_and_non_exceeded_state() -> None:
   accumulator = CostAccumulator(1.0)

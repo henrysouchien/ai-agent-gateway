@@ -12,7 +12,30 @@ from .events import event_to_dict
 from .product_config import gateway_product_id
 from .session import GatewaySession, SessionStream
 from .session_recap import compute_recap, compute_recap_from_events
+from .secret_boundary import sanitize_tool_event
 from .server_models import _SIDECAR_SLUG_RE
+
+
+_OPENAI_REPLAY_ONLY_KEYS = frozenset({
+  "signature",
+  "thinkingSignature",
+  "textSignature",
+  "encrypted_content",
+  "openai_history_version",
+})
+
+
+def _log_safe_openai_history(value: Any) -> Any:
+  """Remove replay-only OpenAI state before transcript or recap processing."""
+  if isinstance(value, dict):
+    return {
+      key: _log_safe_openai_history(item)
+      for key, item in value.items()
+      if key not in _OPENAI_REPLAY_ONLY_KEYS
+    }
+  if isinstance(value, list):
+    return [_log_safe_openai_history(item) for item in value]
+  return value
 
 
 def _now_iso() -> str:
@@ -78,7 +101,15 @@ def _write_transcript(
   except Exception:
     if warn is not None:
       warn("Chat log sidecar write failed for %s (telemetry-only)", session_id, exc_info=True)
-  payload = dict(entry)
+  # Sanitize at WRITE time, not only on the read path: replay-only OpenAI state
+  # (encrypted_content, text/thinking signatures, history version) must never be
+  # persisted to GATEWAY_LOG_DIR at all. Sanitizing only when transcripts are read
+  # back for recaps is too late -- the ciphertext is already on disk, which is the
+  # disclosure D17 forbids.
+  payload = sanitize_tool_event(
+    _log_safe_openai_history(dict(entry)),
+    sink="chat_transcript",
+  )
   payload["ts"] = time.time()
   path = transcript_dir / f"{session_id}.jsonl"
   try:
@@ -174,7 +205,12 @@ def _read_session_transcript_events(
       continue
     if payload.get("type") == "session_recap":
       continue
-    events.append(dict(payload))
+    events.append(
+      sanitize_tool_event(
+        _log_safe_openai_history(dict(payload)),
+        sink="transcript_replay",
+      )
+    )
   return events
 
 
@@ -195,7 +231,7 @@ def _compute_cumulative_session_recap_payload(
       event = event_for_wire(entry, active_turn.event_log)
       if event.get("type") == "session_recap":
         continue
-      events.append(event)
+      events.append(_log_safe_openai_history(event))
 
   recap = compute_recap_from_events(
     events,

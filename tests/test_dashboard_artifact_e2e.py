@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# ruff: noqa: F811
+# ruff: noqa: E402, F811
 
 import asyncio
 import json
@@ -23,6 +23,9 @@ from agent_gateway import AgentRunner, EventLog, ToolDispatcher
 from agent_gateway.fixture_gate import FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME, FIXTURE_MODEL_ID
 from agent_gateway.providers.fixture import FixtureProvider
 from schema.dashboard_payload import DashboardPayload
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_runner_capability_execution,
+)
 
 TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
@@ -58,7 +61,10 @@ def test_fixture_provider_run_emits_dashboard_artifact_and_endpoints_serve(
   local_handlers: dict[str, Any] = {}
   installed = install_named_skill_emit_dashboard_artifact_handler(
     local_handlers=local_handlers,
-    skill_profile=SimpleNamespace(name=FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME, mutation_mode=None),
+    skill_profile=SimpleNamespace(
+      name=FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME,
+      mutation_mode="read_only",
+    ),
     skill_run_id="fixture-dashboard-run",
     context_ticker="PCTY",
     skill_scope="ticker",
@@ -78,15 +84,17 @@ def test_fixture_provider_run_emits_dashboard_artifact_and_endpoints_serve(
     event_log=event_log,
     dispatcher=dispatcher,
     session_id="fixture-dashboard-session",
-    provider=FixtureProvider(),
-    auth_config={
-      "auth_mode": "none",
-      "api_key": "",
-      "auth_token": "",
-      "model": FIXTURE_MODEL_ID,
-      "max_tokens": 1_024,
-      "thinking": False,
-    },
+    capability_execution=stub_runner_capability_execution(
+      provider=FixtureProvider(),
+      model=FIXTURE_MODEL_ID,
+      effort="none",
+      auth_config={
+        "auth_mode": "none",
+        "api_key": "",
+        "auth_token": "",
+        "max_tokens": 1_024,
+      },
+    ),
     get_tool_definitions=lambda: [
       {
         "name": "emit_dashboard_artifact",
@@ -156,7 +164,10 @@ def test_emit_dashboard_artifact_failing_payload_returns_error_without_write_or_
   local_handlers: dict[str, Any] = {}
   install_named_skill_emit_dashboard_artifact_handler(
     local_handlers=local_handlers,
-    skill_profile=SimpleNamespace(name=FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME, mutation_mode=None),
+    skill_profile=SimpleNamespace(
+      name=FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME,
+      mutation_mode="read_only",
+    ),
     skill_run_id="fixture-dashboard-run",
     context_ticker="PCTY",
     skill_scope="ticker",

@@ -158,3 +158,71 @@ def test_startup_concurrency_rejects_invalid_or_negative_values() -> None:
     assert warnings == [
       ("Ignoring invalid %s=%r; using %d", "MCP_STARTUP_CONCURRENCY", value, 4)
     ]
+
+
+def test_resolve_missing_stdio_executable_decisive_shapes(tmp_path: Path) -> None:
+  present = tmp_path / "gsheets-mcp"
+  present.write_text("#!/bin/sh\n", encoding="utf-8")
+  present.chmod(0o755)
+  missing = tmp_path / "deleted-venv" / "bin" / "gsheets-mcp"
+  script = 'exec "$GSHEETS_MCP_EXECUTABLE" serve'
+
+  # Existing executable target: no finding.
+  assert mcp_client_config.resolve_missing_stdio_executable(
+    "bash", ["-c", script], {"GSHEETS_MCP_EXECUTABLE": str(present)}
+  ) is None
+  # Deleted target behind the env var: decisive, names the path and the var.
+  finding = mcp_client_config.resolve_missing_stdio_executable(
+    "bash", ["-c", script], {"GSHEETS_MCP_EXECUTABLE": str(missing)}
+  )
+  assert finding is not None
+  assert str(missing) in finding
+  assert "GSHEETS_MCP_EXECUTABLE" in finding
+  # Unset/empty env reference: decisive.
+  finding = mcp_client_config.resolve_missing_stdio_executable(
+    "bash", ["-c", script], {}
+  )
+  assert finding is not None
+  assert "GSHEETS_MCP_EXECUTABLE" in finding
+  # Present-but-not-executable target: decisive.
+  plain = tmp_path / "not-executable"
+  plain.write_text("", encoding="utf-8")
+  plain.chmod(0o644)
+  finding = mcp_client_config.resolve_missing_stdio_executable(
+    str(plain), [], {}
+  )
+  assert finding is not None
+  assert str(plain) in finding
+  # Direct argv PATH lookup against the spawn env PATH.
+  assert mcp_client_config.resolve_missing_stdio_executable(
+    "gsheets-mcp", ["serve"], {"PATH": str(tmp_path)}
+  ) is None
+  finding = mcp_client_config.resolve_missing_stdio_executable(
+    "definitely-not-a-real-mcp-server", [], {"PATH": str(tmp_path)}
+  )
+  assert finding is not None
+  assert "definitely-not-a-real-mcp-server" in finding
+
+
+def test_resolve_missing_stdio_executable_keeps_ambiguous_shapes_silent(
+  tmp_path: Path,
+) -> None:
+  # Unrecognized shell scripts stay ambiguous: current behavior unchanged.
+  assert mcp_client_config.resolve_missing_stdio_executable(
+    "bash", ["-c", "some-wrapper --flag && exec server"], {}
+  ) is None
+  # Shell without -c payload stays ambiguous.
+  assert mcp_client_config.resolve_missing_stdio_executable(
+    "bash", ["script.sh"], {"PATH": "/usr/bin:/bin"}
+  ) is None
+  # Relative paths (cwd-dependent) stay ambiguous.
+  assert mcp_client_config.resolve_missing_stdio_executable(
+    "./relative/server", [], {}
+  ) is None
+  assert mcp_client_config.resolve_missing_stdio_executable(
+    "bash",
+    ["-c", 'exec "$SERVER_EXEC" serve'],
+    {"SERVER_EXEC": "relative/server"},
+  ) is None
+  # Empty command stays ambiguous (existing missing-command handling owns it).
+  assert mcp_client_config.resolve_missing_stdio_executable("", [], {}) is None

@@ -13,11 +13,16 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from agent_gateway.model_registry import (
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
+from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 
 
 API_KEY = "artifacts-pr8-key"
-HMAC_KEY = "artifact-api-test-secret"
+HMAC_KEY = "artifact-api-test-hmac-key-at-least-32-bytes"
 USER_ID = "alice"
 USER_EMAIL = "alice@example.com"
 CLAIM_HEADERS = {
@@ -29,8 +34,6 @@ CLAIM_HEADERS = {
   "nonce": "X-Agent-Claim-Nonce",
   "signature": "X-Agent-Claim-Signature",
 }
-
-
 @dataclass(frozen=True)
 class ArtifactPr8Fixture:
   app: Any
@@ -56,21 +59,28 @@ class _FakeAutonomousRegistry:
 @pytest.fixture
 def artifact_pr8(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ArtifactPr8Fixture:
   data_dir = tmp_path / "data"
+  (data_dir / "gateway").mkdir(parents=True)
   monkeypatch.setenv("USER_DATA_DIR", str(data_dir))
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   monkeypatch.setenv("AGENT_API_CLAIM_MAX_TTL_SECONDS", "600")
 
   async def _build_chat_runtime(*, session, request, channel, auth_manager):
-    _ = session, request, channel, auth_manager
-    return ChatRuntime(system_prompt="test", build_runner=lambda *_args: None)
+    _ = session, channel, auth_manager
+    return ChatRuntime(
+      system_prompt="test",
+      build_runner=lambda *_args: None,
+      capability_execution=request.capability_execution,
+    )
 
   app = create_gateway_app(
     GatewayServerConfig(
       jwt_secret="artifacts-pr8-test-secret-0123456789",
       valid_api_keys={API_KEY},
-      auth_config={"model": "test-model"},
-      allowed_models=set(),
+      tenant_id="test-product",
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
+      claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
     )
   )
   return ArtifactPr8Fixture(app=app, data_dir=data_dir)
@@ -149,7 +159,7 @@ def test_control_artifacts_list_includes_html_artifact_sidecars(
   with TestClient(artifact_pr8.app) as client:
     headers = _bearer_headers(client, USER_ID)
     response = client.get("/api/control/artifacts", headers=headers)
-    skill_response = client.get("/api/control/artifacts?skill=fixture-html-artifact", headers=headers)
+    skill_response = client.get("/api/control/artifacts?skill=historical-html-artifact", headers=headers)
 
   assert response.status_code == 200
   artifacts = response.json()["artifacts"]
@@ -157,7 +167,7 @@ def test_control_artifacts_list_includes_html_artifact_sidecars(
   html_artifact = artifacts[0]
   assert html_artifact == {
     "ticker": "PCTY",
-    "skill": "fixture-html-artifact",
+    "skill": "historical-html-artifact",
     "artifact_id": html_artifact_id,
     "artifact_path": f"artifacts/_html/{html_artifact_id}.json",
     "binary_artifact_path": f"artifacts/_html/{html_artifact_id}.html",
@@ -936,7 +946,7 @@ def _write_html_artifact(
     "summary": "Deterministic dev-only HTML artifact fixture for Hank web live QA.",
     "ticker": "PCTY",
     "session_id": session_id,
-    "source_skill": "fixture-html-artifact",
+    "source_skill": "historical-html-artifact",
     "sources": [],
     "exports": {
       "copy_as_prompt": None,

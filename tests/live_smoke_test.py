@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_gateway.auth import AuthConfig, ResolverResult
+from agent_gateway.model_registry import CAPABILITY_IDS, INITIAL_MODEL_REGISTRY
 from agent_gateway.rates import load_rate_table, UnknownModelError
 
 
@@ -67,24 +68,31 @@ def test_auth_config() -> None:
   raw = {
     "provider": "anthropic",
     "billing_mode": "metered",
-    "model": "claude-sonnet-4-6",
     "max_tokens": 16000,
     "api_key": "sk-ant-api03-test",
     "auth_mode": "api",
-    "thinking": True,
     "base_url": None,
   }
   config = AuthConfig.from_dict(raw)
   print(f"  provider:     {config.provider}")
   print(f"  billing_mode: {config.billing_mode}")
-  print(f"  model:        {config.model}")
   print(f"  max_tokens:   {config.max_tokens}")
 
   rebuilt = config.to_dict()
   assert rebuilt["api_key"] == "sk-ant-api03-test", "api_key lost in round-trip"
-  assert rebuilt["thinking"] is True, "thinking lost in round-trip"
   assert rebuilt["auth_mode"] == "api", "auth_mode lost in round-trip"
-  print("  Round-trip preserved: api_key, thinking, auth_mode, base_url")
+  assert "model" not in rebuilt and "thinking" not in rebuilt
+  print("  Round-trip preserved credential material without model selection")
+
+  try:
+    AuthConfig.from_dict({
+      **raw,
+      "model": "claude-sonnet-4-6",
+      "thinking": True,
+    })
+    assert False, "Should reject model-selection fields"
+  except ValueError as e:
+    assert "model, thinking" in str(e)
 
   # Validation
   try:
@@ -159,15 +167,18 @@ def test_gateway_strict_mode() -> None:
     return ResolverResult(
       user_id=init_request.user_id or "",
       channel="excel",
+      credential_principal="service",
+      allow_service_for_interactive=True,
       risk_user_id=101,
       role="owner",
       auth_config=AuthConfig.from_dict({
         "provider": "anthropic",
         "billing_mode": "byok",
-        "model": "claude-sonnet-4-6",
         "max_tokens": 16000,
         "api_key": "sk-ant-api03-fake-for-test",
       }),
+      model_entitled_capabilities=CAPABILITY_IDS,
+      model_entitled_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
     )
 
   app = create_agent(
@@ -255,6 +266,8 @@ def test_resolver_timeout() -> None:
     return ResolverResult(
       user_id=init_request.user_id or "",
       channel="excel",
+      credential_principal="service",
+      allow_service_for_interactive=True,
       risk_user_id=101,
       role="owner",
       auth_config=AuthConfig.from_dict({
@@ -323,6 +336,25 @@ def test_billing_ledger() -> None:
         rate_table_version="2026-04-08",
         billing_mode=mode,
         channel="web",
+        provider="anthropic",
+        capability_bind={
+          "schema_version": "1.0",
+          "capability_id": "session.driver",
+          "model_key": f"test.anthropic.{model}",
+          "provider": "anthropic",
+          "upstream_model": model,
+          "adapter": "test.anthropic",
+          "protocol_profile": "test.reasoning",
+          "route": "test.in_process",
+          "effort": "none",
+          "credential_principal": "user",
+          "credential_ref": "test-user:anthropic",
+          "run_mode": "interactive",
+          "registry_revision": "test-live-smoke.1",
+          "policy_revision": "test-live-smoke.1",
+          "selection_source": "capability_default",
+        },
+        provider_reported_model=None,
       )
       events.append(evt)
       asyncio.run(ledger.record(evt))
@@ -386,15 +418,17 @@ def test_on_usage_fires_with_ledger() -> None:
       return ResolverResult(
         user_id=init_request.user_id or "",
         channel="web",
+        credential_principal="user",
         risk_user_id=101,
         role="owner",
         auth_config=AuthConfig.from_dict({
           "provider": "anthropic",
           "billing_mode": "metered",
-          "model": "claude-sonnet-4-6",
           "max_tokens": 16000,
           "api_key": "sk-ant-api03-fake",
         }),
+        model_entitled_capabilities=CAPABILITY_IDS,
+        model_entitled_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
       )
 
     app = create_agent(

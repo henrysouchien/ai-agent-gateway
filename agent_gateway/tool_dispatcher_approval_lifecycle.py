@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import logging
 import os
 import time
@@ -29,6 +30,24 @@ from .batch_approval_projection import (
   require_batch_stage_run_seq,
 )
 from .policy_imports import resolve_server_policy_tool_class
+from .secret_boundary import (
+  SANITIZATION_FAILED,
+  SecretBoundary,
+  sanitize_approval_decision_projection,
+  sanitize_boundary_value,
+  sanitization_failure_tool_input,
+)
+
+
+_APPROVAL_EXECUTABLE_STATES = frozenset({
+  "approved",
+  "auto_approved",
+})
+_APPROVAL_DENIED_STATES = frozenset({
+  "denied",
+  "auto_denied",
+})
+_APPROVAL_WINNER_DELIVERY_TIMEOUT_SECONDS = 30.0
 
 
 def _approval_wait_timeout_seconds(
@@ -51,6 +70,104 @@ def _approval_wait_timeout_seconds(
   if batch_admission is None:
     return float(approval_queue_timeout_seconds_fn(expiry_seconds))
   return float(expiry_seconds or 600)
+
+
+def _require_exact_reconciled_approval(
+  decision: Any,
+  *,
+  request: PolicyApprovalRequest,
+) -> dict[str, Any]:
+  if not isinstance(decision, dict):
+    raise RuntimeError(
+      "durable approval winner delivered a malformed decision"
+    )
+  if decision.get("approval_id") != request.approval_id:
+    raise RuntimeError(
+      "durable approval winner delivered a different approval"
+    )
+  approved = decision.get("approved")
+  allow_tool_type = decision.get("allow_tool_type")
+  if type(approved) is not bool or type(allow_tool_type) is not bool:
+    raise RuntimeError(
+      "durable approval winner delivered invalid decision booleans"
+    )
+  expected_approved = request.state in _APPROVAL_EXECUTABLE_STATES
+  if approved != expected_approved:
+    raise RuntimeError(
+      "durable approval winner disagrees with the delivered decision"
+    )
+  return decision
+
+
+async def _reconcile_approval_timeout_winner(
+  *,
+  approval_store: Any,
+  approval_queue: asyncio.Queue,
+  request: PolicyApprovalRequest,
+) -> dict[str, Any] | None:
+  latest = await approval_store.get(request.approval_id)
+  if latest is None:
+    raise RuntimeError(
+      "timed-out approval disappeared before winner reconciliation"
+    )
+  if latest.approval_id != request.approval_id:
+    raise RuntimeError(
+      "timed-out approval lookup returned a different approval"
+    )
+  transition_failure: Exception | None = None
+  if latest.state == "pending_user":
+    try:
+      expired = await approval_store.transition_state(
+        latest.approval_id,
+        "expired",
+        expected_state_version=latest.state_version,
+        decision_reason="Timed out waiting for user approval",
+      )
+    except Exception as exc:
+      transition_failure = exc
+      latest = await approval_store.get(request.approval_id)
+      if latest is None:
+        raise RuntimeError(
+          "approval disappeared after timeout transition contention"
+        ) from exc
+      if latest.approval_id != request.approval_id:
+        raise RuntimeError(
+          "approval contention lookup returned a different approval"
+        ) from exc
+    else:
+      if expired.state != "expired":
+        raise RuntimeError(
+          "approval timeout transition returned a non-expired state"
+        )
+      return None
+
+  if latest.state == "expired":
+    return None
+  if latest.state in (
+    _APPROVAL_EXECUTABLE_STATES | _APPROVAL_DENIED_STATES
+  ):
+    try:
+      decision = await asyncio.wait_for(
+        approval_queue.get(),
+        timeout=_APPROVAL_WINNER_DELIVERY_TIMEOUT_SECONDS,
+      )
+    except asyncio.TimeoutError as exc:
+      raise RuntimeError(
+        "durable approval winner was not delivered before the "
+        "reconciliation deadline"
+      ) from exc
+    return _require_exact_reconciled_approval(
+      decision,
+      request=latest,
+    )
+  if transition_failure is not None:
+    raise RuntimeError(
+      "approval timeout could not establish a durable winner"
+    ) from transition_failure
+  raise RuntimeError(
+    "approval timeout observed an invalid durable state: "
+    f"{latest.state}"
+  )
 
 
 async def run_approval_lifecycle(
@@ -88,6 +205,7 @@ async def run_approval_lifecycle(
   apply_decision_to_request_fn: Any = apply_decision_to_request,
   utc_now_fn: Any = utc_now,
   os_urandom_fn: Any = os.urandom,
+  secret_boundary: SecretBoundary | None = None,
 ) -> dict[str, Any]:
   arguments = dict(locals())
   batch_admission = acquire_batch_approval_admission(session)
@@ -139,6 +257,7 @@ async def _run_approval_lifecycle_impl(
   utc_now_fn: Any = utc_now,
   os_urandom_fn: Any = os.urandom,
   batch_admission: Any | None = None,
+  secret_boundary: SecretBoundary | None = None,
 ) -> dict[str, Any]:
   if store is None or policy is None:
     raise RuntimeError("approval lifecycle is not configured")
@@ -153,6 +272,20 @@ async def _run_approval_lifecycle_impl(
   else:
     redacted = dict(approval_args_redacted or {})
     args_hash = approval_args_hash
+  redacted = sanitize_boundary_value(
+    redacted,
+    sink="approval_request",
+    boundary=secret_boundary,
+  )
+  if not isinstance(redacted, dict):
+    redacted = sanitization_failure_tool_input()
+  safe_reason = sanitize_boundary_value(
+    reason or None,
+    sink="approval_request",
+    boundary=secret_boundary,
+  )
+  if safe_reason is not None and not isinstance(safe_reason, str):
+    safe_reason = SANITIZATION_FAILED
   build_request_kwargs = {
     "tool_call_id": tool_call_id,
     "tool_name": tool_name,
@@ -160,7 +293,7 @@ async def _run_approval_lifecycle_impl(
     "tool_args_redacted": redacted,
     "args_hash": args_hash,
     "run_context": run_context,
-    "reason": reason or None,
+    "reason": safe_reason,
     "approval_constraint": approval_constraint,
     "required_owner_user_id": required_owner_user_id,
   }
@@ -284,10 +417,16 @@ async def _run_approval_lifecycle_impl(
     )
 
   if session_cache_approved or automatic_approval_reason is not None:
-    decision_reason = (
+    decision_reason = sanitize_boundary_value(
+      (
       automatic_approval_reason
       or "Session approval cache matched exact planned identity"
+      ),
+      sink="approval_decision",
+      boundary=secret_boundary,
     )
+    if not isinstance(decision_reason, str):
+      decision_reason = SANITIZATION_FAILED
     decision_source = (
       "headless_hook_approved"
       if automatic_approval_reason is not None
@@ -311,13 +450,20 @@ async def _run_approval_lifecycle_impl(
     }
 
   if automatic_denial_reason is not None:
+    safe_automatic_denial_reason = sanitize_boundary_value(
+      automatic_denial_reason,
+      sink="approval_decision",
+      boundary=secret_boundary,
+    )
+    if not isinstance(safe_automatic_denial_reason, str):
+      safe_automatic_denial_reason = SANITIZATION_FAILED
     request = await store.transition_state(
       request.approval_id,
       "auto_denied",
       expected_state_version=request.state_version,
       decider_id=run_context.user_id,
       decider_role=run_context.decider_role,
-      decision_reason=automatic_denial_reason,
+      decision_reason=safe_automatic_denial_reason,
     )
     await policy.on_resolve(request=request)
     return {
@@ -337,10 +483,19 @@ async def _run_approval_lifecycle_impl(
 
   decision = effective_trade_approval_decision_fn(tool_name, request.tool_args_redacted, decision)
   decision = constrain_approval_decision(request, decision)
+  decision, raw_modified_tool_args = sanitize_approval_decision_projection(
+    decision,
+    sink="approval_decision",
+    boundary=secret_boundary,
+  )
   request = apply_decision_to_request_fn(request, decision)
   await store.update_request(request)
-  final_tool_input = decision.modified_tool_args if decision.modified_tool_args is not None else tool_input
-  policy_modified_tool_args = decision.modified_tool_args is not None
+  final_tool_input = (
+    raw_modified_tool_args
+    if raw_modified_tool_args is not None
+    else tool_input
+  )
+  policy_modified_tool_args = raw_modified_tool_args is not None
 
   if decision.outcome == "auto_approve":
     request = await store.transition_state(
@@ -431,9 +586,8 @@ async def _run_approval_lifecycle_impl(
         schedule_notification_delivery()
     except Exception:
       logging.getLogger("agent_gateway.approval_notifications").warning(
-        "Failed to enqueue approval notification intent for %s",
+        "Failed to enqueue approval notification intent for %s | failure=true",
         request.approval_id,
-        exc_info=True,
       )
   nonce = os_urandom_fn(8).hex()
   approval = await await_user_approval_via_pending_tools_fn(
@@ -494,6 +648,12 @@ async def await_user_approval_via_pending_tools(
     "tool_name": request.tool_name,
     "resolved_qualifier": resolved_qualifier,
   }
+  planned_change = request.tool_args_redacted.get("planned_change")
+  if isinstance(planned_change, dict):
+    # Control-plane stage harnesses need only the trusted plan projection. Do
+    # not duplicate the agent-authored judgment (which can be very large) into
+    # the live pending-tool registry.
+    pending_entry["planned_change"] = deepcopy(planned_change)
   if batch_admission is not None:
     pending_entry["stage_run_seq"] = require_batch_stage_run_seq(session)
   session.pending_tools[request.tool_call_id] = pending_entry
@@ -527,24 +687,21 @@ async def await_user_approval_via_pending_tools(
     try:
       await session_log.append(approval_event)
     except Exception:
-      log.warning("Failed to persist approval request event for %s", request.tool_call_id, exc_info=True)
+      log.warning(
+        "Failed to persist approval request event for %s | failure=true",
+        request.tool_call_id,
+      )
 
   try:
     return await asyncio.wait_for(approval_queue.get(), timeout=max(0.1, timeout_seconds))
   except asyncio.TimeoutError:
-    if approval_store is not None:
-      try:
-        latest = await approval_store.get(request.approval_id)
-        if latest is not None and latest.state == "pending_user":
-          await approval_store.transition_state(
-            latest.approval_id,
-            "expired",
-            expected_state_version=latest.state_version,
-            decision_reason="Timed out waiting for user approval",
-          )
-      except Exception:
-        log.warning("Failed to expire timed-out approval request %s", request.approval_id, exc_info=True)
-    return None
+    if approval_store is None:
+      return None
+    return await _reconcile_approval_timeout_winner(
+      approval_store=approval_store,
+      approval_queue=approval_queue,
+      request=request,
+    )
   finally:
     session.pending_tools.pop(request.tool_call_id, None)
     session.approval_queues.pop(request.tool_call_id, None)
@@ -598,8 +755,16 @@ def resolve_run_context(
   approval_policy: Any | None,
 ) -> RunContext:
   if run_context is not None:
+    owner_user_id = str(getattr(session, "owner_user_id", None) or "").strip()
+    if owner_user_id and run_context.user_id != owner_user_id:
+      return replace(run_context, user_id=owner_user_id)
     return run_context
-  resolved_user_id = str(user_id or getattr(session, "user_id", "") or "unknown")
+  resolved_user_id = str(
+    getattr(session, "owner_user_id", None)
+    or user_id
+    or getattr(session, "user_id", "")
+    or "unknown"
+  )
   resolved_channel = str(channel or getattr(session, "channel", None) or "web")
   return RunContext(
     user_id=resolved_user_id,

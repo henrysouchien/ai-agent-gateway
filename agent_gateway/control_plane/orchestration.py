@@ -7,7 +7,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from ..excel_dispatch import mint_and_submit
+from ..excel_dispatch import _validate_relay_restart_exceptions, mint_and_submit
 
 
 class ExcelDispatchRequest(BaseModel):
@@ -39,6 +39,8 @@ def _mint_error_status(error: dict[str, Any]) -> int:
     return 400
   if code in {"no_excel_session", "ambiguous_target"}:
     return 409
+  if code == "relay_restart_in_progress":
+    return 503
   if code in {"relay_error", "internal_error"}:
     return 502
   return 500
@@ -52,6 +54,7 @@ def _profile_for_auth_context(auth_context: Any) -> str:
 
 
 def _relay_status_error(status: str, response: dict[str, Any]) -> JSONResponse | None:
+  del response
   if status in {"session_mismatch", "user_mismatch"}:
     return _json_error(
       409,
@@ -64,9 +67,7 @@ def _relay_status_error(status: str, response: dict[str, Any]) -> JSONResponse |
   return _json_error(
     502,
     "relay_error",
-    f"Excel relay result returned status '{status}'",
-    status=status,
-    response=response,
+    "Excel relay result returned an invalid status",
   )
 
 
@@ -78,17 +79,22 @@ def _dispatch_state_response(response: dict[str, Any]) -> JSONResponse:
       payload["result"] = response.get("result")
     return JSONResponse(payload)
   if state in {"failed", "timeout"}:
-    error = response.get("error")
-    if not isinstance(error, dict):
-      error = {"message": f"Excel relay request {state}"}
-    return JSONResponse({"state": state, "error": error})
+    return JSONResponse({
+      "state": state,
+      "error": {
+        "message": (
+          "Excel agent request failed"
+          if state == "failed"
+          else "Excel relay request timed out"
+        ),
+      },
+    })
   if state == "pending":
     return JSONResponse({"state": "pending"})
   return _json_error(
     502,
     "relay_error",
-    f"Excel relay returned unknown result state '{state}'",
-    response=response,
+    "Excel relay returned an invalid result state",
   )
 
 
@@ -96,7 +102,11 @@ def build_orchestration_router(
   *,
   relay: Any,
   authenticate: Callable[[Request], Any],
+  relay_restart_exceptions: tuple[type[Exception], ...],
 ) -> APIRouter:
+  restart_exception_types = _validate_relay_restart_exceptions(
+    relay_restart_exceptions
+  )
   router = APIRouter()
 
   @router.post("/api/orchestration/excel-dispatch")
@@ -120,6 +130,7 @@ def build_orchestration_router(
       args_predicate=payload.args_predicate,
       delegator_profile=_profile_for_auth_context(auth_context),
       delegator_run_id=None,
+      relay_restart_exceptions=restart_exception_types,
     )
     if error is not None:
       return JSONResponse(error, status_code=_mint_error_status(error))
@@ -158,14 +169,14 @@ def build_orchestration_router(
         gateway_session_id=grant.bound_excel_session_id,
         user_id=auth_context.user_id,
       )
-    except PermissionError as exc:
+    except PermissionError:
       return _json_error(
         409,
         "relay_owner_mismatch",
-        str(exc) or "Bound Excel session cannot poll this relay request",
+        "Bound Excel session cannot poll this relay request",
       )
-    except Exception as exc:
-      return _json_error(502, "relay_error", str(exc) or exc.__class__.__name__)
+    except Exception:
+      return _json_error(502, "relay_error", "Excel relay result polling failed")
 
     if not isinstance(response, dict):
       return _json_error(

@@ -8,39 +8,42 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-import agent_gateway.autonomous as autonomous
-from agent_gateway import EventLog
-from agent_gateway.providers import ModelInfo, ModelProvider
+import agent_gateway.autonomous as autonomous  # noqa: E402
+from agent_gateway import BoundCapabilityExecution, EventLog  # noqa: E402
+from agent_gateway.session import GatewaySession  # noqa: E402
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_capability_execution_resolver,
+)
 
 
 def _run(coro):
   return asyncio.run(coro)
 
 
-class _StubProvider(ModelProvider):
-  name = "stub"
-
-  def has_active_credential(self, config: dict[str, Any]) -> bool:
-    _ = config
-    return True
-
-  def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
-    _ = config, timeout
-    return object()
-
-  async def close_client(self, client: Any, timeout: float = 2.0) -> None:
-    _ = client, timeout
-
-  def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
-
-  def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
-    return dict(kwargs)
-
-  async def stream(self, client: Any, params: dict[str, Any]):
-    _ = client, params
-    if False:
-      yield
+def _bound_execution() -> dict[str, Any]:
+  resolver = stub_capability_execution_resolver(run_mode="autonomous")
+  resolved = resolver.resolve("session.driver")
+  execution = BoundCapabilityExecution(
+    bind=resolved.bind,
+    registry=resolved.registry,
+    adapter=resolved.adapter,
+    auth_config={
+      **resolved.auth_config,
+      "max_tokens": 16_000,
+    },
+  )
+  return {
+    "capability_execution": execution,
+    "capability_execution_resolver": resolver,
+    "session": GatewaySession(
+      session_id="autonomous-mcp-test",
+      api_key_hash="test",
+      created_at=1,
+      expires_at=2,
+      user_id="alice",
+      role="owner",
+    ),
+  }
 
 
 class _FakeMcpClientManager:
@@ -68,13 +71,12 @@ async def _fake_run_session(
   runner: Any,
   event_log: EventLog,
   *,
-  model: str,
   max_turns: int,
   timeout_seconds: float,
   initial_message: str,
   system_prompt: str | list[tuple[str, bool]],
 ) -> autonomous.RunOutput:
-  _ = runner, event_log, model, max_turns, timeout_seconds, initial_message, system_prompt
+  _ = runner, event_log, max_turns, timeout_seconds, initial_message, system_prompt
   return autonomous.RunOutput(
     response="Completed.",
     tools_used=[],
@@ -108,9 +110,9 @@ def test_run_autonomous_forwards_mcp_session_inject_servers_to_dispatcher(
     autonomous.run_autonomous(
       "You are helpful.",
       "Run the task.",
-      provider=_StubProvider(),
-      model="stub-model",
+      **_bound_execution(),
       mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
+      trusted_mcp_allowed_servers={"browser"},
       mcp_session_inject_servers={"browser"},
       user_id="alice",
       billing_mode="byok",
@@ -142,9 +144,9 @@ def test_run_autonomous_forwards_mcp_timeout_overrides_to_manager(
     autonomous.run_autonomous(
       "You are helpful.",
       "Run the task.",
-      provider=_StubProvider(),
-      model="stub-model",
+      **_bound_execution(),
       mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
+      trusted_mcp_allowed_servers={"browser"},
       mcp_timeout_overrides={"browser": 90},
       user_id="alice",
       billing_mode="byok",
@@ -179,9 +181,9 @@ def test_run_autonomous_defaults_to_no_injection_and_no_timeout_overrides(
     autonomous.run_autonomous(
       "You are helpful.",
       "Run the task.",
-      provider=_StubProvider(),
-      model="stub-model",
+      **_bound_execution(),
       mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
+      trusted_mcp_allowed_servers={"browser"},
       user_id="alice",
       billing_mode="byok",
       rate_table_version="unknown",
@@ -229,9 +231,9 @@ def test_run_autonomous_forwards_mcp_session_inject_servers_to_sub_agents(
     autonomous.run_autonomous(
       "You are helpful.",
       "Run the task.",
-      provider=_StubProvider(),
-      model="stub-model",
+      **_bound_execution(),
       mcp_servers={"browser": {"command": "python3", "args": ["run_server.py"]}},
+      trusted_mcp_allowed_servers={"browser"},
       skills_dir=skills_dir,
       mcp_session_inject_servers={"browser"},
       user_id="alice",

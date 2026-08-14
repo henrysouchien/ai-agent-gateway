@@ -33,6 +33,7 @@ def _runtime(
     stdio_connect_stabilize_delay=lambda: 0,
     is_retryable_stdio_startup_error=retryable,
     build_mcp_env=lambda _env: {},
+    preflight_stdio_executable=lambda _command, _args, _env: None,
     build_http_headers=lambda _headers: {},
     safe_cache_name=lambda name: name,
     close_contexts=lambda _contexts: None,

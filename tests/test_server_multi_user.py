@@ -1,6 +1,8 @@
 import asyncio
 import json
+import logging
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -25,17 +27,35 @@ from agent_gateway import (  # noqa: E402
   ToolDispatcher,
 )
 from agent_gateway.auth import AuthConfig, NoCredentialError, ProviderCredentialFailure, ResolverResult  # noqa: E402
+from agent_gateway.capability_binding import (  # noqa: E402
+  CredentialHandle,
+)
+from agent_gateway.model_registry import (  # noqa: E402
+  CAPABILITY_IDS,
+  CapabilityDefault,
+  CapabilitySelectionPolicy,
+  ModelRegistryEntry,
+  ProductModelRegistry,
+  ProductModelSelectionPolicy,
+)
 from agent_gateway import server as server_module  # noqa: E402
 from agent_gateway import server_artifact_helpers as artifact_helpers_module  # noqa: E402
 from agent_gateway import server_artifact_routes as artifact_routes_module  # noqa: E402
 from agent_gateway import server_chat_helpers as chat_helpers_module  # noqa: E402
 from agent_gateway import server_models as models_module  # noqa: E402
-from agent_gateway.server import ChatInitRequest, ChatRuntime, GatewayServerConfig, create_gateway_app  # noqa: E402
+from agent_gateway.server import (  # noqa: E402
+  ChatInitRequest,
+  ChatRuntime,
+  GatewayServerConfig,
+  MaterializedCredential,
+  create_gateway_app,
+)
 
 
 def test_server_parent_aliases_moved_helpers() -> None:
   assert server_module.ChatRuntime is models_module.ChatRuntime
   assert server_module.GatewayServerConfig is models_module.GatewayServerConfig
+  assert "credentials_refresh_resolver" not in GatewayServerConfig.__dataclass_fields__
   assert server_module._artifact_json_response is artifact_helpers_module._artifact_json_response
   assert server_module._error_payload is artifact_helpers_module._error_payload
   assert server_module._server_artifact_routes is artifact_routes_module
@@ -102,14 +122,12 @@ class _StubRunner:
     *,
     messages: list[dict[str, Any]],
     system_prompt: str | None = None,
-    model_override: str | None = None,
     max_turns: int | None = None,
   ) -> None:
     self._run_calls.append(
       {
         "messages": messages,
         "system_prompt": system_prompt,
-        "model_override": model_override,
         "max_turns": max_turns,
       }
     )
@@ -125,10 +143,109 @@ class _StubRunner:
     self._event_log.append({"type": "stream_complete", "usage": {}})
 
 
+def _strict_session_driver_config(
+  *,
+  provider: str,
+  model: str,
+  effort: str = "high",
+  tenant_id: str,
+  auth_config: dict[str, Any],
+) -> dict[str, Any]:
+  model_key = f"test.server.{provider}.{model}"
+  registry = ProductModelRegistry(
+    schema="product-model-registry/v1",
+    revision="server-multi-user-tests.1",
+    models={
+      model_key: ModelRegistryEntry(
+        key=model_key,
+        label=f"{provider} {model}",
+        provider=provider,
+        upstream_model=model,
+        adapter=f"{provider}.responses" if provider != "anthropic" else "anthropic.messages",
+        protocol_profile="test.reasoning",
+        route="test.in_process",
+        lifecycle="active",
+        capabilities={
+          capability_id: (
+            "user_selectable"
+            if capability_id == "session.driver"
+            else "internal"
+          )
+          for capability_id in CAPABILITY_IDS
+        },
+        supported_efforts=frozenset({effort}),
+        default_effort=effort,
+        features=frozenset({"tools", "streaming"}),
+        reported_identities=frozenset({model}),
+      )
+    },
+  )
+  policy = ProductModelSelectionPolicy(
+    schema="product-model-selection/v1",
+    revision="server-multi-user-tests.1",
+    capabilities={
+      capability_id: CapabilitySelectionPolicy(
+        capability_id=capability_id,
+        default=CapabilityDefault(
+          kind="model",
+          model_key=model_key,
+          effort=effort,
+        ),
+        by_channel={},
+        allowed_model_keys=frozenset({model_key}),
+        allow_saved_preference=(capability_id == "session.driver"),
+        allow_explicit_user=(capability_id == "session.driver"),
+      )
+      for capability_id in CAPABILITY_IDS
+    },
+  )
+  service_handle = CredentialHandle(
+    handle_id=f"service:server-multi-user-tests:{provider}",
+    provider=provider,
+    principal="service",
+    tenant_id=tenant_id,
+    actor_id=None,
+  )
+  forbidden_selection = {
+    "model",
+    "model_key",
+    "effort",
+    "thinking",
+    "thinking_enabled_requested",
+  } & set(auth_config)
+  if forbidden_selection:
+    raise ValueError(
+      "server multi-user credential fixture received model selection: "
+      + ", ".join(sorted(forbidden_selection))
+    )
+  service_material = MaterializedCredential(
+    handle=service_handle,
+    auth_config={
+      **auth_config,
+      "provider": provider,
+      "billing_mode": str(auth_config.get("billing_mode") or "byok"),
+      "rate_table_version": str(auth_config.get("rate_table_version") or "unknown"),
+    },
+  )
+
+  def _materialize_service_credential(handle: CredentialHandle) -> MaterializedCredential:
+    if handle is not service_handle:
+      raise RuntimeError("unknown server multi-user test credential handle")
+    return service_material
+
+  return {
+    "tenant_id": tenant_id,
+    "allow_service_credentials_for_interactive": True,
+    "model_registry": registry,
+    "model_selection_policy": policy,
+    "service_provider_handles": {provider: service_handle},
+    "service_auth_config_resolver": _materialize_service_credential,
+  }
+
+
 def _make_app(
   *,
   credentials_resolver=None,
-  credentials_refresh_resolver=None,
   resolver_timeout_seconds: float = 5.0,
   channel_profile_allowlist: dict[str, frozenset[str]] | None = None,
   transcript_dir: Path | None = None,
@@ -139,16 +256,29 @@ def _make_app(
   async def _build_chat_runtime(session, request, channel, auth_manager):
     _ = channel, auth_manager
     captured_requests.append({"session": session, "request": request})
+    capability_execution = request.capability_execution
+    assert capability_execution is not None
     return ChatRuntime(
       system_prompt="test",
       build_runner=lambda event_log, _sid: _StubRunner(event_log, run_calls),
+      capability_execution=capability_execution,
     )
 
   app = create_gateway_app(
     GatewayServerConfig(
-      auth_config={"model": "claude-sonnet-4-6"},
+      **_strict_session_driver_config(
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        tenant_id="test-product",
+        auth_config={
+          "provider": "anthropic",
+          "billing_mode": "byok",
+          "rate_table_version": "unknown",
+          "api_key": "service-test-key",
+          "max_tokens": 16000,
+        },
+      ),
       credentials_resolver=credentials_resolver,
-      credentials_refresh_resolver=credentials_refresh_resolver,
       resolver_timeout_seconds=resolver_timeout_seconds,
       channel_profile_allowlist=channel_profile_allowlist,
       build_chat_runtime=_build_chat_runtime,
@@ -174,7 +304,17 @@ def _init_session(
     payload["context"] = context
   response = client.post("/api/chat/init", json=payload)
   assert response.status_code == 200, response.text
-  return response.json()
+  init = response.json()
+  session = client.app.state.auth.session_store.get_session(
+    init["session_id"]
+  )
+  assert session is not None
+  session.model_entitled_capabilities = frozenset(CAPABILITY_IDS)
+  session.model_entitled_keys = frozenset(
+    client.app.state.gateway_config.model_registry.models
+  )
+  init["session_token"] = client.app.state.auth.issue_token(session)
+  return init
 
 
 def _consume_chat_stream(client: TestClient, token: str, payload: dict[str, Any]) -> None:
@@ -184,6 +324,8 @@ def _consume_chat_stream(client: TestClient, token: str, payload: dict[str, Any]
     headers={"Authorization": f"Bearer {token}"},
     json=payload,
   ) as response:
+    if response.status_code != 200:
+      response.read()
     assert response.status_code == 200, response.text
     list(response.iter_lines())
 
@@ -194,7 +336,6 @@ def _auth_config_for(user_id: str) -> AuthConfig:
       "provider": "anthropic",
       "billing_mode": "byok",
       "api_key": f"key-{user_id}",
-      "model": "claude-sonnet-4-6",
       "max_tokens": 16000,
     }
   )
@@ -212,7 +353,7 @@ class _NoopMcpClient:
 
 
 class _ReplayProvider(ModelProvider):
-  name = "stub"
+  name = "anthropic"
 
   def __init__(self, responses: list[str]) -> None:
     self.responses = list(responses)
@@ -274,9 +415,11 @@ def test_chat_stream_rebuilds_multi_turn_memory_from_session_log(tmp_path: Path)
   session_log = AgentSessionLog(path=tmp_path / "sessions" / "interactive.jsonl")
 
   async def _build_chat_runtime(session, request, channel, auth_manager):
-    _ = session, request, channel, auth_manager
+    _ = channel, auth_manager
+    capability_execution = request.capability_execution
+    assert capability_execution is not None
 
-    def _build_runner(event_log, session_id):
+    def _build_runner(event_log, session_id, _started_at=None):
       return AgentRunner(
         event_log=event_log,
         dispatcher=ToolDispatcher(
@@ -286,8 +429,7 @@ def test_chat_stream_rebuilds_multi_turn_memory_from_session_log(tmp_path: Path)
           session_id=session_id,
         ),
         session_id=session_id,
-        provider=provider,
-        auth_config={"api_key": "k", "model": "stub-model"},
+        capability_execution=capability_execution,
         get_tool_definitions=lambda: [],
         user_id=session.user_id,
         billing_mode="byok",
@@ -299,13 +441,34 @@ def test_chat_stream_rebuilds_multi_turn_memory_from_session_log(tmp_path: Path)
         ),
       )
 
-    return ChatRuntime(system_prompt="system", build_runner=_build_runner)
+    return ChatRuntime(
+      system_prompt="system",
+      build_runner=_build_runner,
+      capability_execution=capability_execution,
+    )
+
+  def _resolve_replay_adapter(adapter: str) -> ModelProvider:
+    if adapter != "anthropic.messages":
+      raise ValueError(f"unexpected adapter: {adapter}")
+    return provider
 
   app = create_gateway_app(
     GatewayServerConfig(
-      auth_config={"model": "stub-model"},
-      allowed_models={"stub-model"},
-      build_chat_runtime=_build_chat_runtime,
+      **_strict_session_driver_config(
+        provider="anthropic",
+        model="stub-model",
+        effort="none",
+        tenant_id="test-product",
+        auth_config={
+          "provider": "anthropic",
+          "billing_mode": "byok",
+          "rate_table_version": "unknown",
+          "api_key": "k",
+        },
+        ),
+        default_provider=provider,
+        capability_adapter_resolver=_resolve_replay_adapter,
+        build_chat_runtime=_build_chat_runtime,
     )
   )
   client = TestClient(app)
@@ -342,6 +505,7 @@ def _resolver_result_for(user_id: str, *, channel: str = "excel") -> ResolverRes
     user_id=user_id,
     channel=channel,
     auth_config=_auth_config_for(user_id),
+    credential_principal="user",
     risk_user_id=abs(hash(user_id)) % 10_000 + 1,
     role="owner",
   )
@@ -417,6 +581,11 @@ def test_chat_init_accepts_resolver_derived_user_without_request_user_id() -> No
   assert session.user_id == "alice"
   assert session.channel == "excel"
   assert session.is_public is False
+  assert session.tenant_id == "test-product"
+  assert session.session_credential_handle is not None
+  assert session.session_credential_handle.principal == "user"
+  assert session.session_credential_handle.actor_id == session.owner_user_id
+  assert session.allow_service_for_interactive is False
 
 
 def test_channel_profile_allowlist_none_preserves_profile_resolution() -> None:
@@ -618,14 +787,11 @@ def test_chat_init_calls_resolver_and_stores_auth_config() -> None:
     "provider": "anthropic",
     "billing_mode": "byok",
     "api_key": "key-alice",
-    "model": "claude-sonnet-4-6",
     "max_tokens": 16000,
   }
 
 
-def test_chat_refresh_resolver_updates_session_auth_config() -> None:
-  refresh_requests: list[Any] = []
-
+def test_chat_turn_keeps_bound_auth_immutable_without_mid_attempt_refresh() -> None:
   async def _resolver(_api_key: str, init_request):
     return ResolverResult(
       user_id=init_request.user_id,
@@ -636,30 +802,16 @@ def test_chat_refresh_resolver_updates_session_auth_config() -> None:
           "billing_mode": "byok",
           "rate_table_version": "unknown",
           "api_key": "key-alice",
-          "model": "claude-sonnet-4-6",
           "max_tokens": 16000,
         }
       ),
+      credential_principal="user",
       risk_user_id=101,
       role="owner",
     )
 
-  async def _refresh(request):
-    refresh_requests.append(request)
-    return AuthConfig.from_dict(
-      {
-        "provider": "anthropic",
-        "billing_mode": "metered",
-        "rate_table_version": "2026-04-08",
-        "api_key": "key-rotated",
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 16000,
-      }
-    )
-
-  app, _captured_requests, _run_calls = _make_app(
+  app, captured_requests, _run_calls = _make_app(
     credentials_resolver=_resolver,
-    credentials_refresh_resolver=_refresh,
   )
 
   with TestClient(app) as client:
@@ -671,15 +823,12 @@ def test_chat_refresh_resolver_updates_session_auth_config() -> None:
     )
 
   session = app.state.auth.session_store.get_session(init_response["session_id"])
-  assert session.auth_config["api_key"] == "key-rotated"
+  bound_auth_config = captured_requests[0]["request"].bound_auth_config
+  assert bound_auth_config is not None
+  assert bound_auth_config["api_key"] == "key-alice"
   assert session.auth_config["billing_mode"] == "byok"
   assert session.auth_config["rate_table_version"] == "unknown"
-  assert refresh_requests
-  assert refresh_requests[0].user_id == "alice"
-  assert refresh_requests[0].request_id == "req-refresh"
-  assert refresh_requests[0].billing_mode == "byok"
-  assert refresh_requests[0].rate_table_version == "unknown"
-  assert refresh_requests[0].failure.kind == "rate_limit"
+  assert session.auth_config["api_key"] == "key-alice"
 
 
 def test_chat_rejects_cross_user_reuse_in_strict_mode() -> None:
@@ -789,6 +938,59 @@ def test_chat_request_drain_trailing_constructs_deferred_event_log() -> None:
   assert session.active_turn.event_log.closed is True
 
 
+def test_chat_late_dispatch_failure_logs_traceback(caplog) -> None:
+  async def _build_chat_runtime(*_args, **_kwargs):
+    await asyncio.sleep(0.05)
+    raise RuntimeError("late chat dispatch failure")
+
+  app = create_gateway_app(
+    GatewayServerConfig(
+      **_strict_session_driver_config(
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        tenant_id="test-product",
+        auth_config={
+          "provider": "anthropic",
+          "billing_mode": "byok",
+          "rate_table_version": "unknown",
+          "api_key": "service-test-key",
+          "max_tokens": 16000,
+        },
+      ),
+      build_chat_runtime=_build_chat_runtime,
+      log_name="agent_gateway.server",
+    )
+  )
+  caplog.set_level(logging.WARNING, logger="agent_gateway.server")
+
+  with TestClient(app) as client:
+    init_response = _init_session(client, user_id="alice")
+    _consume_chat_stream(
+      client,
+      init_response["session_token"],
+      {"messages": [{"role": "user", "content": "fail late"}]},
+    )
+
+    deadline = time.monotonic() + 1.0
+    records = []
+    while time.monotonic() < deadline:
+      records = [
+        record
+        for record in caplog.records
+        if record.name == "agent_gateway.server"
+        and "chat turn dispatch failed" in record.getMessage()
+      ]
+      if records:
+        break
+      time.sleep(0.01)
+
+    assert len(records) == 1
+    assert records[0].exc_info
+    assert records[0].exc_info[0] is RuntimeError
+    assert "Traceback (most recent call last)" in caplog.text
+    assert "late chat dispatch failure" in caplog.text
+
+
 def test_chat_metadata_reaches_runtime_and_transcript(tmp_path: Path) -> None:
   app, captured_requests, _run_calls = _make_app(transcript_dir=tmp_path)
   metadata = {
@@ -862,7 +1064,19 @@ def test_gateway_server_config_accepts_on_session_created_hook() -> None:
   def _hook(_session, _api_key: str, _request) -> None:
     return None
 
-  config = GatewayServerConfig(build_chat_runtime=lambda *_args, **_kwargs: None, on_session_created=_hook)
+  config = GatewayServerConfig(
+    **_strict_session_driver_config(
+      provider="anthropic",
+      model="claude-sonnet-4-6",
+      tenant_id="test-product",
+      auth_config={
+        "provider": "anthropic",
+        "api_key": "service-test-key",
+      },
+    ),
+    build_chat_runtime=lambda *_args, **_kwargs: None,
+    on_session_created=_hook,
+  )
 
   assert config.on_session_created is _hook
 
@@ -901,7 +1115,6 @@ def test_auth_config_to_dict_is_called_before_create_session_boundary() -> None:
         "provider": "anthropic",
         "billing_mode": "byok",
         "api_key": "tracked-key",
-        "model": "claude-sonnet-4-6",
       }
 
   tracked = _TrackedAuthConfig()
@@ -911,6 +1124,8 @@ def test_auth_config_to_dict_is_called_before_create_session_boundary() -> None:
       user_id="alice",
       channel="excel",
       auth_config=tracked,
+      credential_principal="service",
+      allow_service_for_interactive=True,
       risk_user_id=101,
       role="owner",
     )
@@ -926,5 +1141,4 @@ def test_auth_config_to_dict_is_called_before_create_session_boundary() -> None:
     "provider": "anthropic",
     "billing_mode": "byok",
     "api_key": "tracked-key",
-    "model": "claude-sonnet-4-6",
   }

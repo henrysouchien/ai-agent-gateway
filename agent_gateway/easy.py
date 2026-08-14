@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import inspect
 import logging
 import os
@@ -10,23 +11,103 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI
 
-from ._provider_utils import _get_default_model_for_provider, _resolve_provider
-from .auth import CredentialsRefreshResolver, CredentialsResolver
+from ._provider_utils import _resolve_provider
+from .agent_session_log import AgentSessionLog, slugify
+from .auth import CredentialsResolver
+from .capability_binding import (
+  CredentialHandle,
+)
+from .capability_execution import MaterializedCredential
 from .code_execution import CodeExecutionConfig, build_code_execution
 from .commercial_work_start import CommercialWorkStartGate
+from .dispatcher_factory import (
+  GatewayDispatcherDeps,
+  InvocationPrincipal,
+  build_tool_dispatcher,
+)
 from .mcp_client import McpClientManager
 from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, SessionUsageSummary, UsageEvent, UsageLedger
+from .model_registry import (
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+  CapabilityDefault,
+  ModelRegistryEntry,
+  ProductModelSelectionPolicy,
+)
 from .providers import AnthropicProvider, ModelProvider
 from .rates import load_rate_table
 from .runner import AgentRunner, ToolResultContext
-from .server import ChatRequest, ChatRuntime, GatewayServerConfig, _make_request_approval, create_gateway_app
+from .server import (
+  ChatRequest,
+  ChatRuntime,
+  GatewayServerConfig,
+  _make_request_approval,
+  create_gateway_app,
+)
 from .session import AuthManager, GatewaySession
 from .skills import SkillLoader, SkillStateStore
 from .task_registry import CoordinatorConfig
-from .tool_dispatcher import LocalToolHandler, ToolDispatcher
-from .thinking import parse_effort
+from .tool_dispatcher import LocalToolHandler
+from .thinking import resolve_effort_pair
 
 log = logging.getLogger("agent_gateway.easy")
+
+_SESSION_LOG_BASE_DIR_ENV = "AGENT_SESSION_LOG_BASE_DIR"
+_INITIAL_DRIVER_DEFAULT = INITIAL_MODEL_SELECTION_POLICY.capabilities[
+  "session.driver"
+].default
+if _INITIAL_DRIVER_DEFAULT.kind != "model" or _INITIAL_DRIVER_DEFAULT.model_key is None:
+  raise RuntimeError("initial session.driver policy must select a stable model key")
+_DEFAULT_EASY_MODEL_KEY = _INITIAL_DRIVER_DEFAULT.model_key
+
+
+def _resolve_session_log_base_dir(
+  configured: str | Path | None,
+) -> Path:
+  """Resolve durable storage for the convenience runtime without cwd drift."""
+
+  raw = str(configured or "").strip()
+  if not raw:
+    raw = os.getenv(_SESSION_LOG_BASE_DIR_ENV, "").strip()
+    if raw:
+      env_path = Path(raw).expanduser()
+      if not env_path.is_absolute():
+        raise ValueError(
+          f"{_SESSION_LOG_BASE_DIR_ENV} must be an absolute path"
+        )
+      return env_path.resolve(strict=False)
+  if raw:
+    return Path(raw).expanduser().resolve(strict=False)
+  return Path("~/.cache/agent-gateway/agent-sessions").expanduser()
+
+
+def _easy_session_log(
+  session: GatewaySession,
+  *,
+  base_dir: Path,
+) -> AgentSessionLog:
+  existing = getattr(session, "agent_session_log", None)
+  if existing is not None:
+    if not isinstance(existing, AgentSessionLog):
+      raise TypeError(
+        "GatewaySession.agent_session_log must be AgentSessionLog"
+      )
+    return existing
+
+  path = (
+    base_dir
+    / "easy"
+    / (
+      f"agentsess_{slugify(session.session_id)}_"
+      f"{slugify(session.user_id)}.jsonl"
+    )
+  )
+  session_log = AgentSessionLog(
+    path=path,
+    gateway_session=session,
+  )
+  setattr(session, "agent_session_log", session_log)
+  return session_log
 
 
 class _NullMcpClient:
@@ -74,11 +155,63 @@ def _call_commercial_usage_producer_factory(
   return factory(*legacy_args)
 
 
+def _easy_model_selection_policy(
+  *,
+  model_key: str,
+  effort: str | None,
+) -> tuple[ModelRegistryEntry, ProductModelSelectionPolicy]:
+  entry = INITIAL_MODEL_REGISTRY.require(model_key)
+  driver_policy = INITIAL_MODEL_SELECTION_POLICY.capabilities[
+    "session.driver"
+  ]
+  if entry.key not in driver_policy.allowed_model_keys:
+    raise ValueError(
+      f"model key {entry.key!r} is not selectable for session.driver"
+    )
+  configured_effort = resolve_effort_pair(
+    effort=effort,
+    thinking=None,
+    field_prefix="effort.",
+    blank_is_unset=True,
+  )
+  effort = (
+    configured_effort.value
+    if configured_effort is not None
+    else entry.default_effort
+  )
+  if effort not in entry.supported_efforts:
+    raise ValueError(
+      f"effort {effort!r} is not supported by model key {entry.key!r}"
+    )
+  policy = ProductModelSelectionPolicy(
+    schema="product-model-selection/v1",
+    revision=(
+      f"{INITIAL_MODEL_SELECTION_POLICY.revision}.easy."
+      f"{entry.key}.{effort}"
+    ),
+    capabilities={
+      **INITIAL_MODEL_SELECTION_POLICY.capabilities,
+      "session.driver": replace(
+        driver_policy,
+        default=CapabilityDefault(
+          kind="model",
+          model_key=entry.key,
+          effort=effort,
+        ),
+        allowed_model_keys=frozenset({entry.key}),
+      ),
+    },
+  )
+  policy.admit_registry(INITIAL_MODEL_REGISTRY)
+  return entry, policy
+
+
 def create_agent(
   system_prompt: str | list[tuple[str, bool]],
   *,
-  provider: str | ModelProvider = "anthropic",
-  model: str | None = None,
+  provider: str | ModelProvider | None = None,
+  model_key: str = _DEFAULT_EASY_MODEL_KEY,
+  effort: str | None = None,
   provider_config: dict[str, Any] | None = None,
   api_key: str | None = None,
   auth_token: str | None = None,
@@ -96,6 +229,7 @@ def create_agent(
   skills_excluded_tools: set[str] | None = None,
   skill_state_file: str | Path | None = None,
   outputs_dir: str | Path | None = None,
+  session_log_base_dir: str | Path | None = None,
   code_execution: bool = False,
   code_execution_config: CodeExecutionConfig | None = None,
   needs_approval: Callable[..., bool] | None = None,
@@ -115,7 +249,6 @@ def create_agent(
   on_startup: Callable[..., Any] | None = None,
   on_shutdown: Callable[..., Any] | None = None,
   credentials_resolver: CredentialsResolver | None = None,
-  credentials_refresh_resolver: CredentialsRefreshResolver | None = None,
   resolver_timeout_seconds: float = 5.0,
   usage_ledger: UsageLedger | None = None,
   usage_ledger_dlq_path: Path | None = None,
@@ -151,10 +284,11 @@ def create_agent(
     system_prompt: Prompt string, or a list of `(text, should_cache)` blocks for
       providers that support prompt caching.
     provider: Provider name (`"anthropic"`, `"codex"`, `"openai"`, or `"xai"`) or a
-      `ModelProvider` instance.
-    model: Default model for incoming chat requests. When omitted, string
-      providers use their provider-specific default model. Required when you
-      pass a `ModelProvider` instance.
+      `ModelProvider` instance. When omitted, the registry entry determines it.
+    model_key: Stable product-registry key used by the deployment's
+      `session.driver` default. Raw upstream model IDs are not accepted.
+    effort: Explicit effort for the stable model key. When omitted, the
+      registry entry's default effort is used.
     provider_config: Provider-specific config merged into the auth config last.
       Use this for fields like `base_url` or `compat`.
     api_key: Provider API key. Anthropic falls back to `ANTHROPIC_API_KEY`;
@@ -169,8 +303,7 @@ def create_agent(
       `McpClientManager(config_path=None, inline_servers=...)`.
     mcp_config_path: Alternate Claude desktop config file to read MCP servers
       from. When omitted, `MCP_CONFIG_PATH` is used if set; otherwise inline
-      `mcp_servers` remain inline-only and file-backed MCP config uses the
-      `McpClientManager` default of `~/.claude.json`.
+      `mcp_servers` remain inline-only and no file-backed servers are loaded.
     mcp_timeout_overrides: Optional per-server MCP tool timeout overrides in
       seconds.
     mcp_default_tool_timeout: Default MCP tool timeout in seconds.
@@ -188,6 +321,8 @@ def create_agent(
       prompt and `## STATE_UPDATE_JSON` updates from the final response are
       merged back into this file.
     outputs_dir: Directory for named-skill output files. Stale same-day outputs are cleaned before background sub-agent launch.
+    session_log_base_dir: Durable parent/child session-log root. Defaults to
+      `AGENT_SESSION_LOG_BASE_DIR`, then `~/.cache/agent-gateway/agent-sessions`.
     code_execution: Enable built-in `code_execute` and `code_execute_status`.
       Docker is preferred; subprocess is the fallback when registered.
     code_execution_config: Optional `CodeExecutionConfig` override.
@@ -208,8 +343,6 @@ def create_agent(
     on_startup: Optional async or sync startup callback.
     on_shutdown: Optional async or sync shutdown callback.
     credentials_resolver: Optional init-time resolver for per-user credentials.
-    credentials_refresh_resolver: Optional stream-time resolver for rotating
-      resolver-backed credentials after provider rate-limit, billing, or auth failures.
     commercial_work_start_gate: Default-off verifier and durable one-time
       consumption gate run before request-scoped runtime construction.
 
@@ -234,6 +367,7 @@ def create_agent(
     app = create_agent(
       "You are a concise assistant.",
       provider="openai",
+      model_key="openai.gpt-5-6",
     )
     ```
 
@@ -288,10 +422,34 @@ def create_agent(
       "commercial authority subscriber must protect the work-start gate cache"
     )
   skill_state_store = SkillStateStore(skill_state_file) if skill_state_file is not None else None
+  if provider_config is not None and set(provider_config) & {
+    "model",
+    "effort",
+    "thinking",
+  }:
+    raise ValueError(
+      "provider_config is not model/effort selection authority; use "
+      "model_key and effort"
+    )
+  capability_entry = INITIAL_MODEL_REGISTRY.require(model_key)
+  resolved_provider = provider or capability_entry.provider
+  requested_provider_name = str(
+    getattr(resolved_provider, "name", resolved_provider) or ""
+  ).strip().lower()
+  if requested_provider_name == "agent-sdk":
+    raise ValueError(
+      "agent-sdk is an adapter, not credential provider selection; use a "
+      "stable model key with an SDK adapter"
+    )
+  if requested_provider_name != capability_entry.provider:
+    raise ValueError(
+      f"provider {requested_provider_name!r} does not match model key "
+      f"{capability_entry.key!r}"
+    )
   if credentials_resolver is None:
     provider_instance, _provider_name, auth_config = _resolve_provider(
-      provider,
-      model,
+      resolved_provider,
+      capability_entry.upstream_model,
       api_key,
       auth_token,
       provider_config,
@@ -299,19 +457,61 @@ def create_agent(
     )
   else:
     provider_instance, _provider_name, auth_config = _resolve_provider(
-      provider,
-      model,
+      resolved_provider,
+      capability_entry.upstream_model,
       None,
       None,
       provider_config,
       auth_config={},
       max_tokens=max_tokens,
-  )
-  if isinstance(provider, str) and provider.strip().lower() == "anthropic":
+    )
+  if (
+    isinstance(resolved_provider, str)
+    and resolved_provider.strip().lower() == "anthropic"
+  ):
     provider_instance = AnthropicProvider(rate_table=load_rate_table(rates_file))
-  model = str(auth_config.get("model") or _get_default_model_for_provider(_provider_name))
+  if _provider_name != capability_entry.provider:
+    raise ValueError("resolved provider does not match the selected model key")
+  capability_entry, model_selection_policy = _easy_model_selection_policy(
+    model_key=capability_entry.key,
+    effort=effort,
+  )
+  tenant_id = "agent-gateway.easy"
+  service_credential_handle = CredentialHandle(
+    handle_id=f"easy-service-{_provider_name}",
+    provider=capability_entry.provider,
+    principal="service",
+    tenant_id=tenant_id,
+    actor_id=None,
+  )
+  rate_table = getattr(provider_instance, "_rate_table", None)
+  service_auth_config = {
+    **auth_config,
+    "provider": capability_entry.provider,
+    "billing_mode": str(auth_config.get("billing_mode") or "byok"),
+    "rate_table_version": str(
+      auth_config.get("rate_table_version")
+      or getattr(rate_table, "version", "unknown")
+      or "unknown"
+    ),
+  }
+
+  def _materialize_service_credential(
+    handle: CredentialHandle,
+  ) -> MaterializedCredential:
+    if handle is not service_credential_handle:
+      raise RuntimeError("unknown easy-agent service credential handle")
+    return MaterializedCredential(
+      handle=handle,
+      auth_config=service_auth_config,
+    )
 
   skill_loader = SkillLoader(skills_dir) if skills_dir else None
+  resolved_session_log_base_dir = (
+    _resolve_session_log_base_dir(session_log_base_dir)
+    if skill_loader is not None
+    else None
+  )
   mcp_client: McpClientManager | None = None
   resolved_mcp_config_path = (
     mcp_config_path if mcp_config_path is not None else _mcp_config_path_from_env()
@@ -321,7 +521,12 @@ def create_agent(
     if code_execution:
       builtin_names |= {"code_execute", "code_execute_status"}
     if skills_dir and "run_agent" not in builtin_names:
-      builtin_names |= {"run_agent", "get_background_result", "send_message"}
+      builtin_names |= {
+        "run_agent",
+        "get_agent_result_content",
+        "get_background_result",
+        "send_message",
+      }
     mcp_client = McpClientManager(
       inline_servers=mcp_servers,
       config_path=resolved_mcp_config_path,
@@ -343,7 +548,10 @@ def create_agent(
       return
     error = task.exception()
     if error is not None:
-      log.critical("commercial usage shipper exited unexpectedly: %s", error)
+      log.critical(
+        "commercial usage shipper exited unexpectedly | exception_type=%s",
+        type(error).__name__,
+      )
     elif not shipper_stop.is_set():
       log.critical("commercial usage shipper exited before shutdown")
 
@@ -352,7 +560,10 @@ def create_agent(
       return
     error = task.exception()
     if error is not None:
-      log.critical("commercial reconciliation shipper exited unexpectedly: %s", error)
+      log.critical(
+        "commercial reconciliation shipper exited unexpectedly | exception_type=%s",
+        type(error).__name__,
+      )
     elif not shipper_stop.is_set():
       log.critical("commercial reconciliation shipper exited before shutdown")
 
@@ -363,6 +574,21 @@ def create_agent(
     auth_manager: AuthManager,
   ) -> ChatRuntime:
     _ = auth_manager
+    capability_execution = request.capability_execution
+    capability_execution_resolver = request.capability_execution_resolver
+    if (
+      capability_execution is None
+      or capability_execution_resolver is None
+    ):
+      raise RuntimeError(
+        "create_agent runtime requires a prepared session.driver turn"
+      )
+    capability_execution.validate()
+    bound_auth_config = capability_execution.auth_config
+    if capability_execution.provider is not provider_instance:
+      raise RuntimeError(
+        "create_agent provider must be the capability execution provider"
+      )
     commercial_usage_producer = None
     if commercial_usage_producer_factory is not None:
       commercial_usage_producer = _call_commercial_usage_producer_factory(
@@ -393,6 +619,7 @@ def create_agent(
         make_run_agent_handler,
         make_run_agent_tool_def,
       )
+      from .agent_result_content import make_get_agent_result_content_tool_def
 
       local_handlers["run_agent"] = make_run_agent_handler(
         runner_ref,
@@ -405,8 +632,7 @@ def create_agent(
         excluded_tools=skills_excluded_tools,
         skill_state_store=skill_state_store,
         outputs_dir=Path(outputs_dir) if outputs_dir is not None else None,
-        default_model=model,
-        allowed_models=allowed_models,
+        capability_execution_resolver=capability_execution_resolver,
         coordinator_config=coordinator,
         approval_key_qualifier=ce_bundle.approval_qualifier if ce_bundle else None,
       )
@@ -418,6 +644,8 @@ def create_agent(
         extra_tool_defs.append(make_run_agent_tool_def(skill_loader))
       if not any(definition.get("name") == "get_background_result" for definition in extra_tool_defs):
         extra_tool_defs.append(make_get_background_result_tool_def())
+      if not any(definition.get("name") == "get_agent_result_content" for definition in extra_tool_defs):
+        extra_tool_defs.append(make_get_agent_result_content_tool_def())
       if not any(definition.get("name") == "send_message" for definition in extra_tool_defs):
         extra_tool_defs.append(make_send_message_tool_def())
 
@@ -451,10 +679,9 @@ def create_agent(
         return await result
       return result
 
-    resolved_billing_mode = str((session.auth_config or auth_config).get("billing_mode", "byok"))
-    rate_table = getattr(provider_instance, "_rate_table", None)
+    resolved_billing_mode = str(bound_auth_config.get("billing_mode", "byok"))
     resolved_rate_table_version = str(
-      (session.auth_config or auth_config).get("rate_table_version")
+      bound_auth_config.get("rate_table_version")
       or getattr(rate_table, "version", "unknown")
       or "unknown"
     )
@@ -473,7 +700,10 @@ def create_agent(
         except Exception as exc:
           if usage_ledger is None:
             raise
-          log.warning("on_usage observer failed after ledger record (non-fatal): %s", exc)
+          log.warning(
+            "on_usage observer failed after ledger record (non-fatal) | exception_type=%s",
+            type(exc).__name__,
+          )
 
     async def _combined_on_session_summary(summary: SessionUsageSummary) -> None:
       session.cached_usage = summary
@@ -484,8 +714,28 @@ def create_agent(
 
     def _build_runner(event_log, session_id: str, started_at: float | None = None) -> AgentRunner:
       resolved_started_at = float(started_at if started_at is not None else session.created_at)
-      dispatcher = ToolDispatcher(
+      agent_session_log = (
+        _easy_session_log(
+          session,
+          base_dir=resolved_session_log_base_dir,
+        )
+        if resolved_session_log_base_dir is not None
+        else None
+      )
+      dispatcher_deps = GatewayDispatcherDeps(
         mcp_client=mcp_client or _NullMcpClient(),
+        approval_store=None,
+        approval_policy=None,
+        mcp_meta_inject_servers=frozenset(),
+      )
+      principal = InvocationPrincipal.from_session(
+        session,
+        approval_key_qualifier=approval_qualifier,
+      )
+      dispatcher = build_tool_dispatcher(
+        deps=dispatcher_deps,
+        principal=principal,
+        profile="chat_embedded",
         local_tool_handlers=local_handlers,
         needs_approval=_needs_approval,
         request_approval=_make_request_approval(session, event_log),
@@ -493,7 +743,6 @@ def create_agent(
         event_log=event_log,
         session_id=session_id,
         mcp_session_inject_servers=mcp_session_inject_servers,
-        approval_key_qualifier=approval_qualifier,
         session_cache_denied_tools=session_cache_denied_tools,
         get_tool_definitions=_get_tool_defs,
         commercial_work_start=request.commercial_work_start,
@@ -504,20 +753,16 @@ def create_agent(
         ),
         commercial_mcp_servers=commercial_mcp_servers,
       )
-      runner_auth_config = dict(session.auth_config or auth_config)
-      if request.effort is not None:
-        requested_effort = parse_effort(request.effort)
-        runner_auth_config.pop("thinking", None)
-        runner_auth_config["effort"] = requested_effort.value
-        runner_auth_config["thinking_enabled_requested"] = requested_effort.value != "none"
       runner = AgentRunner(
         event_log=event_log,
         dispatcher=dispatcher,
+        gateway_session=session,
         session_id=session_id,
         started_at=resolved_started_at,
-        provider=provider_instance,
-        auth_config=runner_auth_config,
+        capability_execution=capability_execution,
+        allow_stub_response=False,
         mcp_client=mcp_client,
+        purpose=session.purpose,
         get_tool_definitions=_get_tool_defs,
         per_turn_timeout=per_turn_timeout,
         on_tool_result=_combined_on_tool_result,
@@ -532,6 +777,7 @@ def create_agent(
         usage_ledger_dlq_path=resolved_usage_dlq_path,
         max_budget_usd=max_budget_usd,
         coordinator=coordinator,
+        agent_session_log=agent_session_log,
         code_execution_spill_dir_provider=ce_bundle.ensure_work_dir if ce_bundle else None,
         commercial_usage_producer=commercial_usage_producer,
       )
@@ -541,9 +787,8 @@ def create_agent(
     return ChatRuntime(
       system_prompt=system_prompt,
       build_runner=_build_runner,
+      capability_execution=capability_execution,
       get_tool_definitions=_get_tool_defs,
-      provider=provider_instance,
-      model_override=request.model or model,
       max_turns=max_turns,
     )
 
@@ -591,14 +836,20 @@ def create_agent(
       try:
         await shipper_task[0]
       except Exception as exc:
-        log.error("commercial usage shipper stopped with an error: %s", exc)
+        log.error(
+          "commercial usage shipper stopped with an error | exception_type=%s",
+          type(exc).__name__,
+        )
       shipper_task[0] = None
     if reconciliation_shipper_task[0] is not None:
       shipper_stop.set()
       try:
         await reconciliation_shipper_task[0]
       except Exception as exc:
-        log.error("commercial reconciliation shipper stopped with an error: %s", exc)
+        log.error(
+          "commercial reconciliation shipper stopped with an error | exception_type=%s",
+          type(exc).__name__,
+        )
       reconciliation_shipper_task[0] = None
     if code_execution and app_ref[0] is not None:
       from .code_execution import cleanup_code_execution
@@ -613,20 +864,23 @@ def create_agent(
     if mcp_client is not None:
       await mcp_client.shutdown()
 
-  allowed_models: set[str] = set()
-
   app = create_gateway_app(
     GatewayServerConfig(
       jwt_secret=jwt_secret or secrets.token_hex(32),
       valid_api_keys=valid_api_keys or set(),
       session_ttl=session_ttl,
       cors_origins=["*"] if cors_origins is None else cors_origins,
-      allowed_models=allowed_models,
       build_chat_runtime=_build_chat_runtime,
       default_provider=provider_instance,
-      auth_config=auth_config,
+      tenant_id=tenant_id,
+      allow_service_credentials_for_interactive=True,
       credentials_resolver=credentials_resolver,
-      credentials_refresh_resolver=credentials_refresh_resolver,
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=model_selection_policy,
+      service_provider_handles={
+        capability_entry.provider: service_credential_handle
+      },
+      service_auth_config_resolver=_materialize_service_credential,
       resolver_timeout_seconds=resolver_timeout_seconds,
       commercial_work_start_gate=commercial_work_start_gate,
       mcp_client=mcp_client,
@@ -654,10 +908,9 @@ def create_agent(
           _result, err = await mcp_client.call_tool(close_tool, {"_session_id": session.session_id})
           if err:
             log.warning(
-              "MCP session cleanup failed for %s/%s: %s",
+              "MCP session cleanup failed for %s/%s | error=true",
               server_name,
               session.session_id,
-              err.get("message", ""),
             )
         else:
           log.debug("No close_session tool for %s; session cleanup skipped", server_name)

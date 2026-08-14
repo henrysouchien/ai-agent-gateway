@@ -3,9 +3,10 @@ from __future__ import annotations
 
 MAX_NOTIFICATIONS_PER_TURN = 5
 
-# A turn that exhausts max_tokens with no usable tool call (e.g. long interleaved
-# thinking + a very large tool-call JSON truncated mid-stream) must not silently
-# end the run (ACUI-27): nudge and continue, bounded to avoid loops.
+# Top-level interactive runs retain a bounded continuation guard. Child/workflow
+# logical responses are unbounded here: max_tokens segments are provider-call
+# mechanics, while existing wall-clock timeout, cancellation, and operator
+# controls provide operational runaway protection.
 MAX_TOKENS_CONTINUATIONS = 3
 MAX_TOKENS_NUDGE = (
   "[System: Your previous response hit the output-token limit and was truncated; "

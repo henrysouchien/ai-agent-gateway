@@ -16,6 +16,7 @@ from agent_gateway import tool_dispatcher as dispatcher_module
 from agent_gateway import tool_dispatcher_audit as audit
 from agent_gateway import ToolDispatcher
 from agent_gateway.event_log import EventLog
+from agent_gateway.secret_boundary import SecretBoundary
 
 
 class _NullMcpClient:
@@ -104,6 +105,37 @@ def test_emit_execution_audit_copies_and_clears_raw_args() -> None:
   asyncio.run(_run())
 
 
+def test_emit_execution_audit_legacy_emitter_receives_safe_projection() -> None:
+  async def _run() -> None:
+    secret = "CUSTOM-ACTIVE-CREDENTIAL-LEGACY-AUDIT-8f21d7"
+    emitter = _Emitter()
+    boundary = SecretBoundary((secret,))
+
+    await audit.emit_execution_audit(
+      SimpleNamespace(approval_id="approval-1"),
+      {
+        "credential": secret,
+        "api_key_set": True,
+        "path": "/Users/alice/Documents/report.xlsx",
+      },
+      approval_store=_Store(emitter),
+      outcome="tool_error",
+      error_summary=f"failed {secret}",
+      boundary_sanitizer=lambda value, sink: boundary.sanitize(
+        value,
+        sink=sink,
+      ),
+    )
+
+    serialized = repr(emitter.calls)
+    assert secret not in serialized
+    assert "<redacted-secret>" in serialized
+    assert emitter.calls[0]["raw_tool_args"]["api_key_set"] is True
+    assert emitter.calls[0]["raw_tool_args"]["path"] == "/Users/alice/Documents/report.xlsx"
+
+  asyncio.run(_run())
+
+
 def test_emit_execution_audit_noops_without_request_store_or_emitter() -> None:
   async def _run() -> None:
     raw_tool_args = {"path": "x"}
@@ -146,6 +178,7 @@ def test_tool_dispatcher_audit_wrappers_preserve_parent_seams(monkeypatch) -> No
       approval_store: Any | None,
       outcome: str,
       error_summary: str | None = None,
+      boundary_sanitizer: Any | None = None,
     ) -> None:
       execution_calls.append(
         {
@@ -154,6 +187,7 @@ def test_tool_dispatcher_audit_wrappers_preserve_parent_seams(monkeypatch) -> No
           "approval_store": approval_store,
           "outcome": outcome,
           "error_summary": error_summary,
+          "boundary_sanitizer": boundary_sanitizer,
         }
       )
 
@@ -173,8 +207,10 @@ def test_tool_dispatcher_audit_wrappers_preserve_parent_seams(monkeypatch) -> No
         "approval_store": store,
         "outcome": "tool_error",
         "error_summary": "boom",
+        "boundary_sanitizer": execution_calls[0]["boundary_sanitizer"],
       }
     ]
+    assert callable(execution_calls[0]["boundary_sanitizer"])
 
     event_log = EventLog()
     dispatcher = ToolDispatcher(mcp_client=_NullMcpClient(), event_log=event_log)

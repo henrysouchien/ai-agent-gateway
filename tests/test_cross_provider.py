@@ -1,9 +1,12 @@
+# ruff: noqa: E402
+
 import asyncio
 import datetime
-import logging
 import sys
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
@@ -13,19 +16,21 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway import (
   AgentRunner,
   EventLog,
-  GatewaySession,
   ModelInfo,
   ModelProvider,
-  ProviderResolver,
-  ResolvedProvider,
   SkillLoader,
   ToolDispatcher,
   make_run_agent_handler,
   make_run_agent_tool_def,
   parse_skill_file,
 )
+from agent_gateway.capability_binding import (
+  CapabilityResolutionError,
+)
+from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.providers import StreamEvent
-import agent_gateway._provider_utils as provider_utils
+from tests.tool_catalog_test_support import OWNER_GATEWAY_SESSION
+from tests.capability_execution_test_support import stub_bound_capability_execution
 
 
 def _run(coro):
@@ -47,9 +52,10 @@ class _RecordingProvider(ModelProvider):
   def __init__(self, name: str) -> None:
     self.name = name
     self.created_configs: list[dict[str, Any]] = []
+    self.request_tools: list[list[dict[str, Any]]] = []
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
-    return True
+    return bool(config.get("api_key"))
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
     _ = timeout
@@ -63,6 +69,7 @@ class _RecordingProvider(ModelProvider):
     return ModelInfo(
       id=model,
       provider=self.name,
+      supports_thinking=True,
       input_cost_per_mtok=0.0,
       output_cost_per_mtok=0.0,
       cache_read_cost_per_mtok=0.0,
@@ -79,7 +86,8 @@ class _RecordingProvider(ModelProvider):
     max_tokens: int,
     **kwargs: Any,
   ) -> dict[str, Any]:
-    _ = model, messages, system_prompt, tools, max_tokens, kwargs
+    _ = model, messages, system_prompt, max_tokens, kwargs
+    self.request_tools.append(list(tools))
     return {}
 
   async def stream(self, client: Any, params: dict[str, Any]):
@@ -92,32 +100,98 @@ class _RecordingProvider(ModelProvider):
     yield StreamEvent(type="message_end", stop_reason="end_turn")
 
 
+def _execution(
+  provider: _RecordingProvider,
+  model: str,
+  *,
+  capability_id: str = "node.implement",
+) -> BoundCapabilityExecution:
+  return stub_bound_capability_execution(
+    provider=provider,
+    model=model,
+    effort="high",
+    capability_id=capability_id,
+    credential_principal="user",
+    auth_config={
+      "api_key": f"{provider.name}-key",
+      "max_tokens": 16_000,
+    },
+  )
+
+
+class _ExactResolver:
+  def __init__(self) -> None:
+    self.providers = {
+      "anthropic": _RecordingProvider("anthropic"),
+      "openai": _RecordingProvider("openai"),
+    }
+    self.calls: list[dict[str, Any]] = []
+
+  def resolve(self, capability_id: str, **kwargs: Any) -> BoundCapabilityExecution:
+    self.calls.append({"capability_id": capability_id, **kwargs})
+    return _execution(
+      self.providers["anthropic"],
+      "claude-sonnet-4-6",
+      capability_id=capability_id,
+    )
+
+
 class _StubRunner:
   def __init__(self) -> None:
     self._full_session_id = "session-cross-provider"
+    self._agent_session_log = object()
     self.calls: list[dict[str, Any]] = []
+    self.durable_events: list[dict[str, Any]] = []
+
+  async def _append_durable_event(
+    self,
+    event: dict[str, Any],
+  ) -> object:
+    self.durable_events.append(dict(event))
+    return object()
+
+  async def _confirm_durable_skill_event(
+    self,
+    event: dict[str, Any],
+  ) -> dict[str, Any] | None:
+    return next(
+      (
+        dict(durable_event)
+        for durable_event in self.durable_events
+        if durable_event == event
+      ),
+      None,
+    )
 
   async def spawn_sub_agent(self, task: str, **kwargs: Any):
     self.calls.append({"task": task, **kwargs})
     return {"response": "ok"}, None
 
 
-def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
+def _make_dispatcher(
+  event_log: EventLog | None = None,
+  *,
+  get_tool_definitions: Any | None = None,
+) -> ToolDispatcher:
   return ToolDispatcher(
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
     event_log=event_log or EventLog(),
     session_id="sess-parent",
+    get_tool_definitions=get_tool_definitions,
   )
 
 
-def _make_runner(provider: ModelProvider, *, auth_config: dict[str, Any] | None = None) -> AgentRunner:
+def _make_runner(provider: _RecordingProvider) -> AgentRunner:
   return AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=provider,
-    auth_config=auth_config or {"api_key": "parent-key", "model": "claude-sonnet-4-6"},
+    capability_execution=_execution(
+      provider,
+      "claude-sonnet-4-6",
+      capability_id="session.driver",
+    ),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -129,241 +203,148 @@ def _write_skill(skills_dir: Path, name: str, body: str) -> None:
   (skills_dir / f"{name}.md").write_text(body, encoding="utf-8")
 
 
-def test_spawn_sub_agent_provider_override_uses_provided_provider_and_auth_config() -> None:
-  parent_provider = _RecordingProvider("anthropic")
-  child_provider = _RecordingProvider("openai")
-  runner = _make_runner(parent_provider)
-
-  result, error = _run(
-    runner.spawn_sub_agent(
-      "Collect context",
-      provider=child_provider,
-      auth_config={"api_key": "child-key", "model": "gpt-4o-mini"},
-      dispatcher=_make_dispatcher(),
-      max_turns=1,
-      timeout=5.0,
-    )
-  )
-
-  assert error is None
-  assert result is not None
-  assert result["response"] == "openai response"
-  assert parent_provider.created_configs == []
-  assert child_provider.created_configs == [
-    {
-      "auth_mode": "api",
-      "api_key": "child-key",
-      "auth_token": "",
-      "model": "gpt-4o-mini",
-      "max_tokens": 16000,
-      "effort": "high",
-      "thinking_enabled_requested": True,
-    }
-  ]
-
-
-def test_spawn_sub_agent_provider_override_requires_auth_config() -> None:
+def test_spawn_sub_agent_requires_bound_execution_instead_of_parent_fallback() -> None:
   runner = _make_runner(_RecordingProvider("anthropic"))
 
-  result, error = _run(
-    runner.spawn_sub_agent(
-      "Collect context",
-      provider=_RecordingProvider("openai"),
-      dispatcher=_make_dispatcher(),
-      max_turns=1,
-      timeout=5.0,
+  with pytest.raises(TypeError, match="capability_execution"):
+    _run(
+      runner.spawn_sub_agent(  # type: ignore[call-arg]
+        "Collect context",
+        dispatcher=_make_dispatcher(),
+        max_turns=1,
+        timeout=5.0,
+      )
     )
+
+
+def test_bound_execution_rejects_provider_family_mismatch() -> None:
+  execution = _execution(_RecordingProvider("openai"), "gpt-4o-mini")
+  with pytest.raises(CapabilityResolutionError, match="does not match"):
+    BoundCapabilityExecution(
+      bind=execution.bind,
+      registry=execution.registry,
+      adapter=_RecordingProvider("anthropic"),
+      auth_config=execution.auth_config,
+    )
+
+
+def test_run_agent_rejects_raw_provider_and_model_selection_before_spawn() -> None:
+  runner = _StubRunner()
+  resolver = _ExactResolver()
+  handler = make_run_agent_handler(
+    [runner],
+    parent_session=OWNER_GATEWAY_SESSION,
+    skill_loader=None,
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={},
+    capability_execution_resolver=resolver,
   )
+
+  result, error = _run(handler({
+    "background": False,
+    "task": "Collect",
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+  }))
 
   assert result is None
-  assert error == {"code": "invalid_input", "message": "auth_config required when overriding provider"}
+  assert error["code"] == "invalid_input"
+  assert resolver.calls == []
+  assert runner.calls == []
 
 
-def test_spawn_sub_agent_without_provider_uses_parent_provider_and_existing_auth_chain() -> None:
-  parent_provider = _RecordingProvider("anthropic")
-  runner = _make_runner(parent_provider)
-  sub_session = GatewaySession(
-    session_id="sub0:sess-parent",
-    api_key_hash="hash",
-    created_at=1,
-    expires_at=2,
-    user_id="alice",
-    auth_config={"api_key": "sub-key", "model": "claude-opus-4-6"},
-  )
-
-  result, error = _run(
-    runner.spawn_sub_agent(
-      "Collect context",
-      dispatcher=_make_dispatcher(),
-      sub_session=sub_session,
-      max_turns=1,
-      timeout=5.0,
-    )
-  )
-
-  assert error is None
-  assert result is not None
-  assert result["response"] == "anthropic response"
-  assert parent_provider.created_configs == [
-    {
-      "auth_mode": "api",
-      "api_key": "sub-key",
-      "auth_token": "",
-      "model": "claude-opus-4-6",
-      "max_tokens": 16000,
-      "effort": "high",
-      "thinking_enabled_requested": True,
-    }
-  ]
-
-
-def test_make_run_agent_handler_resolves_provider_before_model_validation() -> None:
+def test_run_agent_rejects_provider_only_before_resolver_or_spawn() -> None:
   runner = _StubRunner()
-  resolved_provider = _RecordingProvider("openai")
-
-  def _resolve_provider(name: str) -> ResolvedProvider:
-    assert name == "openai"
-    return ResolvedProvider(
-      provider=resolved_provider,
-      auth_config={"api_key": "openai-key"},
-      allowed_models={"gpt-4o-mini"},
-    )
-
-  resolver: ProviderResolver = _resolve_provider
+  resolver = _ExactResolver()
   handler = make_run_agent_handler(
     [runner],
     skill_loader=None,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
-    allowed_models={"claude-sonnet-4-6"},
-    provider_resolver=resolver,
-  )
-
-  result, error = _run(handler({"task": "Collect", "provider": "openai", "model": "gpt-4o-mini"}))
-
-  assert error is None
-  assert result == {"response": "ok"}
-  assert len(runner.calls) == 1
-  assert runner.calls[0]["task"] == "Collect"
-  assert runner.calls[0]["provider"] is resolved_provider
-  assert runner.calls[0]["auth_config"] == {"api_key": "openai-key"}
-  assert runner.calls[0]["model"] == "gpt-4o-mini"
-  assert runner.calls[0]["system_prompt"].endswith(f"Today's date: {datetime.date.today().isoformat()}")
-  assert runner.calls[0]["excluded_tools"] == {"run_agent", "get_background_result", "send_message"}
-
-
-def test_make_run_agent_handler_without_provider_resolver_rejects_requested_provider() -> None:
-  handler = make_run_agent_handler(
-    [_StubRunner()],
-    skill_loader=None,
-    mcp_client=_NullMcpClient(),
-    local_tool_handlers={},
+    capability_execution_resolver=resolver,
   )
 
   result, error = _run(handler({"task": "Collect", "provider": "openai"}))
 
   assert result is None
-  assert error == {
-    "code": "provider_not_supported",
-    "message": "Provider 'openai' requested but no provider_resolver configured",
-  }
+  assert error["code"] == "invalid_input"
+  assert resolver.calls == []
+  assert runner.calls == []
+
+
+def test_run_agent_rejects_bare_upstream_model() -> None:
+  runner = _StubRunner()
+  resolver = _ExactResolver()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=None,
+    mcp_client=_NullMcpClient(),
+    local_tool_handlers={},
+    capability_execution_resolver=resolver,
+  )
+
+  result, error = _run(handler({
+    "background": False,
+    "task": "Collect",
+    "model": "gpt-4o-mini",
+  }))
+
+  assert result is None
+  assert error["code"] == "invalid_input"
+  assert resolver.calls == []
+  assert runner.calls == []
 
 
 def test_skill_profile_parses_provider_frontmatter(tmp_path: Path) -> None:
   skill_path = tmp_path / "worker.md"
-  skill_path.write_text("---\nprovider: openai\n---\nUse the OpenAI worker.\n", encoding="utf-8")
+  skill_path.write_text(
+    "---\nprovider: openai\n---\nUse the OpenAI worker.\n",
+    encoding="utf-8",
+  )
 
   profile = parse_skill_file(skill_path)
 
   assert profile.provider == "openai"
 
 
-def test_make_run_agent_handler_uses_skill_provider_and_resolved_default_model(tmp_path: Path) -> None:
+def test_run_agent_rejects_legacy_skill_and_task_selectors(tmp_path: Path) -> None:
   skills_dir = tmp_path / "skills"
   _write_skill(
     skills_dir,
     "openai-worker",
-    "---\nagent_callable: true\nagent_description: Uses the OpenAI worker.\nprovider: openai\n---\nUse the OpenAI worker.",
+    (
+      "---\nagent_callable: true\nagent_description: Uses the OpenAI worker.\n"
+      "provider: openai\nmodel: gpt-4o-mini\nmutation_mode: read_only\n"
+      "---\nUse the OpenAI worker."
+    ),
   )
   runner = _StubRunner()
-  resolved_provider = _RecordingProvider("openai")
-
-  def _resolve_provider(name: str) -> ResolvedProvider:
-    assert name == "openai"
-    return ResolvedProvider(
-      provider=resolved_provider,
-      auth_config={"api_key": "openai-key"},
-      allowed_models={"gpt-4o-mini"},
-      default_model="gpt-4o-mini",
-    )
-
-  resolver: ProviderResolver = _resolve_provider
+  resolver = _ExactResolver()
   handler = make_run_agent_handler(
     [runner],
     skill_loader=SkillLoader(skills_dir),
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
-    default_model="claude-sonnet-4-6",
-    allowed_models={"claude-sonnet-4-6"},
-    provider_resolver=resolver,
+    capability_execution_resolver=resolver,
   )
 
-  result, error = _run(handler({"agent": "openai-worker", "task": "Collect"}))
+  result, error = _run(handler({
+    "agent": "openai-worker",
+    "task": "Collect",
+    "background": False,
+  }))
 
-  assert error is None
-  assert result == {"response": "ok"}
-  assert len(runner.calls) == 1
-  assert runner.calls[0]["provider"] is resolved_provider
-  assert runner.calls[0]["auth_config"] == {"api_key": "openai-key"}
-  assert runner.calls[0]["model"] == "gpt-4o-mini"
+  assert result is None
+  assert error["code"] == "invalid_input"
+  assert resolver.calls == []
+  assert runner.calls == []
 
 
-def test_make_run_agent_handler_ignores_invalid_knob_for_resolved_provider(
-  tmp_path: Path,
-  monkeypatch,
-  caplog,
-) -> None:
-  skills_dir = tmp_path / "skills"
-  _write_skill(
-    skills_dir,
-    "openai-worker",
-    "---\nagent_callable: true\nagent_description: Uses the OpenAI worker.\nprovider: openai\n---\nUse the OpenAI worker.",
+def test_run_agent_tool_schema_omits_model_selection_authority() -> None:
+  schema = make_run_agent_tool_def()["input_schema"]
+
+  assert not {"provider", "model", "model_key", "effort"} & set(
+    schema["properties"]
   )
-  runner = _StubRunner()
-  resolved_provider = _RecordingProvider("openai")
-  provider_utils._SUB_AGENT_DEFAULT_MODEL_WARNED.clear()
-  monkeypatch.setenv("SUB_AGENT_DEFAULT_MODEL", "claude-opus-4-8")
-
-  def _resolve_provider(name: str) -> ResolvedProvider:
-    assert name == "openai"
-    return ResolvedProvider(
-      provider=resolved_provider,
-      auth_config={"api_key": "openai-key"},
-      allowed_models={"gpt-4o-mini"},
-      default_model="gpt-4o-mini",
-    )
-
-  handler = make_run_agent_handler(
-    [runner],
-    skill_loader=SkillLoader(skills_dir),
-    mcp_client=_NullMcpClient(),
-    local_tool_handlers={},
-    default_model="claude-sonnet-4-6",
-    allowed_models={"claude-sonnet-4-6", "claude-opus-4-8"},
-    provider_resolver=_resolve_provider,
-  )
-
-  caplog.set_level(logging.WARNING, logger="agent_gateway.provider_utils")
-  result, error = _run(handler({"agent": "openai-worker", "task": "Collect"}))
-
-  assert error is None
-  assert result == {"response": "ok"}
-  assert runner.calls[0]["provider"] is resolved_provider
-  assert runner.calls[0]["model"] == "gpt-4o-mini"
-  assert "Ignoring SUB_AGENT_DEFAULT_MODEL='claude-opus-4-8'" in caplog.text
-
-
-def test_make_run_agent_tool_def_includes_provider_field() -> None:
-  tool_def = make_run_agent_tool_def()
-
-  assert "provider" in tool_def["input_schema"]["properties"]
+  assert schema["required"] == ["objective"]
+  assert schema["additionalProperties"] is False

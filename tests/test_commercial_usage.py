@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from agent_workflow_contracts import CapabilityBind
 
 from agent_gateway.commercial_claims import VerifiedCommercialClaim
 from agent_gateway.commercial_work_authorization import VerifiedWorkAuthorization
@@ -18,12 +19,13 @@ from agent_gateway.commercial_usage import (
 from agent_gateway.multi_user.billing import SessionUsageSummary, UsageEvent
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker
 from agent_gateway.runner_usage import call_usage_event_hook
-from agent_gateway.providers import StreamEvent
+from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.usage_outbox import CommercialUsageOutboxError
 from agent_gateway.usage_resilience import (
   CommercialUsageCircuitOpen,
   CommercialUsageDurability,
 )
+from tests.capability_execution_test_support import stub_bound_capability_execution
 
 
 send_prompt_module = importlib.import_module("agent_gateway.send_prompt")
@@ -71,6 +73,23 @@ def _lineage(**changes) -> CommercialUsageLineage:
 
 
 def _event(**changes) -> UsageEvent:
+  capability_bind = CapabilityBind(
+    schema_version="1.0",
+    capability_id="portfolio.review",
+    model_key="anthropic.claude-sonnet-test",
+    provider="anthropic",
+    upstream_model="claude-sonnet-test",
+    adapter="anthropic.sdk.messages",
+    protocol_profile="anthropic.messages",
+    route="direct",
+    effort="none",
+    credential_principal="user",
+    credential_ref="test-credential",
+    run_mode="interactive",
+    registry_revision="test-v1",
+    policy_revision="test-v1",
+    selection_source="explicit_user",
+  ).receipt()
   facts = {
     "user_id": "123",
     "session_id": "sess_001",
@@ -79,6 +98,8 @@ def _event(**changes) -> UsageEvent:
     "timestamp": float(NOW),
     "model": "claude-sonnet-test",
     "provider": "anthropic",
+    "capability_bind": capability_bind,
+    "provider_reported_model": None,
     "input_tokens": 1000,
     "output_tokens": 200,
     "reasoning_tokens_observed": 50,
@@ -140,6 +161,19 @@ async def test_producer_emits_complete_canonical_delta_without_reasoning_double_
 
   assert payload is not None
   assert emitted == [payload]
+  assert payload["schema_version"] == 3
+  assert payload["capability_bind"] == _event().capability_bind
+  assert payload["provider"] == payload["capability_bind"]["provider"]
+  assert payload["model"] == payload["capability_bind"]["upstream_model"]
+  assert payload["capability_id"] == payload["capability_bind"]["capability_id"]
+  assert payload["provider_reported_model"] is None
+  assert all(payload[field] is None for field in (
+    "workflow_attempt_group_id",
+    "workflow_attempt_number",
+    "retry_of_workflow_run_id",
+    "workflow_attempt_kind",
+    "work_authorization_id",
+  ))
   assert payload["uncached_input_tokens"] == 1000
   assert payload["billable_output_tokens"] == 200
   assert payload["reasoning_tokens_observed"] == 50
@@ -150,7 +184,34 @@ async def test_producer_emits_complete_canonical_delta_without_reasoning_double_
 
 
 @pytest.mark.asyncio
-async def test_verified_work_start_emits_attempt_authoritative_usage_v2() -> None:
+async def test_producer_keeps_reported_model_distinct_from_exact_bind() -> None:
+  producer = CommercialUsageProducer(
+    enabled=True, claim=_claim(), lineage=_lineage(), sink=lambda _events: None
+  )
+  payload = await producer.emit(
+    _event(provider_reported_model="claude-sonnet-test-20260801")
+  )
+
+  assert payload is not None
+  assert payload["provider_reported_model"] == "claude-sonnet-test-20260801"
+  assert payload["model"] == "claude-sonnet-test"
+  assert payload["capability_bind"]["upstream_model"] == "claude-sonnet-test"
+
+
+@pytest.mark.asyncio
+async def test_producer_rejects_capability_projection_drift() -> None:
+  producer = CommercialUsageProducer(
+    enabled=True,
+    claim=_claim(),
+    lineage=_lineage(capability_id="different.capability"),
+    sink=lambda _events: None,
+  )
+  with pytest.raises(ValueError, match="capability projection differs"):
+    await producer.emit(_event())
+
+
+@pytest.mark.asyncio
+async def test_verified_work_start_emits_attempt_authoritative_usage_v3() -> None:
   emitted = []
   work_start = _work_start(attempt_number=2)
   producer = CommercialUsageProducer(
@@ -165,7 +226,9 @@ async def test_verified_work_start_emits_attempt_authoritative_usage_v2() -> Non
 
   assert payload is not None
   authorization = work_start.authorization
-  assert payload["schema_version"] == 2
+  assert payload["schema_version"] == 3
+  assert payload["capability_bind"] == _event().capability_bind
+  assert payload["provider_reported_model"] is None
   assert payload["workflow_run_id"] == str(authorization.workflow_run_id)
   assert payload["workflow_attempt_group_id"] == str(
     authorization.workflow_attempt_group_id
@@ -190,7 +253,7 @@ async def test_verified_work_start_emits_attempt_authoritative_usage_v2() -> Non
     {"billing_mode": "byok"},
   ),
 )
-async def test_usage_v2_rejects_drift_from_verified_work_start(event_changes) -> None:
+async def test_usage_v3_rejects_drift_from_verified_work_start(event_changes) -> None:
   producer = CommercialUsageProducer(
     enabled=True,
     claim=None,
@@ -198,7 +261,7 @@ async def test_usage_v2_rejects_drift_from_verified_work_start(event_changes) ->
     sink=lambda _events: None,
     work_start=_work_start(),
   )
-  with pytest.raises(ValueError, match="differs from verified"):
+  with pytest.raises(ValueError, match="differs"):
     await producer.emit(_event(**event_changes))
 
 
@@ -305,7 +368,7 @@ async def test_resilient_durability_constructs_request_scoped_producer(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_resilient_durability_persists_verified_usage_v2(tmp_path) -> None:
+async def test_resilient_durability_persists_verified_usage_v3(tmp_path) -> None:
   durability = CommercialUsageDurability.create(
     outbox_path=tmp_path / "commercial.sqlite3",
     spool_path=tmp_path / "commercial.spool",
@@ -321,7 +384,7 @@ async def test_resilient_durability_persists_verified_usage_v2(tmp_path) -> None
   assert payload is not None
   stored = durability.outbox.get(payload["source_event_id"])
   assert stored is not None
-  assert stored.payload["schema_version"] == 2
+  assert stored.payload["schema_version"] == 3
   assert stored.payload["workflow_attempt_number"] == 2
   assert stored.payload["workflow_attempt_group_id"] == str(
     work_start.authorization.workflow_attempt_group_id
@@ -364,6 +427,7 @@ async def test_session_reconciliation_callback_never_emits_second_cost_event() -
     cache_creation_tokens=100, cost=0.0125, turns=1, channel="mcp",
     started_at=NOW - 1, ended_at=NOW,
     usage_event_count=1, usage_event_ids=("evt_001",),
+    capability_bind=_event().capability_bind,
   ))
 
   assert report.status == "match"
@@ -396,6 +460,7 @@ async def test_resilient_producer_persists_default_reconciliation_revisions(
     cache_creation_tokens=100, cost=0.0125, turns=1, channel="mcp",
     started_at=NOW - 1, ended_at=NOW,
     usage_event_count=1, usage_event_ids=("evt_001",),
+    capability_bind=_event().capability_bind,
   )
   report = await producer.reconcile(summary)
   assert report.status == "match"
@@ -447,6 +512,7 @@ async def test_resilient_producer_persists_reconciliation_with_custom_observer(
     cache_creation_tokens=100, cost=0.0125, turns=1, channel="mcp",
     started_at=NOW - 1, ended_at=NOW,
     usage_event_count=1, usage_event_ids=("evt_001",),
+    capability_bind=_event().capability_bind,
   ))
 
   assert observed == [report]
@@ -497,6 +563,7 @@ async def test_reconciliation_persistence_failure_trips_future_work_without_retr
     cache_creation_tokens=100, cost=0.0125, turns=1, channel="mcp",
     started_at=NOW - 1, ended_at=NOW,
     usage_event_count=1, usage_event_ids=("evt_001",),
+    capability_bind=_event().capability_bind,
   ))
   assert report.status == "match"
   assert durability.circuit_breaker.snapshot.tripped is True
@@ -532,12 +599,19 @@ async def test_shared_runner_hook_produces_before_legacy_observer() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_prompt_real_producer_emits_metered_canonical_identity(monkeypatch) -> None:
-  class Provider:
+async def test_send_prompt_real_producer_emits_metered_canonical_identity() -> None:
+  class Provider(ModelProvider):
     name = "anthropic"
 
     def has_active_credential(self, config):
       return True
+
+    def get_model_info(self, model):
+      return ModelInfo(
+        id=model,
+        provider=self.name,
+        supports_thinking=True,
+      )
 
     def create_client(self, config, *, timeout=None):
       return object()
@@ -560,14 +634,31 @@ async def test_send_prompt_real_producer_emits_metered_canonical_identity(monkey
       return None
 
   emitted = []
-  producer = CommercialUsageProducer(
-    enabled=True, claim=_claim(), lineage=_lineage(), sink=emitted.extend
+  provider = Provider()
+  capability_execution = stub_bound_capability_execution(
+    provider=provider,
+    model="claude-sonnet-4-6",
+    effort="none",
+    credential_principal="user",
+    auth_config={
+      "max_tokens": 4096,
+      "auth_mode": "api",
+      "api_key": "k",
+    },
   )
-  monkeypatch.setattr(send_prompt_module, "AnthropicProvider", Provider)
+  producer = CommercialUsageProducer(
+    enabled=True,
+    claim=_claim(),
+    lineage=_lineage(capability_id="session.driver"),
+    sink=emitted.extend,
+  )
 
   await send_prompt_module.send_prompt(
-    "hello", model="claude-sonnet-4-6", user_id="alice",
-    auth_config={"api_key": "k"}, session_id="sess-1", request_id="req-1",
+    "hello",
+    capability_execution=capability_execution,
+    user_id="alice",
+    session_id="sess-1",
+    request_id="req-1",
     rate_table_version="rates-v1", billing_mode="metered", channel="mcp",
     commercial_usage_producer=producer,
   )

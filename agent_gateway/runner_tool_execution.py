@@ -10,7 +10,12 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent_workflow_contracts import AgentCompletionEnvelope, TaskResult
+
 from .artifact_readback import readback_artifact_ready_event
+from .runner_background_tasks import (
+  _BACKGROUND_RESULT_ACK_RESULT_KEY,
+)
 from .runner_session_events import (
   build_tool_call_complete_event as _build_tool_call_complete_event,
   build_tool_call_start_event as _build_tool_call_start_event,
@@ -18,12 +23,29 @@ from .runner_session_events import (
 from .runner_session_lifecycle import _runner_attr
 from .runner_state import ToolResultContext
 from .runner_tool_audit import redact_tool_input_for_event as _redact_tool_input_for_event
+from .secret_boundary import (
+  sanitize_boundary_value,
+  sanitize_tool_event,
+  sanitization_failure_tool_input,
+)
 from .tool_display import resolve_display
 from .tool_result_semantics import classify_semantic_tool_error
+from .workflow_evidence_provenance import (
+  WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY as _WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY,
+  register_workflow_evidence_projection as _register_workflow_evidence_projection,
+)
+from .workflow_output_attachment import (
+  WorkflowOutputAttachment,
+  WorkflowOutputAttachmentError,
+  accepted_workflow_continuation_run_id,
+  completed_workflow_output_attachment,
+  record_workflow_output_attachment,
+)
 
 
 log = logging.getLogger("agent_gateway.runner")
 _RUN_AGENT_DISPATCH_TIMEOUT_SECONDS = 2100.0
+_ACTIVE_SKILL_ALLOW_RESULT_KEY = "_active_skill_allow"
 _ACTIVE_SKILL_DENY_RESULT_KEY = "_active_skill_deny"
 _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
 _READABLE_RESOURCE_SNAPSHOT_RESULT_KEY = "_readable_resource_snapshot"
@@ -90,6 +112,28 @@ _OUTPUT_FILE_GATED_TOOL_ALTERNATIVES: dict[str, dict[str, Any]] = {
     ),
   },
 }
+
+
+def _canonical_agent_result_payload(result: Any) -> Any:
+  """Serialize only the normalized agent-result wire models.
+
+  Dispatcher handlers are allowed to keep the strongly typed value in-process,
+  but the durable tool event and model-visible JSON boundary must never fall
+  through ``json.dumps(default=str)``.  This is deliberately not a generic
+  Pydantic adapter: only the two admitted parent-facing result contracts cross
+  this seam.
+  """
+
+  if isinstance(result, (TaskResult, AgentCompletionEnvelope)):
+    return result.model_dump(mode="json")
+  return result
+
+
+def _is_accepted_ui_blocks_result(tool_name: str, result: Any, error: Any) -> bool:
+  if tool_name != "emit_ui_blocks" or error is not None or not isinstance(result, dict):
+    return False
+  accepted = result.get("accepted")
+  return isinstance(accepted, dict) and isinstance(accepted.get("ui_blocks_id"), str)
 
 
 def _record_tool_excluded_attempt(runner: Any, tool_name: str) -> int:
@@ -373,6 +417,13 @@ class RunnerToolExecutionMixin:
       tool_name,
       tool_input,
     )
+    redacted_tool_input = sanitize_boundary_value(
+      redacted_tool_input,
+      sink="tool_input",
+      boundary=getattr(self, "_secret_boundary", None),
+    )
+    if not isinstance(redacted_tool_input, dict):
+      redacted_tool_input = sanitization_failure_tool_input()
     tool_input_preview = json_module.dumps(redacted_tool_input, default=str)[:200]
     logger.info(
       "[%s] Tool call: %s | input=%s",
@@ -388,14 +439,17 @@ class RunnerToolExecutionMixin:
         }
       },
     )
-    if tool_name == "emit_html_artifact":
-      html_bytes = len((tool_input.get("html") or "").encode("utf-8"))
-      if html_bytes > 512 * 1024:
+    if tool_name == "emit_canvas_artifact":
+      from .canvas_kit_contract import limits as canvas_kit_limits
+
+      source_bytes = len((tool_input.get("tsx_source") or "").encode("utf-8"))
+      source_cap = canvas_kit_limits()["source_max_bytes"]
+      if source_bytes > source_cap:
         return (
           self._make_error_result(
             tool_id,
             "invalid_input",
-            f"emit_html_artifact: html payload {html_bytes} bytes exceeds 512KB limit",
+            f"emit_canvas_artifact: tsx_source payload {source_bytes} bytes exceeds {source_cap} byte limit",
           ),
           tool_name,
           [],
@@ -443,6 +497,9 @@ class RunnerToolExecutionMixin:
     load_servers_signal: Optional[List[str]] = None
     load_local_tools_signal: Optional[List[str]] = None
     readable_resource_snapshot: dict[str, Any] | None = None
+    background_result_ack: tuple[str, int] | None = None
+    workflow_output_attachment: WorkflowOutputAttachment | None = None
+    superseded_continuation_run_id: str | None = None
 
     try:
       if tool_name in self._effective_excluded_tools():
@@ -461,6 +518,10 @@ class RunnerToolExecutionMixin:
           setattr(self, "_stop_after_tool_results_tool_name", tool_name)
       else:
         dispatch_kwargs: Dict[str, Any] = {"call_index": call_index}
+        if getattr(self, "_dispatcher_accepts_advertised_tool_names", False):
+          dispatch_kwargs["advertised_tool_names"] = base_kwargs.get(
+            "_request_advertised_tool_names"
+          )
         if self._dispatcher_accepts_abort_event:
           dispatch_kwargs["abort_event"] = self._tool_abort_event
         if self._dispatcher_accepts_skill_run_context:
@@ -486,7 +547,19 @@ class RunnerToolExecutionMixin:
         # MCP tools already carry per-server read timeouts in McpClientManager.
         # Applying the runner's generic cap here would mask longer server policy.
         has_mcp_server_timeout = server is not None
-        skip_timeout = tool_name == "get_background_result" or needs_approval or has_mcp_server_timeout
+        # run_name_pipeline and workflow_run dispatch captured LLM work whose
+        # duration is fundamentally unknowable — wall-clock caps on LLM work are the
+        # ACUI-25 anti-pattern (a cap terminally killed legitimate slow turns
+        # before the stall guard could act). Liveness for LLM work is the
+        # event-gap stall watchdog, never a timeout (operator ruling,
+        # 2026-08-01); the generic cap must not apply.
+        skip_timeout = (
+          tool_name == "get_background_result"
+          or tool_name == "run_name_pipeline"
+          or tool_name == "workflow_run"
+          or needs_approval
+          or has_mcp_server_timeout
+        )
         effective_tool_timeout = self._tool_call_timeout
         if tool_name == "run_agent":
           # Sub-agents legitimately outrun the generic tool cap, but skipping the
@@ -520,13 +593,50 @@ class RunnerToolExecutionMixin:
         else:
           result, error = await dispatch_coro
 
+      if error is None:
+        result = _canonical_agent_result_payload(result)
+
       # Strip private control fields from result before logging, event capture, and
       # model-bound tool_result content. _load_servers is a control signal -- capture
       # it for _refresh_tools (called after finally), then remove from result.
       if error is None and isinstance(result, dict):
+        popped_background_result_ack = result.pop(
+          _BACKGROUND_RESULT_ACK_RESULT_KEY,
+          None,
+        )
+        requested_background_task_id = tool_input.get("task_id")
+        if (
+          tool_name == "get_background_result"
+          and isinstance(requested_background_task_id, str)
+          and requested_background_task_id.strip() != "*"
+          and isinstance(popped_background_result_ack, dict)
+          and popped_background_result_ack.get("task_id")
+          == requested_background_task_id.strip()
+          and isinstance(
+            popped_background_result_ack.get("notification_generation"),
+            int,
+          )
+          and not isinstance(
+            popped_background_result_ack.get("notification_generation"),
+            bool,
+          )
+        ):
+          background_result_ack = (
+            requested_background_task_id.strip(),
+            popped_background_result_ack["notification_generation"],
+          )
         popped_snapshot = result.pop(_READABLE_RESOURCE_SNAPSHOT_RESULT_KEY, None)
         if isinstance(popped_snapshot, dict):
           readable_resource_snapshot = popped_snapshot
+        popped_workflow_evidence = result.pop(
+          _WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY,
+          None,
+        )
+        if isinstance(popped_workflow_evidence, dict):
+          _register_workflow_evidence_projection(
+            getattr(self, "_workflow_evidence_provenance", {}),
+            popped_workflow_evidence,
+          )
         popped = result.pop("_load_servers", None)
         if isinstance(popped, list):
           load_servers_signal = [str(server_name) for server_name in popped if server_name]
@@ -538,8 +648,14 @@ class RunnerToolExecutionMixin:
           "_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY",
           _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY,
         )
+        skill_allow_key = _runner_attr(
+          self,
+          "_ACTIVE_SKILL_ALLOW_RESULT_KEY",
+          _ACTIVE_SKILL_ALLOW_RESULT_KEY,
+        )
         skill_deny_key = _runner_attr(self, "_ACTIVE_SKILL_DENY_RESULT_KEY", _ACTIVE_SKILL_DENY_RESULT_KEY)
         self._activate_skill_report_doors(result.pop(report_doors_key, None))
+        self._activate_skill_allow(result.pop(skill_allow_key, None), base_kwargs)
         self._activate_skill_deny(result.pop(skill_deny_key, None), base_kwargs)
 
       tool_elapsed = time_module.time() - tool_t0
@@ -549,7 +665,36 @@ class RunnerToolExecutionMixin:
           "classify_semantic_tool_error",
           classify_semantic_tool_error,
         )(result)
-      result_json = json_module.dumps(result, default=str) if result is not None else ""
+      if error is None and semantic_error is None:
+        superseded_continuation_run_id = accepted_workflow_continuation_run_id(
+          tool_name,
+          result,
+        )
+        try:
+          workflow_output_attachment = completed_workflow_output_attachment(
+            tool_name,
+            result,
+          )
+        except WorkflowOutputAttachmentError as exc:
+          result = None
+          error = {
+            "code": "workflow_output_attachment_invalid",
+            "message": str(exc),
+          }
+      if semantic_error is None and _is_accepted_ui_blocks_result(tool_name, result, error):
+        setattr(self, "_stop_after_tool_results_reason", "accepted_ui_blocks")
+        setattr(self, "_stop_after_tool_results_tool_name", tool_name)
+      log_result = sanitize_boundary_value(
+        result,
+        sink="tool_log",
+        boundary=getattr(self, "_secret_boundary", None),
+      )
+      log_error = sanitize_boundary_value(
+        error if error is not None else semantic_error,
+        sink="tool_log",
+        boundary=getattr(self, "_secret_boundary", None),
+      )
+      result_json = json_module.dumps(log_result, default=str) if result is not None else ""
       result_bytes = len(result_json)
       result_preview = result_json[:150] if result_json else "null"
       if error or semantic_error:
@@ -559,7 +704,7 @@ class RunnerToolExecutionMixin:
           self._sid,
           tool_name,
           tool_elapsed,
-          error_detail,
+          log_error,
           extra={
             "data": {
               "event": "tool_done",
@@ -569,8 +714,8 @@ class RunnerToolExecutionMixin:
               "server": server,
               "error": True,
               "semantic_error": semantic_error is not None and error is None,
-              "error_detail": str(error_detail)[:200],
-              "error_sub_code": error_detail.get("sub_code", "") if isinstance(error_detail, dict) else "",
+              "error_detail": str(log_error)[:200],
+              "error_sub_code": log_error.get("sub_code", "") if isinstance(log_error, dict) else "",
             }
           },
         )
@@ -597,7 +742,12 @@ class RunnerToolExecutionMixin:
       cancelled_exc = exc
       error = {"code": "cancelled", "message": "Task was cancelled"}
     except Exception as exc:
-      logger.error("[%s] Tool %s unhandled error: %s", self._sid, tool_name, exc)
+      safe_exc = sanitize_boundary_value(
+        str(exc),
+        sink="tool_log",
+        boundary=getattr(self, "_secret_boundary", None),
+      )
+      logger.error("[%s] Tool %s unhandled error: %s", self._sid, tool_name, safe_exc)
       error = {"code": "internal_error", "message": str(exc)}
     finally:
       duration_ms = int((time_module.time() - tool_t0) * 1000)
@@ -693,14 +843,63 @@ class RunnerToolExecutionMixin:
         skill_run_id=self._skill_run_id,
         workspace_dir=self._workspace_dir,
         batch_id=getattr(self, "_batch_id", None),
+        boundary_sanitizer=lambda value, sink: sanitize_boundary_value(
+          value,
+          sink=sink,
+          boundary=getattr(self, "_secret_boundary", None),
+        ),
       )
+    )
+    result_entry = sanitize_boundary_value(
+      result_entry,
+      sink="model_tool_result",
+      boundary=getattr(self, "_secret_boundary", None),
+    )
+    if not isinstance(result_entry, dict):
+      result_entry = {
+        "type": "tool_result",
+        "tool_use_id": tool_id,
+        "content": "<secret-sanitization-failed>",
+        "is_error": True,
+      }
+    sanitized_extra_blocks = sanitize_boundary_value(
+      extra_blocks,
+      sink="model_tool_result",
+      boundary=getattr(self, "_secret_boundary", None),
+    )
+    extra_blocks = (
+      [dict(block) for block in sanitized_extra_blocks if isinstance(block, dict)]
+      if isinstance(sanitized_extra_blocks, list)
+      else []
     )
     live_entry, durable_entry = self._compact_model_tool_result_entry(result_entry, tool_name=tool_name)
     final_tool_result_blocks = [dict(durable_entry)]
     final_tool_result_blocks.extend(dict(block) for block in extra_blocks)
     tool_complete_event["final_tool_result_blocks"] = final_tool_result_blocks
+    tool_complete_event = sanitize_tool_event(
+      tool_complete_event,
+      sink="tool_complete",
+      boundary=getattr(self, "_secret_boundary", None),
+    )
     await self._append_durable_event(tool_complete_event)
     self._append(tool_complete_event)
+    if superseded_continuation_run_id is not None:
+      # The continuation is durably accepted (tool_call_complete appended
+      # above), so any staged prior-revision attachment for this run is stale
+      # and must never reach a later final assistant turn (PN-E2E-03).
+      self._pending_workflow_output_attachments.pop(
+        superseded_continuation_run_id,
+        None,
+      )
+    if workflow_output_attachment is not None:
+      record_workflow_output_attachment(
+        self._pending_workflow_output_attachments,
+        workflow_output_attachment,
+      )
+    if background_result_ack is not None:
+      self._pending_background_result_acks[tool_id] = (
+        background_result_ack
+      )
     if error is None:
       # Stored-artifact readbacks surface to the pane as artifact_ready
       # (origin "readback") right behind their tool_call_complete.

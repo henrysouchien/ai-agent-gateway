@@ -11,6 +11,9 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway import AgentRunner, EventLog, McpClientManager, ModelInfo, ModelProvider, ToolDispatcher  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner import STREAM_STALL_TIMEOUT, STREAM_THINKING_STALL_TIMEOUT  # noqa: E402
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_bound_capability_execution,
+)
 
 
 def _run(coro):
@@ -42,7 +45,12 @@ class _CaptureProvider(ModelProvider):
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    raise ValueError(f"stop after create_client: {model}")
+    return ModelInfo(
+      id=model,
+      provider=self.name,
+      max_output_tokens=16_000,
+      supports_thinking=True,
+    )
 
   def build_request_params(
     self,
@@ -71,12 +79,17 @@ def _make_runner(*, stream_stall_timeout: float | None = None) -> AgentRunner:
     event_log=event_log,
     session_id="sess_watchdog",
   )
+  provider = _CaptureProvider()
   return AgentRunner(
     event_log=event_log,
     dispatcher=dispatcher,
     session_id="sess_watchdog",
-    provider=_CaptureProvider(),
-    auth_config={"api_key": "k"},
+    capability_execution=stub_bound_capability_execution(
+      provider=provider,
+      model="capture-model",
+      effort="high",
+      auth_config={"api_key": "k"},
+    ),
     get_tool_definitions=lambda: [],
     stream_stall_timeout=stream_stall_timeout,
     user_id="alice",
@@ -174,12 +187,16 @@ def test_runner_preserves_extra_auth_config_keys_for_provider_create_client() ->
     event_log=EventLog(),
     dispatcher=dispatcher,
     session_id="sess_passthrough",
-    provider=provider,
-    auth_config={
-      "api_key": "k",
-      "base_url": "https://custom.example/v1",
-      "compat": {"streaming": True},
-    },
+    capability_execution=stub_bound_capability_execution(
+      provider=provider,
+      model="claude-sonnet-5",
+      effort="high",
+      auth_config={
+        "api_key": "k",
+        "base_url": "https://custom.example/v1",
+        "compat": {"streaming": True},
+      },
+    ),
     mcp_client=McpClientManager(config_path=None),
     get_tool_definitions=lambda: [],
     user_id="alice",
@@ -193,6 +210,7 @@ def test_runner_preserves_extra_auth_config_keys_for_provider_create_client() ->
     "auth_mode": "api",
     "api_key": "k",
     "auth_token": "",
+    "provider": "capture",
     "model": "claude-sonnet-5",
     "max_tokens": 16000,
     "effort": "high",

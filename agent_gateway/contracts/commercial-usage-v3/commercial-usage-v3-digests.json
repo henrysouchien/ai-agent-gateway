@@ -1,0 +1,6 @@
+{
+  "contract_version": "commercial-usage-v3",
+  "digests": {
+    "commercial-usage-event-v3.schema.json": "sha256:ff61aa245ac411a3ba09012419ef71fc43a95d45f4264950508ff9528067debd"
+  }
+}

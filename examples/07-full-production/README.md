@@ -6,6 +6,8 @@ This example shows the "graduate from `create_agent()`" setup:
 - explicit API key allowlist
 - session TTL
 - CORS configuration
+- canonical `session.driver` capability and model policy
+- opaque service credential handles with deferred materialization
 - custom tool approval for a write tool
 - usage and tool timing hooks
 - transcript logging
@@ -30,7 +32,7 @@ This example enforces `valid_api_keys={"demo-key"}`.
 ```bash
 SESSION_TOKEN=$(curl -s http://127.0.0.1:8000/api/chat/init \
   -H 'Content-Type: application/json' \
-  -d '{"api_key":"demo-key"}' \
+  -d '{"api_key":"demo-key","user_id":"demo-user"}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_token"])')
 export SESSION_TOKEN
 ```
@@ -106,6 +108,9 @@ cat reports/launch-checklist.md
 ## What It Shows
 
 - App-level auth and session settings live in `GatewayServerConfig`.
+- The gateway resolves one exact `session.driver` bind before runtime
+  construction; the runtime reuses its provider, model, effort, bound auth, and
+  native execution transport.
 - Observability hooks can write JSONL logs without changing the runner core.
 - Tool approval can be scoped to side-effecting tools such as `write_report`.
 - Transcript files are written automatically when `transcript_dir` is configured.

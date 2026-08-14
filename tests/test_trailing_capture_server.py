@@ -9,10 +9,51 @@ import pytest
 from fastapi import HTTPException
 from pydantic import BaseModel
 
+from agent_gateway.capability_binding import (
+  CredentialHandle,
+)
+from agent_gateway.model_registry import (
+  CAPABILITY_IDS,
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
 from agent_gateway.event_log import EventLog, log_has_terminal
+from agent_gateway.providers import AnthropicProvider
+from agent_gateway.server import MaterializedCredential
 from agent_gateway.server_chat_helpers import _chat_turn_state_from_events, _dispatch_chat_turn
 from agent_gateway.server_models import ChatMessage, ChatRequest, ChatRuntime, ChatTurnInputs
 from agent_gateway.session import GatewaySession, SessionStream
+
+
+_SERVICE_HANDLE = CredentialHandle(
+  handle_id="service:trailing-capture-tests:anthropic",
+  provider="anthropic",
+  principal="service",
+  tenant_id="trailing-capture-tests",
+  actor_id=None,
+)
+_PROVIDER = AnthropicProvider()
+
+
+def _materialize_service_credential(
+  handle: CredentialHandle,
+) -> MaterializedCredential:
+  assert handle is _SERVICE_HANDLE
+  return MaterializedCredential(
+    handle=handle,
+    auth_config={
+      "provider": "anthropic",
+      "api_key": "test-key",
+      "billing_mode": "byok",
+      "rate_table_version": "test-v1",
+    },
+  )
+
+
+def _resolve_capability_provider(adapter: str) -> AnthropicProvider:
+  if adapter != "anthropic.messages":
+    raise RuntimeError(f"unknown test capability adapter: {adapter}")
+  return _PROVIDER
 
 
 def _run(coro):
@@ -31,7 +72,11 @@ def _session(*, kind: str = "chat", channel: str | None = None) -> GatewaySessio
     expires_at=4_000_000_000,
     user_id="alice",
     kind=kind,  # type: ignore[arg-type]
+    tenant_id=_SERVICE_HANDLE.tenant_id,
+    allow_service_for_interactive=True,
     channel=channel,
+    model_entitled_capabilities=CAPABILITY_IDS,
+    model_entitled_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
   )
 
 
@@ -42,7 +87,7 @@ def _inputs(*, profile: str | None = None) -> ChatTurnInputs:
     request_id="req-trailing",
     context=context,
     metadata={},
-    model=None,
+    model_key=None,
   )
 
 
@@ -51,8 +96,54 @@ async def _no_event(_event: Any) -> None:
 
 
 def _runtime_builder(runner_factory):
-  async def build_chat_runtime(*_args: Any, **_kwargs: Any) -> ChatRuntime:
-    return ChatRuntime(system_prompt="test", build_runner=runner_factory)
+  async def build_chat_runtime(
+    session,
+    request,
+    channel,
+    auth_manager,
+  ) -> ChatRuntime:
+    _ = (session, channel, auth_manager)
+    capability_bind = request.capability_bind
+    assert capability_bind is not None
+
+    def build_bound_runner(event_log, session_id, _started_at):
+      runner = runner_factory(event_log, session_id)
+      runner.capability_execution = request.capability_execution
+      return runner
+
+    return ChatRuntime(
+      system_prompt="test",
+      build_runner=build_bound_runner,
+      capability_execution=request.capability_execution,
+    )
+
+  setattr(
+    build_chat_runtime,
+    "_gateway_model_registry",
+    INITIAL_MODEL_REGISTRY,
+  )
+  setattr(
+    build_chat_runtime,
+    "_gateway_model_selection_policy",
+    INITIAL_MODEL_SELECTION_POLICY,
+  )
+  setattr(build_chat_runtime, "_gateway_tenant_id", _SERVICE_HANDLE.tenant_id)
+  setattr(
+    build_chat_runtime,
+    "_gateway_service_provider_handles",
+    {"anthropic": _SERVICE_HANDLE},
+  )
+  setattr(
+    build_chat_runtime,
+    "_gateway_service_auth_config_resolver",
+    _materialize_service_credential,
+  )
+  setattr(
+    build_chat_runtime,
+    "_gateway_capability_adapter_resolver",
+    _resolve_capability_provider,
+  )
+  setattr(build_chat_runtime, "_gateway_channel_profile_allowlist", None)
 
   return build_chat_runtime
 
@@ -78,7 +169,11 @@ class _DrainingRunner:
     self._terminal_emitted = terminal_emitted
 
   async def run(self, **_kwargs: Any) -> None:
-    self._event_log.append({"type": "stream_complete", "usage": {}})
+    self._event_log.append({
+      "type": "stream_complete",
+      "terminal_disposition": "completed",
+      "usage": {},
+    })
     self._terminal_emitted.set()
     await asyncio.Event().wait()
 
@@ -140,11 +235,41 @@ def test_log_has_terminal_falls_back_to_closed() -> None:
   assert log_has_terminal(SimpleNamespace(closed=False)) is False
 
 
+def test_stream_complete_disposition_closes_after_nonterminal_interruption() -> None:
+  event_log = EventLog()
+
+  interruption_entry = event_log.append({
+    "type": "interrupted",
+    "reason": "recovered_on_attach",
+  })
+  trailing_entry = event_log.append({
+    "type": "text_delta",
+    "text": "recovered",
+  })
+  terminal_entry = event_log.append({
+    "type": "stream_complete",
+    "terminal_disposition": "interrupted",
+    "reason": "operator_pause",
+    "usage": {},
+  })
+
+  assert interruption_entry is not None
+  assert trailing_entry is not None
+  assert terminal_entry is not None
+  assert event_log.has_terminal is True
+  assert event_log.closed is True
+  assert event_log.append({"type": "text_delta", "text": "too late"}) is None
+
+
 def test_deferred_dispatch_happy_path_closes_after_trailing_event(tmp_path) -> None:
   async def case() -> None:
     event_log = EventLog(defer_terminal_close=True)
     events = [
-      {"type": "stream_complete", "usage": {}},
+      {
+        "type": "stream_complete",
+        "terminal_disposition": "completed",
+        "usage": {},
+      },
       {"type": "citation_validation", "violation_count": 0},
     ]
     result = await _dispatch_chat_turn(
@@ -155,7 +280,6 @@ def test_deferred_dispatch_happy_path_closes_after_trailing_event(tmp_path) -> N
       build_chat_runtime=_runtime_builder(
         lambda log, _sid: _AppendingRunner(log, events)
       ),
-      credentials_resolver=None,
       transcript_dir=tmp_path,
     )
 
@@ -184,7 +308,6 @@ def test_deferred_dispatch_cancelled_mid_drain_keeps_first_terminal() -> None:
         build_chat_runtime=_runtime_builder(
           lambda log, _sid: _DrainingRunner(log, terminal_emitted)
         ),
-        credentials_resolver=None,
         transcript_dir=None,
       )
     )
@@ -196,7 +319,11 @@ def test_deferred_dispatch_cancelled_mid_drain_keeps_first_terminal() -> None:
     terminal_events = [
       entry.event for entry in event_log.entries if entry.event.get("type") in {"stream_complete", "error"}
     ]
-    assert terminal_events == [{"type": "stream_complete", "usage": {}}]
+    assert terminal_events == [{
+      "type": "stream_complete",
+      "terminal_disposition": "completed",
+      "usage": {},
+    }]
     assert event_log.closed is True
 
   _run(case())
@@ -211,7 +338,6 @@ def test_deferred_dispatch_runner_exception_emits_exactly_one_terminal() -> None
       event_log=event_log,
       on_event=_no_event,
       build_chat_runtime=_runtime_builder(lambda _log, _sid: _FailingRunner()),
-      credentials_resolver=None,
       transcript_dir=None,
     )
 
@@ -269,7 +395,6 @@ def test_dispatch_pre_lifecycle_rejections_preserve_scoped_close(
           event_log=event_log,
           on_event=_no_event,
           build_chat_runtime=build_runtime,
-          credentials_resolver=None,
           transcript_dir=None,
         )
       assert exc_info.value.status_code == status_code
@@ -298,10 +423,42 @@ def test_dispatch_pre_lifecycle_rejections_preserve_scoped_close(
 def test_chat_turn_state_uses_terminal_before_trailing_event() -> None:
   events = [
     {"type": "text_delta", "text": "done"},
-    {"type": "stream_complete"},
+    {"type": "stream_complete", "terminal_disposition": "completed"},
     {"type": "citation_validation", "violation_count": 0},
   ]
   assert _chat_turn_state_from_events(events) == "completed"
+
+
+def test_chat_turn_state_rejects_missing_terminal_disposition() -> None:
+  assert _chat_turn_state_from_events([{"type": "stream_complete"}]) == "failed"
+
+
+def test_chat_turn_state_projects_interrupted_terminal_with_trailing_event() -> None:
+  events = [
+    {"type": "operator_pause", "safe_boundary": "before_turn"},
+    {
+      "type": "stream_complete",
+      "terminal_disposition": "interrupted",
+      "reason": "operator_pause",
+    },
+    {"type": "citation_validation", "violation_count": 0},
+  ]
+
+  assert _chat_turn_state_from_events(events) == "interrupted"
+
+
+def test_chat_turn_state_uses_first_terminal_error_before_trailing_success() -> None:
+  events = [
+    {"type": "text_delta", "text": "partial"},
+    {"type": "error", "error": "provider failed"},
+    {
+      "type": "stream_complete",
+      "terminal_disposition": "completed",
+      "usage": {},
+    },
+  ]
+
+  assert _chat_turn_state_from_events(events) == "failed"
 
 
 def test_chat_request_drain_trailing_compatibility() -> None:
@@ -314,4 +471,3 @@ def test_chat_request_drain_trailing_compatibility() -> None:
   }
   assert LegacyChatRequest.model_validate(new_payload).messages == new_payload["messages"]
   assert ChatRequest.model_validate({"messages": new_payload["messages"]}).drain_trailing is False
-

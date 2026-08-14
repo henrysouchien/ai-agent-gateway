@@ -125,11 +125,10 @@ def test_user_event_bus_seeds_replay_buffer_from_durable_events() -> None:
         {"type": "message", "value": "two"},
         {"type": "message", "value": "three"},
       ],
-      terminated=True,
     )
     assert seeded == 2
 
-    subscriber = bus.subscribe_entries("alice", control_run_id="run-1", after_seq=0)
+    subscriber = await bus.subscribe_entries("alice", control_run_id="run-1", after_seq=0)
     truncated = await asyncio.wait_for(subscriber.__anext__(), timeout=0.5)
     assert truncated.seq is None
     assert truncated.event == {
@@ -149,6 +148,127 @@ def test_user_event_bus_seeds_replay_buffer_from_durable_events() -> None:
     assert live.event == {"type": "message", "value": "four"}
 
     assert await bus.seed_replay_buffer("alice", "run-1", [{"type": "message", "value": "duplicate"}]) == 0
+    await subscriber.aclose()
+    await bus.shutdown()
+
+  asyncio.run(_run())
+
+
+def test_terminal_publish_is_atomic_with_durable_replay_seed() -> None:
+  async def _run() -> None:
+    bus = UserEventBus()
+    terminal = {
+      "type": "run_state_changed",
+      "state": "completed",
+    }
+    assert await bus.seed_replay_buffer(
+      "alice",
+      "batch_1",
+      [terminal],
+      terminated=True,
+    ) == 1
+    assert await bus.publish_terminal_if_absent(
+      "alice",
+      "batch_1",
+      terminal,
+    ) is False
+
+    subscriber = await bus.subscribe_entries(
+      "alice",
+      control_run_id="batch_1",
+      after_seq=0,
+    )
+    replayed = await asyncio.wait_for(
+      subscriber.__anext__(),
+      timeout=0.5,
+    )
+    assert replayed.seq == 1
+    assert replayed.event == terminal
+    with pytest.raises(StopAsyncIteration):
+      await subscriber.__anext__()
+    await subscriber.aclose()
+    await bus.shutdown()
+
+  asyncio.run(_run())
+
+
+def test_terminal_publish_delivers_once_and_schedules_cleanup() -> None:
+  async def _run() -> None:
+    bus = UserEventBus()
+    terminal = {
+      "type": "run_state_changed",
+      "state": "failed",
+    }
+    subscriber = await bus.subscribe_entries(
+      "alice",
+      control_run_id="batch_2",
+    )
+
+    assert await bus.publish_terminal_if_absent(
+      "alice",
+      "batch_2",
+      terminal,
+    ) is True
+    assert await bus.publish_terminal_if_absent(
+      "alice",
+      "batch_2",
+      terminal,
+    ) is False
+    delivered = await asyncio.wait_for(
+      subscriber.__anext__(),
+      timeout=0.5,
+    )
+    assert delivered.seq == 1
+    assert delivered.event == terminal
+    with pytest.raises(StopAsyncIteration):
+      await subscriber.__anext__()
+    await subscriber.aclose()
+    await bus.shutdown()
+
+  asyncio.run(_run())
+
+
+def test_terminal_publish_appends_after_live_prefix_and_stops_follower() -> None:
+  async def _run() -> None:
+    bus = UserEventBus()
+    subscriber = await bus.subscribe_entries(
+      "alice",
+      control_run_id="batch_3",
+    )
+    terminal = {
+      "type": "run_state_changed",
+      "state": "completed",
+    }
+
+    await bus.publish(
+      "alice",
+      "batch_3",
+      {"type": "run_state_changed", "state": "running"},
+    )
+    prefix = await asyncio.wait_for(
+      subscriber.__anext__(),
+      timeout=0.5,
+    )
+    assert prefix.seq == 1
+    assert prefix.event["state"] == "running"
+    assert await bus.publish_terminal_if_absent(
+      "alice",
+      "batch_3",
+      terminal,
+    ) is True
+    assert await bus.publish_terminal_if_absent(
+      "alice",
+      "batch_3",
+      terminal,
+    ) is False
+    delivered = await asyncio.wait_for(
+      subscriber.__anext__(),
+      timeout=0.5,
+    )
+    assert delivered.seq == 2
+    assert delivered.event == terminal
+    with pytest.raises(StopAsyncIteration):
+      await subscriber.__anext__()
     await subscriber.aclose()
     await bus.shutdown()
 

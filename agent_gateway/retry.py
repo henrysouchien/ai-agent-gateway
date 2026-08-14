@@ -17,6 +17,7 @@ RetryHook = Callable[[int, str, float], Awaitable[None] | None]
 
 _DEFAULT_BACKOFF_STEPS = [30.0, 60.0, 120.0, 300.0, 600.0]
 _PERMANENT_STATUS_CODES = {400, 401, 403, 404}
+_WRITER_LEASE_ALREADY_HELD_EXIT_REASON = "writer_lease_already_held"
 _TRANSIENT_EXCEPTION_NAMES = {
   "APIConnectionError",
   "APITimeoutError",
@@ -124,6 +125,8 @@ def _classify_error_text(text: str | None) -> Outcome | None:
 
 def classify_outcome(exc: Exception | None, output: RunOutput | None) -> Outcome:
   if output is not None:
+    if output.exit_reason == _WRITER_LEASE_ALREADY_HELD_EXIT_REASON:
+      return "permanent"
     if output.operator_paused:
       return "permanent"
     if (

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import logging
 import sys
 from dataclasses import replace
@@ -36,7 +39,11 @@ from agent_gateway.batch_approval_projection import (
   BatchApprovalScope,
 )
 from agent_gateway.single_user_policy import SingleUserApprovalPolicy
-from agent_gateway.tool_dispatcher_helpers import PlannedWritePlanningRejected
+from agent_gateway.secret_boundary import SecretBoundary
+from agent_gateway.tool_dispatcher_helpers import (
+  PlannedWritePlanningRejected,
+  TrustedToolPlan,
+)
 from api.fms.core.change_set import (
   ArtifactOnlyPlan,
   ArtifactPayload,
@@ -50,18 +57,12 @@ from api.fms.core.change_set import (
   EffectSpec,
   InlinePayload,
   IntentRef,
-  JournaledCasPlan,
   ProducerRef,
   ReviewKind,
   ReviewRequirement,
-  SnapshotPayload,
-  StoreTarget,
-  StoreWritePayload,
   TargetRef,
   TargetScope,
-  compute_legacy_journal_base_vector_hash,
 )
-from schema.cas import journal_content_id
 
 
 class _NullMcp:
@@ -113,6 +114,34 @@ def _decision() -> SimpleNamespace:
     reason="needs approval",
     allow_persistent_grant=True,
   )
+
+
+def test_resolve_run_context_uses_canonical_session_owner_for_approval_identity() -> None:
+  session = SimpleNamespace(
+    user_id="henry",
+    owner_user_id="1",
+    request_id="request-1",
+    session_id="session-1",
+    channel="cli",
+  )
+
+  resolved = lifecycle_helpers.resolve_run_context(
+    run_context=RunContext(
+      user_id="henry",
+      request_id="request-1",
+      session_id="session-1",
+      profile="chat",
+      channel="cli",
+    ),
+    session=session,
+    user_id="henry",
+    channel="cli",
+    role="owner",
+    session_id="session-1",
+    approval_policy=SimpleNamespace(policy_bundle_hash="policy-1"),
+  )
+
+  assert resolved.user_id == "1"
 
 
 def test_tool_dispatcher_resolve_tool_class_uses_policy_owner(
@@ -260,8 +289,10 @@ def test_tool_dispatcher_resolve_tool_class_raises_when_policy_import_dependency
   def fake_import_module(_name: str) -> Any:
     raise ModuleNotFoundError("No module named 'broken_dependency'", name="broken_dependency")
 
-  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
+  # Construct first: since S1 fail-closed roles, __init__ resolves the
+  # effective role through the policy import machinery being broken here.
   dispatcher = ToolDispatcher(mcp_client=_NullMcp(), local_tool_handlers={}, event_log=EventLog())
+  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
 
   with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
     dispatcher._resolve_tool_class("execute_trade")
@@ -320,7 +351,7 @@ def test_non_batch_approval_keeps_global_wait_ceiling() -> None:
   ) == 270.0
 
 
-def test_pending_tool_helper_registers_event_waits_and_cleans_up() -> None:
+def test_durable_interactive_approval_event_carries_stable_id_and_cleans_up() -> None:
   async def scenario() -> None:
     session_log = _SessionLog()
     session = SimpleNamespace(pending_tools={}, approval_queues={}, agent_session_log=session_log)
@@ -350,7 +381,11 @@ def test_pending_tool_helper_registers_event_waits_and_cleans_up() -> None:
       "tool_name": "place_order",
       "resolved_qualifier": "qual-1",
     }
-    assert event_log.entries[0].event["type"] == "tool_approval_request"
+    approval_event = event_log.entries[0].event
+    assert approval_event["type"] == "tool_approval_request"
+    assert str(approval_event["approval_id"]).strip()
+    assert approval_event["approval_id"] == request.approval_id
+    assert session_log.events[0]["approval_id"] == approval_event["approval_id"]
     assert session_log.events[0]["allow_persistent_approval"] is True
 
     await queue.put({"approved": True, "allow_tool_type": False})
@@ -358,6 +393,55 @@ def test_pending_tool_helper_registers_event_waits_and_cleans_up() -> None:
     assert await task == {"approved": True, "allow_tool_type": False}
     assert session.pending_tools == {}
     assert session.approval_queues == {}
+
+  asyncio.run(scenario())
+
+
+def test_pending_tool_exposes_only_trusted_planned_change_projection() -> None:
+  async def scenario() -> None:
+    session = SimpleNamespace(pending_tools={}, approval_queues={}, agent_session_log=None)
+    event_log = EventLog()
+    planned_change = {
+      "schema_version": "planned-change-review.v1",
+      "change_set_id": "change-set-1",
+      "change_hash": "a" * 64,
+      "intent": {"subcommand": "persist_business_model"},
+      "target": {"ticker": "MSFT", "research_file_id": 1},
+    }
+    request = SimpleNamespace(
+      approval_id="approval-1",
+      tool_call_id="call-1",
+      tool_name="fms_persist_business_model",
+      tool_args_redacted={
+        "judgment": {"ticker": "MSFT", "large": "x" * 10_000},
+        "planned_change": planned_change,
+      },
+    )
+    task = asyncio.create_task(
+      lifecycle_helpers.await_user_approval_via_pending_tools(
+        session=session,
+        approval_store=None,
+        event_log=event_log,
+        request=request,
+        decision=_decision(),
+        nonce="nonce-1",
+        resolved_qualifier="qual-1",
+        allow_persistent=False,
+        timeout_seconds=5,
+        log=logging.getLogger("test"),
+      )
+    )
+
+    queue = await _wait_for_queue(session, request.tool_call_id)
+    pending = session.pending_tools[request.tool_call_id]
+    assert pending["planned_change"] == planned_change
+    assert "tool_input" not in pending
+    assert "judgment" not in pending
+    planned_change["target"]["ticker"] = "DRIFT"
+    assert pending["planned_change"]["target"]["ticker"] == "MSFT"
+
+    await queue.put({"approved": False, "allow_tool_type": False})
+    assert await task == {"approved": False, "allow_tool_type": False}
 
   asyncio.run(scenario())
 
@@ -479,6 +563,186 @@ def test_pending_tool_helper_expires_store_request_on_timeout() -> None:
   asyncio.run(scenario())
 
 
+def test_pending_tool_timeout_observes_concurrent_durable_vote() -> None:
+  async def scenario() -> None:
+    vote_won = asyncio.Event()
+    session = SimpleNamespace(
+      pending_tools={},
+      approval_queues={},
+      agent_session_log=None,
+    )
+
+    class Store:
+      state = "pending_user"
+      state_version = 7
+
+      async def get(self, approval_id: str) -> SimpleNamespace:
+        assert approval_id == "approval-1"
+        return SimpleNamespace(
+          approval_id=approval_id,
+          state=self.state,
+          state_version=self.state_version,
+        )
+
+      async def transition_state(
+        self,
+        approval_id: str,
+        state: str,
+        **kwargs: Any,
+      ) -> SimpleNamespace:
+        assert approval_id == "approval-1"
+        assert state == "expired"
+        assert kwargs["expected_state_version"] == 7
+        self.state = "approved"
+        self.state_version = 8
+        vote_won.set()
+        raise RuntimeError("approval request state_version changed")
+
+    task = asyncio.create_task(
+      lifecycle_helpers.await_user_approval_via_pending_tools(
+        session=session,
+        approval_store=Store(),
+        event_log=None,
+        request=_request(),
+        decision=_decision(),
+        nonce="nonce-1",
+        resolved_qualifier="",
+        allow_persistent=False,
+        timeout_seconds=0,
+        log=logging.getLogger("test"),
+      )
+    )
+
+    await asyncio.wait_for(vote_won.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert "call-1" in session.pending_tools
+    approval_queue = session.approval_queues["call-1"]
+    approval_queue.put_nowait({
+      "approved": True,
+      "allow_tool_type": False,
+      "approval_id": "approval-1",
+    })
+
+    assert await asyncio.wait_for(task, timeout=1) == {
+      "approved": True,
+      "allow_tool_type": False,
+      "approval_id": "approval-1",
+    }
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+
+  asyncio.run(scenario())
+
+
+def test_pending_tool_timeout_rejects_mismatched_vote_delivery() -> None:
+  async def scenario() -> None:
+    session = SimpleNamespace(
+      pending_tools={},
+      approval_queues={},
+      agent_session_log=None,
+    )
+
+    class Store:
+      state = "pending_user"
+      state_version = 7
+
+      async def get(self, approval_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+          approval_id=approval_id,
+          state=self.state,
+          state_version=self.state_version,
+        )
+
+      async def transition_state(
+        self,
+        _approval_id: str,
+        _state: str,
+        **_kwargs: Any,
+      ) -> SimpleNamespace:
+        self.state = "denied"
+        self.state_version = 8
+        raise RuntimeError("approval request state_version changed")
+
+    task = asyncio.create_task(
+      lifecycle_helpers.await_user_approval_via_pending_tools(
+        session=session,
+        approval_store=Store(),
+        event_log=None,
+        request=_request(),
+        decision=_decision(),
+        nonce="nonce-1",
+        resolved_qualifier="",
+        allow_persistent=False,
+        timeout_seconds=0,
+        log=logging.getLogger("test"),
+      )
+    )
+
+    queue = await _wait_for_queue(session, "call-1")
+    await asyncio.sleep(0.11)
+    queue.put_nowait({
+      "approved": False,
+      "allow_tool_type": False,
+      "approval_id": "different-approval",
+    })
+
+    with pytest.raises(
+      RuntimeError,
+      match="different approval",
+    ):
+      await asyncio.wait_for(task, timeout=1)
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+
+  asyncio.run(scenario())
+
+
+def test_pending_tool_timeout_bounds_missing_winner_delivery(
+  monkeypatch,
+) -> None:
+  async def scenario() -> None:
+    session = SimpleNamespace(
+      pending_tools={},
+      approval_queues={},
+      agent_session_log=None,
+    )
+
+    class Store:
+      async def get(self, approval_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+          approval_id=approval_id,
+          state="approved",
+          state_version=8,
+        )
+
+    monkeypatch.setattr(
+      lifecycle_helpers,
+      "_APPROVAL_WINNER_DELIVERY_TIMEOUT_SECONDS",
+      0.01,
+    )
+    with pytest.raises(
+      RuntimeError,
+      match="reconciliation deadline",
+    ):
+      await lifecycle_helpers.await_user_approval_via_pending_tools(
+        session=session,
+        approval_store=Store(),
+        event_log=None,
+        request=_request(),
+        decision=_decision(),
+        nonce="nonce-1",
+        resolved_qualifier="",
+        allow_persistent=False,
+        timeout_seconds=0,
+        log=logging.getLogger("test"),
+      )
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+
+  asyncio.run(scenario())
+
+
 def test_tool_dispatcher_pending_approval_wrapper_threads_instance_state(monkeypatch) -> None:
   captured: dict[str, Any] = {}
 
@@ -520,13 +784,150 @@ def test_tool_dispatcher_pending_approval_wrapper_threads_instance_state(monkeyp
   assert result == {"approved": True}
   assert captured["session"] is session
   assert captured["approval_store"] == "store"
-  assert captured["event_log"] is dispatcher._event_log
+  assert captured["event_log"] is dispatcher._boundary_event_log
   assert captured["request"] is request
   assert captured["decision"] is decision
   assert captured["nonce"] == "nonce-1"
   assert captured["resolved_qualifier"] == "qual-1"
   assert captured["allow_persistent"] is True
   assert captured["timeout_seconds"] == 15
+
+
+def test_native_approval_store_event_are_sanitized_while_policy_and_execution_remain_raw(
+  tmp_path: Path,
+) -> None:
+  async def scenario() -> None:
+    secret = "CUSTOM-ACTIVE-CREDENTIAL-NATIVE-APPROVAL-8f21d7"
+    raw_input = {
+      "path": "/Users/alice/Documents/report.xlsx",
+      "credential": secret,
+      "api_key_set": True,
+    }
+    raw_modified = {**raw_input, "normalized": True}
+
+    class Policy:
+      policy_id = "secret-test"
+      policy_version = "1"
+      policy_bundle_hash = "secret-test-bundle"
+
+      def __init__(self) -> None:
+        self.raw_args: dict[str, Any] | None = None
+
+      async def decide(self, *, payload, **_kwargs: Any):
+        self.raw_args = dict(payload.tool_args)
+        return PolicyApprovalDecision(
+          outcome="request_user_approval",
+          reason=f"review {secret}",
+          expiry_seconds=60,
+          args_predicate={"credential": secret},
+          persistent_grant_scope_hint=f"scope:{secret}",
+          modified_tool_args=raw_modified,
+        )
+
+      async def on_resolve(self, **_kwargs: Any):
+        return None
+
+    policy = Policy()
+    store = SQLiteApprovalStore(tmp_path / "native-approval.sqlite3")
+    event_log = EventLog()
+    session = _planned_session()
+    session.agent_session_log = None
+    dispatcher = ToolDispatcher(
+      role="owner",
+      mcp_client=_NullMcp(),
+      local_tool_handlers={},
+      event_log=event_log,
+      session=session,
+      store=store,
+      policy=policy,
+      run_context=RunContext(
+        user_id="alice",
+        request_id="request-secret",
+        session_id=session.session_id,
+        profile="chat",
+        channel="web",
+        decider_role="owner",
+      ),
+    )
+    dispatcher.bind_secret_boundary(SecretBoundary((secret,)))
+    task = asyncio.create_task(
+      dispatcher._run_approval_lifecycle(
+        tool_call_id="tool-secret",
+        tool_name="unprofiled_write",
+        tool_input=raw_input,
+        qualifier="",
+        reason=f"input reason {secret}",
+        allow_persistent=True,
+        approval_args_redacted=raw_input,
+        approval_args_hash="hash-only",
+      )
+    )
+    queue = await _wait_for_queue(session, "tool-secret")
+    approval_event = event_log.entries[-1].event
+    request_id = approval_event["approval_id"]
+    stored_pending = await store.get(request_id)
+    assert stored_pending is not None
+
+    await store.transition_state(
+      request_id,
+      "approved",
+      expected_state_version=stored_pending.state_version,
+      decider_id="alice",
+      decider_role="owner",
+      decision="approved",
+      decision_reason="approved",
+    )
+    await queue.put({"approved": True, "allow_tool_type": False})
+    result = await task
+
+    assert policy.raw_args == raw_input
+    assert result["tool_input"] == raw_modified
+    durable_projection = json.dumps({
+      "event": approval_event,
+      "tool_args": stored_pending.tool_args_redacted,
+      "reason": stored_pending.reason,
+      "predicate": stored_pending.args_predicate,
+      "scope": stored_pending.persistent_grant_scope,
+    })
+    assert secret not in durable_projection
+    assert "<redacted-secret>" in durable_projection
+    assert stored_pending.tool_args_redacted["api_key_set"] is True
+    assert stored_pending.tool_args_redacted["path"] == raw_input["path"]
+
+  asyncio.run(scenario())
+
+
+def test_dispatcher_owned_event_projection_removes_exact_secret() -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-DISPATCHER-EVENT-8f21d7"
+  event_log = EventLog()
+
+  async def handler(_tool_input: dict[str, Any], **_kwargs: Any):
+    return {"ok": True}, None
+
+  dispatcher = ToolDispatcher(
+    role="owner",
+    mcp_client=_NullMcp(),
+    local_tool_handlers={"lookup": handler},
+    event_log=event_log,
+    get_tool_definitions=lambda: [{
+      "name": "lookup",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+      },
+    }],
+  )
+  dispatcher.bind_secret_boundary(SecretBoundary((secret,)))
+
+  _result, error = asyncio.run(
+    dispatcher.dispatch("tool-validation", "lookup", {secret: 1})
+  )
+
+  assert error is not None
+  serialized = json.dumps([entry.event for entry in event_log.entries])
+  assert secret not in serialized
+  assert "<redacted-secret>" in serialized
 
 
 def test_tool_dispatcher_run_approval_lifecycle_wrapper_threads_instance_state(monkeypatch) -> None:
@@ -622,217 +1023,27 @@ def _planned_change_set() -> ChangeSet:
   )
 
 
-def _planned_workbook_change_set(
-  subcommand: str = "persist_dcf_relative_valuation",
-) -> ChangeSet:
-  base_hash = f"{'a' * 64}:engine-v1"
-  target_hash = f"{'b' * 64}:engine-v1"
-  projection_base_hash = "c" * 64
-  projection_target_hash = "d" * 64
-  operations = [
-    {
-      "type": "set_value",
-      "item_id": "tpl.a.unit_economics.gross_margin",
-      "values": {"2027": 0.42, "2028": 0.43},
-    }
-  ]
-  effect_rows = [
-    EffectSpec(
-      "snapshot-workbook",
-      EffectKind.SNAPSHOT_WORKBOOK,
-      EffectCriticality.REQUIRED,
-      (),
-      SnapshotPayload(
-        "workbook",
-        "models/PCTY.xlsx",
-        base_hash,
-        InlinePayload(
-          "v1",
-          "application/json",
-          CanonicalPayload.from_value({"target": "models/PCTY.xlsx"}).content,
-        ),
-      ),
-    ),
-    EffectSpec(
-      "write-workbook",
-      EffectKind.WRITE_WORKBOOK_BUNDLE,
-      EffectCriticality.REQUIRED,
-      ("snapshot-workbook",),
-      StoreWritePayload(
-        "workbook",
-        "models/PCTY.xlsx",
-        base_hash,
-        target_hash,
-        CanonicalPayload.from_value({"target_hash": target_hash}),
-        InlinePayload(
-          "v1",
-          "application/json",
-          CanonicalPayload.from_value(
-            {
-              "operations": operations,
-              "expected_readback": {"gross_margin": {"2027": 0.42}},
-              "force_overwrite": True,
-            }
-          ).content,
-        ),
-      ),
-    ),
-  ]
-  base_vector = [BaseRevision("workbook", "models/PCTY.xlsx", base_hash)]
-  target_hashes = {"workbook": target_hash}
-  target_keys = ["models/PCTY.xlsx"]
-  forecast_mode = None
-  if subcommand == "persist_forecast_assumptions":
-    projection_key = "overrides/PCTY.json"
-    forecast_mode = "main_write"
-    effect_rows.extend(
-      [
-        EffectSpec(
-          "snapshot-projection",
-          EffectKind.SNAPSHOT_OVERRIDES,
-          EffectCriticality.REQUIRED,
-          (),
-          SnapshotPayload(
-            "projection_override",
-            projection_key,
-            projection_base_hash,
-            InlinePayload(
-              "v1",
-              "application/json",
-              CanonicalPayload.from_value({"target": projection_key}).content,
-            ),
-          ),
-        ),
-        EffectSpec(
-          "write-projection",
-          EffectKind.WRITE_OVERRIDE_JSON,
-          EffectCriticality.REQUIRED,
-          ("snapshot-projection",),
-          StoreWritePayload(
-            "projection_override",
-            projection_key,
-            projection_base_hash,
-            projection_target_hash,
-            CanonicalPayload.from_value({"ticker": "PCTY"}),
-            InlinePayload(
-              "v1",
-              "application/json",
-              CanonicalPayload.from_value({"ticker": "PCTY", "drivers": {}}).content,
-            ),
-          ),
-        ),
-      ]
-    )
-    base_vector.append(
-      BaseRevision("projection_override", projection_key, projection_base_hash)
-    )
-    target_hashes["projection_override"] = projection_target_hash
-    target_keys.insert(0, projection_key)
-  effects = tuple(effect_rows)
-  target_keys_tuple = tuple(target_keys)
-  store_targets = tuple(
-    StoreTarget(store_id, target_hashes[store_id])
-    for store_id in sorted(target_hashes)
-  )
-  strategy_plan = JournaledCasPlan(
-    content_id=journal_content_id(
-      subcommand,
-      target_store_hashes=target_hashes,
-      target_keys=target_keys_tuple,
-      forecast_mode=forecast_mode,
-    ),
-    legacy_base_vector_hash=compute_legacy_journal_base_vector_hash(effects),
-    subcommand=subcommand,
-    target_store_hashes=store_targets,
-    target_keys=target_keys_tuple,
-    forecast_mode=forecast_mode,
-  )
-  return ChangeSet(
-    "v1",
-    "",
-    "",
-    ProducerRef("dcf-relative-valuation", "research_producer", "alice", "run-1"),
-    TargetRef("PCTY", 7, "workspace/PCTY", TargetScope.WORKSPACE),
-    tuple(sorted(base_vector, key=lambda base: base.store_id)),
-    IntentRef(
-      subcommand,
-      CanonicalPayload.from_value({"ticker": "PCTY"}),
-    ),
-    DomainResultRef(
-      "dcf_relative_valuation",
-      "v1",
-      InlinePayload(
-        "v1",
-        "application/json",
-        CanonicalPayload.from_value({"ok": True}).content,
-      ),
-    ),
-    effects,
-    (),
-    ReviewRequirement(ReviewKind.NONE, None),
-    CommitStrategy.JOURNALED_CAS,
-    strategy_plan,
-  )
-
-
-def test_trusted_plan_approval_review_exposes_exact_workbook_change_and_undo() -> None:
-  change_set = _planned_workbook_change_set()
-  trusted_plan = dispatcher_module.TrustedToolPlan.create(
-    identity_source="change_set",
-    identity=change_set,
-    prepared=SimpleNamespace(change_set=change_set),
-  )
-
-  review = trusted_plan.approval_review()
-
-  assert review["schema_version"] == "planned-change-review.v1"
-  assert review["change_set_id"] == change_set.change_set_id
-  assert review["target"] == {
-    "ticker": "PCTY",
-    "research_file_id": 7,
-    "workspace": "workspace/PCTY",
-    "scope": "workspace",
-  }
-  assert review["commit_strategy"] == "JOURNALED_CAS"
-  assert review["precommit_snapshot_store_ids"] == ["workbook"]
-  assert review["workbook"]["will_write"] is True
-  assert review["workbook"]["operation_count"] == 1
-  write = review["workbook"]["writes"][0]
-  assert write["precommit_snapshot_present"] is True
-  assert write["execution"] == {
-    "operations": [
-      {
-        "item_id": "tpl.a.unit_economics.gross_margin",
-        "type": "set_value",
-        "values": {"2027": 0.42, "2028": 0.43},
-      }
-    ],
-    "force_overwrite": True,
-  }
-  assert write["expected_readback_digest"]
-  assert review["undo"] == {
-    "scope": "workbook_and_projection_state",
-    "status": "durable_token_after_commit",
-    "tool_name": "fms_undo_model_writer_commit",
-    "issued_when": "authorized_commit_succeeds",
-    "covers_store_ids": ["workbook"],
-  }
-
-
-def test_trusted_plan_approval_review_exposes_forecast_assumptions_undo() -> None:
-  change_set = _planned_workbook_change_set("persist_forecast_assumptions")
-  trusted_plan = dispatcher_module.TrustedToolPlan.create(
-    identity_source="change_set",
-    identity=change_set,
-    prepared=SimpleNamespace(change_set=change_set),
-  )
-
-  assert trusted_plan.approval_review()["undo"] == {
-    "scope": "workbook_and_projection_state",
-    "status": "durable_token_after_commit",
-    "tool_name": "fms_undo_model_writer_commit",
-    "issued_when": "authorized_commit_succeeds",
-    "covers_store_ids": ["projection_override", "workbook"],
+def _exact_staged_workbook_execution(
+  *,
+  target_hash: str,
+  operations: list[dict[str, Any]],
+) -> dict[str, Any]:
+  workbook_bytes = b"exact staged workbook"
+  sidecar_bytes = b"sidecar"
+  return {
+    "execution_kind": "canonical_normal_workbook_bundle_v1",
+    "workbook_content_base64": base64.b64encode(workbook_bytes).decode("ascii"),
+    "workbook_content_sha256": hashlib.sha256(workbook_bytes).hexdigest(),
+    "sidecar_content_base64": base64.b64encode(sidecar_bytes).decode("ascii"),
+    "sidecar_content_sha256": hashlib.sha256(sidecar_bytes).hexdigest(),
+    "workbook_source_target_hash": target_hash,
+    "compute_engine_version": "engine-v1",
+    "mutation": {
+      "operations": operations,
+      "force_overwrite": True,
+      "refresh_schema_cache": False,
+    },
+    "expected_readback": {"gross_margin": {"2027": 0.42}},
   }
 
 
@@ -923,12 +1134,13 @@ def _business_model_planned_handler(
   *,
   receipt_status: str,
   restore_payload: object = _DEFAULT_BUSINESS_MODEL_RESTORE,
+  user_scope: str = "alice",
 ) -> tuple[Any, ChangeSet, Any]:
   change_set = _planned_change_set()
   prepared_bytes = b'{"schema_version":"prepared-business-model-accept.v1"}'
   prepared_accept = SimpleNamespace(
     caller_kind="fms_persist",
-    user_scope="alice",
+    user_scope=user_scope,
     idempotency_locator="skill-run-phase6",
     intent_digest="b" * 64,
     to_canonical_bytes=lambda: prepared_bytes,
@@ -993,6 +1205,90 @@ def _business_model_planned_handler(
   return legacy_handler, change_set, gateway_prepared
 
 
+def test_fms_business_model_non_accept_uses_generic_exact_plan() -> None:
+  change_set = _planned_change_set()
+  outer = SimpleNamespace(
+    change_set=change_set,
+    completion=SimpleNamespace(projection={"verdict": "BM_INSUFFICIENT_DATA"}),
+  )
+  gateway_prepared = SimpleNamespace(change_set=change_set, prepared=outer)
+  trusted = TrustedToolPlan.create(
+    identity_source="change_set",
+    identity=change_set,
+    prepared=gateway_prepared,
+  )
+
+  assert ToolDispatcher._prepared_business_model_authorization(
+    "fms_persist_business_model",
+    trusted,
+  ) is None
+
+
+def test_fms_business_model_approval_row_uses_prepared_owner_scope(
+  tmp_path: Path,
+) -> None:
+  handler, _change_set, _prepared = _business_model_planned_handler(
+    receipt_status="COMMITTED",
+    user_scope="1",
+  )
+
+  class Policy:
+    policy_id = "phase6-test"
+    policy_version = "1"
+
+    async def decide(self, **_kwargs: Any):
+      return PolicyApprovalDecision(outcome="auto_approve", reason="approved")
+
+    async def on_resolve(self, **_kwargs: Any):
+      return None
+
+  session = _planned_session()
+  session.user_id = "henry"
+  session.owner_user_id = "1"
+  session.channel = "cli"
+  store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+  dispatcher = ToolDispatcher(
+    role="owner",
+    mcp_client=_NullMcp(),
+    local_tool_handlers={"fms_persist_business_model": handler},
+    needs_approval=lambda *_args: True,
+    approved_tool_types=set(),
+    session=session,
+    store=store,
+    policy=Policy(),
+    run_context=RunContext(
+      user_id="henry",
+      request_id="skill-run-phase6",
+      session_id="sess-1",
+      profile="chat",
+      channel="cli",
+      decider_role="owner",
+    ),
+  )
+
+  _result, error = asyncio.run(
+    dispatcher.dispatch(
+      "call-owner-scope",
+      "fms_persist_business_model",
+      {"judgment": {"ticker": "TEST"}},
+      skill_run_id="skill-run-phase6",
+    )
+  )
+
+  assert error is None
+  prepared = asyncio.run(
+    store.get_prepared_business_model_change(
+      caller_kind="fms_persist",
+      user_scope="1",
+      idempotency_locator="skill-run-phase6",
+    )
+  )
+  assert prepared is not None
+  approval = asyncio.run(store.get(prepared.approval_id))
+  assert approval is not None
+  assert approval.user_id == "1"
+
+
 @pytest.mark.parametrize(
   ("receipt_status", "expected_lifecycle"),
   [
@@ -1025,6 +1321,7 @@ def test_fms_business_model_exact_write_persists_attempt_lifecycle(
 
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"fms_persist_business_model": handler},
     needs_approval=lambda *_args: True,
@@ -1130,6 +1427,7 @@ def test_fms_business_model_missing_restoration_proof_does_not_supersede(
 
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"fms_persist_business_model": handler},
     needs_approval=lambda *_args: True,
@@ -1221,6 +1519,7 @@ def test_fms_business_model_pending_record_reconciles_original_approval(
 
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"fms_persist_business_model": handler},
     needs_approval=lambda *_args: True,
@@ -1554,9 +1853,9 @@ def test_planned_dispatch_persists_identity_and_executes_exact_objects(
         "writes": [],
       }
       assert review["undo"] == {
-        "scope": "workbook_and_projection_state",
+        "scope": "workbook_and_ticker_override_state",
         "status": "not_required",
-        "reason": "plan_has_no_workbook_or_projection_state_write",
+        "reason": "plan_has_no_workbook_or_ticker_override_state_write",
       }
       return PolicyApprovalDecision(outcome="auto_approve", reason="exact plan approved")
 
@@ -1565,6 +1864,7 @@ def test_planned_dispatch_persists_identity_and_executes_exact_objects(
 
   store = Store(tmp_path / "approvals.sqlite3")
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
@@ -1619,6 +1919,7 @@ def test_planned_dispatch_session_cache_still_creates_bound_row(tmp_path: Path) 
 
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
@@ -1650,6 +1951,7 @@ def test_planned_dispatch_persistent_grant_still_creates_bound_row(
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
   policy = SingleUserApprovalPolicy(store=store)
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
@@ -1729,6 +2031,7 @@ def test_planned_dispatch_headless_denial_still_creates_bound_row(tmp_path: Path
 
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
@@ -1768,6 +2071,7 @@ def test_planned_dispatch_headless_autonomous_allow_creates_bound_row(
 
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: False,
@@ -1819,6 +2123,7 @@ def test_planned_dispatch_timeout_preserves_bound_row_and_skips_executor(
   session = _planned_session()
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
@@ -1858,6 +2163,7 @@ def test_planned_dispatch_fails_closed_without_durable_lifecycle(
   events: list[str] = []
   handler, _change_set, _prepared = _planned_handler(events=events)
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
@@ -1888,13 +2194,19 @@ def test_raw_patch_mcp_dry_run_bypasses_write_planning_and_authorization() -> No
       return {"dry_run": True}, None
 
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=Mcp(),
     needs_approval=lambda *_args: True,
   )
   tool_input = {"research_file_id": 42, "ops": [], "dry_run": True}
 
   result, error = asyncio.run(
-    dispatcher.dispatch("dry-run-call", "apply_patch_ops", tool_input)
+    dispatcher.dispatch(
+      "dry-run-call",
+      "apply_patch_ops",
+      tool_input,
+      advertised_tool_names=frozenset({"apply_patch_ops"}),
+    )
   )
 
   assert error is None
@@ -2081,6 +2393,7 @@ def test_missing_catalog_blocks_even_generic_local_handler(
 
   monkeypatch.setattr(dispatcher_module, "import_module", fake_import_module)
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"ordinary": handler},
   )
@@ -2107,6 +2420,7 @@ def test_loaded_catalog_true_miss_preserves_generic_local_handler(
     lambda _name: _catalog_module(),
   )
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"ordinary": handler},
   )
@@ -2125,6 +2439,7 @@ def test_loaded_catalog_true_miss_preserves_generic_local_handler(
 def test_promotion_saga_generic_dispatch_requires_owner_control_route_before_approval_paths(
   tmp_path: Path,
   approval_path: str,
+  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   calls: list[str] = []
 
@@ -2154,9 +2469,15 @@ def test_promotion_saga_generic_dispatch_requires_owner_control_route_before_app
 
   dispatcher_kwargs: dict[str, Any] = {
     "mcp_client": _NullMcp(),
-    "local_tool_handlers": {"merge_diligence_pr": handler},
+    "role": "owner",
+    "local_tool_handlers": {"promote_reviewed_change": handler},
     "needs_approval": lambda *_args: approval_path != "no_lifecycle",
   }
+  monkeypatch.setattr(
+    dispatcher_module,
+    "constraint_for_catalog_action",
+    lambda _action: "fresh_human_owner",
+  )
   if approval_path != "no_lifecycle":
     dispatcher_kwargs.update(
       session=_planned_session(),
@@ -2164,7 +2485,7 @@ def test_promotion_saga_generic_dispatch_requires_owner_control_route_before_app
       policy=Policy(),
     )
   if approval_path == "session_cache":
-    dispatcher_kwargs["approved_tool_types"] = {"merge_diligence_pr"}
+    dispatcher_kwargs["approved_tool_types"] = {"promote_reviewed_change"}
   if approval_path == "headless":
     dispatcher_kwargs["should_avoid_permission_prompts"] = True
 
@@ -2172,8 +2493,8 @@ def test_promotion_saga_generic_dispatch_requires_owner_control_route_before_app
   result, error = asyncio.run(
     dispatcher.dispatch(
       "call-promotion",
-      "merge_diligence_pr",
-      {"pr_id": "dpr-1", "confirm_merge": True},
+      "promote_reviewed_change",
+      {"change_id": "change-1", "confirm": True},
     )
   )
 
@@ -2216,6 +2537,7 @@ def test_planned_dispatch_partial_hook_triplet_fails_closed(
     handler.execute_prepared_change = executor
 
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
   )
@@ -2243,6 +2565,7 @@ def test_catalogued_exact_write_cannot_fall_back_to_legacy_handler(
     return {"status": "unexpected"}, None
 
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={tool_name: legacy_handler},
   )
@@ -2283,6 +2606,7 @@ def test_planned_dispatch_preserves_trusted_planning_rejection() -> None:
   handler.plan_change = plan_change
   handler.execute_prepared_change = execute_prepared_change
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
@@ -2315,6 +2639,7 @@ def test_planned_dispatch_fails_closed_on_row_persistence_error(tmp_path: Path) 
       raise AssertionError("policy must not run after persistence failure")
 
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
@@ -2349,6 +2674,7 @@ def test_planned_dispatch_rejects_trusted_context_loss(tmp_path: Path) -> None:
       return None
 
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
@@ -2386,6 +2712,7 @@ def test_planned_dispatch_requires_reinvocation_for_policy_modified_args(
 
   store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
@@ -2417,6 +2744,7 @@ def test_local_handler_receives_context_when_event_logging_is_disabled() -> None
     return {"ok": True}, None
 
   dispatcher = ToolDispatcher(
+    role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"read": handler},
     event_log=None,
@@ -2457,7 +2785,7 @@ def test_fresh_owner_lifecycle_blocks_every_automatic_source(
         outcome="auto_approve",
         reason="custom automatic policy",
         allow_persistent_grant=True,
-        persistent_grant_scope_hint="state_write:merge_diligence_pr",
+        persistent_grant_scope_hint="state_write:apply_proposal_series",
         grant_reference="grant-should-not-survive",
       )
 
@@ -2475,8 +2803,8 @@ def test_fresh_owner_lifecycle_blocks_every_automatic_source(
       policy=policy,
       session=SimpleNamespace(),
       tool_call_id="promotion-call",
-      tool_name="merge_diligence_pr",
-      tool_input={"confirm_merge": True},
+      tool_name="apply_proposal_series",
+      tool_input={"proposal_ids": ["proposal-1"]},
       qualifier="",
       reason="promotion",
       allow_persistent=True,

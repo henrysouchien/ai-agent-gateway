@@ -17,6 +17,9 @@ from agent_gateway.runner_skill_gate import (  # noqa: E402
   normalize_skill_deny,
   normalize_skill_report_doors,
 )
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_runner_capability_execution,
+)
 
 
 class _NullMcpClient:
@@ -42,6 +45,15 @@ class _StubProvider:
   name = "stub"
 
 
+def _capability_execution():
+  return stub_runner_capability_execution(
+    provider=_StubProvider(),
+    model="stub-model",
+    effort="none",
+    auth_config={"api_key": "k"},
+  )
+
+
 def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
   return ToolDispatcher(
     mcp_client=_NullMcpClient(),
@@ -57,8 +69,7 @@ def _make_runner(tool_names: list[str] | None = None) -> AgentRunner:
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-skill-gate",
-    provider=_StubProvider(),
-    auth_config={"api_key": "k", "model": "stub-model"},
+    capability_execution=_capability_execution(),
     excluded_tools={"always_hidden"},
     get_tool_definitions=lambda: [{"name": name} for name in (tool_names or [])],
     user_id="alice",
@@ -73,8 +84,7 @@ def _make_runner_with_mcp_tools(tools: list[dict[str, Any]]) -> AgentRunner:
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-skill-gate",
-    provider=_StubProvider(),
-    auth_config={"api_key": "k", "model": "stub-model"},
+    capability_execution=_capability_execution(),
     mcp_client=_McpClientWithTools(tools),
     user_id="alice",
     billing_mode="byok",
@@ -87,6 +97,12 @@ def test_skill_gate_filter_helpers_normalize_inputs() -> None:
 
   assert effective_excluded_tools({"always_hidden"}, set()) == {"always_hidden"}
   assert effective_excluded_tools({"always_hidden"}, {"write"}) == {"always_hidden", "write"}
+  assert effective_excluded_tools({"always_hidden"}, set(), {"always_hidden"}) == set()
+  assert effective_excluded_tools(
+    {"always_hidden"},
+    {"always_hidden"},
+    {"always_hidden"},
+  ) == {"always_hidden"}
   assert filter_excluded_tool_definitions(tools, {"write"}) == [{"name": "read"}, {"name": "always_hidden"}]
   assert filter_excluded_tool_definitions(tools, set()) == tools
   assert normalize_skill_report_doors({" report ": " skill ", "": "skip", "empty": " "}) == {"report": "skill"}
@@ -175,10 +191,23 @@ def test_runner_skill_gate_delegates_filter_and_activate() -> None:
   assert runner._effective_excluded_tools() == {"always_hidden"}
   assert runner._filter_excluded_tool_definitions([{"name": "read"}, {"name": "always_hidden"}]) == [{"name": "read"}]
 
+  runner._activate_skill_allow([" always_hidden ", ""], base_kwargs)
+  assert runner._active_skill_allow == {"always_hidden"}
+  assert runner._effective_excluded_tools() == set()
+  assert base_kwargs["tools"] == [
+    {"name": "read"},
+    {"name": "write"},
+    {"name": "always_hidden"},
+  ]
+
   runner._activate_skill_deny([" write ", ""], base_kwargs)
 
   assert runner._active_skill_deny == {"write"}
-  assert base_kwargs["tools"] == [{"name": "read"}]
+  assert base_kwargs["tools"] == [{"name": "read"}, {"name": "always_hidden"}]
+
+  runner._activate_skill_deny(["always_hidden"], base_kwargs)
+  assert runner._effective_excluded_tools() == {"always_hidden"}
+  assert base_kwargs["tools"] == [{"name": "read"}, {"name": "write"}]
 
   unchanged_tools = base_kwargs["tools"]
   runner._activate_skill_deny({"bad": "mapping"}, base_kwargs)

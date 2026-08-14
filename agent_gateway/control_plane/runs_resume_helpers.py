@@ -294,7 +294,15 @@ def _resume_joined_len(parts: list[str]) -> int:
 
 
 def _build_autonomous_resume_context(record: AutonomousTask, payload: AutonomousResumeRequest) -> str:
-  parts: list[str] = [
+  parts: list[str] = []
+  evidence_status = getattr(record, "events_evidence_status", "missing")
+  if evidence_status != "complete":
+    parts.append(
+      f"durable event evidence for this run is {evidence_status}; "
+      "treat all durable writes as possibly already applied and inspect current "
+      "state before writing"
+    )
+  parts.extend([
     (
       f"Resume autonomous control run {record.control_run_id}. "
       f"The prior top-level process ended with state={_autonomous_state(record.state)} "
@@ -304,7 +312,7 @@ def _build_autonomous_resume_context(record: AutonomousTask, payload: Autonomous
       "Continue from the latest safe point. Do not repeat durable writes that already succeeded; "
       "inspect current state before writing again, and summarize what was resumed."
     ),
-  ]
+  ])
   operator_note = payload.message or payload.context
   if isinstance(operator_note, str) and operator_note.strip():
     parts.append(

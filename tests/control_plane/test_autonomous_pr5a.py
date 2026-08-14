@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from itertools import count
 import json
+import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -13,6 +16,25 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from agent_gateway.autonomous_capability_handoff import (
+  AutonomousCapabilityBinding,
+)
+from agent_gateway.autonomous_event_channel import (
+  adopt_inherited_autonomous_event_channel,
+)
+from agent_gateway.autonomous_launch_envelope import (
+  AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+  verify_autonomous_launch_envelope,
+)
+from agent_gateway.capability_binding import (
+  CapabilityBind,
+  CredentialHandle,
+)
+from agent_gateway.model_registry import (
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
+from agent_gateway.capability_execution import MaterializedCredential
 from agent_gateway.control_plane import runs as runs_module
 from agent_gateway.control_plane import runs_chat_helpers as chat_helpers_module
 from agent_gateway.control_plane import runs_helpers as helpers_module
@@ -24,12 +46,53 @@ from agent_gateway.control_plane.runs import (
   _completed_tool_result_tail,
   _render_completed_tool_result_tail,
 )
+from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.event_log import EventLog
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent_gateway.session import GatewaySession
+
+from .manifest_helpers import TASK_MANIFEST_VERSION, write_v6_manifest
 
 
 API_KEY = "autonomous-pr5a-key"
-HMAC_KEY = "autonomous-pr5a-hmac"
+HMAC_KEY = "autonomous-pr5a-hmac-key-at-least-32-bytes"
+_MODEL_ENTRY = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5")
+_SERVICE_HANDLE = CredentialHandle(
+  handle_id="service:test-product:anthropic",
+  provider="anthropic",
+  principal="service",
+  tenant_id="test-product",
+  actor_id=None,
+)
+def _autonomous_capability_binding(request) -> AutonomousCapabilityBinding:
+  return AutonomousCapabilityBinding(
+    bind=request.required_bind
+    or CapabilityBind(
+      schema_version="1.0",
+      capability_id="session.driver",
+      model_key=_MODEL_ENTRY.key,
+      provider=_MODEL_ENTRY.provider,
+      upstream_model=_MODEL_ENTRY.upstream_model,
+      adapter=_MODEL_ENTRY.adapter,
+      protocol_profile=_MODEL_ENTRY.protocol_profile,
+      route=_MODEL_ENTRY.route,
+      effort="high",
+      credential_principal="service",
+      credential_ref=_SERVICE_HANDLE.handle_id,
+      run_mode=request.run_mode,
+      registry_revision=INITIAL_MODEL_REGISTRY.revision,
+      policy_revision=INITIAL_MODEL_SELECTION_POLICY.revision,
+      selection_source="capability_default",
+    ),
+    materialized_credential=MaterializedCredential(
+      handle=_SERVICE_HANDLE,
+      auth_config={
+        "provider": _SERVICE_HANDLE.provider,
+        "auth_mode": "api",
+        "api_key": "autonomous-pr5a-test-secret",
+      },
+    ),
+  )
 
 
 def test_control_plane_runs_parent_aliases_moved_helpers() -> None:
@@ -49,19 +112,104 @@ def test_control_plane_runs_parent_aliases_moved_helpers() -> None:
 
 def test_control_plane_run_status_vocab_normalizes_internal_states() -> None:
   assert helpers_module._autonomous_state("blocked") == "failed"
-  assert helpers_module._autonomous_state("budget_limited") == "failed"
+  assert helpers_module._autonomous_state("budget_limited") == "budget_limited"
   assert helpers_module._autonomous_state("remediating") == "running"
-  assert helpers_module._TERMINAL_RUN_STATES == {"completed", "failed", "interrupted", "cancelled"}
+  assert helpers_module._TERMINAL_RUN_STATES == {
+    "completed",
+    "budget_limited",
+    "failed",
+    "interrupted",
+    "cancelled",
+  }
+
+
+def test_chat_run_projection_ignores_child_terminal_events() -> None:
+  session = GatewaySession(
+    session_id="parent-chat",
+    api_key_hash="hash",
+    created_at=100,
+    expires_at=200,
+    user_id="alice",
+  )
+  session.event_history.append({
+    "type": "error",
+    "error": "child failed",
+    "sub_agent_id": "sub0:spawned",
+  })
+  session.event_history.append({
+    "type": "stream_complete",
+    "terminal_disposition": "completed",
+    "sub_agent_id": "sub0:resumed",
+  })
+  session.event_history.append({
+    "type": "stream_complete",
+    "terminal_disposition": "interrupted",
+  })
+
+  run = helpers_module._chat_run_from_session(session)
+
+  assert run.state == "interrupted"
+
+
+_FAKE_PROCESS_PIDS = count(90_000)
+_FAKE_PROCESSES: dict[int, "_FakeAutonomousProcess"] = {}
+
+
+class _FakeStdin:
+  def __init__(self) -> None:
+    self.buffer = bytearray()
+
+  def write(self, payload: bytes) -> None:
+    self.buffer.extend(payload)
+
+  async def drain(self) -> None:
+    return None
+
+  def close(self) -> None:
+    return None
+
+  async def wait_closed(self) -> None:
+    return None
 
 
 class _FakeAutonomousProcess:
-  def __init__(self) -> None:
-    self.returncode: int | None = None
+  def __init__(self, inherited_event_fd: int, *, channel_id: str) -> None:
+    self.pid = next(_FAKE_PROCESS_PIDS)
+    self._returncode: int | None = None
+    self._inherited_fds: list[int] = []
+    self._event_channel = adopt_inherited_autonomous_event_channel(
+      inherited_event_fd,
+      channel_id=channel_id,
+    )
+    self._event_channel.start(timeout_seconds=2)
+    self.stdin = _FakeStdin()
+    _FAKE_PROCESSES[self.pid] = self
+
+  @property
+  def returncode(self) -> int | None:
+    return self._returncode
+
+  @returncode.setter
+  def returncode(self, value: int | None) -> None:
+    self._returncode = value
+    if value is not None:
+      self._close_inherited_fds()
+
+  def _close_inherited_fds(self) -> None:
+    self._event_channel.interrupt()
+    for inherited_fd in self._inherited_fds:
+      if inherited_fd >= 0:
+        os.close(inherited_fd)
+    self._inherited_fds.clear()
 
   async def wait(self) -> int:
     while self.returncode is None:
       await asyncio.sleep(0.01)
+    self._close_inherited_fds()
     return self.returncode
+
+  def retain_inherited_fds(self, inherited_fds: tuple[int, ...]) -> None:
+    self._inherited_fds.extend(os.dup(fd) for fd in inherited_fds)
 
   def terminate(self) -> None:
     if self.returncode is None:
@@ -80,7 +228,27 @@ name: resumable-skill
 description: Resumable test skill
 agent_callable: true
 resumable: true
+mutation_mode: read_only
+required_context: []
+requires_portfolio_context: false
 catalog: false
+semantic_metadata:
+  contract_name: skill-metadata
+  schema_version: '2'
+  catalog_version: skill-catalog/2
+  skill_id: resumable-skill
+  tool_refs: []
+  allowed_effects: [read]
+  approval_constraints: [runtime_policy]
+  output_contracts:
+    - owner: platform
+      contract_name: skill-result-envelope
+      schema_version: '1'
+  credential_requirements: []
+  scheduling:
+    eligibility: ineligible
+    opt_in: not_required
+  allowed_profiles: [analyst]
 ---
 Run the resumable test skill.
 """,
@@ -94,10 +262,9 @@ class _NoopRunner:
     *,
     messages: list[dict[str, Any]],
     system_prompt: str | None = None,
-    model_override: str | None = None,
     max_turns: int | None = None,
   ) -> None:
-    _ = messages, system_prompt, model_override, max_turns
+    _ = messages, system_prompt, max_turns
 
 
 def _make_app(
@@ -106,26 +273,35 @@ def _make_app(
   *,
   control_skills_dir: Path | None = None,
   dispatch_scope_validator: Any | None = None,
+  claim_signing_authority_installed: bool = True,
 ):
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(tmp_path / "autonomous-logs"))
 
   async def _build_chat_runtime(*, session, request, channel, auth_manager):
-    _ = session, request, channel, auth_manager
+    _ = session, channel, auth_manager
     return ChatRuntime(
       system_prompt="system",
       build_runner=lambda event_log, _sid: _runner_with_log(event_log),
+      capability_execution=request.capability_execution,
     )
 
   return create_gateway_app(
     GatewayServerConfig(
       jwt_secret="autonomous-pr5a-test-secret-0123456789",
       valid_api_keys={API_KEY},
-      auth_config={"model": "test-model"},
-      allowed_models=set(),
+      tenant_id="test-product",
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
+      autonomous_capability_binding_resolver=_autonomous_capability_binding,
       control_skills_dir=control_skills_dir,
       dispatch_scope_validator=dispatch_scope_validator,
+      claim_signing_authority=(
+        GatewayClaimSigningAuthority(HMAC_KEY)
+        if claim_signing_authority_installed
+        else None
+      ),
     )
   )
 
@@ -153,35 +329,41 @@ def _write_rehydrate_manifest(
   context: str | None = "Original work packet",
 ) -> dict[str, Any]:
   log_dir = _autonomous_log_dir(tmp_path)
-  manifest = {
-    "manifest_version": 1,
-    "task_id": task_id,
-    "control_run_id": control_run_id or task_id,
-    "user_id": user_id,
-    "user_email": user_email,
-    "profile": "analyst",
-    "mode": mode,
-    "task": None if mode == "skill" else "summarize",
-    "skill": skill,
-    "context": context,
-    "ticker": "MSFT",
-    "channel": channel,
-    "dev_mode": False,
-    "cmd": [sys.executable, "-m", "agent.autonomous", "--profile", "analyst"],
-    "log_path": str(log_dir / f"{task_id}.log"),
-    "events_path": str(log_dir / f"{task_id}.events.jsonl"),
-    "operator_inbox_path": str(log_dir / f"{task_id}.operator-messages.jsonl"),
-    "approval_decisions_path": str(log_dir / f"{task_id}.approval-decisions.jsonl"),
-    "started_at": 100.0,
-    "state": state,
-    "exit_code": exit_code,
-    "error": error,
-    "completed_at": completed_at,
-    "resumed_from": None,
-    "resumed_as": [],
-  }
-  (log_dir / f"{task_id}.task.json").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
-  return manifest
+  capability_bind = CapabilityBind(
+    schema_version="1.0",
+    capability_id="session.driver",
+    model_key=_MODEL_ENTRY.key,
+    provider=_MODEL_ENTRY.provider,
+    upstream_model=_MODEL_ENTRY.upstream_model,
+    adapter=_MODEL_ENTRY.adapter,
+    protocol_profile=_MODEL_ENTRY.protocol_profile,
+    route=_MODEL_ENTRY.route,
+    effort="high",
+    credential_principal="service",
+    credential_ref=_SERVICE_HANDLE.handle_id,
+    run_mode="autonomous",
+    registry_revision=INITIAL_MODEL_REGISTRY.revision,
+    policy_revision=INITIAL_MODEL_SELECTION_POLICY.revision,
+    selection_source="capability_default",
+  )
+  return write_v6_manifest(
+    log_dir,
+    task_id,
+    control_run_id=control_run_id or task_id,
+    user_id=user_id,
+    user_email=user_email,
+    mode=mode,
+    task=None if mode == "skill" else "summarize",
+    skill=skill,
+    context=context,
+    channel=channel,
+    cmd=[sys.executable, "-m", "agent.autonomous", "--profile", "analyst"],
+    state=state,
+    exit_code=exit_code,
+    error=error,
+    completed_at=completed_at,
+    capability_bind=capability_bind.receipt(),
+  )
 
 
 def _write_rehydrate_events(tmp_path: Path, task_id: str, events: list[dict[str, Any]]) -> None:
@@ -257,6 +439,61 @@ def _headers(session: dict[str, Any]) -> dict[str, str]:
   return {"Authorization": f"Bearer {session['session_token']}"}
 
 
+@pytest.mark.parametrize(
+  ("stored_role", "live_role"),
+  [("invite", "owner"), ("owner", "invite")],
+)
+def test_autonomous_resume_uses_live_role_in_both_directions(
+  monkeypatch,
+  tmp_path,
+  stored_role: str,
+  live_role: str,
+) -> None:
+  processes, _envs = _install_fake_spawn(monkeypatch)
+  skills_dir = tmp_path / "skills"
+  _write_resumable_skill(skills_dir)
+  app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
+
+  with TestClient(app) as client:
+    session_payload = _control_session(client, "alice")
+    session = app.state.auth.session_store.get_session(session_payload["session_id"])
+    assert session is not None
+    session.role = stored_role
+    headers = {
+      "Authorization": f"Bearer {app.state.auth.issue_token(session)}"
+    }
+    started = client.post(
+      "/api/control/runs",
+      headers=headers,
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "skill",
+        "skill": "resumable-skill",
+        "context": "Original work packet",
+      },
+    )
+    assert started.status_code == 200, started.text
+    original = app.state.subprocess_registry._tasks["bg_0"]
+    assert original.role == stored_role
+    original.state = "failed"
+    original.exit_code = 1
+    original.completed_at = time.time()
+    processes[0].returncode = 1
+
+    session.role = live_role
+    headers = {
+      "Authorization": f"Bearer {app.state.auth.issue_token(session)}"
+    }
+    resumed = client.post(
+      "/api/control/runs/bg_0/resume",
+      headers=headers,
+      json={},
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert app.state.subprocess_registry._tasks["bg_1"].role == live_role
+
+
 def _install_fake_spawn(monkeypatch) -> tuple[list[_FakeAutonomousProcess], list[dict[str, str]]]:
   from agent_gateway import autonomous_runner
 
@@ -265,12 +502,25 @@ def _install_fake_spawn(monkeypatch) -> tuple[list[_FakeAutonomousProcess], list
 
   async def fake_exec(*args, **kwargs):
     _ = args
-    process = _FakeAutonomousProcess()
+    envelope = json.loads(
+      kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV]
+    )
+    process = _FakeAutonomousProcess(
+      os.dup(kwargs["pass_fds"][0]),
+      channel_id=envelope["channel_id"],
+    )
+    process.retain_inherited_fds(tuple(kwargs["pass_fds"][1:]))
     processes.append(process)
     envs.append(dict(kwargs["env"]))
     return process
 
   monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
+  monkeypatch.setattr(autonomous_runner, "_get_process_group_id", lambda pid: pid)
+
+  def signal_process_group(process_group_id: int, signal_number: int) -> None:
+    _FAKE_PROCESSES[process_group_id].returncode = -signal_number
+
+  monkeypatch.setattr(autonomous_runner, "_signal_process_group", signal_process_group)
   return processes, envs
 
 
@@ -329,10 +579,16 @@ def test_autonomous_control_endpoints_spawn_read_logs_cancel_and_enforce_user_sc
     assert "--ticker" in start_payload["cmd"]
     assert start_payload["cmd"][start_payload["cmd"].index("--ticker") + 1] == "AAPL"
 
-    assert envs[0]["AGENT_API_CLAIM_USER_ID"] == "alice"
-    assert envs[0]["AGENT_API_CLAIM_USER_EMAIL"] == "alice@example.com"
-    assert envs[0]["AGENT_API_USER_CLAIM_HMAC_KEY"] == HMAC_KEY
-    assert Path(envs[0]["AGENT_AUTONOMOUS_EVENTS_PATH"]).name == "bg_0.events.jsonl"
+    envelope = verify_autonomous_launch_envelope(
+      HMAC_KEY,
+      envs[0][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    )
+    authority = envelope.session_authority.ordinary_authority
+    assert authority.user_id == "alice"
+    assert authority.user_email == "alice@example.com"
+    assert "AGENT_API_CLAIM_USER_EMAIL" not in envs[0]
+    assert "AGENT_API_USER_CLAIM_HMAC_KEY" not in envs[0]
+    assert "AGENT_AUTONOMOUS_EVENTS_PATH" not in envs[0]
 
     record = app.state.subprocess_registry._tasks["bg_0"]
     record.log_path.write_text("line 1\nline 2\n", encoding="utf-8")
@@ -354,6 +610,229 @@ def test_autonomous_control_endpoints_spawn_read_logs_cancel_and_enforce_user_sc
     assert cancel.status_code == 200, cancel.text
     assert cancel.json()["state"] == "cancelled"
     assert processes[0].returncode == -15
+
+
+def test_live_two_user_run_matrix_is_disjoint_and_cross_user_actions_are_404(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  app = _make_app(monkeypatch, tmp_path)
+  registry = app.state.subprocess_registry
+  sequence = count()
+
+  async def fake_start(**kwargs: Any) -> dict[str, str]:
+    task_id = f"bg_live_{next(sequence)}"
+    log_path = tmp_path / f"{task_id}.log"
+    log_path.write_text("", encoding="utf-8")
+    registry._tasks[task_id] = SimpleNamespace(
+      task_id=task_id,
+      control_run_id=task_id,
+      session_id=task_id,
+      profile=kwargs["profile"],
+      mode=kwargs["mode"],
+      skill=kwargs.get("skill"),
+      task=kwargs.get("task"),
+      ticker=kwargs.get("ticker"),
+      channel=kwargs.get("channel"),
+      user_id=kwargs["user_id"],
+      owner_user_id=kwargs["owner_user_id"],
+      raw_user_id=kwargs["user_id"],
+      user_slug=kwargs.get("user_slug"),
+      risk_user_id=kwargs.get("risk_user_id") or 0,
+      user_email=kwargs.get("user_email"),
+      user_aliases=list(kwargs.get("user_aliases") or []),
+      identity_status=kwargs.get("identity_status") or "legacy_user_id_fallback",
+      state="running",
+      exit_code=None,
+      error=None,
+      proc=SimpleNamespace(returncode=None),
+      operator_inbox_path=None,
+      owner_lifeline_fd=None,
+      approval_channel=None,
+      event_channel=None,
+      log_handle=None,
+      started_at=time.time(),
+      completed_at=None,
+      event_lines=[],
+      resumed_from=None,
+      resumed_as=[],
+      dispatch_scope=kwargs.get("dispatch_scope"),
+      schedule_id=None,
+      schedule_name=None,
+      capability_bind=None,
+      max_budget_usd=kwargs.get("max_budget_usd"),
+      log_path=log_path,
+      cmd=["recorded-fake-run"],
+    )
+    return {"task_id": task_id, "run_id": task_id}
+
+  def fake_logs(task_id: str, *, tail: int) -> dict[str, Any]:
+    lines = registry._tasks[task_id].log_path.read_text(encoding="utf-8").splitlines()
+    return {"lines": lines[-tail:] if tail else [], "total_lines": len(lines)}
+
+  async def fake_cancel(task_id: str) -> dict[str, Any]:
+    record = registry._tasks[task_id]
+    record.state = "killed"
+    record.proc.returncode = -15
+    record.completed_at = time.time()
+    return {"task_id": task_id, "state": "killed"}
+
+  monkeypatch.setattr(registry, "start", fake_start)
+  monkeypatch.setattr(registry, "logs", fake_logs)
+  monkeypatch.setattr(registry, "cancel", fake_cancel)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+    bob = _control_session(client, "bob")
+    starts: dict[str, dict[str, Any]] = {}
+    for owner, session in (("alice", alice), ("bob", bob)):
+      response = client.post(
+        "/api/control/runs",
+        headers=_headers(session),
+        json={
+          "kind": "autonomous",
+          "profile": "analyst",
+          "mode": "task",
+          "task": f"Review {owner}'s portfolio",
+          "channel": "tui",
+        },
+      )
+      assert response.status_code == 200, response.text
+      starts[owner] = response.json()
+
+    for owner, session in (("alice", alice), ("bob", bob)):
+      listed = client.get(
+        "/api/control/runs?kind=autonomous",
+        headers=_headers(session),
+      )
+      assert listed.status_code == 200, listed.text
+      assert [run["run_id"] for run in listed.json()["runs"]] == [
+        starts[owner]["run_id"]
+      ]
+
+    for owner, session, other_session in (
+      ("alice", alice, bob),
+      ("bob", bob, alice),
+    ):
+      run_id = starts[owner]["run_id"]
+      record = app.state.subprocess_registry._find_by_control_run_id(run_id)
+      assert record is not None
+      record.log_path.write_text(f"{owner} only\n", encoding="utf-8")
+
+      detail = client.get(f"/api/control/runs/{run_id}", headers=_headers(session))
+      logs = client.get(f"/api/control/runs/{run_id}/logs", headers=_headers(session))
+      assert detail.status_code == 200, detail.text
+      assert detail.json()["owner_user_id"] == owner
+      assert logs.status_code == 200, logs.text
+      assert logs.json()["log_lines"] == [f"{owner} only"]
+
+      assert client.get(
+        f"/api/control/runs/{run_id}", headers=_headers(other_session)
+      ).status_code == 404
+      assert client.get(
+        f"/api/control/runs/{run_id}/logs", headers=_headers(other_session)
+      ).status_code == 404
+      assert client.delete(
+        f"/api/control/runs/{run_id}", headers=_headers(other_session)
+      ).status_code == 404
+      assert record.proc is not None and record.proc.returncode is None
+
+    for owner, session in (("alice", alice), ("bob", bob)):
+      cancelled = client.delete(
+        f"/api/control/runs/{starts[owner]['run_id']}",
+        headers=_headers(session),
+      )
+      assert cancelled.status_code == 200, cancelled.text
+      assert cancelled.json()["state"] == "cancelled"
+
+def test_autonomous_control_route_requires_and_uses_installed_claim_authority(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  calls: list[dict[str, Any]] = []
+  payload = {
+    "kind": "autonomous",
+    "profile": "analyst",
+    "mode": "task",
+    "task": "summarize",
+    "channel": "tui",
+  }
+
+  installed_app = _make_app(monkeypatch, tmp_path)
+  record = SimpleNamespace(
+    task_id="bg_stub",
+    control_run_id="bg_stub",
+    log_path=tmp_path / "bg_stub.log",
+    started_at=1,
+    cmd=["stub-runner"],
+  )
+
+  async def stub_start(**kwargs):
+    assert type(
+      installed_app.state.gateway_claim_signing_authority
+    ) is GatewayClaimSigningAuthority
+    calls.append(dict(kwargs))
+    return {"task_id": record.task_id}
+
+  installed_app.state.subprocess_registry.start = stub_start
+  monkeypatch.setattr(
+    runs_module,
+    "_autonomous_task_for_user",
+    lambda registry, task_id, owner_user_id: record,
+  )
+  monkeypatch.setattr(
+    runs_module,
+    "_autonomous_run_from_task",
+    lambda _record, *, skills_dir=None: models_module.AutonomousRunResponse(
+      kind="autonomous",
+      run_id=record.control_run_id,
+      task_id=record.task_id,
+      agent="hank",
+      profile="analyst",
+      mode="task",
+      skill=None,
+      task="summarize",
+      ticker=None,
+      channel="tui",
+      user_id="alice",
+      state="running",
+      started_at="1970-01-01T00:00:01+00:00",
+      ended_at=None,
+      cost_usd=None,
+      skill_run_ids=[],
+      current_verdict=None,
+    ),
+  )
+  with TestClient(installed_app) as client:
+    installed_session = _control_session(client, "alice")
+    accepted = client.post(
+      "/api/control/runs",
+      headers=_headers(installed_session),
+      json=payload,
+    )
+
+  assert accepted.status_code == 200, accepted.text
+  assert accepted.json()["run_id"] == "bg_stub"
+  assert len(calls) == 1
+
+  absent_app = _make_app(
+    monkeypatch,
+    tmp_path,
+    claim_signing_authority_installed=False,
+  )
+  with TestClient(absent_app) as client:
+    absent_session = _control_session(client, "bob")
+    rejected = client.post(
+      "/api/control/runs",
+      headers=_headers(absent_session),
+      json=payload,
+    )
+
+  assert rejected.status_code == 409
+  assert rejected.json() == {
+    "detail": "autonomous dispatch requires installed claim-signing authority"
+  }
+  assert len(calls) == 1
 
 
 def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_path) -> None:
@@ -408,12 +887,18 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
     assert start_run["identity_status"] == "gateway_user_key_mapping"
     assert start_run["max_budget_usd"] == 5.0
     assert start.json()["cmd"][start.json()["cmd"].index("--max-budget-usd") + 1] == "5.0"
-    assert envs[0]["AGENT_API_CLAIM_USER_ID"] == "1"
-    assert envs[0]["AUTONOMOUS_USER_ID"] == "1"
-    assert envs[0]["AUTONOMOUS_RAW_USER_ID"] == "henry"
+    envelope = verify_autonomous_launch_envelope(
+      HMAC_KEY,
+      envs[0][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    )
+    authority = envelope.session_authority.ordinary_authority
+    assert authority.user_id == "1"
+    assert authority.raw_user_id == "henry"
+    assert "AUTONOMOUS_USER_ID" not in envs[0]
+    assert "AUTONOMOUS_RAW_USER_ID" not in envs[0]
 
     manifest = json.loads((_autonomous_log_dir(tmp_path) / "bg_0.task.json").read_text(encoding="utf-8"))
-    assert manifest["manifest_version"] == 2
+    assert manifest["manifest_version"] == TASK_MANIFEST_VERSION
     assert manifest["owner_user_id"] == "1"
     assert manifest["user_id"] == "1"
     assert manifest["raw_user_id"] == "henry"
@@ -473,7 +958,11 @@ def test_autonomous_dispatch_persists_redacted_dispatch_scope(monkeypatch, tmp_p
     assert start_payload["run"]["dispatch_scope"] == dispatch_scope
     assert "--context" not in start_payload["cmd"]
     assert all("Portfolio:" not in part for part in start_payload["cmd"])
-    assert json.loads(envs[0]["AGENT_AUTONOMOUS_DISPATCH_SCOPE_JSON"]) == dispatch_scope
+    envelope = verify_autonomous_launch_envelope(
+      HMAC_KEY,
+      envs[0][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    )
+    assert envelope.session_authority.dispatch_scope.receipt() == dispatch_scope
 
     manifest = json.loads((_autonomous_log_dir(tmp_path) / "bg_0.task.json").read_text(encoding="utf-8"))
     assert manifest["dispatch_scope"] == dispatch_scope
@@ -597,7 +1086,11 @@ def test_autonomous_reaper_terminalizes_approval_pending_process_exit(monkeypatc
 
   assert record.state == "failed"
   assert record.completed_at is not None
-  assert record.error == "Process exited with code 1"
+  assert record.error == (
+    "Process exited with code 1; "
+    "autonomous event channel failed: AutonomousEventChannelProtocolError: "
+    "autonomous event channel closed before END"
+  )
   assert detail["state"] == "failed"
   assert any(
     event.get("type") == "run_state_changed" and event.get("state") == "failed"
@@ -605,7 +1098,7 @@ def test_autonomous_reaper_terminalizes_approval_pending_process_exit(monkeypatc
   )
 
 
-def test_rehydrated_autonomous_run_is_owner_scoped_with_event_derived_fields(monkeypatch, tmp_path) -> None:
+def _rehydrated_owner_scope_responses(monkeypatch, tmp_path):
   _write_rehydrate_manifest(
     tmp_path,
     "bg_4",
@@ -650,6 +1143,13 @@ def test_rehydrated_autonomous_run_is_owner_scoped_with_event_derived_fields(mon
         ],
         "ts": 190,
       },
+      {
+        "type": "stream_complete",
+        "terminal_disposition": "completed",
+        "run_id": "run-rehydrated",
+        "control_run_id": "run-rehydrated",
+        "ts": 199,
+      },
     ],
   )
   app = _make_app(monkeypatch, tmp_path)
@@ -663,10 +1163,25 @@ def test_rehydrated_autonomous_run_is_owner_scoped_with_event_derived_fields(mon
     bob_listed = client.get("/api/control/runs?kind=autonomous", headers=_headers(bob))
     bob_detail = client.get("/api/control/runs/run-rehydrated", headers=_headers(bob))
 
+  return listed, detail, bob_listed, bob_detail
+
+
+def test_rehydrated_autonomous_run_is_owner_scoped(monkeypatch, tmp_path) -> None:
+  listed, detail, bob_listed, bob_detail = _rehydrated_owner_scope_responses(monkeypatch, tmp_path)
   assert listed.status_code == 200, listed.text
   runs = listed.json()["runs"]
   assert [run["run_id"] for run in runs] == ["run-rehydrated"]
   assert runs[0]["state"] == "completed"
+  assert detail.status_code == 200, detail.text
+  assert detail.json()["run_id"] == "run-rehydrated"
+  assert bob_listed.status_code == 200
+  assert bob_listed.json()["runs"] == []
+  assert bob_detail.status_code == 404
+
+
+def test_rehydrated_autonomous_run_event_derived_fields(monkeypatch, tmp_path) -> None:
+  listed, detail, _bob_listed, _bob_detail = _rehydrated_owner_scope_responses(monkeypatch, tmp_path)
+  runs = listed.json()["runs"]
   assert runs[0]["cost_usd"] == 0.12
   assert runs[0]["skill_run_ids"] == ["skill-run-1"]
   assert runs[0]["current_verdict"] == {
@@ -687,15 +1202,16 @@ def test_rehydrated_autonomous_run_is_owner_scoped_with_event_derived_fields(mon
       "skill_run_id": "skill-run-1",
     }
   ]
-  assert detail.status_code == 200, detail.text
-  assert detail.json()["run_id"] == "run-rehydrated"
-  assert detail.json()["cost_usd"] == 0.12
-  assert bob_listed.status_code == 200
-  assert bob_listed.json()["runs"] == []
-  assert bob_detail.status_code == 404
+  detail_payload = detail.json()
+  assert detail_payload["cost_usd"] == 0.12
+  assert {
+    "kind": "skill_run",
+    "ref": "skill-run-1",
+    "skill_run_id": "skill-run-1",
+  } in detail_payload["terminal_receipt"]["result_refs"]
 
 
-def test_readable_resources_list_detail_visible_rehydrated_snapshots(monkeypatch, tmp_path) -> None:
+def _rehydrated_readable_resource_responses(monkeypatch, tmp_path):
   content = "## Daily note\n\nCaptured markdown.\n"
   _write_rehydrate_manifest(
     tmp_path,
@@ -737,7 +1253,26 @@ def test_readable_resources_list_detail_visible_rehydrated_snapshots(monkeypatch
     detail = client.get("/api/control/readable-resources/rr:daily-note", headers=_headers(alice))
     spoofed = client.get("/api/control/readable-resources/rr:spoofed", headers=_headers(alice))
     bob_detail = client.get("/api/control/readable-resources/rr:daily-note", headers=_headers(bob))
+    run_detail = client.get("/api/control/runs/run-readable", headers=_headers(alice))
+    bob_run_detail = client.get("/api/control/runs/run-readable", headers=_headers(bob))
 
+  return listed, filtered, detail, spoofed, bob_detail, run_detail, bob_run_detail
+
+
+def test_readable_resources_rehydrated_run_remains_owner_scoped(monkeypatch, tmp_path) -> None:
+  _listed, _filtered, _detail, _spoofed, _bob_detail, run_detail, bob_run_detail = (
+    _rehydrated_readable_resource_responses(monkeypatch, tmp_path)
+  )
+  assert run_detail.status_code == 200, run_detail.text
+  assert run_detail.json()["state"] == "completed"
+  assert bob_run_detail.status_code == 404
+
+
+def test_readable_resources_list_detail_visible_rehydrated_snapshots(monkeypatch, tmp_path) -> None:
+  content = "## Daily note\n\nCaptured markdown.\n"
+  listed, filtered, detail, spoofed, bob_detail, _run_detail, _bob_run_detail = (
+    _rehydrated_readable_resource_responses(monkeypatch, tmp_path)
+  )
   assert listed.status_code == 200, listed.text
   payload = listed.json()
   assert payload["next_cursor"] is None
@@ -758,7 +1293,7 @@ def test_readable_resources_list_detail_visible_rehydrated_snapshots(monkeypatch
   assert bob_detail.status_code == 404
 
 
-def test_run_cost_prefers_terminal_stream_complete_total(monkeypatch, tmp_path) -> None:
+def _terminal_cost_detail(monkeypatch, tmp_path):
   _write_rehydrate_manifest(
     tmp_path,
     "bg_5",
@@ -799,19 +1334,28 @@ def test_run_cost_prefers_terminal_stream_complete_total(monkeypatch, tmp_path) 
     alice = _control_session(client, "alice", email="alice@example.com")
     detail = client.get("/api/control/runs/run-cost", headers=_headers(alice))
 
+  return detail
+
+
+def test_rehydrated_terminal_cost_run_is_visible(monkeypatch, tmp_path) -> None:
+  detail = _terminal_cost_detail(monkeypatch, tmp_path)
   assert detail.status_code == 200, detail.text
+
+
+def test_run_cost_prefers_terminal_stream_complete_total(monkeypatch, tmp_path) -> None:
+  detail = _terminal_cost_detail(monkeypatch, tmp_path)
   assert detail.json()["cost_usd"] == 0.08
 
 
-def test_autonomous_budget_exceeded_event_maps_to_failed_run_state(monkeypatch, tmp_path) -> None:
+def _budget_exceeded_detail(monkeypatch, tmp_path):
   _write_rehydrate_manifest(
     tmp_path,
     "bg_8",
     control_run_id="run-budget",
     user_id="alice",
     state="completed",
-    exit_code=2,
-    error="Process exited with code 2",
+    exit_code=0,
+    error=None,
     completed_at=210.0,
   )
   _write_rehydrate_events(
@@ -825,17 +1369,40 @@ def test_autonomous_budget_exceeded_event_maps_to_failed_run_state(monkeypatch, 
     alice = _control_session(client, "alice", email="alice@example.com")
     detail = client.get("/api/control/runs/run-budget", headers=_headers(alice))
 
+  return detail
+
+
+def test_rehydrated_budget_event_run_is_visible(monkeypatch, tmp_path) -> None:
+  detail = _budget_exceeded_detail(monkeypatch, tmp_path)
   assert detail.status_code == 200, detail.text
+  assert detail.json()["ended_at"] is not None
+
+
+def test_autonomous_budget_exceeded_event_maps_to_budget_limited_run_state(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  detail = _budget_exceeded_detail(monkeypatch, tmp_path)
   payload = detail.json()
-  assert payload["state"] == "failed"
-  assert payload["ended_at"] is not None
+  assert payload["state"] == "budget_limited"
+  assert payload["resumable"] is False
+  assert payload["terminal_receipt"]["disposition"] == "budget_limited"
+  assert payload["terminal_receipt"]["error"] is None
 
 
-@pytest.mark.parametrize("internal_state", ["budget_limited", "budget_exceeded", "blocked"])
+@pytest.mark.parametrize(
+  ("internal_state", "projected_state"),
+  [
+    ("budget_limited", "budget_limited"),
+    ("budget_exceeded", "budget_limited"),
+    ("blocked", "failed"),
+  ],
+)
 def test_internal_autonomous_terminal_states_do_not_inherit_failed_resume_affordance(
   monkeypatch,
   tmp_path,
   internal_state: str,
+  projected_state: str,
 ) -> None:
   processes, _envs = _install_fake_spawn(monkeypatch)
   skills_dir = tmp_path / "skills"
@@ -866,13 +1433,13 @@ def test_internal_autonomous_terminal_states_do_not_inherit_failed_resume_afford
     resumed = client.post("/api/control/runs/bg_0/resume", headers=_headers(alice), json={})
 
   assert detail.status_code == 200, detail.text
-  assert detail.json()["state"] == "failed"
+  assert detail.json()["state"] == projected_state
   assert detail.json()["resumable"] is False
   assert resumed.status_code == 409, resumed.text
   assert resumed.json()["detail"] == "Autonomous run is not resumable"
 
 
-def test_run_cost_sums_turn_estimates_when_terminal_total_missing(monkeypatch, tmp_path) -> None:
+def _turn_estimate_cost_detail(monkeypatch, tmp_path):
   _write_rehydrate_manifest(
     tmp_path,
     "bg_6",
@@ -907,7 +1474,16 @@ def test_run_cost_sums_turn_estimates_when_terminal_total_missing(monkeypatch, t
     alice = _control_session(client, "alice", email="alice@example.com")
     detail = client.get("/api/control/runs/run-live-cost", headers=_headers(alice))
 
+  return detail
+
+
+def test_rehydrated_turn_cost_run_is_visible(monkeypatch, tmp_path) -> None:
+  detail = _turn_estimate_cost_detail(monkeypatch, tmp_path)
   assert detail.status_code == 200, detail.text
+
+
+def test_run_cost_sums_turn_estimates_when_terminal_total_missing(monkeypatch, tmp_path) -> None:
+  detail = _turn_estimate_cost_detail(monkeypatch, tmp_path)
   assert detail.json()["cost_usd"] == 0.03
 
 
@@ -917,11 +1493,73 @@ def test_autonomous_state_passes_interrupted_through() -> None:
   assert _autonomous_state("interrupted") == "interrupted"
 
 
-def test_autonomous_state_maps_budget_aliases_to_failed() -> None:
+def test_autonomous_state_maps_budget_aliases_to_budget_limited() -> None:
   from agent_gateway.control_plane.runs import _autonomous_state
 
-  assert _autonomous_state("budget_limited") == "failed"
-  assert _autonomous_state("budget_exceeded") == "failed"
+  assert _autonomous_state("budget_limited") == "budget_limited"
+  assert _autonomous_state("budget_exceeded") == "budget_limited"
+
+
+def _interrupted_terminal_detail(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  skills_dir = tmp_path / "skills"
+  _write_resumable_skill(skills_dir)
+  _write_rehydrate_manifest(
+    tmp_path,
+    "bg_9",
+    control_run_id="run-interrupted-terminal",
+    user_id="alice",
+    state="completed",
+    skill="resumable-skill",
+    exit_code=0,
+    error=None,
+    completed_at=220.0,
+  )
+  _write_rehydrate_events(
+    tmp_path,
+    "bg_9",
+    [
+      {
+        "type": "stream_complete",
+        "terminal_disposition": "interrupted",
+        "reason": "operator_pause",
+        "run_id": "run-interrupted-terminal",
+        "control_run_id": "run-interrupted-terminal",
+        "ts": 219,
+      }
+    ],
+  )
+  app = _make_app(
+    monkeypatch,
+    tmp_path,
+    control_skills_dir=skills_dir,
+  )
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice", email="alice@example.com")
+    detail = client.get(
+      "/api/control/runs/run-interrupted-terminal",
+      headers=_headers(alice),
+    )
+
+  return detail
+
+
+def test_rehydrated_terminal_run_is_visible(monkeypatch, tmp_path) -> None:
+  detail = _interrupted_terminal_detail(monkeypatch, tmp_path)
+  assert detail.status_code == 200, detail.text
+
+
+def test_interrupted_terminal_projects_resumable_interrupted_control_run(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  detail = _interrupted_terminal_detail(monkeypatch, tmp_path)
+  payload = detail.json()
+  assert payload["state"] == "interrupted"
+  assert payload["resumable"] is True
 
 
 @pytest.mark.parametrize(
@@ -966,22 +1604,55 @@ def test_autonomous_messageable_matches_operator_message_acceptance(
   assert message.json()["detail"] == "Autonomous run is not accepting messages"
 
 
-def test_rehydrated_interrupted_resumable_skill_uses_existing_resume_flow(monkeypatch, tmp_path) -> None:
+def test_autonomous_child_stream_complete_keeps_parent_messageable(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+    start = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "task",
+        "task": "summarize",
+      },
+    )
+    assert start.status_code == 200, start.text
+    record = app.state.subprocess_registry._tasks["bg_0"]
+    assert record.event_lines is not None
+    record.event_lines.append({
+      "type": "stream_complete",
+      "terminal_disposition": "completed",
+      "sub_agent_id": "sub0:spawned",
+    })
+
+    detail = client.get("/api/control/runs/bg_0", headers=_headers(alice))
+    message = client.post(
+      "/api/control/runs/bg_0/messages",
+      headers=_headers(alice),
+      json={
+        "message": "continue parent work",
+        "message_id": "msg-after-child-complete",
+      },
+    )
+
+  assert detail.status_code == 200, detail.text
+  assert detail.json()["state"] == "running"
+  assert detail.json()["messageable"] is True
+  assert message.status_code == 200, message.text
+  assert message.json()["delivery_status"] == "delivered"
+
+
+def _exercise_rehydrated_interrupted_resume(monkeypatch, tmp_path):
   processes, _envs = _install_fake_spawn(monkeypatch)
   skills_dir = tmp_path / "skills"
-  skills_dir.mkdir()
-  (skills_dir / "resumable-skill.md").write_text(
-    """---
-name: resumable-skill
-description: Resumable test skill
-agent_callable: true
-resumable: true
-catalog: false
----
-Run the resumable test skill.
-""",
-    encoding="utf-8",
-  )
+  _write_resumable_skill(skills_dir)
   _write_rehydrate_manifest(
     tmp_path,
     "bg_0",
@@ -1015,16 +1686,20 @@ Run the resumable test skill.
     alice = _control_session(client, "alice", email="alice@example.com")
 
     detail = client.get("/api/control/runs/bg_0", headers=_headers(alice))
-    assert detail.status_code == 200, detail.text
-    assert detail.json()["state"] == "interrupted"
-    assert detail.json()["ended_at"] == "1970-01-01T00:05:21Z"
-    assert detail.json()["resumable"] is True
-
     resumed = client.post(
       "/api/control/runs/bg_0/resume",
       headers=_headers(alice),
       json={"message": "resume safely", "request_id": "resume-rehydrated"},
     )
+
+  return detail, resumed, processes, app
+
+
+def test_rehydrated_interrupted_resumable_skill_uses_existing_resume_flow(monkeypatch, tmp_path) -> None:
+  detail, resumed, processes, app = _exercise_rehydrated_interrupted_resume(monkeypatch, tmp_path)
+  assert detail.status_code == 200, detail.text
+  assert detail.json()["state"] == "interrupted"
+  assert detail.json()["resumable"] is True
 
   assert resumed.status_code == 200, resumed.text
   payload = resumed.json()
@@ -1036,33 +1711,29 @@ Run the resumable test skill.
   original = app.state.subprocess_registry._tasks["bg_0"]
   assert original.state == "interrupted"
   assert original.error == "gateway restarted while run was active"
-  assert original.completed_at == 321.0
   assert original.proc is None
   assert original.resumed_as == ["bg_1"]
   resumed_record = app.state.subprocess_registry._tasks["bg_1"]
   assert resumed_record.context is not None
   assert "state=interrupted" in resumed_record.context
-  assert "persisted event" in resumed_record.context
   assert "operator context" in resumed_record.context
   assert "rehydrated log line" in resumed_record.context
+
+
+def test_rehydrated_interrupted_resume_uses_durable_event_evidence(monkeypatch, tmp_path) -> None:
+  detail, _resumed, _processes, app = _exercise_rehydrated_interrupted_resume(monkeypatch, tmp_path)
+  assert detail.json()["ended_at"] == "1970-01-01T00:05:21Z"
+  original = app.state.subprocess_registry._tasks["bg_0"]
+  assert original.completed_at == 321.0
+  resumed_record = app.state.subprocess_registry._tasks["bg_1"]
+  assert resumed_record.context is not None
+  assert "persisted event" in resumed_record.context
 
 
 def test_autonomous_resume_starts_linked_run_for_resumable_interrupted_skill(monkeypatch, tmp_path) -> None:
   processes, _envs = _install_fake_spawn(monkeypatch)
   skills_dir = tmp_path / "skills"
-  skills_dir.mkdir()
-  (skills_dir / "resumable-skill.md").write_text(
-    """---
-name: resumable-skill
-description: Resumable test skill
-agent_callable: true
-resumable: true
-catalog: false
----
-Run the resumable test skill.
-""",
-    encoding="utf-8",
-  )
+  _write_resumable_skill(skills_dir)
   app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
 
   with TestClient(app) as client:
@@ -1126,18 +1797,7 @@ def test_autonomous_resume_allows_only_one_active_replacement(monkeypatch, tmp_p
   processes, _envs = _install_fake_spawn(monkeypatch)
   monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_MAX_RUNNING", "3")
   skills_dir = tmp_path / "skills"
-  skills_dir.mkdir()
-  (skills_dir / "resumable-skill.md").write_text(
-    """---
-name: resumable-skill
-description: Resumable test skill
-agent_callable: true
-resumable: true
----
-Run the resumable test skill.
-""",
-    encoding="utf-8",
-  )
+  _write_resumable_skill(skills_dir)
   app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
   original_start = app.state.subprocess_registry.start
 
@@ -1183,6 +1843,10 @@ Run the resumable test skill.
         client.post("/api/control/runs/bg_0/resume", headers=headers, json={"request_id": "resume-1"}),
         client.post("/api/control/runs/bg_0/resume", headers=headers, json={"request_id": "resume-2"}),
       )
+      replacement = app.state.subprocess_registry._tasks["bg_1"]
+      processes[1].returncode = 0
+      if replacement.reaper_task is not None:
+        await replacement.reaper_task
       return original, first, second
 
   original, first, second = asyncio.run(run_concurrent_resume())
@@ -1254,18 +1918,7 @@ def test_autonomous_resume_context_preserves_recovery_packet_when_original_conte
 ) -> None:
   processes, _envs = _install_fake_spawn(monkeypatch)
   skills_dir = tmp_path / "skills"
-  skills_dir.mkdir()
-  (skills_dir / "resumable-skill.md").write_text(
-    """---
-name: resumable-skill
-description: Resumable test skill
-agent_callable: true
-resumable: true
----
-Run the resumable test skill.
-""",
-    encoding="utf-8",
-  )
+  _write_resumable_skill(skills_dir)
   app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
 
   with TestClient(app) as client:
@@ -1443,18 +2096,7 @@ def test_autonomous_resume_context_reserves_tail_sections_with_saturated_recover
 ) -> None:
   processes, _envs = _install_fake_spawn(monkeypatch)
   skills_dir = tmp_path / "skills"
-  skills_dir.mkdir()
-  (skills_dir / "resumable-skill.md").write_text(
-    """---
-name: resumable-skill
-description: Resumable test skill
-agent_callable: true
-resumable: true
----
-Run the resumable test skill.
-""",
-    encoding="utf-8",
-  )
+  _write_resumable_skill(skills_dir)
   app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
 
   with TestClient(app) as client:
@@ -1591,7 +2233,26 @@ description: Forecast assumptions writer
 agent_callable: true
 resumable: true
 mutation_mode: model_writer
+required_context: []
+requires_portfolio_context: false
 catalog: false
+semantic_metadata:
+  contract_name: skill-metadata
+  schema_version: '2'
+  catalog_version: skill-catalog/2
+  skill_id: forecast-assumptions
+  tool_refs: []
+  allowed_effects: [state_write]
+  approval_constraints: [runtime_policy]
+  output_contracts:
+    - owner: platform
+      contract_name: skill-result-envelope
+      schema_version: '1'
+  credential_requirements: []
+  scheduling:
+    eligibility: ineligible
+    opt_in: not_required
+  allowed_profiles: [analyst]
 ---
 Update forecast assumptions.
 """,
@@ -1746,7 +2407,7 @@ def test_autonomous_dispatch_allows_scoped_web_fixture_qa_bridge(monkeypatch, tm
         "kind": "autonomous",
         "profile": "_fixture",
         "mode": "skill",
-        "skill": "fixture-approval-html-artifact",
+        "skill": "fixture-approval-canvas-artifact",
         "context": "Exercise paused approval evidence fixture.",
         "dev_mode": True,
       },
@@ -1757,7 +2418,7 @@ def test_autonomous_dispatch_allows_scoped_web_fixture_qa_bridge(monkeypatch, tm
   record = app.state.subprocess_registry._tasks["bg_0"]
   assert record.channel == "web"
   assert record.profile == "_fixture"
-  assert record.skill == "fixture-approval-html-artifact"
+  assert record.skill == "fixture-approval-canvas-artifact"
   assert record.dev_mode is True
   assert envs[-1]["_FIXTURE_DEV_MODE"] == "true"
 

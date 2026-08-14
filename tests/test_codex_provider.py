@@ -4,6 +4,7 @@ import base64
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -148,11 +149,31 @@ def test_codex_gpt55_uses_gpt5_family_metadata() -> None:
 
   assert model_info.id == "gpt-5.5"
   assert model_info.provider == "codex"
-  assert model_info.context_window == 1_050_000
+  assert model_info.context_window == 400_000
   assert model_info.input_cost_per_mtok == 5.00
   assert model_info.output_cost_per_mtok == 30.00
   assert model_info.supports_thinking is True
   assert model_info.supports_vision is True
+
+
+@pytest.mark.parametrize("model_id", ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6", "gpt-5.5", "gpt-5.1"])
+def test_codex_gpt5x_family_window_matches_chatgpt_backend(model_id: str) -> None:
+  # ChatGPT backend enforces ~370-385k input (probed live 2026-07-21); the
+  # registry pins 400k total so the proactive compaction trigger (80% of
+  # window) fires before the backend's real wall instead of never.
+  provider = CodexProvider()
+
+  assert provider.get_model_info(model_id).context_window == 400_000
+
+
+def test_codex_terra_effective_compaction_trigger_is_reachable() -> None:
+  from agent_gateway.runner_limits import effective_compaction_trigger
+
+  provider = CodexProvider()
+
+  trigger = effective_compaction_trigger(160_000, provider.get_model_info("gpt-5.6-terra"))
+
+  assert trigger == 320_000
 
 
 def test_codex_gpt55_cost_estimation_is_non_zero() -> None:
@@ -366,10 +387,13 @@ def test_parse_sse_and_map_event_translate_responses_stream() -> None:
   state = _ResponsesStreamState()
   payload = (
     'data: {"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1","summary":[]}}\n\n'
-    'data: {"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}\n\n'
-    'data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}\n\n'
-    'data: {"type":"response.reasoning_summary_part.done"}\n\n'
-    'data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"thinking\\n\\n"}]}}\n\n'
+    # Field set and shapes come from a real captured stream: part.added always carries an
+    # empty text, part.done echoes the completed part, and the server's summary text never
+    # carries a trailing separator -- which is why the durable rebuild uses "\n\n".join().
+    'data: {"type":"response.reasoning_summary_part.added","item_id":"rs_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""},"sequence_number":2}\n\n'
+    'data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"thinking","sequence_number":3}\n\n'
+    'data: {"type":"response.reasoning_summary_part.done","item_id":"rs_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":"thinking"},"sequence_number":4}\n\n'
+    'data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"thinking"}]}}\n\n'
     'data: {"type":"response.output_item.added","item":{"type":"message","id":"msg_1"}}\n\n'
     'data: {"type":"response.content_part.added","part":{"type":"output_text","text":""}}\n\n'
     'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
@@ -388,8 +412,9 @@ def test_parse_sse_and_map_event_translate_responses_stream() -> None:
   for item in parsed:
     events.extend(_map_event(item, state))
 
+  # A single summary part yields ONE thinking_delta. The mapper used to emit a second
+  # "\n\n" delta on part.done, which no "\n\n".join() rebuild ever produces.
   assert [event.type for event in events] == [
-    "thinking_delta",
     "thinking_delta",
     "thinking_end",
     "text_delta",
@@ -403,32 +428,39 @@ def test_parse_sse_and_map_event_translate_responses_stream() -> None:
     "message_end",
   ]
 
-  thinking_end = events[2]
-  assert thinking_end.thinking_text == "thinking\n\n"
+  # Select by type rather than index: a change in how many deltas a block emits should
+  # not silently re-point every assertion below it at the wrong event.
+  def _only(event_type: str):
+    matches = [event for event in events if event.type == event_type]
+    assert len(matches) == 1, f"expected exactly one {event_type}, got {len(matches)}"
+    return matches[0]
+
+  thinking_end = _only("thinking_end")
+  assert thinking_end.thinking_text == "thinking"
   assert thinking_end.raw_block["thinkingSignature"] == json.dumps(
-    {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "thinking\n\n"}]},
+    {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "thinking"}]},
     separators=(",", ":"),
   )
 
-  text_end = events[4]
+  text_end = _only("text_end")
   assert text_end.text == "hello"
   assert text_end.raw_block["textSignature"] == _encode_text_signature_v1("msg_1", "final_answer")
 
-  tool_use_end = events[8]
+  tool_use_end = _only("tool_use_end")
   assert tool_use_end.tool_id == "call_1|fc_item_1"
   assert tool_use_end.tool_name == "lookup"
   assert tool_use_end.tool_input == {"path": "README.md"}
   assert tool_use_end.tool_input_json == "{\"path\":\"README.md\"}"
 
-  message_start = events[9]
+  message_start = _only("message_start")
   assert message_start.input_tokens == 8
   assert message_start.cache_read_tokens == 2
 
-  usage_update = events[10]
+  usage_update = _only("usage_update")
   assert usage_update.output_tokens == 7
   assert usage_update.reasoning_tokens == 3
 
-  message_end = events[11]
+  message_end = _only("message_end")
   assert message_end.stop_reason == "tool_use"
 
 
@@ -458,3 +490,256 @@ def test_normalize_messages_converts_compaction_to_text_and_truncates() -> None:
     for m in normalized
     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
   )
+
+
+def _reasoning_events(part_texts: list[str], *, item_id: str = "rs_1", final_summary: Any = ...) -> list[dict[str, Any]]:
+  """Build a protocol-shaped reasoning stream.
+
+  Shapes follow a real captured stream: part.added carries an empty text, deltas carry the
+  content, and the server's summary parts never end with a separator. Every part gets a
+  .done -- INCLUDING the last one. Omitting the final .done is exactly what hid this defect
+  in the openai twin of this mapper through a full review round, because the stray separator
+  only lands after the final part.
+  """
+  events: list[dict[str, Any]] = [
+    {"type": "response.output_item.added",
+     "item": {"type": "reasoning", "id": item_id, "summary": [], "encrypted_content": "ENC"}},
+  ]
+  for index, text in enumerate(part_texts):
+    events.append({"type": "response.reasoning_summary_part.added", "item_id": item_id,
+                   "summary_index": index, "part": {"type": "summary_text", "text": ""}})
+    events.append({"type": "response.reasoning_summary_text.delta", "item_id": item_id,
+                   "summary_index": index, "delta": text})
+    events.append({"type": "response.reasoning_summary_part.done", "item_id": item_id,
+                   "summary_index": index, "part": {"type": "summary_text", "text": text}})
+  done_item: dict[str, Any] = {"type": "reasoning", "id": item_id, "encrypted_content": "ENC"}
+  if final_summary is ...:
+    done_item["summary"] = [{"type": "summary_text", "text": text} for text in part_texts]
+  elif final_summary is not None:
+    done_item["summary"] = final_summary
+  events.append({"type": "response.output_item.done", "item": done_item})
+  return events
+
+
+def _drive_thinking(events: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+  """Return one (streamed, durable, signature) triple per reasoning block.
+
+  `streamed` is the concatenation of every thinking_delta -- exactly what a streaming client
+  accumulates. `durable` is the thinking_end block a transcript persists. They are built by
+  different code paths and must agree.
+  """
+  state = _ResponsesStreamState()
+  blocks: list[tuple[str, str, str]] = []
+  streamed: list[str] = []
+  for raw in events:
+    for mapped in _map_event(raw, state):
+      if mapped.type == "thinking_delta":
+        streamed.append(mapped.thinking_text or "")
+      elif mapped.type == "thinking_end":
+        blocks.append(("".join(streamed), mapped.thinking_text or "", mapped.signature or ""))
+        streamed = []
+  return blocks
+
+
+def test_single_part_reasoning_summary_has_no_trailing_separator() -> None:
+  (streamed, durable, _), = _drive_thinking(_reasoning_events(["only"]))
+  assert streamed == durable == "only"
+
+
+def test_multi_part_reasoning_summary_streams_what_it_persists() -> None:
+  (streamed, durable, _), = _drive_thinking(_reasoning_events(["first", "second", "third"]))
+  assert durable == "first\n\nsecond\n\nthird"
+  assert streamed == durable
+
+
+def test_consecutive_reasoning_items_start_without_a_leading_separator() -> None:
+  """One response can carry several reasoning items -- a live capture showed six.
+
+  Each output_item.added opens a fresh block, so the second item must not inherit a
+  separator from the first.
+  """
+  events = _reasoning_events(["a1", "a2"], item_id="rs_1") + _reasoning_events(["b1", "b2"], item_id="rs_2")
+  blocks = _drive_thinking(events)
+  assert [durable for _, durable, _ in blocks] == ["a1\n\na2", "b1\n\nb2"]
+  assert [streamed for streamed, _, _ in blocks] == [durable for _, durable, _ in blocks]
+
+
+def test_reasoning_signature_replays_the_server_item_verbatim() -> None:
+  """The signature is what same-model replay sends back to the model.
+
+  It is serialized from the event's item, so the mapper's own text bookkeeping must never
+  appear in it -- live traffic carries ~4KB of encrypted_content per reasoning item that has
+  to survive byte for byte.
+  """
+  (_, _, signature), = _drive_thinking(_reasoning_events(["first", "second"]))
+  replayed = json.loads(signature)
+  assert [part["text"] for part in replayed["summary"]] == ["first", "second"]
+  assert replayed["encrypted_content"] == "ENC"
+
+
+def test_reasoning_without_a_final_summary_keeps_the_streamed_text() -> None:
+  """The one path where this fix changes the DURABLE text, not just the stream.
+
+  When the final item omits a summary list, finalization cannot rebuild and keeps whatever
+  was accumulated. That text reaches the model again on cross-model replay, where
+  normalize_messages converts a thinking block to plain assistant text -- so a stray trailing
+  separator here would become model input, not just a display artifact.
+  """
+  (streamed, durable, _), = _drive_thinking(_reasoning_events(["first", "second"], final_summary=None))
+  assert durable == "first\n\nsecond"
+  assert streamed == durable
+
+
+def _drive_tool_call(
+  seeded_arguments: str,
+  deltas: list[str],
+  *,
+  done_arguments: str | None = None,
+) -> tuple[str, str]:
+  """Return (streamed, durable) argument JSON for one function call.
+
+  `done_arguments=None` omits the field from output_item.done, which forces finalization to
+  fall back on the accumulator (`current_tool_json`) -- the only way to observe what the
+  delta handler actually built.
+  """
+  state = _ResponsesStreamState()
+  events: list[dict[str, Any]] = [
+    {"type": "response.output_item.added",
+     "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+              "name": "lookup", "arguments": seeded_arguments}},
+  ]
+  events.extend({"type": "response.function_call_arguments.delta", "delta": d} for d in deltas)
+  done_item: dict[str, Any] = {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                               "name": "lookup"}
+  if done_arguments is not None:
+    done_item["arguments"] = done_arguments
+  events.append({"type": "response.output_item.done", "item": done_item})
+
+  streamed: list[str] = []
+  durable = ""
+  for raw in events:
+    for mapped in _map_event(raw, state):
+      if mapped.type == "tool_use_delta":
+        streamed.append(mapped.tool_input_json or "")
+      elif mapped.type == "tool_use_end":
+        durable = mapped.tool_input_json or ""
+  return "".join(streamed), durable
+
+
+def test_seeded_tool_arguments_are_replaced_by_authoritative_deltas() -> None:
+  """A backend that seeds arguments AND repeats them as deltas must not double them.
+
+  Pre-fix the seed stayed in the accumulator and the deltas appended to it, yielding
+  '{"path":"README.md"}{"path":"README.md"}' -- which no longer parses as one object.
+  Matches the guard openai_responses_helpers.py already carries.
+  """
+  streamed, durable = _drive_tool_call('{"path":"README.md"}', ['{"path":"', 'README.md"}'])
+  assert durable == '{"path":"README.md"}'
+  assert streamed == durable
+
+
+def test_tool_arguments_without_deltas_keep_the_seeded_snapshot() -> None:
+  """The guard must not clear the seed when no deltas ever arrive.
+
+  This is the xAI shape -- complete call in output_item.added, no separate delta events --
+  so a fix that reset the accumulator unconditionally would erase the arguments entirely.
+  """
+  _, durable = _drive_tool_call('{"path":"README.md"}', [])
+  assert durable == '{"path":"README.md"}'
+
+
+def test_authoritative_done_arguments_still_win_over_the_accumulator() -> None:
+  """function_call_arguments.done overwrites whatever the deltas built."""
+  state = _ResponsesStreamState()
+  for raw in [
+    {"type": "response.output_item.added",
+     "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+              "name": "lookup", "arguments": ""}},
+    {"type": "response.function_call_arguments.delta", "delta": '{"path":"tru'},
+    {"type": "response.function_call_arguments.done", "arguments": '{"path":"truncated.md"}'},
+    {"type": "response.output_item.done",
+     "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup"}},
+  ]:
+    events = _map_event(raw, state)
+  assert [e.tool_input_json for e in events if e.type == "tool_use_end"] == [
+    '{"path":"truncated.md"}'
+  ]
+
+
+def test_consecutive_tool_calls_each_get_their_own_arguments() -> None:
+  """Two calls on ONE state must not contaminate each other.
+
+  Both calls carry a seed AND non-empty deltas -- that combination is what makes this test
+  bite. What isolates the calls is the reset at call 2's output_item.added, NOT anything at
+  finalization, which is why no reset lives there. Without that reset, call 1's flag survives,
+  call 2 skips the replace branch, and its deltas concatenate onto its seed as
+  '{"b":2}{"b":2}'. Reviews r1 and r2 both flagged weaker versions of this test: r1 for
+  claiming to guard a finalization reset it never exercised, r2 for giving call 2 no deltas,
+  which left the flag unread and the assertion vacuous.
+  """
+  state = _ResponsesStreamState()
+  durable: list[str] = []
+  for raw in [
+    {"type": "response.output_item.added",
+     "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+              "name": "lookup", "arguments": '{"a":1}'}},
+    {"type": "response.function_call_arguments.delta", "delta": '{"a":'},
+    {"type": "response.function_call_arguments.delta", "delta": '1}'},
+    {"type": "response.output_item.done",
+     "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup"}},
+    {"type": "response.output_item.added",
+     "item": {"type": "function_call", "id": "fc_2", "call_id": "call_2",
+              "name": "lookup", "arguments": '{"b":2}'}},
+    # Call 2 carries BOTH a seed and real deltas: that is what exercises the seed-site reset.
+    # With call 1's flag still set, the replace branch is skipped and these concatenate onto
+    # the seed as '{"b":2}{"b":2}'. (r2 caught the earlier version, which gave call 2 no
+    # deltas and so never read the flag at all.)
+    {"type": "response.function_call_arguments.delta", "delta": '{"b":'},
+    {"type": "response.function_call_arguments.delta", "delta": '2}'},
+    {"type": "response.output_item.done",
+     "item": {"type": "function_call", "id": "fc_2", "call_id": "call_2", "name": "lookup"}},
+  ]:
+    durable.extend(e.tool_input_json or "" for e in _map_event(raw, state) if e.type == "tool_use_end")
+  assert durable == ['{"a":1}', '{"b":2}']
+
+
+def test_empty_argument_delta_does_not_discard_the_seeded_snapshot() -> None:
+  """Over-correction guard: a zero-length delta must not wipe a valid seed.
+
+  The replace-on-first-delta branch is gated on a non-empty delta. Without that gate an
+  empty delta clears the snapshot, and a finalization that omits arguments then degrades the
+  whole call to "{}" -- a regression the fix itself would have introduced. Review r1 caught
+  this; the same gate was applied to the OpenAI twin, which had it too.
+  """
+  _, durable = _drive_tool_call('{"path":"README.md"}', [""])
+  assert durable == '{"path":"README.md"}'
+
+
+def test_finalized_arguments_survive_a_stale_completed_item() -> None:
+  """The accumulator outranks output_item.done.arguments, and must keep doing so.
+
+  function_call_arguments.done is the streaming contract's finalization event and writes
+  through to the accumulator. Review r1 proposed reordering this to match the OpenAI mapper;
+  review r2 refuted it with this case -- a stale item snapshot would silently replace
+  explicitly finalized arguments. The mappers disagree here on purpose.
+  """
+  state = _ResponsesStreamState()
+  durable: list[str] = []
+  for raw in [
+    {"type": "response.output_item.added",
+     "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+              "name": "lookup", "arguments": ""}},
+    {"type": "response.function_call_arguments.delta", "delta": '{"path":"README.md"}'},
+    {"type": "response.function_call_arguments.done", "arguments": '{"path":"README.md"}'},
+    {"type": "response.output_item.done",
+     "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+              "name": "lookup", "arguments": '{"path":"READ"}'}},
+  ]:
+    durable.extend(e.tool_input_json or "" for e in _map_event(raw, state) if e.type == "tool_use_end")
+  assert durable == ['{"path":"README.md"}']
+
+
+def test_accumulator_reaches_finalization_when_the_item_omits_arguments() -> None:
+  """Fallback path: nothing on the completed item -> use what the deltas built."""
+  _, durable = _drive_tool_call("", ['{"path":"', 'README.md"}'])
+  assert durable == '{"path":"README.md"}'

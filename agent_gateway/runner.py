@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import fcntl  # noqa: F401 - compatibility alias for runner session lifecycle monkeypatches
 import inspect
 import json  # noqa: F401 - compatibility alias for runner tool execution monkeypatches
@@ -11,9 +12,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
-from ._provider_utils import _get_default_model_for_provider  # noqa: F401 - compatibility alias
+from agent_workflow_contracts import ResultRequirement
+
 from .agent_session_log import AgentSessionLog
 from .auth import ProviderCredentialFailure
+from .capability_execution import BoundCapabilityExecution
 from .context_builder import SessionContextBuilder
 from .context_capture import ContextCapture
 from .event_log import EventLog
@@ -26,32 +29,20 @@ from .multi_user.billing import (
   normalize_identity,
 )
 from .product_config import gateway_product_id  # noqa: F401 - compatibility alias
-from .providers import ModelInfo, ModelProvider, ThinkingLevel  # noqa: F401 - compatibility aliases
+from .policy_controls import normalizer_excluded_tools
 from .runner_introspection import (
   derive_sub_agent_id as _derive_sub_agent_id,  # noqa: F401 - compatibility alias
   detect_keyword_param as _detect_keyword_param,
   detect_user_id_param as _detect_user_id_param,
-  format_exc as _format_exc,  # noqa: F401 - compatibility alias
 )
 from .runner_limits import (
-  COMPACTION_TRIGGER_PCT as COMPACTION_TRIGGER_PCT,
-  CONTEXT_WARNING_PCT as CONTEXT_WARNING_PCT,
-  MODEL_CONTEXT_LIMIT as MODEL_CONTEXT_LIMIT,
+  CONTEXT_PRESSURE_REMINDER_PCT as CONTEXT_PRESSURE_REMINDER_PCT,
+  conservative_request_input_token_bound_for_request as _conservative_request_input_token_bound_for_request,  # noqa: F401 - compatibility alias
   effective_compaction_trigger as _effective_compaction_trigger,  # noqa: F401 - compatibility alias
-  estimate_tokens as _estimate_tokens,  # noqa: F401 - compatibility alias
   model_context_window as _model_context_window,  # noqa: F401 - compatibility alias
-  system_prompt_estimate_text as _system_prompt_estimate_text,  # noqa: F401 - compatibility alias
-  token_breakdown_snapshot as _token_breakdown_snapshot,  # noqa: F401 - compatibility alias
   token_estimate_snapshot as _token_estimate_snapshot,  # noqa: F401 - compatibility alias
 )
-from .runner_prompt_rules import (
-  last_user_message as _last_user_message,
-  message_content_text as _message_content_text,  # noqa: F401 - compatibility alias
-  messages_require_tool_only_turns as _messages_require_tool_only_turns,  # noqa: F401 - compatibility alias
-  prepend_system_prompt_preamble as _prepend_system_prompt_preamble,  # noqa: F401 - compatibility alias
-  system_prompt_requires_tool_only_turns as _system_prompt_requires_tool_only_turns,  # noqa: F401 - compatibility alias
-  system_prompt_text as _system_prompt_text,  # noqa: F401 - compatibility alias
-)
+from .runner_prompt_rules import last_user_message as _last_user_message
 from .runner_run_loop_defaults import (
   MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFICATIONS_PER_TURN,  # noqa: F401 - compatibility alias
   MAX_TOKENS_CONTINUATIONS as _MAX_TOKENS_CONTINUATIONS,  # noqa: F401 - compatibility alias
@@ -60,95 +51,51 @@ from .runner_run_loop_defaults import (
 from .runner_background_lifecycle import RunnerBackgroundLifecycleMixin
 from .runner_hooks_lifecycle import RunnerHooksLifecycleMixin
 from .runner_auth import (
-  call_credential_refresher as _call_credential_refresher,  # noqa: F401 - compatibility alias
   merge_refreshed_auth_config as _merge_refreshed_auth_config,  # noqa: F401 - compatibility alias
 )
 from .runner_background_tasks import (
   background_asyncio_tasks as _background_asyncio_tasks,  # noqa: F401 - compatibility alias
-  background_task_call_index as _background_task_call_index,  # noqa: F401 - compatibility alias
-  background_elapsed_seconds as _background_elapsed_seconds,  # noqa: F401 - compatibility alias
-  background_task_model as _background_task_model,  # noqa: F401 - compatibility alias
-  background_task_payload as _background_task_payload,  # noqa: F401 - compatibility alias
-  background_task_provider_name as _background_task_provider_name,  # noqa: F401 - compatibility alias
-  background_task_ids as _background_task_ids,  # noqa: F401 - compatibility alias
-  background_task_ids_for_asyncio_tasks as _background_task_ids_for_asyncio_tasks,  # noqa: F401 - compatibility alias
-  background_task_limit_error as _background_task_limit_error,  # noqa: F401 - compatibility alias
-  background_task_registration_metadata as _background_task_registration_metadata,  # noqa: F401 - compatibility alias
-  background_task_reminder_text as _background_task_reminder_text,  # noqa: F401 - compatibility alias
-  background_result_task as _background_result_task,  # noqa: F401 - compatibility alias
-  background_result_tasks as _background_result_tasks,  # noqa: F401 - compatibility alias
+  bounded_background_error as _bounded_background_error,
   background_task_started_result as _background_task_started_result,  # noqa: F401 - compatibility alias
-  background_timeout_value as _background_timeout_value,  # noqa: F401 - compatibility alias
-  background_wait_tasks as _background_wait_tasks,  # noqa: F401 - compatibility alias
-  call_before_background_task_start_hook as _call_before_background_task_start_hook,  # noqa: F401 - compatibility alias
+  agent_completion_notification as _agent_completion_notification,
   drain_cancelled_background_tasks as _drain_cancelled_background_tasks,  # noqa: F401 - compatibility alias
   drain_still_pending_background_tasks as _drain_still_pending_background_tasks,  # noqa: F401 - compatibility alias
   entry_aware_background_handler as _entry_aware_background_handler,  # noqa: F401 - compatibility alias
-  ensure_sub_agent_semaphore as _ensure_sub_agent_semaphore,  # noqa: F401 - compatibility alias
   kill_background_tasks as _kill_background_tasks,  # noqa: F401 - compatibility alias
   kill_background_tasks_for_asyncio_tasks as _kill_background_tasks_for_asyncio_tasks,
-  parse_background_result_request as _parse_background_result_request,  # noqa: F401 - compatibility alias
-  parse_child_budget_usd as _parse_child_budget_usd,  # noqa: F401 - compatibility alias
   prepare_background_task_registration as _prepare_background_task_registration,  # noqa: F401 - compatibility alias
-  resume_chain_depth as _resume_chain_depth,  # noqa: F401 - compatibility alias
-  resume_root_task_id as _resume_root_task_id,  # noqa: F401 - compatibility alias
-  resume_root_task_id_from_registry as _resume_root_task_id_from_registry,  # noqa: F401 - compatibility alias
-  resume_task_id_override as _resume_task_id_override,  # noqa: F401 - compatibility alias
-  resumed_task_ids as _resumed_task_ids,  # noqa: F401 - compatibility alias
-  resumed_task_ids_from_registry as _resumed_task_ids_from_registry,  # noqa: F401 - compatibility alias
-  sub_agent_result_from_log_entries as _sub_agent_result_from_log_entries,  # noqa: F401 - compatibility alias
-  task_completed_event_payload as _task_completed_event_payload,  # noqa: F401 - compatibility alias
-  task_correlation_payload as _task_correlation_payload,  # noqa: F401 - compatibility alias
   task_registered_event_payload as _task_registered_event_payload,  # noqa: F401 - compatibility alias
-  wait_for_background_tasks as _wait_for_background_tasks,  # noqa: F401 - compatibility alias
+  workflow_owns_terminal_notification as _workflow_owns_terminal_notification,
 )
 from .runner_callbacks import (
-  call_before_stream_complete_hook as _call_before_stream_complete_hook,  # noqa: F401 - compatibility alias
   call_metric_hook as _call_metric_hook,  # noqa: F401 - compatibility alias
-  call_tool_timing_hook as _call_tool_timing_hook,  # noqa: F401 - compatibility alias
-  call_tool_result_hook as _call_tool_result_hook,  # noqa: F401 - compatibility alias
 )
 from .runner_notifications import (
   build_notification_reminder as _build_notification_reminder,  # noqa: F401 - compatibility alias
   consume_notifications as _consume_notifications,  # noqa: F401 - compatibility alias
-  inject_system_prompt_reminder as _inject_system_prompt_reminder,  # noqa: F401 - compatibility alias
 )
 from .runner_session_lifecycle import RunnerSessionLifecycleMixin
+from .skill_lifecycle import (
+  TopLevelSkillAdmission,
+  TopLevelSkillLifecycleMetadata,
+  TopLevelSkillResultPolicy,
+  TopLevelServerTerminalCause,
+)
 from .runner_sub_agents import RunnerSubAgentMixin
+from .sub_agent_skill_state import result_response_text
 from .runner_stream_turn import RunnerStreamTurnMixin
 from .runner_run_loop import RunnerRunLoopMixin
 from .runner_tool_execution import RunnerToolExecutionMixin
+from .workflow_output_attachment import WorkflowOutputAttachment
 from .runner_session_events import (
-  build_assistant_message_event as _build_assistant_message_event,  # noqa: F401 - compatibility alias
   build_attach_event as _build_attach_event,  # noqa: F401 - compatibility alias
-  build_budget_exceeded_event as _build_budget_exceeded_event,  # noqa: F401 - compatibility alias
-  build_budget_exceeded_text_event as _build_budget_exceeded_text_event,  # noqa: F401 - compatibility alias
-  build_chat_done_log_data as _build_chat_done_log_data,  # noqa: F401 - compatibility alias
   build_context_warning_log_data as _build_context_warning_log_data,  # noqa: F401 - compatibility alias
-  build_detach_event as _build_detach_event,  # noqa: F401 - compatibility alias
-  build_error_event as _build_error_event,  # noqa: F401 - compatibility alias
-  build_interrupted_event as _build_interrupted_event,  # noqa: F401 - compatibility alias
-  build_max_turns_reached_event as _build_max_turns_reached_event,  # noqa: F401 - compatibility alias
-  build_max_turns_text_event as _build_max_turns_text_event,  # noqa: F401 - compatibility alias
   build_orphan_tool_call_interrupted_events as _build_orphan_tool_call_interrupted_events,  # noqa: F401 - compatibility alias
-  build_operator_pause_event as _build_operator_pause_event,  # noqa: F401 - compatibility alias
-  build_run_error_event as _build_run_error_event,  # noqa: F401 - compatibility alias
-  build_runtime_guard_event as _build_runtime_guard_event,  # noqa: F401 - compatibility alias
-  build_stream_complete_event as _build_stream_complete_event,  # noqa: F401 - compatibility alias
-  build_stream_retry_event as _build_stream_retry_event,  # noqa: F401 - compatibility alias
   build_stub_response_events as _build_stub_response_events,
   build_tool_call_complete_event as _build_tool_call_complete_event,  # noqa: F401 - compatibility alias
   build_tool_call_start_event as _build_tool_call_start_event,  # noqa: F401 - compatibility alias
-  build_turn_complete_log_data as _build_turn_complete_log_data,  # noqa: F401 - compatibility alias
-  build_token_estimate_log_data as _build_token_estimate_log_data,  # noqa: F401 - compatibility alias
-  build_turn_complete_event as _build_turn_complete_event,  # noqa: F401 - compatibility alias
-  build_user_message_event as _build_user_message_event,  # noqa: F401 - compatibility alias
   durable_event_payload as _durable_event_payload,  # noqa: F401 - compatibility alias
   release_write_lease as _release_write_lease,  # noqa: F401 - compatibility alias
-  run_detach_reason as _run_detach_reason,  # noqa: F401 - compatibility alias
-  run_interrupted_reason as _run_interrupted_reason,  # noqa: F401 - compatibility alias
-  shutdown_interrupted_reason as _shutdown_interrupted_reason,  # noqa: F401 - compatibility alias
-  write_lease_metadata as _write_lease_metadata,  # noqa: F401 - compatibility alias
 )
 from .runner_skill_gate import (
   default_tool_definitions as _default_tool_definitions,
@@ -165,52 +112,33 @@ from .runner_state import (
   StreamTurnResult,  # noqa: F401 - compatibility alias
   SubAgentConfig,
   ToolResultContext,
-  assistant_turn_message as _assistant_turn_message,  # noqa: F401 - compatibility alias
-  background_tasks_completed_user_message as _background_tasks_completed_user_message,  # noqa: F401 - compatibility alias
   budget_cost_progress as _budget_cost_progress,  # noqa: F401 - compatibility alias
   budget_exceeded_state as _budget_exceeded_state,  # noqa: F401 - compatibility alias
-  budget_reason_suffix as _budget_reason_suffix,  # noqa: F401 - compatibility alias
   execute_tool_use_loop as _execute_tool_use_loop,  # noqa: F401 - compatibility alias
-  model_visible_extra_blocks as _model_visible_extra_blocks,  # noqa: F401 - compatibility alias
-  no_tool_use_turn_outcome as _no_tool_use_turn_outcome,  # noqa: F401 - compatibility alias
   normalized_run_config as _normalized_run_config,  # noqa: F401 - compatibility alias
-  select_run_max_tokens as _select_run_max_tokens,  # noqa: F401 - compatibility alias
-  session_drain_state as _session_drain_state,  # noqa: F401 - compatibility alias
-  stream_turn_log_summary as _stream_turn_log_summary,  # noqa: F401 - compatibility alias
-  sub_agent_batch_error as _sub_agent_batch_error,  # noqa: F401 - compatibility alias
   turn_reminder_state as _turn_reminder_state,  # noqa: F401 - compatibility alias
-  usage_cache_status as _usage_cache_status,  # noqa: F401 - compatibility alias
-  user_turn_message as _user_turn_message,  # noqa: F401 - compatibility alias
 )
 from .runner_streaming import (
   STREAM_STALL_TIMEOUT as STREAM_STALL_TIMEOUT,
   STREAM_THINKING_STALL_TIMEOUT as STREAM_THINKING_STALL_TIMEOUT,
   classify_guard_outcome,  # noqa: F401 - compatibility alias
   effective_stream_stall_timeout,  # noqa: F401 - compatibility alias
-  observed_thinking_in_messages,  # noqa: F401 - compatibility alias
   thinking_level,  # noqa: F401 - compatibility alias
 )
 from .runner_tool_audit import (
   get_tool_risk_value as _get_tool_risk_value,  # noqa: F401 - compatibility alias
   redact_tool_input_for_event as _redact_tool_input_for_event,  # noqa: F401 - compatibility alias
 )
+from .secret_boundary import SecretBoundary, sanitize_tool_event
 from .runner_usage import (
-  apply_message_start_usage as _apply_message_start_usage,  # noqa: F401 - compatibility alias
-  apply_usage_update as _apply_usage_update,  # noqa: F401 - compatibility alias
   build_usage_event as _build_usage_event,  # noqa: F401 - compatibility alias
-  call_late_usage_event_hook as _call_late_usage_event_hook,  # noqa: F401 - compatibility alias
-  call_session_summary_hook as _call_session_summary_hook,  # noqa: F401 - compatibility alias
-  call_usage_event_hook as _call_usage_event_hook,  # noqa: F401 - compatibility alias
-  empty_usage_totals as _empty_usage_totals,  # noqa: F401 - compatibility alias
-  estimate_usage_cost as _estimate_usage_cost,  # noqa: F401 - compatibility alias
-  turn_usage_payload as _turn_usage_payload,  # noqa: F401 - compatibility alias
+  record_compaction as _record_compaction,  # noqa: F401 - compatibility alias
   usage_delta as _usage_delta,  # noqa: F401 - compatibility alias
-  usage_delta_state as _usage_delta_state,  # noqa: F401 - compatibility alias
   usage_has_tokens as _usage_has_tokens,  # noqa: F401 - compatibility alias
 )
 from .session_recap import emit_recap_then_terminal
+from .session import GatewaySession
 from .task_registry import (
-  COORDINATOR_DEFAULT_PREAMBLE,  # noqa: F401 - compatibility alias
   CoordinatorConfig,
   NotificationQueue,
   ParentMessage,
@@ -218,24 +146,16 @@ from .task_registry import (
   TaskNotification,
   TaskRegistry,
   TaskState,
-  format_parent_messages_for_model,  # noqa: F401 - compatibility alias
-  make_progress_tracker,  # noqa: F401 - compatibility alias
 )
 from .tool_dispatcher import ToolDispatcher
 from .tool_display import resolve_display  # noqa: F401 - compatibility alias
 from .tool_result_compaction import (
-  MODEL_TOOL_RESULT_MAX_CHARS as MODEL_TOOL_RESULT_MAX_CHARS,
   MODEL_TOOL_RESULT_MAX_CHARS_ENV as MODEL_TOOL_RESULT_MAX_CHARS_ENV,
-  MODEL_TOOL_RESULT_MIN_CHARS as MODEL_TOOL_RESULT_MIN_CHARS,
   SPILL_TRUNCATED_TOOL_RESULTS_ENV as SPILL_TRUNCATED_TOOL_RESULTS_ENV,
   annotate_result,
   compact_model_tool_result_entry as _compact_model_tool_result_entry,
   is_error_tool_result_entry,
   make_error_result,
-  model_tool_result_max_chars as _model_tool_result_max_chars,  # noqa: F401 - compatibility alias
-  scalar_preview_fields as _scalar_preview_fields,  # noqa: F401 - compatibility alias
-  spill_truncated_tool_results_enabled as _spill_truncated_tool_results_enabled,  # noqa: F401 - compatibility alias
-  truncate_model_tool_result_content as _truncate_model_tool_result_content,  # noqa: F401 - compatibility alias
   write_tool_result_spill,
 )
 from .tool_result_semantics import (
@@ -264,6 +184,7 @@ STREAM_RETRY_BACKOFF = 2.0
 # timeout fires first and returns a clean tool error; this only triggers if
 # that inner await itself never resolves.
 _RUN_AGENT_DISPATCH_TIMEOUT_SECONDS = 2100.0
+_ACTIVE_SKILL_ALLOW_RESULT_KEY = "_active_skill_allow"
 _ACTIVE_SKILL_DENY_RESULT_KEY = "_active_skill_deny"
 _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
 # Report doors are the only auto-clear doors in scope and normally return noop;
@@ -305,9 +226,9 @@ class AgentRunner(
 
   Constructor highlights:
 
-  - `provider` supplies model-specific request/stream behavior.
+  - `capability_execution` freezes the complete capability bind, adapter, and
+    credential material before construction.
   - `dispatcher` executes local or MCP tools.
-  - `auth_config` carries provider credentials, model, and token limits.
   - `get_tool_definitions` supplies the current tool schema visible to the
     model.
   - `on_tool_result`, `on_usage`, and `on_tool_timing` are observability hooks.
@@ -320,9 +241,8 @@ class AgentRunner(
     dispatcher: ToolDispatcher,
     session_id: str,
     *,
-    provider: ModelProvider,
-    auth_config: Dict[str, Any] | None = None,
-    allow_stub_response: bool = True,
+    capability_execution: BoundCapabilityExecution,
+    allow_stub_response: bool = False,
     client_timeout: float | None = None,
     max_tokens_override: int | None = None,
     per_turn_timeout: float | None = None,
@@ -330,6 +250,7 @@ class AgentRunner(
     mcp_client: McpClientManager | None = None,
     loaded_mcp_servers: Set[str] | None = None,
     excluded_tools: Set[str] | None = None,
+    purpose: str | None = None,
     get_tool_definitions: Callable[[], List[Dict[str, Any]]] | None = None,
     on_tool_result: OnToolResult | None = None,
     on_usage: OnUsage | None = None,
@@ -355,7 +276,8 @@ class AgentRunner(
     max_budget_usd: float | None = None,
     _cost_accumulator: CostAccumulator | None = None,
     _parent_aggregator: _UsageAggregator | None = None,
-    max_concurrent_sub_agents: int | None = None,
+    max_concurrent_sub_agents: int | None = 4,
+    result_requirement: ResultRequirement | None = None,
     agent_session_log: AgentSessionLog | None = None,
     context_builder: SessionContextBuilder | None = None,
     task_registry: TaskRegistry | None = None,
@@ -368,31 +290,179 @@ class AgentRunner(
     emit_session_recap: bool = True,
     code_execution_spill_dir_provider: Callable[[], str] | SpillSink | None = None,
     skill_run_id: str | None = None,
+    top_level_skill_admission: TopLevelSkillAdmission | None = None,
+    top_level_skill_lifecycle: TopLevelSkillLifecycleMetadata | None = None,
+    top_level_skill_result_policy: TopLevelSkillResultPolicy | None = None,
     workspace_dir: str | Path | None = None,
     batch_id: int | str | None = None,
     context_surfaces: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
     context_capture: ContextCapture | None = None,
     commercial_usage_producer: Any | None = None,
+    gateway_session: GatewaySession | None = None,
   ) -> None:
+    if (
+      gateway_session is not None
+      and type(gateway_session) is not GatewaySession
+    ):
+      raise TypeError(
+        "AgentRunner gateway_session must be exact GatewaySession"
+      )
+    if (
+      gateway_session is not None
+      and (
+        session_id != gateway_session.session_id
+        or (
+          user_id is not None
+          and user_id != gateway_session.user_id
+        )
+        or (
+          channel is not None
+          and gateway_session.channel is not None
+          and channel != gateway_session.channel
+        )
+      )
+    ):
+      raise ValueError(
+        "AgentRunner identity does not match GatewaySession"
+      )
+    if not isinstance(capability_execution, BoundCapabilityExecution):
+      raise TypeError(
+        "AgentRunner requires a BoundCapabilityExecution"
+      )
+    capability_execution.validate()
     if max_budget_usd is not None and max_budget_usd <= 0:
       raise ValueError("max_budget_usd must be positive when provided")
     if max_concurrent_sub_agents is not None and max_concurrent_sub_agents <= 0:
       raise ValueError("max_concurrent_sub_agents must be positive when provided")
     if max_resume_chain_depth <= 0:
       raise ValueError("max_resume_chain_depth must be positive")
+    if (
+      result_requirement is not None
+      and not isinstance(result_requirement, ResultRequirement)
+    ):
+      raise TypeError("result_requirement must be a ResultRequirement")
+    if result_requirement is not None and result_requirement.mode != "narrative":
+      raise ValueError("agent execution accepts terminal-message results only")
+    if (
+      top_level_skill_lifecycle is not None
+      and not isinstance(
+        top_level_skill_lifecycle,
+        TopLevelSkillLifecycleMetadata,
+      )
+    ):
+      raise TypeError(
+        "top_level_skill_lifecycle must be "
+        "TopLevelSkillLifecycleMetadata"
+      )
+    if (
+      top_level_skill_result_policy is not None
+      and not isinstance(
+        top_level_skill_result_policy,
+        TopLevelSkillResultPolicy,
+      )
+    ):
+      raise TypeError(
+        "top_level_skill_result_policy must be "
+        "TopLevelSkillResultPolicy"
+      )
+    if (
+      (top_level_skill_lifecycle is None)
+      != (top_level_skill_result_policy is None)
+    ):
+      raise ValueError(
+        "top_level_skill_lifecycle and "
+        "top_level_skill_result_policy must be provided together"
+      )
+    if (
+      top_level_skill_admission is not None
+      and not isinstance(
+        top_level_skill_admission,
+        TopLevelSkillAdmission,
+      )
+    ):
+      raise TypeError(
+        "top_level_skill_admission must be TopLevelSkillAdmission"
+      )
+    if (
+      top_level_skill_admission is not None
+      and top_level_skill_lifecycle is None
+    ):
+      raise ValueError(
+        "top_level_skill_admission requires a top-level lifecycle"
+      )
+    if (
+      top_level_skill_lifecycle is not None
+      and agent_session_log is not None
+      and top_level_skill_admission is None
+    ):
+      raise ValueError(
+        "Durable top-level skills require a pre-acquired admission"
+      )
+    if (
+      top_level_skill_admission is not None
+      and agent_session_log is None
+    ):
+      raise ValueError(
+        "top_level_skill_admission requires an agent session log"
+      )
+    if (
+      top_level_skill_admission is not None
+      and top_level_skill_admission.state != "held"
+    ):
+      raise RuntimeError(
+        "AgentRunner requires a held top-level skill admission"
+      )
+    if skill_run_id is not None and (
+      type(skill_run_id) is not str
+      or not skill_run_id
+      or skill_run_id != skill_run_id.strip()
+    ):
+      raise ValueError(
+        "skill_run_id must be a non-empty string without "
+        "surrounding whitespace"
+      )
+    explicit_skill_run_id = skill_run_id
+    if (
+      top_level_skill_lifecycle is not None
+      and explicit_skill_run_id is not None
+      and explicit_skill_run_id
+      != top_level_skill_lifecycle.skill_run_id
+    ):
+      raise ValueError(
+        "skill_run_id must match top_level_skill_lifecycle"
+      )
 
     self._log = event_log
     self._dispatcher = dispatcher
+    self._gateway_session = gateway_session
     self._spill_dir_provider = normalize_spill_sink(code_execution_spill_dir_provider)
-    self._provider = provider
+    self._capability_execution = capability_execution
+    self._secret_boundary = SecretBoundary.from_capability_execution(
+      capability_execution
+    )
+    bind_dispatcher_boundary = getattr(
+      self._dispatcher,
+      "bind_secret_boundary",
+      None,
+    )
+    if callable(bind_dispatcher_boundary):
+      bind_dispatcher_boundary(self._secret_boundary)
+    self._provider = capability_execution.provider
     self._full_session_id = session_id or "no-session"
     self._sid = self._full_session_id[:12]
     self._session_started_at = float(started_at if started_at is not None else time.time())
     self._emit_session_recap = bool(emit_session_recap)
-    self._skill_run_id = str(skill_run_id).strip() if skill_run_id else None
+    self._top_level_skill_lifecycle = top_level_skill_lifecycle
+    self._top_level_skill_result_policy = top_level_skill_result_policy
+    self._top_level_skill_admission = top_level_skill_admission
+    self._skill_run_id = (
+      top_level_skill_lifecycle.skill_run_id
+      if top_level_skill_lifecycle is not None
+      else explicit_skill_run_id
+    )
     self._workspace_dir = str(workspace_dir) if workspace_dir is not None else None
     self._batch_id = str(batch_id).strip() if batch_id is not None and str(batch_id).strip() else None
-    self._auth_config = dict(auth_config or {})
+    self._auth_config = dict(capability_execution.auth_config)
     self._allow_stub_response = bool(allow_stub_response)
     self._effort_resolution = None
     self._client_timeout = client_timeout
@@ -402,6 +472,8 @@ class AgentRunner(
     self._mcp_client = mcp_client
     self._loaded_mcp_servers = loaded_mcp_servers if loaded_mcp_servers is not None else set()
     self._excluded_tools = set(excluded_tools or set())
+    self.set_purpose(purpose)
+    self._active_skill_allow: set[str] = set()
     self._active_skill_deny: set[str] = set()
     self._active_skill_report_doors: dict[str, str] = {}
     self._get_tool_definitions = get_tool_definitions
@@ -446,6 +518,12 @@ class AgentRunner(
     self._sub_agent_config = sub_agent_config
     self._compaction_trigger = compaction_trigger
     self._compaction_instructions = compaction_instructions
+    self._context_pressure_next_reminder_pct = (
+      CONTEXT_PRESSURE_REMINDER_PCT
+    )
+    self._portable_compaction_failed_est_at: int | None = None
+    self._portable_compaction_last_turn: int | None = None
+    self._portable_compaction_floor_warned = False
     self._tool_call_timeout = tool_call_timeout
     self._on_max_turns = on_max_turns
     self._final_answer_guard = final_answer_guard
@@ -459,7 +537,8 @@ class AgentRunner(
     self._coordinator = coordinator
     self._max_resume_chain_depth = max_resume_chain_depth
     self._max_concurrent_sub_agents = max_concurrent_sub_agents
-    self._max_background_tasks = max_concurrent_sub_agents or 3
+    self._max_background_tasks = max_concurrent_sub_agents or 4
+    self._result_requirement = result_requirement
     self._sub_agent_semaphore: asyncio.Semaphore | None = None
     self._active_client: Any | None = None
     self._disconnected = False
@@ -478,17 +557,22 @@ class AgentRunner(
         "capture_readable_resource_snapshot" in dispatch_params
         or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in dispatch_params.values())
       )
+      self._dispatcher_accepts_advertised_tool_names = (
+        "advertised_tool_names" in dispatch_params
+        or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in dispatch_params.values())
+      )
     except (TypeError, ValueError):
       self._dispatcher_accepts_abort_event = False
       self._dispatcher_accepts_skill_run_context = False
       self._dispatcher_accepts_readable_resource_snapshot = False
+      self._dispatcher_accepts_advertised_tool_names = False
     task_registry_auto_created = task_registry is None
     self._task_registry = task_registry or TaskRegistry(
       max_inflight=self._max_background_tasks,
       id_prefix="bg",
     )
     self._message_inbox = message_inbox
-    self._operator_pause_event = operator_pause_event
+    self._operator_pause_event = operator_pause_event or asyncio.Event()
     self._shutdown_signal_provider = shutdown_signal_provider
     self._notification_queue = NotificationQueue()
     if self._coordinator is not None and self._coordinator.enabled:
@@ -500,48 +584,224 @@ class AgentRunner(
     class _NotificationListener:
       def on_transition(self_listener, entry: TaskEntry, old_state: TaskState, new_state: TaskState) -> None:
         _ = self_listener, old_state
-        if new_state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.KILLED):
+        if _workflow_owns_terminal_notification(entry):
+          return
+        if new_state in (
+          TaskState.COMPLETED,
+          TaskState.FAILED,
+          TaskState.KILLED,
+          TaskState.INTERRUPTED,
+        ):
+          if entry.completion_envelope is not None:
+            notification = _agent_completion_notification(
+              entry,
+              entry.completion_envelope,
+              timestamp=time.time(),
+            )
+            if notification_queue.push(notification):
+              entry.notification_delivery_state = "queued"
+            else:
+              entry.notification_delivery_state = "queue_omitted"
+            return
           event_name = new_state.value
+          payload = entry.result or entry.error or {}
+          if new_state == TaskState.FAILED and isinstance(
+            entry.error,
+            dict,
+          ):
+            payload = _bounded_background_error(entry.error)
+          elif new_state == TaskState.INTERRUPTED:
+            payload = self._background_task_payload(entry)
           summary = ""
           if entry.result and isinstance(entry.result, dict):
-            summary = str(entry.result.get("response", ""))
+            summary = result_response_text(entry.result)
           elif entry.error and isinstance(entry.error, dict):
-            summary = str(entry.error.get("message", ""))
-          notification_queue.push(
-            TaskNotification(
-              task_id=entry.task_id,
-              agent_name=entry.agent_name,
-              event=event_name,
-              summary=summary,
-              timestamp=time.time(),
-              payload=entry.result or entry.error or {},
-            )
+            summary = str(payload.get("message", ""))
+          notification = TaskNotification(
+            task_id=entry.task_id,
+            agent_name=entry.agent_name,
+            event=event_name,
+            summary=summary,
+            timestamp=time.time(),
+            payload=payload,
+            notification_generation=entry.notification_generation,
           )
+          _, omission_reason = notification.inline_payload()
+          if notification_queue.push(notification):
+            entry.notification_delivery_state = (
+              "queued"
+              if omission_reason is None
+              else "payload_omitted"
+            )
+          else:
+            entry.notification_delivery_state = "queue_omitted"
 
     notifications_enabled = not (
       self._coordinator is not None
       and self._coordinator.enabled
       and not self._coordinator.auto_notify
     )
+    self._background_notifications_enabled = notifications_enabled
     if notifications_enabled:
       self._task_registry.add_listener(_NotificationListener())
     self._agent_session_log = agent_session_log
     self._context_builder = context_builder
-    self._gateway_session_id = self._full_session_id
+    self._gateway_session_id = (
+      gateway_session.session_id
+      if gateway_session is not None
+      else self._full_session_id
+    )
     self._role = "sub_agent" if self._full_session_id.startswith("sub") and ":" in self._full_session_id else "writer"
     self._sub_agent_id = self._full_session_id if self._role == "sub_agent" else None
     self._client_kind = self._channel or ("cron" if self._agent_session_log is not None else "cli")
     self._runner_id: str | None = None
     self._write_lease_file: Any | None = None
+    self._pending_background_completion_appends: set[
+      asyncio.Task[Any]
+    ] = set()
+    self._pending_background_initializations: set[
+      asyncio.Task[Any]
+    ] = set()
+    self._pending_background_result_acks: dict[
+      str,
+      tuple[str, int],
+    ] = {}
+    self._deferred_write_lease_release = False
+    self._writer_lease_poisoned = False
+    self._write_lease_settlement_waiters: set[
+      asyncio.Future[Any]
+    ] = set()
     self._durable_attach_emitted = False
     self._last_durable_seq = 0
     self._last_assistant_message_seq: int | None = None
+    self._pending_workflow_output_attachments: dict[
+      str,
+      WorkflowOutputAttachment,
+    ] = {}
+    # Runtime-owned verified workflow evidence projections keyed by
+    # workflow_run_id; the final-answer guard consumes these as provenance.
+    self._workflow_evidence_provenance: dict[str, dict[str, Any]] = {}
     self._task_registry_rebuild_lock = asyncio.Lock()
     self._task_registry_rebuilt = False
+    self._top_level_skill_started_event: dict[str, Any] | None = None
+    self._top_level_skill_started_task: asyncio.Task[Any] | None = None
+    self._top_level_skill_started_committed = False
+    self._top_level_skill_result_event: dict[str, Any] | None = None
+    self._top_level_skill_completion_effect_plan: Any | None = None
+    self._top_level_skill_result_task: asyncio.Task[Any] | None = None
+    self._top_level_skill_result_failure: BaseException | None = None
+    self._top_level_skill_result_failure_code: str | None = None
+    self._top_level_skill_result_committed = False
+    self._top_level_skill_started_projected = False
+    self._top_level_skill_result_projected = False
+    self._prepared_top_level_terminal_event: (
+      dict[str, Any] | None
+    ) = None
+    self._deferred_top_level_terminal_event: (
+      dict[str, Any] | None
+    ) = None
+    self._deferred_top_level_terminal_flushed = False
+    self._top_level_skill_terminal_committed = False
+    self._deferred_top_level_interrupted_event: (
+      dict[str, Any] | None
+    ) = None
+    self._deferred_top_level_interrupted_flushed = False
+    self._top_level_skill_detach_committed = False
+    self._top_level_skill_settlement_complete = asyncio.Event()
+    self._top_level_skill_settlement_error: (
+      BaseException | None
+    ) = None
+    if top_level_skill_admission is not None:
+      self._write_lease_file = top_level_skill_admission.transfer(
+        log_path=agent_session_log.path,
+        write_lease_path=agent_session_log.write_lease_path,
+      )
 
   @property
   def _background_tasks(self) -> Dict[str, TaskEntry]:
     return self._task_registry._tasks
+
+  @property
+  def capability_execution(self) -> BoundCapabilityExecution:
+    return self._capability_execution
+
+  @property
+  def committed_top_level_skill_result_event(
+    self,
+  ) -> dict[str, Any] | None:
+    """Return a defensive copy of the committed top-level skill receipt."""
+
+    if not self._top_level_skill_result_committed:
+      return None
+    event = self._top_level_skill_result_event
+    if event is None:
+      raise RuntimeError(
+        "Committed top-level skill result is missing its event"
+      )
+    return deepcopy(event)
+
+  @property
+  def top_level_skill_enrolled(self) -> bool:
+    return self._top_level_skill_lifecycle is not None
+
+  def classify_server_cancellation_cause(
+    self,
+  ) -> TopLevelServerTerminalCause:
+    """Classify an external cancellation without exception-text inference."""
+
+    provider = self._shutdown_signal_provider
+    if provider is not None:
+      try:
+        if provider():
+          return "shutdown"
+      except Exception:
+        pass
+    return "caller_cancellation"
+
+  def set_server_terminal_cause(
+    self,
+    cause: TopLevelServerTerminalCause,
+  ) -> bool:
+    """Record a typed cause before the completion fence becomes irrevocable."""
+
+    policy = self._top_level_skill_result_policy
+    if policy is None or self._top_level_skill_result_committed:
+      return False
+    return policy.set_server_terminal_cause(cause)
+
+  async def wait_for_top_level_skill_settlement(self) -> bool:
+    """Wait until receipt, terminal, detach, and lease handoff all settle."""
+
+    if self._top_level_skill_lifecycle is None:
+      return False
+    await self._top_level_skill_settlement_complete.wait()
+    error = self._top_level_skill_settlement_error
+    if error is not None:
+      raise error
+    if self._write_lease_file is not None:
+      raise RuntimeError(
+        "Top-level skill settlement completed before lease handoff"
+      )
+    if not self._top_level_skill_result_committed:
+      raise RuntimeError(
+        "Top-level skill settlement completed without a result receipt"
+      )
+    if self._deferred_top_level_terminal_event is None:
+      raise RuntimeError(
+        "Top-level skill settlement completed without a terminal event"
+      )
+    if not self._deferred_top_level_terminal_flushed:
+      raise RuntimeError(
+        "Top-level skill settlement completed before terminal projection"
+      )
+    if (
+      self._durable_attach_emitted
+      and not self._top_level_skill_detach_committed
+    ):
+      raise RuntimeError(
+        "Top-level skill settlement completed before durable detach"
+      )
+    return True
 
   @property
   def effort_introspection(self) -> dict[str, Any] | None:
@@ -554,6 +814,54 @@ class AgentRunner(
       "effective": resolution.effective.value,
       "thinking_enabled_effective": resolution.thinking_enabled_effective,
     }
+
+  async def _call_on_tool_result(
+    self,
+    ctx: ToolResultContext,
+  ) -> List[Dict[str, Any]]:
+    extra_blocks = await RunnerHooksLifecycleMixin._call_on_tool_result(
+      self,
+      ctx,
+    )
+    policy = self._top_level_skill_result_policy
+    observer = (
+      policy.terminal_tool_result_observer
+      if policy is not None
+      else None
+    )
+    if observer is None:
+      return extra_blocks
+    disposition = observer(ctx)
+    if inspect.isawaitable(disposition):
+      disposition = await disposition
+    if disposition is not None:
+      if disposition not in {"success", "failure"}:
+        raise RuntimeError(
+          "Top-level terminal tool observer must return exactly "
+          "'success', 'failure', or None"
+        )
+      self._stop_after_tool_results_reason = (
+        "terminal_tool_result"
+        if disposition == "success"
+        else "terminal_tool_failure"
+      )
+      self._stop_after_tool_results_tool_name = getattr(
+        ctx,
+        "tool_name",
+        None,
+      )
+      result = getattr(ctx, "result", None)
+      self._stop_after_tool_results_status = (
+        result.get("status")
+        if isinstance(result, dict)
+        else None
+      )
+      self._stop_after_tool_results_skill_run_id = getattr(
+        ctx,
+        "skill_run_id",
+        None,
+      )
+    return extra_blocks
 
   @staticmethod
   def _normalize_context_surfaces(surfaces: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -569,20 +877,33 @@ class AgentRunner(
     try:
       return self._normalize_context_surfaces(self._context_surfaces_provider())
     except Exception as exc:
-      log.warning("[%s] context surface provider failed (non-fatal): %s", self._sid, exc)
+      log.warning(
+        "[%s] context surface provider failed (non-fatal) | exception_type=%s",
+        self._sid,
+        type(exc).__name__,
+      )
       return self._normalize_context_surfaces(self._context_surfaces_static)
 
-  def _append(self, event: Dict[str, Any]) -> None:
+  def _append(self, event: Dict[str, Any]) -> Any | None:
+    event = sanitize_tool_event(
+      event,
+      sink="event_log",
+      boundary=getattr(self, "_secret_boundary", None),
+    )
+    if event.get("type") == "compaction":
+      _record_compaction(self._aggregator)
+      self._context_pressure_next_reminder_pct = (
+        CONTEXT_PRESSURE_REMINDER_PCT
+      )
     if event.get("type") in {"stream_complete", "error"}:
-      emit_recap_then_terminal(
+      return emit_recap_then_terminal(
         self._log,
         event,
         session_id=self._full_session_id,
         started_at=self._session_started_at,
         emit_recap=self._emit_session_recap,
       )
-      return
-    self._log.append(event)
+    return self._log.append(event)
 
   def request_operator_pause(self) -> None:
     if self._operator_pause_event is None:
@@ -655,8 +976,21 @@ class AgentRunner(
   def _default_tool_definitions(self) -> List[Dict[str, Any]]:
     return _default_tool_definitions(self._get_tool_definitions, self._mcp_client)
 
+  def set_purpose(self, purpose: str | None) -> None:
+    self._purpose = (
+      purpose.strip().lower()
+      if isinstance(purpose, str) and purpose.strip()
+      else None
+    )
   def _effective_excluded_tools(self) -> set[str]:
-    return _effective_excluded_tools(self._excluded_tools, self._active_skill_deny)
+    excluded = _effective_excluded_tools(
+      self._excluded_tools,
+      self._active_skill_deny,
+      self._active_skill_allow,
+    )
+    if self._purpose == "normalizer":
+      excluded.update(normalizer_excluded_tools())
+    return excluded
 
   def _filter_excluded_tool_definitions(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return _filter_excluded_tool_definitions(tools, self._effective_excluded_tools())
@@ -668,6 +1002,15 @@ class AgentRunner(
     normalized = _normalize_skill_report_doors(value)
     if normalized is not None:
       self._active_skill_report_doors = normalized
+
+  def _activate_skill_allow(self, tool_names: Any, base_kwargs: Dict[str, Any]) -> None:
+    allowed = _normalize_skill_deny(tool_names)
+    if allowed is None:
+      return
+    if allowed == self._active_skill_allow:
+      return
+    self._active_skill_allow = allowed
+    self._rebuild_filtered_tool_definitions(base_kwargs)
 
   def _activate_skill_deny(self, tool_names: Any, base_kwargs: Dict[str, Any]) -> None:
     denied = _normalize_skill_deny(tool_names)
@@ -696,6 +1039,7 @@ class AgentRunner(
       clear_current_skill()
     except Exception:
       return False
+    self._active_skill_allow.clear()
     self._active_skill_deny.clear()
     self._active_skill_report_doors.clear()
     self._rebuild_filtered_tool_definitions(base_kwargs)

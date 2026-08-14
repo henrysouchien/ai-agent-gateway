@@ -18,8 +18,8 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _TOP_LEVEL_KEYS = {
   "name",
   "system_prompt",
-  "provider",
-  "model",
+  "model_key",
+  "effort",
   "host",
   "port",
   "api_prefix",
@@ -44,8 +44,8 @@ class AgentProjectConfig:
   path: Path
   name: str
   system_prompt: str
-  provider: str
-  model: str | None
+  model_key: str | None
+  effort: str | None
   host: str
   port: int
   api_prefix: str
@@ -73,14 +73,12 @@ def validate_project_name(name: str) -> str:
 def default_agent_config_payload(
   *,
   name: str,
-  provider: str = "anthropic",
-  model: str | None = None,
+  model_key: str | None = None,
+  effort: str | None = None,
 ) -> dict[str, Any]:
   payload: dict[str, Any] = {
     "name": validate_project_name(name),
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
-    "provider": provider,
-    "model": model,
     "host": "127.0.0.1",
     "port": 8000,
     "api_prefix": "/api",
@@ -94,6 +92,10 @@ def default_agent_config_payload(
     "max_budget_usd": None,
     "per_turn_timeout": 300,
   }
+  if model_key is not None:
+    payload["model_key"] = model_key
+  if effort is not None:
+    payload["effort"] = effort
   return payload
 
 
@@ -131,13 +133,17 @@ def write_agent_project(
   target_dir: str | Path,
   *,
   name: str,
-  provider: str = "anthropic",
-  model: str | None = None,
+  model_key: str | None = None,
+  effort: str | None = None,
   force: bool = False,
 ) -> list[Path]:
   root = Path(target_dir).expanduser()
   project_name = validate_project_name(name)
-  payload = default_agent_config_payload(name=project_name, provider=provider, model=model)
+  payload = default_agent_config_payload(
+    name=project_name,
+    model_key=model_key,
+    effort=effort,
+  )
   files = {
     root / DEFAULT_AGENT_CONFIG: yaml.safe_dump(payload, sort_keys=False),
     root / "agent.py": default_agent_py(),
@@ -201,8 +207,8 @@ def load_agent_project_config(config_path: str | Path = DEFAULT_AGENT_CONFIG) ->
     path=path,
     name=name,
     system_prompt=_string(payload.get("system_prompt"), DEFAULT_SYSTEM_PROMPT),
-    provider=_string(payload.get("provider"), "anthropic"),
-    model=_optional_string(payload.get("model")),
+    model_key=_optional_string(payload.get("model_key")),
+    effort=_optional_string(payload.get("effort")),
     host=_string(payload.get("host"), "127.0.0.1"),
     port=_int(payload.get("port"), 8000, key="port"),
     api_prefix=_api_prefix(_string(payload.get("api_prefix"), "/api")),
@@ -220,10 +226,14 @@ def load_agent_project_config(config_path: str | Path = DEFAULT_AGENT_CONFIG) ->
 
 def create_agent_from_yaml(config_path: str | Path = DEFAULT_AGENT_CONFIG) -> FastAPI:
   config = load_agent_project_config(config_path)
+  selection: dict[str, str] = {}
+  if config.model_key is not None:
+    selection["model_key"] = config.model_key
+  if config.effort is not None:
+    selection["effort"] = config.effort
   return create_agent(
     config.system_prompt,
-    provider=config.provider,
-    model=config.model,
+    **selection,
     max_tokens=config.max_tokens,
     mcp_servers=config.mcp_servers or None,
     skills_dir=config.skills_dir,

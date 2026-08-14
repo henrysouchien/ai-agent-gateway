@@ -7,13 +7,21 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import HTTPException, Request
 
-from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock
+from agent_gateway.approvals import (
+  ApprovalActionError,
+  _cancel_pending_approval_and_unblock,
+)
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
+from agent_gateway.autonomous_runner_state import (
+  is_root_run_event,
+  is_root_terminal_event,
+)
 from agent_gateway.fixture_gate import (
-  FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME,
+  FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME,
   FIXTURE_TERMINAL_FAILURE_SKILL_NAME,
   fixture_provider_available,
   is_fixture_profile_name,
@@ -30,13 +38,22 @@ from agent_gateway.control_run_lifecycle import (
   is_autonomous_run_internal_resumable_state,
   is_control_run_active_state,
 )
+from .autonomous_approval_delivery import (
+  autonomous_approval_delivery_context,
+  deliver_autonomous_approval_outbox,
+)
+from .autonomous_approval_drainer import (
+  wake_autonomous_approval_delivery,
+)
 from .runs_models import (
   AutonomousDispatchRequest,
   AutonomousDispatchResponse,
+  AutonomousResultReference,
   AutonomousResumeRequest,
   AutonomousRunMessageRequest,
   AutonomousRunResponse,
   AutonomousRunState,
+  AutonomousTerminalReceipt,
   ChatContinuationRequest,
   ChatDispatchRequest,
   ChatDispatchResponse,
@@ -53,16 +70,19 @@ from .runs_models import (
   RunResponse,
   RunsListResponse,
   StagedProposalResponse,
+  ToolResultSummaryResponse,
   VerdictSummaryResponse,
 )
 
 __all__ = [
   "AutonomousDispatchRequest",
   "AutonomousDispatchResponse",
+  "AutonomousResultReference",
   "AutonomousResumeRequest",
   "AutonomousRunMessageRequest",
   "AutonomousRunResponse",
   "AutonomousRunState",
+  "AutonomousTerminalReceipt",
   "ChatContinuationRequest",
   "ChatDispatchRequest",
   "ChatDispatchResponse",
@@ -134,7 +154,7 @@ def _record_owner_user_id(record: AutonomousTask) -> str:
   owner_user_id = getattr(record, "owner_user_id", None)
   if isinstance(owner_user_id, str) and owner_user_id.strip():
     return owner_user_id.strip()
-  return str(record.user_id)
+  return ""
 
 
 def _positive_risk_user_id(value: Any) -> int | None:
@@ -164,24 +184,32 @@ def _state_from_session(session: GatewaySession, events: list[dict[str, Any]]) -
     return "approval_pending"
   if session.stream_active or (session.active_turn is not None and session.active_turn.is_running):
     return "running"
-  raw_terminal_state: ChatRunState | None = None
   for event in reversed(events):
-    event_type = event.get("type")
-    if event_type == "run_state_changed":
+    if is_root_run_event(event) and event.get("type") == "run_state_changed":
       state = coerce_control_run_state(event.get("state"))
       if state is not None:
         return state
-    if raw_terminal_state is None:
-      if event_type == "error":
-        raw_terminal_state = "failed"
-      elif event_type == "stream_complete":
-        raw_terminal_state = "completed"
-  return raw_terminal_state or "starting"
+
+  for event in events:
+    if not is_root_terminal_event(event):
+      continue
+    event_type = event.get("type")
+    if event_type in {"error", "stream_error"}:
+      return "failed"
+    if event_type != "stream_complete":
+      continue
+    disposition = event.get("terminal_disposition")
+    if disposition == "completed":
+      return "completed"
+    if disposition == "interrupted":
+      return "interrupted"
+    return "failed"
+  return "starting"
 
 
 def _ended_at_from_events(events: list[dict[str, Any]]) -> str | None:
   for event in reversed(events):
-    if event.get("type") != "run_state_changed":
+    if not is_root_run_event(event) or event.get("type") != "run_state_changed":
       continue
     state = coerce_control_run_state(event.get("state"))
     if state not in CONTROL_TERMINAL_RUN_STATES:
@@ -202,6 +230,70 @@ def _skill_run_ids(events: list[dict[str, Any]]) -> list[str]:
   return ordered
 
 
+def _autonomous_result_refs(events: list[dict[str, Any]]) -> list[AutonomousResultReference]:
+  seen: set[tuple[str, str, str | None]] = set()
+  refs: list[AutonomousResultReference] = []
+
+  def add(kind: str, ref: Any, *, skill_run_id: str | None) -> None:
+    if not isinstance(ref, str) or not ref.strip():
+      return
+    normalized_ref = ref.strip()
+    key = (kind, normalized_ref, skill_run_id)
+    if key in seen:
+      return
+    seen.add(key)
+    refs.append(
+      AutonomousResultReference(
+        kind=kind,  # type: ignore[arg-type]
+        ref=normalized_ref,
+        skill_run_id=skill_run_id,
+      )
+    )
+
+  for event in events:
+    if event.get("type") != "skill_result_captured":
+      continue
+    raw_skill_run_id = event.get("skill_run_id")
+    skill_run_id = (
+      raw_skill_run_id.strip()
+      if isinstance(raw_skill_run_id, str) and raw_skill_run_id.strip()
+      else None
+    )
+    if skill_run_id is not None:
+      add("skill_run", skill_run_id, skill_run_id=skill_run_id)
+    artifact_refs = event.get("artifact_refs")
+    if isinstance(artifact_refs, list):
+      for artifact_ref in artifact_refs:
+        add("artifact", artifact_ref, skill_run_id=skill_run_id)
+    proposal_ids = event.get("proposal_ids")
+    if isinstance(proposal_ids, list):
+      for proposal_id in proposal_ids:
+        add("proposal", proposal_id, skill_run_id=skill_run_id)
+    add("output_memory", event.get("output_memory_file"), skill_run_id=skill_run_id)
+  return refs
+
+
+def _autonomous_terminal_receipt(
+  record: AutonomousTask,
+  *,
+  state: AutonomousRunState,
+  events: list[dict[str, Any]],
+) -> AutonomousTerminalReceipt | None:
+  if state not in CONTROL_TERMINAL_RUN_STATES or record.completed_at is None:
+    return None
+  raw_error = record.error
+  return AutonomousTerminalReceipt(
+    run_id=record.control_run_id,
+    disposition=state,  # type: ignore[arg-type]
+    exit_code=record.exit_code,
+    error=str(raw_error) if raw_error is not None else None,
+    terminal_reason=getattr(record, "terminal_reason", None),
+    completed_at=_iso_from_unix(record.completed_at),
+    log_ref=f"/control/runs/{quote(record.control_run_id, safe='')}/logs",
+    result_refs=_autonomous_result_refs(events),
+  )
+
+
 def _current_verdict(events: list[dict[str, Any]]) -> VerdictSummaryResponse | None:
   for event in reversed(events):
     if event.get("type") != "skill_result_captured":
@@ -217,6 +309,147 @@ def _current_verdict(events: list[dict[str, Any]]) -> VerdictSummaryResponse | N
       confidence=str(verdict["confidence"]) if verdict.get("confidence") is not None else None,
       one_line_summary=str(verdict.get("one_line_summary") or ""),
       skill_run_id=skill_run_id,
+    )
+  return None
+
+
+def _bounded_summary_text(value: Any, *, limit: int = 1000) -> str | None:
+  if not isinstance(value, str) or not value.strip():
+    return None
+  normalized = value.strip()
+  return normalized if len(normalized) <= limit else normalized[:limit] + "...<truncated>"
+
+
+def _verdict_token(value: Any) -> str | None:
+  if isinstance(value, dict):
+    value = value.get("verdict") or value.get("verdict_token")
+  return _bounded_summary_text(value, limit=128)
+
+
+def _stage_receipt_status(
+  result: dict[str, Any],
+  *,
+  readback: dict[str, Any],
+  typed_outputs: dict[str, Any],
+) -> str | None:
+  business_model_receipt = (
+    typed_outputs.get("business_model_stage_receipt")
+    if isinstance(typed_outputs.get("business_model_stage_receipt"), dict)
+    else {}
+  )
+  readback_receipt = (
+    readback.get("stage_receipt")
+    if isinstance(readback.get("stage_receipt"), dict)
+    else {}
+  )
+  result_receipt = result.get("receipt") if isinstance(result.get("receipt"), dict) else {}
+  persisted_receipt = (
+    result_receipt.get("stage_receipt")
+    if isinstance(result_receipt.get("stage_receipt"), dict)
+    else {}
+  )
+  candidates = [
+    status
+    for status in (
+      _bounded_summary_text(business_model_receipt.get("status"), limit=128),
+      _bounded_summary_text(readback.get("stage_receipt_status"), limit=128),
+      _bounded_summary_text(readback_receipt.get("status"), limit=128),
+      _bounded_summary_text(persisted_receipt.get("status"), limit=128),
+    )
+    if status is not None
+  ]
+  # A projected receipt must not hide disagreement between deterministic
+  # readback and the persisted receipt. Returning no status makes stage
+  # validation fail closed on the control-plane summary.
+  if len(set(candidates)) > 1:
+    return None
+  return candidates[0] if candidates else None
+
+
+def _latest_tool_result(events: list[dict[str, Any]]) -> ToolResultSummaryResponse | None:
+  for event in reversed(events):
+    if event.get("type") != "tool_call_complete":
+      continue
+    tool_call_id = _bounded_summary_text(event.get("tool_call_id"), limit=256)
+    tool_name = _bounded_summary_text(event.get("tool_name"), limit=256)
+    if tool_call_id is None or tool_name is None:
+      continue
+    result = event.get("result") if isinstance(event.get("result"), dict) else {}
+    result_error = result.get("error") if isinstance(result.get("error"), dict) else None
+    event_error = event.get("error") if isinstance(event.get("error"), dict) else None
+    semantic_error = (
+      event.get("semantic_error")
+      if isinstance(event.get("semantic_error"), dict)
+      else None
+    )
+    error = result_error or event_error or semantic_error
+    status = _bounded_summary_text(result.get("status"), limit=128)
+    status_is_error = (status or "").lower() in {"error", "failed", "failure"}
+    succeeded = not (
+      bool(event.get("is_error"))
+      or status_is_error
+      or result_error is not None
+      or event_error is not None
+      or semantic_error is not None
+    )
+    verdict_echo = (
+      result.get("verdict_echo")
+      if isinstance(result.get("verdict_echo"), dict)
+      else {}
+    )
+    readback = result.get("readback") if isinstance(result.get("readback"), dict) else {}
+    readback_verdict = (
+      readback.get("verdict")
+      if isinstance(readback.get("verdict"), dict)
+      else {}
+    )
+    typed_outputs = (
+      readback.get("typed_outputs")
+      if isinstance(readback.get("typed_outputs"), dict)
+      else {}
+    )
+    verdict = next(
+      (
+        token
+        for token in (
+          _verdict_token(result.get("verdict")),
+          _verdict_token(verdict_echo),
+          _verdict_token(readback_verdict),
+        )
+        if token is not None
+      ),
+      None,
+    )
+    return ToolResultSummaryResponse(
+      tool_call_id=tool_call_id,
+      tool_name=tool_name,
+      status=status,
+      succeeded=succeeded,
+      subcommand=_bounded_summary_text(result.get("subcommand"), limit=128),
+      gate_code=_bounded_summary_text(result.get("gate_code"), limit=128),
+      artifact_ref=_bounded_summary_text(result.get("artifact_ref"), limit=1000),
+      proposal_id=_bounded_summary_text(result.get("proposal_id"), limit=256),
+      verdict=verdict,
+      stage_receipt_status=_stage_receipt_status(
+        result,
+        readback=readback,
+        typed_outputs=typed_outputs,
+      ),
+      error_code=(
+        _bounded_summary_text(error.get("type") or error.get("code"), limit=128)
+        if error is not None
+        else None
+      ),
+      error_message=(
+        _bounded_summary_text(error.get("message"), limit=1000)
+        if error is not None
+        else None
+      ),
+      error_recoverable=(
+        error.get("recoverable")
+        if error is not None and isinstance(error.get("recoverable"), bool)
+        else None
+      ),
     )
   return None
 
@@ -365,8 +598,14 @@ def _pending_approval(session: GatewaySession) -> PendingApprovalResponse | None
       continue
     return PendingApprovalResponse(
       pending_id=str(tool_call_id),
+      approval_id=str(pending.get("approval_id") or ""),
       tool_name=str(pending.get("tool_name") or ""),
       tool_input=dict(pending.get("tool_input") or {}),
+      planned_change=(
+        dict(pending["planned_change"])
+        if isinstance(pending.get("planned_change"), dict)
+        else None
+      ),
       resolved_qualifier=(
         str(pending["resolved_qualifier"]) if pending.get("resolved_qualifier") is not None else None
       ),
@@ -399,10 +638,12 @@ def _chat_run_from_session(session: GatewaySession) -> ChatRunResponse:
     started_at=_iso_from_unix(session.created_at),
     ended_at=_ended_at_from_events(events) if state in _TERMINAL_RUN_STATES else None,
     cost_usd=_events_cost_usd(events),
+    max_budget_usd=getattr(session, "max_budget_usd", None),
     initial_message=session.initial_message,
     skill_run_ids=_skill_run_ids(events),
     current_verdict=_current_verdict(events),
     pending_approval=_pending_approval(session),
+    latest_tool_result=_latest_tool_result(events),
     dispatch_scope=session.dispatch_scope,
   )
 
@@ -503,14 +744,21 @@ async def _deny_autonomous_pending_approvals_for_cancel(
     nonce = str(event.get("nonce") or "")
     if not approval_id or not tool_call_id or not nonce:
       continue
-    request_record = await store.get(approval_id)
-    if request_record is None or request_record.state != "pending_user":
-      continue
+    get_delivery = getattr(
+      store,
+      "get_autonomous_approval_delivery",
+      None,
+    )
+    if not callable(get_delivery):
+      raise ApprovalActionError(
+        503,
+        {"error": "Autonomous approval delivery outbox unavailable"},
+      )
 
     pending_entry = _autonomous_pending_entry_from_event(event)
     approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
     shim_session = GatewaySession(
-      session_id=record.control_run_id,
+      session_id=record.session_id,
       api_key_hash="control-autonomous",
       created_at=int(record.started_at),
       expires_at=int(time.time()) + 600,
@@ -525,32 +773,61 @@ async def _deny_autonomous_pending_approvals_for_cancel(
     shim_session.pending_tools[tool_call_id] = pending_entry
     shim_session.approval_queues[tool_call_id] = approval_queue
 
-    await _record_vote_and_unblock(
-      target_session=shim_session,
-      pending_entry=pending_entry,
-      tool_call_id=tool_call_id,
-      nonce=nonce,
-      decider_id=owner_user_id,
-      decider_role=getattr(authenticated, "role", None),
-      approved=False,
-      allow_tool_type=False,
-      reason="run_cancelled",
-      app_state=app_state,
-    )
     try:
-      await registry.send_approval_decision(
-        record.control_run_id,
-        user_id=owner_user_id,
-        channel=authenticated.channel,
-        approval_id=approval_id,
+      result = await _cancel_pending_approval_and_unblock(
+        target_session=shim_session,
+        pending_entry=pending_entry,
         tool_call_id=tool_call_id,
         nonce=nonce,
-        approved=False,
-        allow_tool_type=False,
+        decider_id=owner_user_id,
+        decider_role=getattr(authenticated, "role", None),
         reason="run_cancelled",
+        app_state=app_state,
+        authoritative_store=store,
+        authoritative_policy=policy,
+        expected_owner_user_id=_record_owner_user_id(record),
+        expected_request_id=record.control_run_id,
+        expected_run_id=record.control_run_id,
+        expected_session_id=record.session_id,
+        expected_channel=record.channel,
+        autonomous_delivery=autonomous_approval_delivery_context(
+          record,
+          tool_call_id=tool_call_id,
+          nonce=nonce,
+        ),
+        system_override=True,
+        release_queue=False,
       )
-    except (OSError, PermissionError, RuntimeError, ValueError):
-      pass
+    finally:
+      wake_autonomous_approval_delivery(app_state)
+    if (
+      result.get("identity_matches") is not True
+      or result.get("transitioned") is not True
+    ):
+      continue
+    delivery = await get_delivery(
+      approval_id,
+      tool_call_id=tool_call_id,
+      nonce=nonce,
+    )
+    request_record = await store.get(approval_id)
+    if delivery is None or request_record is None:
+      raise RuntimeError(
+        "autonomous cancellation approval outbox commit unavailable"
+      )
+    await deliver_autonomous_approval_outbox(
+      registry=registry,
+      store=store,
+      record=record,
+      request_record=request_record,
+      delivery=delivery,
+      approval_id=approval_id,
+      tool_call_id=tool_call_id,
+      nonce=nonce,
+      approved=False,
+      user_id=owner_user_id,
+      channel=authenticated.channel,
+    )
 
 
 def _loader_api() -> Any:
@@ -578,6 +855,8 @@ def _skill_is_resumable(skills_dir: Path | None, skill: str | None) -> bool:
 
 
 def _autonomous_task_resumable(record: AutonomousTask, skills_dir: Path | None) -> bool:
+  if record.capability_bind is None:
+    return False
   if record.mode != "skill" or not record.skill:
     return False
   if not is_autonomous_run_internal_resumable_state(record.state):
@@ -599,7 +878,10 @@ def _autonomous_task_messageable(
     return False
   if record.proc is not None and record.proc.returncode is not None:
     return False
-  return not any(event.get("type") == "stream_complete" for event in events)
+  return not any(
+    is_root_terminal_event(event) and event.get("type") == "stream_complete"
+    for event in events
+  )
 
 
 def _autonomous_run_from_task(record: AutonomousTask, *, skills_dir: Path | None = None) -> AutonomousRunResponse:
@@ -629,6 +911,9 @@ def _autonomous_run_from_task(record: AutonomousTask, *, skills_dir: Path | None
     user_aliases=_identity_aliases(record.user_aliases, owner_user_id),
     identity_status=record.identity_status,
     state=state,
+    exit_code=record.exit_code,
+    error=record.error,
+    terminal_receipt=_autonomous_terminal_receipt(record, state=state, events=events),
     messageable=_autonomous_task_messageable(record, state=state, events=events),
     started_at=_iso_from_unix(record.started_at),
     ended_at=_iso_from_unix(record.completed_at) if record.completed_at is not None else None,
@@ -738,7 +1023,7 @@ def _require_web_safe_autonomous_dispatch(
     qa_fixture_bridge == _QA_FIXTURE_APPROVAL_ARTIFACT_VALUE
     and fixture_provider_available()
     and is_fixture_profile_name(profile)
-    and skill == FIXTURE_APPROVAL_HTML_ARTIFACT_SKILL_NAME
+    and skill == FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME
     and bool(payload.dev_mode)
   ):
     return

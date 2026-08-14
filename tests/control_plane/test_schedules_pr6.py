@@ -9,70 +9,91 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from agent_gateway.autonomous_runner_state import AutonomousTask
+from agent_gateway.capability_binding import (
+  CapabilityBind,
+)
+from agent_gateway.model_registry import (
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
+from agent_gateway.autonomous_launch_envelope import AutonomousControlAuthority
 from agent_gateway.control_plane import schedules as schedules_module
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+
+from .manifest_helpers import write_v6_manifest
 
 
 API_KEY = "schedules-pr6-key"
 LAUNCHD_PREFIX = "com.henrychien."
+_MODEL_ENTRY = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5")
 
 
 def _make_app(*, dispatch_scope_validator: Any | None = None):
   async def _build_chat_runtime(*, session, request, channel, auth_manager):
-    _ = session, request, channel, auth_manager
-    return ChatRuntime(system_prompt="test", build_runner=lambda *_args: None)
+    _ = session, channel, auth_manager
+    return ChatRuntime(
+      system_prompt="test",
+      build_runner=lambda *_args: None,
+      capability_execution=request.capability_execution,
+    )
 
   return create_gateway_app(
     GatewayServerConfig(
       jwt_secret="schedules-pr6-test-secret-0123456789",
       valid_api_keys={API_KEY},
-      auth_config={"model": "test-model"},
-      allowed_models=set(),
+      tenant_id="test-product",
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
       dispatch_scope_validator=dispatch_scope_validator,
     )
   )
 
 
-def _control_session(client: TestClient, user_id: str, *, channel: str = "tui") -> dict[str, Any]:
+def _control_session(
+  client: TestClient,
+  user_id: str,
+  *,
+  channel: str = "tui",
+  role: str = "invite",
+) -> dict[str, Any]:
   response = client.post(
     "/api/control/session",
     json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": channel}},
   )
   assert response.status_code == 200, response.text
-  return response.json()
+  payload = response.json()
+  session = client.app.state.auth.session_store.get_session(payload["session_id"])
+  assert session is not None
+  session.role = role
+  payload["role"] = role
+  payload["session_token"] = client.app.state.auth.issue_token(session)
+  return payload
 
 
 def _headers(session_payload: dict[str, Any]) -> dict[str, str]:
   return {"Authorization": f"Bearer {session_payload['session_token']}"}
 
 
-def test_agent_run_schedule_store_path_prefers_gateway_state_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-  explicit = tmp_path / "explicit.json"
-  user_data_dir = tmp_path / "state"
-  gateway_log_dir = tmp_path / "gateway" / "logs"
+def test_agent_run_schedule_store_path_is_scoped_to_owner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
 
-  monkeypatch.setenv("AGENT_GATEWAY_AGENT_RUN_SCHEDULES_PATH", str(explicit))
-  monkeypatch.setenv("USER_DATA_DIR", str(user_data_dir))
-  monkeypatch.setenv("GATEWAY_LOG_DIR", str(gateway_log_dir))
-  assert schedules_module.default_agent_run_schedule_store_path() == explicit
-
-  monkeypatch.delenv("AGENT_GATEWAY_AGENT_RUN_SCHEDULES_PATH")
-  assert schedules_module.default_agent_run_schedule_store_path() == user_data_dir / "agent-run-schedules.json"
-
-  monkeypatch.delenv("USER_DATA_DIR")
-  assert schedules_module.default_agent_run_schedule_store_path() == tmp_path / "gateway" / "agent-run-schedules.json"
+  assert schedules_module.schedule_store_path_for("alice") == (
+    tmp_path / "users" / "alice" / "agent-run-schedules.json"
+  )
+  with pytest.raises(ValueError, match="user_id is required for per-user store access"):
+    schedules_module.schedule_store_for(None)
 
 
 @pytest.fixture
 def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-  monkeypatch.setenv(
-    "AGENT_GATEWAY_AGENT_RUN_SCHEDULES_PATH",
-    str(tmp_path / "agent-run-schedules.json"),
-  )
+  (tmp_path / "gateway").mkdir(mode=0o700)
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  monkeypatch.delenv("AGENT_GATEWAY_AGENT_RUN_SCHEDULES_PATH", raising=False)
   monkeypatch.setenv("AGENT_GATEWAY_AGENT_RUN_SCHEDULE_POLL_SECONDS", "0")
   launchd_store: dict[str, dict[str, Any]] = {}
   jobs_store: dict[str, dict[str, Any]] = {}
@@ -82,6 +103,7 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     "launchd_disable": [],
     "launchd_delete": [],
     "launchd_logs": [],
+    "schedule_show": [],
     "jobs_create": [],
     "jobs_update": [],
     "jobs_delete": [],
@@ -138,19 +160,14 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
       for schedule in sorted(jobs_store.values(), key=lambda item: item["name"]):
         items.append(
           {
-            "name": schedule["name"],
             "source": "jobs-mcp",
-            "schedule_id": schedule["schedule_id"],
-            "job_type": schedule["job_type"],
-            "schedule_description": schedule["schedule_description"],
-            "enabled": schedule["enabled"],
-            "last_run_at": schedule["last_run_at"],
-            "next_run_at": schedule["next_run_at"],
+            **schedule,
           }
         )
     return {"status": "ok", "schedules": items}
 
   def schedule_show(name: str, source: str | None = None) -> dict[str, Any]:
+    calls["schedule_show"].append({"name": name, "source": source})
     if source in (None, "launchd"):
       launchd = _launchd_show(name)
       if launchd is not None:
@@ -308,13 +325,53 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
   monkeypatch.setattr(schedules_module, "_scheduler_mcp", lambda: scheduler_fake)
   monkeypatch.setattr(schedules_module, "_jobs_api", lambda: jobs_fake)
 
-  return {"launchd": launchd_store, "jobs": jobs_store, "calls": calls}
+  return {
+    "launchd": launchd_store,
+    "jobs": jobs_store,
+    "calls": calls,
+    "tmp_path": tmp_path,
+  }
 
 
-def test_launchd_schedule_create_list_show_logs_toggle_delete(fake_schedule_backends) -> None:
+def test_jobs_schedule_list_rejects_incomplete_rows_without_detail_fallback(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  detail_calls: list[tuple[str, str | None]] = []
+  scheduler = types.SimpleNamespace(
+    schedule_list=lambda **_kwargs: {
+      "status": "ok",
+      "schedules": [{
+        "source": "jobs-mcp",
+        "name": "incomplete",
+        "schedule_id": "sched-incomplete",
+        "job_type": "test",
+        "enabled": True,
+        "schedule_description": "Incomplete",
+      }],
+    },
+    schedule_show=lambda name, source=None: detail_calls.append((name, source)),
+  )
+  monkeypatch.setattr(schedules_module, "_scheduler_mcp", lambda: scheduler)
+
+  with pytest.raises(HTTPException) as exc_info:
+    schedules_module._list_schedules("jobs-mcp")
+
+  assert exc_info.value.status_code == 400
+  assert exc_info.value.detail == "jobs-mcp schedule missing supported frequency"
+  assert detail_calls == []
+
+
+def test_launchd_schedule_create_is_rejected_before_backend_resolution(
+  fake_schedule_backends,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  def _unexpected_scheduler_resolution():
+    raise AssertionError("launchd create must fail before resolving the scheduler backend")
+
+  monkeypatch.setattr(schedules_module, "_scheduler_mcp", _unexpected_scheduler_resolution)
   app = _make_app()
   with TestClient(app) as client:
-    session = _control_session(client, "alice")
+    session = _control_session(client, "alice", role="owner")
     headers = _headers(session)
 
     create = client.post(
@@ -330,14 +387,32 @@ def test_launchd_schedule_create_list_show_logs_toggle_delete(fake_schedule_back
         "comment": "market close prep",
       },
     )
-    assert create.status_code == 201, create.text
-    schedule = create.json()["schedule"]
-    assert schedule["source"] == "launchd"
-    assert schedule["name"] == "daily-close"
-    assert schedule["label"] == f"{LAUNCHD_PREFIX}daily-close"
-    assert schedule["enabled"] is True
-    assert schedule["recent_log_lines"] == ["launchd line 1", "launchd line 2"]
-    assert fake_schedule_backends["calls"]["launchd_create"][0]["schedule"] == {"hour": 9, "minute": 30}
+
+    assert create.status_code == 403, create.text
+    assert create.json()["detail"] == {
+      "error": "launchd_schedule_creation_forbidden",
+      "message": (
+        "The Agent Control API cannot create launchd schedules. "
+        "Install approved launchd jobs through deployment-managed templates."
+      ),
+    }
+    assert fake_schedule_backends["calls"]["launchd_create"] == []
+
+
+def test_existing_launchd_schedule_list_show_logs_toggle_delete(fake_schedule_backends) -> None:
+  fake_schedule_backends["launchd"]["daily-close"] = {
+    "command": ["/usr/bin/python3", "task.py"],
+    "working_directory": "/tmp",
+    "schedule": {"hour": 9, "minute": 30},
+    "schedule_description": "Daily at 9:30 AM",
+    "enabled": True,
+    "last_exit_status": None,
+    "recent_log_lines": ["launchd line 1", "launchd line 2"],
+  }
+  app = _make_app()
+  with TestClient(app) as client:
+    session = _control_session(client, "alice", role="owner")
+    headers = _headers(session)
 
     listed = client.get("/api/control/schedules?source=launchd", headers=headers)
     assert listed.status_code == 200, listed.text
@@ -371,7 +446,7 @@ def test_launchd_schedule_create_list_show_logs_toggle_delete(fake_schedule_back
 def test_jobs_mcp_schedule_create_list_show_toggle_delete(fake_schedule_backends) -> None:
   app = _make_app()
   with TestClient(app) as client:
-    session = _control_session(client, "alice")
+    session = _control_session(client, "alice", role="owner")
     headers = _headers(session)
 
     create = client.post(
@@ -406,6 +481,9 @@ def test_jobs_mcp_schedule_create_list_show_toggle_delete(fake_schedule_backends
         "params": {"symbols": ["AAPL"]},
       }
     ]
+    assert fake_schedule_backends["calls"]["schedule_show"] == [
+      {"name": "weekly-oi", "source": "jobs-mcp"}
+    ]
 
     listed = client.get("/api/control/schedules?source=jobs-mcp", headers=headers)
     assert listed.status_code == 200, listed.text
@@ -413,10 +491,18 @@ def test_jobs_mcp_schedule_create_list_show_toggle_delete(fake_schedule_backends
     assert listed_schedule["name"] == "weekly-oi"
     assert listed_schedule["frequency"] == "weekly"
     assert listed_schedule["time_of_day"] == "08:15"
+    assert listed_schedule["params"] == {"symbols": ["AAPL"]}
+    assert fake_schedule_backends["calls"]["schedule_show"] == [
+      {"name": "weekly-oi", "source": "jobs-mcp"}
+    ]
 
     detail = client.get("/api/control/schedules/weekly-oi", headers=headers)
     assert detail.status_code == 200, detail.text
     assert detail.json()["schedule_id"] == "sched_weekly-oi"
+    assert fake_schedule_backends["calls"]["schedule_show"] == [
+      {"name": "weekly-oi", "source": "jobs-mcp"},
+      {"name": "weekly-oi", "source": None},
+    ]
 
     logs = client.get("/api/control/schedules/weekly-oi/logs", headers=headers)
     assert logs.status_code == 400
@@ -440,7 +526,7 @@ def test_jobs_mcp_schedule_create_list_show_toggle_delete(fake_schedule_backends
     ]
 
 
-def test_schedule_list_source_filter_is_operator_global(fake_schedule_backends) -> None:
+def test_operator_schedule_surfaces_are_owner_only(fake_schedule_backends) -> None:
   fake_schedule_backends["launchd"]["daily-close"] = {
     "command": ["/bin/echo", "launchd"],
     "working_directory": "/tmp",
@@ -466,8 +552,8 @@ def test_schedule_list_source_filter_is_operator_global(fake_schedule_backends) 
 
   app = _make_app()
   with TestClient(app) as client:
-    alice = _control_session(client, "alice")
-    bob = _control_session(client, "bob")
+    alice = _control_session(client, "alice", role="owner")
+    bob = _control_session(client, "bob", role="invite")
 
     all_for_alice = client.get("/api/control/schedules", headers=_headers(alice))
     all_for_bob = client.get("/api/control/schedules", headers=_headers(bob))
@@ -477,11 +563,64 @@ def test_schedule_list_source_filter_is_operator_global(fake_schedule_backends) 
 
     assert all_for_alice.status_code == 200, all_for_alice.text
     assert all_for_bob.status_code == 200, all_for_bob.text
-    assert all_for_alice.json() == all_for_bob.json()
     assert {item["source"] for item in all_for_alice.json()["schedules"]} == {"launchd", "jobs-mcp"}
+    assert all_for_bob.json()["schedules"] == []
     assert [item["source"] for item in launchd_only.json()["schedules"]] == ["launchd"]
     assert [item["source"] for item in jobs_only.json()["schedules"]] == ["jobs-mcp"]
     assert invalid_source.status_code == 422
+
+    invite_headers = _headers(bob)
+    direct_responses = (
+      client.get("/api/control/schedules/daily-close", headers=invite_headers),
+      client.get("/api/control/schedules/daily-close/logs", headers=invite_headers),
+      client.post(
+        "/api/control/schedules",
+        headers=invite_headers,
+        json={
+          "source": "launchd",
+          "name": "invite-launchd",
+          "command": ["/bin/echo", "no"],
+          "schedule": {"hour": 9},
+          "working_directory": "/tmp",
+        },
+      ),
+      client.post(
+        "/api/control/schedules",
+        headers=invite_headers,
+        json={
+          "source": "jobs-mcp",
+          "name": "invite-job",
+          "job_type": "oi_analysis",
+          "frequency": "daily",
+          "time_of_day": "08:15",
+        },
+      ),
+      client.put(
+        "/api/control/schedules/daily-close/enabled",
+        headers=invite_headers,
+        json={"enabled": False},
+      ),
+      client.put(
+        "/api/control/schedules/weekly-oi/enabled",
+        headers=invite_headers,
+        json={"enabled": False},
+      ),
+      client.delete(
+        "/api/control/schedules/daily-close?confirm=true",
+        headers=invite_headers,
+      ),
+      client.delete(
+        "/api/control/schedules/weekly-oi?confirm=true",
+        headers=invite_headers,
+      ),
+    )
+    assert all(response.status_code == 404 for response in direct_responses)
+    assert fake_schedule_backends["calls"]["launchd_create"] == []
+    assert fake_schedule_backends["calls"]["launchd_disable"] == []
+    assert fake_schedule_backends["calls"]["launchd_delete"] == []
+    assert fake_schedule_backends["calls"]["jobs_create"] == []
+    assert fake_schedule_backends["calls"]["jobs_update"] == []
+    assert fake_schedule_backends["calls"]["jobs_delete"] == []
 
 
 def test_web_schedule_reads_are_projected_and_raw_fields_redacted(fake_schedule_backends) -> None:
@@ -510,7 +649,7 @@ def test_web_schedule_reads_are_projected_and_raw_fields_redacted(fake_schedule_
 
   app = _make_app()
   with TestClient(app) as client:
-    session = _control_session(client, "alice", channel="web")
+    session = _control_session(client, "alice", channel="web", role="owner")
     headers = _headers(session)
 
     listed = client.get("/api/control/schedules", headers=headers)
@@ -568,7 +707,7 @@ def test_web_schedule_reads_are_projected_and_raw_fields_redacted(fake_schedule_
 def test_web_raw_schedule_writes_are_rejected_before_backends(fake_schedule_backends) -> None:
   app = _make_app()
   with TestClient(app) as client:
-    session = _control_session(client, "alice", channel="web")
+    session = _control_session(client, "alice", channel="web", role="owner")
     headers = _headers(session)
 
     create_launchd = client.post(
@@ -629,6 +768,186 @@ def _agent_run_schedule_payload(**overrides: Any) -> dict[str, Any]:
   }
   payload.update(overrides)
   return payload
+
+
+@pytest.mark.parametrize("role", ["owner", "invite"])
+def test_schedule_create_stamps_exact_dispatch_role(tmp_path: Path, role: str) -> None:
+  store = schedules_module.AgentRunScheduleStore(tmp_path / "schedules.json")
+  session = types.SimpleNamespace(
+    user_id="alice",
+    owner_user_id="alice",
+    raw_user_id="alice",
+    user_email=None,
+    user_slug="alice",
+    risk_user_id=0,
+    user_aliases=("alice",),
+    identity_status="active",
+    channel="web",
+    role=role,
+  )
+  request = schedules_module.CreateAgentRunScheduleRequest.model_validate(
+    _agent_run_schedule_payload()
+  )
+
+  record = store.create(request, session)
+
+  assert record["dispatch_role"] == role
+  assert record["dispatch_revision"] == 1
+  assert record["dispatch_authored_by"] == "alice"
+
+
+def test_schedule_create_rejects_mixed_case_role(tmp_path: Path) -> None:
+  store = schedules_module.AgentRunScheduleStore(tmp_path / "schedules.json")
+  session = types.SimpleNamespace(
+    user_id="alice",
+    owner_user_id="alice",
+    raw_user_id="alice",
+    user_email=None,
+    user_slug="alice",
+    risk_user_id=0,
+    user_aliases=("alice",),
+    identity_status="active",
+    channel="web",
+    role="Owner",
+  )
+  request = schedules_module.CreateAgentRunScheduleRequest.model_validate(
+    _agent_run_schedule_payload()
+  )
+
+  with pytest.raises(ValueError, match="role must be exactly"):
+    store.create(request, session)
+
+
+def test_schedule_dispatch_authority_tracks_dispatch_revision_and_enable_gate(
+  fake_schedule_backends,
+) -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    session_payload = _control_session(client, "alice", channel="web")
+    headers = _headers(session_payload)
+    live_session = app.state.auth.session_store.get_session(
+      session_payload["session_id"]
+    )
+    assert live_session is not None
+    live_session.role = "invite"
+
+    created_response = client.post(
+      "/api/control/schedules",
+      headers=headers,
+      json=_agent_run_schedule_payload(),
+    )
+    assert created_response.status_code == 201, created_response.text
+    schedule_id = created_response.json()["schedule"]["schedule_id"]
+    stored = app.state.agent_run_schedule_store_for("alice").get_for_owner("alice", schedule_id)
+    assert stored is not None
+    assert (
+      stored["dispatch_role"],
+      stored["dispatch_revision"],
+      stored["dispatch_authored_by"],
+    ) == ("invite", 1, "alice")
+    invite_disabled = client.put(
+      f"/api/control/schedules/{schedule_id}/enabled",
+      headers=headers,
+      json={"enabled": False},
+    )
+    assert invite_disabled.status_code == 200, invite_disabled.text
+
+    live_session.role = "owner"
+    headers = {
+      "Authorization": f"Bearer {app.state.auth.issue_token(live_session)}"
+    }
+    metadata_response = client.patch(
+      f"/api/control/schedules/{schedule_id}",
+      headers=headers,
+      json={"kind": "agent_run_schedule", "timezone": "UTC"},
+    )
+    assert metadata_response.status_code == 200, metadata_response.text
+    stored = app.state.agent_run_schedule_store_for("alice").get_for_owner("alice", schedule_id)
+    assert stored is not None
+    assert (
+      stored["dispatch_role"],
+      stored["dispatch_revision"],
+      stored["dispatch_authored_by"],
+    ) == ("invite", 1, "alice")
+    owner_enable_invite_dispatch = client.patch(
+      f"/api/control/schedules/{schedule_id}",
+      headers=headers,
+      json={"kind": "agent_run_schedule", "enabled": True},
+    )
+    assert owner_enable_invite_dispatch.status_code == 403
+
+    dispatch_response = client.patch(
+      f"/api/control/schedules/{schedule_id}",
+      headers=headers,
+      json={
+        "kind": "agent_run_schedule",
+        "dispatch": {
+          "kind": "autonomous",
+          "profile": "analyst",
+          "mode": "skill",
+          "skill": "earnings-review",
+          "context": "Owner-authored revision",
+        },
+      },
+    )
+    assert dispatch_response.status_code == 200, dispatch_response.text
+    owner_enabled = client.put(
+      f"/api/control/schedules/{schedule_id}/enabled",
+      headers=headers,
+      json={"enabled": True},
+    )
+    assert owner_enabled.status_code == 200, owner_enabled.text
+    disabled = client.put(
+      f"/api/control/schedules/{schedule_id}/enabled",
+      headers=headers,
+      json={"enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
+    stored = app.state.agent_run_schedule_store_for("alice").get_for_owner("alice", schedule_id)
+    assert stored is not None
+    assert (stored["dispatch_role"], stored["dispatch_revision"]) == ("owner", 2)
+
+    live_session.role = "invite"
+    headers = {
+      "Authorization": f"Bearer {app.state.auth.issue_token(live_session)}"
+    }
+    patch_enable = client.patch(
+      f"/api/control/schedules/{schedule_id}",
+      headers=headers,
+      json={"kind": "agent_run_schedule", "enabled": True},
+    )
+    put_enable = client.put(
+      f"/api/control/schedules/{schedule_id}/enabled",
+      headers=headers,
+      json={"enabled": True},
+    )
+    assert patch_enable.status_code == 403
+    assert put_enable.status_code == 403
+
+    recapture = client.patch(
+      f"/api/control/schedules/{schedule_id}",
+      headers=headers,
+      json={
+        "kind": "agent_run_schedule",
+        "dispatch": {
+          "kind": "autonomous",
+          "profile": "analyst",
+          "mode": "skill",
+          "skill": "earnings-review",
+          "context": "Invite-authored revision",
+        },
+      },
+    )
+    assert recapture.status_code == 200, recapture.text
+    enabled = client.put(
+      f"/api/control/schedules/{schedule_id}/enabled",
+      headers=headers,
+      json={"enabled": True},
+    )
+    assert enabled.status_code == 200, enabled.text
+    stored = app.state.agent_run_schedule_store_for("alice").get_for_owner("alice", schedule_id)
+    assert stored is not None
+    assert (stored["dispatch_role"], stored["dispatch_revision"]) == ("invite", 3)
 
 
 def test_web_agent_run_schedule_crud_is_safe_and_owner_scoped(fake_schedule_backends) -> None:
@@ -738,25 +1057,63 @@ def test_web_agent_run_schedule_crud_is_safe_and_owner_scoped(fake_schedule_back
 
       async def start(self, **kwargs: Any) -> dict[str, Any]:
         self.starts.append(kwargs)
-        task = AutonomousTask(
-          task_id="bg_run_now",
-          control_run_id="bg_run_now",
-          user_id=str(kwargs["user_id"]),
-          user_email=kwargs.get("user_email"),
-          profile=str(kwargs["profile"]),
+        capability_bind = CapabilityBind(
+          schema_version="1.0",
+          capability_id="session.driver",
+          model_key=_MODEL_ENTRY.key,
+          provider=_MODEL_ENTRY.provider,
+          upstream_model=_MODEL_ENTRY.upstream_model,
+          adapter=_MODEL_ENTRY.adapter,
+          protocol_profile=_MODEL_ENTRY.protocol_profile,
+          route=_MODEL_ENTRY.route,
+          effort="high",
+          credential_principal="service",
+          credential_ref="service:test-product:anthropic",
+          run_mode="cron",
+          registry_revision=INITIAL_MODEL_REGISTRY.revision,
+          policy_revision=INITIAL_MODEL_SELECTION_POLICY.revision,
+          selection_source="capability_default",
+        )
+        manifest = write_v6_manifest(
+          fake_schedule_backends["tmp_path"] / "fake-registry",
+          "bg_run_now",
           mode=str(kwargs["mode"]),
           task=kwargs.get("task"),
           skill=kwargs.get("skill"),
           context=kwargs.get("context"),
           ticker=kwargs.get("ticker"),
           channel=kwargs.get("channel"),
+          capability_bind=capability_bind.receipt(),
+        )
+        task = AutonomousTask(
+          task_id="bg_run_now",
+          control_run_id="bg_run_now",
+          session_id="bg_run_now",
+          channel_id=manifest["channel_id"],
+          user_id=str(kwargs["user_id"]),
+          user_email=kwargs.get("user_email"),
+          role=str(kwargs["role"]),
+          profile=str(kwargs["profile"]),
+          mode=str(kwargs["mode"]),
+          task=kwargs.get("task"),
+          skill=kwargs.get("skill"),
+          pack=None,
+          deliver=True,
+          context=kwargs.get("context"),
+          ticker=kwargs.get("ticker"),
+          channel=kwargs.get("channel"),
           dev_mode=bool(kwargs.get("dev_mode")),
           dispatch_scope=kwargs.get("dispatch_scope"),
           cmd=["python", "-m", "agent.autonomous"],
-          log_path=Path("bg_run_now.log"),
-          events_path=None,
-          operator_inbox_path=Path("bg_run_now.inbox"),
+          log_path=Path(manifest["log_path"]),
+          operator_inbox_path=Path(manifest["operator_inbox_path"]),
           approval_decisions_path=None,
+          control_authority=AutonomousControlAuthority.from_receipt(
+            manifest["control_authority"]
+          ),
+          owner_lease_path=Path(manifest["owner_lease_path"]),
+          owner_lease_device=manifest["owner_lease_device"],
+          owner_lease_inode=manifest["owner_lease_inode"],
           started_at=1_700_000_000.0,
           owner_user_id=kwargs.get("owner_user_id"),
           raw_user_id=str(kwargs["user_id"]),
@@ -766,6 +1123,7 @@ def test_web_agent_run_schedule_crud_is_safe_and_owner_scoped(fake_schedule_back
           identity_status=str(kwargs.get("identity_status") or "legacy_user_id_fallback"),
           schedule_id=kwargs.get("schedule_id"),
           schedule_name=kwargs.get("schedule_name"),
+          capability_bind=capability_bind,
         )
         self._tasks[task.control_run_id] = task
         return {"run_id": task.control_run_id, "task_id": task.task_id}
@@ -781,6 +1139,7 @@ def test_web_agent_run_schedule_crud_is_safe_and_owner_scoped(fake_schedule_back
     assert run_now_payload["run"]["schedule_name"] == "weekday-nvda-earnings-watch"
     assert fake_registry.user_event_bus is not None
     assert fake_registry.starts[0] == {
+      "role": "invite",
       "profile": "analyst",
       "mode": "skill",
       "task": None,
@@ -932,23 +1291,20 @@ def test_web_agent_run_schedule_rejects_task_mode_dispatch(fake_schedule_backend
 
 
 def test_operator_raw_schedule_routes_are_not_shadowed_by_owned_agent_schedule(fake_schedule_backends) -> None:
+  fake_schedule_backends["launchd"]["daily-close"] = {
+    "command": ["/usr/bin/python3", "task.py"],
+    "working_directory": "/tmp",
+    "schedule": {"hour": 9, "minute": 30},
+    "schedule_description": "Daily at 9:30 AM",
+    "enabled": True,
+    "last_exit_status": None,
+    "recent_log_lines": [],
+  }
   app = _make_app()
   with TestClient(app) as client:
-    session = _control_session(client, "alice")
+    session = _control_session(client, "alice", role="owner")
     headers = _headers(session)
 
-    raw_create = client.post(
-      "/api/control/schedules",
-      headers=headers,
-      json={
-        "source": "launchd",
-        "name": "daily-close",
-        "command": ["/usr/bin/python3", "task.py"],
-        "schedule": {"hour": 9, "minute": 30},
-        "working_directory": "/tmp",
-      },
-    )
-    assert raw_create.status_code == 201, raw_create.text
     safe_create = client.post(
       "/api/control/schedules",
       headers=headers,
@@ -1037,6 +1393,9 @@ def test_agent_run_schedule_store_claims_due_records_until_stale(tmp_path: Path)
       "task": "Review the portfolio.",
     },
     "owner_user_id": "alice-owner",
+    "dispatch_role": "owner",
+    "dispatch_revision": 1,
+    "dispatch_authored_by": "alice-owner",
     "raw_user_id": "alice",
     "channel": "web",
     "created_at": "2026-01-01T00:00:00Z",
@@ -1048,14 +1407,21 @@ def test_agent_run_schedule_store_claims_due_records_until_stale(tmp_path: Path)
   now = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
 
   assert [item["schedule_id"] for item in store.due_records(now=now)] == ["sched_due"]
-  claimed = store.claim_due_record("sched_due", claim_id="claim_1", now=now)
+  claimed = store.claim_due_record(
+    "sched_due", claim_id="claim_1", now=now
+  )
   assert claimed is not None
   assert claimed["running_claim_id"] == "claim_1"
-  assert store.claim_due_record("sched_due", claim_id="claim_2", now=now) is None
+  not_claimed = store.claim_due_record(
+    "sched_due", claim_id="claim_2", now=now
+  )
+  assert not_claimed is None
   assert store.due_records(now=now) == []
 
   stale_now = now + timedelta(minutes=16)
-  reclaimed = store.claim_due_record("sched_due", claim_id="claim_2", now=stale_now)
+  reclaimed = store.claim_due_record(
+    "sched_due", claim_id="claim_2", now=stale_now
+  )
   assert reclaimed is not None
   assert reclaimed["running_claim_id"] == "claim_2"
   assert (
@@ -1081,8 +1447,110 @@ def test_agent_run_schedule_store_claims_due_records_until_stale(tmp_path: Path)
   assert "running_claimed_at" not in stored
 
 
+def test_per_user_schedule_files_are_isolated_and_one_tick_fires_both_owners(
+  fake_schedule_backends: Any,
+) -> None:
+  app = _make_app()
+
+  class FakeRegistry:
+    def __init__(self) -> None:
+      self.starts: list[dict[str, Any]] = []
+
+    def set_user_event_bus(self, _user_event_bus: Any | None) -> None:
+      return None
+
+    async def start(self, **kwargs: Any) -> dict[str, Any]:
+      self.starts.append(kwargs)
+      run_id = f"bg_{kwargs['owner_user_id']}"
+      return {"run_id": run_id, "task_id": run_id}
+
+  registry = FakeRegistry()
+  app.state.agent_run_schedule_runner.autonomous_registry = registry
+
+  with TestClient(app) as client:
+    sessions = {
+      owner: _control_session(client, owner, channel="web")
+      for owner in ("alice", "bob")
+    }
+    created: dict[str, str] = {}
+    for owner in ("alice", "bob"):
+      response = client.post(
+        "/api/control/schedules",
+        headers=_headers(sessions[owner]),
+        json=_agent_run_schedule_payload(
+          name=f"{owner}-daily-review",
+          request_id=f"create-{owner}-schedule",
+        ),
+      )
+      assert response.status_code == 201, response.text
+      created[owner] = response.json()["schedule"]["schedule_id"]
+
+    for owner in ("alice", "bob"):
+      listed = client.get(
+        "/api/control/schedules",
+        headers=_headers(sessions[owner]),
+      )
+      assert listed.status_code == 200, listed.text
+      assert [
+        row["schedule_id"]
+        for row in listed.json()["schedules"]
+        if row.get("kind") == "agent_run_schedule"
+      ] == [created[owner]]
+
+    for owner in ("alice", "bob"):
+      path = (
+        fake_schedule_backends["tmp_path"]
+        / "users"
+        / owner
+        / "agent-run-schedules.json"
+      )
+      assert path.is_file()
+      payload = json.loads(path.read_text(encoding="utf-8"))
+      assert [row["owner_user_id"] for row in payload["schedules"]] == [owner]
+      payload["schedules"][0]["next_run_at"] = "2026-01-01T00:00:00Z"
+      path.write_text(json.dumps(payload), encoding="utf-8")
+
+    results = asyncio.run(
+      app.state.agent_run_schedule_runner.fire_due(
+        now=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+      )
+    )
+
+  assert {result["schedule_id"] for result in results} == set(created.values())
+  assert {start["owner_user_id"] for start in registry.starts} == {"alice", "bob"}
+  assert {start["user_id"] for start in registry.starts} == {"alice", "bob"}
+
+
+def test_retired_global_schedule_file_is_never_read(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  global_path = tmp_path / "agent-run-schedules.json"
+  global_path.write_text(
+    json.dumps({
+      "version": 1,
+      "schedules": [{
+        "kind": "agent_run_schedule",
+        "schedule_id": "legacy-global",
+        "owner_user_id": "alice",
+      }],
+      "idempotency": {},
+    }),
+    encoding="utf-8",
+  )
+
+  assert schedules_module.schedule_store_for("alice").list_for_owner("alice") == []
+  runner = schedules_module.AgentRunScheduleRunner(
+    autonomous_registry=object(),
+    poll_interval_seconds=0,
+  )
+  assert runner._existing_stores() == []
+
+
 def test_agent_run_schedule_runner_starts_due_autonomous_run_with_owner_identity(tmp_path: Path) -> None:
-  store_path = tmp_path / "agent-run-schedules.json"
+  store_path = tmp_path / "users" / "alice-owner" / "agent-run-schedules.json"
+  store_path.parent.mkdir(parents=True)
   dispatch_scope = {
     "kind": "portfolio",
     "source": "user_selected",
@@ -1109,6 +1577,9 @@ def test_agent_run_schedule_runner_starts_due_autonomous_run_with_owner_identity
     "owner_user_id": "alice-owner",
     "raw_user_id": "alice",
     "user_email": "alice@example.com",
+    "dispatch_role": "owner",
+    "dispatch_revision": 1,
+    "dispatch_authored_by": "alice-owner",
     "user_slug": "alice",
     "risk_user_id": 42,
     "user_aliases": ["alice-owner", "alice"],
@@ -1135,7 +1606,8 @@ def test_agent_run_schedule_runner_starts_due_autonomous_run_with_owner_identity
   registry = FakeRegistry()
   store = schedules_module.AgentRunScheduleStore(store_path)
   runner = schedules_module.AgentRunScheduleRunner(
-    store=store,
+    store_for=lambda _owner_user_id: store,
+    users_root=tmp_path / "users",
     autonomous_registry=registry,
     user_event_bus_factory=lambda: "bus",
     poll_interval_seconds=0,
@@ -1147,6 +1619,7 @@ def test_agent_run_schedule_runner_starts_due_autonomous_run_with_owner_identity
   assert registry.user_event_bus == "bus"
   assert registry.starts == [
     {
+      "role": "owner",
       "profile": "analyst",
       "mode": "task",
       "task": "Review the portfolio.",
@@ -1177,7 +1650,7 @@ def test_agent_run_schedule_runner_starts_due_autonomous_run_with_owner_identity
 def test_jobs_mcp_create_contract_rejects_wrong_day_types_and_frequency(fake_schedule_backends) -> None:
   app = _make_app()
   with TestClient(app) as client:
-    session = _control_session(client, "alice")
+    session = _control_session(client, "alice", role="owner")
     headers = _headers(session)
 
     string_day = client.post(

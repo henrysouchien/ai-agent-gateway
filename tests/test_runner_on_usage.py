@@ -8,14 +8,37 @@ from typing import Any
 
 import pytest
 
+from agent_workflow_contracts import (  # noqa: E402
+  AgentOperationRef,
+  AttemptRef,
+  OrdinaryDelegationTaskRef,
+  OutcomeRequirement,
+  ResultRequirement,
+  TaskResultProvenance,
+  sha256_digest,
+)
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner, EventLog, GatewaySession, ModelInfo, ModelProvider, ToolDispatcher  # noqa: E402
+from agent_gateway import (  # noqa: E402
+  AgentRunner,
+  AgentSessionLog,
+  EventLog,
+  GatewaySession,
+  ModelInfo,
+  ModelProvider,
+  ToolDispatcher,
+)
+from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
-from agent_gateway.multi_user.billing import SessionUsageSummary, UsageEvent  # noqa: E402
+from agent_gateway.multi_user.billing import (  # noqa: E402
+  SessionUsageSummary,
+  UsageEvent,
+  _UsageAggregator,
+)
 from agent_gateway.providers import CostEstimate, StreamEvent  # noqa: E402
 from agent_gateway.runner_usage import (  # noqa: E402
   apply_message_start_usage,
@@ -30,6 +53,10 @@ from agent_gateway.runner_usage import (  # noqa: E402
   usage_delta,
   usage_delta_state,
   usage_has_tokens,
+  usage_snapshot,
+)
+from tests.capability_execution_test_support import (  # noqa: E402
+  stub_bound_capability_execution,
 )
 
 
@@ -68,7 +95,116 @@ def _run(coro):
   return asyncio.run(coro)
 
 
+def test_compaction_event_seam_counts_once_rearms_and_shares_root_total() -> None:
+  async def case() -> None:
+    aggregator = _UsageAggregator(
+      user_id="alice",
+      session_id="sess-parent",
+      request_id="req-123",
+      channel="web",
+    )
+    parent = object.__new__(AgentRunner)
+    child = object.__new__(AgentRunner)
+    parent._aggregator = aggregator
+    child._aggregator = aggregator
+    parent._log = EventLog()
+    child._log = EventLog()
+    parent._context_pressure_next_reminder_pct = 90
+    child._context_pressure_next_reminder_pct = 80
+
+    parent._append({"type": "status", "message": "ordinary event"})
+    parent._append({"type": "compaction", "chars": 12})
+    child._append({"type": "compaction", "chars": 34})
+
+    summary = await aggregator.snapshot()
+    assert summary.compaction_count == 2
+    assert parent._context_pressure_next_reminder_pct == 60
+    assert child._context_pressure_next_reminder_pct == 60
+    assert [
+      entry.event["type"]
+      for entry in parent._log.entries
+    ] == ["status", "compaction"]
+    assert [
+      entry.event["type"]
+      for entry in child._log.entries
+    ] == ["compaction"]
+
+    await aggregator.close()
+    with pytest.raises(
+      RuntimeError,
+      match="closed before compaction",
+    ):
+      parent._append({"type": "compaction", "chars": 56})
+    assert (await aggregator.snapshot()).compaction_count == 2
+
+  _run(case())
+
+
+def _subagent_identity(physical_task_id: str) -> dict[str, Any]:
+  operation = AgentOperationRef(
+    namespace="agent-operation",
+    name="usage-test-child",
+    version="1.0",
+    digest=sha256_digest({"operation": "usage-test-child"}),
+  )
+  logical_task = OrdinaryDelegationTaskRef(
+    delegation_id=f"delegation:{physical_task_id}",
+    operation=operation,
+  )
+  attempt = AttemptRef(
+    attempt_number=1,
+    attempt_id=f"attempt:{physical_task_id}:1",
+    physical_task_id=physical_task_id,
+  )
+  digest = sha256_digest({
+    "logical_task": logical_task.model_dump(mode="json"),
+    "attempt": attempt.model_dump(mode="json"),
+  })
+  return {
+    "logical_task": logical_task,
+    "attempt": attempt,
+    "result_requirement": ResultRequirement(
+      mode="narrative",
+      terminal_narrative="required",
+      outcome=OutcomeRequirement(required=False, source="none"),
+    ),
+    "result_provenance": TaskResultProvenance(
+      admitted_task_digest=digest,
+      model_bind_digest=digest,
+      capability_binding_digest=digest,
+      tool_grant_digest=digest,
+    ),
+  }
+
+
+def _child_execution(
+  provider: ModelProvider,
+  *,
+  model: str = "claude-sonnet-4-6",
+) -> BoundCapabilityExecution:
+  return stub_bound_capability_execution(
+    provider=provider,
+    model=model,
+    effort="none",
+    capability_id="node.implement",
+    credential_principal="user",
+    auth_config={
+      "api_key": "k",
+    },
+  )
+
+
+def _runner_execution(provider: ModelProvider) -> BoundCapabilityExecution:
+  return stub_bound_capability_execution(
+    provider=provider,
+    model="claude-sonnet-4-6",
+    effort="none",
+    auth_config={"api_key": "k"},
+  )
+
+
 def _usage_event() -> UsageEvent:
+  bind = _runner_execution(_UsageProvider()).bind
   return UsageEvent(
     user_id="alice",
     session_id="sess-parent",
@@ -76,7 +212,6 @@ def _usage_event() -> UsageEvent:
     parent_turn_id=None,
     timestamp=123.0,
     model="claude-sonnet-4-6",
-    provider="stub",
     input_tokens=10,
     output_tokens=5,
     cache_read_tokens=1,
@@ -85,10 +220,14 @@ def _usage_event() -> UsageEvent:
     rate_table_version="2026-04-08",
     billing_mode="metered",
     channel="web",
+    provider=bind.provider,
+    capability_bind=bind.receipt(),
+    provider_reported_model=None,
   )
 
 
 def _session_summary() -> SessionUsageSummary:
+  bind = _runner_execution(_UsageProvider()).bind
   return SessionUsageSummary(
     user_id="alice",
     session_id="sess-parent",
@@ -104,6 +243,9 @@ def _session_summary() -> SessionUsageSummary:
     ended_at=123.0,
     model="claude-sonnet-4-6",
     provider="stub",
+    capability_bind=bind.receipt(),
+    usage_event_count=1,
+    usage_event_ids=("usage-summary-event-1",),
     rate_table_version="2026-04-08",
     billing_mode="metered",
   )
@@ -184,7 +326,15 @@ class _RetryAfterUsageProvider(_UsageProvider):
 
   async def stream(self, client: Any, params: dict[str, Any]):
     self.calls += 1
-    yield StreamEvent(type="message_start", input_tokens=10)
+    if self.calls == 1:
+      provider_unit_deltas = {"web_search": 2}
+    else:
+      provider_unit_deltas = {"web_search": 1, "web_fetch": 4}
+    yield StreamEvent(
+      type="message_start",
+      input_tokens=10,
+      provider_unit_deltas=provider_unit_deltas,
+    )
     yield StreamEvent(type="usage_update", output_tokens=2)
     if self.calls == 1:
       raise TimeoutError("retry me")
@@ -196,17 +346,22 @@ def test_retry_emits_failed_billable_delta_before_success(monkeypatch: pytest.Mo
 
   class Producer:
     async def emit(self, event, *, usage_state="succeeded"):
-      states.append((event.input_tokens, event.output_tokens, usage_state))
+      states.append((
+        event.input_tokens,
+        event.output_tokens,
+        event.provider_unit_deltas,
+        usage_state,
+      ))
 
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 1)
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
   event_log = EventLog()
+  provider = _RetryAfterUsageProvider()
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-retry",
-    provider=_RetryAfterUsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     user_id="alice", request_id="req-retry", billing_mode="metered",
     rate_table_version="v1", channel="web",
     commercial_usage_producer=Producer(),
@@ -214,7 +369,10 @@ def test_retry_emits_failed_billable_delta_before_success(monkeypatch: pytest.Mo
 
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
 
-  assert states == [(10, 2, "failed_billable"), (10, 2, "succeeded")]
+  assert states == [
+    (10, 2, {"web_search": 2}, "failed_billable"),
+    (10, 2, {"web_search": 1, "web_fetch": 4}, "succeeded"),
+  ]
 
 
 def test_terminal_watchdog_emits_accumulated_failed_billable_usage(
@@ -235,10 +393,11 @@ def test_terminal_watchdog_emits_accumulated_failed_billable_usage(
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 0)
   monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", 0.001)
   event_log = EventLog()
+  provider = HangingProvider()
   runner = AgentRunner(
     event_log=event_log, dispatcher=_make_dispatcher(event_log),
-    session_id="sess-watchdog", provider=HangingProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    session_id="sess-watchdog",
+    capability_execution=_runner_execution(provider),
     user_id="alice", request_id="req-watchdog", billing_mode="metered",
     rate_table_version="v1", channel="web", per_turn_timeout=0.01,
     commercial_usage_producer=Producer(),
@@ -271,10 +430,11 @@ def test_disconnect_on_retry_persists_canceled_partial_delta_first(
 
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 1)
   event_log = EventLog()
+  provider = DisconnectingProvider()
   runner = AgentRunner(
     event_log=event_log, dispatcher=_make_dispatcher(event_log),
-    session_id="sess-disconnect", provider=DisconnectingProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    session_id="sess-disconnect",
+    capability_execution=_runner_execution(provider),
     user_id="alice", request_id="req-disconnect", billing_mode="metered",
     rate_table_version="v1", channel="web",
     commercial_usage_producer=Producer(),
@@ -326,6 +486,30 @@ def test_usage_helper_functions_match_runner_usage_contract() -> None:
   assert usage_has_tokens({key: 0 for key in delta}) is False
   assert AgentRunner._usage_delta(before, after) == delta
   assert AgentRunner._usage_has_tokens(delta) is True
+
+
+def test_usage_snapshot_owns_nested_provider_unit_deltas() -> None:
+  usage = empty_usage_totals()
+  apply_message_start_usage(
+    usage,
+    input_tokens=10,
+    cache_creation_tokens=0,
+    cache_read_tokens=0,
+    provider_units=2,
+    provider_unit_deltas={"search": 2},
+  )
+
+  snapshot = usage_snapshot(usage)
+  apply_usage_update(
+    usage,
+    output_tokens=1,
+    provider_units=5,
+    provider_unit_deltas={"search": 1, "image": 4},
+  )
+
+  assert snapshot["provider_unit_deltas"] == {"search": 2}
+  assert usage["provider_unit_deltas"] == {"search": 3, "image": 4}
+  assert snapshot["provider_unit_deltas"] is not usage["provider_unit_deltas"]
 
 
 def test_usage_delta_state_returns_delta_and_token_flag() -> None:
@@ -430,16 +614,19 @@ def test_turn_usage_payload_copies_usage_and_rounds_cost() -> None:
   usage = {
     "input_tokens": 10,
     "output_tokens": 5,
+    "provider_unit_deltas": {"search": 2},
     "cache_read_input_tokens": 3,
     "cache_creation_input_tokens": 2,
   }
 
   payload = turn_usage_payload(usage, estimated_cost=0.123456)
   usage["input_tokens"] = 99
+  usage["provider_unit_deltas"]["search"] = 99
 
   assert payload == {
     "input_tokens": 10,
     "output_tokens": 5,
+    "provider_unit_deltas": {"search": 2},
     "cache_read_input_tokens": 3,
     "cache_creation_input_tokens": 2,
     "estimated_cost": 0.1235,
@@ -492,6 +679,7 @@ def test_estimate_usage_cost_passes_uncached_and_cache_token_counts() -> None:
 
 
 def test_build_usage_event_helper_sets_billing_fields() -> None:
+  bind = _runner_execution(_UsageProvider()).bind
   event = build_usage_event(
     user_id="alice",
     session_id="sess-parent",
@@ -505,6 +693,8 @@ def test_build_usage_event_helper_sets_billing_fields() -> None:
       "output_tokens": 50,
       "cache_read_input_tokens": 10,
       "cache_creation_input_tokens": 5,
+      "capability_bind": bind.receipt(),
+      "provider_reported_model": None,
     },
     cost_total=0.25,
     rate_table_version="2026-04-08",
@@ -519,6 +709,8 @@ def test_build_usage_event_helper_sets_billing_fields() -> None:
   assert event.timestamp == 123.5
   assert event.model == "claude-sonnet-4-6"
   assert event.provider == "stub"
+  assert event.capability_bind == bind.receipt()
+  assert event.provider_reported_model is None
   assert event.input_tokens == 100
   assert event.output_tokens == 50
   assert event.cache_read_tokens == 10
@@ -640,8 +832,11 @@ def test_call_usage_event_hook_failure_records_metric_and_dlq(tmp_path: Path) ->
 
   payload = json.loads(dlq_path.read_text(encoding="utf-8").strip())
   assert metrics == [("gateway.usage_event_dropped", 1)]
-  assert payload["event_id"] == event.event_id
-  assert payload["user_id"] == "alice"
+  assert payload["usage_event_schema_version"] == 2
+  assert payload["event"]["event_id"] == event.event_id
+  assert payload["event"]["capability_bind"] == event.capability_bind
+  assert payload["event"]["provider_reported_model"] is None
+  assert payload["event"]["user_id"] == "alice"
 
 
 def test_late_usage_and_summary_helpers_support_async_callbacks() -> None:
@@ -729,18 +924,31 @@ class _TwoTurnTextProvider(_UsageProvider):
 class _FailingAfterUsageProvider(_UsageProvider):
   async def stream(self, client: Any, params: dict[str, Any]):
     _ = client, params
-    yield StreamEvent(type="message_start", input_tokens=40, cache_read_tokens=4, cache_creation_tokens=3)
-    yield StreamEvent(type="usage_update", output_tokens=7)
+    yield StreamEvent(
+      type="message_start",
+      input_tokens=40,
+      cache_read_tokens=4,
+      cache_creation_tokens=3,
+      provider_unit_deltas={"web_search": 2},
+    )
+    yield StreamEvent(
+      type="usage_update",
+      output_tokens=7,
+      provider_unit_deltas={"web_search": 1, "web_fetch": 4},
+    )
     raise RuntimeError("stream exploded")
     yield  # pragma: no cover
 
 
-def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
+def _make_dispatcher(
+  event_log: EventLog | None = None,
+) -> ToolDispatcher:
   return ToolDispatcher(
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
     event_log=event_log or EventLog(),
     session_id="sess-parent",
+    get_tool_definitions=None,
   )
 
 
@@ -773,12 +981,12 @@ def test_runner_tool_timing_forwards_tool_call_and_request_ids() -> None:
       }
     )
 
+  provider = _UsageProvider()
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     on_tool_timing=on_tool_timing,
     user_id="alice",
     request_id="req-123",
@@ -815,12 +1023,12 @@ def test_runner_tool_timing_forwards_tool_call_and_request_ids() -> None:
 def test_runner_build_usage_event_preserves_timestamp_and_cost_delegates(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+  provider = _UsageProvider()
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     user_id="alice",
     request_id="req-123",
     billing_mode="metered",
@@ -837,6 +1045,8 @@ def test_runner_build_usage_event_preserves_timestamp_and_cost_delegates(
       "output_tokens": 50,
       "cache_read_input_tokens": 10,
       "cache_creation_input_tokens": 5,
+      "capability_bind": runner.capability_execution.bind.receipt(),
+      "provider_reported_model": None,
     },
   )
 
@@ -858,8 +1068,7 @@ def test_final_answer_guard_can_inject_follow_up_turn() -> None:
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-parent",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     final_answer_guard=guard,
     user_id="alice",
     billing_mode="byok",
@@ -899,6 +1108,8 @@ def test_final_answer_guard_can_inject_follow_up_turn() -> None:
     "provider_unit_deltas": {},
     "cache_read_input_tokens": 0,
     "cache_creation_input_tokens": 0,
+    "estimated_cost": 0.0,
+    "capability_bind": runner.capability_execution.bind.receipt(),
   }
 
 
@@ -915,13 +1126,12 @@ def test_final_answer_guard_records_draft_before_budget_stop() -> None:
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-parent",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     final_answer_guard=guard,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
-    max_budget_usd=0.000001,
+    max_budget_usd=0.002,
   )
 
   async def _append_durable_event(event: dict[str, Any]):
@@ -964,8 +1174,7 @@ def test_final_answer_guard_records_draft_before_operator_pause() -> None:
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-parent",
-    provider=provider,
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     final_answer_guard=guard,
     operator_pause_event=pause_event,
     user_id="alice",
@@ -999,12 +1208,12 @@ def test_final_answer_guard_records_draft_before_operator_pause() -> None:
 def test_on_usage_fires_once_per_turn_with_usage_event_fields() -> None:
   events: list[UsageEvent] = []
   event_log = EventLog()
+  provider = _UsageProvider()
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     on_usage=events.append,
     user_id="alice",
     request_id="req-123",
@@ -1033,15 +1242,92 @@ def test_on_usage_fires_once_per_turn_with_usage_event_fields() -> None:
   assert event.provider == "stub"
 
 
+def test_runner_preserves_cumulative_typed_provider_unit_deltas(
+  tmp_path: Path,
+) -> None:
+  class _ProviderUnitUsageProvider(_UsageProvider):
+    async def stream(self, client: Any, params: dict[str, Any]):
+      _ = client, params
+      yield StreamEvent(
+        type="message_start",
+        input_tokens=100,
+        cache_read_tokens=10,
+        cache_creation_tokens=5,
+        provider_unit_deltas={"web_search": 2},
+      )
+      yield StreamEvent(type="text_delta", text="usage probe complete")
+      yield StreamEvent(
+        type="text_end",
+        raw_block={"type": "text", "text": "usage probe complete"},
+      )
+      yield StreamEvent(
+        type="usage_update",
+        input_tokens=7,
+        output_tokens=50,
+        reasoning_tokens=11,
+        cache_read_tokens=4,
+        cache_creation_tokens=2,
+        provider_unit_deltas={"web_search": 1, "web_fetch": 4},
+      )
+      yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+  usage_events: list[UsageEvent] = []
+  event_log = EventLog()
+  durable_log = AgentSessionLog(tmp_path / "provider-unit-usage.jsonl")
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log),
+    session_id="sess-provider-unit-usage",
+    capability_execution=_runner_execution(_ProviderUnitUsageProvider()),
+    agent_session_log=durable_log,
+    on_usage=usage_events.append,
+    user_id="alice",
+    request_id="req-provider-unit-usage",
+    billing_mode="metered",
+    rate_table_version="2026-04-08",
+    channel="web",
+  )
+
+  _run(runner.run(messages=[{"role": "user", "content": "exercise usage"}]))
+
+  assert len(usage_events) == 1
+  assert usage_events[0].provider_units is None
+  assert usage_events[0].provider_unit_deltas == {
+    "web_search": 3,
+    "web_fetch": 4,
+  }
+  turn_complete = next(
+    entry.event
+    for entry in event_log.entries
+    if entry.event.get("type") == "turn_complete"
+  )
+  assert turn_complete["usage"]["provider_units"] == 0
+  assert turn_complete["usage"]["provider_unit_deltas"] == {
+    "web_search": 3,
+    "web_fetch": 4,
+  }
+  durable_entries, _ = _run(durable_log.query(order="asc"))
+  assistant = next(
+    entry.event
+    for entry in durable_entries
+    if entry.event.get("type") == "assistant_message"
+  )
+  assert assistant["usage"]["provider_units"] == 0
+  assert assistant["usage"]["provider_unit_deltas"] == {
+    "web_search": 3,
+    "web_fetch": 4,
+  }
+
+
 def test_stream_turn_failure_emits_partial_usage_and_rolls_back_totals() -> None:
   events: list[UsageEvent] = []
   event_log = EventLog()
+  provider = _FailingAfterUsageProvider()
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-parent",
-    provider=_FailingAfterUsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     on_usage=events.append,
     user_id="alice",
     request_id="req-123",
@@ -1052,15 +1338,23 @@ def test_stream_turn_failure_emits_partial_usage_and_rolls_back_totals() -> None
   usage_totals = {
     "input_tokens": 5,
     "output_tokens": 2,
+    "reasoning_tokens_observed": 0,
+    "provider_units": 0,
+    "provider_unit_deltas": {"existing": 1},
     "cache_read_input_tokens": 1,
     "cache_creation_input_tokens": 0,
   }
-  initial_usage_totals = dict(usage_totals)
+  initial_usage_totals = usage_snapshot(usage_totals)
 
   result = _run(
     runner._stream_turn(
       client=object(),
-      config={"model": "claude-sonnet-4-6", "thinking": False, "auth_mode": "api"},
+      config={
+        "model": "claude-sonnet-4-6",
+        "effort": "none",
+        "thinking_enabled_requested": False,
+        "auth_mode": "api",
+      },
       model_info=runner._provider.get_model_info("claude-sonnet-4-6"),
       system_prompt=None,
       current_messages=[{"role": "user", "content": "hello"}],
@@ -1081,6 +1375,8 @@ def test_stream_turn_failure_emits_partial_usage_and_rolls_back_totals() -> None
   event = events[0]
   assert event.input_tokens == 40
   assert event.output_tokens == 7
+  assert event.provider_units is None
+  assert event.provider_unit_deltas == {"web_search": 3, "web_fetch": 4}
   assert event.cache_read_tokens == 4
   assert event.cache_creation_tokens == 3
   assert event.cost_usd == pytest.approx(0.00005825)
@@ -1095,12 +1391,12 @@ def test_on_usage_failure_does_not_block_chat_response(tmp_path: Path) -> None:
   def _failing_on_usage(_event: UsageEvent) -> None:
     raise RuntimeError("ledger offline")
 
+  provider = _UsageProvider()
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     on_usage=_failing_on_usage,
     user_id="alice",
     request_id="req-123",
@@ -1121,12 +1417,12 @@ def test_on_usage_failure_writes_to_dlq_spool(tmp_path: Path) -> None:
   async def _failing_on_usage(_event: UsageEvent) -> None:
     raise RuntimeError("db unavailable")
 
+  provider = _UsageProvider()
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     on_usage=_failing_on_usage,
     user_id="alice",
     request_id="req-123",
@@ -1138,21 +1434,26 @@ def test_on_usage_failure_writes_to_dlq_spool(tmp_path: Path) -> None:
   _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
 
   payload = json.loads(spool_path.read_text(encoding="utf-8").strip())
-  assert payload["user_id"] == "alice"
-  assert payload["request_id"] == "req-123"
-  assert payload["session_id"] == "sess-parent"
-  assert payload["input_tokens"] == 100
-  assert payload["output_tokens"] == 50
+  assert payload["usage_event_schema_version"] == 2
+  assert payload["event"]["user_id"] == "alice"
+  assert payload["event"]["request_id"] == "req-123"
+  assert payload["event"]["session_id"] == "sess-parent"
+  assert payload["event"]["input_tokens"] == 100
+  assert payload["event"]["output_tokens"] == 50
+  assert payload["event"]["capability_bind"] == runner.capability_execution.bind.receipt()
+  assert payload["event"]["provider_reported_model"] is None
 
 
-def test_spawn_sub_agent_emits_usage_with_parent_turn_id() -> None:
+def test_spawn_sub_agent_emits_usage_with_parent_turn_id(tmp_path: Path) -> None:
   events: list[UsageEvent] = []
+  provider = _UsageProvider()
   parent_runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
+    agent_session_log=AgentSessionLog(path=tmp_path / "usage-parent.jsonl"),
+    workspace_dir=str(tmp_path),
     on_usage=events.append,
     user_id="alice",
     request_id="req-123",
@@ -1167,10 +1468,12 @@ def test_spawn_sub_agent_emits_usage_with_parent_turn_id() -> None:
     user_id="alice",
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
   )
-
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect usage",
+      capability_execution=_child_execution(_UsageProvider()),
+      **_subagent_identity("sub0:sess-parent"),
+      skill_name="test-child",
       dispatcher=_make_dispatcher(),
       sub_session=sub_session,
       max_turns=1,
@@ -1191,12 +1494,12 @@ def test_spawn_sub_agent_emits_usage_with_parent_turn_id() -> None:
 def test_run_appends_turn_complete_event_to_event_log() -> None:
   event_log = EventLog()
   durable_events: list[dict[str, Any]] = []
+  provider = _UsageProvider()
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -1224,19 +1527,146 @@ def test_run_appends_turn_complete_event_to_event_log() -> None:
     "cache_read_input_tokens": 10,
     "cache_creation_input_tokens": 5,
     "estimated_cost": 0.0002,
+    "capability_bind": runner.capability_execution.bind.receipt(),
   }
   assert assistant_messages[0]["model"] == "claude-sonnet-4-6"
   assert assistant_messages[0]["provider"] == "stub"
 
 
+def test_native_compaction_block_counts_once_in_session_summary(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class _NativeCompactionProvider(_UsageProvider):
+    def __init__(self) -> None:
+      self.calls = 0
+      self.system_prompts: list[Any] = []
+
+    def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
+      self.system_prompts.append(kwargs["system_prompt"])
+      return {}
+
+    async def stream(self, client: Any, params: dict[str, Any]):
+      _ = client, params
+      self.calls += 1
+      yield StreamEvent(type="message_start", input_tokens=100)
+      if self.calls == 1:
+        yield StreamEvent(
+          type="compaction",
+          raw_block={
+            "type": "compaction",
+            "content": "native summary",
+          },
+        )
+      else:
+        yield StreamEvent(type="text_delta", text="done")
+        yield StreamEvent(
+          type="text_end",
+          raw_block={"type": "text", "text": "done"},
+        )
+      yield StreamEvent(type="usage_update", output_tokens=5)
+      yield StreamEvent(
+        type="message_end",
+        stop_reason=(
+          "compaction"
+          if self.calls == 1
+          else "end_turn"
+        ),
+      )
+
+  summaries: list[SessionUsageSummary] = []
+  event_log = EventLog()
+  durable_log = AgentSessionLog(
+    path=tmp_path / "native-compaction.jsonl"
+  )
+  provider = _NativeCompactionProvider()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log),
+    session_id="sess-native-compaction",
+    capability_execution=_runner_execution(provider),
+    user_id="alice",
+    request_id="req-native-compaction",
+    on_session_summary=summaries.append,
+    billing_mode="byok",
+    rate_table_version="unknown",
+    agent_session_log=durable_log,
+    compaction_trigger=None,
+  )
+  monkeypatch.setattr(
+    gateway_runner,
+    "_model_context_window",
+    lambda _model_info: 1_000,
+  )
+
+  def token_snapshot(
+    *,
+    system_text: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+  ) -> SimpleNamespace:
+    return SimpleNamespace(
+      system_text=system_text,
+      messages_text="",
+      tools_text="",
+      system_chars=len(system_text),
+      tools_chars=0,
+      est_system_tokens=1,
+      est_messages_tokens=599,
+      est_tools_tokens=0,
+      est_total_tokens=600,
+      message_count=len(messages),
+      tool_count=len(tools),
+    )
+
+  monkeypatch.setattr(
+    gateway_runner,
+    "_token_estimate_snapshot",
+    token_snapshot,
+  )
+
+  _run(
+    runner.run(
+      messages=[{
+        "role": "user",
+        "content": "trigger native compaction",
+      }],
+      system_prompt="base prompt",
+      max_turns=2,
+    )
+  )
+
+  assert len(summaries) == 1
+  assert summaries[0].compaction_count == 1
+  assert provider.calls == 2
+  assert all(
+    "Context at 60%" in str(prompt)
+    for prompt in provider.system_prompts
+  )
+  assert sum(
+    entry.event.get("type") == "compaction"
+    for entry in event_log.entries
+  ) == 1
+  assistant_messages, _ = _run(
+    durable_log.query(
+      event_types={"assistant_message"},
+      order="asc",
+    )
+  )
+  assert assistant_messages[0].event["content_blocks"] == [{
+    "type": "compaction",
+    "content": "native summary",
+  }]
+
+
 def test_runner_emits_session_summary_once_after_run() -> None:
   summaries: list[SessionUsageSummary] = []
+  provider = _UsageProvider()
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     user_id="alice",
     request_id="req-summary",
     channel="web",
@@ -1263,6 +1693,7 @@ def test_runner_emits_session_summary_once_after_run() -> None:
   assert summary.billing_mode == "byok"
   assert summary.drain_complete is True
   assert summary.in_flight_task_count == 0
+  assert summary.compaction_count == 0
   assert summary.model == "claude-sonnet-4-6"
   assert summary.provider == "stub"
 
@@ -1270,12 +1701,24 @@ def test_runner_emits_session_summary_once_after_run() -> None:
 def test_runner_session_summary_reports_failed_drain_and_in_flight_tasks() -> None:
   summaries: list[SessionUsageSummary] = []
   pending_task = SimpleNamespace(done=lambda: False)
+  pending_entry = SimpleNamespace(
+    task_id="bg-pending",
+    agent_name=None,
+    asyncio_task=pending_task,
+    started_at=0.0,
+    completed_at=None,
+    notification_delivery_state="not_queued",
+    progress=SimpleNamespace(
+      tool_use_count=0,
+      last_tool_name=None,
+    ),
+  )
+  provider = _UsageProvider()
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     user_id="alice",
     request_id="req-summary-drain",
     on_session_summary=summaries.append,
@@ -1289,10 +1732,13 @@ def test_runner_session_summary_reports_failed_drain_and_in_flight_tasks() -> No
 
   def _list_running_tasks(*, state: Any = None) -> list[Any]:
     _ = state
-    return [SimpleNamespace(asyncio_task=pending_task)]
+    return [pending_entry]
 
   runner._shutdown_background_tasks = _raise_shutdown  # type: ignore[method-assign]
-  runner._task_registry = SimpleNamespace(list_tasks=_list_running_tasks)
+  runner._task_registry = SimpleNamespace(
+    admission_count=1,
+    list_tasks=_list_running_tasks,
+  )
 
   with pytest.raises(RuntimeError, match="drain failed"):
     _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
@@ -1303,12 +1749,12 @@ def test_runner_session_summary_reports_failed_drain_and_in_flight_tasks() -> No
 
 
 def test_runner_is_single_use() -> None:
+  provider = _UsageProvider()
   runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(provider),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -1323,24 +1769,24 @@ def test_runner_is_single_use() -> None:
 def test_sub_runner_with_parent_aggregator_does_not_emit_own_summary() -> None:
   parent_summaries: list[SessionUsageSummary] = []
   child_summaries: list[SessionUsageSummary] = []
+  parent_provider = _UsageProvider()
   parent_runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(parent_provider),
     user_id="alice",
     request_id="req-parent",
     on_session_summary=parent_summaries.append,
     billing_mode="byok",
     rate_table_version="unknown",
   )
+  child_provider = _UsageProvider()
   child_runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sub0:sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(child_provider),
     user_id="alice",
     request_id="req-parent",
     on_session_summary=child_summaries.append,
@@ -1364,26 +1810,31 @@ def test_sub_runner_with_parent_aggregator_does_not_emit_own_summary() -> None:
 @pytest.mark.parametrize("timeout", [0, None, -1])
 def test_spawn_sub_agent_no_wall_clock(
   monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
   timeout: float | None,
 ) -> None:
   async def _unexpected_wait_for(*_args: Any, **_kwargs: Any) -> None:
     raise AssertionError("asyncio.wait_for should not wrap non-positive timeouts")
 
   monkeypatch.setattr(gateway_runner.asyncio, "wait_for", _unexpected_wait_for)
+  parent_provider = _UsageProvider()
   parent_runner = AgentRunner(
     event_log=EventLog(),
     dispatcher=_make_dispatcher(),
     session_id="sess-parent",
-    provider=_UsageProvider(),
-    auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
+    capability_execution=_runner_execution(parent_provider),
+    agent_session_log=AgentSessionLog(path=tmp_path / "timeout-parent.jsonl"),
+    workspace_dir=str(tmp_path),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
   )
-
   result, error = _run(
     parent_runner.spawn_sub_agent(
       "Collect usage",
+      capability_execution=_child_execution(_UsageProvider()),
+      **_subagent_identity("sub0:sess-parent"),
+      skill_name="test-child",
       dispatcher=_make_dispatcher(),
       max_turns=1,
       timeout=timeout,
@@ -1392,4 +1843,96 @@ def test_spawn_sub_agent_no_wall_clock(
 
   assert error is None
   assert result is not None
-  assert result["response"] == "hello"
+  assert result.execution.status == "succeeded"
+  assert result.values.terminal_narrative is not None
+
+
+def test_failed_response_usage_reaches_runner_as_failed_billable() -> None:
+  """Provider-level `response.failed` billing must survive the runner seam.
+
+  r9 of the OpenAI Responses cutover flagged that finding 2 (billable usage lost on
+  failed responses) was proven only inside the provider mapper. This covers the seam:
+  the fixed provider yields `_terminal_events()` -- message_start, usage_update,
+  message_end(error) -- and only THEN raises, so the runner must have already
+  accumulated the tokens and must bill them as `failed_billable`, not drop them.
+  """
+  states: list[tuple[int, int, str]] = []
+
+  class _FailedResponseProvider(_UsageProvider):
+    async def stream(self, client: Any, params: dict[str, Any]):
+      _ = client, params
+      # Mirrors openai.py stream(): terminal events first, then the saved error.
+      yield StreamEvent(type="message_start", input_tokens=100, cache_read_tokens=10)
+      yield StreamEvent(type="usage_update", output_tokens=42)
+      yield StreamEvent(type="message_end", stop_reason="error")
+      raise RuntimeError("response.failed: server_error")
+
+    def is_retryable_error(self, exc: Exception) -> bool:
+      _ = exc
+      return False
+
+  class Producer:
+    async def emit(self, event, *, usage_state="succeeded"):
+      states.append((event.input_tokens, event.output_tokens, usage_state))
+
+  event_log = EventLog()
+  provider = _FailedResponseProvider()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log),
+    session_id="sess-failed-response",
+    capability_execution=_runner_execution(provider),
+    user_id="alice", request_id="req-failed", billing_mode="metered",
+    rate_table_version="v1", channel="web",
+    commercial_usage_producer=Producer(),
+  )
+
+  # The runner absorbs a non-retryable stream error (logs it, ends the turn) rather
+  # than propagating -- so billing, not the exception, is the only signal that the
+  # failed response was accounted for.
+  _run(runner.run(messages=[{"role": "user", "content": "hello"}]))
+
+  # The nonzero usage carried by the failed response must be billed, not dropped.
+  assert states, "failed response emitted no usage event at all"
+  assert all(state == "failed_billable" for _, _, state in states), states
+  assert any(output > 0 for _, output, _ in states), (
+    f"failed response billed zero output tokens: {states}"
+  )
+
+
+def test_final_answer_guard_receives_registered_workflow_evidence() -> None:
+  event_log = EventLog()
+  provider = _TwoTurnTextProvider()
+  guard_tools_views: list[list[str]] = []
+
+  def guard(messages, answer_text, tools_used, tool_definitions, turn_count):
+    _ = messages, answer_text, tool_definitions, turn_count
+    guard_tools_views.append(list(tools_used))
+    return None
+
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log),
+    session_id="sess-parent",
+    capability_execution=_runner_execution(provider),
+    final_answer_guard=guard,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  runner._workflow_evidence_provenance["workflow-1"] = {
+    "workflow_run_id": "workflow-1",
+    "evidence_tools": ["filings_search", "get_financials", "code_execute"],
+    "observed_sources": [
+      {"source_kind": "filing", "document_id": "edgar:1"},
+    ],
+  }
+
+  _run(runner.run(messages=[{"role": "user", "content": "compare margin bps"}]))
+
+  assert guard_tools_views
+  merged = guard_tools_views[0]
+  assert "filings_search" in merged
+  assert "get_financials" in merged
+  # Child arithmetic verification never transfers to the parent's final math.
+  assert "code_execute" not in merged

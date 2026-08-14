@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, HTTPException, Query, Request
+from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
 
 from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock
 from agent_gateway.autonomous_runner import AutonomousRegistry
@@ -198,7 +199,11 @@ def build_runs_router(
       ) from exc
 
   @router.post("", response_model=RunDispatchResponse)
-  async def dispatch_run(request: Request, payload: ControlRunDispatchRequest) -> RunDispatchResponse:
+  async def dispatch_run(
+    request: Request,
+    payload: ControlRunDispatchRequest,
+    http_response: Response,
+  ) -> RunDispatchResponse:
     authenticated = _require_bearer_session(request, auth)
     owner_user_id = _session_owner_user_id(authenticated)
     if payload.kind == "chat":
@@ -208,6 +213,29 @@ def build_runs_router(
       if session_channel is not None and requested_channel is not None and session_channel != requested_channel:
         raise HTTPException(status_code=401, detail="Channel mismatch")
       channel = session_channel or requested_channel
+      context: dict[str, Any] = dict(payload.context or {})
+      if channel is not None:
+        context["channel"] = channel
+      stage_skill_route: dict[str, str] | None = None
+      if payload.skill is not None:
+        context["skill"] = payload.skill
+        stage_skill_route = {
+          "route_kind": "stage",
+          "skill_name": payload.skill,
+        }
+        context["stage_skill_route"] = dict(stage_skill_route)
+      if payload.ticker is not None:
+        context["ticker"] = payload.ticker
+      if payload.dev_mode:
+        context["dev_mode"] = True
+      dispatch_scope = await _validated_dispatch_scope_payload(
+        payload.dispatch_scope,
+        session=authenticated,
+      )
+      if dispatch_scope is not None:
+        context["dispatch_scope"] = dispatch_scope
+        context.setdefault("portfolio_name", dispatch_scope["portfolio_name"])
+
       chat_session = auth.session_store.create_session(
         api_key_hash=authenticated.api_key_hash,
         user_id=owner_user_id,
@@ -216,6 +244,13 @@ def build_runs_router(
         role=authenticated.role,
         kind="chat",
         auth_config=authenticated.auth_config,
+        model_entitled_capabilities=authenticated.model_entitled_capabilities,
+        model_entitled_keys=authenticated.model_entitled_keys,
+        tenant_id=authenticated.tenant_id,
+        session_credential_handle=authenticated.session_credential_handle,
+        allow_service_for_interactive=(
+          authenticated.allow_service_for_interactive
+        ),
       )
       chat_session.owner_user_id = owner_user_id
       chat_session.raw_user_id = authenticated.user_id
@@ -226,39 +261,37 @@ def build_runs_router(
       chat_session.is_public = channel == "public"
       chat_session.approval_store = getattr(request.app.state, "gateway_approval_store", None)
       chat_session.approval_policy = getattr(request.app.state, "gateway_approval_policy", None)
+      chat_session.max_budget_usd = payload.max_budget_usd
       chat_session.initial_message = payload.message
-
-      context: dict[str, Any] = dict(payload.context or {})
-      if channel is not None:
-        context["channel"] = channel
-      if payload.skill is not None:
-        context["skill"] = payload.skill
-      if payload.ticker is not None:
-        context["ticker"] = payload.ticker
-      if payload.dev_mode:
-        context["dev_mode"] = True
-      dispatch_scope = await _validated_dispatch_scope_payload(payload.dispatch_scope, session=authenticated)
+      chat_session.stage_skill_route = (
+        dict(stage_skill_route) if stage_skill_route is not None else None
+      )
       if dispatch_scope is not None:
-        context["dispatch_scope"] = dispatch_scope
-        context.setdefault("portfolio_name", dispatch_scope["portfolio_name"])
         chat_session.dispatch_scope = dispatch_scope
 
-      run = await _dispatch_control_chat_turn(
-        request=request,
-        session=chat_session,
-        messages=[ChatMessage(role="user", content=payload.message)],
-        request_id=None,
-        context=context,
-        model=None,
-        deadline_sec=payload.deadline_sec,
-      )
-      token = auth.issue_token(chat_session)
-      return ChatDispatchResponse(
-        run=run,
-        chat_session_token=token,
-        chat_session_id=chat_session.session_id,
-        chat_session_expires_at=chat_session.expires_at,
-      )
+      try:
+        run = await _dispatch_control_chat_turn(
+          request=request,
+          session=chat_session,
+          messages=[ChatMessage(role="user", content=payload.message)],
+          request_id=None,
+          context=context,
+          model_key=payload.model_key,
+          effort=payload.effort,
+          catalog_revision=payload.catalog_revision,
+          deadline_sec=payload.deadline_sec,
+        )
+        response = ChatDispatchResponse(
+          run=run,
+          chat_session_token=auth.issue_token(chat_session),
+          chat_session_id=chat_session.session_id,
+          chat_session_expires_at=chat_session.expires_at,
+        )
+      except BaseException:
+        await auth.session_store.expire_session_async(chat_session.session_id)
+        raise
+      http_response.headers["Cache-Control"] = "private, no-store"
+      return response
 
     _require_control_session(authenticated)
     requested_channel = _normalize_channel(payload.channel)
@@ -279,6 +312,7 @@ def build_runs_router(
     registry.set_user_event_bus(getattr(request.app.state, "user_event_bus", None))
     try:
       start_payload = await registry.start(
+        role=authenticated.role,
         profile=payload.profile,
         mode=payload.mode,
         task=payload.task,
@@ -368,6 +402,12 @@ def build_runs_router(
     context = dict(payload.context or {})
     if target_session.channel is not None:
       context["channel"] = target_session.channel
+    stage_skill_route = getattr(target_session, "stage_skill_route", None)
+    if isinstance(stage_skill_route, dict):
+      skill_name = str(stage_skill_route.get("skill_name") or "").strip()
+      if skill_name:
+        context["skill"] = skill_name
+        context["stage_skill_route"] = dict(stage_skill_route)
     dispatch_scope = getattr(target_session, "dispatch_scope", None)
     if isinstance(dispatch_scope, dict):
       context["dispatch_scope"] = dict(dispatch_scope)
@@ -388,7 +428,9 @@ def build_runs_router(
       messages=list(payload.messages),
       request_id=message_id or payload.request_id,
       context=context,
-      model=payload.model,
+      model_key=payload.model_key,
+      effort=payload.effort,
+      catalog_revision=payload.catalog_revision,
       deadline_sec=payload.deadline_sec,
       record_parent_message=True,
     )
@@ -427,6 +469,8 @@ def build_runs_router(
       resume_context = _build_autonomous_resume_context(record, resume_payload)
       try:
         start_payload = await registry.start(
+          # Resume follows current authority in both promotion and revocation directions.
+          role=authenticated.role,
           profile=record.profile,
           mode=record.mode,
           task=record.task,
@@ -605,18 +649,28 @@ def build_runs_router(
 
         cancelled_event = _run_state_event(control_run_id, "cancelled")
         session.event_history.append(cancelled_event)
-        await _publish_control_event(request.app.state, _session_owner_user_id(session), control_run_id, cancelled_event)
+        await _publish_control_event(
+          request.app.state,
+          session,
+          control_run_id,
+          cancelled_event,
+        )
         await _cancel_control_chat_background_tasks(
           session,
           settle_timeout=0.05 if pending_snapshot else 0.0,
         )
         run = _chat_run_from_session(session)
         await auth.session_store.expire_session_async(control_run_id)
-        await _cleanup_run_buffer(request.app.state, _session_owner_user_id(session), control_run_id)
+        await _cleanup_run_buffer(
+          request.app.state,
+          session,
+          control_run_id,
+        )
         return run
     registry = _require_autonomous_registry(autonomous_registry)
     record = _autonomous_task_for_user(registry, control_run_id, owner_user_id)
     _require_autonomous_channel(record, authenticated.channel)
+    approval_error: Exception | None = None
     try:
       await _deny_autonomous_pending_approvals_for_cancel(
         registry=registry,
@@ -624,9 +678,24 @@ def build_runs_router(
         authenticated=authenticated,
         app_state=request.app.state,
       )
-    except ApprovalActionError as exc:
-      raise HTTPException(status_code=exc.status_code, detail=exc.payload) from exc
-    await registry.cancel(record.task_id)
+    except Exception as exc:
+      approval_error = exc
+    await asyncio.shield(registry.cancel(record.task_id))
+    if isinstance(approval_error, ApprovalActionError):
+      raise HTTPException(
+        status_code=approval_error.status_code,
+        detail=approval_error.payload,
+      ) from approval_error
+    if approval_error is not None:
+      raise HTTPException(
+        status_code=503,
+        detail={
+          "error": (
+            "Autonomous run was cancelled but pending approval "
+            "settlement failed"
+          ),
+        },
+      ) from approval_error
     return _autonomous_run_from_task(record, skills_dir=skills_root)
 
   return router

@@ -5,11 +5,26 @@ import time
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple
+from typing import (
+  Any,
+  AsyncIterator,
+  Callable,
+  Deque,
+  Dict,
+  List,
+  Mapping,
+  Literal,
+  Optional,
+  Sequence,
+  Set,
+  Tuple,
+)
 
 
 TERMINAL_EVENT_TYPES = {"stream_complete", "error"}
 OnEvent = Callable[[Dict[str, Any], str], None]
+PrepareEvent = Callable[[Dict[str, Any]], Dict[str, Any]]
+OnEventErrorPolicy = Literal["ignore", "raise"]
 
 
 @dataclass
@@ -19,6 +34,14 @@ class LogEntry:
   seq: int
   timestamp: float
   event: Dict[str, Any]
+
+
+def _copy_log_entry(entry: LogEntry) -> LogEntry:
+  return LogEntry(
+    seq=entry.seq,
+    timestamp=entry.timestamp,
+    event=deepcopy(entry.event),
+  )
 
 
 class EventLog:
@@ -35,7 +58,13 @@ class EventLog:
     on_event: OnEvent | None = None,
     session_id: str = "",
     defer_terminal_close: bool = False,
+    on_event_error: OnEventErrorPolicy = "ignore",
+    prepare_event: PrepareEvent | None = None,
   ) -> None:
+    if on_event_error not in {"ignore", "raise"}:
+      raise ValueError(
+        "on_event_error must be either 'ignore' or 'raise'"
+      )
     self._entries: List[LogEntry] = []
     self._closed = False
     self._has_terminal = False
@@ -44,6 +73,8 @@ class EventLog:
     self._version = 0
     self._updated = asyncio.Event()
     self._on_event = on_event
+    self._on_event_error = on_event_error
+    self._prepare_event = prepare_event
     self._session_id = session_id
     self._raw_tool_inputs: Dict[str, Dict[str, Any]] = {}
 
@@ -51,15 +82,38 @@ class EventLog:
     if self._closed:
       return None
 
-    entry = LogEntry(seq=self._next_seq, timestamp=time.time(), event=dict(event))
+    prepared_event = event
+    if self._prepare_event is not None:
+      try:
+        prepared_event = self._prepare_event(event)
+        if type(prepared_event) is not dict:
+          raise TypeError(
+            "prepare_event must return an exact event dictionary"
+          )
+      except BaseException:
+        self._closed = True
+        self._version += 1
+        self._updated.set()
+        raise
+
+    owned_event = deepcopy(prepared_event)
+    entry = LogEntry(
+      seq=self._next_seq,
+      timestamp=time.time(),
+      event=owned_event,
+    )
     self._next_seq += 1
     self._entries.append(entry)
 
     if self._on_event is not None:
       try:
-        self._on_event(event, self._session_id)
+        self._on_event(deepcopy(owned_event), self._session_id)
       except Exception:
-        pass
+        if self._on_event_error == "raise":
+          self._closed = True
+          self._version += 1
+          self._updated.set()
+          raise
 
     if entry.event.get("type") in TERMINAL_EVENT_TYPES:
       self._has_terminal = True
@@ -68,7 +122,7 @@ class EventLog:
 
     self._version += 1
     self._updated.set()
-    return entry
+    return _copy_log_entry(entry)
 
   def close(self, error: Optional[str] = None) -> None:
     if self._closed:
@@ -94,7 +148,7 @@ class EventLog:
       while index < len(self._entries):
         entry = self._entries[index]
         index += 1
-        yield entry
+        yield _copy_log_entry(entry)
         if entry.event.get("type") in TERMINAL_EVENT_TYPES and not self._defer_terminal_close:
           return
 
@@ -109,7 +163,7 @@ class EventLog:
 
   @property
   def entries(self) -> List[LogEntry]:
-    return list(self._entries)
+    return [_copy_log_entry(entry) for entry in self._entries]
 
   def record_raw_tool_input(
     self,
@@ -159,6 +213,17 @@ class _BusEvent:
   timestamp: float
   seq: int | None
   control_run_id: str | None
+  terminal: bool = False
+
+
+def _copy_bus_event(entry: _BusEvent) -> _BusEvent:
+  return _BusEvent(
+    event=deepcopy(entry.event),
+    timestamp=entry.timestamp,
+    seq=entry.seq,
+    control_run_id=entry.control_run_id,
+    terminal=entry.terminal,
+  )
 
 
 @dataclass(eq=False)
@@ -168,6 +233,9 @@ class _Subscriber:
   max_queue_size: int
   queue: Deque[_BusEvent]
   updated: asyncio.Event
+  after_seq_floor: int = 0
+  stop_at_terminal: bool = False
+  stream_terminated: bool = False
   dropped_count: int = 0
   oldest_dropped_ts: float | None = None
   dropped_through_seq: int | None = None
@@ -183,6 +251,82 @@ class _Subscriber:
 
 class _SubscriberClosed(Exception):
   pass
+
+
+class _SubscriberTerminated(Exception):
+  pass
+
+
+class EventSubscription(AsyncIterator[_BusEvent]):
+  """Explicit event subscription whose close works before first iteration."""
+
+  def __init__(
+    self,
+    *,
+    bus: "UserEventBus",
+    subscriber: _Subscriber,
+    replay_events: Sequence[_BusEvent],
+    truncation_event: _BusEvent | None = None,
+    registered: bool,
+    stop_at_terminal: bool = False,
+  ) -> None:
+    self._bus = bus
+    self._subscriber = subscriber
+    self._replay_events: Deque[_BusEvent] = deque(
+      _copy_bus_event(entry) for entry in replay_events
+    )
+    self._truncation_event = (
+      _copy_bus_event(truncation_event)
+      if truncation_event is not None
+      else None
+    )
+    self._registered = registered
+    self._closed = not registered
+    self._stop_at_terminal = stop_at_terminal
+    self._terminal_delivered = False
+
+  def __aiter__(self) -> "EventSubscription":
+    return self
+
+  async def __anext__(self) -> _BusEvent:
+    if self._closed:
+      raise StopAsyncIteration
+    if self._truncation_event is not None:
+      entry = self._truncation_event
+      self._truncation_event = None
+      return _copy_bus_event(entry)
+    if self._replay_events:
+      entry = self._replay_events.popleft()
+      if self._stop_at_terminal and entry.terminal:
+        self._terminal_delivered = True
+      return _copy_bus_event(entry)
+    if self._stop_at_terminal and self._terminal_delivered:
+      await self.aclose()
+      raise StopAsyncIteration
+    try:
+      entry = await self._bus._next_entry(self._subscriber)
+    except _SubscriberTerminated:
+      await asyncio.shield(self.aclose())
+      raise StopAsyncIteration from None
+    except _SubscriberClosed:
+      self._closed = True
+      self._registered = False
+      raise StopAsyncIteration from None
+    except asyncio.CancelledError:
+      await asyncio.shield(self.aclose())
+      raise
+    if self._stop_at_terminal and entry.terminal:
+      self._terminal_delivered = True
+    return entry
+
+  async def aclose(self) -> None:
+    if self._closed:
+      return
+    self._closed = True
+    if not self._registered:
+      return
+    self._registered = False
+    await asyncio.shield(self._bus._unsubscribe(self._subscriber))
 
 
 class UserEventBus:
@@ -212,6 +356,58 @@ class UserEventBus:
 
   async def publish(self, user_id: str, control_run_id: str, event: dict) -> None:
     """Publish an event tagged with user_id + control_run_id."""
+    await self._publish(
+      user_id,
+      control_run_id,
+      event,
+    )
+
+  async def publish_terminal_if_absent(
+    self,
+    user_id: str,
+    control_run_id: str,
+    event: dict,
+  ) -> bool:
+    """Publish and terminalize one run atomically, or report it already terminal."""
+
+    normalized_user_id = str(user_id)
+    normalized_run_id = str(control_run_id)
+    key = (normalized_user_id, normalized_run_id)
+    event_copy = deepcopy(dict(event))
+
+    async with self._lock:
+      if self._shutdown:
+        raise RuntimeError("required event bus is closed")
+      if key in self._terminated_runs:
+        return False
+      seq = self._next_seq_by_run.get(key, 1)
+      self._next_seq_by_run[key] = seq + 1
+      entry = _BusEvent(
+        event=event_copy,
+        timestamp=time.time(),
+        seq=seq,
+        control_run_id=normalized_run_id,
+        terminal=True,
+      )
+      replay_buffer = self._replay_buffers.get(key)
+      if replay_buffer is None:
+        replay_buffer = deque(maxlen=self._replay_buffer_max)
+        self._replay_buffers[key] = replay_buffer
+      replay_buffer.append(entry)
+      self._terminated_runs.add(key)
+      self._schedule_cleanup_locked(key)
+
+      for subscriber in list(self._subscribers.get(normalized_user_id, ())):
+        if subscriber.matches(normalized_user_id, normalized_run_id):
+          self._enqueue_for_subscriber(subscriber, entry)
+      return True
+
+  async def _publish(
+    self,
+    user_id: str,
+    control_run_id: str,
+    event: dict,
+  ) -> None:
     normalized_user_id = str(user_id)
     normalized_run_id = str(control_run_id)
     key = (normalized_user_id, normalized_run_id)
@@ -222,7 +418,7 @@ class UserEventBus:
       seq = self._next_seq_by_run.get(key, 1)
       self._next_seq_by_run[key] = seq + 1
       entry = _BusEvent(
-        event=dict(event),
+        event=deepcopy(dict(event)),
         timestamp=time.time(),
         seq=seq,
         control_run_id=normalized_run_id,
@@ -256,13 +452,25 @@ class UserEventBus:
     normalized_user_id = str(user_id)
     normalized_run_id = str(control_run_id)
     key = (normalized_user_id, normalized_run_id)
-    seed_events = [dict(event) for event in events if isinstance(event, dict)]
+    seed_events = [deepcopy(event) for event in events if isinstance(event, dict)]
 
     async with self._lock:
       if self._shutdown:
         return 0
       if key in self._replay_buffers or key in self._next_seq_by_run:
         if terminated:
+          replay_buffer = self._replay_buffers.get(key)
+          if replay_buffer:
+            last = replay_buffer.pop()
+            replay_buffer.append(
+              _BusEvent(
+                event=last.event,
+                timestamp=last.timestamp,
+                seq=last.seq,
+                control_run_id=last.control_run_id,
+                terminal=True,
+              )
+            )
           self._terminated_runs.add(key)
           self._schedule_cleanup_locked(key)
         return 0
@@ -279,6 +487,7 @@ class UserEventBus:
             timestamp=now,
             seq=index,
             control_run_id=normalized_run_id,
+            terminal=terminated and index == total_events,
           )
         )
 
@@ -314,7 +523,13 @@ class UserEventBus:
           self._cancel_user_cleanup_locked(subscriber.user_id)
         else:
           self._cancel_cleanup_locked((subscriber.user_id, subscriber.control_run_id))
-          replay_events = list(self._replay_buffers.get((subscriber.user_id, subscriber.control_run_id), ()))
+          replay_events = [
+            _copy_bus_event(entry)
+            for entry in self._replay_buffers.get(
+              (subscriber.user_id, subscriber.control_run_id),
+              (),
+            )
+          ]
 
       try:
         for entry in replay_events:
@@ -331,35 +546,46 @@ class UserEventBus:
 
     return _iterator()
 
-  def subscribe_entries(
+  async def subscribe_entries(
     self,
     user_id: str,
     *,
     control_run_id: str | None = None,
     after_seq: int = 0,
-  ) -> AsyncIterator[_BusEvent]:
-    """Subscribe to bus entries with per-run seq metadata for projected streams."""
+  ) -> EventSubscription:
+    """Atomically register and return an explicitly closeable subscription."""
 
-    async def _iterator() -> AsyncIterator[_BusEvent]:
-      subscriber = _Subscriber(
-        user_id=str(user_id),
-        control_run_id=str(control_run_id) if control_run_id is not None else None,
-        max_queue_size=self._subscriber_queue_max,
-        queue=deque(),
-        updated=asyncio.Event(),
-      )
-      normalized_after_seq = max(int(after_seq), 0)
-      replay_events: List[_BusEvent] = []
-      truncation_event: _BusEvent | None = None
-      async with self._lock:
-        if self._shutdown:
-          return
+    subscriber = _Subscriber(
+      user_id=str(user_id),
+      control_run_id=str(control_run_id) if control_run_id is not None else None,
+      max_queue_size=self._subscriber_queue_max,
+      queue=deque(),
+      updated=asyncio.Event(),
+      stop_at_terminal=control_run_id is not None,
+    )
+    normalized_after_seq = max(int(after_seq), 0)
+    if subscriber.control_run_id is not None:
+      subscriber.after_seq_floor = normalized_after_seq
+    replay_events: List[_BusEvent] = []
+    truncation_event: _BusEvent | None = None
+    registered = False
+    async with self._lock:
+      if not self._shutdown:
         self._register_subscriber_locked(subscriber)
+        registered = True
         if subscriber.control_run_id is None:
           self._cancel_user_cleanup_locked(subscriber.user_id)
         else:
-          self._cancel_cleanup_locked((subscriber.user_id, subscriber.control_run_id))
-          replay_buffer = list(self._replay_buffers.get((subscriber.user_id, subscriber.control_run_id), ()))
+          key = (subscriber.user_id, subscriber.control_run_id)
+          self._cancel_cleanup_locked(key)
+          subscriber.stream_terminated = key in self._terminated_runs
+          replay_buffer = [
+            _copy_bus_event(entry)
+            for entry in self._replay_buffers.get(
+              (subscriber.user_id, subscriber.control_run_id),
+              (),
+            )
+          ]
           if replay_buffer:
             head_seq = replay_buffer[0].seq
             if head_seq is not None and normalized_after_seq < head_seq - 1:
@@ -379,23 +605,14 @@ class UserEventBus:
               for entry in replay_buffer
               if entry.seq is not None and entry.seq > normalized_after_seq
             ]
-
-      try:
-        if truncation_event is not None:
-          yield truncation_event
-        for entry in replay_events:
-          yield entry
-
-        while True:
-          try:
-            entry = await self._next_entry(subscriber)
-          except _SubscriberClosed:
-            return
-          yield entry
-      finally:
-        await asyncio.shield(self._unsubscribe(subscriber))
-
-    return _iterator()
+    return EventSubscription(
+      bus=self,
+      subscriber=subscriber,
+      replay_events=replay_events,
+      truncation_event=truncation_event,
+      registered=registered,
+      stop_at_terminal=subscriber.stop_at_terminal,
+    )
 
   async def cleanup_run(self, user_id: str, control_run_id: str) -> None:
     """Schedule deferred per-run replay-buffer cleanup."""
@@ -432,15 +649,19 @@ class UserEventBus:
     subscribers = self._subscribers.setdefault(subscriber.user_id, set())
     subscribers.add(subscriber)
 
+  def _unregister_subscriber_locked(self, subscriber: _Subscriber) -> None:
+    subscriber.closed = True
+    subscriber.updated.set()
+    subscribers = self._subscribers.get(subscriber.user_id)
+    if subscribers is None:
+      return
+    subscribers.discard(subscriber)
+    if not subscribers:
+      self._subscribers.pop(subscriber.user_id, None)
+
   async def _unsubscribe(self, subscriber: _Subscriber) -> None:
     async with self._lock:
-      subscriber.closed = True
-      subscriber.updated.set()
-      subscribers = self._subscribers.get(subscriber.user_id)
-      if subscribers is not None:
-        subscribers.discard(subscriber)
-        if not subscribers:
-          self._subscribers.pop(subscriber.user_id, None)
+      self._unregister_subscriber_locked(subscriber)
       if self._shutdown:
         return
 
@@ -465,7 +686,7 @@ class UserEventBus:
           subscriber.dropped_through_seq = None
           return sentinel
         if subscriber.queue:
-          return dict(subscriber.queue.popleft().event)
+          return deepcopy(subscriber.queue.popleft().event)
         if subscriber.closed or self._shutdown:
           raise _SubscriberClosed()
         subscriber.updated.clear()
@@ -494,13 +715,25 @@ class UserEventBus:
             control_run_id=subscriber.control_run_id,
           )
         if subscriber.queue:
-          return subscriber.queue.popleft()
+          return _copy_bus_event(subscriber.queue.popleft())
         if subscriber.closed or self._shutdown:
           raise _SubscriberClosed()
+        if subscriber.stop_at_terminal and subscriber.stream_terminated:
+          raise _SubscriberTerminated()
         subscriber.updated.clear()
       await subscriber.updated.wait()
 
   def _enqueue_for_subscriber(self, subscriber: _Subscriber, entry: _BusEvent) -> None:
+    terminal_transition = subscriber.stop_at_terminal and entry.terminal
+    if terminal_transition:
+      subscriber.stream_terminated = True
+    if (
+      entry.seq is not None
+      and entry.seq <= subscriber.after_seq_floor
+    ):
+      if terminal_transition:
+        subscriber.updated.set()
+      return
     if len(subscriber.queue) >= subscriber.max_queue_size:
       dropped = subscriber.queue.popleft()
       subscriber.dropped_count += 1
@@ -508,7 +741,7 @@ class UserEventBus:
         subscriber.oldest_dropped_ts = dropped.timestamp
       if dropped.seq is not None:
         subscriber.dropped_through_seq = dropped.seq
-    subscriber.queue.append(entry)
+    subscriber.queue.append(_copy_bus_event(entry))
     subscriber.updated.set()
 
   def _schedule_cleanup_locked(self, key: Tuple[str, str]) -> None:
@@ -539,6 +772,14 @@ class UserEventBus:
     return any(
       subscriber.matches(user_id, control_run_id)
       for subscriber in self._subscribers.get(user_id, ())
+    )
+
+  def _has_run_state_locked(self, key: Tuple[str, str]) -> bool:
+    return (
+      key in self._replay_buffers
+      or key in self._next_seq_by_run
+      or key in self._terminated_runs
+      or key in self._cleanup_tasks
     )
 
   def _cancel_user_cleanup_locked(self, user_id: str) -> None:

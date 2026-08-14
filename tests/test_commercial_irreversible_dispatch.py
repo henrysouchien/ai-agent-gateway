@@ -60,6 +60,7 @@ def test_irreversible_rechecks_after_approval_and_injects_token_free_lineage() -
 
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
+    role="owner",
     needs_approval=lambda *_args, **_kwargs: True,
     request_approval=approve,
     commercial_work_start=commercial,
@@ -68,7 +69,12 @@ def test_irreversible_rechecks_after_approval_and_injects_token_free_lineage() -
   )
 
   result, error = asyncio.run(
-    dispatcher.dispatch("call-1", "execute_trade", {"preview_id": "preview-1"})
+    dispatcher.dispatch(
+      "call-1",
+      "execute_trade",
+      {"preview_id": "preview-1"},
+      advertised_tool_names=frozenset({"execute_trade"}),
+    )
   )
 
   assert error is None
@@ -99,6 +105,7 @@ def test_irreversible_live_recheck_failure_never_calls_mcp() -> None:
 
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
+    role="owner",
     needs_approval=lambda *_args, **_kwargs: False,
     commercial_work_start=_commercial(),
     commercial_irreversible_recheck=deny,
@@ -106,7 +113,12 @@ def test_irreversible_live_recheck_failure_never_calls_mcp() -> None:
   )
 
   result, error = asyncio.run(
-    dispatcher.dispatch("call-1", "execute_trade", {"preview_id": "preview-1"})
+    dispatcher.dispatch(
+      "call-1",
+      "execute_trade",
+      {"preview_id": "preview-1"},
+      advertised_tool_names=frozenset({"execute_trade"}),
+    )
   )
 
   assert result is None
@@ -121,6 +133,7 @@ def test_commercial_dispatch_denies_untrusted_mcp_without_metadata_leak() -> Non
   mcp = _Mcp()
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
+    role="owner",
     needs_approval=lambda *_args, **_kwargs: False,
     commercial_work_start=_commercial(),
     commercial_irreversible_recheck=lambda _context: None,
@@ -128,7 +141,12 @@ def test_commercial_dispatch_denies_untrusted_mcp_without_metadata_leak() -> Non
   )
 
   result, error = asyncio.run(
-    dispatcher.dispatch("call-1", "execute_trade", {"preview_id": "preview-1"})
+    dispatcher.dispatch(
+      "call-1",
+      "execute_trade",
+      {"preview_id": "preview-1"},
+      advertised_tool_names=frozenset({"execute_trade"}),
+    )
   )
 
   assert result is None
@@ -140,13 +158,19 @@ def test_missing_irreversible_recheck_fails_closed() -> None:
   mcp = _Mcp()
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
+    role="owner",
     needs_approval=lambda *_args, **_kwargs: False,
     commercial_work_start=_commercial(),
     commercial_mcp_servers=frozenset({"portfolio-trades-mcp"}),
   )
 
   result, error = asyncio.run(
-    dispatcher.dispatch("call-1", "execute_trade", {"preview_id": "preview-1"})
+    dispatcher.dispatch(
+      "call-1",
+      "execute_trade",
+      {"preview_id": "preview-1"},
+      advertised_tool_names=frozenset({"execute_trade"}),
+    )
   )
 
   assert result is None
@@ -158,11 +182,17 @@ def test_noncommercial_dispatch_remains_metadata_free() -> None:
   mcp = _Mcp()
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
+    role="owner",
     needs_approval=lambda *_args, **_kwargs: False,
   )
 
   result, error = asyncio.run(
-    dispatcher.dispatch("call-1", "execute_trade", {"preview_id": "preview-1"})
+    dispatcher.dispatch(
+      "call-1",
+      "execute_trade",
+      {"preview_id": "preview-1"},
+      advertised_tool_names=frozenset({"execute_trade"}),
+    )
   )
 
   assert error is None

@@ -15,6 +15,7 @@ from .approval_policy import (
   utc_now,
 )
 from .approval_store import PersistentGrantCancellationFenced
+from .policy_controls import effective_allow_tool_type
 from .session import GatewaySession
 
 
@@ -177,6 +178,7 @@ async def _record_vote_and_unblock(
   authoritative_store: Any | None = None,
   authoritative_policy: Any | None = None,
   authoritative_identity: Mapping[str, Any] | None = None,
+  autonomous_delivery: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
   lock = _approval_resolution_lock(target_session, tool_call_id)
   async with lock:
@@ -195,6 +197,7 @@ async def _record_vote_and_unblock(
       authoritative_store=authoritative_store,
       authoritative_policy=authoritative_policy,
       authoritative_identity=authoritative_identity,
+      autonomous_delivery=autonomous_delivery,
     )
 
 
@@ -214,6 +217,7 @@ async def _record_vote_and_unblock_locked(
   authoritative_store: Any | None = None,
   authoritative_policy: Any | None = None,
   authoritative_identity: Mapping[str, Any] | None = None,
+  autonomous_delivery: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
   approval_queue = _validate_pending_entry(
     pending_entry=pending_entry,
@@ -231,8 +235,14 @@ async def _record_vote_and_unblock_locked(
   effective_denied_by = denied_by if not approved else None
 
   if not approval_id:
+    effective_allow = effective_allow_tool_type(
+      pending_entry.get("tool_class"),
+      pending_entry.get("tool_name"),
+      allow_tool_type,
+    )
+    pending_entry["allow_tool_type"] = effective_allow
     pending_entry["status"] = "approval_received"
-    await approval_queue.put({"approved": approved, "allow_tool_type": allow_tool_type, "denied_by": effective_denied_by})
+    await approval_queue.put({"approved": approved, "allow_tool_type": effective_allow, "denied_by": effective_denied_by})
     return {"status": "ok"}
 
   if store is None or policy is None:
@@ -283,7 +293,18 @@ async def _record_vote_and_unblock_locked(
           "approval_id": str(approval_id),
         },
       )
-    allow_tool_type = False
+
+  effective_allow = effective_allow_tool_type(
+    request_record.tool_class,
+    request_record.tool_name,
+    (
+      allow_tool_type
+      and request_record.approval_constraint == "standard"
+    ),
+  )
+  pending_entry["tool_class"] = request_record.tool_class
+  pending_entry["tool_name"] = request_record.tool_name
+  pending_entry["allow_tool_type"] = effective_allow
 
   if approved and not policy.role_authorized_for_class(
     decider_role=decider_role,
@@ -309,7 +330,27 @@ async def _record_vote_and_unblock_locked(
     external_callback_id=None,
   )
   try:
-    request_record = await store.record_vote(str(approval_id), vote)
+    if autonomous_delivery is None:
+      request_record = await store.record_vote(str(approval_id), vote)
+    else:
+      record_with_delivery = getattr(
+        store,
+        "record_vote_with_autonomous_delivery",
+        None,
+      )
+      if not callable(record_with_delivery):
+        raise ApprovalActionError(
+          503,
+          {
+            "error": "Autonomous approval delivery outbox unavailable",
+            "approval_id": str(approval_id),
+          },
+        )
+      request_record = await record_with_delivery(
+        str(approval_id),
+        vote,
+        delivery=autonomous_delivery,
+      )
   except ValueError as exc:
     raise ApprovalActionError(
       409,
@@ -344,7 +385,7 @@ async def _record_vote_and_unblock_locked(
   if (
     request_record.state == "approved"
     and request_record.approval_constraint == "standard"
-    and allow_tool_type
+    and effective_allow
     and request_record.persistent_grant_scope
   ):
     try:
@@ -387,10 +428,7 @@ async def _record_vote_and_unblock_locked(
   await approval_queue.put(
     {
       "approved": executable,
-      "allow_tool_type": (
-        request_record.approval_constraint == "standard"
-        and allow_tool_type
-      ),
+      "allow_tool_type": effective_allow,
       "approval_id": str(approval_id),
       "denied_by": effective_denied_by,
     }
@@ -399,7 +437,7 @@ async def _record_vote_and_unblock_locked(
     "Tool approval: %s | approved=%s allow_tool_type=%s approval_id=%s",
     pending_entry.get("tool_name", "?"),
     executable,
-    allow_tool_type and request_record.approval_constraint == "standard",
+    effective_allow,
     approval_id,
   )
   return {"approval": _approval_request_to_dict(request_record)}
@@ -521,6 +559,7 @@ async def _cancel_pending_approval_and_unblock(
   expected_run_id: str,
   expected_session_id: str,
   expected_channel: str | None,
+  autonomous_delivery: Mapping[str, Any] | None = None,
   system_override: bool = False,
   role_authorization_prechecked: bool = False,
   release_queue: bool = True,
@@ -632,6 +671,7 @@ async def _cancel_pending_approval_and_unblock(
         decider_id=decider_id,
         decider_role=decider_role,
         decision_reason=reason,
+        autonomous_delivery=autonomous_delivery,
       )
     except asyncio.CancelledError:
       request_record = await store.get(approval_id)
@@ -715,6 +755,7 @@ async def _cancel_pending_approval_and_unblock(
       )
     result: dict[str, Any] = {
       "identity_matches": identity_matches,
+      "transitioned": transitioned,
       "quarantined": (
         not identity_matches
         or request_record.state not in {"denied", "auto_denied"}

@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
+import threading
 import time
 import uuid
 from dataclasses import replace
+from itertools import count
 from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
 
+from agent_gateway.autonomous_capability_handoff import AutonomousCapabilityBinding
+from agent_gateway.autonomous_event_channel import (
+  adopt_inherited_autonomous_event_channel,
+)
+from agent_gateway.autonomous_launch_envelope import (
+  AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+)
 from agent_gateway.approval_audit import ApprovalAuditEmitter
 from agent_gateway.approval_notifications import ApprovalNotificationDestination
 from agent_gateway.approval_policy import (
@@ -21,20 +32,129 @@ from agent_gateway.approval_policy import (
 )
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.audit_writer import JSONLAuditWriter
+from agent_gateway.capability_binding import (
+  CapabilityBind,
+  CredentialHandle,
+)
+from agent_gateway.model_registry import (
+  CAPABILITY_IDS,
+  INITIAL_MODEL_REGISTRY,
+  INITIAL_MODEL_SELECTION_POLICY,
+)
+from agent_gateway.capability_execution import MaterializedCredential
 from agent_gateway.control_plane import approvals as approvals_module
+from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 
 
 API_KEY = "approvals-pr7-key"
+HMAC_KEY = "approvals-pr7-test-hmac-key-at-least-32-bytes"
+_MODEL_ENTRY = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5")
+_SERVICE_HANDLE = CredentialHandle(
+  handle_id="service:approvals-pr7:anthropic",
+  provider="anthropic",
+  principal="service",
+  tenant_id="test-product",
+  actor_id=None,
+)
+
+
+def _autonomous_capability_binding(request) -> AutonomousCapabilityBinding:
+  handle = _SERVICE_HANDLE
+  return AutonomousCapabilityBinding(
+    bind=request.required_bind
+    or CapabilityBind(
+      schema_version="1.0",
+      capability_id="session.driver",
+      model_key=_MODEL_ENTRY.key,
+      provider=_MODEL_ENTRY.provider,
+      upstream_model=_MODEL_ENTRY.upstream_model,
+      adapter=_MODEL_ENTRY.adapter,
+      protocol_profile=_MODEL_ENTRY.protocol_profile,
+      route=_MODEL_ENTRY.route,
+      effort="high",
+      credential_principal="service",
+      credential_ref=handle.handle_id,
+      run_mode=request.run_mode,
+      registry_revision=INITIAL_MODEL_REGISTRY.revision,
+      policy_revision=INITIAL_MODEL_SELECTION_POLICY.revision,
+      selection_source="capability_default",
+    ),
+    materialized_credential=MaterializedCredential(
+      handle=handle,
+      auth_config={
+        "provider": handle.provider,
+        "auth_mode": "api",
+        "api_key": "approvals-pr7-test-secret",
+      },
+    ),
+  )
+
+
+_FAKE_PROCESS_PIDS = count(90_000)
+_FAKE_PROCESSES: dict[int, "_FakeAutonomousProcess"] = {}
+
+
+class _FakeStdin:
+  def __init__(self) -> None:
+    self.buffer = bytearray()
+
+  def write(self, payload: bytes) -> None:
+    self.buffer.extend(payload)
+
+  async def drain(self) -> None:
+    return None
+
+  def close(self) -> None:
+    return None
+
+  async def wait_closed(self) -> None:
+    return None
 
 
 class _FakeAutonomousProcess:
-  returncode: int | None = None
+  def __init__(self, inherited_event_fd: int) -> None:
+    self.pid = next(_FAKE_PROCESS_PIDS)
+    self._returncode: int | None = None
+    self._inherited_fds = [inherited_event_fd]
+    self._event_channel = None
+    self.stdin = _FakeStdin()
+    _FAKE_PROCESSES[self.pid] = self
+
+  @property
+  def returncode(self) -> int | None:
+    return self._returncode
+
+  @returncode.setter
+  def returncode(self, value: int | None) -> None:
+    self._returncode = value
+    if value is not None:
+      self._close_child_endpoints()
+
+  def start_event_channel(self, channel_id: str) -> None:
+    inherited_fd = self._inherited_fds.pop(0)
+    self._event_channel = adopt_inherited_autonomous_event_channel(
+      inherited_fd,
+      channel_id=channel_id,
+    )
+    self._event_channel.start(timeout_seconds=1)
+
+  def _close_child_endpoints(self) -> None:
+    if self._event_channel is not None:
+      self._event_channel.close()
+      self._event_channel = None
+    for inherited_fd in self._inherited_fds:
+      if inherited_fd >= 0:
+        os.close(inherited_fd)
+    self._inherited_fds.clear()
 
   async def wait(self) -> int:
     while self.returncode is None:
       await asyncio.sleep(0.01)
     return self.returncode
+
+  def retain_inherited_fds(self, inherited_fds: tuple[int, ...]) -> None:
+    self._inherited_fds.extend(os.dup(fd) for fd in inherited_fds)
 
   def terminate(self) -> None:
     if self.returncode is None:
@@ -43,6 +163,42 @@ class _FakeAutonomousProcess:
   def kill(self) -> None:
     if self.returncode is None:
       self.returncode = -9
+
+
+def _patch_fake_autonomous_spawn(
+  monkeypatch,
+  autonomous_runner,
+  fake_exec,
+) -> None:
+  async def retaining_fake_exec(*args: Any, **kwargs: Any):
+    process = await fake_exec(*args, **kwargs)
+    envelope = json.loads(
+      kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV]
+    )
+    process.start_event_channel(envelope["channel_id"])
+    process.retain_inherited_fds(tuple(kwargs["pass_fds"][1:]))
+    return process
+
+  monkeypatch.setattr(
+    autonomous_runner.asyncio,
+    "create_subprocess_exec",
+    retaining_fake_exec,
+  )
+  monkeypatch.setattr(
+    autonomous_runner,
+    "_get_process_group_id",
+    lambda pid: pid,
+  )
+
+  def signal_process_group(process_group_id: int, signal_number: int) -> None:
+    process = _FAKE_PROCESSES[process_group_id]
+    process.returncode = -signal_number
+
+  monkeypatch.setattr(
+    autonomous_runner,
+    "_signal_process_group",
+    signal_process_group,
+  )
 
 
 def _run(coro):
@@ -81,16 +237,24 @@ class _NoopPolicy:
 
 def _make_app(tmp_path, policy: _NoopPolicy | None = None):
   async def _build_chat_runtime(*, session, request, channel, auth_manager):
-    _ = session, request, channel, auth_manager
-    return ChatRuntime(system_prompt="test", build_runner=lambda *_args: None)
+    _ = session, channel, auth_manager
+    return ChatRuntime(
+      system_prompt="test",
+      build_runner=lambda *_args: None,
+      capability_execution=request.capability_execution,
+    )
 
   app = create_gateway_app(
     GatewayServerConfig(
       jwt_secret="approvals-pr7-test-secret-0123456789",
       valid_api_keys={API_KEY},
-      auth_config={"model": "test-model"},
-      allowed_models=set(),
+      tenant_id="test-product",
+      model_registry=INITIAL_MODEL_REGISTRY,
+      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      service_provider_handles={"anthropic": _SERVICE_HANDLE},
       build_chat_runtime=_build_chat_runtime,
+      autonomous_capability_binding_resolver=_autonomous_capability_binding,
+      claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
     )
   )
   writer = JSONLAuditWriter(tmp_path / "audit")
@@ -114,7 +278,7 @@ def _control_session(client: TestClient, user_id: str, *, channel: str = "tui") 
     json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": channel}},
   )
   assert response.status_code == 200, response.text
-  return response.json()
+  return _with_model_entitlements(client, response.json())
 
 
 def _chat_session(client: TestClient, user_id: str, *, channel: str = "tui") -> dict[str, Any]:
@@ -123,7 +287,22 @@ def _chat_session(client: TestClient, user_id: str, *, channel: str = "tui") -> 
     json={"api_key": API_KEY, "user_id": user_id, "context": {"channel": channel}},
   )
   assert response.status_code == 200, response.text
-  return response.json()
+  return _with_model_entitlements(client, response.json())
+
+
+def _with_model_entitlements(
+  client: TestClient,
+  session_payload: dict[str, Any],
+) -> dict[str, Any]:
+  session = client.app.state.auth.session_store.get_session(
+    session_payload["session_id"]
+  )
+  assert session is not None
+  session.model_entitled_capabilities = CAPABILITY_IDS
+  session.model_entitled_keys = frozenset(INITIAL_MODEL_REGISTRY.models)
+  payload = dict(session_payload)
+  payload["session_token"] = client.app.state.auth.issue_token(session)
+  return payload
 
 
 def _headers(session_payload: dict[str, Any]) -> dict[str, str]:
@@ -152,11 +331,14 @@ def _approval_record(
   user_id: str,
   delegation_id: str | None = None,
   channel: str = "tui",
+  tool_name: str = "execute_trade",
   tool_class: str = "external_write",
   state: str = "pending_user",
   required_decider_count: int = 1,
   eligible_decider_count: int = 1,
   persistent_grant_scope: str | None = None,
+  approval_constraint: str = "standard",
+  required_owner_user_id: str | None = None,
 ) -> ApprovalRequest:
   now = utc_now()
   return ApprovalRequest(
@@ -171,7 +353,7 @@ def _approval_record(
     user_id=user_id,
     profile="chat",
     channel=channel,
-    tool_name="execute_trade",
+    tool_name=tool_name,
     tool_class=tool_class,  # type: ignore[arg-type]
     tool_args_redacted={"ticker": "AAPL"},
     args_hash=f"hash-{approval_id}",
@@ -184,7 +366,8 @@ def _approval_record(
     decision=state if state in {"approved", "denied", "expired"} else None,  # type: ignore[arg-type]
     required_decider_count=required_decider_count,
     eligible_decider_count=eligible_decider_count,
-    approval_constraint="standard",
+    approval_constraint=approval_constraint,  # type: ignore[arg-type]
+    required_owner_user_id=required_owner_user_id,
     persistent_grant_scope=persistent_grant_scope,
     policy_id="test-policy",
     policy_version="1",
@@ -200,11 +383,14 @@ def _install_pending_approval(
   user_id: str,
   delegation_id: str | None = None,
   channel: str = "tui",
+  tool_name: str = "execute_trade",
   tool_class: str = "external_write",
   state: str = "pending_user",
   required_decider_count: int = 1,
   eligible_decider_count: int = 1,
   persistent_grant_scope: str | None = None,
+  approval_constraint: str = "standard",
+  required_owner_user_id: str | None = None,
 ) -> tuple[ApprovalRequest, asyncio.Queue]:
   tool_call_id = f"tool-{uuid.uuid4().hex}"
   approval_id = f"appr-{uuid.uuid4().hex}"
@@ -215,11 +401,14 @@ def _install_pending_approval(
     user_id=user_id,
     delegation_id=delegation_id,
     channel=channel,
+    tool_name=tool_name,
     tool_class=tool_class,
     state=state,
     required_decider_count=required_decider_count,
     eligible_decider_count=eligible_decider_count,
     persistent_grant_scope=persistent_grant_scope,
+    approval_constraint=approval_constraint,
+    required_owner_user_id=required_owner_user_id,
   )
   _run(store.create(request_record))
 
@@ -232,7 +421,7 @@ def _install_pending_approval(
     "status": "approval_pending",
     "tool_name": request_record.tool_name,
     "tool_input": dict(request_record.tool_args_redacted),
-    "resolved_qualifier": "external_write:execute_trade:AAPL",
+    "resolved_qualifier": f"{tool_class}:{tool_name}",
     "reason": request_record.reason,
     "allow_persistent_approval": persistent_grant_scope is not None,
   }
@@ -294,8 +483,8 @@ def _install_autonomous_pending_approval(
     tool_call_id=tool_call_id,
     parent_approval_id=None,
     approval_chain_id=approval_id,
-    request_id=f"req-{approval_id}",
-    session_id=f"agent-control:{run_id}:123",
+    request_id=run_id,
+    session_id=record.session_id,
     run_id=run_id,
     user_id=user_id,
     profile="analyst",
@@ -450,14 +639,16 @@ def _install_pinned_batch_pending_approval(
 def test_control_approval_list_resolve_unblocks_queue_persists_grant_and_audits(tmp_path) -> None:
   app, store, policy, writer = _make_app(tmp_path)
   with TestClient(app) as client:
-    control = _control_session(client, "alice")
+    control = _with_role(app, _control_session(client, "alice"), "owner")
     chat = _chat_session(client, "alice")
     approval, queue = _install_pending_approval(
       app=app,
       store=store,
       chat_payload=chat,
       user_id="alice",
-      persistent_grant_scope="external_write:execute_trade:AAPL",
+      tool_name="memory_write",
+      tool_class="state_write",
+      persistent_grant_scope="state_write:memory_write",
     )
 
     listed = client.get("/api/control/approvals", headers=_headers(control))
@@ -488,8 +679,8 @@ def test_control_approval_list_resolve_unblocks_queue_persists_grant_and_audits(
     grant = _run(
       store.find_persistent_grant(
         user_id="alice",
-        tool_name="execute_trade",
-        scope_hint="external_write:execute_trade:AAPL",
+        tool_name="memory_write",
+        scope_hint="state_write:memory_write",
       )
     )
     assert grant is not None
@@ -498,6 +689,63 @@ def test_control_approval_list_resolve_unblocks_queue_persists_grant_and_audits(
     assert entries[0].decider_id == "alice"
     assert entries[0].decider_role == "owner"
     assert entries[0].decision_reason == "looks safe"
+
+
+def test_control_approval_uses_canonical_owner_for_fresh_owner_vote(tmp_path) -> None:
+  app, store, _policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control = _control_session(client, "alice-control-alias")
+    chat = _chat_session(client, "alice-chat-alias")
+    outsider = _control_session(client, "bob")
+    control_session = _session(app, control)
+    chat_session = _session(app, chat)
+    control_session.owner_user_id = "101"
+    control_session.risk_user_id = 101
+    control_session.role = "owner"
+    chat_session.owner_user_id = "101"
+    chat_session.risk_user_id = 101
+    control["session_token"] = app.state.auth.issue_token(control_session)
+    approval, queue = _install_pending_approval(
+      app=app,
+      store=store,
+      chat_payload=chat,
+      user_id="101",
+      approval_constraint="fresh_human_owner",
+      required_owner_user_id="101",
+    )
+
+    owner_list = client.get("/api/control/approvals", headers=_headers(control))
+    outsider_list = client.get("/api/control/approvals", headers=_headers(outsider))
+    cross_user = client.post(
+      f"/api/control/runs/{chat['session_id']}/approvals/{approval.approval_id}",
+      headers=_headers(outsider),
+      json={"approved": True},
+    )
+    assert owner_list.status_code == 200, owner_list.text
+    assert [item["approval_id"] for item in owner_list.json()["approvals"]] == [
+      approval.approval_id
+    ]
+    assert outsider_list.status_code == 200, outsider_list.text
+    assert outsider_list.json()["approvals"] == []
+    assert cross_user.status_code == 404
+    assert queue.empty()
+
+    response = client.post(
+      f"/api/control/runs/{chat['session_id']}/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={
+        "approved": True,
+        "allow_tool_type": False,
+        "reason": "canonical owner confirms",
+      },
+    )
+
+    assert response.status_code == 200, response.text
+    resolved = response.json()["approval"]
+    assert resolved["state"] == "approved"
+    assert resolved["decider_id"] == "101"
+    assert resolved["required_owner_user_id"] == "101"
+    assert queue.get_nowait()["approved"] is True
 
 
 def test_control_approval_endpoints_reject_chat_session_tokens(tmp_path) -> None:
@@ -599,11 +847,11 @@ def test_control_approval_list_resolve_routes_approval_pending_autonomous_decisi
   from agent_gateway import autonomous_runner
 
   async def fake_exec(*args, **kwargs):
-    _ = args, kwargs
-    return _FakeAutonomousProcess()
+    _ = args
+    return _FakeAutonomousProcess(os.dup(kwargs["pass_fds"][0]))
 
-  monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
-  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", "approval-test-hmac")
+  _patch_fake_autonomous_spawn(monkeypatch, autonomous_runner, fake_exec)
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   app, store, policy, _writer = _make_app(tmp_path)
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -646,25 +894,18 @@ def test_control_approval_list_resolve_routes_approval_pending_autonomous_decisi
     assert response.json()["approval"]["state"] == "approved"
     assert policy.resolved == [approval.approval_id]
 
-    assert record.approval_decisions_path is not None
-    decisions = [
-      json.loads(line)
-      for line in record.approval_decisions_path.read_text(encoding="utf-8").splitlines()
-      if line.strip()
-    ]
-    assert decisions == [
-      {
-        "approval_id": approval.approval_id,
-        "tool_call_id": approval.tool_call_id,
-        "nonce": f"nonce-{approval.approval_id}",
-        "approved": True,
-        "allow_tool_type": False,
-        "reason": "reviewed diff",
-        "decider": {"user_id": "alice"},
-        "channel": "tui",
-        "decided_at": decisions[0]["decided_at"],
-      }
-    ]
+    delivery = _run(
+      store.get_autonomous_approval_delivery(
+        approval.approval_id,
+        tool_call_id=approval.tool_call_id,
+        nonce=f"nonce-{approval.approval_id}",
+      )
+    )
+    assert delivery is not None
+    assert delivery["approved"] is True
+    assert delivery["allow_tool_type"] is False
+    assert record.approval_decisions_path is None
+    assert record.approval_channel is not None
 
 
 def test_batch_approval_list_and_vote_use_canonical_owner_and_exact_durable_join(
@@ -719,7 +960,7 @@ def test_batch_approval_endpoints_pin_projection_store_and_policy_across_same_id
   session_store = SQLiteApprovalStore(tmp_path / "session-approvals.sqlite3")
   projection_store = SQLiteApprovalStore(tmp_path / "projection-approvals.sqlite3")
   with TestClient(app) as client:
-    control = _control_session(client, "alice")
+    control = _with_role(app, _control_session(client, "alice"), "owner")
     approval, queue = _install_pinned_batch_pending_approval(
       app=app,
       durable_store=projection_store,
@@ -869,11 +1110,11 @@ def test_cancel_autonomous_run_denies_pending_approval_and_clears_queue(
   from agent_gateway import autonomous_runner
 
   async def fake_exec(*args, **kwargs):
-    _ = args, kwargs
-    return _FakeAutonomousProcess()
+    _ = args
+    return _FakeAutonomousProcess(os.dup(kwargs["pass_fds"][0]))
 
-  monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
-  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", "approval-test-hmac")
+  _patch_fake_autonomous_spawn(monkeypatch, autonomous_runner, fake_exec)
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   app, store, policy, _writer = _make_app(tmp_path)
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -921,25 +1162,251 @@ def test_cancel_autonomous_run_denies_pending_approval_and_clears_queue(
     assert after_cancel.json()["approvals"] == []
 
     assert record is not None
-    assert record.approval_decisions_path is not None
-    decisions = [
-      json.loads(line)
-      for line in record.approval_decisions_path.read_text(encoding="utf-8").splitlines()
-      if line.strip()
-    ]
-    assert decisions == [
-      {
-        "approval_id": approval.approval_id,
-        "tool_call_id": approval.tool_call_id,
-        "nonce": f"nonce-{approval.approval_id}",
-        "approved": False,
-        "allow_tool_type": False,
-        "reason": "run_cancelled",
-        "decider": {"user_id": "alice"},
+    delivery = _run(
+      store.get_autonomous_approval_delivery(
+        approval.approval_id,
+        tool_call_id=approval.tool_call_id,
+        nonce=f"nonce-{approval.approval_id}",
+      )
+    )
+    assert delivery is not None
+    assert delivery["approved"] is False
+    assert delivery["allow_tool_type"] is False
+    assert record.approval_decisions_path is None
+    assert record.approval_channel is None
+
+
+def test_autonomous_cancel_after_approval_commit_fences_grant_and_sends_no_denial(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner
+
+  async def fake_exec(*args, **kwargs):
+    _ = args
+    return _FakeAutonomousProcess(os.dup(kwargs["pass_fds"][0]))
+
+  _patch_fake_autonomous_spawn(monkeypatch, autonomous_runner, fake_exec)
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+  app, store, _policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    start = client.post(
+      "/api/control/runs",
+      headers=_headers(control),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "task",
+        "task": "approval cancellation race",
         "channel": "tui",
-        "decided_at": decisions[0]["decided_at"],
-      }
-    ]
+      },
+    )
+    assert start.status_code == 200, start.text
+    run_id = start.json()["run_id"]
+    approval = _install_autonomous_pending_approval(
+      app=app,
+      store=store,
+      run_id=run_id,
+      user_id="alice",
+    )
+    record = app.state.subprocess_registry._find_by_control_run_id(run_id)
+    assert record is not None
+    record.state = "approval_pending"
+
+    grant_committed = threading.Event()
+    cancellation_fence_committed = threading.Event()
+    release_approval = threading.Event()
+    release_cancellation = threading.Event()
+    original_create_grant = store.create_persistent_grant
+    original_fence = store.fence_persistent_grants_for_cancellation
+
+    async def pause_after_grant_commit(*args: Any, **kwargs: Any) -> Any:
+      created = await original_create_grant(*args, **kwargs)
+      grant_committed.set()
+      while not release_approval.is_set():
+        await asyncio.sleep(0.001)
+      return created
+
+    async def track_cancellation_fence(*args: Any, **kwargs: Any) -> Any:
+      result = await original_fence(*args, **kwargs)
+      cancellation_fence_committed.set()
+      while not release_cancellation.is_set():
+        await asyncio.sleep(0.001)
+      return result
+
+    monkeypatch.setattr(
+      store,
+      "create_persistent_grant",
+      pause_after_grant_commit,
+    )
+    monkeypatch.setattr(
+      store,
+      "fence_persistent_grants_for_cancellation",
+      track_cancellation_fence,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+      approve_future = executor.submit(
+        client.post,
+        f"/api/control/runs/{run_id}/approvals/{approval.approval_id}",
+        headers=_headers(control),
+        json={
+          "approved": True,
+          "allow_tool_type": True,
+          "reason": "approve before cancellation",
+        },
+      )
+      assert grant_committed.wait(timeout=2)
+      cancel_future = executor.submit(
+        client.delete,
+        f"/api/control/runs/{run_id}",
+        headers=_headers(control),
+      )
+      assert cancellation_fence_committed.wait(timeout=2)
+      assert record.proc is not None
+      assert record.proc.returncode is None
+      release_approval.set()
+      approve_response = approve_future.result(timeout=3)
+      assert record.proc.returncode is None
+      release_cancellation.set()
+      cancel_response = cancel_future.result(timeout=3)
+
+    assert approve_response.status_code == 409, approve_response.text
+    assert cancel_response.status_code == 200, cancel_response.text
+    assert cancel_response.json()["state"] == "cancelled"
+    assert record.proc is not None
+    assert record.proc.returncode is not None
+    stored = _run(store.get(approval.approval_id))
+    assert stored is not None
+    assert stored.state == "approved"
+    delivery = _run(
+      store.get_autonomous_approval_delivery(
+        approval.approval_id,
+        tool_call_id=approval.tool_call_id,
+        nonce=f"nonce-{approval.approval_id}",
+      )
+    )
+    assert delivery is not None
+    assert delivery["approved"] is True
+    assert record.approval_decisions_path is None
+    assert record.approval_channel is None
+    assert _run(
+      store.find_persistent_grant(
+        user_id="alice",
+        tool_name=approval.tool_name,
+        scope_hint=str(approval.persistent_grant_scope),
+      )
+    ) is None
+
+
+def test_autonomous_cancel_terminalization_wins_and_delivers_only_denial(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner
+
+  async def fake_exec(*args, **kwargs):
+    _ = args
+    return _FakeAutonomousProcess(os.dup(kwargs["pass_fds"][0]))
+
+  _patch_fake_autonomous_spawn(monkeypatch, autonomous_runner, fake_exec)
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+  app, store, _policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    start = client.post(
+      "/api/control/runs",
+      headers=_headers(control),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "task",
+        "task": "cancellation wins approval race",
+        "channel": "tui",
+      },
+    )
+    assert start.status_code == 200, start.text
+    run_id = start.json()["run_id"]
+    approval = _install_autonomous_pending_approval(
+      app=app,
+      store=store,
+      run_id=run_id,
+      user_id="alice",
+    )
+    record = app.state.subprocess_registry._find_by_control_run_id(run_id)
+    assert record is not None
+    record.state = "approval_pending"
+
+    terminalized = threading.Event()
+    release_cancellation = threading.Event()
+    original_terminalize = store.terminalize_pending_for_cancellation
+
+    async def pause_after_terminalization(
+      *args: Any,
+      **kwargs: Any,
+    ) -> Any:
+      result = await original_terminalize(*args, **kwargs)
+      if result[1]:
+        terminalized.set()
+        while not release_cancellation.is_set():
+          await asyncio.sleep(0.001)
+      return result
+
+    monkeypatch.setattr(
+      store,
+      "terminalize_pending_for_cancellation",
+      pause_after_terminalization,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+      cancel_future = executor.submit(
+        client.delete,
+        f"/api/control/runs/{run_id}",
+        headers=_headers(control),
+      )
+      assert terminalized.wait(timeout=2)
+      approve_future = executor.submit(
+        client.post,
+        f"/api/control/runs/{run_id}/approvals/{approval.approval_id}",
+        headers=_headers(control),
+        json={
+          "approved": True,
+          "allow_tool_type": True,
+          "reason": "late approval",
+        },
+      )
+      approve_response = approve_future.result(timeout=3)
+      release_cancellation.set()
+      cancel_response = cancel_future.result(timeout=3)
+
+    assert approve_response.status_code == 409, approve_response.text
+    assert cancel_response.status_code == 200, cancel_response.text
+    assert cancel_response.json()["state"] == "cancelled"
+    assert record.proc is not None
+    assert record.proc.returncode is not None
+    stored = _run(store.get(approval.approval_id))
+    assert stored is not None
+    assert stored.state == "denied"
+    assert stored.votes_received_count == 0
+    delivery = _run(
+      store.get_autonomous_approval_delivery(
+        approval.approval_id,
+        tool_call_id=approval.tool_call_id,
+        nonce=f"nonce-{approval.approval_id}",
+      )
+    )
+    assert delivery is not None
+    assert delivery["approved"] is False
+    assert record.approval_decisions_path is None
+    assert record.approval_channel is None
+    assert _run(
+      store.find_persistent_grant(
+        user_id="alice",
+        tool_name=approval.tool_name,
+        scope_hint=str(approval.persistent_grant_scope),
+      )
+    ) is None
 
 
 def test_terminal_autonomous_run_hides_stale_pending_approval(
@@ -949,11 +1416,11 @@ def test_terminal_autonomous_run_hides_stale_pending_approval(
   from agent_gateway import autonomous_runner
 
   async def fake_exec(*args, **kwargs):
-    _ = args, kwargs
-    return _FakeAutonomousProcess()
+    _ = args
+    return _FakeAutonomousProcess(os.dup(kwargs["pass_fds"][0]))
 
-  monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
-  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", "approval-test-hmac")
+  _patch_fake_autonomous_spawn(monkeypatch, autonomous_runner, fake_exec)
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   app, store, policy, _writer = _make_app(tmp_path)
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -1016,11 +1483,11 @@ def test_exited_autonomous_process_hides_pending_approval_even_before_state_upda
   from agent_gateway import autonomous_runner
 
   async def fake_exec(*args, **kwargs):
-    _ = args, kwargs
-    return _FakeAutonomousProcess()
+    _ = args
+    return _FakeAutonomousProcess(os.dup(kwargs["pass_fds"][0]))
 
-  monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
-  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", "approval-test-hmac")
+  _patch_fake_autonomous_spawn(monkeypatch, autonomous_runner, fake_exec)
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   app, store, policy, _writer = _make_app(tmp_path)
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -1073,18 +1540,18 @@ def test_exited_autonomous_process_hides_pending_approval_even_before_state_upda
     assert policy.resolved == []
 
 
-def test_autonomous_approval_delivery_failure_does_not_resolve_store(
+def test_autonomous_approval_delivery_failure_preserves_durable_retry(
   monkeypatch,
   tmp_path,
 ) -> None:
   from agent_gateway import autonomous_runner
 
   async def fake_exec(*args, **kwargs):
-    _ = args, kwargs
-    return _FakeAutonomousProcess()
+    _ = args
+    return _FakeAutonomousProcess(os.dup(kwargs["pass_fds"][0]))
 
-  monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
-  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", "approval-test-hmac")
+  _patch_fake_autonomous_spawn(monkeypatch, autonomous_runner, fake_exec)
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   app, store, policy, _writer = _make_app(tmp_path)
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -1109,7 +1576,8 @@ def test_autonomous_approval_delivery_failure_does_not_resolve_store(
     )
     record = app.state.subprocess_registry._find_by_control_run_id(run_id)
     assert record is not None
-    record.approval_decisions_path = None
+    assert record.approval_channel is not None
+    record.approval_channel.close()
 
     response = client.post(
       f"/api/control/runs/{run_id}/approvals/{approval.approval_id}",
@@ -1118,12 +1586,23 @@ def test_autonomous_approval_delivery_failure_does_not_resolve_store(
     )
 
     assert response.status_code == 409, response.text
-    assert "approval inbox unavailable" in response.json()["error"]
+    assert "approval channel endpoint is unavailable" in response.json()["error"]
     stored = _run(store.get(approval.approval_id))
     assert stored is not None
-    assert stored.state == "pending_user"
-    assert stored.votes_received_count == 0
-    assert policy.resolved == []
+    assert stored.state == "approved"
+    assert stored.votes_received_count == 1
+    delivery = _run(
+      store.get_autonomous_approval_delivery(
+        approval.approval_id,
+        tool_call_id=approval.tool_call_id,
+        nonce=f"nonce-{approval.approval_id}",
+      )
+    )
+    assert delivery is not None
+    assert delivery["state"] == "pending"
+    assert delivery["approved"] is True
+    assert delivery["last_error"] is not None
+    assert policy.resolved == [approval.approval_id]
 
 
 def test_role_class_precheck_blocks_approval_but_allows_denial_for_invite(tmp_path) -> None:
@@ -1288,10 +1767,11 @@ def test_chat_tool_approval_endpoint_relay_policy_denial_records_provenance(tmp_
     assert policy.resolved == [approval.approval_id]
     assert queue.get_nowait() == {
       "approved": False,
-      "allow_tool_type": True,
+      "allow_tool_type": False,
       "approval_id": approval.approval_id,
       "denied_by": "relay_policy",
     }
+    assert pending["allow_tool_type"] is False
     stored = _run(store.get(approval.approval_id))
     assert stored is not None
     assert stored.state == "denied"
