@@ -1039,6 +1039,9 @@ def test_rebuild_task_registry_ignores_tool_call_complete_final_blocks(tmp_path:
         "task_type": "background",
         "agent_name": "writer",
         "started_at": 1.0,
+        "capability_bind": _child_execution(
+          _ScriptedProvider([])
+        ).bind.receipt(),
       }
     )
   )

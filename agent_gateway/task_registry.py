@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -18,12 +19,17 @@ from agent_workflow_contracts import (
   TaskResultRef,
 )
 
+from .agent_session_log_records import EVENT_SCHEMA_VERSION
 from .events import AgentCompletionEvent, event_from_dict
 from .skill_lifecycle import (
   SKILL_RESULT_CORE_FIELDS,
   SkillLifecycleArtifactIdentity,
   TopLevelSkillLifecycleMetadata,
 )
+
+log = logging.getLogger("agent_gateway.task_registry")
+
+
 class TaskState(Enum):
   PENDING = "pending"
   RUNNING = "running"
@@ -1121,6 +1127,7 @@ class TaskRegistry:
     self._max_retained = max_retained
     self._id_prefix = id_prefix
     self._listeners: list[TaskLifecycleListener] = []
+    self._durable_skip_warned: set[str] = set()
 
   def register(
     self,
@@ -1347,12 +1354,38 @@ class TaskRegistry:
   def add_listener(self, listener: TaskLifecycleListener) -> None:
     self._listeners.append(listener)
 
+  def _warn_skipped_durable_task(self, task_id: str, reason: str) -> None:
+    """Log a durable-task rebuild skip once per (task, reason), not per pass.
+
+    Rebuild and durable lookup run repeatedly; an unreadable record is a
+    standing condition, not a new event each pass (same rationale as the
+    autonomous-manifest warn-once skip).
+    """
+
+    key = f"{task_id}\0{reason}"
+    if key in self._durable_skip_warned:
+      return
+    self._durable_skip_warned.add(key)
+    log.warning(
+      "Skipping durable task %s during registry rebuild: %s",
+      task_id,
+      reason,
+    )
+
   def load_from_events(self, events: list[dict[str, Any]]) -> None:
     """Rebuild registry from durable task events without firing listeners.
 
     Tasks that were killed in a prior process rebuild as ``interrupted`` if no
-    durable completion event exists; v1 cannot distinguish those from tasks
-    that were running when the process crashed.
+    durable completion event exists; the log cannot distinguish those from
+    tasks that were running when the process crashed.
+
+    Only ``task_registered`` records at the current ``EVENT_SCHEMA_VERSION``
+    that carry a ``capability_bind`` receipt are rebuilt. Older records are
+    drained, not migrated (model-selection-authority plan section 6): they are
+    loudly skipped here instead of being reconstructed as bind-less entries
+    that would fail only at resume. Their numeric task-ID suffixes still
+    advance the registry sequence so new registrations never collide with a
+    skipped durable identity.
     """
     grouped: dict[str, dict[str, Any]] = {}
     global_skill_results: list[dict[str, Any]] = []
@@ -1396,6 +1429,27 @@ class TaskRegistry:
       suffix = self._numeric_suffix(task_id)
       if suffix is not None:
         max_suffix = suffix if max_suffix is None else max(max_suffix, suffix)
+      raw_event_schema_version = registered.get("event_schema_version")
+      if (
+        isinstance(raw_event_schema_version, bool)
+        or not isinstance(raw_event_schema_version, int)
+        or raw_event_schema_version != EVENT_SCHEMA_VERSION
+      ):
+        self._warn_skipped_durable_task(
+          task_id,
+          "task_registered record has unsupported event_schema_version "
+          f"{raw_event_schema_version!r} (expected {EVENT_SCHEMA_VERSION}); "
+          "pre-cutover durable tasks are drained, not rebuilt",
+        )
+        continue
+      if not isinstance(registered.get("capability_bind"), dict):
+        self._warn_skipped_durable_task(
+          task_id,
+          "task_registered record carries no capability_bind receipt; "
+          "refusing to rebuild a task that could not reauthorize its "
+          "exact binding",
+        )
+        continue
       completions = list(bucket.get("completions", []))
       completed = _require_exact_duplicate_events(
         completions,
@@ -1641,11 +1695,7 @@ class TaskRegistry:
         result=dict(result) if isinstance(result, dict) else result,
         error=dict(error) if isinstance(error, dict) else error,
         metadata=metadata,
-        capability_bind_receipt=(
-          dict(registered["capability_bind"])
-          if isinstance(registered.get("capability_bind"), dict)
-          else None
-        ),
+        capability_bind_receipt=dict(registered["capability_bind"]),
         admitted_task=admitted_task,
         task_result=task_result,
         parent_result_policy=parent_result_policy,

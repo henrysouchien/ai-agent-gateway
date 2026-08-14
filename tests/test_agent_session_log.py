@@ -200,8 +200,8 @@ def test_append_assigns_seq_timestamp_and_schema_version(tmp_path: Path) -> None
   assert second.seq == 2
   assert first.timestamp > 0
   assert second.timestamp >= first.timestamp
-  assert first.event["event_schema_version"] == 1
-  assert second.event["event_schema_version"] == 1
+  assert first.event["event_schema_version"] == session_log_records.EVENT_SCHEMA_VERSION
+  assert second.event["event_schema_version"] == session_log_records.EVENT_SCHEMA_VERSION
   assert _run(log.latest_seq()) == 2
 
   iterated = list(_run(_collect_async(log.iter_from(after_seq=1))))
@@ -209,8 +209,8 @@ def test_append_assigns_seq_timestamp_and_schema_version(tmp_path: Path) -> None
 
   rows = _load_jsonl(log.path)
   assert [row["seq"] for row in rows] == [1, 2]
-  assert rows[0]["event"]["event_schema_version"] == 1
-  assert rows[1]["event"]["event_schema_version"] == 1
+  assert rows[0]["event"]["event_schema_version"] == session_log_records.EVENT_SCHEMA_VERSION
+  assert rows[1]["event"]["event_schema_version"] == session_log_records.EVENT_SCHEMA_VERSION
 
 
 async def _collect_async(iterator):
@@ -409,7 +409,11 @@ def test_concurrent_appends_remain_well_formed_jsonl(tmp_path: Path) -> None:
   rows = _load_jsonl(log.path)
   assert len(rows) == 200
   assert [row["seq"] for row in rows] == list(range(1, 201))
-  assert all(row["event"]["event_schema_version"] == 1 for row in rows)
+  assert all(
+    row["event"]["event_schema_version"]
+    == session_log_records.EVENT_SCHEMA_VERSION
+    for row in rows
+  )
   assert _run(log.latest_seq()) == 200
 
 

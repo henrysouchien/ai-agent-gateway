@@ -13,6 +13,17 @@ from .approval_policy import DelegationGrant, utc_now
 
 DEFAULT_MESSAGE_EXCEL_AGENT_TIMEOUT_SECONDS = 300.0
 ALLOWED_DELEGATION_TOOL_CLASSES = frozenset({"read", "pure_transform", "artifact_write", "state_write"})
+# Sentinel distinguishing "caller omitted this field" from an explicit null so
+# chat selection intent is forwarded (or refused) on presence, never guessed.
+_ABSENT: Any = object()
+# Chat selection intent keys copied from caller tool_input by presence: stable
+# keys flow through to relay admission/delivery; raw 'model' is refused typed.
+CHAT_SELECTION_INTENT_KEYS = ("model", "model_key", "effort", "catalog_revision")
+
+
+def chat_selection_intent_kwargs(tool_input: dict[str, Any]) -> dict[str, Any]:
+  """Extract chat model-selection intent for mint_and_submit by key presence."""
+  return {key: tool_input[key] for key in CHAT_SELECTION_INTENT_KEYS if key in tool_input}
 # Keeps the public helper signature stable while preserving the interactive handler's
 # historical behavior of forwarding timeout_s to relay.submit.
 _SUBMIT_TIMEOUT_SECONDS: ContextVar[int | None] = ContextVar("_SUBMIT_TIMEOUT_SECONDS", default=None)
@@ -161,6 +172,10 @@ async def mint_and_submit(
   default_ceiling: frozenset[str] = ALLOWED_DELEGATION_TOOL_CLASSES,
   relay_timeout_seconds: Any = None,
   seed_history: Any = None,
+  model: Any = _ABSENT,
+  model_key: Any = _ABSENT,
+  effort: Any = _ABSENT,
+  catalog_revision: Any = _ABSENT,
   relay_restart_exceptions: tuple[type[Exception], ...],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
   """Discover a target workbook, mint its grant, and submit one Excel agent turn."""
@@ -168,6 +183,16 @@ async def mint_and_submit(
   restart_exception_types = _validate_relay_restart_exceptions(
     relay_restart_exceptions
   )
+
+  if model is not _ABSENT:
+    # Same admission rule as the relay (relay_requests.enqueue): raw 'model' is
+    # retired selection intent and must be refused typed before any grant is
+    # minted, never silently dropped into a server-default turn.
+    return None, _error(
+      "chat_model_not_accepted",
+      "'model' is not accepted; pass 'model_key' with a stable model key "
+      "from the session's eligible model choices, or omit it for the server default",
+    )
 
   parsed_ceiling, error = validate_requested_ceiling(default_ceiling)
   if error is not None:
@@ -266,6 +291,15 @@ async def mint_and_submit(
     }
     if seed_history is not None:
       submit_tool_input["seed_history"] = seed_history
+    # Stable model-selection intent flows through to relay admission/delivery
+    # exactly like every other chat path; it is never silently discarded here.
+    for selection_key, selection_value in (
+      ("model_key", model_key),
+      ("effort", effort),
+      ("catalog_revision", catalog_revision),
+    ):
+      if selection_value is not _ABSENT:
+        submit_tool_input[selection_key] = selection_value
     submitted = await relay.submit(
       tool_name="send_chat_message",
       tool_input=submit_tool_input,
@@ -442,6 +476,7 @@ def make_message_excel_agent_handler(
         relay_timeout_seconds=relay_timeout_seconds,
         seed_history=tool_input.get("seed_history"),
         relay_restart_exceptions=restart_exception_types,
+        **chat_selection_intent_kwargs(tool_input),
       )
     finally:
       _SUBMIT_TIMEOUT_SECONDS.reset(token)
@@ -502,6 +537,33 @@ def make_message_excel_agent_tool_def() -> dict[str, Any]:
         "args_predicate": {
           "type": ["object", "null"],
           "description": "Optional argument predicate that scopes delegated auto-approval.",
+        },
+        "model_key": {
+          "type": "string",
+          "description": (
+            "Optional per-turn model selection for the Excel agent. Pass a stable "
+            "model key exactly as returned by the session's eligible model choices; "
+            "omit it to use the server default. Raw provider model IDs and "
+            "provider:model aliases are refused with a typed error, never "
+            "silently dropped."
+          ),
+        },
+        "effort": {
+          "type": "string",
+          "description": (
+            "Optional effort level supported by the selected model_key. Requires "
+            "model_key; unsupported efforts are refused with a typed error. Omit "
+            "it for the model's default effort."
+          ),
+        },
+        "catalog_revision": {
+          "type": "string",
+          "description": (
+            "Optional model-catalog revision observed when choosing model_key. "
+            "Requires model_key. Concurrency context so stale selections can be "
+            "detected; never authority over the server's catalog. Omit it when "
+            "no revision was observed."
+          ),
         },
         "timeout_s": {
           "type": "number",

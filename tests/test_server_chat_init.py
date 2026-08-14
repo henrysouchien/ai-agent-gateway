@@ -15,12 +15,16 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from dataclasses import replace
+
 from agent_gateway.auth import AuthConfig, ResolverResult
 from agent_gateway.capability_binding import ModelSelectionIntent
 from agent_gateway.model_registry import (
   CAPABILITY_IDS,
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
+  ProductModelRegistry,
+  ProductModelSelectionPolicy,
 )
 from agent_gateway.model_preferences import ModelPreferenceStore
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
@@ -63,6 +67,8 @@ def _make_app(
   *,
   on_session_created=None,
   model_preference_store: ModelPreferenceStore | None = None,
+  model_registry=None,
+  model_selection_policy=None,
 ):
   async def _build_chat_runtime(_session, request, _channel, _auth_manager):
     return ChatRuntime(
@@ -74,8 +80,8 @@ def _make_app(
   return create_gateway_app(
     GatewayServerConfig(
       tenant_id="test-product",
-      model_registry=INITIAL_MODEL_REGISTRY,
-      model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      model_registry=model_registry or INITIAL_MODEL_REGISTRY,
+      model_selection_policy=model_selection_policy or INITIAL_MODEL_SELECTION_POLICY,
       credentials_resolver=credentials_resolver,
       model_preference_store=model_preference_store,
       build_chat_runtime=_build_chat_runtime,
@@ -130,6 +136,141 @@ def test_delete_model_preference_uses_authenticated_resolver_identity(
     actor_id="101",
     capability_id="session.driver",
   ) is None
+
+
+def _stale_preference_deployment(
+  lifecycle: str,
+) -> tuple[ProductModelRegistry, ProductModelSelectionPolicy]:
+  """A later deployment where xai.grok-4-5 left the active lifecycle."""
+
+  entries = dict(INITIAL_MODEL_REGISTRY.models)
+  entries["xai.grok-4-5"] = replace(
+    entries["xai.grok-4-5"],
+    lifecycle=lifecycle,
+    capabilities={
+      capability_id: "internal"
+      for capability_id in entries["xai.grok-4-5"].capabilities
+    },
+  )
+  registry = ProductModelRegistry(
+    schema="product-model-registry/v1",
+    revision=f"post-{lifecycle}",
+    models=entries,
+  )
+  capabilities = {
+    capability_id: (
+      replace(
+        policy,
+        allowed_model_keys=policy.allowed_model_keys - {"xai.grok-4-5"},
+      )
+      if "xai.grok-4-5" in policy.allowed_model_keys
+      else policy
+    )
+    for capability_id, policy in INITIAL_MODEL_SELECTION_POLICY.capabilities.items()
+  }
+  selection_policy = ProductModelSelectionPolicy(
+    schema="product-model-selection/v1",
+    revision=f"post-{lifecycle}",
+    capabilities=capabilities,
+  )
+  selection_policy.admit_registry(registry)
+  return registry, selection_policy
+
+
+@pytest.mark.parametrize(
+  ("lifecycle", "reason"),
+  [
+    ("deprecated", "model_deprecated"),
+    ("revoked", "model_revoked"),
+    ("hidden", "model_hidden"),
+  ],
+)
+def test_init_with_stale_saved_preference_binds_default_and_names_reason(
+  tmp_path: Path,
+  lifecycle: str,
+  reason: str,
+) -> None:
+  async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    return _resolver_result(channel="cli")
+
+  store = ModelPreferenceStore(tmp_path / "model-preferences.sqlite3")
+  stored = store.put(
+    tenant_id="test-product",
+    actor_id="101",
+    capability_id="session.driver",
+    model_key="xai.grok-4-5",
+    effort="medium",
+  )
+  registry, selection_policy = _stale_preference_deployment(lifecycle)
+  app = _make_app(
+    _resolver,
+    model_preference_store=store,
+    model_registry=registry,
+    model_selection_policy=selection_policy,
+  )
+
+  with TestClient(app) as client:
+    response = client.post(
+      "/api/chat/init",
+      json={"api_key": "cli-key", "context": {"channel": "cli"}},
+    )
+
+  assert response.status_code == 200, response.text
+  driver = response.json()["capability_choices"]["session.driver"]
+  assert driver["selected"] is not None
+  assert driver["selected"]["model_key"] == "anthropic.claude-opus-5"
+  assert driver["selected"]["reason"] == "capability_default"
+  notices = {notice["code"]: notice for notice in driver["notices"]}
+  notice = notices["saved_preference_not_applied"]
+  assert notice["model_key"] == "xai.grok-4-5"
+  assert notice["reason"] == reason
+  assert "it remains saved until replaced or cleared" in notice["message"]
+  assert "xai.grok-4-5" not in {
+    choice["model_key"] for choice in driver["choices"]
+  }
+  # The stored preference row is retained, never repaired or deleted.
+  assert store.get(
+    tenant_id="test-product",
+    actor_id="101",
+    capability_id="session.driver",
+  ) == stored
+
+
+def test_init_with_unsupported_effort_preference_binds_default(
+  tmp_path: Path,
+) -> None:
+  async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    return _resolver_result(channel="cli")
+
+  store = ModelPreferenceStore(tmp_path / "model-preferences.sqlite3")
+  stored = store.put(
+    tenant_id="test-product",
+    actor_id="101",
+    capability_id="session.driver",
+    model_key="anthropic.claude-haiku-4-5",
+    effort="high",
+  )
+  app = _make_app(_resolver, model_preference_store=store)
+
+  with TestClient(app) as client:
+    response = client.post(
+      "/api/chat/init",
+      json={"api_key": "cli-key", "context": {"channel": "cli"}},
+    )
+
+  assert response.status_code == 200, response.text
+  driver = response.json()["capability_choices"]["session.driver"]
+  assert driver["selected"] is not None
+  assert driver["selected"]["model_key"] == "anthropic.claude-opus-5"
+  notices = {notice["code"]: notice for notice in driver["notices"]}
+  notice = notices["saved_preference_not_applied"]
+  assert notice["model_key"] == "anthropic.claude-haiku-4-5"
+  assert notice["reason"] == "effort_unsupported"
+  assert store.get(
+    tenant_id="test-product",
+    actor_id="101",
+    capability_id="session.driver",
+  ) == stored
 
 
 def test_channel_mismatch_at_init_returns_400() -> None:

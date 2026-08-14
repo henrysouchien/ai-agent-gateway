@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 
-EVENT_SCHEMA_VERSION = 1
+# v2 (2026-08-14): task_registered records carry the complete capability_bind
+# receipt. v1 records are drained, not migrated (model-selection-authority plan
+# section 6): rebuild loudly skips them instead of reconstructing bind-less
+# tasks that fail only at resume.
+EVENT_SCHEMA_VERSION = 2
 _REVERSE_SCAN_CHUNK_SIZE = 64 * 1024
 _SLUG_RE = re.compile(r"[^a-z0-9_-]")
 _SEGMENT_FILE_RE = re.compile(r"^(?P<first>\d{12})-(?P<last>\d{12})-g(?P<generation>\d{6})\.jsonl$")

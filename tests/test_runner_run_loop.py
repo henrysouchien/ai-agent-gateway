@@ -75,6 +75,26 @@ from agent_workflow_contracts import (  # noqa: E402
 )
 
 
+def _bind_receipt() -> dict[str, str]:
+  return {
+    "schema_version": "1.0",
+    "capability_id": "node.implement",
+    "model_key": "test.anthropic.claude-sonnet-4-6",
+    "provider": "anthropic",
+    "upstream_model": "claude-sonnet-4-6",
+    "adapter": "test.anthropic",
+    "protocol_profile": "test.reasoning",
+    "route": "test.in_process",
+    "effort": "high",
+    "credential_principal": "user",
+    "credential_ref": "test-user:anthropic",
+    "run_mode": "interactive",
+    "registry_revision": "test-capability-execution.1",
+    "policy_revision": "test-capability-execution.1",
+    "selection_source": "internal_policy",
+  }
+
+
 def test_agent_runner_stub_response_is_explicit_opt_in() -> None:
   parameter = inspect.signature(AgentRunner).parameters["allow_stub_response"]
 
@@ -133,6 +153,7 @@ def test_shared_log_sub_agent_success_ignores_foreign_unfinished_skill_lifecycle
       "owner_runner_id": "runner-parent",
       "owner_role": "writer",
       "sub_agent_id": "sub-parent:sess-parent",
+      "capability_bind": _bind_receipt(),
       "metadata": {
         "owner_runner_id": "runner-parent",
         "owner_role": "writer",
@@ -2348,12 +2369,14 @@ def test_delivery_epoch_freezes_admission_but_allows_exact_omitted_retrieval() -
       started, start_error = await runner._register_background_task(
         tool_input={"task": "must not start"},
         handler=forbidden_handler,
+        capability_bind_receipt=_bind_receipt(),
       )
       resumed, resume_error = await runner._register_background_task(
         tool_input={"task": "must not resume"},
         handler=forbidden_handler,
         original_task_id=entry.task_id,
         validate_resume_source=True,
+        capability_bind_receipt=_bind_receipt(),
       )
       assert started is None
       assert resumed is None

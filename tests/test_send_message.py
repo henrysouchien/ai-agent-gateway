@@ -421,6 +421,7 @@ def test_task_registry_rehydrates_acceptance_for_terminal_replay() -> None:
   registry.load_from_events([
     {
       "type": "task_registered",
+      "event_schema_version": 2,
       "task_id": "bg_3",
       "task_type": "background_agent",
       "started_at": 1.0,
@@ -491,6 +492,7 @@ def test_task_registry_rejects_duplicate_durable_message_identity() -> None:
   events = [
     {
       "type": "task_registered",
+      "event_schema_version": 2,
       "task_id": "bg_3",
       "task_type": "background_agent",
       "started_at": 1.0,
@@ -567,6 +569,7 @@ def test_task_registry_rejects_parent_message_authority_mismatch(
   events = [
     {
       "type": "task_registered",
+      "event_schema_version": 2,
       "task_id": "bg_3",
       "task_type": "background_agent",
       "started_at": 1.0,
@@ -598,6 +601,7 @@ def test_task_registry_rejects_ambiguous_parent_message_lifecycle(
   }
   registration = {
     "type": "task_registered",
+    "event_schema_version": 2,
     "task_id": "bg_3",
     "task_type": "background_agent",
     "started_at": 1.0,
@@ -654,6 +658,7 @@ def test_task_registry_rejects_parent_message_after_completion() -> None:
   events = [
     {
       "type": "task_registered",
+      "event_schema_version": 2,
       "task_id": "bg_3",
       "task_type": "background_agent",
       "started_at": 1.0,

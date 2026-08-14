@@ -113,10 +113,28 @@ def _events(result: TaskResult, envelope: AgentCompletionEnvelope) -> list[dict]
   return [
     {
       "type": "task_registered",
+      "event_schema_version": 2,
       "task_id": result.attempt.physical_task_id,
       "task_type": "background_agent",
       "started_at": 1.0,
       "metadata": {},
+      "capability_bind": {
+        "schema_version": "1.0",
+        "capability_id": "node.implement",
+        "model_key": "test.anthropic.claude-sonnet-4-6",
+        "provider": "anthropic",
+        "upstream_model": "claude-sonnet-4-6",
+        "adapter": "test.anthropic",
+        "protocol_profile": "test.reasoning",
+        "route": "test.in_process",
+        "effort": "high",
+        "credential_principal": "user",
+        "credential_ref": "test-user:anthropic",
+        "run_mode": "interactive",
+        "registry_revision": "test-capability-execution.1",
+        "policy_revision": "test-capability-execution.1",
+        "selection_source": "internal_policy",
+      },
     },
     {
       "type": "task_completed",

@@ -7,7 +7,11 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from ..excel_dispatch import _validate_relay_restart_exceptions, mint_and_submit
+from ..excel_dispatch import (
+  CHAT_SELECTION_INTENT_KEYS,
+  _validate_relay_restart_exceptions,
+  mint_and_submit,
+)
 
 
 class ExcelDispatchRequest(BaseModel):
@@ -17,6 +21,20 @@ class ExcelDispatchRequest(BaseModel):
   window_seconds: Any = None
   args_predicate: Any = None
   timeout_s: Any = None
+  # Chat model-selection intent. Stable keys thread through to the relay chat
+  # payload; raw 'model' is refused typed by mint_and_submit, never dropped.
+  model: Any = None
+  model_key: Any = None
+  effort: Any = None
+  catalog_revision: Any = None
+
+  def selection_intent_kwargs(self) -> dict[str, Any]:
+    """Selection intent forwarded by field presence, so omission stays omission."""
+    return {
+      key: getattr(self, key)
+      for key in CHAT_SELECTION_INTENT_KEYS
+      if key in self.model_fields_set
+    }
 
 
 def _json_error(status_code: int, code: str, message: str, **details: Any) -> JSONResponse:
@@ -35,7 +53,7 @@ def _require_store(request: Request) -> Any | None:
 
 def _mint_error_status(error: dict[str, Any]) -> int:
   code = str(error.get("code") or "")
-  if code == "invalid_input":
+  if code in {"invalid_input", "chat_model_not_accepted"}:
     return 400
   if code in {"no_excel_session", "ambiguous_target"}:
     return 409
@@ -131,6 +149,7 @@ def build_orchestration_router(
       delegator_profile=_profile_for_auth_context(auth_context),
       delegator_run_id=None,
       relay_restart_exceptions=restart_exception_types,
+      **payload.selection_intent_kwargs(),
     )
     if error is not None:
       return JSONResponse(error, status_code=_mint_error_status(error))

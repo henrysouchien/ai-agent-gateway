@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from pydantic import ValidationError
 
@@ -11,6 +13,7 @@ from agent_gateway.capability_binding import (
   eligible_model_choices,
   reauthorize_capability_bind,
   resolve_capability_model,
+  saved_preference_ineligibility,
   validate_reported_identity,
 )
 from agent_gateway.model_registry import (
@@ -18,6 +21,7 @@ from agent_gateway.model_registry import (
   INITIAL_ADAPTER_ROUTE_SUPPORT,
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
+  ProductModelRegistry,
 )
 from agent_workflow_contracts import CapabilityBind
 
@@ -260,6 +264,134 @@ def test_ineligible_saved_preference_is_not_execution_intent() -> None:
 
   assert bind.model_key == "anthropic.claude-opus-5"
   assert bind.selection_source == "capability_default"
+
+
+def _registry_with_lifecycle(model_key: str, lifecycle: str) -> ProductModelRegistry:
+  """A later registry revision where model_key left the active lifecycle."""
+
+  entries = dict(INITIAL_MODEL_REGISTRY.models)
+  entries[model_key] = replace(
+    entries[model_key],
+    lifecycle=lifecycle,
+    capabilities={
+      capability_id: "internal"
+      for capability_id in entries[model_key].capabilities
+    },
+  )
+  return ProductModelRegistry(
+    schema="product-model-registry/v1",
+    revision=f"stale-{lifecycle}",
+    models=entries,
+  )
+
+
+@pytest.mark.parametrize(
+  ("lifecycle", "reason"),
+  [
+    ("deprecated", "model_deprecated"),
+    ("revoked", "model_revoked"),
+    ("hidden", "model_hidden"),
+    ("disabled", "model_disabled"),
+  ],
+)
+def test_stale_saved_preference_yields_default_not_refusal(
+  lifecycle: str,
+  reason: str,
+) -> None:
+  registry = _registry_with_lifecycle("anthropic.claude-sonnet-5", lifecycle)
+  saved = ModelSelectionIntent(
+    model_key="anthropic.claude-sonnet-5",
+    effort="high",
+    source="saved_preference",
+  )
+
+  bind = resolve_capability_model(
+    "session.driver",
+    registry=registry,
+    selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+    auth=_auth(),
+    saved_preference=saved,
+  )
+
+  assert bind.model_key == "anthropic.claude-opus-5"
+  assert bind.selection_source == "capability_default"
+  assert saved_preference_ineligibility(
+    saved,
+    capability_id="session.driver",
+    registry=registry,
+    policy=INITIAL_MODEL_SELECTION_POLICY.capabilities["session.driver"],
+    auth=_auth(),
+  ) == reason
+
+
+def test_saved_preference_with_unsupported_effort_yields_default() -> None:
+  saved = ModelSelectionIntent(
+    model_key="anthropic.claude-haiku-4-5",
+    effort="high",
+    source="saved_preference",
+  )
+
+  bind = _resolve("session.driver", saved_preference=saved)
+
+  assert bind.model_key == "anthropic.claude-opus-5"
+  assert bind.selection_source == "capability_default"
+  assert saved_preference_ineligibility(
+    saved,
+    capability_id="session.driver",
+    registry=INITIAL_MODEL_REGISTRY,
+    policy=INITIAL_MODEL_SELECTION_POLICY.capabilities["session.driver"],
+    auth=_auth(),
+  ) == "effort_unsupported"
+
+
+def test_saved_preference_ineligibility_names_each_reason() -> None:
+  policy = INITIAL_MODEL_SELECTION_POLICY.capabilities["session.driver"]
+  auth = _auth()
+
+  assert saved_preference_ineligibility(
+    ModelSelectionIntent(
+      model_key="anthropic.claude-retired-1",
+      effort=None,
+      source="saved_preference",
+    ),
+    capability_id="session.driver",
+    registry=INITIAL_MODEL_REGISTRY,
+    policy=policy,
+    auth=auth,
+  ) == "model_unknown"
+  assert saved_preference_ineligibility(
+    ModelSelectionIntent(
+      model_key="xai.grok-4-5",
+      effort=None,
+      source="saved_preference",
+    ),
+    capability_id="node.explore",
+    registry=INITIAL_MODEL_REGISTRY,
+    policy=INITIAL_MODEL_SELECTION_POLICY.capabilities["node.explore"],
+    auth=auth,
+  ) == "model_not_allowed"
+  assert saved_preference_ineligibility(
+    ModelSelectionIntent(
+      model_key="openai.gpt-5-6",
+      effort="medium",
+      source="saved_preference",
+    ),
+    capability_id="session.driver",
+    registry=INITIAL_MODEL_REGISTRY,
+    policy=policy,
+    auth=auth,
+  ) == "credential_ineligible"
+  assert saved_preference_ineligibility(
+    ModelSelectionIntent(
+      model_key="anthropic.claude-sonnet-5",
+      effort="high",
+      source="saved_preference",
+    ),
+    capability_id="session.driver",
+    registry=INITIAL_MODEL_REGISTRY,
+    policy=policy,
+    auth=auth,
+  ) is None
 
 
 def test_eligible_choices_are_derived_from_entitlement_and_handles() -> None:

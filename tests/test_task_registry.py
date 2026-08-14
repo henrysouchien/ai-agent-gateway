@@ -1202,6 +1202,7 @@ def test_load_from_events_reconstructs_tasks_restores_seq_and_bypasses_listeners
       },
       {
         "type": "task_registered",
+        "event_schema_version": 2,
         "task_id": "bg_7",
         "agent_name": "writer",
         "started_at": 100.0,
@@ -1219,6 +1220,7 @@ def test_load_from_events_reconstructs_tasks_restores_seq_and_bypasses_listeners
       },
       {
         "type": "task_registered",
+        "event_schema_version": 2,
         "task_id": "bg_9",
         "agent_name": "reviewer",
         "started_at": 200.0,
@@ -1297,10 +1299,15 @@ def test_load_from_events_accepts_exact_duplicate_task_events() -> None:
   registry = TaskRegistry()
   registration = {
     "type": "task_registered",
+    "event_schema_version": 2,
     "task_id": "bg_7",
     "task_type": "background",
     "agent_name": "writer",
     "started_at": 100.0,
+    "capability_bind": _bind_receipt(
+      provider="anthropic",
+      model="claude-sonnet-4-6",
+    ),
   }
   completion = {
     "type": "task_completed",
@@ -1324,6 +1331,104 @@ def test_load_from_events_accepts_exact_duplicate_task_events() -> None:
 
 
 @pytest.mark.parametrize(
+  "event_schema_version",
+  [1, None, "2", 2.0, True, 3],
+  ids=["v1", "missing", "string", "float", "bool", "future"],
+)
+def test_load_from_events_loudly_skips_unsupported_schema_version(
+  event_schema_version: object,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  """Pre-cutover registrations drain with a loud skip, never rebuild.
+
+  A v1 record rebuilt as a bind-less INTERRUPTED entry would fail only at
+  resume with a generic invalid_task_metadata (review 2026-08-14, B7).
+  """
+
+  registry = TaskRegistry()
+  event = {
+    "type": "task_registered",
+    "task_id": "bg_7",
+    "task_type": "background",
+    "agent_name": "writer",
+    "started_at": 100.0,
+    "capability_bind": _bind_receipt(
+      provider="anthropic",
+      model="claude-sonnet-4-6",
+    ),
+  }
+  if event_schema_version is not None:
+    event["event_schema_version"] = event_schema_version
+
+  with caplog.at_level("WARNING", logger="agent_gateway.task_registry"):
+    registry.load_from_events([event])
+
+  assert registry.get("bg_7") is None
+  assert registry.list_tasks() == []
+  skip_records = [
+    record
+    for record in caplog.records
+    if "Skipping durable task bg_7" in record.getMessage()
+  ]
+  assert len(skip_records) == 1
+  assert "event_schema_version" in skip_records[0].getMessage()
+  # The skipped identity still advances the sequence so new registrations
+  # never collide with the drained durable record.
+  assert registry.register("background_agent").task_id == "bg_8"
+
+
+def test_load_from_events_loudly_skips_v2_registration_without_bind(
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  registry = TaskRegistry()
+  event = {
+    "type": "task_registered",
+    "event_schema_version": 2,
+    "task_id": "bg_7",
+    "task_type": "background",
+    "agent_name": "writer",
+    "started_at": 100.0,
+  }
+
+  with caplog.at_level("WARNING", logger="agent_gateway.task_registry"):
+    registry.load_from_events([event])
+
+  assert registry.get("bg_7") is None
+  skip_records = [
+    record
+    for record in caplog.records
+    if "Skipping durable task bg_7" in record.getMessage()
+  ]
+  assert len(skip_records) == 1
+  assert "capability_bind" in skip_records[0].getMessage()
+
+
+def test_load_from_events_skip_warns_once_per_task_and_reason(
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  registry = TaskRegistry()
+  event = {
+    "type": "task_registered",
+    "event_schema_version": 1,
+    "task_id": "bg_7",
+    "task_type": "background",
+    "agent_name": "writer",
+    "started_at": 100.0,
+  }
+
+  with caplog.at_level("WARNING", logger="agent_gateway.task_registry"):
+    registry.load_from_events([dict(event)])
+    registry.load_from_events([dict(event)])
+
+  skip_records = [
+    record
+    for record in caplog.records
+    if "Skipping durable task bg_7" in record.getMessage()
+  ]
+  assert len(skip_records) == 1
+
+
+@pytest.mark.parametrize(
   ("event_type", "changed_field", "changed_value"),
   [
     ("task_registered", "agent_name", "reviewer"),
@@ -1338,10 +1443,15 @@ def test_load_from_events_rejects_conflicting_duplicate_task_events(
   registry = TaskRegistry()
   registration = {
     "type": "task_registered",
+    "event_schema_version": 2,
     "task_id": "bg_7",
     "task_type": "background",
     "agent_name": "writer",
     "started_at": 100.0,
+    "capability_bind": _bind_receipt(
+      provider="anthropic",
+      model="claude-sonnet-4-6",
+    ),
   }
   completion = {
     "type": "task_completed",
@@ -1378,10 +1488,15 @@ def test_load_from_events_quarantines_task_result_settlement_mismatch(
   registry.load_from_events([
     {
       "type": "task_registered",
+      "event_schema_version": 2,
       "task_id": "bg_7",
       "task_type": "background",
       "agent_name": "writer",
       "started_at": 100.0,
+      "capability_bind": _bind_receipt(
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+      ),
     },
     {
       "type": "task_completed",
@@ -1412,9 +1527,14 @@ def test_load_from_events_rejects_raw_completed_child_payload() -> None:
     [
       {
         "type": "task_registered",
+        "event_schema_version": 2,
         "task_id": "bg_3",
         "agent_name": "reviewer",
         "started_at": 100.0,
+        "capability_bind": _bind_receipt(
+          provider="anthropic",
+          model="claude-sonnet-4-6",
+        ),
       },
       {
         "type": "task_completed",
@@ -1454,9 +1574,14 @@ def test_load_from_events_rejects_malformed_child_error(
     [
       {
         "type": "task_registered",
+        "event_schema_version": 2,
         "task_id": "bg_5",
         "agent_name": "reviewer",
         "started_at": 100.0,
+        "capability_bind": _bind_receipt(
+          provider="anthropic",
+          model="claude-sonnet-4-6",
+        ),
       },
       {
         "type": "task_completed",
@@ -1517,9 +1642,14 @@ def test_load_from_events_quarantines_legacy_cancelled_report_completion() -> No
       },
       {
         "type": "task_registered",
+        "event_schema_version": 2,
         "task_id": "bg_4",
         "agent_name": "reviewer",
         "started_at": 100.0,
+        "capability_bind": _bind_receipt(
+          provider="anthropic",
+          model="claude-sonnet-4-6",
+        ),
       },
     ]
   )
@@ -1542,10 +1672,15 @@ def test_load_from_events_ignores_resume_suffix_for_seq_base() -> None:
     [
       {
         "type": "task_registered",
+        "event_schema_version": 2,
         "task_id": "bg_3_r1",
         "agent_name": "reviewer",
         "started_at": 100.0,
         "original_task_id": "bg_3",
+        "capability_bind": _bind_receipt(
+          provider="anthropic",
+          model="claude-sonnet-4-6",
+        ),
       },
     ]
   )

@@ -15,10 +15,29 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.excel_dispatch import (
   make_message_excel_agent_handler,
+  make_message_excel_agent_tool_def,
   mint_and_submit,
   poll_result,
   validate_requested_ceiling,
 )
+
+
+def test_message_excel_agent_tool_def_advertises_stable_selection_keys() -> None:
+  """The documented tool contract must expose the selection triple the handlers
+  thread through, teaching stable keys and omission-equals-server-default."""
+
+  properties = make_message_excel_agent_tool_def()["input_schema"]["properties"]
+
+  assert "model" not in properties
+  assert properties["model_key"]["type"] == "string"
+  assert "stable" in properties["model_key"]["description"]
+  assert "server default" in properties["model_key"]["description"]
+  assert "typed error" in properties["model_key"]["description"]
+  assert properties["effort"]["type"] == "string"
+  assert "Requires model_key" in properties["effort"]["description"]
+  assert properties["catalog_revision"]["type"] == "string"
+  assert "Requires model_key" in properties["catalog_revision"]["description"]
+  assert "never authority" in properties["catalog_revision"]["description"]
 
 
 class _RelayRestartInProgress(RuntimeError):
@@ -180,6 +199,9 @@ def test_mint_and_submit_happy_path_returns_ids_and_bound_grant(tmp_path: Path) 
       default_ceiling=frozenset({"read", "pure_transform"}),
       relay_timeout_seconds=42,
       seed_history=[{"role": "user", "content": "seed"}],
+      model_key="anthropic.claude-sonnet-5",
+      effort="high",
+      catalog_revision="2026-08-13.1",
       relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
     )
 
@@ -219,8 +241,141 @@ def test_mint_and_submit_happy_path_returns_ids_and_bound_grant(tmp_path: Path) 
       "force_compaction": True,
       "delegation_id": submitted["delegation_id"],
       "seed_history": [{"role": "user", "content": "seed"}],
+      "model_key": "anthropic.claude-sonnet-5",
+      "effort": "high",
+      "catalog_revision": "2026-08-13.1",
     }
     assert relay.result_calls == []
+
+  _run(_case())
+
+
+def test_mint_and_submit_refuses_raw_model_typed_without_grant_or_submit(tmp_path: Path) -> None:
+  async def _case() -> None:
+    store = _store(tmp_path)
+    relay = FakeRelay(
+      workbooks=[
+        {
+          "name": "Budget.xlsx",
+          "session": "workbook-session-1",
+          "gateway_session_id": "excel-session-1",
+          "detached": False,
+        }
+      ]
+    )
+
+    submitted, error = await mint_and_submit(
+      relay=relay,
+      approval_store=store,
+      user_id="alice",
+      gateway_session_id="orchestrator-session-1",
+      text="Update the model",
+      model="claude-sonnet-4-6",
+      relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
+    )
+
+    assert submitted is None
+    assert error is not None
+    assert error["code"] == "chat_model_not_accepted"
+    assert "model_key" in error["message"]
+    assert _delegation_count(tmp_path) == 0
+    assert relay.submissions == []
+
+  _run(_case())
+
+
+def test_mint_and_submit_refuses_explicit_null_raw_model(tmp_path: Path) -> None:
+  async def _case() -> None:
+    store = _store(tmp_path)
+    relay = FakeRelay(
+      workbooks=[
+        {
+          "name": "Budget.xlsx",
+          "session": "workbook-session-1",
+          "gateway_session_id": "excel-session-1",
+          "detached": False,
+        }
+      ]
+    )
+
+    # Presence of the retired key is refused even with a null value, matching
+    # the relay admission predicate ("model" in tool_input).
+    submitted, error = await mint_and_submit(
+      relay=relay,
+      approval_store=store,
+      user_id="alice",
+      gateway_session_id="orchestrator-session-1",
+      text="Update the model",
+      model=None,
+      relay_restart_exceptions=_RELAY_RESTART_EXCEPTIONS,
+    )
+
+    assert submitted is None
+    assert error is not None
+    assert error["code"] == "chat_model_not_accepted"
+    assert relay.submissions == []
+
+  _run(_case())
+
+
+def test_message_handler_threads_stable_selection_keys_to_relay_payload(tmp_path: Path) -> None:
+  async def _case() -> None:
+    store = _store(tmp_path)
+    relay = FakeRelay(
+      workbooks=[
+        {
+          "name": "Budget.xlsx",
+          "session": "workbook-session-1",
+          "gateway_session_id": "excel-session-1",
+          "detached": False,
+        }
+      ]
+    )
+    handler = _handler(relay, store)
+
+    result, error = await handler(
+      {
+        "text": "Update the model",
+        "model_key": "anthropic.claude-sonnet-5",
+        "effort": "high",
+        "catalog_revision": "2026-08-13.1",
+      }
+    )
+
+    assert error is None
+    assert result is not None
+    assert len(relay.submissions) == 1
+    tool_input = relay.submissions[0]["tool_input"]
+    assert tool_input["model_key"] == "anthropic.claude-sonnet-5"
+    assert tool_input["effort"] == "high"
+    assert tool_input["catalog_revision"] == "2026-08-13.1"
+    assert "model" not in tool_input
+
+  _run(_case())
+
+
+def test_message_handler_refuses_raw_model_typed(tmp_path: Path) -> None:
+  async def _case() -> None:
+    store = _store(tmp_path)
+    relay = FakeRelay(
+      workbooks=[
+        {
+          "name": "Budget.xlsx",
+          "session": "workbook-session-1",
+          "gateway_session_id": "excel-session-1",
+          "detached": False,
+        }
+      ]
+    )
+    handler = _handler(relay, store)
+
+    result, error = await handler({"text": "Update the model", "model": "claude-sonnet-4-6"})
+
+    assert result is None
+    assert error is not None
+    assert error["code"] == "chat_model_not_accepted"
+    assert _delegation_count(tmp_path) == 0
+    assert relay.submissions == []
 
   _run(_case())
 

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import httpx
+from fastapi import FastAPI, HTTPException, Request
 
 from agent_gateway import autonomous_excel_dispatch as dispatch
+from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.control_plane.orchestration import build_orchestration_router
 
 
 def _run(awaitable: Any) -> Any:
@@ -171,6 +175,183 @@ def test_handler_exchanges_key_posts_and_polls_until_done(monkeypatch) -> None:
   assert all(request["url"] == f"{base}/api/orchestration/excel-dispatch/request-1" for request in get_requests)
   assert all(request["params"] == {"delegation_id": "delegation-1"} for request in get_requests)
   assert all(request["headers"] == {"Authorization": "Bearer jwt-token"} for request in get_requests)
+
+
+def test_handler_forwards_stable_selection_intent_keys_to_dispatch_payload(monkeypatch) -> None:
+  base = "https://gateway.example"
+  transport = _FakeGatewayHttp(
+    [
+      _response("POST", f"{base}/api/chat/init", 200, {"session_token": "jwt-token"}),
+      _response(
+        "POST",
+        f"{base}/api/orchestration/excel-dispatch",
+        200,
+        {"request_id": "request-1", "delegation_id": "delegation-1"},
+      ),
+      _response(
+        "GET",
+        f"{base}/api/orchestration/excel-dispatch/request-1",
+        200,
+        {"state": "done", "result": {"text": "complete"}},
+      ),
+    ]
+  )
+  monkeypatch.setattr(dispatch, "_get_session_token", None)
+  monkeypatch.setattr(dispatch.httpx, "AsyncClient", transport.client_factory)
+
+  handler = dispatch.make_autonomous_message_excel_agent_handler(
+    gateway_url=base,
+    gateway_api_key="api-key-1",
+    poll_interval_seconds=0.001,
+    tls_verify=False,
+  )
+  result, error = _run(
+    handler(
+      {
+        "text": "Update the model",
+        "model_key": "anthropic.claude-sonnet-5",
+        "effort": "high",
+        "catalog_revision": "2026-08-13.1",
+      }
+    )
+  )
+
+  assert error is None
+  assert result is not None
+  submit_json = transport.requests[1]["json"]
+  assert submit_json["model_key"] == "anthropic.claude-sonnet-5"
+  assert submit_json["effort"] == "high"
+  assert submit_json["catalog_revision"] == "2026-08-13.1"
+  assert "model" not in submit_json
+
+
+def test_handler_omitted_selection_intent_sends_no_selection_keys(monkeypatch) -> None:
+  base = "https://gateway.example"
+  transport = _FakeGatewayHttp(
+    [
+      _response("POST", f"{base}/api/chat/init", 200, {"session_token": "jwt-token"}),
+      _response(
+        "POST",
+        f"{base}/api/orchestration/excel-dispatch",
+        200,
+        {"request_id": "request-1", "delegation_id": "delegation-1"},
+      ),
+      _response(
+        "GET",
+        f"{base}/api/orchestration/excel-dispatch/request-1",
+        200,
+        {"state": "done", "result": {"text": "complete"}},
+      ),
+    ]
+  )
+  monkeypatch.setattr(dispatch, "_get_session_token", None)
+  monkeypatch.setattr(dispatch.httpx, "AsyncClient", transport.client_factory)
+
+  handler = dispatch.make_autonomous_message_excel_agent_handler(
+    gateway_url=base,
+    gateway_api_key="api-key-1",
+    poll_interval_seconds=0.001,
+    tls_verify=False,
+  )
+  result, error = _run(handler({"text": "Update the model"}))
+
+  assert error is None
+  assert result is not None
+  submit_json = transport.requests[1]["json"]
+  assert submit_json == {"text": "Update the model"}
+  for selection_key in ("model", "model_key", "effort", "catalog_revision"):
+    assert selection_key not in submit_json
+
+
+class _SelectionFakeRelay:
+  """Minimal relay double for end-to-end orchestration route tests."""
+
+  def __init__(self) -> None:
+    self.list_calls: list[dict[str, Any]] = []
+    self.submissions: list[dict[str, Any]] = []
+
+  async def list_workbooks(
+    self,
+    gateway_session_id: str | None = None,
+    user_id: str | None = None,
+  ) -> list[dict[str, Any]]:
+    self.list_calls.append({"gateway_session_id": gateway_session_id, "user_id": user_id})
+    return [
+      {
+        "name": "Budget.xlsx",
+        "session": "workbook-session-1",
+        "gateway_session_id": "excel-session-1",
+        "detached": False,
+      }
+    ]
+
+  async def submit(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    self.submissions.append({"args": args, "kwargs": dict(kwargs)})
+    return {"request_id": kwargs.get("request_id")}
+
+
+def test_handler_raw_model_is_refused_typed_by_orchestration_route(
+  monkeypatch,
+  tmp_path: Path,
+) -> None:
+  """End-to-end: the handler forwards raw 'model' instead of dropping it, and the
+  hardened orchestration route refuses it typed with HTTP 400
+  chat_model_not_accepted before any relay submission."""
+
+  base = "https://gateway.example"
+  monkeypatch.setenv("EXCEL_ORCHESTRATION_DEV", "1")
+
+  relay = _SelectionFakeRelay()
+  app = FastAPI()
+  app.state.gateway_approval_store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+
+  class _AuthContext:
+    user_id = "alice"
+    session_id = "orchestrator-session"
+    profile = "autonomous"
+
+  def _authenticate(request: Request) -> _AuthContext:
+    if request.headers.get("Authorization") != "Bearer helper-jwt":
+      raise HTTPException(status_code=401, detail="missing token")
+    return _AuthContext()
+
+  app.include_router(
+    build_orchestration_router(
+      relay=relay,
+      authenticate=_authenticate,
+      relay_restart_exceptions=(RuntimeError,),
+    )
+  )
+
+  real_async_client = httpx.AsyncClient
+
+  def _client_factory(**kwargs: Any) -> httpx.AsyncClient:
+    del kwargs
+    return real_async_client(transport=httpx.ASGITransport(app=app), base_url=base)
+
+  monkeypatch.setattr(
+    dispatch,
+    "_get_session_token",
+    lambda api_key, *, gateway_base_url, tls_verify: "helper-jwt",
+  )
+  monkeypatch.setattr(dispatch.httpx, "AsyncClient", _client_factory)
+
+  handler = dispatch.make_autonomous_message_excel_agent_handler(
+    gateway_url=base,
+    gateway_api_key="api-key-1",
+    poll_interval_seconds=0.001,
+    tls_verify=False,
+  )
+  result, error = _run(
+    handler({"text": "Update the model", "model": "claude-sonnet-4-6"})
+  )
+
+  assert result is None
+  assert error is not None
+  assert error["code"] == "chat_model_not_accepted"
+  assert error["status_code"] == 400
+  assert error["payload"]["code"] == "chat_model_not_accepted"
+  assert relay.submissions == []
 
 
 def test_handler_prefers_imported_gateway_session_helper(monkeypatch) -> None:

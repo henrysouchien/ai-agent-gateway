@@ -431,6 +431,7 @@ def test_runner_background_registration_resolves_parent_module_helpers(monkeypat
   result, error = asyncio.run(
     AgentRunner._register_background_task(
       runner,
+      capability_bind_receipt=_bind_receipt(),
       tool_input={},
       handler=handler,
       task_type="plan_run",
@@ -1453,6 +1454,7 @@ def test_runner_register_background_task_returns_limit_error_before_hooks() -> N
 
   result, error = asyncio.run(
     runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={},
       handler=handler,
       on_before_start=lambda: started.append("hook"),
@@ -1500,6 +1502,7 @@ def test_runner_register_background_task_returns_resume_depth_error_before_regis
 
   result, error = asyncio.run(
     runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={},
       handler=handler,
       on_before_start=lambda: started.append("hook"),
@@ -1794,6 +1797,7 @@ def test_task_registered_payload_and_started_result_shape_outputs() -> None:
     "task_id": "bg_4",
     "owner_runner_id": "runner-1",
     "owner_role": "writer",
+    "capability_bind": _bind_receipt(),
   }
 
   payload = task_registered_event_payload(
@@ -1809,6 +1813,7 @@ def test_task_registered_payload_and_started_result_shape_outputs() -> None:
     "task_id": "bg_4",
     "owner_runner_id": "runner-1",
     "owner_role": "writer",
+    "capability_bind": _bind_receipt(),
     "task_type": "background_agent",
     "agent_name": "Analyst",
     "parent_session_id": "sess-parent",
@@ -1982,6 +1987,100 @@ def test_background_registration_metadata_includes_optional_fields() -> None:
   assert correlation["cost_observation_threshold_usd"] == 1.25
 
 
+@pytest.mark.parametrize("missing_bind", [None, {}, "receipt", 7])
+def test_background_registration_metadata_requires_capability_bind(
+  missing_bind: object,
+) -> None:
+  """Durable registrations must carry the exact binding (B7).
+
+  A bind-less durable record could only fail late at resume, so the write
+  path refuses it up front instead of persisting it.
+  """
+
+  with pytest.raises(ValueError, match="capability_bind"):
+    background_task_registration_metadata(
+      owner_runner_id="runner-1",
+      owner_role="writer",
+      sub_agent_id="sub3:sess",
+      parent_turn_id="turn-1",
+      call_index=3,
+      capability_bind_receipt=missing_bind,  # type: ignore[arg-type]
+      cost_observation_threshold_usd=None,
+      original_task_id=None,
+      tool_input={},
+    )
+
+
+@pytest.mark.parametrize("missing_bind", [None, {}])
+def test_prepare_background_task_registration_requires_capability_bind(
+  missing_bind: object,
+) -> None:
+  entry = _task(task_id="bg_3", metadata={})
+
+  with pytest.raises(ValueError, match="capability_bind"):
+    prepare_background_task_registration(
+      entry,
+      tool_input={},
+      capability_bind_receipt=missing_bind,  # type: ignore[arg-type]
+      owner_runner_id="runner-1",
+      owner_role="writer",
+      sub_agent_id_for_call_index=lambda call_index: f"sub-{call_index}",
+      parent_turn_id="turn-1",
+      original_task_id=None,
+    )
+
+
+def test_task_registered_event_payload_refuses_bind_less_correlation() -> None:
+  entry = _task(task_id="bg_4", metadata={})
+
+  with pytest.raises(ValueError, match="capability_bind"):
+    task_registered_event_payload(
+      entry,
+      correlation_payload={
+        "task_id": "bg_4",
+        "owner_runner_id": "runner-1",
+        "owner_role": "writer",
+      },
+      agent_name="Analyst",
+      parent_session_id="sess-parent",
+    )
+
+
+def test_register_background_task_requires_capability_bind_before_registration() -> None:
+  class Registry:
+    admission_count = 0
+
+    def register(self, *_args: Any, **_kwargs: Any) -> None:
+      raise AssertionError(
+        "bind-less registration must refuse before reserving a task"
+      )
+
+  runner = object.__new__(AgentRunner)
+  runner._task_registry = Registry()
+  runner._max_background_tasks = 3
+
+  async def handler(_tool_input: dict[str, Any], **_kwargs: Any):
+    return None, None
+
+  with pytest.raises(ValueError, match="capability_bind"):
+    asyncio.run(
+      AgentRunner._register_background_task(
+        runner,
+        tool_input={},
+        handler=handler,
+        capability_bind_receipt=None,  # type: ignore[arg-type]
+      )
+    )
+  with pytest.raises(TypeError, match="capability_bind_receipt"):
+    asyncio.run(
+      AgentRunner._register_background_task(
+        runner,
+        tool_input={},
+        handler=handler,
+      )
+    )
+
+
 def test_prepare_background_task_registration_mutates_entry_and_returns_call_index() -> None:
   entry = _task(
     task_id="bg_3_r2",
@@ -2049,6 +2148,7 @@ def test_register_background_task_rejects_untyped_workflow_metadata_before_regis
   with pytest.raises(TypeError, match="exact WorkflowTaskMetadata"):
     asyncio.run(
       runner._register_background_task(
+        capability_bind_receipt=_bind_receipt(),
         tool_input={},
         handler=handler,
         workflow_task_metadata=_workflow_task_metadata().payload(),  # type: ignore[arg-type]

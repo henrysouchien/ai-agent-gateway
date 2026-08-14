@@ -260,6 +260,68 @@ def test_post_dev_gate_mints_grant_and_submits(monkeypatch, tmp_path: Path) -> N
   assert relay.result_calls == []
 
 
+def test_post_threads_stable_selection_keys_to_relay_payload(monkeypatch, tmp_path: Path) -> None:
+  monkeypatch.setenv("EXCEL_ORCHESTRATION_DEV", "1")
+  relay = _FakeRelay(
+    workbooks=[
+      {
+        "name": "Budget.xlsx",
+        "session": "workbook-session-1",
+        "gateway_session_id": "excel-session-1",
+        "detached": False,
+      }
+    ]
+  )
+  app, _store = _make_app(tmp_path, relay)
+
+  with TestClient(app) as client:
+    response = client.post(
+      "/api/orchestration/excel-dispatch",
+      headers=_headers(user_id="alice"),
+      json={
+        "text": "Update the model",
+        "model_key": "anthropic.claude-sonnet-5",
+        "effort": "high",
+        "catalog_revision": "2026-08-13.1",
+      },
+    )
+
+  assert response.status_code == 200, response.text
+  assert len(relay.submissions) == 1
+  tool_input = relay.submissions[0]["tool_input"]
+  assert tool_input["model_key"] == "anthropic.claude-sonnet-5"
+  assert tool_input["effort"] == "high"
+  assert tool_input["catalog_revision"] == "2026-08-13.1"
+  assert "model" not in tool_input
+
+
+def test_post_refuses_raw_model_typed_without_grant_or_submit(monkeypatch, tmp_path: Path) -> None:
+  monkeypatch.setenv("EXCEL_ORCHESTRATION_DEV", "1")
+  relay = _FakeRelay(
+    workbooks=[
+      {
+        "name": "Budget.xlsx",
+        "session": "workbook-session-1",
+        "gateway_session_id": "excel-session-1",
+        "detached": False,
+      }
+    ]
+  )
+  app, store = _make_app(tmp_path, relay)
+
+  with TestClient(app) as client:
+    response = client.post(
+      "/api/orchestration/excel-dispatch",
+      headers=_headers(user_id="alice"),
+      json={"text": "Update the model", "model": "claude-sonnet-4-6"},
+    )
+
+  assert response.status_code == 400, response.text
+  body = response.json()
+  assert body["code"] == "chat_model_not_accepted"
+  assert relay.submissions == []
+
+
 @pytest.mark.parametrize("exception_type", _RELAY_RESTART_EXCEPTIONS)
 def test_post_restart_barriers_return_retryable_503_and_revoke_grant(
   monkeypatch,

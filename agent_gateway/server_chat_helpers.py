@@ -28,6 +28,7 @@ from .capability_binding import (
   ModelSelectionIntent,
   eligible_model_choices,
   resolve_capability_model,
+  saved_preference_ineligibility,
 )
 from .capability_execution import CapabilityExecutionResolver
 from .model_registry import ProductModelRegistry, ProductModelSelectionPolicy
@@ -487,6 +488,20 @@ def _latest_chat_run_state(session: GatewaySession, session_id: str) -> str | No
   return None
 
 
+_SAVED_PREFERENCE_NOT_APPLIED_DETAILS: dict[str, str] = {
+  "model_unknown": "its model key is no longer in the catalog",
+  "model_deprecated": "its model is deprecated",
+  "model_disabled": "its model is disabled",
+  "model_revoked": "its model is revoked",
+  "model_hidden": "its model is no longer offered for selection",
+  "model_not_allowed": "its model is not allowed for this capability",
+  "effort_unsupported": "its stored effort is not supported by its model",
+  "credential_ineligible": (
+    "no eligible credential or entitlement covers its model"
+  ),
+}
+
+
 def build_capability_choices(
   *,
   session: GatewaySession,
@@ -567,13 +582,25 @@ def build_capability_choices(
           saved_preference is not None
           and bind.selection_source != "saved_preference"
         ):
+          reason = saved_preference_ineligibility(
+            saved_preference,
+            capability_id=capability_id,
+            registry=registry,
+            policy=policy,
+            auth=resolver.auth_context,
+          )
+          detail = _SAVED_PREFERENCE_NOT_APPLIED_DETAILS.get(
+            reason or "",
+            "it is currently ineligible",
+          )
           notices.append(CapabilityChoiceNotice(
             code="saved_preference_not_applied",
             message=(
-              "The saved preference is currently ineligible and was not "
-              "applied; it remains saved until replaced or cleared."
+              f"The saved preference was not applied because {detail}; "
+              "it remains saved until replaced or cleared."
             ),
             model_key=saved_preference.model_key,
+            reason=reason,
           ))
     responses[capability_id] = CapabilityChoiceResponse(
       capability=capability_id,

@@ -18,6 +18,7 @@ for path in (PKG_DIR, TESTS_DIR):
     sys.path.insert(0, str(path))
 
 from agent_gateway import AgentRunner, AgentSessionLog, EventLog  # noqa: E402
+from agent_gateway.agent_session_log_records import EVENT_SCHEMA_VERSION  # noqa: E402
 import agent_gateway.skill_completion_wal as completion_wal_module  # noqa: E402
 from agent_gateway.autonomous import run_session  # noqa: E402
 from agent_gateway.providers import StreamEvent  # noqa: E402
@@ -50,6 +51,26 @@ from test_session_log_runner import (  # noqa: E402
 
 def _run(coro: Any) -> Any:
   return asyncio.run(coro)
+
+
+def _bind_receipt() -> dict[str, str]:
+  return {
+    "schema_version": "1.0",
+    "capability_id": "node.implement",
+    "model_key": "test.stub.claude-sonnet-4-6",
+    "provider": "stub",
+    "upstream_model": "claude-sonnet-4-6",
+    "adapter": "test.stub",
+    "protocol_profile": "test.reasoning",
+    "route": "test.in_process",
+    "effort": "none",
+    "credential_principal": "user",
+    "credential_ref": "test-user:stub",
+    "run_mode": "interactive",
+    "registry_revision": "test-capability-execution.1",
+    "policy_revision": "test-capability-execution.1",
+    "selection_source": "internal_policy",
+  }
 
 
 class _RecordingContextCapture:
@@ -108,7 +129,7 @@ def _durable_writer_event(
     **event,
     "runner_id": runner_id,
     "role": "writer",
-    "event_schema_version": 1,
+    "event_schema_version": EVENT_SCHEMA_VERSION,
   }
 
 
@@ -679,6 +700,7 @@ def test_top_level_result_follows_background_completion(
       runner = runner_ref[0]
       assert runner is not None
       return await runner._register_background_task(
+        capability_bind_receipt=_bind_receipt(),
         tool_input=tool_input,
         handler=_background_handler,
         agent_name="researcher",
@@ -1615,7 +1637,7 @@ def test_recovery_preserves_genuine_writer_wrapper(
     assert event["runner_id"] == "runner-original"
     assert event["role"] == "writer"
     assert "sub_agent_id" not in event
-    assert event["event_schema_version"] == 1
+    assert event["event_schema_version"] == EVENT_SCHEMA_VERSION
 
 
 class _AmbiguousResultLog(AgentSessionLog):
@@ -2402,7 +2424,7 @@ def test_child_skill_durable_confirmer_requires_exact_whole_envelope(
     assert confirmed is not None
     assert confirmed["runner_id"] == "runner-child-confirm"
     assert confirmed["role"] == "parent"
-    assert confirmed["event_schema_version"] == 1
+    assert confirmed["event_schema_version"] == EVENT_SCHEMA_VERSION
     mutated = {
       **event,
       "ts": 2.0,

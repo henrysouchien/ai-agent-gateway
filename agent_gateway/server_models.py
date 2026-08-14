@@ -290,6 +290,7 @@ class CapabilityChoiceNotice(BaseModel):
   code: str
   message: str
   model_key: str | None = None
+  reason: str | None = None
 
 
 class CapabilityChoiceResponse(BaseModel):

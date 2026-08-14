@@ -12,6 +12,21 @@ _No unreleased changes recorded yet._
   dist and public-repository sync paths, so installed wheels include the
   component and formatter declarations required by `authoring_manifest()` and
   Canvas typechecking. Other runtime `node_modules` trees remain excluded.
+- Saved model preferences on a model that is no longer eligible (deprecated,
+  revoked, hidden, disallowed, or unsupported effort) now resolve the eligible
+  capability default with a typed not-applied notice carrying the reason,
+  instead of hard-refusing every turn in the session. The stored preference is
+  never mutated or deleted.
+- Session-log task events are now versioned (`EVENT_SCHEMA_VERSION` 2) and the
+  registry rebuild loudly warn-skips pre-cutover or bind-less records instead
+  of rebuilding them into resumable entries that fail late; durable task
+  registration requires a capability bind receipt end to end.
+- Excel dispatch (`mint_and_submit`, the orchestration route, and the
+  autonomous `message_excel_agent` handler) now forwards stable
+  `model_key`/`effort`/`catalog_revision` selection intent instead of silently
+  discarding it, refuses raw `model` with the typed `chat_model_not_accepted`
+  code before any grant is minted, and advertises the selection triple in the
+  shared tool definition.
 
 ## 0.16.0 (2026-08-13)
 

@@ -432,6 +432,71 @@ def eligible_model_choices(
   return tuple(choices)
 
 
+SavedPreferenceIneligibilityReason: TypeAlias = Literal[
+  "model_unknown",
+  "model_deprecated",
+  "model_disabled",
+  "model_revoked",
+  "model_hidden",
+  "model_not_allowed",
+  "effort_unsupported",
+  "credential_ineligible",
+]
+
+_LIFECYCLE_INELIGIBILITY: Mapping[str, SavedPreferenceIneligibilityReason] = {
+  "deprecated": "model_deprecated",
+  "disabled": "model_disabled",
+  "revoked": "model_revoked",
+  "hidden": "model_hidden",
+}
+
+
+def saved_preference_ineligibility(
+  saved_preference: ModelSelectionIntent,
+  *,
+  capability_id: str,
+  registry: ProductModelRegistry,
+  policy: CapabilitySelectionPolicy,
+  auth: AuthContext,
+) -> SavedPreferenceIneligibilityReason | None:
+  """Why a saved preference cannot be applied now, or None if it is eligible.
+
+  This is the same eligibility rule that admits entries into
+  ``eligible_model_choices`` (lifecycle, exposure, policy allowance,
+  credential), plus the stored effort.  It never mutates or interprets the
+  stored preference: an ineligible preference is reported as not applied and
+  the applicable eligible default resolves instead.
+  """
+
+  try:
+    entry = registry.require(saved_preference.model_key)
+  except KeyError:
+    return "model_unknown"
+  if entry.lifecycle != "active":
+    return _LIFECYCLE_INELIGIBILITY.get(entry.lifecycle, "model_hidden")
+  if entry.key not in policy.allowed_model_keys:
+    return "model_not_allowed"
+  exposure = entry.capabilities.get(capability_id)
+  if not (
+    exposure == "user_selectable"
+    or (
+      exposure == "internal"
+      and policy.allow_authenticated_run_override
+    )
+  ):
+    return "model_not_allowed"
+  effort = saved_preference.effort or entry.default_effort
+  if effort not in entry.supported_efforts:
+    return "effort_unsupported"
+  if _eligible_handle(
+    auth=auth,
+    capability_id=capability_id,
+    entry=entry,
+  ) is None:
+    return "credential_ineligible"
+  return None
+
+
 def _selection_candidate(
   capability_id: str,
   *,
@@ -585,23 +650,13 @@ def resolve_capability_model(
         capability_id=normalized,
         model_key=saved_preference.model_key,
       )
-    try:
-      saved_entry = registry.require(saved_preference.model_key)
-      saved_effort = saved_preference.effort or saved_entry.default_effort
-      saved_is_eligible = (
-        saved_entry.key in policy.allowed_model_keys
-        and normalized in saved_entry.capabilities
-        and saved_entry.lifecycle != "disabled"
-        and saved_effort in saved_entry.supported_efforts
-        and _eligible_handle(
-          auth=auth,
-          capability_id=normalized,
-          entry=saved_entry,
-        ) is not None
-      )
-    except KeyError:
-      saved_is_eligible = False
-    if not saved_is_eligible:
+    if saved_preference_ineligibility(
+      saved_preference,
+      capability_id=normalized,
+      registry=registry,
+      policy=policy,
+      auth=auth,
+    ) is not None:
       # A saved preference is not current execution intent.  Preserve it in the
       # preference store, report it as not applied at the API boundary, and
       # continue with the applicable policy default.
@@ -893,7 +948,9 @@ __all__ = [
   "EligibleModelChoice",
   "ModelSelectionIntent",
   "RunMode",
+  "SavedPreferenceIneligibilityReason",
   "eligible_model_choices",
+  "saved_preference_ineligibility",
   "reauthorize_capability_bind",
   "require_capability_execution_bind",
   "resolve_capability_model",

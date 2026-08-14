@@ -665,6 +665,7 @@ async def _append_unsettled_required_skill_task(
   }
   await runner._append_durable_event({
     "type": "task_registered",
+    "capability_bind": _bind_receipt(),
     "task_id": task_id,
     "task_type": "background",
     "agent_name": "earnings-review",
@@ -696,6 +697,7 @@ async def _append_task_log(log: AgentSessionLog) -> None:
   await log.append(
     {
       "type": "task_registered",
+      "capability_bind": _bind_receipt(),
       "task_id": "bg_3",
       "task_type": "background",
       "agent_name": "earnings-review",
@@ -1001,6 +1003,7 @@ def test_transcript_reconstructs_final_answer_guard_draft(tmp_path: Path) -> Non
     log.append(
       {
         "type": "task_registered",
+        "capability_bind": _bind_receipt(),
         "task_id": "bg_3",
         "task_type": "background",
         "agent_name": "earnings-review",
@@ -1122,6 +1125,7 @@ def test_consumed_parent_message_is_restored_before_assistant_not_resume_tail(
     log = AgentSessionLog(path=tmp_path / "sessions" / "consumed-parent-message.jsonl")
     registration = await log.append({
       "type": "task_registered",
+      "capability_bind": _bind_receipt(),
       "task_id": "bg_3",
       "task_type": "background",
       "agent_name": "earnings-review",
@@ -1223,6 +1227,7 @@ def test_assistant_binding_closes_consumption_audit_crash_window(
     assert log is not None
     await log.append({
       "type": "task_registered",
+      "capability_bind": _bind_receipt(),
       "task_id": "bg_3",
       "task_type": "background",
       "agent_name": "earnings-review",
@@ -1310,6 +1315,7 @@ def test_consumed_parent_message_projection_fails_closed_on_duplicate_ack(
     log = AgentSessionLog(path=tmp_path / "sessions" / "duplicate-consumed-parent-message.jsonl")
     await log.append({
       "type": "task_registered",
+      "capability_bind": _bind_receipt(),
       "task_id": "bg_3",
       "task_type": "background",
       "sub_agent_id": "sub3:sess-parent",
@@ -1367,6 +1373,7 @@ def test_parent_message_projection_fails_closed_on_duplicate_unconsumed_sent(
     log = AgentSessionLog(path=tmp_path / "sessions" / "duplicate-parent-message.jsonl")
     await log.append({
       "type": "task_registered",
+      "capability_bind": _bind_receipt(),
       "task_id": "bg_3",
       "task_type": "background",
       "sub_agent_id": "sub3:sess-parent",
@@ -1410,6 +1417,7 @@ def test_register_background_task_resume_generates_r_suffix(tmp_path: Path) -> N
       ), None
 
     result, error = await runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={},
       handler=_handler,
       agent_name="earnings-review",
@@ -1459,6 +1467,7 @@ def test_resume_successor_registration_is_single_claim_across_retries(
       dict[str, Any] | None,
     ]:
       return await runner._register_background_task(
+        capability_bind_receipt=_bind_receipt(),
         tool_input={"task": "resume"},
         handler=_handler,
         agent_name="earnings-review",
@@ -1529,6 +1538,7 @@ def test_resume_successor_registration_is_single_claim_across_retries(
 
     restarted_result, restarted_error = (
       await restarted._register_background_task(
+        capability_bind_receipt=_bind_receipt(),
         tool_input={"task": "resume"},
         handler=_restarted_handler,
         original_task_id="bg_claim_root",
@@ -1586,6 +1596,7 @@ def test_required_skill_result_recovers_after_append_failure_and_replay(
       ), None
 
     started, start_error = await runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={"task": "recover lifecycle"},
       handler=_handler,
       agent_name="earnings-review",
@@ -1661,6 +1672,7 @@ def test_required_skill_result_recovers_after_append_failure_and_replay(
       dict[str, Any] | None,
     ]:
       return await restarted._register_background_task(
+        capability_bind_receipt=_bind_receipt(),
         tool_input={"task": "recover lifecycle"},
         handler=_must_not_rerun,
         original_task_id="bg_skill_marker_recovery",
@@ -1943,6 +1955,8 @@ def test_task_registry_cold_replay_does_not_settle_invalid_skill_marker(
   events = [
     {
       "type": "task_registered",
+      "event_schema_version": 2,
+      "capability_bind": _bind_receipt(),
       "task_id": task_id,
       "task_type": "background",
       "agent_name": "earnings-review",
@@ -2021,6 +2035,8 @@ def test_task_registry_cold_replay_ignores_unrelated_skill_marker() -> None:
   registry.load_from_events([
     {
       "type": "task_registered",
+      "event_schema_version": 2,
+      "capability_bind": _bind_receipt(),
       "task_id": task_id,
       "task_type": "background",
       "metadata": {
@@ -2200,6 +2216,7 @@ def test_writer_recovery_fails_closed_on_duplicate_task_bounds(
     if duplicate_event_type == "task_registered":
       await runner._append_durable_event({
         "type": "task_registered",
+        "capability_bind": _bind_receipt(),
         "task_id": task_id,
         "task_type": "background",
         "agent_name": "earnings-review",
@@ -2417,6 +2434,7 @@ def test_required_skill_result_recovery_is_bounded_to_task_interval(
 
     await runner._append_durable_event({
       "type": "task_registered",
+      "capability_bind": _bind_receipt(),
       "task_id": old_task_id,
       "task_type": "background",
       "agent_name": "earnings-review",
@@ -2452,6 +2470,7 @@ def test_required_skill_result_recovery_is_bounded_to_task_interval(
     })
     await runner._append_durable_event({
       "type": "task_registered",
+      "capability_bind": _bind_receipt(),
       "task_id": successor_task_id,
       "task_type": "background",
       "agent_name": "earnings-review",
@@ -2534,6 +2553,7 @@ def test_required_skill_result_owned_append_survives_repeated_cancellation(
     )
     await runner._append_durable_event({
       "type": "task_registered",
+      "capability_bind": _bind_receipt(),
       "task_id": entry.task_id,
       "task_type": "background",
       "agent_name": entry.agent_name,
@@ -2646,6 +2666,7 @@ def test_resume_successor_retries_failed_registration_without_ghost(
 
     with pytest.raises(RuntimeError, match="registration unavailable"):
       await runner._register_background_task(
+        capability_bind_receipt=_bind_receipt(),
         tool_input={"task": "resume"},
         handler=_handler,
         original_task_id="bg_registration_retry",
@@ -2660,6 +2681,7 @@ def test_resume_successor_retries_failed_registration_without_ghost(
     assert runner._task_registry.admission_count == 1
 
     result, error = await runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={"task": "resume"},
       handler=_handler,
       original_task_id="bg_registration_retry",
@@ -2708,6 +2730,7 @@ def test_pending_resume_registration_reserves_capacity_without_durable_ghost(
     await runner._append_durable_event(
       {
         "type": "task_registered",
+        "capability_bind": _bind_receipt(),
         "task_id": source.task_id,
         "task_type": source.task_type,
         "agent_name": source.agent_name,
@@ -2751,6 +2774,7 @@ def test_pending_resume_registration_reserves_capacity_without_durable_ghost(
 
     caller = asyncio.create_task(
       runner._register_background_task(
+        capability_bind_receipt=_bind_receipt(),
         tool_input={"task": "resume"},
         handler=_resume_handler,
         original_task_id=source.task_id,
@@ -2768,6 +2792,7 @@ def test_pending_resume_registration_reserves_capacity_without_durable_ghost(
 
     competing_result, competing_error = (
       await runner._register_background_task(
+        capability_bind_receipt=_bind_receipt(),
         tool_input={"task": "competing"},
         handler=_competing_handler,
         on_before_start=lambda: side_effects.append("competing_start"),
@@ -2836,6 +2861,7 @@ def test_pending_resume_registration_reserves_capacity_without_durable_ghost(
       return _report_task_result_payload("must not rerun"), None
 
     replay, replay_error = await restarted._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={"task": "resume"},
       handler=_restarted_handler,
       original_task_id=source.task_id,
@@ -2882,6 +2908,7 @@ def test_resume_successor_initialization_survives_caller_cancellation(
 
     caller = asyncio.create_task(
       runner._register_background_task(
+        capability_bind_receipt=_bind_receipt(),
         tool_input={"task": "resume"},
         handler=_handler,
         original_task_id="bg_cancel_registration",
@@ -2908,6 +2935,7 @@ def test_resume_successor_initialization_survives_caller_cancellation(
     assert handler_calls == 1
 
     replay, replay_error = await runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={"task": "resume"},
       handler=_handler,
       original_task_id="bg_cancel_registration",
@@ -2957,6 +2985,7 @@ def test_resume_successor_does_not_start_if_source_settles_during_registration(
 
     caller = asyncio.create_task(
       runner._register_background_task(
+        capability_bind_receipt=_bind_receipt(),
         tool_input={"task": "resume"},
         handler=_handler,
         original_task_id=source.task_id,
@@ -3045,6 +3074,7 @@ def test_shutdown_owns_hung_resume_initialization_without_late_worker(
 
     caller = asyncio.create_task(
       runner._register_background_task(
+        capability_bind_receipt=_bind_receipt(),
         tool_input={"task": "resume"},
         handler=_handler,
         original_task_id="bg_shutdown_registration",
@@ -3143,6 +3173,7 @@ def test_resume_successor_reconciles_registration_failure_after_fsync(
       return _report_task_result_payload("reconciled registration"), None
 
     result, error = await runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={"task": "resume"},
       handler=_handler,
       original_task_id="bg_registration_fsync",
@@ -3240,6 +3271,7 @@ def test_resume_successor_collision_returns_structured_error(
       return _report_task_result_payload("must not run"), None
 
     result, error = await runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={"task": "resume"},
       handler=_handler,
       original_task_id="bg_collision",
@@ -3273,6 +3305,7 @@ def test_resume_chain_depth_and_cap(tmp_path: Path) -> None:
       return _report_task_result_payload("unused"), None
 
     result, error = await runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={},
       handler=_handler,
       agent_name="earnings-review",
@@ -4024,6 +4057,7 @@ def test_timed_out_completion_reconciles_late_post_fsync_commit(
     assert log is not None
     await log.append({
       "type": "task_registered",
+      "capability_bind": _bind_receipt(),
       "task_id": entry.task_id,
       "task_type": "background",
       "agent_name": entry.agent_name,
@@ -4413,11 +4447,77 @@ def test_resume_refuses_missing_durable_bind_before_materialization(
 
     result, error = await handler({"task_id": "bg_missing_bind"})
 
+    # A bind-less durable registration is loudly skipped at rebuild
+    # (drain, not migrate), so resume refuses with a typed not_found
+    # before any reconstruction or materialization — never a late
+    # invalid_task_metadata failure on a rebuilt bind-less entry.
     assert result is None
     assert error is not None
-    assert error["code"] == "invalid_task_metadata"
-    assert "exact admitted task" in error["message"]
+    assert error["code"] == "not_found"
+    assert "bg_missing_bind" in error["message"]
     assert resolver.materialize_calls == []
+    assert runner._task_registry.get("bg_missing_bind") is None
+
+  _run(_case())
+
+
+def test_resume_loudly_skips_pre_cutover_v1_registration(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  """A v1 task_registered record never rebuilds as an INTERRUPTED entry.
+
+  Pre-cutover records are drained with a warn-once loud skip (review
+  2026-08-14, B7); resume answers with a typed not_found instead of a
+  late invalid_task_metadata on a bind-less reconstruction.
+  """
+
+  async def _case() -> None:
+    import agent_gateway.agent_session_log as session_log_module
+
+    seed_runner = _runner(tmp_path)
+    log = seed_runner._agent_session_log
+    assert log is not None
+    monkeypatch.setattr(session_log_module, "EVENT_SCHEMA_VERSION", 1)
+    await log.append({
+      "type": "task_registered",
+      "task_id": "bg_v1_record",
+      "task_type": "background",
+      "agent_name": "earnings-review",
+      "sub_agent_id": "sub:bg_v1_record",
+      "capability_bind": _bind_receipt(),
+      "started_at": 1.0,
+    })
+    monkeypatch.undo()
+
+    runner = _runner(tmp_path)
+    runner.resume_sub_agent = pytest.fail  # type: ignore[method-assign]
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir, "earnings-review")
+    resolver = _TestResumeCapabilityExecutionResolver()
+    handler = make_resume_handler(
+      [runner],
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+      capability_execution_resolver=resolver,
+    )
+
+    with caplog.at_level("WARNING", logger="agent_gateway.task_registry"):
+      result, error = await handler({"task_id": "bg_v1_record"})
+
+    assert result is None
+    assert error is not None
+    assert error["code"] == "not_found"
+    assert resolver.materialize_calls == []
+    assert runner._task_registry.get("bg_v1_record") is None
+    skip_messages = [
+      record.getMessage()
+      for record in caplog.records
+      if "Skipping durable task bg_v1_record" in record.getMessage()
+    ]
+    assert skip_messages
+    assert "event_schema_version" in skip_messages[0]
 
   _run(_case())
 

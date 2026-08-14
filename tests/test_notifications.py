@@ -57,6 +57,26 @@ class _StubProvider:
   name = "stub"
 
 
+def _bind_receipt() -> dict[str, str]:
+  return {
+    "schema_version": "1.0",
+    "capability_id": "node.implement",
+    "model_key": "test.stub.stub-model",
+    "provider": "stub",
+    "upstream_model": "stub-model",
+    "adapter": "test.stub",
+    "protocol_profile": "test.reasoning",
+    "route": "test.in_process",
+    "effort": "none",
+    "credential_principal": "user",
+    "credential_ref": "test-user:stub",
+    "run_mode": "interactive",
+    "registry_revision": "test-capability-execution.1",
+    "policy_revision": "test-capability-execution.1",
+    "selection_source": "internal_policy",
+  }
+
+
 def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
   return ToolDispatcher(
     mcp_client=_NullMcpClient(),
@@ -1212,6 +1232,7 @@ def test_omitted_result_backpressure_has_total_wildcard_recovery() -> None:
       raise AssertionError("backpressure must refuse before task start")
 
     result, error = await runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={"task": "must wait"},
       handler=_unused_handler,
     )
@@ -1310,6 +1331,7 @@ def test_durable_evicted_task_preserves_run_ownership_then_becomes_historical(
       "started_at": 100.0,
       "owner_runner_id": owner_runner_id,
       "owner_role": "writer",
+      "capability_bind": _bind_receipt(),
     })
     await durable_log.append({
       "type": "task_completed",
@@ -1425,6 +1447,7 @@ def test_background_kill_notifies_once_with_canonical_child_return() -> None:
       return None, None
 
     result, error = await runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={"task": "wait"},
       handler=_handler,
       agent_name="writer",
@@ -1528,6 +1551,7 @@ def test_register_background_task_wraps_handler_with_task_entry() -> None:
       return _report_child_return(), None
 
     result, error = await runner._register_background_task(
+      capability_bind_receipt=_bind_receipt(),
       tool_input={"task": "Collect"},
       handler=_handler,
       agent_name="writer",

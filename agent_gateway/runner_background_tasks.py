@@ -1182,6 +1182,26 @@ def task_completed_event_payload(
   return payload
 
 
+def require_capability_bind_receipt(
+  capability_bind_receipt: Any,
+) -> dict[str, str]:
+  """Refuse to build a durable registration without a capability bind.
+
+  Durable task records reauthorize the exact binding at resume; a bind-less
+  registration can only fail late. Refuse loudly at the write boundary
+  instead (model-selection-authority review 2026-08-14, B7).
+  """
+
+  if (
+    not isinstance(capability_bind_receipt, dict)
+    or not capability_bind_receipt
+  ):
+    raise ValueError(
+      "durable task registration requires a capability_bind receipt"
+    )
+  return dict(capability_bind_receipt)
+
+
 def task_registered_event_payload(
   entry: Any,
   *,
@@ -1189,6 +1209,7 @@ def task_registered_event_payload(
   agent_name: str | None,
   parent_session_id: str,
 ) -> Dict[str, Any]:
+  require_capability_bind_receipt(correlation_payload.get("capability_bind"))
   metadata = dict(entry.metadata)
   raw_workflow_task = metadata.get(WORKFLOW_TASK_METADATA_KEY)
   if raw_workflow_task is not None:
@@ -1243,7 +1264,7 @@ def background_task_registration_metadata(
   sub_agent_id: str,
   parent_turn_id: str | None,
   call_index: int,
-  capability_bind_receipt: dict[str, str] | None,
+  capability_bind_receipt: dict[str, str],
   cost_observation_threshold_usd: float | None,
   original_task_id: str | None,
   tool_input: Dict[str, Any],
@@ -1258,8 +1279,9 @@ def background_task_registration_metadata(
     "call_index": call_index,
     "task_type": "background",
   }
-  if capability_bind_receipt is not None:
-    correlation["capability_bind"] = dict(capability_bind_receipt)
+  correlation["capability_bind"] = require_capability_bind_receipt(
+    capability_bind_receipt
+  )
   if cost_observation_threshold_usd is not None:
     correlation["cost_observation_threshold_usd"] = (
       cost_observation_threshold_usd
@@ -1289,7 +1311,7 @@ def prepare_background_task_registration(
   entry: Any,
   *,
   tool_input: Dict[str, Any],
-  capability_bind_receipt: dict[str, str] | None,
+  capability_bind_receipt: dict[str, str],
   owner_runner_id: str | None,
   owner_role: str,
   sub_agent_id_for_call_index: Callable[[int], str],
@@ -1298,10 +1320,8 @@ def prepare_background_task_registration(
   required_skill_lifecycle: Mapping[str, Any] | None = None,
   workflow_task_metadata: WorkflowTaskMetadata | None = None,
 ) -> int:
-  entry.capability_bind_receipt = (
-    dict(capability_bind_receipt)
-    if capability_bind_receipt is not None
-    else None
+  entry.capability_bind_receipt = require_capability_bind_receipt(
+    capability_bind_receipt
   )
   cost_observation_threshold_usd = parse_cost_observation_threshold_usd(
     tool_input.get("cost_observation_threshold_usd")

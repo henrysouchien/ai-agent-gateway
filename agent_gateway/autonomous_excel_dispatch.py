@@ -250,7 +250,22 @@ def _dispatch_payload(tool_input: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
   payload: dict[str, Any] = {"text": text}
-  for name in ("workbook", "force_compaction", "window_seconds", "args_predicate"):
+  for name in (
+    "workbook",
+    "force_compaction",
+    "window_seconds",
+    "args_predicate",
+    # Chat model-selection intent is forwarded by key presence so omission stays
+    # omission (server default). Stable keys thread through to the relay chat
+    # payload; raw 'model' is deliberately forwarded too so the hardened
+    # /api/orchestration/excel-dispatch route refuses it typed
+    # (chat_model_not_accepted, HTTP 400) at the single refusal locus instead
+    # of this client silently dropping the caller's selection intent.
+    "model",
+    "model_key",
+    "effort",
+    "catalog_revision",
+  ):
     if name in tool_input:
       payload[name] = tool_input[name]
   return payload

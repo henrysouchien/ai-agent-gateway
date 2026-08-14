@@ -44,6 +44,7 @@ from .runner_background_tasks import (
   ordinary_parent_result_policy as _ordinary_parent_result_policy,
   parse_background_result_request as _parse_background_result_request,
   prepare_background_task_registration as _prepare_background_task_registration,
+  require_capability_bind_receipt as _require_capability_bind_receipt,
   resume_chain_depth as _resume_chain_depth,
   resume_root_task_id as _resume_root_task_id,
   resume_root_task_id_from_registry as _resume_root_task_id_from_registry,
@@ -1862,7 +1863,7 @@ class RunnerBackgroundLifecycleMixin:
       RequiredSkillResultProjector | None
     ),
     original_task_id: str | None,
-    capability_bind_receipt: dict[str, str] | None,
+    capability_bind_receipt: dict[str, str],
     admitted_task: AdmittedTask | None,
     parent_result_policy: ParentResultPolicy | None,
     reconcile_registration: bool,
@@ -2184,7 +2185,7 @@ class RunnerBackgroundLifecycleMixin:
       RequiredSkillResultProjector | None
     ) = None,
     original_task_id: str | None = None,
-    capability_bind_receipt: dict[str, str] | None = None,
+    capability_bind_receipt: dict[str, str],
     admitted_task: AdmittedTask | None = None,
     parent_result_policy: ParentResultPolicy | None = None,
     task_id_override: str | None = None,
@@ -2198,6 +2199,9 @@ class RunnerBackgroundLifecycleMixin:
       or task_type.strip() != task_type
     ):
       raise ValueError("task_type must be canonical non-empty text")
+    capability_bind_receipt = _require_capability_bind_receipt(
+      capability_bind_receipt
+    )
     try:
       required_skill_lifecycle = (
         _normalize_required_skill_lifecycle(
