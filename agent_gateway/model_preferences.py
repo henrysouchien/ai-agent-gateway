@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import os
 from pathlib import Path
 import sqlite3
@@ -19,7 +20,9 @@ class ModelPreferenceStore:
     self.path = Path(path).expanduser().resolve(strict=False)
     self.path.parent.mkdir(parents=True, exist_ok=True)
     self._lock = RLock()
-    with self._connect() as connection:
+    # ``with connection`` scopes the transaction only; ``closing`` releases
+    # the sqlite handle deterministically instead of at garbage collection.
+    with closing(self._connect()) as connection, connection:
       connection.execute("PRAGMA journal_mode=WAL")
       connection.execute("PRAGMA synchronous=FULL")
       connection.execute(
@@ -65,7 +68,7 @@ class ModelPreferenceStore:
       actor_id,
       capability_id,
     )
-    with self._lock, self._connect() as connection:
+    with self._lock, closing(self._connect()) as connection, connection:
       row = connection.execute(
         """
         SELECT model_key, effort
@@ -101,7 +104,7 @@ class ModelPreferenceStore:
       effort=effort,
       source="saved_preference",
     )
-    with self._lock, self._connect() as connection:
+    with self._lock, closing(self._connect()) as connection, connection:
       connection.execute(
         """
         INSERT INTO model_preferences (
@@ -135,7 +138,7 @@ class ModelPreferenceStore:
       actor_id,
       capability_id,
     )
-    with self._lock, self._connect() as connection:
+    with self._lock, closing(self._connect()) as connection, connection:
       cursor = connection.execute(
         """
         DELETE FROM model_preferences
@@ -143,7 +146,8 @@ class ModelPreferenceStore:
         """,
         (tenant, actor, capability),
       )
-    return cursor.rowcount > 0
+      deleted = cursor.rowcount > 0
+    return deleted
 
 
 __all__ = ["ModelPreferenceStore"]

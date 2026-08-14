@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -21,7 +22,15 @@ from agent_workflow_contracts import CapabilityBind
 from .commercial_contract import canonical_usage_payload_sha256
 
 
+log = logging.getLogger("agent_gateway.usage_outbox")
+
 OUTBOX_SCHEMA_VERSION = 3
+# The only usage-event payload contract this artifact may forward to ingest.
+# Queued rows at any other payload schema version are dead-lettered loudly at
+# ship time instead of shipping opaquely; draining the outbox under the
+# producing artifact remains the cutover procedure (product decision 6) — this
+# gate makes a violated drain observable.
+SHIPPABLE_USAGE_PAYLOAD_SCHEMA_VERSION = 3
 _V1_OUTBOX_TABLE_INFO = (
   ("event_id", "TEXT", 0, None, 1),
   ("payload_sha256", "TEXT", 1, None, 0),
@@ -457,6 +466,17 @@ def _source_time_text(value: Any) -> str:
   if parsed.tzinfo is None:
     raise ValueError("commercial usage occurred_at must be timezone-aware")
   return _utc_text(parsed)
+
+
+def _queued_payload_schema_version(payload_json: object) -> object:
+  """Read the queued payload's declared schema version without trusting shape."""
+  try:
+    payload = json.loads(str(payload_json))
+  except (TypeError, ValueError):
+    return None
+  if not isinstance(payload, dict):
+    return None
+  return payload.get("schema_version")
 
 
 def _payload_json(payload: dict[str, Any]) -> str:
@@ -997,7 +1017,7 @@ class CommercialUsageOutbox:
         )
         rows = connection.execute(
           """
-          SELECT event_id FROM commercial_usage_outbox
+          SELECT event_id, payload_json FROM commercial_usage_outbox
           WHERE state IN ('pending', 'retryable')
             AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
           ORDER BY created_at, event_id
@@ -1005,7 +1025,38 @@ class CommercialUsageOutbox:
           """,
           (current_text, limit),
         ).fetchall()
-        event_ids = [str(row["event_id"]) for row in rows]
+        event_ids: list[str] = []
+        for row in rows:
+          event_id = str(row["event_id"])
+          version = _queued_payload_schema_version(row["payload_json"])
+          if version == SHIPPABLE_USAGE_PAYLOAD_SCHEMA_VERSION:
+            event_ids.append(event_id)
+            continue
+          # Ship-time payload schema gate: never forward a payload this
+          # artifact's usage contract does not describe. Dead-letter the row
+          # loudly and leave its immutable evidence in place.
+          connection.execute(
+            """
+            UPDATE commercial_usage_outbox
+            SET state = 'dead', sending_lease_token = NULL,
+                sending_lease_expires_at = NULL, next_attempt_at = NULL,
+                last_error = ?
+            WHERE event_id = ? AND state IN ('pending', 'retryable')
+            """,
+            (
+              f"unshippable_payload_schema_version:{version!r}",
+              event_id,
+            ),
+          )
+          log.error(
+            "commercial usage outbox refused to ship row %s: payload "
+            "schema_version %r is not the shippable version %d; row "
+            "dead-lettered (drain the outbox under the producing artifact "
+            "before cutover)",
+            event_id,
+            version,
+            SHIPPABLE_USAGE_PAYLOAD_SCHEMA_VERSION,
+          )
         for event_id in event_ids:
           connection.execute(
             """

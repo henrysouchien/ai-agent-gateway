@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import Any, AsyncIterator, Dict
 from urllib.parse import urlparse
 
+from ..model_registry import AdapterRouteSupport
 from ..thinking import EffortResolution, clamp_effort
 from .base import (
   CostEstimate,
@@ -104,6 +105,20 @@ class OpenAIProvider(ModelProvider):
   """First-party OpenAI provider using the Responses API exclusively."""
 
   name = "openai"
+
+  @classmethod
+  def adapter_route_support(cls) -> AdapterRouteSupport:
+    # This implementation speaks ONLY the Responses API (`responses.create`
+    # is required at client creation and streaming) against the public
+    # api.openai.com base.  It does not implement Chat Completions; the
+    # `openai.sdk.chat_completions` adapter is a Risk-local implementation in
+    # the Risk serving process and must never be declared here.
+    return AdapterRouteSupport(
+      adapter="openai.responses",
+      provider="openai",
+      protocol_profiles=frozenset({"responses.reasoning"}),
+      routes=frozenset({"openai.public"}),
+    )
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     if str(config.get("auth_mode", "api")).strip().lower() == "oauth":

@@ -18,7 +18,12 @@ from .capability_binding import (
   require_capability_execution_bind,
   resolve_capability_model,
 )
-from .model_registry import ProductModelRegistry, ProductModelSelectionPolicy
+from .model_registry import (
+  CAPABILITY_EXECUTION_PROCESS,
+  CAPABILITY_IDS,
+  ProductModelRegistry,
+  ProductModelSelectionPolicy,
+)
 from .providers import ModelProvider
 
 
@@ -137,12 +142,29 @@ class CapabilityExecutionResolver:
   authenticated_run_overrides: Mapping[CapabilityId, ModelSelectionIntent] = field(
     default_factory=dict
   )
+  # Explicit designation of which capabilities THIS serving process executes
+  # (for the gateway server, `GATEWAY_EXECUTED_CAPABILITY_IDS`).  Capabilities
+  # outside the set are executed by another serving process; attempting to
+  # resolve or materialize one here is a typed refusal, not a stream-time
+  # `provider_unavailable`.  `None` leaves the resolver unrestricted for
+  # processes (Risk, Investment workers) that designate their own executable
+  # sets at their own boundaries.
+  executable_capability_ids: frozenset[str] | None = None
 
   def __post_init__(self) -> None:
     if not callable(self.credential_materializer):
       raise TypeError("credential_materializer must be callable")
     if not callable(self.adapter_resolver):
       raise TypeError("adapter_resolver must be callable")
+    if self.executable_capability_ids is not None:
+      executable = frozenset(self.executable_capability_ids)
+      unknown = executable - CAPABILITY_IDS
+      if unknown:
+        raise ValueError(
+          "executable_capability_ids has unknown capabilities: "
+          + ", ".join(sorted(unknown))
+        )
+      object.__setattr__(self, "executable_capability_ids", executable)
     self.selection_policy.admit_registry(self.registry)
     run_overrides = dict(self.authenticated_run_overrides)
     for capability_id, intent in run_overrides.items():
@@ -168,6 +190,23 @@ class CapabilityExecutionResolver:
         str(self.trusted_channel).strip() or None,
       )
 
+  def _require_executable_here(self, capability_id: str) -> None:
+    """Refuse capabilities designated as executed by another serving process."""
+
+    if (
+      self.executable_capability_ids is None
+      or capability_id in self.executable_capability_ids
+    ):
+      return
+    executing_process = CAPABILITY_EXECUTION_PROCESS.get(capability_id)
+    raise CapabilityResolutionError(
+      "capability_externally_executed",
+      f"capability {capability_id!r} is executed by the "
+      f"{executing_process or 'designated external'} serving process, "
+      "not this gateway process",
+      capability_id=capability_id,
+    )
+
   def resolve(
     self,
     capability_id: CapabilityId,
@@ -176,6 +215,7 @@ class CapabilityExecutionResolver:
     saved_preference: ModelSelectionIntent | None = None,
     parent_bind: CapabilityBind | None = None,
   ) -> BoundCapabilityExecution:
+    self._require_executable_here(str(capability_id or "").strip())
     bind = resolve_capability_model(
       capability_id,
       registry=self.registry,
@@ -192,6 +232,7 @@ class CapabilityExecutionResolver:
   def materialize_bind(self, bind: CapabilityBind) -> BoundCapabilityExecution:
     """Reauthorize and materialize a durable bind without reselection."""
 
+    self._require_executable_here(bind.capability_id)
     handle = reauthorize_capability_bind(
       bind,
       registry=self.registry,
@@ -202,6 +243,7 @@ class CapabilityExecutionResolver:
   def authorize_bind(self, bind: CapabilityBind) -> CapabilityBind:
     """Reauthorize a durable bind without credentials or adapter construction."""
 
+    self._require_executable_here(bind.capability_id)
     reauthorize_capability_bind(
       bind,
       registry=self.registry,
@@ -215,6 +257,7 @@ class CapabilityExecutionResolver:
     *,
     handle: CredentialHandle | None = None,
   ) -> BoundCapabilityExecution:
+    self._require_executable_here(bind.capability_id)
     selected_handle = handle or reauthorize_capability_bind(
       bind,
       registry=self.registry,
@@ -224,7 +267,11 @@ class CapabilityExecutionResolver:
       materialized = self.credential_materializer(selected_handle)
     except CapabilityResolutionError:
       raise
-    except Exception as exc:
+    except (LookupError, ValueError) as exc:
+      # Expected credential-authority failures (missing/rejected material)
+      # become the typed secret-free refusal.  Anything else is a programming
+      # or configuration error and propagates as such, distinct from a
+      # credential refusal.
       raise CapabilityResolutionError(
         "credential_unavailable",
         f"credential material is unavailable for {bind.provider!r}",
@@ -273,7 +320,10 @@ class CapabilityExecutionResolver:
       adapter = self.adapter_resolver(bind.adapter)
     except CapabilityResolutionError:
       raise
-    except Exception as exc:
+    except (LookupError, ValueError) as exc:
+      # Expected adapter-resolution failures (adapter unknown/uninstalled)
+      # become the typed refusal; unexpected exceptions are configuration or
+      # programming errors and propagate unchanged.
       raise CapabilityResolutionError(
         "provider_unavailable",
         f"adapter is unavailable for {bind.adapter!r}",
@@ -301,18 +351,28 @@ def derive_batch_capability_execution(
   parent_execution.validate()
   parent_auth = parent_resolver.auth_context
   parent_bind = parent_execution.bind
-  run_scoped = set(parent_auth.run_scoped_user_providers)
+  # The batch context authorizes exactly the inherited bind's credential use:
+  # a user credential is run-scoped to the bind's provider family only, and no
+  # other user handle crosses into the derived batch authorization.
   if parent_bind.credential_principal == "user":
-    run_scoped.add(parent_bind.provider)
+    user_provider_handles = {
+      provider: handle
+      for provider, handle in parent_auth.user_provider_handles.items()
+      if provider == parent_bind.provider
+    }
+    run_scoped = frozenset({parent_bind.provider})
+  else:
+    user_provider_handles = {}
+    run_scoped = frozenset()
   batch_auth = AuthContext(
     run_mode="batch",
     actor_id=parent_auth.actor_id,
     tenant_id=parent_auth.tenant_id,
-    user_provider_handles=parent_auth.user_provider_handles,
+    user_provider_handles=user_provider_handles,
     service_provider_handles=parent_auth.service_provider_handles,
     entitled_capabilities=parent_auth.entitled_capabilities,
     entitled_model_keys=parent_auth.entitled_model_keys,
-    run_scoped_user_providers=frozenset(run_scoped),
+    run_scoped_user_providers=run_scoped,
   )
   batch_resolver = CapabilityExecutionResolver(
     registry=parent_resolver.registry,
@@ -322,8 +382,14 @@ def derive_batch_capability_execution(
     adapter_resolver=parent_resolver.adapter_resolver,
     trusted_channel=parent_resolver.trusted_channel,
     authenticated_run_overrides=parent_resolver.authenticated_run_overrides,
+    executable_capability_ids=parent_resolver.executable_capability_ids,
   )
-  batch_bind = parent_bind.model_copy(update={"run_mode": "batch"})
+  # Validated construction of the derived bind: every contract validator runs
+  # rather than being bypassed by model_copy(update=...).
+  batch_bind = CapabilityBind.model_validate({
+    **parent_bind.model_dump(mode="json"),
+    "run_mode": "batch",
+  })
   batch_execution = batch_resolver.materialize_bind(batch_bind)
   return batch_resolver, batch_execution
 

@@ -149,14 +149,36 @@ def test_materializer_cannot_change_selected_credential_handle() -> None:
   assert refused.value.code == "credential_unavailable"
 
 
-def test_materializer_exception_is_secret_free_typed_refusal() -> None:
-  def _explode(_handle: CredentialHandle) -> MaterializedCredential:
-    raise RuntimeError("credential secret must not escape")
+def test_materializer_expected_failure_is_secret_free_typed_refusal() -> None:
+  def _missing(_handle: CredentialHandle) -> MaterializedCredential:
+    raise LookupError("credential secret must not escape")
 
   with pytest.raises(CapabilityResolutionError) as refused:
-    _resolver(materializer=_explode).resolve("session.driver")
+    _resolver(materializer=_missing).resolve("session.driver")
   assert refused.value.code == "credential_unavailable"
   assert "secret" not in str(refused.value)
+
+
+def test_materializer_unexpected_exception_is_not_a_credential_refusal() -> None:
+  """A programming/configuration error must not masquerade as a typed refusal."""
+
+  def _explode(_handle: CredentialHandle) -> MaterializedCredential:
+    raise RuntimeError("materializer misconfigured")
+
+  with pytest.raises(RuntimeError, match="materializer misconfigured"):
+    _resolver(materializer=_explode).resolve("session.driver")
+
+
+def test_adapter_resolver_unexpected_exception_propagates_unwrapped() -> None:
+  resolver = _resolver()
+  object.__setattr__(
+    resolver,
+    "adapter_resolver",
+    lambda adapter: (_ for _ in ()).throw(RuntimeError("adapter wiring bug")),
+  )
+
+  with pytest.raises(RuntimeError, match="adapter wiring bug"):
+    resolver.resolve("session.driver")
 
 
 def test_adapter_resolver_failure_is_typed_before_runtime_dispatch() -> None:
@@ -355,6 +377,54 @@ def test_batch_derivation_preserves_exact_bind_and_scopes_user_handle() -> None:
   assert batch.bind == interactive.bind.model_copy(update={"run_mode": "batch"})
   assert batch.bind.credential_ref == interactive.bind.credential_ref
   assert "anthropic" in batch_resolver.auth_context.run_scoped_user_providers
+
+
+def test_batch_derivation_narrows_user_scope_to_the_inherited_binds_provider() -> None:
+  """Only the bind's own user credential crosses into the batch authorization."""
+
+  resolver = _resolver(auth=_auth(providers=("anthropic", "openai", "xai")))
+  interactive = resolver.resolve("session.driver")
+  assert interactive.bind.credential_principal == "user"
+  assert interactive.bind.provider == "anthropic"
+
+  batch_resolver, batch = derive_batch_capability_execution(
+    resolver,
+    interactive,
+  )
+
+  assert batch_resolver.auth_context.run_scoped_user_providers == frozenset(
+    {"anthropic"}
+  )
+  assert set(batch_resolver.auth_context.user_provider_handles) == {"anthropic"}
+  assert batch.bind.run_mode == "batch"
+
+
+def test_batch_derivation_from_service_parent_carries_no_user_handles() -> None:
+  auth = AuthContext(
+    run_mode="interactive",
+    actor_id="alice",
+    tenant_id="tenant",
+    user_provider_handles={"openai": _handle("openai")},
+    service_provider_handles={
+      "anthropic": _handle("anthropic", principal="service"),
+    },
+    entitled_capabilities=CAPABILITY_IDS,
+    entitled_model_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
+    allow_service_for_interactive=True,
+  )
+  resolver = _resolver(auth=auth)
+  interactive = resolver.resolve("session.driver")
+  assert interactive.bind.credential_principal == "service"
+
+  batch_resolver, batch = derive_batch_capability_execution(
+    resolver,
+    interactive,
+  )
+
+  assert batch_resolver.auth_context.run_scoped_user_providers == frozenset()
+  assert dict(batch_resolver.auth_context.user_provider_handles) == {}
+  assert batch.bind.credential_principal == "service"
+  assert batch.bind.run_mode == "batch"
 
 
 def test_batch_service_default_uses_service_principal() -> None:

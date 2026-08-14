@@ -1430,3 +1430,38 @@ def test_truncate_helper_as_text_summary_ends_with_separator() -> None:
   truncated = truncate_to_last_compaction(messages, compaction_as_text=True)
 
   assert truncated[0]["content"][0]["text"].endswith("\n\n")
+
+
+def test_declared_adapter_support_matches_messages_implementation() -> None:
+  from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
+
+  declaration = AnthropicProvider.adapter_route_support()
+
+  assert declaration is not None
+  assert declaration.adapter == "anthropic.messages"
+  assert declaration.provider == "anthropic"
+  assert declaration.protocol_profiles == frozenset(
+    {"messages.standard", "messages.adaptive"}
+  )
+  assert declaration.routes == frozenset({"anthropic.public"})
+
+  # Admits the packaged public-Messages entries (adaptive and standard).
+  for key in (
+    "anthropic.claude-opus-5",
+    "anthropic.claude-haiku-4-5",
+    "anthropic.claude-haiku-4-5-20251001-gateway",
+  ):
+    assert declaration.supports(INITIAL_MODEL_REGISTRY.require(key)), key
+
+  # The Risk-local SDK adapter's execution identities are a different
+  # implementation in a different serving process — never claimed here.
+  for key in (
+    "anthropic.claude-sonnet-4-6-sdk",
+    "anthropic.claude-opus-4-8-oauth",
+    "anthropic.claude-sonnet-4-20250514-sdk",
+  ):
+    assert not declaration.supports(INITIAL_MODEL_REGISTRY.require(key)), key
+
+  # messages.adaptive is a real protocol fact of this implementation: the
+  # adaptive-thinking models resolve as thinking-capable.
+  assert AnthropicProvider().get_model_info("claude-opus-5").supports_thinking

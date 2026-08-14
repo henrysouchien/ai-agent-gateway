@@ -18,11 +18,14 @@ from agent_gateway.capability_binding import (
 )
 from agent_gateway.model_registry import (
   CAPABILITY_IDS,
-  INITIAL_ADAPTER_ROUTE_SUPPORT,
+  GATEWAY_EXECUTED_CAPABILITY_IDS,
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
+  CapabilityDefault,
   ProductModelRegistry,
+  ProductModelSelectionPolicy,
 )
+from agent_gateway.providers import installed_adapter_route_support
 from agent_workflow_contracts import CapabilityBind
 
 
@@ -99,7 +102,10 @@ def _resolve(
 
 
 def test_initial_registry_is_closed_over_installed_adapter_support() -> None:
-  INITIAL_MODEL_REGISTRY.admit_adapter_support(INITIAL_ADAPTER_ROUTE_SUPPORT)
+  INITIAL_MODEL_REGISTRY.admit_adapter_support(
+    installed_adapter_route_support(),
+    executed_capability_ids=GATEWAY_EXECUTED_CAPABILITY_IDS,
+  )
   INITIAL_MODEL_SELECTION_POLICY.admit_registry(INITIAL_MODEL_REGISTRY)
   assert len(INITIAL_MODEL_REGISTRY.models) == 16
   assert set(INITIAL_MODEL_SELECTION_POLICY.capabilities) == CAPABILITY_IDS
@@ -201,10 +207,19 @@ def test_provider_or_upstream_selectors_are_not_model_keys(selector: str) -> Non
     )
 
   assert refused.value.code == "capability_model_unavailable"
+  # Refusals carry the current eligible stable keys so the client can recover
+  # explicitly; the raw selector is echoed but never repaired or inferred.
   assert refused.value.receipt() == {
     "error_code": "capability_model_unavailable",
     "capability_id": "session.driver",
     "model_key": selector,
+    "eligible_model_keys": [
+      "anthropic.claude-fable-5",
+      "anthropic.claude-haiku-4-5",
+      "anthropic.claude-mythos-5",
+      "anthropic.claude-opus-5",
+      "anthropic.claude-sonnet-5",
+    ],
   }
 
 
@@ -449,6 +464,248 @@ def test_plan_author_inherits_exact_parent_identity_and_effort() -> None:
   assert author.capability_id == "plan.author"
 
 
+def test_parent_inheritance_copies_credential_run_mode_and_provenance_whole() -> None:
+  """Product decision 4: exact parent inheritance copies the WHOLE binding."""
+
+  parent_auth = AuthContext(
+    run_mode="interactive",
+    actor_id="alice",
+    tenant_id="tenant",
+    user_provider_handles={},
+    service_provider_handles={"anthropic": _service_handle("anthropic")},
+    entitled_capabilities=CAPABILITY_IDS,
+    entitled_model_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
+    allow_service_for_interactive=True,
+  )
+  parent = _resolve("session.driver", auth=parent_auth).model_copy(
+    update={"registry_revision": "older-registry", "policy_revision": "older-policy"}
+  )
+  assert parent.credential_principal == "service"
+
+  # The child context also holds an eligible user credential; whole-binding
+  # inheritance must NOT re-select it in place of the parent's service handle.
+  child_auth = AuthContext(
+    run_mode="interactive",
+    actor_id="alice",
+    tenant_id="tenant",
+    user_provider_handles={"anthropic": _user_handle("anthropic")},
+    service_provider_handles={"anthropic": _service_handle("anthropic")},
+    entitled_capabilities=CAPABILITY_IDS,
+    entitled_model_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
+    allow_service_for_interactive=True,
+  )
+  author = _resolve("plan.author", auth=child_auth, parent_bind=parent)
+
+  assert author.capability_id == "plan.author"
+  assert author.selection_source == "parent_binding"
+  assert (
+    author.credential_principal,
+    author.credential_ref,
+    author.run_mode,
+    author.registry_revision,
+    author.policy_revision,
+  ) == (
+    parent.credential_principal,
+    parent.credential_ref,
+    parent.run_mode,
+    parent.registry_revision,
+    parent.policy_revision,
+  )
+
+
+def test_parent_inheritance_refuses_rotated_credential_without_substitution() -> None:
+  parent = _resolve("session.driver")
+
+  rotated_auth = AuthContext(
+    run_mode="interactive",
+    actor_id="alice",
+    tenant_id="tenant",
+    user_provider_handles={
+      "anthropic": CredentialHandle(
+        handle_id="user:tenant:alice:anthropic:rotated",
+        provider="anthropic",
+        principal="user",
+        tenant_id="tenant",
+        actor_id="alice",
+      ),
+    },
+    service_provider_handles={},
+    entitled_capabilities=CAPABILITY_IDS,
+    entitled_model_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
+  )
+  with pytest.raises(CapabilityResolutionError) as refused:
+    _resolve("plan.author", auth=rotated_auth, parent_bind=parent)
+
+  assert refused.value.code == "credential_unavailable"
+  assert refused.value.eligible_model_keys  # actionable recovery choices
+
+
+def test_channel_inherit_parent_checks_identity_consistency() -> None:
+  """The by_channel inherit branch applies the same parent-identity check."""
+
+  plan_policy = INITIAL_MODEL_SELECTION_POLICY.capabilities["plan.author"]
+  capabilities = dict(INITIAL_MODEL_SELECTION_POLICY.capabilities)
+  capabilities["plan.author"] = replace(
+    plan_policy,
+    by_channel={"cli": CapabilityDefault("inherit_parent")},
+  )
+  selection_policy = ProductModelSelectionPolicy(
+    schema="product-model-selection/v1",
+    revision="channel-inherit-test",
+    capabilities=capabilities,
+  )
+  parent = _resolve("session.driver")
+  tampered = parent.model_copy(update={"route": "attacker.route"})
+
+  with pytest.raises(CapabilityResolutionError) as refused:
+    resolve_capability_model(
+      "plan.author",
+      registry=INITIAL_MODEL_REGISTRY,
+      selection_policy=selection_policy,
+      auth=_auth(),
+      trusted_channel="cli",
+      parent_bind=tampered,
+    )
+  assert refused.value.code == "parent_binding_incompatible"
+
+  inherited = resolve_capability_model(
+    "plan.author",
+    registry=INITIAL_MODEL_REGISTRY,
+    selection_policy=selection_policy,
+    auth=_auth(),
+    trusted_channel="cli",
+    parent_bind=parent,
+  )
+  assert inherited.selection_source == "parent_binding"
+  assert inherited.credential_ref == parent.credential_ref
+
+
+def test_stale_catalog_revision_with_ineligible_key_is_typed_stale_refusal() -> None:
+  with pytest.raises(CapabilityResolutionError) as refused:
+    _resolve(
+      "session.driver",
+      explicit_intent=ModelSelectionIntent(
+        model_key="anthropic.does-not-exist",
+        effort=None,
+        source="explicit_user",
+        catalog_revision="1999-01-01.0",
+      ),
+    )
+
+  assert refused.value.code == "capability_catalog_stale"
+  assert refused.value.catalog_revision == INITIAL_MODEL_REGISTRY.revision
+  assert "anthropic.claude-opus-5" in refused.value.eligible_model_keys
+  receipt = refused.value.receipt()
+  assert receipt["error_code"] == "capability_catalog_stale"
+  assert receipt["catalog_revision"] == INITIAL_MODEL_REGISTRY.revision
+
+
+def test_stale_catalog_revision_with_still_eligible_key_is_accepted() -> None:
+  bind = _resolve(
+    "session.driver",
+    explicit_intent=ModelSelectionIntent(
+      model_key="anthropic.claude-sonnet-5",
+      effort="xhigh",
+      source="explicit_user",
+      catalog_revision="1999-01-01.0",
+    ),
+  )
+
+  assert bind.model_key == "anthropic.claude-sonnet-5"
+  assert bind.effort == "xhigh"
+  assert bind.selection_source == "explicit_user"
+
+
+def test_current_catalog_revision_keeps_specific_refusal_codes() -> None:
+  with pytest.raises(CapabilityResolutionError) as refused:
+    _resolve(
+      "session.driver",
+      explicit_intent=ModelSelectionIntent(
+        model_key="anthropic.does-not-exist",
+        effort=None,
+        source="explicit_user",
+        catalog_revision=INITIAL_MODEL_REGISTRY.revision,
+      ),
+    )
+
+  assert refused.value.code == "capability_model_unavailable"
+  assert refused.value.eligible_model_keys
+
+
+def test_explicit_choice_without_effort_uses_policy_effort_not_entry_default() -> None:
+  # session.driver policy effort is "high"; openai.gpt-5-6's own default is
+  # "medium".  Design § Selection rules: the policy effort applies when the
+  # source carries none.
+  bind = _resolve(
+    "session.driver",
+    auth=_auth(providers=("openai",)),
+    explicit_intent=ModelSelectionIntent(
+      model_key="openai.gpt-5-6",
+      effort=None,
+      source="explicit_user",
+    ),
+  )
+
+  assert bind.effort == "high"
+
+
+def test_explicit_choice_with_unsupported_policy_effort_refuses_not_repairs() -> None:
+  # anthropic.claude-haiku-4-5 supports only "none"; the applicable policy
+  # effort "high" is not silently repaired to the entry default.
+  with pytest.raises(CapabilityResolutionError) as refused:
+    _resolve(
+      "session.driver",
+      explicit_intent=ModelSelectionIntent(
+        model_key="anthropic.claude-haiku-4-5",
+        effort=None,
+        source="explicit_user",
+      ),
+    )
+
+  assert refused.value.code == "capability_effort_unsupported"
+  assert refused.value.eligible_model_keys
+
+
+def test_explicit_choice_of_unexposed_model_is_refused_like_choices() -> None:
+  """The resolver refuses what eligible_model_choices would not advertise."""
+
+  entries = dict(INITIAL_MODEL_REGISTRY.models)
+  entries["anthropic.claude-sonnet-5"] = replace(
+    entries["anthropic.claude-sonnet-5"],
+    capabilities={
+      capability_id: "internal"
+      for capability_id in entries["anthropic.claude-sonnet-5"].capabilities
+    },
+  )
+  registry = ProductModelRegistry(
+    schema="product-model-registry/v1",
+    revision="exposure-test",
+    models=entries,
+  )
+
+  choices = eligible_model_choices(
+    "session.driver",
+    registry=registry,
+    selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+    auth=_auth(),
+  )
+  assert "anthropic.claude-sonnet-5" not in {choice.key for choice in choices}
+
+  with pytest.raises(CapabilityResolutionError) as refused:
+    resolve_capability_model(
+      "session.driver",
+      registry=registry,
+      selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      auth=_auth(),
+      explicit_intent=ModelSelectionIntent(
+        model_key="anthropic.claude-sonnet-5",
+        effort="high",
+        source="explicit_user",
+      ),
+    )
+  assert refused.value.code == "capability_model_not_allowed"
+
+
 def test_plan_author_requires_parent_without_authenticated_override() -> None:
   with pytest.raises(CapabilityResolutionError) as refused:
     _resolve("plan.author")
@@ -587,3 +844,115 @@ def test_interactive_service_handle_requires_explicit_server_policy() -> None:
     allow_service_for_interactive=True,
   )
   assert _resolve("session.driver", auth=admitted).credential_principal == "service"
+
+
+# --- Externally-executed capability designation (review item C2/C3) ---
+#
+# risk.* and investment.* workload capabilities are admitted registry facts
+# resolved and executed inside their own serving processes.  A gateway-process
+# resolver constructed with the gateway executable set refuses them with the
+# named typed code before any credential or adapter work — never a stream-time
+# provider_unavailable.
+
+
+def _gateway_process_resolver(auth: AuthContext):
+  from agent_gateway.capability_execution import CapabilityExecutionResolver
+
+  def _never_materialize(handle):
+    raise AssertionError("must refuse before credential materialization")
+
+  def _never_resolve_adapter(adapter_id):
+    raise AssertionError("must refuse before adapter resolution")
+
+  return CapabilityExecutionResolver(
+    registry=INITIAL_MODEL_REGISTRY,
+    selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+    auth_context=auth,
+    credential_materializer=_never_materialize,
+    adapter_resolver=_never_resolve_adapter,
+    executable_capability_ids=GATEWAY_EXECUTED_CAPABILITY_IDS,
+  )
+
+
+def test_externally_executed_capability_draws_typed_refusal_on_resolve() -> None:
+  auth = _auth(
+    run_mode="batch",
+    service=True,
+    capabilities=frozenset({"risk.completion"}),
+    model_keys=frozenset({"anthropic.claude-sonnet-4-6-sdk"}),
+  )
+  resolver = _gateway_process_resolver(auth)
+
+  with pytest.raises(CapabilityResolutionError) as refused:
+    resolver.resolve("risk.completion")
+
+  assert refused.value.code == "capability_externally_executed"
+  assert refused.value.capability_id == "risk.completion"
+  assert "risk" in str(refused.value)
+
+
+def test_externally_executed_bind_refuses_gateway_materialization() -> None:
+  # The bind itself is a legitimate admitted registry fact (this is exactly
+  # how the Risk process resolves it); only executing it HERE is refused.
+  auth = _auth(
+    run_mode="batch",
+    service=True,
+    capabilities=frozenset({"risk.completion"}),
+    model_keys=frozenset({"anthropic.claude-sonnet-4-6-sdk"}),
+  )
+  bind = _resolve("risk.completion", auth=auth)
+  assert bind.adapter == "anthropic.sdk.messages"
+  resolver = _gateway_process_resolver(auth)
+
+  with pytest.raises(CapabilityResolutionError) as refused:
+    resolver.materialize_bind(bind)
+
+  assert refused.value.code == "capability_externally_executed"
+
+
+def test_gateway_executed_capability_is_not_blocked_by_the_designation() -> None:
+  from agent_gateway.capability_execution import (
+    CapabilityExecutionResolver,
+    MaterializedCredential,
+  )
+  from agent_gateway.providers import AnthropicProvider
+
+  handle = _user_handle("anthropic")
+  auth = _auth()
+  materialized = MaterializedCredential(
+    handle=handle,
+    auth_config={
+      "provider": "anthropic",
+      "billing_mode": "byok",
+      "auth_mode": "api",
+      "api_key": "test-api-key",
+      "max_tokens": 16_000,
+    },
+  )
+  resolver = CapabilityExecutionResolver(
+    registry=INITIAL_MODEL_REGISTRY,
+    selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+    auth_context=auth,
+    credential_materializer=lambda selected: materialized,
+    adapter_resolver=lambda adapter_id: AnthropicProvider(),
+    executable_capability_ids=GATEWAY_EXECUTED_CAPABILITY_IDS,
+  )
+
+  execution = resolver.resolve("session.driver")
+
+  assert execution.bind.capability_id == "session.driver"
+  assert execution.bind.model_key == "anthropic.claude-opus-5"
+
+
+def test_unknown_executable_capability_designation_is_rejected() -> None:
+  from agent_gateway.capability_execution import CapabilityExecutionResolver
+
+  with pytest.raises(ValueError, match="unknown capabilities"):
+    CapabilityExecutionResolver(
+      registry=INITIAL_MODEL_REGISTRY,
+      selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      auth_context=_auth(),
+      credential_materializer=lambda handle: None,
+      adapter_resolver=lambda adapter_id: None,
+      executable_capability_ids=frozenset({"session.driver", "made.up"}),
+    )

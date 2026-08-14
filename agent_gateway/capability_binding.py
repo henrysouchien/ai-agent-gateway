@@ -26,6 +26,7 @@ IntentSource: TypeAlias = Literal["explicit_user", "saved_preference"]
 CapabilityResolutionCode: TypeAlias = Literal[
   "unknown_capability",
   "capability_policy_missing",
+  "capability_catalog_stale",
   "capability_model_not_allowed",
   "capability_model_unavailable",
   "capability_model_deprecated",
@@ -34,6 +35,7 @@ CapabilityResolutionCode: TypeAlias = Literal[
   "capability_effort_invalid",
   "capability_effort_unsupported",
   "capability_entitlement_required",
+  "capability_externally_executed",
   "credential_unavailable",
   "default_not_eligible",
   "parent_binding_required",
@@ -59,6 +61,7 @@ class CapabilityResolutionError(ValueError):
     provider: str | None = None,
     upstream_model: str | None = None,
     eligible_model_keys: tuple[str, ...] = (),
+    catalog_revision: str | None = None,
   ) -> None:
     super().__init__(message)
     self.code = code
@@ -67,6 +70,7 @@ class CapabilityResolutionError(ValueError):
     self.provider = provider
     self.upstream_model = upstream_model
     self.eligible_model_keys = eligible_model_keys
+    self.catalog_revision = catalog_revision
 
   def receipt(self) -> dict[str, object]:
     receipt: dict[str, object] = {
@@ -81,6 +85,8 @@ class CapabilityResolutionError(ValueError):
       receipt["upstream_model"] = self.upstream_model
     if self.eligible_model_keys:
       receipt["eligible_model_keys"] = list(self.eligible_model_keys)
+    if self.catalog_revision is not None:
+      receipt["catalog_revision"] = self.catalog_revision
     return receipt
 
 
@@ -323,11 +329,30 @@ def _entry_for_key(
     )
 
 
+def _user_exposed(
+  *,
+  capability_id: str,
+  entry: ModelRegistryEntry,
+  policy: CapabilitySelectionPolicy,
+) -> bool:
+  """Whether the entry is exposed to user selection, as eligible choices are."""
+
+  exposure = entry.capabilities.get(capability_id)
+  return (
+    exposure == "user_selectable"
+    or (
+      exposure == "internal"
+      and policy.allow_authenticated_run_override
+    )
+  )
+
+
 def _validate_entry_for_policy(
   *,
   capability_id: str,
   entry: ModelRegistryEntry,
   policy: CapabilitySelectionPolicy,
+  user_selected: bool = False,
 ) -> None:
   if entry.key not in policy.allowed_model_keys:
     _refuse(
@@ -343,6 +368,20 @@ def _validate_entry_for_policy(
       capability_id=capability_id,
       entry=entry,
     )
+  if user_selected:
+    # The resolver is the security boundary: a user-driven selection may only
+    # admit what eligible_model_choices would advertise for this capability.
+    if not _user_exposed(
+      capability_id=capability_id,
+      entry=entry,
+      policy=policy,
+    ):
+      _refuse(
+        "capability_model_not_allowed",
+        f"{entry.key} is not user-selectable for {capability_id}",
+        capability_id=capability_id,
+        entry=entry,
+      )
   if entry.lifecycle == "deprecated":
     _refuse(
       "capability_model_deprecated",
@@ -364,6 +403,66 @@ def _validate_entry_for_policy(
       capability_id=capability_id,
       entry=entry,
     )
+  if user_selected and entry.lifecycle != "active":
+    # Only "hidden" remains after the specific lifecycle refusals above:
+    # eligible_model_choices never advertises it, so user-driven selection
+    # refuses it rather than admitting a broader set than choices expose.
+    _refuse(
+      "capability_model_unavailable",
+      f"{entry.key} is not available for selection for {capability_id}",
+      capability_id=capability_id,
+      entry=entry,
+    )
+
+
+def _policy_effort(
+  policy: CapabilitySelectionPolicy,
+  trusted_channel: str | None,
+) -> str | None:
+  """The applicable channel/capability policy effort for sourced selections.
+
+  Design § Selection rules: effort follows the selection source only when the
+  source explicitly carries an effort; otherwise the applicable capability or
+  channel policy effort applies.  Only when the policy carries no effort (for
+  example an inherit_parent default) does the registry entry's own default
+  effort apply.
+  """
+
+  channel = str(trusted_channel or "").strip()
+  if channel and channel in policy.by_channel:
+    channel_effort = policy.by_channel[channel].effort
+    if channel_effort is not None:
+      return channel_effort
+  return policy.default.effort
+
+
+def _parent_entry(
+  *,
+  capability_id: str,
+  registry: ProductModelRegistry,
+  parent_bind: CapabilityBind,
+) -> ModelRegistryEntry:
+  """The current registry entry for an exact parent binding, identity-checked."""
+
+  entry = _entry_for_key(
+    registry,
+    capability_id=capability_id,
+    model_key=parent_bind.model_key,
+  )
+  if (
+    entry.provider != parent_bind.provider
+    or entry.upstream_model != parent_bind.upstream_model
+    or entry.adapter != parent_bind.adapter
+    or entry.protocol_profile != parent_bind.protocol_profile
+    or entry.route != parent_bind.route
+  ):
+    _refuse(
+      "parent_binding_incompatible",
+      f"{capability_id} parent binding identity is inconsistent with its stable key",
+      capability_id=capability_id,
+      entry=entry,
+    )
+  return entry
 
 
 def _eligible_handle(
@@ -405,13 +504,10 @@ def eligible_model_choices(
   choices: list[EligibleModelChoice] = []
   for key in sorted(policy.allowed_model_keys):
     entry = registry.require(key)
-    exposure = entry.capabilities.get(normalized)
-    if not (
-      exposure == "user_selectable"
-      or (
-        exposure == "internal"
-        and policy.allow_authenticated_run_override
-      )
+    if not _user_exposed(
+      capability_id=normalized,
+      entry=entry,
+      policy=policy,
     ):
       continue
     if entry.lifecycle != "active":
@@ -458,6 +554,7 @@ def saved_preference_ineligibility(
   registry: ProductModelRegistry,
   policy: CapabilitySelectionPolicy,
   auth: AuthContext,
+  trusted_channel: str | None = None,
 ) -> SavedPreferenceIneligibilityReason | None:
   """Why a saved preference cannot be applied now, or None if it is eligible.
 
@@ -476,16 +573,17 @@ def saved_preference_ineligibility(
     return _LIFECYCLE_INELIGIBILITY.get(entry.lifecycle, "model_hidden")
   if entry.key not in policy.allowed_model_keys:
     return "model_not_allowed"
-  exposure = entry.capabilities.get(capability_id)
-  if not (
-    exposure == "user_selectable"
-    or (
-      exposure == "internal"
-      and policy.allow_authenticated_run_override
-    )
+  if not _user_exposed(
+    capability_id=capability_id,
+    entry=entry,
+    policy=policy,
   ):
     return "model_not_allowed"
-  effort = saved_preference.effort or entry.default_effort
+  effort = (
+    saved_preference.effort
+    or _policy_effort(policy, trusted_channel)
+    or entry.default_effort
+  )
   if effort not in entry.supported_efforts:
     return "effort_unsupported"
   if _eligible_handle(
@@ -508,6 +606,7 @@ def _selection_candidate(
   trusted_channel: str | None,
   parent_bind: CapabilityBind | None,
 ) -> tuple[ModelRegistryEntry, str, SelectionSource]:
+  sourced_policy_effort = _policy_effort(policy, trusted_channel)
   if explicit_intent is not None:
     if explicit_intent.source != "explicit_user" or not policy.allow_explicit_user:
       _refuse(
@@ -521,7 +620,11 @@ def _selection_candidate(
       capability_id=capability_id,
       model_key=explicit_intent.model_key,
     )
-    effort = explicit_intent.effort or entry.default_effort
+    effort = (
+      explicit_intent.effort
+      or sourced_policy_effort
+      or entry.default_effort
+    )
     return entry, effort, "explicit_user"
 
   if saved_preference is not None:
@@ -537,7 +640,11 @@ def _selection_candidate(
       capability_id=capability_id,
       model_key=saved_preference.model_key,
     )
-    effort = saved_preference.effort or entry.default_effort
+    effort = (
+      saved_preference.effort
+      or sourced_policy_effort
+      or entry.default_effort
+    )
     return entry, effort, "saved_preference"
 
   if authenticated_run_override is not None:
@@ -556,7 +663,11 @@ def _selection_candidate(
       capability_id=capability_id,
       model_key=authenticated_run_override.model_key,
     )
-    effort = authenticated_run_override.effort or entry.default_effort
+    effort = (
+      authenticated_run_override.effort
+      or sourced_policy_effort
+      or entry.default_effort
+    )
     return entry, effort, "explicit_user"
 
   channel = str(trusted_channel or "").strip()
@@ -569,10 +680,10 @@ def _selection_candidate(
           f"{capability_id} requires a parent binding",
           capability_id=capability_id,
         )
-      entry = _entry_for_key(
-        registry,
+      entry = _parent_entry(
         capability_id=capability_id,
-        model_key=parent_bind.model_key,
+        registry=registry,
+        parent_bind=parent_bind,
       )
       return entry, parent_bind.effort, "parent_binding"
     entry = registry.require(channel_default.model_key or "")
@@ -585,24 +696,11 @@ def _selection_candidate(
         f"{capability_id} requires an exact parent binding",
         capability_id=capability_id,
       )
-    entry = _entry_for_key(
-      registry,
+    entry = _parent_entry(
       capability_id=capability_id,
-      model_key=parent_bind.model_key,
+      registry=registry,
+      parent_bind=parent_bind,
     )
-    if (
-      entry.provider != parent_bind.provider
-      or entry.upstream_model != parent_bind.upstream_model
-      or entry.adapter != parent_bind.adapter
-      or entry.protocol_profile != parent_bind.protocol_profile
-      or entry.route != parent_bind.route
-    ):
-      _refuse(
-        "parent_binding_incompatible",
-        f"{capability_id} parent binding identity is inconsistent with its stable key",
-        capability_id=capability_id,
-        entry=entry,
-      )
     return entry, parent_bind.effort, "parent_binding"
 
   entry = registry.require(policy.default.model_key or "")
@@ -610,6 +708,18 @@ def _selection_candidate(
     "capability_default" if capability_id == "session.driver" else "internal_policy"
   )
   return entry, policy.default.effort or entry.default_effort, source
+
+
+_STALE_CATALOG_REFUSAL_CODES: frozenset[str] = frozenset({
+  "capability_model_unavailable",
+  "capability_model_not_allowed",
+  "capability_model_deprecated",
+  "capability_model_disabled",
+  "capability_model_revoked",
+  "capability_effort_unsupported",
+  "capability_entitlement_required",
+  "credential_unavailable",
+})
 
 
 def resolve_capability_model(
@@ -641,6 +751,72 @@ def resolve_capability_model(
       capability_id=normalized,
     )
 
+  try:
+    return _resolve_admitted_capability_model(
+      normalized,
+      registry=registry,
+      selection_policy=selection_policy,
+      policy=policy,
+      auth=auth,
+      explicit_intent=explicit_intent,
+      saved_preference=saved_preference,
+      authenticated_run_override=authenticated_run_override,
+      trusted_channel=trusted_channel,
+      parent_bind=parent_bind,
+    )
+  except CapabilityResolutionError as exc:
+    if not exc.eligible_model_keys:
+      # Refusals always carry the current eligible choices so a client can
+      # recover explicitly (design § Failure and fallback behavior).
+      choices = eligible_model_choices(
+        normalized,
+        registry=registry,
+        selection_policy=selection_policy,
+        auth=auth,
+      )
+      exc.eligible_model_keys = tuple(choice.key for choice in choices)
+    observed_revision = (
+      explicit_intent.catalog_revision if explicit_intent is not None else None
+    )
+    if (
+      observed_revision is not None
+      and observed_revision != registry.revision
+      and exc.code in _STALE_CATALOG_REFUSAL_CODES
+    ):
+      # The catalog revision is concurrency context, not authority: a
+      # still-eligible key is accepted despite a stale revision, but a key
+      # that no longer resolves under the current catalog names the stale
+      # revision so the client refreshes choices instead of retrying blind.
+      raise CapabilityResolutionError(
+        "capability_catalog_stale",
+        (
+          f"the selection was made against catalog revision "
+          f"{observed_revision!r}; the current revision is "
+          f"{registry.revision!r} and the selection no longer resolves"
+        ),
+        capability_id=normalized,
+        model_key=exc.model_key,
+        provider=exc.provider,
+        upstream_model=exc.upstream_model,
+        eligible_model_keys=exc.eligible_model_keys,
+        catalog_revision=registry.revision,
+      ) from exc
+    raise
+
+
+def _resolve_admitted_capability_model(
+  normalized: str,
+  *,
+  registry: ProductModelRegistry,
+  selection_policy: ProductModelSelectionPolicy,
+  policy: CapabilitySelectionPolicy,
+  auth: AuthContext,
+  explicit_intent: ModelSelectionIntent | None,
+  saved_preference: ModelSelectionIntent | None,
+  authenticated_run_override: ModelSelectionIntent | None,
+  trusted_channel: str | None,
+  parent_bind: CapabilityBind | None,
+) -> CapabilityBind:
   effective_saved_preference = saved_preference
   if saved_preference is not None:
     if saved_preference.source != "saved_preference" or not policy.allow_saved_preference:
@@ -656,6 +832,7 @@ def resolve_capability_model(
       registry=registry,
       policy=policy,
       auth=auth,
+      trusted_channel=trusted_channel,
     ) is not None:
       # A saved preference is not current execution intent.  Preserve it in the
       # preference store, report it as not applied at the API boundary, and
@@ -676,6 +853,7 @@ def resolve_capability_model(
     capability_id=normalized,
     entry=entry,
     policy=policy,
+    user_selected=source in {"explicit_user", "saved_preference"},
   )
   resolved_effort = _canonical_effort(effort, field_name=f"{normalized}.effort")
   if resolved_effort not in entry.supported_efforts:
@@ -686,19 +864,27 @@ def resolve_capability_model(
       entry=entry,
     )
 
+  if source == "parent_binding":
+    if parent_bind is None:  # pragma: no cover - guarded by _selection_candidate
+      _refuse(
+        "parent_binding_required",
+        f"{normalized} requires an exact parent binding",
+        capability_id=normalized,
+      )
+    return _inherit_parent_binding_whole(
+      normalized,
+      entry=entry,
+      auth=auth,
+      parent_bind=parent_bind,
+      resolved_effort=resolved_effort,
+    )
+
   handle = _eligible_handle(
     auth=auth,
     capability_id=normalized,
     entry=entry,
   )
   if handle is None:
-    choices = eligible_model_choices(
-      normalized,
-      registry=registry,
-      selection_policy=selection_policy,
-      auth=auth,
-    )
-    eligible_keys = tuple(choice.key for choice in choices)
     code: CapabilityResolutionCode
     if source in {"capability_default", "channel_default", "internal_policy"}:
       code = "default_not_eligible"
@@ -711,7 +897,6 @@ def resolve_capability_model(
       f"{entry.key} is not eligible for {normalized}; credential or entitlement action is required",
       capability_id=normalized,
       entry=entry,
-      eligible_model_keys=eligible_keys,
     )
 
   return CapabilityBind(
@@ -730,6 +915,64 @@ def resolve_capability_model(
     registry_revision=registry.revision,
     policy_revision=selection_policy.revision,
     selection_source=source,
+  )
+
+
+def _inherit_parent_binding_whole(
+  normalized: str,
+  *,
+  entry: ModelRegistryEntry,
+  auth: AuthContext,
+  parent_bind: CapabilityBind,
+  resolved_effort: str,
+) -> CapabilityBind:
+  """Copy the exact parent binding whole for the inheriting capability.
+
+  Product decision 4 / plan §6.D: exact parent inheritance copies the whole
+  binding — execution identity, effort, credential principal and reference,
+  run mode, and registry/policy revision provenance — with only the capability
+  and ``selection_source: parent_binding`` naming the child.  The parent's
+  credential is REauthorized against current facts (it may have been rotated
+  or revoked); it is never re-selected, so an ineligible parent credential is
+  a typed refusal, not a substitution.
+  """
+
+  handle = _eligible_handle(
+    auth=auth,
+    capability_id=normalized,
+    entry=entry,
+    credential_ref=parent_bind.credential_ref,
+    credential_principal=parent_bind.credential_principal,
+  )
+  if handle is None:
+    code: CapabilityResolutionCode
+    if normalized not in auth.entitled_capabilities or entry.key not in auth.entitled_model_keys:
+      code = "capability_entitlement_required"
+    else:
+      code = "credential_unavailable"
+    _refuse(
+      code,
+      f"the parent binding's credential authority is not eligible for {normalized}",
+      capability_id=normalized,
+      entry=entry,
+    )
+
+  return CapabilityBind(
+    schema_version="1.0",
+    capability_id=normalized,
+    model_key=parent_bind.model_key,
+    provider=parent_bind.provider,
+    upstream_model=parent_bind.upstream_model,
+    adapter=parent_bind.adapter,
+    protocol_profile=parent_bind.protocol_profile,
+    route=parent_bind.route,
+    effort=resolved_effort,
+    credential_principal=parent_bind.credential_principal,
+    credential_ref=parent_bind.credential_ref,
+    run_mode=parent_bind.run_mode,
+    registry_revision=parent_bind.registry_revision,
+    policy_revision=parent_bind.policy_revision,
+    selection_source="parent_binding",
   )
 
 

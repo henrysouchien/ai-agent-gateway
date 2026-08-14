@@ -98,7 +98,9 @@ from .capability_execution import (
   MaterializedCredential,
 )
 from .model_registry import (
-  INITIAL_ADAPTER_ROUTE_SUPPORT,
+  CAPABILITY_EXECUTION_PROCESS,
+  EXTERNALLY_EXECUTED_CAPABILITY_IDS,
+  GATEWAY_EXECUTED_CAPABILITY_IDS,
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
   AdapterRouteSupport,
@@ -172,6 +174,18 @@ from .providers import (
   StreamEvent,
   ThinkingLevel,
   XAIProvider,
+  installed_adapter_route_support,
+)
+
+# Import-time admission of the loaded INITIAL artifacts against the adapter
+# support the installed package actually declares, for the capabilities this
+# (gateway) process executes.  Externally-executed capabilities (risk.*,
+# investment.*) are admitted registry facts resolved in their own serving
+# processes.  `create_gateway_app` re-runs the full closure over whatever
+# registry the server is configured with.
+INITIAL_MODEL_REGISTRY.admit_adapter_support(
+  installed_adapter_route_support(),
+  executed_capability_ids=GATEWAY_EXECUTED_CAPABILITY_IDS,
 )
 from .memory import EmbeddingProvider, MarkdownSyncManager, MemoryStore
 from .mcp_client import McpClientManager
@@ -408,10 +422,13 @@ __all__ = [
   "McpClientManager",
   "MissingUserIdError",
   "EligibleModelChoice",
-  "INITIAL_ADAPTER_ROUTE_SUPPORT",
+  "CAPABILITY_EXECUTION_PROCESS",
+  "EXTERNALLY_EXECUTED_CAPABILITY_IDS",
+  "GATEWAY_EXECUTED_CAPABILITY_IDS",
   "INITIAL_MODEL_REGISTRY",
   "INITIAL_MODEL_SELECTION_POLICY",
   "AdapterRouteSupport",
+  "installed_adapter_route_support",
   "CapabilityDefault",
   "CapabilitySelectionPolicy",
   "ModelRegistryEntry",

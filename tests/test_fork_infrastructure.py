@@ -666,3 +666,89 @@ def test_dynamic_fork_bind_inherits_exact_parent_selection() -> None:
   assert fork.bind.upstream_model == parent.bind.upstream_model
   assert fork.bind.effort == parent.bind.effort
   assert dict(fork.auth_config) == dict(parent.auth_config)
+
+
+def test_learning_fork_provenance_uses_canonical_full_payload_digest() -> None:
+  from agent_gateway.runner_fork_agents import (
+    _LEARNING_FORK_OPERATION,
+    learning_fork_result_provenance,
+  )
+  from agent_gateway.sub_agent import seal_admitted_task_payload
+
+  parent_bind = _bind()
+  parent = BoundCapabilityExecution(
+    bind=parent_bind,
+    registry=_registry_for_bind(parent_bind),
+    adapter=_Provider(),
+    auth_config={"api_key": "secret", "provider": "anthropic"},
+  )
+  execution = _bind_learning_fork_execution(parent)
+  logical_task = OrdinaryDelegationTaskRef(
+    delegation_id="fork-1",
+    operation=_LEARNING_FORK_OPERATION,
+  )
+  attempt = AttemptRef(
+    attempt_number=1,
+    attempt_id="fork-1:attempt:1",
+    physical_task_id="sub0:parent-session",
+  )
+  requirement = ResultRequirement(
+    mode="narrative",
+    terminal_narrative="required",
+    outcome=OutcomeRequirement(required=False, source="none"),
+  )
+  scope_receipt = fork_scope_receipt_dict(
+    tool_decisions=(
+      ForkToolDecision("memory_write", "allow", "learning surface"),
+    ),
+    capability_bind=execution.bind,
+    tenant_id="tenant-1",
+    billing_mode="byok",
+    resolved_budget_usd=1.0,
+    max_turns=10,
+    suffix_ceiling=20_000,
+  )
+
+  provenance = learning_fork_result_provenance(
+    physical_task_id="sub0:parent-session",
+    logical_task=logical_task,
+    attempt=attempt,
+    objective="LEARN",
+    result_requirement=requirement,
+    execution=execution,
+    scope_receipt=scope_receipt,
+  )
+
+  # One definition of admitted_task_digest: the canonical full-payload seal
+  # from sub_agent, over the fork's complete admission payload (component
+  # digests included) — never a bespoke field subset.
+  expected_payload = {
+    "schema_version": "1.0",
+    "admitted_task_id": "admitted:sub0:parent-session",
+    "logical_task": logical_task.model_dump(mode="json"),
+    "attempt": attempt.model_dump(mode="json"),
+    "objective": "LEARN",
+    "operation": _LEARNING_FORK_OPERATION.model_dump(mode="json"),
+    "result_requirement": requirement.model_dump(mode="json"),
+    "model_bind": execution.bind.model_dump(mode="json"),
+    "scope_receipt": dict(scope_receipt),
+    "model_bind_digest": provenance.model_bind_digest,
+    "capability_binding_digest": provenance.capability_binding_digest,
+    "tool_grant_digest": provenance.tool_grant_digest,
+  }
+  assert provenance.admitted_task_digest == sha256_digest(expected_payload)
+  assert provenance.model_bind_digest == sha256_digest(execution.bind)
+  assert provenance.tool_grant_digest == sha256_digest(scope_receipt)
+
+  # The retired four-field subset digest is not the admitted task digest.
+  legacy_subset_digest = sha256_digest({
+    "logical_task": logical_task.model_dump(mode="json"),
+    "attempt": attempt.model_dump(mode="json"),
+    "objective": "LEARN",
+    "result_requirement": requirement.model_dump(mode="json"),
+  })
+  assert provenance.admitted_task_digest != legacy_subset_digest
+
+  # The seal is derived, never supplied.
+  with pytest.raises(ValueError, match="derived"):
+    seal_admitted_task_payload({"admitted_task_digest": "sha256:forged"})

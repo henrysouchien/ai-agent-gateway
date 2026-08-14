@@ -3,13 +3,30 @@
 The registry owns stable execution identity.  The policy owns defaults.  They
 are deliberately ordinary, immutable deployment configuration rather than a
 runtime service, and neither contains credential material.
+
+Registry and policy data are authored as typed deployment artifacts
+(``product-model-registry/v1`` and ``product-model-selection/v1``) packaged
+under ``agent_gateway/model_authority/``.  Both artifacts are loaded and fully
+admitted exactly once at process construction (import of this module) and any
+missing, unparsable, unknown-field, or incoherent artifact fails startup.
+
+Deployment selection: a deployment may substitute an alternative admitted
+artifact file by setting ``AGENT_GATEWAY_MODEL_REGISTRY_FILE`` and/or
+``AGENT_GATEWAY_MODEL_SELECTION_FILE`` to a file path.  This is deployment
+configuration naming WHICH artifact to load — the same admission gate runs on
+whatever is selected, fail-closed — it is never model or default authority
+itself.  The default is the packaged artifact.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Mapping, TypeAlias
+
+import yaml
 
 from .thinking import ThinkingLevel
 
@@ -57,6 +74,55 @@ INVESTMENT_CAPABILITY_IDS = frozenset({
   "investment.biotech_review",
 })
 CAPABILITY_IDS = CORE_CAPABILITY_IDS | RISK_CAPABILITY_IDS | INVESTMENT_CAPABILITY_IDS
+
+# --- Capability execution designation -----------------------------------------
+#
+# Typed constant consumed together with the registry artifact: it names which
+# serving process executes each capability.  The gateway server process executes
+# the core conversational/orchestration capabilities.  The ``risk.*`` workload
+# capabilities are executed inside the Risk serving process (its own protocol
+# implementations resolve them via ``providers/model_authority.py`` in that
+# repository), and the ``investment.*`` workload capabilities are executed by
+# the Investment worker processes.  Registry entries that serve only
+# externally-executed capabilities are admitted registry facts — they carry the
+# authoritative execution identity for those processes — but they are excluded
+# from THIS process's executable set by explicit designation, never by silently
+# skipping an entry whose adapter happens to be missing.
+
+CapabilityExecutionProcess: TypeAlias = Literal["gateway", "risk", "investment"]
+
+CAPABILITY_EXECUTION_PROCESS: Mapping[str, CapabilityExecutionProcess] = (
+  MappingProxyType(
+    {
+      **{capability_id: "gateway" for capability_id in CORE_CAPABILITY_IDS},
+      **{capability_id: "risk" for capability_id in RISK_CAPABILITY_IDS},
+      **{
+        capability_id: "investment"
+        for capability_id in INVESTMENT_CAPABILITY_IDS
+      },
+    }
+  )
+)
+if set(CAPABILITY_EXECUTION_PROCESS) != CAPABILITY_IDS:  # pragma: no cover
+  raise ValueError(
+    "CAPABILITY_EXECUTION_PROCESS must designate every known capability"
+  )
+if (
+  len(CORE_CAPABILITY_IDS) + len(RISK_CAPABILITY_IDS) + len(INVESTMENT_CAPABILITY_IDS)
+  != len(CAPABILITY_IDS)
+):  # pragma: no cover
+  # Overlapping process sets would let a later dict-merge entry silently
+  # reassign a capability's serving process.
+  raise ValueError("capability process sets must be disjoint")
+
+GATEWAY_EXECUTED_CAPABILITY_IDS = frozenset(
+  capability_id
+  for capability_id, process in CAPABILITY_EXECUTION_PROCESS.items()
+  if process == "gateway"
+)
+EXTERNALLY_EXECUTED_CAPABILITY_IDS = (
+  CAPABILITY_IDS - GATEWAY_EXECUTED_CAPABILITY_IDS
+)
 
 _EXPOSURES = frozenset({"user_selectable", "internal"})
 _LIFECYCLES = frozenset({"active", "hidden", "deprecated", "disabled", "revoked"})
@@ -162,10 +228,37 @@ class ModelRegistryEntry:
 
 @dataclass(frozen=True, slots=True)
 class AdapterRouteSupport:
+  """Protocol facts declared by one installed adapter implementation.
+
+  Declarations come from the adapter classes themselves
+  (``ModelProvider.adapter_route_support``) — they describe what the installed
+  code actually implements and are never a second hand-maintained model
+  catalog.
+  """
+
   adapter: str
   provider: str
   protocol_profiles: frozenset[str]
   routes: frozenset[str]
+
+  def __post_init__(self) -> None:
+    adapter = _text(self.adapter, field="adapter support adapter")
+    provider = _text(self.provider, field=f"{adapter}.provider").lower()
+    protocol_profiles = frozenset(
+      _text(value, field=f"{adapter}.protocol_profiles")
+      for value in self.protocol_profiles
+    )
+    routes = frozenset(
+      _text(value, field=f"{adapter}.routes") for value in self.routes
+    )
+    if not protocol_profiles:
+      raise ValueError(f"{adapter} must declare at least one protocol profile")
+    if not routes:
+      raise ValueError(f"{adapter} must declare at least one route")
+    object.__setattr__(self, "adapter", adapter)
+    object.__setattr__(self, "provider", provider)
+    object.__setattr__(self, "protocol_profiles", protocol_profiles)
+    object.__setattr__(self, "routes", routes)
 
   def supports(self, entry: ModelRegistryEntry) -> bool:
     return (
@@ -218,8 +311,33 @@ class ProductModelRegistry:
   def admit_adapter_support(
     self,
     supports: Mapping[str, AdapterRouteSupport],
+    *,
+    executed_capability_ids: frozenset[str] | None = None,
   ) -> None:
+    """Require declared adapter support for every entry this process executes.
+
+    ``supports`` is gathered from installed adapter declarations
+    (``installed_adapter_route_support``), never hand-maintained.
+    ``executed_capability_ids`` is the explicit designation of which
+    capabilities the admitting process executes (for the gateway server,
+    ``GATEWAY_EXECUTED_CAPABILITY_IDS``).  Entries all of whose capabilities
+    are designated externally executed are admitted registry facts for the
+    executing process, not local execution obligations.  ``None`` — the
+    fail-closed default — requires installed support for every entry.
+    """
+    if executed_capability_ids is None:
+      executed = CAPABILITY_IDS
+    else:
+      executed = frozenset(executed_capability_ids)
+      unknown = executed - CAPABILITY_IDS
+      if unknown:
+        raise ValueError(
+          "executed_capability_ids has unknown capabilities: "
+          f"{', '.join(sorted(unknown))}"
+        )
     for entry in self.models.values():
+      if not (set(entry.capabilities) & executed):
+        continue
       support = supports.get(entry.adapter)
       if support is None or not support.supports(entry):
         raise ValueError(
@@ -347,207 +465,405 @@ class ProductModelSelectionPolicy:
           )
 
 
-_REASONING = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
-_ADAPTIVE = frozenset({"low", "medium", "high", "xhigh", "max"})
-_NONE = frozenset({"none"})
-_XAI = frozenset({"low", "medium", "high"})
+MODEL_REGISTRY_FILE_ENV_VAR = "AGENT_GATEWAY_MODEL_REGISTRY_FILE"
+MODEL_SELECTION_FILE_ENV_VAR = "AGENT_GATEWAY_MODEL_SELECTION_FILE"
+_MODEL_AUTHORITY_DIR = Path(__file__).with_name("model_authority")
+DEFAULT_MODEL_REGISTRY_ARTIFACT = (
+  _MODEL_AUTHORITY_DIR / "product-model-registry.yaml"
+)
+DEFAULT_MODEL_SELECTION_ARTIFACT = (
+  _MODEL_AUTHORITY_DIR / "product-model-selection.yaml"
+)
+
+_REGISTRY_DOCUMENT_FIELDS = frozenset({"schema", "revision", "models"})
+_REGISTRY_ENTRY_FIELDS = frozenset({
+  "key",
+  "label",
+  "provider",
+  "upstream_model",
+  "adapter",
+  "protocol_profile",
+  "route",
+  "lifecycle",
+  "capabilities",
+  "supported_efforts",
+  "default_effort",
+  "features",
+  "reported_identities",
+})
+_POLICY_DOCUMENT_FIELDS = frozenset({"schema", "revision", "capabilities"})
+_POLICY_CAPABILITY_REQUIRED_FIELDS = frozenset({
+  "default",
+  "by_channel",
+  "allowed_model_keys",
+})
+_POLICY_CAPABILITY_OPTIONAL_FIELDS = frozenset({
+  "allow_saved_preference",
+  "allow_explicit_user",
+  "allow_authenticated_run_override",
+})
+_POLICY_DEFAULT_REQUIRED_FIELDS = frozenset({"kind"})
+_POLICY_DEFAULT_OPTIONAL_FIELDS = frozenset({"model_key", "effort"})
 
 
-def _entry(
-  key: str,
-  label: str,
-  provider: str,
-  upstream_model: str,
-  adapter: str,
-  protocol_profile: str,
-  route: str,
-  capabilities: Mapping[str, CapabilityExposure],
-  supported_efforts: frozenset[str],
-  default_effort: str,
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+  """SafeLoader that rejects duplicate mapping keys at every nesting level.
+
+  The default SafeLoader silently keeps the last value for a repeated key,
+  which would let an artifact replace an authored value without failing
+  admission.  Duplicate keys must fail construction loudly instead.
+  """
+
+  def construct_mapping(self, node, deep=False):  # type: ignore[no-untyped-def]
+    if not isinstance(node, yaml.MappingNode):
+      raise yaml.constructor.ConstructorError(
+        None,
+        None,
+        f"expected a mapping node, but found {node.id}",
+        node.start_mark,
+      )
+    self.flatten_mapping(node)
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+      key = self.construct_object(key_node, deep=deep)
+      try:
+        hash(key)
+      except TypeError as exc:
+        raise yaml.constructor.ConstructorError(
+          "while constructing a mapping",
+          node.start_mark,
+          f"found unhashable key: {key!r}",
+          key_node.start_mark,
+        ) from exc
+      if key in mapping:
+        raise yaml.constructor.ConstructorError(
+          "while constructing a mapping",
+          node.start_mark,
+          f"found duplicate mapping key: {key!r}",
+          key_node.start_mark,
+        )
+      mapping[key] = self.construct_object(value_node, deep=deep)
+    return mapping
+
+
+def _artifact_document(path: Path) -> dict[str, object]:
+  try:
+    raw = path.read_text(encoding="utf-8")
+  except OSError as exc:
+    raise ValueError(f"model authority artifact is unreadable: {path}: {exc}") from exc
+  try:
+    document = yaml.load(raw, Loader=_UniqueKeySafeLoader)  # noqa: S506
+  except yaml.YAMLError as exc:
+    raise ValueError(f"model authority artifact is invalid YAML: {path}: {exc}") from exc
+  if not isinstance(document, dict):
+    raise ValueError(f"model authority artifact must be a mapping: {path}")
+  return document
+
+
+def _artifact_fields(
+  value: object,
   *,
-  features: frozenset[str] = frozenset({"tools", "streaming"}),
-  reported_identities: frozenset[str] | None = None,
+  required: frozenset[str],
+  optional: frozenset[str] = frozenset(),
+  context: str,
+) -> dict[str, object]:
+  if not isinstance(value, dict):
+    raise ValueError(f"{context} must be a mapping")
+  keys = {str(key) for key in value}
+  unknown = keys - required - optional
+  if unknown:
+    raise ValueError(f"{context} has unknown fields: {', '.join(sorted(unknown))}")
+  missing = required - keys
+  if missing:
+    raise ValueError(f"{context} is missing fields: {', '.join(sorted(missing))}")
+  return {str(key): item for key, item in value.items()}
+
+
+def _artifact_string(value: object, *, context: str) -> str:
+  if not isinstance(value, str):
+    raise ValueError(f"{context} must be a string")
+  return value
+
+
+def _artifact_string_list(value: object, *, context: str) -> tuple[str, ...]:
+  if not isinstance(value, list) or not all(
+    isinstance(item, str) for item in value
+  ):
+    raise ValueError(f"{context} must be a list of strings")
+  if len(set(value)) != len(value):
+    raise ValueError(f"{context} has duplicate items")
+  return tuple(value)
+
+
+def _artifact_string_mapping(value: object, *, context: str) -> dict[str, str]:
+  if not isinstance(value, dict) or not all(
+    isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+  ):
+    raise ValueError(f"{context} must map strings to strings")
+  return dict(value)
+
+
+def _artifact_bool(value: object, *, context: str) -> bool:
+  if not isinstance(value, bool):
+    raise ValueError(f"{context} must be a boolean")
+  return value
+
+
+def _registry_entry_from_artifact(
+  value: object,
+  *,
+  context: str,
 ) -> ModelRegistryEntry:
-  lifecycle: ModelLifecycle = (
-    "active"
-    if "user_selectable" in capabilities.values()
-    else "hidden"
-  )
+  fields = _artifact_fields(value, required=_REGISTRY_ENTRY_FIELDS, context=context)
   return ModelRegistryEntry(
-    key=key,
-    label=label,
-    provider=provider,
-    upstream_model=upstream_model,
-    adapter=adapter,
-    protocol_profile=protocol_profile,
-    route=route,
-    lifecycle=lifecycle,
-    capabilities=capabilities,
-    supported_efforts=supported_efforts,
-    default_effort=default_effort,
-    features=features,
-    reported_identities=reported_identities or frozenset({upstream_model}),
+    key=_artifact_string(fields["key"], context=f"{context}.key"),
+    label=_artifact_string(fields["label"], context=f"{context}.label"),
+    provider=_artifact_string(fields["provider"], context=f"{context}.provider"),
+    upstream_model=_artifact_string(
+      fields["upstream_model"],
+      context=f"{context}.upstream_model",
+    ),
+    adapter=_artifact_string(fields["adapter"], context=f"{context}.adapter"),
+    protocol_profile=_artifact_string(
+      fields["protocol_profile"],
+      context=f"{context}.protocol_profile",
+    ),
+    route=_artifact_string(fields["route"], context=f"{context}.route"),
+    lifecycle=_artifact_string(  # type: ignore[arg-type]
+      fields["lifecycle"],
+      context=f"{context}.lifecycle",
+    ),
+    capabilities=_artifact_string_mapping(  # type: ignore[arg-type]
+      fields["capabilities"],
+      context=f"{context}.capabilities",
+    ),
+    supported_efforts=frozenset(
+      _artifact_string_list(
+        fields["supported_efforts"],
+        context=f"{context}.supported_efforts",
+      )
+    ),
+    default_effort=_artifact_string(
+      fields["default_effort"],
+      context=f"{context}.default_effort",
+    ),
+    features=frozenset(
+      _artifact_string_list(fields["features"], context=f"{context}.features")
+    ),
+    reported_identities=frozenset(
+      _artifact_string_list(
+        fields["reported_identities"],
+        context=f"{context}.reported_identities",
+      )
+    ),
   )
 
 
-_DRIVER_AND_NODES = {
-  "session.driver": "user_selectable",
-  "plan.author": "internal",
-  "node.explore": "internal",
-  "node.implement": "internal",
-  "node.mutate": "internal",
-  "node.fork": "internal",
-  "node.verify": "internal",
-  "node.choose": "internal",
-}
-_DRIVER = {
-  "session.driver": "user_selectable",
-  "plan.author": "internal",
-  "node.fork": "internal",
-}
+def load_model_registry(path: str | Path) -> ProductModelRegistry:
+  """Parse and construct one admitted ``product-model-registry/v1`` artifact.
 
-_MODEL_ENTRIES = (
-  _entry("anthropic.claude-fable-5", "Fable 5", "anthropic", "claude-fable-5", "anthropic.messages", "messages.adaptive", "anthropic.public", _DRIVER_AND_NODES, _ADAPTIVE, "high"),
-  _entry(
-    "anthropic.claude-haiku-4-5",
-    "Haiku 4.5",
-    "anthropic",
-    "claude-haiku-4-5",
-    "anthropic.messages",
-    "messages.standard",
-    "anthropic.public",
-    _DRIVER,
-    _NONE,
-    "none",
-    reported_identities=frozenset({
-      "claude-haiku-4-5",
-      "claude-haiku-4-5-20251001",
-    }),
-  ),
-  _entry("anthropic.claude-mythos-5", "Mythos 5", "anthropic", "claude-mythos-5", "anthropic.messages", "messages.adaptive", "anthropic.public", _DRIVER_AND_NODES, _ADAPTIVE, "high"),
-  _entry("anthropic.claude-opus-5", "Opus 5", "anthropic", "claude-opus-5", "anthropic.messages", "messages.adaptive", "anthropic.public", _DRIVER_AND_NODES, _REASONING, "high"),
-  _entry("anthropic.claude-sonnet-5", "Sonnet 5", "anthropic", "claude-sonnet-5", "anthropic.messages", "messages.adaptive", "anthropic.public", _DRIVER_AND_NODES, _REASONING, "high"),
-  _entry("openai.gpt-5-6", "GPT-5.6", "openai", "gpt-5.6", "openai.responses", "responses.reasoning", "openai.public", {**_DRIVER, "investment.quant_worker": "internal"}, _REASONING, "medium"),
-  _entry("codex.gpt-5-6-luna", "GPT-5.6 Luna", "codex", "gpt-5.6-luna", "codex.responses", "codex.reasoning", "codex.chatgpt", _DRIVER, _REASONING, "medium"),
-  _entry("codex.gpt-5-6-sol", "GPT-5.6 Sol", "codex", "gpt-5.6-sol", "codex.responses", "codex.reasoning", "codex.chatgpt", _DRIVER, _REASONING, "medium"),
-  _entry("codex.gpt-5-6-terra", "GPT-5.6 Terra", "codex", "gpt-5.6-terra", "codex.responses", "codex.reasoning", "codex.chatgpt", _DRIVER, _REASONING, "medium"),
-  _entry("xai.grok-4-5", "Grok 4.5", "xai", "grok-4.5", "xai.responses", "responses.reasoning", "xai.public", _DRIVER, _XAI, "medium"),
-  _entry("anthropic.claude-sonnet-4-6-sdk", "Claude Sonnet 4.6 (SDK)", "anthropic", "claude-sonnet-4-6", "anthropic.sdk.messages", "messages.standard", "anthropic.byok", {"risk.completion": "internal", "risk.interpretation": "internal", "investment.research_agent": "internal"}, _NONE, "none"),
-  _entry("anthropic.claude-haiku-4-5-20251001-sdk", "Claude Haiku 4.5 2025-10-01 (SDK)", "anthropic", "claude-haiku-4-5-20251001", "anthropic.sdk.messages", "messages.standard", "anthropic.byok", {"risk.asset_classification": "internal", "risk.overview_editorial": "internal"}, _NONE, "none"),
-  _entry("anthropic.claude-haiku-4-5-20251001-gateway", "Claude Haiku 4.5 2025-10-01 (Gateway)", "anthropic", "claude-haiku-4-5-20251001", "anthropic.messages", "messages.standard", "anthropic.public", {"investment.newsletter": "internal", "investment.earnings_transcript": "internal"}, _NONE, "none"),
-  _entry("anthropic.claude-opus-4-8-oauth", "Claude Opus 4.8 (OAuth)", "anthropic", "claude-opus-4-8", "anthropic.sdk.messages", "messages.oauth", "anthropic.oauth", {"risk.document_ingest": "internal"}, _NONE, "none", features=frozenset({"vision"})),
-  _entry("anthropic.claude-sonnet-4-20250514-sdk", "Claude Sonnet 4 2025-05-14 (SDK)", "anthropic", "claude-sonnet-4-20250514", "anthropic.sdk.messages", "messages.standard", "anthropic.service", {"investment.biotech_review": "internal"}, _NONE, "none"),
-  _entry("openai.gpt-5-4-mini-sdk", "GPT-5.4 Mini (SDK)", "openai", "gpt-5.4-mini", "openai.sdk.chat_completions", "chat_completions.standard", "openai.service", {"risk.peer_generation": "internal"}, _NONE, "none"),
+  Every schema violation — unknown field, missing field, malformed value,
+  duplicate key, or incoherent lifecycle/exposure — raises ``ValueError``.
+  """
+  artifact_path = Path(path)
+  context = f"model registry artifact {artifact_path}"
+  document = _artifact_fields(
+    _artifact_document(artifact_path),
+    required=_REGISTRY_DOCUMENT_FIELDS,
+    context=context,
+  )
+  models_raw = document["models"]
+  if not isinstance(models_raw, list):
+    raise ValueError(f"{context}.models must be a list of entries")
+  models: dict[str, ModelRegistryEntry] = {}
+  for index, raw_entry in enumerate(models_raw):
+    entry = _registry_entry_from_artifact(
+      raw_entry,
+      context=f"{context}.models[{index}]",
+    )
+    if entry.key in models:
+      raise ValueError(f"{context} has duplicate model key: {entry.key}")
+    models[entry.key] = entry
+  return ProductModelRegistry(
+    schema=_artifact_string(  # type: ignore[arg-type]
+      document["schema"],
+      context=f"{context}.schema",
+    ),
+    revision=_artifact_string(document["revision"], context=f"{context}.revision"),
+    models=models,
+  )
+
+
+def _capability_default_from_artifact(
+  value: object,
+  *,
+  context: str,
+) -> CapabilityDefault:
+  fields = _artifact_fields(
+    value,
+    required=_POLICY_DEFAULT_REQUIRED_FIELDS,
+    optional=_POLICY_DEFAULT_OPTIONAL_FIELDS,
+    context=context,
+  )
+  kind = fields["kind"]
+  model_key = fields.get("model_key")
+  effort = fields.get("effort")
+  if model_key is not None:
+    model_key = _artifact_string(model_key, context=f"{context}.model_key")
+  if effort is not None:
+    effort = _artifact_string(effort, context=f"{context}.effort")
+  return CapabilityDefault(
+    kind=_artifact_string(kind, context=f"{context}.kind"),  # type: ignore[arg-type]
+    model_key=model_key,
+    effort=effort,
+  )
+
+
+def _capability_policy_from_artifact(
+  capability_id: str,
+  value: object,
+  *,
+  context: str,
+) -> CapabilitySelectionPolicy:
+  fields = _artifact_fields(
+    value,
+    required=_POLICY_CAPABILITY_REQUIRED_FIELDS,
+    optional=_POLICY_CAPABILITY_OPTIONAL_FIELDS,
+    context=context,
+  )
+  by_channel_raw = fields["by_channel"]
+  if not isinstance(by_channel_raw, dict) or not all(
+    isinstance(channel, str) for channel in by_channel_raw
+  ):
+    raise ValueError(f"{context}.by_channel must map channel names to defaults")
+  by_channel = {
+    channel: _capability_default_from_artifact(
+      channel_default,
+      context=f"{context}.by_channel[{channel!r}]",
+    )
+    for channel, channel_default in by_channel_raw.items()
+  }
+  return CapabilitySelectionPolicy(
+    capability_id=capability_id,
+    default=_capability_default_from_artifact(
+      fields["default"],
+      context=f"{context}.default",
+    ),
+    by_channel=by_channel,
+    allowed_model_keys=frozenset(
+      _artifact_string_list(
+        fields["allowed_model_keys"],
+        context=f"{context}.allowed_model_keys",
+      )
+    ),
+    allow_saved_preference=_artifact_bool(
+      fields.get("allow_saved_preference", False),
+      context=f"{context}.allow_saved_preference",
+    ),
+    allow_explicit_user=_artifact_bool(
+      fields.get("allow_explicit_user", False),
+      context=f"{context}.allow_explicit_user",
+    ),
+    allow_authenticated_run_override=_artifact_bool(
+      fields.get("allow_authenticated_run_override", False),
+      context=f"{context}.allow_authenticated_run_override",
+    ),
+  )
+
+
+def load_model_selection_policy(path: str | Path) -> ProductModelSelectionPolicy:
+  """Parse and construct one admitted ``product-model-selection/v1`` artifact.
+
+  Every schema violation raises ``ValueError``; the complete capability set is
+  required and unknown fields are rejected at every level.
+  """
+  artifact_path = Path(path)
+  context = f"model selection artifact {artifact_path}"
+  document = _artifact_fields(
+    _artifact_document(artifact_path),
+    required=_POLICY_DOCUMENT_FIELDS,
+    context=context,
+  )
+  capabilities_raw = document["capabilities"]
+  if not isinstance(capabilities_raw, dict) or not all(
+    isinstance(capability_id, str) for capability_id in capabilities_raw
+  ):
+    raise ValueError(f"{context}.capabilities must map capability ids to policies")
+  capabilities = {
+    capability_id: _capability_policy_from_artifact(
+      capability_id,
+      raw_policy,
+      context=f"{context}.capabilities[{capability_id!r}]",
+    )
+    for capability_id, raw_policy in capabilities_raw.items()
+  }
+  return ProductModelSelectionPolicy(
+    schema=_artifact_string(  # type: ignore[arg-type]
+      document["schema"],
+      context=f"{context}.schema",
+    ),
+    revision=_artifact_string(document["revision"], context=f"{context}.revision"),
+    capabilities=capabilities,
+  )
+
+
+def _selected_artifact_path(env_var: str, default_path: Path) -> Path:
+  configured = os.environ.get(env_var, "").strip()
+  if not configured:
+    return default_path
+  return Path(configured)
+
+
+MODEL_REGISTRY_ARTIFACT_PATH = _selected_artifact_path(
+  MODEL_REGISTRY_FILE_ENV_VAR,
+  DEFAULT_MODEL_REGISTRY_ARTIFACT,
+)
+MODEL_SELECTION_ARTIFACT_PATH = _selected_artifact_path(
+  MODEL_SELECTION_FILE_ENV_VAR,
+  DEFAULT_MODEL_SELECTION_ARTIFACT,
 )
 
-INITIAL_MODEL_REGISTRY = ProductModelRegistry(
-  schema="product-model-registry/v1",
-  revision="2026-08-13.1",
-  models={entry.key: entry for entry in _MODEL_ENTRIES},
-)
+INITIAL_MODEL_REGISTRY = load_model_registry(MODEL_REGISTRY_ARTIFACT_PATH)
 
-INITIAL_ADAPTER_ROUTE_SUPPORT = MappingProxyType({
-  "anthropic.messages": AdapterRouteSupport(
-    adapter="anthropic.messages",
-    provider="anthropic",
-    protocol_profiles=frozenset({"messages.standard", "messages.adaptive"}),
-    routes=frozenset({"anthropic.public"}),
-  ),
-  "anthropic.sdk.messages": AdapterRouteSupport(
-    adapter="anthropic.sdk.messages",
-    provider="anthropic",
-    protocol_profiles=frozenset({"messages.standard", "messages.oauth"}),
-    routes=frozenset({"anthropic.byok", "anthropic.oauth", "anthropic.service"}),
-  ),
-  "openai.responses": AdapterRouteSupport(
-    adapter="openai.responses",
-    provider="openai",
-    protocol_profiles=frozenset({"responses.reasoning"}),
-    routes=frozenset({"openai.public"}),
-  ),
-  "openai.sdk.chat_completions": AdapterRouteSupport(
-    adapter="openai.sdk.chat_completions",
-    provider="openai",
-    protocol_profiles=frozenset({"chat_completions.standard"}),
-    routes=frozenset({"openai.service"}),
-  ),
-  "codex.responses": AdapterRouteSupport(
-    adapter="codex.responses",
-    provider="codex",
-    protocol_profiles=frozenset({"codex.reasoning"}),
-    routes=frozenset({"codex.chatgpt"}),
-  ),
-  "xai.responses": AdapterRouteSupport(
-    adapter="xai.responses",
-    provider="xai",
-    protocol_profiles=frozenset({"responses.reasoning"}),
-    routes=frozenset({"xai.public"}),
-  ),
-})
-INITIAL_MODEL_REGISTRY.admit_adapter_support(INITIAL_ADAPTER_ROUTE_SUPPORT)
+# Adapter support is admitted from installed adapter declarations, never a
+# hand-maintained table.  ``agent_gateway/__init__`` admits the loaded INITIAL
+# artifacts against ``providers.installed_adapter_route_support()`` for the
+# gateway-executed capability set at import (this module cannot import
+# ``providers`` without a cycle), and ``create_gateway_app`` re-runs the full
+# closure over whatever registry the server is actually configured with.
 
-
-def _model_default(key: str, effort: str) -> CapabilityDefault:
-  return CapabilityDefault(kind="model", model_key=key, effort=effort)
-
-
-_ALL_DRIVER_KEYS = frozenset(
-  entry.key
-  for entry in _MODEL_ENTRIES
-  if entry.capabilities.get("session.driver") == "user_selectable"
-)
-_OPUS_NODE_KEYS = frozenset({
-  "anthropic.claude-opus-5",
-  "anthropic.claude-sonnet-5",
-  "anthropic.claude-fable-5",
-  "anthropic.claude-mythos-5",
-})
-
-_POLICIES = {
-  "session.driver": CapabilitySelectionPolicy("session.driver", _model_default("anthropic.claude-opus-5", "high"), {}, _ALL_DRIVER_KEYS, allow_saved_preference=True, allow_explicit_user=True),
-  "plan.author": CapabilitySelectionPolicy("plan.author", CapabilityDefault("inherit_parent"), {}, _ALL_DRIVER_KEYS, allow_authenticated_run_override=True),
-  "node.explore": CapabilitySelectionPolicy("node.explore", _model_default("anthropic.claude-opus-5", "high"), {}, _OPUS_NODE_KEYS),
-  "node.implement": CapabilitySelectionPolicy("node.implement", _model_default("anthropic.claude-opus-5", "high"), {}, _OPUS_NODE_KEYS),
-  "node.mutate": CapabilitySelectionPolicy("node.mutate", _model_default("anthropic.claude-opus-5", "high"), {}, _OPUS_NODE_KEYS),
-  "node.fork": CapabilitySelectionPolicy("node.fork", CapabilityDefault("inherit_parent"), {}, _ALL_DRIVER_KEYS),
-  "node.verify": CapabilitySelectionPolicy("node.verify", _model_default("anthropic.claude-opus-5", "high"), {}, _OPUS_NODE_KEYS),
-  "node.choose": CapabilitySelectionPolicy("node.choose", _model_default("anthropic.claude-opus-5", "high"), {}, _OPUS_NODE_KEYS),
-  "risk.completion": CapabilitySelectionPolicy("risk.completion", _model_default("anthropic.claude-sonnet-4-6-sdk", "none"), {}, frozenset({"anthropic.claude-sonnet-4-6-sdk"})),
-  "risk.interpretation": CapabilitySelectionPolicy("risk.interpretation", _model_default("anthropic.claude-sonnet-4-6-sdk", "none"), {}, frozenset({"anthropic.claude-sonnet-4-6-sdk"})),
-  "risk.peer_generation": CapabilitySelectionPolicy("risk.peer_generation", _model_default("openai.gpt-5-4-mini-sdk", "none"), {}, frozenset({"openai.gpt-5-4-mini-sdk"})),
-  "risk.asset_classification": CapabilitySelectionPolicy("risk.asset_classification", _model_default("anthropic.claude-haiku-4-5-20251001-sdk", "none"), {}, frozenset({"anthropic.claude-haiku-4-5-20251001-sdk"})),
-  "risk.overview_editorial": CapabilitySelectionPolicy("risk.overview_editorial", _model_default("anthropic.claude-haiku-4-5-20251001-sdk", "none"), {}, frozenset({"anthropic.claude-haiku-4-5-20251001-sdk"})),
-  "risk.document_ingest": CapabilitySelectionPolicy("risk.document_ingest", _model_default("anthropic.claude-opus-4-8-oauth", "none"), {}, frozenset({"anthropic.claude-opus-4-8-oauth"})),
-  "investment.research_agent": CapabilitySelectionPolicy("investment.research_agent", _model_default("anthropic.claude-sonnet-4-6-sdk", "none"), {}, frozenset({"anthropic.claude-sonnet-4-6-sdk"})),
-  "investment.quant_worker": CapabilitySelectionPolicy("investment.quant_worker", _model_default("openai.gpt-5-6", "high"), {}, frozenset({"openai.gpt-5-6"})),
-  "investment.newsletter": CapabilitySelectionPolicy("investment.newsletter", _model_default("anthropic.claude-haiku-4-5-20251001-gateway", "none"), {}, frozenset({"anthropic.claude-haiku-4-5-20251001-gateway"})),
-  "investment.earnings_transcript": CapabilitySelectionPolicy("investment.earnings_transcript", _model_default("anthropic.claude-haiku-4-5-20251001-gateway", "none"), {}, frozenset({"anthropic.claude-haiku-4-5-20251001-gateway"})),
-  "investment.biotech_review": CapabilitySelectionPolicy("investment.biotech_review", _model_default("anthropic.claude-sonnet-4-20250514-sdk", "none"), {}, frozenset({"anthropic.claude-sonnet-4-20250514-sdk"})),
-}
-
-INITIAL_MODEL_SELECTION_POLICY = ProductModelSelectionPolicy(
-  schema="product-model-selection/v1",
-  revision="2026-08-13.1",
-  capabilities=_POLICIES,
+INITIAL_MODEL_SELECTION_POLICY = load_model_selection_policy(
+  MODEL_SELECTION_ARTIFACT_PATH
 )
 INITIAL_MODEL_SELECTION_POLICY.admit_registry(INITIAL_MODEL_REGISTRY)
 
 
 __all__ = [
   "AdapterRouteSupport",
+  "CAPABILITY_EXECUTION_PROCESS",
   "CAPABILITY_IDS",
   "CORE_CAPABILITY_IDS",
   "CapabilityDefault",
+  "CapabilityExecutionProcess",
   "CapabilityExposure",
   "CapabilitySelectionPolicy",
+  "DEFAULT_MODEL_REGISTRY_ARTIFACT",
+  "DEFAULT_MODEL_SELECTION_ARTIFACT",
+  "EXTERNALLY_EXECUTED_CAPABILITY_IDS",
+  "GATEWAY_EXECUTED_CAPABILITY_IDS",
   "INITIAL_MODEL_REGISTRY",
   "INITIAL_MODEL_SELECTION_POLICY",
-  "INITIAL_ADAPTER_ROUTE_SUPPORT",
   "INVESTMENT_CAPABILITY_IDS",
+  "MODEL_REGISTRY_ARTIFACT_PATH",
+  "MODEL_REGISTRY_FILE_ENV_VAR",
+  "MODEL_SELECTION_ARTIFACT_PATH",
+  "MODEL_SELECTION_FILE_ENV_VAR",
   "ModelLifecycle",
   "ModelRegistryEntry",
   "ProductModelRegistry",
   "ProductModelSelectionPolicy",
   "RISK_CAPABILITY_IDS",
   "SelectionSource",
+  "load_model_registry",
+  "load_model_selection_policy",
 ]

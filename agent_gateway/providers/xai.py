@@ -6,6 +6,7 @@ from weakref import WeakKeyDictionary
 
 import httpx
 
+from ..model_registry import AdapterRouteSupport
 from ..thinking import EffortResolution, ThinkingLevel
 from .base import ModelInfo, ModelProvider, StreamEvent, _is_context_length_exception
 from .codex import CodexProvider
@@ -104,6 +105,17 @@ class XAIProvider(ModelProvider):
   """First-class xAI Grok provider using the Responses API."""
 
   name = "xai"
+
+  @classmethod
+  def adapter_route_support(cls) -> AdapterRouteSupport:
+    # Protocol facts: the xAI Responses API with reasoning effort against the
+    # public xAI base URL.
+    return AdapterRouteSupport(
+      adapter="xai.responses",
+      provider="xai",
+      protocol_profiles=frozenset({"responses.reasoning"}),
+      routes=frozenset({"xai.public"}),
+    )
 
   def __init__(self) -> None:
     self._client_state: WeakKeyDictionary[httpx.AsyncClient, dict[str, Any]] = WeakKeyDictionary()
@@ -245,20 +257,28 @@ class XAIProvider(ModelProvider):
     max_tokens: int,
     **request_context: Any,
   ) -> EffortResolution:
-    del model, max_tokens, request_context
+    del max_tokens, request_context
     compat = dict(model_info.compat or {})
     if not compat.get("supportsReasoningEffort"):
+      if requested != ThinkingLevel.NONE:
+        raise ValueError(
+          f"xai model {model!r} does not support reasoning effort "
+          f"{requested.value!r}; unsupported effort is refused, never repaired"
+        )
       return EffortResolution(requested, ThinkingLevel.NONE, False, {})
     supported = tuple(ThinkingLevel(str(value)) for value in compat.get("reasoningEffortValues", ()))
-    normalized = ThinkingLevel.LOW if requested in {ThinkingLevel.MINIMAL, ThinkingLevel.NONE} and ThinkingLevel.NONE not in supported else requested
-    if normalized in {ThinkingLevel.XHIGH, ThinkingLevel.MAX}:
-      normalized = ThinkingLevel.HIGH
-    effective = normalized if normalized in supported else ThinkingLevel.LOW
+    if requested not in supported:
+      raise ValueError(
+        f"xai model {model!r} does not support reasoning effort "
+        f"{requested.value!r} (supported: "
+        f"{', '.join(level.value for level in supported)}); unsupported "
+        "effort is refused, never clamped"
+      )
     return EffortResolution(
       requested=requested,
-      effective=effective,
-      thinking_enabled_effective=effective != ThinkingLevel.NONE,
-      payload_fragments={"reasoning": {"effort": effective.value}},
+      effective=requested,
+      thinking_enabled_effective=requested != ThinkingLevel.NONE,
+      payload_fragments={"reasoning": {"effort": requested.value}},
     )
 
   def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
@@ -294,11 +314,12 @@ class XAIProvider(ModelProvider):
       params["parallel_tool_calls"] = True
     effort_resolution = kwargs.get("effort_resolution")
     if not isinstance(effort_resolution, EffortResolution):
-      effort_resolution = self.resolve_effort(
-        requested=thinking_level,
-        model=model,
-        model_info=model_info,
-        max_tokens=max_tokens,
+      # Effort is admitted upstream (the bound-effort boundaries in
+      # runner_stream_turn/provider_summarize). Resolving it here would be a
+      # reachable local repair path, so a missing resolution is refused.
+      raise ValueError(
+        "xai build_request_params requires an admitted EffortResolution; "
+        "it does not resolve effort locally"
       )
     reasoning = effort_resolution.payload_fragments.get("reasoning")
     if isinstance(reasoning, dict):

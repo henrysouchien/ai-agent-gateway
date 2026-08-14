@@ -459,6 +459,20 @@ async def _publish_foreground_completion(
   return envelope
 
 
+def seal_admitted_task_payload(payload: dict[str, Any]) -> dict[str, Any]:
+  """Stamp the canonical ``admitted_task_digest`` on an admission payload.
+
+  This is the single definition of ``admitted_task_digest``: the SHA-256
+  canonical digest of the complete admission payload — every other field,
+  component digests included — computed last. Callers must not supply a
+  precomputed digest or reimplement the rule over a field subset.
+  """
+  if "admitted_task_digest" in payload:
+    raise ValueError("admitted_task_digest is derived from the payload, never supplied")
+  payload["admitted_task_digest"] = sha256_digest(payload)
+  return payload
+
+
 def _ordinary_admitted_task_factory(
   *,
   operation: Any,
@@ -528,7 +542,7 @@ def _ordinary_admitted_task_factory(
       "capability_binding_digest": capability_binding_digest,
       "tool_grant_digest": admission.tool_grant.digest,
     }
-    payload["admitted_task_digest"] = sha256_digest(payload)
+    seal_admitted_task_payload(payload)
     return AdmittedTask.model_validate(payload)
 
   return _factory
@@ -2009,6 +2023,7 @@ def make_send_message_handler(runner_ref: list[Any]):
 
 
 __all__ = [
+  "seal_admitted_task_payload",
   "make_get_background_result_handler",
   "make_get_background_result_tool_def",
   "make_send_message_handler",

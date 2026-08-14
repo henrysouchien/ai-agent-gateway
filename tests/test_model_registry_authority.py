@@ -17,12 +17,14 @@ from agent_gateway.capability_binding import (
 from agent_gateway.model_registry import (
   CAPABILITY_IDS,
   CapabilityDefault,
-  INITIAL_ADAPTER_ROUTE_SUPPORT,
+  EXTERNALLY_EXECUTED_CAPABILITY_IDS,
+  GATEWAY_EXECUTED_CAPABILITY_IDS,
   INITIAL_MODEL_REGISTRY,
   INITIAL_MODEL_SELECTION_POLICY,
   ProductModelRegistry,
   ProductModelSelectionPolicy,
 )
+from agent_gateway.providers import installed_adapter_route_support
 
 
 def _auth(
@@ -70,8 +72,15 @@ def _resolve_driver(
 
 def test_initial_artifacts_are_complete_and_adapter_closed() -> None:
   assert set(INITIAL_MODEL_SELECTION_POLICY.capabilities) == CAPABILITY_IDS
+  assert (
+    GATEWAY_EXECUTED_CAPABILITY_IDS | EXTERNALLY_EXECUTED_CAPABILITY_IDS
+    == CAPABILITY_IDS
+  )
   INITIAL_MODEL_SELECTION_POLICY.admit_registry(INITIAL_MODEL_REGISTRY)
-  INITIAL_MODEL_REGISTRY.admit_adapter_support(INITIAL_ADAPTER_ROUTE_SUPPORT)
+  INITIAL_MODEL_REGISTRY.admit_adapter_support(
+    installed_adapter_route_support(),
+    executed_capability_ids=GATEWAY_EXECUTED_CAPABILITY_IDS,
+  )
   assert "openai.gpt-4-1-sdk" not in INITIAL_MODEL_REGISTRY.models
   assert "openai.gpt-4o-mini" not in INITIAL_MODEL_REGISTRY.models
   assert "investment.benchmark_judge" not in CAPABILITY_IDS

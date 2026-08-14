@@ -85,6 +85,7 @@ def _inputs(
   *,
   model_key: str | None = None,
   effort: str | None = None,
+  catalog_revision: str | None = None,
   context: dict[str, Any] | None = None,
 ) -> ChatTurnInputs:
   return ChatTurnInputs(
@@ -94,6 +95,7 @@ def _inputs(
     metadata={},
     model_key=model_key,
     effort=effort,
+    catalog_revision=catalog_revision,
   )
 
 
@@ -204,6 +206,50 @@ def test_prepare_rejects_provider_qualified_selector() -> None:
       build_chat_runtime=builder,
     )
   assert refused.value.code == "capability_model_unavailable"
+
+
+def test_prepare_with_stale_catalog_revision_and_ineligible_key_names_stale() -> None:
+  async def builder(*_args: Any, **_kwargs: Any) -> Any:
+    raise AssertionError
+
+  _configure_builder(builder)
+  with pytest.raises(CapabilityResolutionError) as refused:
+    prepare_session_driver_turn(
+      _session(),
+      _inputs(
+        model_key="anthropic.retired-model",
+        catalog_revision="1999-01-01.0",
+      ),
+      build_chat_runtime=builder,
+    )
+
+  assert refused.value.code == "capability_catalog_stale"
+  assert refused.value.catalog_revision == INITIAL_MODEL_REGISTRY.revision
+  assert refused.value.eligible_model_keys
+  receipt = refused.value.receipt()
+  assert receipt["catalog_revision"] == INITIAL_MODEL_REGISTRY.revision
+  assert "user-secret" not in str(receipt)
+
+
+def test_prepare_with_stale_catalog_revision_and_eligible_key_still_binds() -> None:
+  async def builder(*_args: Any, **_kwargs: Any) -> Any:
+    raise AssertionError
+
+  _configure_builder(builder)
+  prepared = prepare_session_driver_turn(
+    _session(),
+    _inputs(
+      model_key="anthropic.claude-sonnet-5",
+      effort="xhigh",
+      catalog_revision="1999-01-01.0",
+    ),
+    build_chat_runtime=builder,
+  )
+
+  bind = prepared.request.capability_bind
+  assert bind is not None
+  assert bind.model_key == "anthropic.claude-sonnet-5"
+  assert bind.effort == "xhigh"
 
 
 def test_effort_without_model_key_is_not_a_complete_intent() -> None:

@@ -807,7 +807,11 @@ class GatewayServerConfig:
     capability_adapter_resolver: Trusted callback that returns the exact
       adapter implementation for a bound adapter ID. Preparation uses it to
       validate credential material and exact effort before any durable or
-      billable side effect.
+      billable side effect. Startup closure resolves every adapter named by a
+      gateway-executed registry entry through it at construction; the callback
+      vouches for the implementations it maps, whereas without it only
+      installed adapters with matching `adapter_route_support` declarations
+      are admitted.
     autonomous_capability_binding_resolver: Trusted server callback that
       resolves and materializes the exact profile/skill-aware session-driver
       bind before an autonomous subprocess is launched. Resume requests carry

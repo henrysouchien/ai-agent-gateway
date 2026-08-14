@@ -19,8 +19,9 @@ NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
 
 
 def _payload(event_id: str) -> dict:
+  # Shippable version: the outbox ship gate dead-letters anything but v3.
   payload = {
-    "schema_version": 1, "source_product": "hank-agent-gateway",
+    "schema_version": 3, "source_product": "hank-agent-gateway",
     "source_event_id": event_id, "environment": "prod",
     "occurred_at": "2026-07-11T11:59:00Z",
     "execution_context_id": "33333333-3333-4333-8333-333333333333",

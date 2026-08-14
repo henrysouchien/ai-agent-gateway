@@ -37,6 +37,7 @@ from agent_gateway.capability_execution import (
   MaterializedCredential,
 )
 from agent_gateway.model_registry import (
+  GATEWAY_EXECUTED_CAPABILITY_IDS,
   ProductModelRegistry,
   ProductModelSelectionPolicy,
 )
@@ -843,6 +844,7 @@ def _batch_capability_execution_context(
     auth_context=auth_context,
     credential_materializer=_materialize,
     adapter_resolver=adapter_resolver,
+    executable_capability_ids=GATEWAY_EXECUTED_CAPABILITY_IDS,
     trusted_channel=(
       authenticated_session.channel
       if authenticated_session is not None

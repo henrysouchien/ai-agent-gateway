@@ -231,7 +231,7 @@ def test_source_partition_uses_normalized_reconciliation_identity(tmp_path) -> N
 
 def test_payload_bytes_are_immutable_across_fenced_state_transitions(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
-  payload = _payload("evt_001")
+  payload = _v3_payload("evt_001")
   outbox.enqueue_batch([payload], created_at=NOW)
   original_json = outbox.get("evt_001").payload_json
 
@@ -278,7 +278,7 @@ def test_payload_bytes_are_immutable_across_fenced_state_transitions(tmp_path) -
 
 def test_database_rejects_accepted_state_without_canonical_receipt(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
-  outbox.enqueue_batch([_payload("evt_001")], created_at=NOW)
+  outbox.enqueue_batch([_v3_payload("evt_001")], created_at=NOW)
   leased = outbox.lease_batch(
     limit=1, lease_for=timedelta(seconds=30), now=NOW
   )[0]
@@ -301,9 +301,50 @@ def test_database_rejects_accepted_state_without_canonical_receipt(tmp_path) -> 
       )
 
 
+def test_lease_dead_letters_non_v3_payloads_instead_of_shipping(
+  tmp_path, caplog
+) -> None:
+  outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
+  outbox.enqueue_batch(
+    [_payload("evt_v1"), _v2_payload("evt_v2"), _v3_payload("evt_v3")],
+    created_at=NOW,
+  )
+
+  with caplog.at_level("ERROR", logger="agent_gateway.usage_outbox"):
+    leased = outbox.lease_batch(limit=10, lease_for=timedelta(seconds=30), now=NOW)
+
+  # Only the v3 payload ships; older queued payloads are refused loudly.
+  assert [row.event_id for row in leased] == ["evt_v3"]
+  for event_id, version in (("evt_v1", 1), ("evt_v2", 2)):
+    row = outbox.get(event_id)
+    assert row.state == "dead"
+    assert row.last_error == f"unshippable_payload_schema_version:{version}"
+    assert row.sending_lease_token is None
+    assert row.ingest_status is None
+  logged = [record.getMessage() for record in caplog.records]
+  assert any("evt_v1" in message and "dead-lettered" in message for message in logged)
+  assert any("evt_v2" in message and "dead-lettered" in message for message in logged)
+
+  # Dead-lettered rows are terminal: they never re-enter the ship path.
+  assert outbox.mark_accepted(
+    "evt_v3",
+    leased[0].sending_lease_token,
+    ingest_status="accepted",
+    canonical_event_id="canonical-v3",
+    accepted_at=NOW,
+  ) is True
+  assert outbox.lease_batch(
+    limit=10, lease_for=timedelta(seconds=30), now=NOW + timedelta(minutes=5)
+  ) == []
+  # Evidence bytes remain immutable in place.
+  assert outbox.get("evt_v1").payload["schema_version"] == 1
+
+
 def test_retry_dead_and_expired_lease_recovery(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
-  outbox.enqueue_batch([_payload("evt_001"), _payload("evt_002")], created_at=NOW)
+  outbox.enqueue_batch(
+    [_v3_payload("evt_001"), _v3_payload("evt_002")], created_at=NOW
+  )
   first = outbox.lease_batch(limit=1, lease_for=timedelta(seconds=5), now=NOW)[0]
   assert outbox.mark_retryable(
     first.event_id,
@@ -335,7 +376,7 @@ def test_retry_dead_and_expired_lease_recovery(tmp_path) -> None:
 
 def test_fractional_lease_expiry_uses_lexically_stable_utc_timestamps(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
-  outbox.enqueue_batch([_payload("evt_001")], created_at=NOW)
+  outbox.enqueue_batch([_v3_payload("evt_001")], created_at=NOW)
   leased = outbox.lease_batch(
     limit=1, lease_for=timedelta(microseconds=500_000), now=NOW
   )[0]

@@ -15,6 +15,7 @@ from .base import (
   _is_context_length_exception,
   truncate_to_last_compaction,
 )
+from ..model_registry import AdapterRouteSupport
 from ..thinking import EffortResolution, clamp_effort
 from .codex_helpers import (
   DEFAULT_CODEX_BASE_URL as DEFAULT_CODEX_BASE_URL,
@@ -64,6 +65,17 @@ class CodexProvider(ModelProvider):
   """`ModelProvider` implementation for the ChatGPT Codex responses backend."""
 
   name = "codex"
+
+  @classmethod
+  def adapter_route_support(cls) -> AdapterRouteSupport:
+    # Protocol facts: the ChatGPT Codex Responses wire protocol with reasoning
+    # effort, served through the ChatGPT-account Codex backend route.
+    return AdapterRouteSupport(
+      adapter="codex.responses",
+      provider="codex",
+      protocol_profiles=frozenset({"codex.reasoning"}),
+      routes=frozenset({"codex.chatgpt"}),
+    )
 
   def __init__(self) -> None:
     self._client_state: WeakKeyDictionary[httpx.AsyncClient, dict[str, Any]] = WeakKeyDictionary()

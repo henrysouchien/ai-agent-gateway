@@ -138,6 +138,124 @@ def test_delete_model_preference_uses_authenticated_resolver_identity(
   ) is None
 
 
+def _put_preference(
+  tmp_path: Path,
+  body: dict[str, Any],
+) -> tuple[Any, ModelPreferenceStore]:
+  async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    return _resolver_result(channel="cli")
+
+  store = ModelPreferenceStore(tmp_path / "model-preferences.sqlite3")
+  app = _make_app(_resolver, model_preference_store=store)
+
+  with TestClient(app) as client:
+    init_response = client.post(
+      "/api/chat/init",
+      json={"api_key": "cli-key", "context": {"channel": "cli"}},
+    )
+    assert init_response.status_code == 200, init_response.text
+    response = client.put(
+      "/api/model-preferences/session.driver",
+      json=body,
+      headers={
+        "Authorization": f"Bearer {init_response.json()['session_token']}"
+      },
+    )
+  return response, store
+
+
+def test_put_preference_with_stale_revision_and_ineligible_key_names_stale_catalog(
+  tmp_path: Path,
+) -> None:
+  response, store = _put_preference(
+    tmp_path,
+    {
+      # No openai credential is eligible in this session; under a stale
+      # observed revision the typed answer is the stale-catalog refresh, not
+      # a bare unavailable-key error.
+      "model_key": "openai.gpt-5-6",
+      "catalog_revision": "1999-01-01.0",
+    },
+  )
+
+  assert response.status_code == 422, response.text
+  payload = response.json()
+  assert payload["error_code"] == "capability_catalog_stale"
+  assert payload["catalog_revision"] == INITIAL_MODEL_REGISTRY.revision
+  assert "anthropic.claude-opus-5" in payload["eligible_model_keys"]
+  assert store.get(
+    tenant_id="test-product",
+    actor_id="101",
+    capability_id="session.driver",
+  ) is None
+
+
+def test_put_preference_with_stale_revision_and_still_eligible_key_is_accepted(
+  tmp_path: Path,
+) -> None:
+  response, store = _put_preference(
+    tmp_path,
+    {
+      "model_key": "anthropic.claude-sonnet-5",
+      "effort": "high",
+      "catalog_revision": "1999-01-01.0",
+    },
+  )
+
+  assert response.status_code == 200, response.text
+  assert response.json() == {
+    "capability": "session.driver",
+    "model_key": "anthropic.claude-sonnet-5",
+    "effort": "high",
+  }
+  stored = store.get(
+    tenant_id="test-product",
+    actor_id="101",
+    capability_id="session.driver",
+  )
+  assert stored is not None
+  assert stored.model_key == "anthropic.claude-sonnet-5"
+
+
+def test_put_preference_with_current_revision_keeps_specific_refusal(
+  tmp_path: Path,
+) -> None:
+  response, _store = _put_preference(
+    tmp_path,
+    {
+      "model_key": "openai.gpt-5-6",
+      "catalog_revision": INITIAL_MODEL_REGISTRY.revision,
+    },
+  )
+
+  assert response.status_code == 422, response.text
+  assert response.json()["error_code"] == "capability_model_unavailable"
+
+
+def test_put_preference_with_stale_revision_and_unsupported_effort_names_stale_catalog(
+  tmp_path: Path,
+) -> None:
+  response, store = _put_preference(
+    tmp_path,
+    {
+      # haiku supports only "none"; under a stale observed revision the
+      # supported-effort set may have changed, so the answer is the typed
+      # stale-catalog refresh.
+      "model_key": "anthropic.claude-haiku-4-5",
+      "effort": "high",
+      "catalog_revision": "1999-01-01.0",
+    },
+  )
+
+  assert response.status_code == 422, response.text
+  assert response.json()["error_code"] == "capability_catalog_stale"
+  assert store.get(
+    tenant_id="test-product",
+    actor_id="101",
+    capability_id="session.driver",
+  ) is None
+
+
 def _stale_preference_deployment(
   lifecycle: str,
 ) -> tuple[ProductModelRegistry, ProductModelSelectionPolicy]:

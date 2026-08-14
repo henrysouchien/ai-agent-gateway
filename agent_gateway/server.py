@@ -48,7 +48,7 @@ from .capability_binding import (
   CapabilityResolutionError,
   eligible_model_choices,
 )
-from .model_registry import CORE_CAPABILITY_IDS
+from .model_registry import GATEWAY_EXECUTED_CAPABILITY_IDS
 from .event_log import EventLog, UserEventBus
 from .dispatcher_factory import GatewayDispatcherDeps
 from .approvals import ApprovalActionError, _record_vote_and_unblock  # noqa: F401
@@ -56,13 +56,9 @@ from .approval_resolver import resolve_policy  # noqa: F401 - compatibility alia
 from .approval_store import SQLiteApprovalStore, expire_pending_loop  # noqa: F401
 from .package_info import package_health
 from .providers import (
-  AnthropicProvider,
-  CodexProvider,
-  FixtureProvider,
   ModelProvider,
-  OpenAIProvider,
   StreamEvent,
-  XAIProvider,
+  installed_adapter_providers,
 )
 from .runner_introspection import exception_traceback_already_logged
 from .session import (
@@ -317,6 +313,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     raise ValueError("tenant_id is required with model-selection authority")
   config.model_selection_policy.admit_registry(config.model_registry)
 
+  # Adapter support comes from the installed adapters' own declarations, never
+  # a hand-maintained table.  `installed_adapter_providers()` maps each
+  # declared adapter id to the class implementing it.
+  installed_providers = installed_adapter_providers()
+
   capability_adapter_cache: dict[str, ModelProvider] = {}
   configured_default_provider = config.default_provider
   if configured_default_provider is not None:
@@ -325,31 +326,32 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     ).strip().lower()
     if configured_family == "agent-sdk":
       configured_family = "anthropic"
-    default_adapter = {
-      "anthropic": "anthropic.messages",
-      "codex": "codex.responses",
-      "openai": "openai.responses",
-      "xai": "xai.responses",
-      "fixture": "fixture.responses",
-    }.get(configured_family)
+    default_adapter = next(
+      (
+        adapter_id
+        for adapter_id, provider_class in installed_providers.items()
+        if provider_class.adapter_route_support().provider == configured_family
+      ),
+      None,
+    )
     if default_adapter is not None:
       capability_adapter_cache[default_adapter] = configured_default_provider
 
   def _resolve_capability_adapter(adapter_id: str) -> ModelProvider:
     normalized_adapter = str(adapter_id or "").strip()
     provider = capability_adapter_cache.get(normalized_adapter)
+    # Explicitly injected implementations — a configured `default_provider`
+    # (already cached) or anything a deployment-supplied
+    # `capability_adapter_resolver` returns — are vouched for by that trusted
+    # configuration.  Only implementations the built-in factory constructs
+    # from installed declarations are closure-checked against them below.
+    deployment_vouched = provider is not None
     if provider is None:
       if config.capability_adapter_resolver is not None:
         provider = config.capability_adapter_resolver(normalized_adapter)
+        deployment_vouched = True
       else:
-        provider_factories: dict[str, type[ModelProvider]] = {
-          "anthropic.messages": AnthropicProvider,
-          "codex.responses": CodexProvider,
-          "fixture.responses": FixtureProvider,
-          "openai.responses": OpenAIProvider,
-          "xai.responses": XAIProvider,
-        }
-        factory = provider_factories.get(normalized_adapter)
+        factory = installed_providers.get(normalized_adapter)
         if factory is None:
           raise ValueError(
             f"no installed capability adapter for {normalized_adapter!r}"
@@ -368,14 +370,52 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         f"capability adapter {normalized_adapter!r} returned provider "
         f"{resolved_family!r}; expected {sorted(expected_providers)}"
       )
+
+    # Closure against the implementation's own protocol declaration.  On the
+    # built-in path the installed adapter class must declare this adapter id,
+    # and every gateway-executed registry entry bound to it must use a
+    # declared protocol profile and route.  Deployment-vouched implementations
+    # (test doubles and app-owned wrappers included) skip only this
+    # declaration check; the packaged/deployment-selected INITIAL artifacts
+    # are still closed against installed declarations at import admission.
+    if not deployment_vouched:
+      declared = getattr(provider, "adapter_route_support", None)
+      declaration = declared() if callable(declared) else None
+      if declaration is None:
+        raise ValueError(
+          f"capability adapter {normalized_adapter!r} declares no protocol support"
+        )
+      if declaration.adapter != normalized_adapter:
+        raise ValueError(
+          f"capability adapter {normalized_adapter!r} resolved an "
+          f"implementation declaring {declaration.adapter!r}"
+        )
+      for entry in config.model_registry.models.values():
+        if entry.adapter != normalized_adapter:
+          continue
+        if not (set(entry.capabilities) & GATEWAY_EXECUTED_CAPABILITY_IDS):
+          continue
+        if not declaration.supports(entry):
+          raise ValueError(
+            f"registry entry {entry.key!r} requires protocol profile "
+            f"{entry.protocol_profile!r} on route {entry.route!r}, which "
+            f"installed adapter {normalized_adapter!r} does not declare"
+          )
     capability_adapter_cache[normalized_adapter] = provider
     return provider
 
-  for adapter_id in {
+  # Full startup closure over the configured registry (design § Configuration
+  # and evolution step 4): every entry serving a capability this gateway
+  # process executes must resolve to an installed, declared adapter now —
+  # never `provider_unavailable` at first use.  Entries serving only
+  # externally-executed capabilities (risk.*, investment.*) are admitted
+  # registry facts for their own serving processes and are excluded here by
+  # explicit designation, not silently skipped.
+  for adapter_id in sorted({
     entry.adapter
     for entry in config.model_registry.models.values()
-    if set(entry.capabilities) & CORE_CAPABILITY_IDS
-  }:
+    if set(entry.capabilities) & GATEWAY_EXECUTED_CAPABILITY_IDS
+  }):
     _resolve_capability_adapter(adapter_id)
 
   auth = config.auth_manager or AuthManager(
@@ -1054,8 +1094,35 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         auth=resolver.auth_context,
       )
     }
+    # The observed catalog revision is concurrency context, not authority: a
+    # still-eligible key is accepted after a harmless refresh, while a key or
+    # effort that no longer resolves under the current catalog names the
+    # stale revision so the client refreshes choices (plan §6.C/§8).
+    stale_catalog = (
+      body.catalog_revision is not None
+      and body.catalog_revision != resolver.registry.revision
+    )
+
+    def _stale_catalog_response() -> JSONResponse:
+      return JSONResponse(
+        {
+          "error_code": "capability_catalog_stale",
+          "capability_id": normalized_capability,
+          "model_key": body.model_key,
+          "catalog_revision": resolver.registry.revision,
+          "eligible_model_keys": sorted(choices),
+          "message": (
+            "The preference was made against a stale catalog revision and no "
+            "longer resolves; refresh eligible choices and select again."
+          ),
+        },
+        status_code=422,
+      )
+
     choice = choices.get(body.model_key)
     if choice is None:
+      if stale_catalog:
+        return _stale_catalog_response()
       return JSONResponse(
         {
           "error_code": "capability_model_unavailable",
@@ -1068,6 +1135,8 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       )
     effort = body.effort or choice.default_effort
     if effort not in choice.supported_efforts:
+      if stale_catalog:
+        return _stale_catalog_response()
       return JSONResponse(
         {
           "error_code": "capability_effort_unsupported",

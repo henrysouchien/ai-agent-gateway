@@ -183,12 +183,15 @@ def _easy_model_selection_policy(
     raise ValueError(
       f"effort {effort!r} is not supported by model key {entry.key!r}"
     )
+  # Revisions are configuration provenance, never a carrier for the caller's
+  # model/effort choice (which is also unbounded and can exceed the 64-char
+  # Version cap on durable bindings). The derived policy keeps the base
+  # revision; the caller's choice is expressed as the session.driver default
+  # below and surfaces in every binding as model_key/effort with
+  # selection_source="capability_default".
   policy = ProductModelSelectionPolicy(
     schema="product-model-selection/v1",
-    revision=(
-      f"{INITIAL_MODEL_SELECTION_POLICY.revision}.easy."
-      f"{entry.key}.{effort}"
-    ),
+    revision=INITIAL_MODEL_SELECTION_POLICY.revision,
     capabilities={
       **INITIAL_MODEL_SELECTION_POLICY.capabilities,
       "session.driver": replace(

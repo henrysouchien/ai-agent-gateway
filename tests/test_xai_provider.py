@@ -185,17 +185,16 @@ def test_xai_effort_and_thinking_env_are_not_auth_authority(monkeypatch) -> None
 @pytest.mark.parametrize(
   ("model", "requested", "effective", "enabled", "payload"),
   [
-    ("grok-4.5", ThinkingLevel.NONE, ThinkingLevel.LOW, True, {"reasoning": {"effort": "low"}}),
-    ("grok-4.5", ThinkingLevel.MINIMAL, ThinkingLevel.LOW, True, {"reasoning": {"effort": "low"}}),
+    ("grok-4.5", ThinkingLevel.LOW, ThinkingLevel.LOW, True, {"reasoning": {"effort": "low"}}),
     ("grok-4.5", ThinkingLevel.MEDIUM, ThinkingLevel.MEDIUM, True, {"reasoning": {"effort": "medium"}}),
-    ("grok-4.5", ThinkingLevel.XHIGH, ThinkingLevel.HIGH, True, {"reasoning": {"effort": "high"}}),
+    ("grok-4.5", ThinkingLevel.HIGH, ThinkingLevel.HIGH, True, {"reasoning": {"effort": "high"}}),
     ("grok-4.3", ThinkingLevel.NONE, ThinkingLevel.NONE, False, {"reasoning": {"effort": "none"}}),
-    ("grok-4.3-fast", ThinkingLevel.MAX, ThinkingLevel.HIGH, True, {"reasoning": {"effort": "high"}}),
-    ("grok-build-0.1", ThinkingLevel.HIGH, ThinkingLevel.NONE, False, {}),
-    ("grok-4.20-beta-latest-non-reasoning", ThinkingLevel.HIGH, ThinkingLevel.NONE, False, {}),
+    ("grok-4.3-fast", ThinkingLevel.HIGH, ThinkingLevel.HIGH, True, {"reasoning": {"effort": "high"}}),
   ],
 )
-def test_effort_resolution_table(model, requested, effective, enabled, payload) -> None:
+def test_effort_resolution_preserves_supported_effort_exactly(
+  model, requested, effective, enabled, payload
+) -> None:
   provider = XAIProvider()
   resolution = provider.resolve_effort(
     requested=requested,
@@ -209,6 +208,56 @@ def test_effort_resolution_table(model, requested, effective, enabled, payload) 
   assert dict(resolution.payload_fragments) == payload
 
 
+@pytest.mark.parametrize(
+  ("model", "requested"),
+  [
+    # Formerly silently clamped/upgraded; unsupported effort now refuses.
+    ("grok-4.5", ThinkingLevel.NONE),
+    ("grok-4.5", ThinkingLevel.MINIMAL),
+    ("grok-4.5", ThinkingLevel.XHIGH),
+    ("grok-4.5", ThinkingLevel.MAX),
+    ("grok-4.3-fast", ThinkingLevel.MAX),
+    ("grok-build-0.1", ThinkingLevel.HIGH),
+    ("grok-4.20-beta-latest-non-reasoning", ThinkingLevel.HIGH),
+  ],
+)
+def test_unsupported_effort_is_refused_never_clamped(model, requested) -> None:
+  provider = XAIProvider()
+  with pytest.raises(ValueError, match="refused"):
+    provider.resolve_effort(
+      requested=requested,
+      model=model,
+      model_info=provider.get_model_info(model),
+      max_tokens=16_000,
+    )
+
+
+def _admitted_effort_resolution(
+  provider: XAIProvider,
+  model: str,
+  requested: ThinkingLevel,
+) -> object:
+  return provider.resolve_effort(
+    requested=requested,
+    model=model,
+    model_info=provider.get_model_info(model),
+    max_tokens=16_000,
+  )
+
+
+def test_build_request_refuses_without_admitted_effort_resolution() -> None:
+  provider = XAIProvider()
+  with pytest.raises(ValueError, match="EffortResolution"):
+    provider.build_request_params(
+      model="grok-4.5",
+      messages=[{"role": "user", "content": "hi"}],
+      system_prompt=None,
+      tools=[],
+      max_tokens=2048,
+      thinking_level=ThinkingLevel.HIGH,
+    )
+
+
 def test_build_request_uses_responses_local_history_and_tools() -> None:
   provider = XAIProvider()
   params = provider.build_request_params(
@@ -217,7 +266,10 @@ def test_build_request_uses_responses_local_history_and_tools() -> None:
     system_prompt="Be precise.",
     tools=[{"name": "calculator", "description": "Calculate", "input_schema": {"type": "object"}}],
     max_tokens=2048,
-    thinking_level=ThinkingLevel.NONE,
+    thinking_level=ThinkingLevel.LOW,
+    effort_resolution=_admitted_effort_resolution(
+      provider, "grok-4.5", ThinkingLevel.LOW
+    ),
   )
   assert params["store"] is False
   assert params["stream"] is True
@@ -256,6 +308,9 @@ def test_encrypted_reasoning_is_replayed_from_local_history() -> None:
     system_prompt=None,
     tools=[],
     max_tokens=1024,
+    effort_resolution=_admitted_effort_resolution(
+      provider, "grok-4.5", ThinkingLevel.LOW
+    ),
   )
   assert reasoning_item in params["input"]
   assert "previous_response_id" not in params

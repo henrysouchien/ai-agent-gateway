@@ -5,6 +5,7 @@ import re
 from typing import Any, AsyncIterator, Literal
 
 from ..auth import ProviderCredentialFailure
+from ..model_registry import AdapterRouteSupport
 from ..thinking import EffortResolution, ThinkingLevel
 
 
@@ -296,6 +297,22 @@ class ModelProvider:
   """
 
   name = "provider"
+
+  @classmethod
+  def adapter_route_support(cls) -> AdapterRouteSupport | None:
+    """Declare the protocol facts this adapter implementation actually provides.
+
+    Installed capability adapters return their adapter id, credential provider
+    family, implemented protocol profiles, and supported deployment routes.
+    The declaration is a statement about the installed code — plan §7: adapter
+    declarations are protocol facts, not a second model catalog — and startup
+    closure admits registry entries against it.  ``None`` means this class
+    declares no capability adapter (base classes and app-owned stubs); a
+    deployment-supplied ``capability_adapter_resolver`` then vouches for any
+    adapter it maps onto such a class.
+    """
+
+    return None
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     raise NotImplementedError

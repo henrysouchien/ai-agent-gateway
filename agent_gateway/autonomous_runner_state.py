@@ -929,15 +929,15 @@ class AutonomousRegistryStateMixin:
         str(record.tool_result_spill_dir) if record.tool_result_spill_dir is not None else None
       ),
     }
-    if record.manifest_version == _runtime_attr(
-      "_TASK_MANIFEST_VERSION",
-      _TASK_MANIFEST_VERSION,
-    ):
-      payload["capability_bind"] = (
-        record.capability_bind.receipt()
-        if record.capability_bind is not None
-        else None
-      )
+    # The durable bind is written unconditionally: a manifest without the
+    # capability_bind field is not a decodable v7 record, and gating the write
+    # on a test-patchable version compare could silently persist bind-less
+    # manifests that fail only at rehydrate.
+    payload["capability_bind"] = (
+      record.capability_bind.receipt()
+      if record.capability_bind is not None
+      else None
+    )
     return payload
 
   def _attach_manifest_tracking(self, record: AutonomousTask) -> None:

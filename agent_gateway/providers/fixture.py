@@ -15,6 +15,7 @@ from ..fixture_gate import (
   FIXTURE_MODEL_ID,
   FIXTURE_TERMINAL_FAILURE_SKILL_NAME,
 )
+from ..model_registry import AdapterRouteSupport
 from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel
 
 
@@ -39,6 +40,17 @@ class FixtureProvider(ModelProvider):
   """Deterministic development-only provider for control-surface QA."""
 
   name = "fixture"
+
+  @classmethod
+  def adapter_route_support(cls) -> AdapterRouteSupport:
+    # Protocol facts: a deterministic in-process stream with no upstream wire
+    # protocol; registry entries binding it must name these exact values.
+    return AdapterRouteSupport(
+      adapter="fixture.responses",
+      provider="fixture",
+      protocol_profiles=frozenset({"fixture.deterministic"}),
+      routes=frozenset({"fixture.in_process"}),
+    )
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
     _ = config

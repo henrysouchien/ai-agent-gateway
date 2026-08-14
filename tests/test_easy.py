@@ -485,6 +485,32 @@ def test_create_agent_budget_thinking_alias_binds_exact_high_effort() -> None:
   assert runtime.capability_bind.effort == "high"
 
 
+def test_easy_policy_carries_base_revision_not_caller_choice() -> None:
+  import re as _re
+
+  from agent_gateway.easy import _easy_model_selection_policy
+  from agent_gateway.model_registry import INITIAL_MODEL_SELECTION_POLICY
+
+  entry, policy = _easy_model_selection_policy(
+    model_key="anthropic.claude-haiku-4-5",
+    effort="none",
+  )
+
+  # Revisions are configuration provenance: the derived policy carries the
+  # base revision verbatim and never encodes the caller's model/effort.
+  assert policy.revision == INITIAL_MODEL_SELECTION_POLICY.revision
+  assert entry.key not in policy.revision
+  assert _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", policy.revision)
+
+  # The caller's choice is expressed as the derived session.driver default,
+  # which resolution surfaces as selection_source="capability_default".
+  driver = policy.capabilities["session.driver"]
+  assert driver.default.kind == "model"
+  assert driver.default.model_key == entry.key
+  assert driver.default.effort == "none"
+  assert driver.allowed_model_keys == frozenset({entry.key})
+
+
 def test_create_agent_refuses_unsupported_configured_effort() -> None:
   with pytest.raises(ValueError, match="effort 'high' is not supported"):
     create_agent(
@@ -1060,6 +1086,9 @@ def test_create_agent_rejects_request_model_outside_driver_policy(
     "model_key": "anthropic.claude-opus-5",
     "provider": "anthropic",
     "upstream_model": "claude-opus-5",
+    # Typed refusals carry the current eligible stable keys so the caller can
+    # recover explicitly (design § Failure and fallback behavior).
+    "eligible_model_keys": ["anthropic.claude-haiku-4-5"],
   }
 
 

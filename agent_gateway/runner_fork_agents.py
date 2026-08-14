@@ -785,6 +785,55 @@ def _learning_receipt_text(event_entries: Sequence[Any]) -> str:
   return f"Self-learning fork completed: {note_part} written"
 
 
+def learning_fork_result_provenance(
+  *,
+  physical_task_id: str,
+  logical_task: OrdinaryDelegationTaskRef,
+  attempt: AttemptRef,
+  objective: str,
+  result_requirement: ResultRequirement,
+  execution: BoundCapabilityExecution,
+  scope_receipt: Mapping[str, Any],
+) -> TaskResultProvenance:
+  """Derive fork provenance from the canonical full-payload admission digest.
+
+  ``admitted_task_digest`` has exactly one definition — the seal computed by
+  :func:`agent_gateway.sub_agent.seal_admitted_task_payload` over the complete
+  admission payload (component digests included). The learning fork's
+  admission artifacts are its logical task, attempt, objective, operation ref,
+  result requirement, inherited model bind, and fork scope receipt; the digest
+  covers all of them rather than a bespoke field subset.
+  """
+  from .sub_agent import seal_admitted_task_payload
+
+  model_bind_digest = sha256_digest(execution.bind)
+  capability_binding_digest = sha256_digest({
+    "kind": "dynamic_parent_bind",
+    "bind": execution.bind.model_dump(mode="json"),
+  })
+  tool_grant_digest = sha256_digest(scope_receipt)
+  admission_payload = seal_admitted_task_payload({
+    "schema_version": "1.0",
+    "admitted_task_id": f"admitted:{physical_task_id}",
+    "logical_task": logical_task.model_dump(mode="json"),
+    "attempt": attempt.model_dump(mode="json"),
+    "objective": objective,
+    "operation": _LEARNING_FORK_OPERATION.model_dump(mode="json"),
+    "result_requirement": result_requirement.model_dump(mode="json"),
+    "model_bind": execution.bind.model_dump(mode="json"),
+    "scope_receipt": dict(scope_receipt),
+    "model_bind_digest": model_bind_digest,
+    "capability_binding_digest": capability_binding_digest,
+    "tool_grant_digest": tool_grant_digest,
+  })
+  return TaskResultProvenance(
+    admitted_task_digest=admission_payload["admitted_task_digest"],
+    model_bind_digest=model_bind_digest,
+    capability_binding_digest=capability_binding_digest,
+    tool_grant_digest=tool_grant_digest,
+  )
+
+
 async def spawn_learning_fork(
   fork_id: str,
   raw_work_item: Any,
@@ -852,19 +901,14 @@ async def spawn_learning_fork(
     max_turns=LEARNING_FORK_MAX_TURNS,
     suffix_ceiling=suffix_ceiling,
   )
-  result_provenance = TaskResultProvenance(
-    admitted_task_digest=sha256_digest({
-      "logical_task": logical_task.model_dump(mode="json"),
-      "attempt": attempt.model_dump(mode="json"),
-      "objective": LEARN_DIRECTIVE,
-      "result_requirement": result_requirement.model_dump(mode="json"),
-    }),
-    model_bind_digest=sha256_digest(execution.bind),
-    capability_binding_digest=sha256_digest({
-      "kind": "dynamic_parent_bind",
-      "bind": execution.bind.model_dump(mode="json"),
-    }),
-    tool_grant_digest=sha256_digest(scope_receipt),
+  result_provenance = learning_fork_result_provenance(
+    physical_task_id=physical_task_id,
+    logical_task=logical_task,
+    attempt=attempt,
+    objective=LEARN_DIRECTIVE,
+    result_requirement=result_requirement,
+    execution=execution,
+    scope_receipt=scope_receipt,
   )
   child_cost: list[float] = []
   result, error = await spawn_fork_agent(
@@ -913,6 +957,7 @@ __all__ = [
   "fork_max_turns",
   "fork_suffix_max_tokens",
   "fork_suffix_messages",
+  "learning_fork_result_provenance",
   "spawn_fork_agent",
   "spawn_learning_fork",
 ]

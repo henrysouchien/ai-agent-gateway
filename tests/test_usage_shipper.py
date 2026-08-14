@@ -77,6 +77,23 @@ def _payload(event_id: str) -> dict:
   return payload
 
 
+def _v3_payload(event_id: str) -> dict:
+  """Shippable payload: the outbox ship gate forwards only usage-event v3."""
+  payload = {
+    **_payload(event_id),
+    "schema_version": 3,
+    "capability_bind": _capability_bind_receipt(),
+    "provider_reported_model": None,
+    "workflow_attempt_group_id": None,
+    "workflow_attempt_number": None,
+    "retry_of_workflow_run_id": None,
+    "workflow_attempt_kind": None,
+    "work_authorization_id": None,
+  }
+  payload["source_payload_sha256"] = canonical_usage_payload_sha256(payload)
+  return payload
+
+
 def _record_reconciliation(
   outbox: CommercialUsageOutbox,
   *,
@@ -255,7 +272,7 @@ class _Sender:
 def test_shipper_maps_acceptance_duplicate_conflict_retry_and_terminal(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
   ids = ["accepted", "duplicate", "conflict", "retry", "terminal"]
-  outbox.enqueue_batch([_payload(event_id) for event_id in ids], created_at=NOW)
+  outbox.enqueue_batch([_v3_payload(event_id) for event_id in ids], created_at=NOW)
   statuses = ["accepted", "duplicate", "conflict", "rejected_retryable", "rejected_terminal"]
   sender = _Sender([
     UsageAcceptance(
@@ -296,7 +313,7 @@ def test_shipper_maps_acceptance_duplicate_conflict_retry_and_terminal(tmp_path)
 
 def test_transport_error_retries_indefinitely_with_exponential_bounded_jitter(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
-  outbox.enqueue_batch([_payload("evt_001")], created_at=NOW)
+  outbox.enqueue_batch([_v3_payload("evt_001")], created_at=NOW)
   sender = _Sender(error=TimeoutError("offline"))
   shipper = CommercialUsageShipper(
     outbox=outbox, sender=sender,
@@ -319,7 +336,7 @@ def test_transport_error_retries_indefinitely_with_exponential_bounded_jitter(tm
 
 def test_retryable_result_moves_to_dead_after_attempt_limit(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
-  outbox.enqueue_batch([_payload("evt_001")], created_at=NOW)
+  outbox.enqueue_batch([_v3_payload("evt_001")], created_at=NOW)
   sender = _Sender([UsageAcceptance(
     "prod", "evt_001", "rejected_retryable", None, "unknown_rate"
   )])
@@ -340,7 +357,7 @@ def test_retryable_result_moves_to_dead_after_attempt_limit(tmp_path) -> None:
 
 def test_stale_lease_fence_prevents_late_shipper_completion(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
-  outbox.enqueue_batch([_payload("evt_001")], created_at=NOW)
+  outbox.enqueue_batch([_v3_payload("evt_001")], created_at=NOW)
   stale = outbox.lease_batch(limit=1, lease_for=timedelta(seconds=1), now=NOW)[0]
   fresh = outbox.lease_batch(
     limit=1, lease_for=timedelta(seconds=10), now=NOW + timedelta(seconds=2)
@@ -357,7 +374,7 @@ def test_stale_lease_fence_prevents_late_shipper_completion(tmp_path) -> None:
 
 def test_shipper_quarantines_ambiguous_sender_results_for_retry(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
-  outbox.enqueue_batch([_payload("evt_001")], created_at=NOW)
+  outbox.enqueue_batch([_v3_payload("evt_001")], created_at=NOW)
   duplicate = UsageAcceptance("prod", "evt_001", "accepted", "canonical", None)
   shipper = CommercialUsageShipper(
     outbox=outbox, sender=_Sender([duplicate, duplicate]),
@@ -373,7 +390,7 @@ def test_shipper_quarantines_ambiguous_sender_results_for_retry(tmp_path) -> Non
 
 def test_permanent_poison_event_isolated_without_blocking_later_valid_row(tmp_path) -> None:
   outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
-  outbox.enqueue_batch([_payload("poison"), _payload("valid")], created_at=NOW)
+  outbox.enqueue_batch([_v3_payload("poison"), _v3_payload("valid")], created_at=NOW)
 
   class IsolatingSender:
     async def send_batch(self, payloads):

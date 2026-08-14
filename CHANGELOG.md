@@ -1,8 +1,60 @@
 # Changelog
 
-## Unreleased (post-0.16.1)
+## Unreleased (post-0.16.2)
 
 _No unreleased changes recorded yet._
+
+## 0.16.2 (2026-08-14)
+
+Completes the model-selection authority conformance work
+(implementation-review items C1-C9 and the §3 sweep).
+
+### Added
+
+- The model registry and selection policy are now packaged
+  `product-model-registry/v1` / `product-model-selection/v1` YAML artifacts
+  parsed by strict typed loaders (unknown fields, duplicate mapping keys,
+  missing required fields, and incoherent lifecycle combinations fail
+  construction loudly) and admitted once at import. Deployment may select an
+  alternative admitted artifact file via
+  `AGENT_GATEWAY_MODEL_REGISTRY_FILE` / `AGENT_GATEWAY_MODEL_SELECTION_FILE`;
+  full admission runs on whatever loads. Lifecycle states
+  (`active`/`hidden`/`deprecated`/`disabled`/`revoked`) are authorable.
+- Installed adapters declare their real protocol support through
+  `ModelProvider.adapter_route_support()`; admission validates registry
+  entries against installed declarations. Capabilities executed outside this
+  package carry an explicit process designation; gateway-process resolvers
+  refuse them with the typed `capability_externally_executed` code.
+- Typed `capability_catalog_stale` refusal when a request's observed catalog
+  revision is stale and its key is no longer eligible.
+
+### Changed
+
+- `inherit_parent` copies the whole parent binding (credential principal and
+  reference, run mode, revisions) rather than reselecting credentials.
+- Effort for an explicit selection without an effort falls to the capability
+  policy effort, not the registry entry default.
+- Selection refusals carry the current eligible model keys; the resolver
+  enforces capability exposure (hidden models are refused as user choices).
+- Server construction closes over the configured registry: gateway-executed
+  entries must resolve installed adapters declaring their profile/route, or
+  startup fails.
+
+### Removed
+
+- The hand-written `INITIAL_ADAPTER_ROUTE_SUPPORT` table (replaced by
+  installed-adapter declarations; breaking for any consumer importing it).
+- The xAI silent effort clamp: unsupported efforts now refuse instead of
+  degrading.
+
+### Fixed
+
+- Usage outbox ships only current-schema payloads; pre-v3 rows dead-letter
+  loudly. The schema gate covers the agent session log and batch registry.
+- Fork admitted-task digest unified on the canonical definition; autonomous
+  manifest bind writes are unconditional; the model preference store closes
+  its sqlite handles; `easy.py` no longer encodes caller selection into
+  policy revisions.
 
 ## 0.16.1 (2026-08-14)
 

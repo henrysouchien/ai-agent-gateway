@@ -9,6 +9,7 @@ from typing import Any, AsyncIterator, Dict, Literal
 from ..rate_limit import get_global_token_bucket
 from ..rates import RateTable, UnknownModelError, load_rate_table
 from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, ThinkingLevel, truncate_to_last_compaction
+from ..model_registry import AdapterRouteSupport
 from ..thinking import EffortResolution, clamp_effort
 from .anthropic_helpers import (
   _COMMON_BETA_SLUGS as _COMMON_BETA_SLUGS,
@@ -430,6 +431,20 @@ class AnthropicProvider(ModelProvider):
   """
 
   name = "anthropic"
+
+  @classmethod
+  def adapter_route_support(cls) -> AdapterRouteSupport:
+    # Protocol facts about this implementation: the public Messages API with
+    # plain requests (`messages.standard`) and adaptive/budgeted thinking
+    # requests (`messages.adaptive`, see `resolve_effort`/`_thinking_param`).
+    # The Risk-local `anthropic.sdk.messages` adapter is a different
+    # implementation in a different serving process and is not declared here.
+    return AdapterRouteSupport(
+      adapter="anthropic.messages",
+      provider="anthropic",
+      protocol_profiles=frozenset({"messages.standard", "messages.adaptive"}),
+      routes=frozenset({"anthropic.public"}),
+    )
 
   def __init__(self, *, rate_table: RateTable | None = None):
     self._rate_table = rate_table or load_rate_table()

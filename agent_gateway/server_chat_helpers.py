@@ -31,7 +31,11 @@ from .capability_binding import (
   saved_preference_ineligibility,
 )
 from .capability_execution import CapabilityExecutionResolver
-from .model_registry import ProductModelRegistry, ProductModelSelectionPolicy
+from .model_registry import (
+  GATEWAY_EXECUTED_CAPABILITY_IDS,
+  ProductModelRegistry,
+  ProductModelSelectionPolicy,
+)
 from .event_adapter import adapt_event
 from .event_log import EventLog, log_has_terminal
 from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
@@ -588,6 +592,7 @@ def build_capability_choices(
             registry=registry,
             policy=policy,
             auth=resolver.auth_context,
+            trusted_channel=resolver.trusted_channel,
           )
           detail = _SAVED_PREFERENCE_NOT_APPLIED_DETAILS.get(
             reason or "",
@@ -755,6 +760,7 @@ def _capability_execution_resolver_for_session(
       if run_overrides is None
       else run_overrides
     ),
+    executable_capability_ids=GATEWAY_EXECUTED_CAPABILITY_IDS,
   )
 
 

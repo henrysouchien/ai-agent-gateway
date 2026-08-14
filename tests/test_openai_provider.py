@@ -616,3 +616,36 @@ def test_openai_compaction_summary_uses_responses_with_effort_none() -> None:
   assert result.text == "compact summary"
   assert client.responses.params is not None
   assert client.responses.params["reasoning"] == {"effort": "none"}
+
+
+def test_declared_adapter_support_matches_responses_only_implementation() -> None:
+  from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY
+
+  declaration = OpenAIProvider.adapter_route_support()
+
+  assert declaration is not None
+  assert declaration.adapter == "openai.responses"
+  assert declaration.provider == "openai"
+  assert declaration.protocol_profiles == frozenset({"responses.reasoning"})
+  assert declaration.routes == frozenset({"openai.public"})
+
+  # The declaration admits the packaged Responses entry and refuses the
+  # Risk-local chat-completions execution identity.
+  assert declaration.supports(INITIAL_MODEL_REGISTRY.require("openai.gpt-5-6"))
+  assert not declaration.supports(
+    INITIAL_MODEL_REGISTRY.require("openai.gpt-5-4-mini-sdk")
+  )
+
+  # Behavior matches the declaration: requests are Responses-shaped, never
+  # Chat Completions-shaped.
+  params = OpenAIProvider().build_request_params(
+    model="gpt-5.6",
+    messages=[{"role": "user", "content": "hello"}],
+    system_prompt="system",
+    tools=[],
+    max_tokens=128,
+  )
+  assert "input" in params
+  assert "instructions" in params
+  assert "max_output_tokens" in params
+  assert "messages" not in params
