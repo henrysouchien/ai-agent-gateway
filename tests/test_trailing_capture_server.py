@@ -20,7 +20,12 @@ from agent_gateway.model_registry import (
 from agent_gateway.event_log import EventLog, log_has_terminal
 from agent_gateway.providers import AnthropicProvider
 from agent_gateway.server import MaterializedCredential
-from agent_gateway.server_chat_helpers import _chat_turn_state_from_events, _dispatch_chat_turn
+from agent_gateway.control_run_lifecycle import CONTROL_RUN_STATE_CLASSIFICATION
+from agent_gateway.server_chat_helpers import (
+  _chat_turn_state_from_events,
+  _dispatch_chat_turn,
+  _latest_chat_run_state,
+)
 from agent_gateway.server_models import ChatMessage, ChatRequest, ChatRuntime, ChatTurnInputs
 from agent_gateway.session import GatewaySession, SessionStream
 
@@ -427,6 +432,23 @@ def test_chat_turn_state_uses_terminal_before_trailing_event() -> None:
     {"type": "citation_validation", "violation_count": 0},
   ]
   assert _chat_turn_state_from_events(events) == "completed"
+
+
+@pytest.mark.parametrize("state", CONTROL_RUN_STATE_CLASSIFICATION)
+def test_latest_chat_run_state_recognizes_every_canonical_owner_state(
+  state: str,
+) -> None:
+  session = _session()
+  session.event_history.append({"type": "run_state_changed", "state": state})
+
+  assert _latest_chat_run_state(session, session.session_id) == state
+
+
+def test_latest_chat_run_state_canonicalizes_internal_cancel_alias() -> None:
+  session = _session()
+  session.event_history.append({"type": "run_state_changed", "state": "killed"})
+
+  assert _latest_chat_run_state(session, session.session_id) == "cancelled"
 
 
 def test_chat_turn_state_rejects_missing_terminal_disposition() -> None:

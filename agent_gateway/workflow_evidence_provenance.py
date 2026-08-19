@@ -35,28 +35,26 @@ _MAX_EVIDENCE_TOOLS = 128
 _NON_TRANSFERABLE_EVIDENCE_TOOLS = frozenset({"code_execute"})
 
 
-def build_workflow_evidence_projection(
-  workflow_run_id: str,
-  node_results: Sequence[Any],
-) -> dict[str, Any] | None:
-  """Project verified child evidence from settled workflow task results.
+def collect_child_evidence(
+  results: Sequence[Any],
+) -> tuple[list[str], list[dict[str, Any]]]:
+  """Fold durable child evidence into bounded tool names and source records.
 
-  Only successfully settled results contribute: those are the durable,
-  provenance-verified settlements the workflow accepted. Returns ``None``
-  when no evidence exists so callers attach nothing.
+  Every *settled* result contributes, whatever its execution status. Retrieval
+  a child actually performed is a fact about the run, not a reward for
+  succeeding: a node that read three filings and then failed did read them,
+  and its typed source identities are exactly as durable as a succeeded
+  node's. Filtering them out is what forced the parent to re-retrieve
+  documents the child already had (D-B4-1).
+
+  Ordering is stable (first observation wins) and both lists are capped.
   """
 
-  run_id = str(workflow_run_id or "").strip()
-  if not run_id:
-    return None
   evidence_tools: list[str] = []
   seen_tools: set[str] = set()
   observed_sources: list[dict[str, Any]] = []
   seen_sources: set[tuple[tuple[str, Any], ...]] = set()
-  for result in node_results:
-    execution = getattr(result, "execution", None)
-    if getattr(execution, "status", None) != "succeeded":
-      continue
+  for result in results:
     evidence = getattr(result, "evidence", None)
     if evidence is None:
       continue
@@ -91,10 +89,46 @@ def build_workflow_evidence_projection(
         continue
       seen_sources.add(key)
       observed_sources.append(record)
+  return evidence_tools, observed_sources
+
+
+def build_workflow_evidence_projection(
+  workflow_run_id: str,
+  node_results: Sequence[Any],
+) -> dict[str, Any] | None:
+  """Project verified child evidence from settled workflow task results.
+
+  Every settled node contributes its durable, provenance-verified evidence —
+  a failed or interrupted node's retrieval happened just as much as a
+  succeeded node's (D-B4-1). Returns ``None`` when no evidence exists so
+  callers attach nothing.
+  """
+
+  run_id = str(workflow_run_id or "").strip()
+  if not run_id:
+    return None
+  evidence_tools, observed_sources = collect_child_evidence(node_results)
   if not evidence_tools and not observed_sources:
     return None
   return {
     "workflow_run_id": run_id,
+    "evidence_tools": evidence_tools,
+    "observed_sources": observed_sources,
+  }
+
+
+def build_child_evidence_projection(result: Any) -> dict[str, Any] | None:
+  """Project one settled child result's evidence for direct-parent delivery.
+
+  The direct-dispatch (``run_agent``) lane has no workflow run identity, so
+  the projection is the same bounded tool/source fold without the run key.
+  Returns ``None`` when the child observed nothing.
+  """
+
+  evidence_tools, observed_sources = collect_child_evidence((result,))
+  if not evidence_tools and not observed_sources:
+    return None
+  return {
     "evidence_tools": evidence_tools,
     "observed_sources": observed_sources,
   }
@@ -173,7 +207,9 @@ def guard_visible_tools_used(
 
 __all__ = [
   "WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY",
+  "build_child_evidence_projection",
   "build_workflow_evidence_projection",
+  "collect_child_evidence",
   "guard_visible_tools_used",
   "register_workflow_evidence_projection",
 ]

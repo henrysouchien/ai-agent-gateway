@@ -1,9 +1,39 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 from agent_gateway.event_adapter import adapt_control_event, adapt_event
 from agent_gateway.tool_display import DETAIL_MAX_CHARS, resolve_display
+
+
+def _imports_tool_display_owner(source: str) -> bool:
+  for node in ast.walk(ast.parse(source)):
+    if not isinstance(node, ast.ImportFrom) or node.level != 1:
+      continue
+    if node.module == "tool_display" and any(
+      alias.name == "resolve_display" for alias in node.names
+    ):
+      return True
+    if node.module is None and any(alias.name == "tool_display" for alias in node.names):
+      return True
+  return False
+
+
+def _assigns_display_from_redacted_input(source: str) -> bool:
+  for node in ast.walk(ast.parse(source)):
+    if not isinstance(node, ast.Assign):
+      continue
+    if not any(isinstance(target, ast.Name) and target.id == "display" for target in node.targets):
+      continue
+    if not isinstance(node.value, ast.Call) or len(node.value.args) != 2:
+      continue
+    tool_name_arg, tool_input_arg = node.value.args
+    if not isinstance(tool_name_arg, ast.Name) or tool_name_arg.id != "tool_name":
+      continue
+    if isinstance(tool_input_arg, ast.Name) and tool_input_arg.id == "redacted_tool_input":
+      return True
+  return False
 
 
 def test_resolve_display_seed_map_renders_product_label_and_detail() -> None:
@@ -208,8 +238,8 @@ def test_clean_emission_sites_stamp_display_from_redacted_input() -> None:
   assert '_runner_attr(self, "resolve_display", resolve_display)(tool_name, redacted_tool_input)' in runner_tool_execution
   assert 'tool_start_event["display"] = display' in runner_tool_execution
 
-  assert "from .tool_display import resolve_display" in sdk_runner_stream
-  assert "display = _resolve_display(tool_name, redacted_tool_input)" in sdk_runner_stream
+  assert _imports_tool_display_owner(sdk_runner_stream)
+  assert _assigns_display_from_redacted_input(sdk_runner_stream)
   assert 'tool_start_event["display"] = display' in sdk_runner_stream
 
   assert "from agent_gateway.tool_display import resolve_display" in addin_runtime

@@ -29,7 +29,16 @@ from .secret_boundary import (
   sanitization_failure_tool_input,
 )
 from .tool_display import resolve_display
-from .tool_result_semantics import classify_semantic_tool_error
+from .tool_dispatch_classification import (
+  DEFAULT_MAX_TOOL_RETRIES as _MAX_TOOL_DISPATCH_RETRIES,
+  RETRYABLE_OUTCOMES as _RETRYABLE_DISPATCH_OUTCOMES,
+  build_dispatch_record,
+  classify_semantic_tool_error,
+  classify_tool_outcome,
+  resolve_dispatch_entry,
+  retry_backoff_seconds,
+  retry_decision,
+)
 from .workflow_evidence_provenance import (
   WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY as _WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY,
   register_workflow_evidence_projection as _register_workflow_evidence_projection,
@@ -114,7 +123,7 @@ _OUTPUT_FILE_GATED_TOOL_ALTERNATIVES: dict[str, dict[str, Any]] = {
 }
 
 
-def _canonical_agent_result_payload(result: Any) -> Any:
+def _canonical_agent_result_payload(result: Any) -> tuple[Any, dict[str, Any] | None]:
   """Serialize only the normalized agent-result wire models.
 
   Dispatcher handlers are allowed to keep the strongly typed value in-process,
@@ -122,11 +131,21 @@ def _canonical_agent_result_payload(result: Any) -> Any:
   through ``json.dumps(default=str)``.  This is deliberately not a generic
   Pydantic adapter: only the two admitted parent-facing result contracts cross
   this seam.
+
+  ``AgentCompletionEnvelope.child_evidence`` is stripped here rather than
+  dumped: it is runtime provenance the parent runtime consumes, not text the
+  model should pay tokens to read, and it rides the same private
+  ``ToolResultContext.child_evidence`` channel as the workflow projection
+  (D-B4-2).  Returns ``(payload, child_evidence)``.
   """
 
-  if isinstance(result, (TaskResult, AgentCompletionEnvelope)):
-    return result.model_dump(mode="json")
-  return result
+  if isinstance(result, AgentCompletionEnvelope):
+    payload = result.model_dump(mode="json")
+    child_evidence = payload.pop("child_evidence", None)
+    return payload, (child_evidence if isinstance(child_evidence, dict) else None)
+  if isinstance(result, TaskResult):
+    return result.model_dump(mode="json"), None
+  return result, None
 
 
 def _is_accepted_ui_blocks_result(tool_name: str, result: Any, error: Any) -> bool:
@@ -474,6 +493,11 @@ class RunnerToolExecutionMixin:
       else None
     )
     provider_id = get_provider_id(tool_name) if callable(get_provider_id) else None
+    dispatch_entry = resolve_dispatch_entry(
+      tool_name,
+      server=server,
+      provider_id=provider_id,
+    )
     display = _runner_attr(self, "resolve_display", resolve_display)(tool_name, redacted_tool_input)
     tool_start_event = _runner_attr(self, "_build_tool_call_start_event", _build_tool_call_start_event)(
       tool_call_id=tool_id,
@@ -492,11 +516,14 @@ class RunnerToolExecutionMixin:
     error: Optional[Dict[str, Any]] = None
     semantic_error: Optional[Dict[str, Any]] = None
     cancelled_exc: BaseException | None = None
+    dispatch_attempts = 1
+    dispatch_retries_exhausted = False
     result_bytes = 0
     duration_ms = 0
     load_servers_signal: Optional[List[str]] = None
     load_local_tools_signal: Optional[List[str]] = None
     readable_resource_snapshot: dict[str, Any] | None = None
+    child_evidence: dict[str, Any] | None = None
     background_result_ack: tuple[str, int] | None = None
     workflow_output_attachment: WorkflowOutputAttachment | None = None
     superseded_continuation_run_id: str | None = None
@@ -531,12 +558,6 @@ class RunnerToolExecutionMixin:
             dispatch_kwargs["batch_id"] = self._batch_id
         if getattr(self, "_dispatcher_accepts_readable_resource_snapshot", False) and tool_name == "memory_write":
           dispatch_kwargs["capture_readable_resource_snapshot"] = True
-        dispatch_coro = self._dispatcher.dispatch(
-          tool_id,
-          tool_name,
-          tool_input,
-          **dispatch_kwargs,
-        )
         needs_approval = False
         requires_approval_fn = getattr(self._dispatcher, "requires_approval", None)
         if requires_approval_fn is not None:
@@ -573,28 +594,80 @@ class RunnerToolExecutionMixin:
             effective_tool_timeout or 0.0,
             _runner_attr(self, "_RUN_AGENT_DISPATCH_TIMEOUT_SECONDS", _RUN_AGENT_DISPATCH_TIMEOUT_SECONDS),
           )
-        if effective_tool_timeout is not None and not skip_timeout:
-          try:
-            result, error = await asyncio_module.wait_for(dispatch_coro, timeout=effective_tool_timeout)
-          except timeout_error_type:
-            elapsed = time_module.time() - tool_t0
-            logger.error(
-              "[%s] Tool %s timed out after %.1fs (limit %.0fs)",
-              self._sid,
-              tool_name,
-              elapsed,
-              effective_tool_timeout,
+        # B-2: one bounded, jittered retry loop owns transient dispatch
+        # failure. Both arms are inside it, because the skip_timeout
+        # population (MCP server timeouts) is exactly where 429 and transport
+        # failures actually appear. The tool_call_start event was appended
+        # before this loop and is never re-emitted; `attempts` carries the
+        # multiplicity. Approval-gated calls never retry (no approval
+        # re-entry), and the abort event is checked between attempts.
+        retry_deadline = (
+          tool_t0 + effective_tool_timeout * (1 + _MAX_TOOL_DISPATCH_RETRIES)
+          if effective_tool_timeout is not None
+          else None
+        )
+        while True:
+          result = None
+          error = None
+          dispatch_coro = self._dispatcher.dispatch(
+            tool_id,
+            tool_name,
+            tool_input,
+            **dispatch_kwargs,
+          )
+          if effective_tool_timeout is not None and not skip_timeout:
+            try:
+              result, error = await asyncio_module.wait_for(dispatch_coro, timeout=effective_tool_timeout)
+            except timeout_error_type:
+              elapsed = time_module.time() - tool_t0
+              logger.error(
+                "[%s] Tool %s timed out after %.1fs (limit %.0fs)",
+                self._sid,
+                tool_name,
+                elapsed,
+                effective_tool_timeout,
+              )
+              error = {
+                "code": "tool_timeout",
+                "sub_code": "timeout",
+                "message": f"Tool '{tool_name}' timed out after {effective_tool_timeout:.0f}s. The tool call was cancelled. You may retry or skip this tool.",
+              }
+          else:
+            result, error = await dispatch_coro
+
+          attempt_outcome = classify_tool_outcome(dispatch_entry, result, error)
+          abort_event = getattr(self, "_tool_abort_event", None)
+          aborted = bool(abort_event is not None and abort_event.is_set())
+          wall_clock_exhausted = bool(
+            retry_deadline is not None and time_module.time() >= retry_deadline
+          )
+          if (
+            retry_decision(
+              dispatch_entry,
+              attempt_outcome,
+              dispatch_attempts,
+              needs_approval=bool(needs_approval),
+              aborted=aborted,
+              wall_clock_exhausted=wall_clock_exhausted,
             )
-            error = {
-              "code": "tool_timeout",
-              "sub_code": "timeout",
-              "message": f"Tool '{tool_name}' timed out after {effective_tool_timeout:.0f}s. The tool call was cancelled. You may retry or skip this tool.",
-            }
-        else:
-          result, error = await dispatch_coro
+            != "retry"
+          ):
+            dispatch_retries_exhausted = (
+              dispatch_attempts > 1 and attempt_outcome in _RETRYABLE_DISPATCH_OUTCOMES
+            )
+            break
+          logger.warning(
+            "[%s] Tool %s dispatch %s on attempt %d; retrying",
+            self._sid,
+            tool_name,
+            attempt_outcome,
+            dispatch_attempts,
+          )
+          await asyncio_module.sleep(retry_backoff_seconds(dispatch_attempts))
+          dispatch_attempts += 1
 
       if error is None:
-        result = _canonical_agent_result_payload(result)
+        result, child_evidence = _canonical_agent_result_payload(result)
 
       # Strip private control fields from result before logging, event capture, and
       # model-bound tool_result content. _load_servers is a control signal -- capture
@@ -637,6 +710,11 @@ class RunnerToolExecutionMixin:
             getattr(self, "_workflow_evidence_provenance", {}),
             popped_workflow_evidence,
           )
+          # The private key is popped before the tool-result hooks run, so the
+          # citation hook can never see the projection on the result itself.
+          # Hand it forward on the context instead, so the parent registry can
+          # be seeded from what the children actually read (D-B4-3).
+          child_evidence = popped_workflow_evidence
         popped = result.pop("_load_servers", None)
         if isinstance(popped, list):
           load_servers_signal = [str(server_name) for server_name in popped if server_name]
@@ -753,6 +831,18 @@ class RunnerToolExecutionMixin:
       duration_ms = int((time_module.time() - tool_t0) * 1000)
       if isinstance(error, dict):
         error = _error_with_model_error_data(error)
+      # Every exit path funnels here — normal, semantic error, exclusion,
+      # timeout, cancellation, unhandled exception — so the dispatch record
+      # settles unconditionally, and it is on the event before the cancelled
+      # arm's early append below.
+      dispatch_record = build_dispatch_record(
+        entry=dispatch_entry,
+        result=result,
+        error=error,
+        semantic_error=semantic_error,
+        attempts=dispatch_attempts,
+        retries_exhausted=dispatch_retries_exhausted,
+      )
       tool_complete_event = _runner_attr(
         self,
         "_build_tool_call_complete_event",
@@ -764,6 +854,7 @@ class RunnerToolExecutionMixin:
         error=error,
         duration_ms=duration_ms,
         server=server,
+        dispatch=dispatch_record,
         semantic_error=semantic_error,
       )
       if error is None:
@@ -843,6 +934,8 @@ class RunnerToolExecutionMixin:
         skill_run_id=self._skill_run_id,
         workspace_dir=self._workspace_dir,
         batch_id=getattr(self, "_batch_id", None),
+        child_evidence=child_evidence,
+        dispatch=dispatch_record,
         boundary_sanitizer=lambda value, sink: sanitize_boundary_value(
           value,
           sink=sink,

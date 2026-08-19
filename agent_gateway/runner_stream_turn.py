@@ -7,17 +7,6 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-try:
-  from agent.shared.capability_plan import (
-    CapabilityPlanSchemaError,
-    PlanExecutionContext,
-  )
-except ImportError:  # standalone gateway: no api capability-plan layer
-  class CapabilityPlanSchemaError(Exception):  # type: ignore[no-redef]
-    """Placeholder; never raised without the api capability-plan layer."""
-
-  PlanExecutionContext = None  # type: ignore[assignment]
-
 from .auth import ProviderCredentialFailure
 from .capability_binding import validate_reported_identity
 from .providers import ModelInfo, ThinkingLevel
@@ -124,7 +113,6 @@ class RunnerStreamTurnMixin:
     system_chars: int,
     tools_chars: int,
     usage_totals: Dict[str, Any],
-    plan_execution_context: PlanExecutionContext | None = None,
   ) -> Tuple[Any, StreamTurnResult] | StreamTurnFailure | None:
     asyncio_module = _runner_attr(self, "asyncio", asyncio)
     time_module = _runner_attr(self, "time", time)
@@ -520,8 +508,6 @@ class RunnerStreamTurnMixin:
           )
         raise
       except Exception as exc:
-        if isinstance(exc, CapabilityPlanSchemaError):
-          raise
         stream_error = exc
         partial_usage_state = _runner_attr(self, "_usage_delta_state", _usage_delta_state)(usage_before_attempt, usage_totals)
         partial_usage = partial_usage_state.usage

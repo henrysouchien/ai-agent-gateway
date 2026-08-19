@@ -334,8 +334,6 @@ def _approval_record(
   tool_name: str = "execute_trade",
   tool_class: str = "external_write",
   state: str = "pending_user",
-  required_decider_count: int = 1,
-  eligible_decider_count: int = 1,
   persistent_grant_scope: str | None = None,
   approval_constraint: str = "standard",
   required_owner_user_id: str | None = None,
@@ -364,8 +362,6 @@ def _approval_record(
     decided_at=now if state in {"approved", "denied", "expired"} else None,
     decider_id="prior" if state in {"approved", "denied"} else None,
     decision=state if state in {"approved", "denied", "expired"} else None,  # type: ignore[arg-type]
-    required_decider_count=required_decider_count,
-    eligible_decider_count=eligible_decider_count,
     approval_constraint=approval_constraint,  # type: ignore[arg-type]
     required_owner_user_id=required_owner_user_id,
     persistent_grant_scope=persistent_grant_scope,
@@ -386,8 +382,6 @@ def _install_pending_approval(
   tool_name: str = "execute_trade",
   tool_class: str = "external_write",
   state: str = "pending_user",
-  required_decider_count: int = 1,
-  eligible_decider_count: int = 1,
   persistent_grant_scope: str | None = None,
   approval_constraint: str = "standard",
   required_owner_user_id: str | None = None,
@@ -404,8 +398,6 @@ def _install_pending_approval(
     tool_name=tool_name,
     tool_class=tool_class,
     state=state,
-    required_decider_count=required_decider_count,
-    eligible_decider_count=eligible_decider_count,
     persistent_grant_scope=persistent_grant_scope,
     approval_constraint=approval_constraint,
     required_owner_user_id=required_owner_user_id,
@@ -673,7 +665,6 @@ def test_control_approval_list_resolve_unblocks_queue_persists_grant_and_audits(
       "approved": True,
       "allow_tool_type": True,
       "approval_id": approval.approval_id,
-      "denied_by": None,
     }
 
     grant = _run(
@@ -946,7 +937,6 @@ def test_batch_approval_list_and_vote_use_canonical_owner_and_exact_durable_join
       "approved": True,
       "allow_tool_type": False,
       "approval_id": approval.approval_id,
-      "denied_by": None,
     }
 
 
@@ -1388,7 +1378,6 @@ def test_autonomous_cancel_terminalization_wins_and_delivers_only_denial(
     stored = _run(store.get(approval.approval_id))
     assert stored is not None
     assert stored.state == "denied"
-    assert stored.votes_received_count == 0
     delivery = _run(
       store.get_autonomous_approval_delivery(
         approval.approval_id,
@@ -1472,7 +1461,6 @@ def test_terminal_autonomous_run_hides_stale_pending_approval(
     stored = _run(store.get(approval.approval_id))
     assert stored is not None
     assert stored.state == "pending_user"
-    assert stored.votes_received_count == 0
     assert policy.resolved == []
 
 
@@ -1536,7 +1524,6 @@ def test_exited_autonomous_process_hides_pending_approval_even_before_state_upda
     stored = _run(store.get(approval.approval_id))
     assert stored is not None
     assert stored.state == "pending_user"
-    assert stored.votes_received_count == 0
     assert policy.resolved == []
 
 
@@ -1590,7 +1577,6 @@ def test_autonomous_approval_delivery_failure_preserves_durable_retry(
     stored = _run(store.get(approval.approval_id))
     assert stored is not None
     assert stored.state == "approved"
-    assert stored.votes_received_count == 1
     delivery = _run(
       store.get_autonomous_approval_delivery(
         approval.approval_id,
@@ -1620,7 +1606,7 @@ def test_role_class_precheck_blocks_approval_but_allows_denial_for_invite(tmp_pa
     assert blocked.status_code == 403, blocked.text
     after_block = _run(store.get(approval.approval_id))
     assert after_block is not None
-    assert after_block.votes_received_count == 0
+    assert after_block.state == "pending_user"
     assert policy.authorization_checks == [("invite", "external_write")]
     assert queue.empty()
 
@@ -1635,7 +1621,6 @@ def test_role_class_precheck_blocks_approval_but_allows_denial_for_invite(tmp_pa
       "approved": False,
       "allow_tool_type": False,
       "approval_id": approval.approval_id,
-      "denied_by": None,
     }
     assert policy.authorization_checks == [("invite", "external_write")]
 
@@ -1737,11 +1722,10 @@ def test_delegated_chat_approval_visible_and_resolvable_cross_channel(tmp_path) 
       "approved": True,
       "allow_tool_type": False,
       "approval_id": approval.approval_id,
-      "denied_by": None,
     }
 
 
-def test_chat_tool_approval_endpoint_relay_policy_denial_records_provenance(tmp_path) -> None:
+def test_chat_tool_approval_endpoint_records_ordinary_user_denial(tmp_path) -> None:
   app, store, policy, _writer = _make_app(tmp_path)
   with TestClient(app) as client:
     chat = _chat_session(client, "alice")
@@ -1757,54 +1741,23 @@ def test_chat_tool_approval_endpoint_relay_policy_denial_records_provenance(tmp_
         "nonce": pending["nonce"],
         "approved": False,
         "allow_tool_type": True,
-        "denied_by": "relay_policy",
       },
     )
     assert response.status_code == 200, response.text
     payload = response.json()
     assert payload["approval"]["state"] == "denied"
-    assert payload["approval"]["decision_reason"] == "Auto-denied by relay chat policy"
+    assert payload["approval"]["decision_reason"] is None
     assert policy.resolved == [approval.approval_id]
     assert queue.get_nowait() == {
       "approved": False,
       "allow_tool_type": False,
       "approval_id": approval.approval_id,
-      "denied_by": "relay_policy",
     }
     assert pending["allow_tool_type"] is False
     stored = _run(store.get(approval.approval_id))
     assert stored is not None
     assert stored.state == "denied"
-    assert stored.decision_reason == "Auto-denied by relay chat policy"
-
-
-def test_chat_tool_approval_endpoint_approved_ignores_denied_by(tmp_path) -> None:
-  app, store, _policy, _writer = _make_app(tmp_path)
-  with TestClient(app) as client:
-    chat = _chat_session(client, "alice")
-    approval, queue = _install_pending_approval(app=app, store=store, chat_payload=chat, user_id="alice")
-    session = _session(app, chat)
-    pending = next(iter(session.pending_tools.values()))
-
-    response = client.post(
-      "/api/chat/tool-approval",
-      headers=_headers(chat),
-      json={
-        "tool_call_id": approval.tool_call_id,
-        "nonce": pending["nonce"],
-        "approved": True,
-        "allow_tool_type": False,
-        "denied_by": "relay_policy",
-      },
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["approval"]["state"] == "approved"
-    assert queue.get_nowait() == {
-      "approved": True,
-      "allow_tool_type": False,
-      "approval_id": approval.approval_id,
-      "denied_by": None,
-    }
+    assert stored.decision_reason is None
 
 
 def test_delegated_chat_approval_hidden_from_non_delegator_cross_channel(tmp_path) -> None:
@@ -1888,38 +1841,6 @@ def test_delegated_chat_approval_hidden_when_grant_delegator_differs(tmp_path) -
     assert queue.empty()
 
 
-def test_n_of_m_partial_vote_does_not_unblock_queue(tmp_path) -> None:
-  app, store, policy, _writer = _make_app(tmp_path)
-  with TestClient(app) as client:
-    control = _control_session(client, "alice")
-    chat = _chat_session(client, "alice")
-    approval, queue = _install_pending_approval(
-      app=app,
-      store=store,
-      chat_payload=chat,
-      user_id="alice",
-      required_decider_count=2,
-      eligible_decider_count=2,
-    )
-
-    response = client.post(
-      f"/api/control/runs/{chat['session_id']}/approvals/{approval.approval_id}",
-      headers=_headers(control),
-      json={"approved": True},
-    )
-    assert response.status_code == 200, response.text
-    assert response.json() == {
-      "status": "vote_recorded",
-      "votes_received_count": 1,
-      "required_decider_count": 2,
-      "eligible_decider_count": 2,
-    }
-    assert queue.empty()
-    assert policy.resolved == []
-    pending = next(iter(_session(app, chat).pending_tools.values()))
-    assert pending["status"] == "approval_pending"
-
-
 def test_terminal_and_expired_approval_states_are_rejected(tmp_path) -> None:
   app, store, _policy, _writer = _make_app(tmp_path)
   with TestClient(app) as client:
@@ -1994,5 +1915,4 @@ def test_chat_tool_approval_endpoint_uses_shared_helper(tmp_path) -> None:
       "approved": True,
       "allow_tool_type": False,
       "approval_id": approval.approval_id,
-      "denied_by": None,
     }

@@ -68,7 +68,6 @@ class _ManualApprovalBasePolicy:
     return PolicyApprovalDecision(
       outcome="request_user_approval",
       reason="Tool requires approval",
-      route_target_type="pending_tools",
       expiry_seconds=600,
       allow_persistent_grant=False,
     )
@@ -260,7 +259,6 @@ def test_lifecycle_approval_request_times_out_without_user_response(monkeypatch,
         return PolicyApprovalDecision(
           outcome="request_user_approval",
           reason="Tool requires approval",
-          route_target_type="pending_tools",
           expiry_seconds=600,
           allow_persistent_grant=True,
         )
@@ -318,7 +316,7 @@ def test_lifecycle_approval_request_times_out_without_user_response(monkeypatch,
   asyncio.run(_run())
 
 
-def test_lifecycle_relay_policy_denial_emits_provenance_and_error(tmp_path: Path) -> None:
+def test_lifecycle_user_denial_emits_ordinary_provenance_and_error(tmp_path: Path) -> None:
   async def _run() -> None:
     class _Policy:
       policy_bundle_hash = "test-policy"
@@ -334,7 +332,6 @@ def test_lifecycle_relay_policy_denial_emits_provenance_and_error(tmp_path: Path
         return PolicyApprovalDecision(
           outcome="request_user_approval",
           reason="Tool requires approval",
-          route_target_type="pending_tools",
           expiry_seconds=600,
           allow_persistent_grant=True,
         )
@@ -395,23 +392,18 @@ def test_lifecycle_relay_policy_denial_emits_provenance_and_error(tmp_path: Path
       allow_tool_type=False,
       reason=None,
       app_state=SimpleNamespace(gateway_approval_store=store, gateway_approval_policy=policy),
-      denied_by="relay_policy",
     )
     result, error = await dispatch_task
 
     assert result is None
-    assert error is not None
-    assert error["code"] == "user_denied"
-    assert error["sub_code"] == "relay_policy_denied"
-    assert "relay chat policy" in error["message"]
-    assert "taskpane composer" in error["message"]
+    assert error == {"code": "user_denied", "message": "User denied execution"}
     stored = await store.get(approval_id)
     assert stored is not None
     assert stored.state == "denied"
-    assert stored.decision_reason == "Auto-denied by relay chat policy"
+    assert stored.decision_reason is None
     events = _decision_events(event_log)
     assert len(events) == 1
-    assert events[0]["decision_source"] == "relay_policy_denied"
+    assert events[0]["decision_source"] == "user_denied"
     assert events[0]["outcome"] == "denied"
     assert events[0]["allow_tool_type_applied"] is False
 
@@ -474,7 +466,6 @@ def test_interactive_irreversible_approval_coerces_allow_tool_type_false(tmp_pat
       "approved": True,
       "allow_tool_type": False,
       "approval_id": request.approval_id,
-      "denied_by": None,
     }
     assert await store.find_persistent_grant(
       user_id="alice",
@@ -686,9 +677,6 @@ def test_callback_headless_and_cache_decision_sources_have_decided_event_coverag
     async def deny(_request):
       return ApprovalDecision(approved=False)
 
-    async def deny_by_relay_policy(_request):
-      return ApprovalDecision(approved=False, denied_by="relay_policy")
-
     async def timeout(_request):
       return None
 
@@ -698,7 +686,6 @@ def test_callback_headless_and_cache_decision_sources_have_decided_event_coverag
     scenarios = [
       _dispatcher(EventLog(), needs_approval=lambda *_args: True, request_approval=approve),
       _dispatcher(EventLog(), needs_approval=lambda *_args: True, request_approval=deny),
-      _dispatcher(EventLog(), needs_approval=lambda *_args: True, request_approval=deny_by_relay_policy),
       _dispatcher(EventLog(), needs_approval=lambda *_args: True, request_approval=timeout),
       _dispatcher(
         EventLog(),
@@ -727,7 +714,6 @@ def test_callback_headless_and_cache_decision_sources_have_decided_event_coverag
     assert sources == {
       "user_approved",
       "user_denied",
-      "relay_policy_denied",
       "approval_timeout",
       "headless_auto_deny",
       "headless_hook_approved",

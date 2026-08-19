@@ -4,12 +4,12 @@ from copy import deepcopy
 
 import pytest
 
-from agent_gateway.ui_blocks_contract import fixtures
 from agent_gateway.ui_blocks_validation import (
   FailureCode,
   build_payload_submitted,
   validate_payload,
 )
+from scripts.ui_blocks_fixture_loader import load_ui_blocks_fixtures
 
 
 def _payload(*blocks: dict, **text: object) -> dict:
@@ -30,7 +30,7 @@ def test_payload_builder_stamps_constants_omits_absent_optionals_and_is_determin
 
 
 def test_all_bundle_fixtures_match_acceptance_and_expected_code() -> None:
-  for fixture in fixtures():
+  for fixture in load_ui_blocks_fixtures():
     payloads = fixture.get("payloads") or [fixture.get("payload")]
     for payload in payloads:
       failures = validate_payload(payload)

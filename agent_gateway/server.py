@@ -52,9 +52,15 @@ from .model_registry import GATEWAY_EXECUTED_CAPABILITY_IDS
 from .event_log import EventLog, UserEventBus
 from .dispatcher_factory import GatewayDispatcherDeps
 from .approvals import ApprovalActionError, _record_vote_and_unblock  # noqa: F401
-from .approval_resolver import resolve_policy  # noqa: F401 - compatibility alias
-from .approval_store import SQLiteApprovalStore, expire_pending_loop  # noqa: F401
-from .package_info import package_health
+from .approval_store import expire_pending_loop  # noqa: F401
+from .package_info import (
+  CONTRACT_CHAT_ATTACHMENTS_V1,
+  CONTRACT_INVESTMENT_SELECTED_CONTENT_V1,
+  package_health,
+)
+from .investment_capability_claim import (
+  investment_capability_signing_available,
+)
 from .providers import (
   ModelProvider,
   StreamEvent,
@@ -258,6 +264,24 @@ async def _drain_shielded_lifecycle_task(
         return
 
 
+def _has_investment_selected_content_reader(mcp_client: Any) -> bool:
+  """Project the optional Investment reader from the loaded MCP catalog."""
+
+  if not investment_capability_signing_available():
+    return False
+
+  is_mcp_tool = getattr(mcp_client, "is_mcp_tool", None)
+  get_server_for_tool = getattr(mcp_client, "get_server_for_tool", None)
+  if not callable(is_mcp_tool) or not callable(get_server_for_tool):
+    return False
+  try:
+    return bool(is_mcp_tool("get_investment_artifact")) and (
+      get_server_for_tool("get_investment_artifact") == "idea-workbench-mcp"
+    )
+  except Exception:
+    return False
+
+
 def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   """Create a FastAPI gateway application from explicit runtime configuration.
 
@@ -303,6 +327,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     and not callable(config.session_execution_policy_resolver)
   ):
     raise TypeError("session_execution_policy_resolver must be callable")
+  if (
+    config.selected_content_admitter is not None
+    and not callable(config.selected_content_admitter)
+  ):
+    raise TypeError("selected_content_admitter must be callable")
   if not isinstance(config.allow_service_credentials_for_interactive, bool):
     raise ValueError(
       "allow_service_credentials_for_interactive must be a bool"
@@ -767,6 +796,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   )
   setattr(_build_chat_runtime_for_dispatch, "_gateway_channel_profile_allowlist", config.channel_profile_allowlist)
   setattr(_build_chat_runtime_for_dispatch, "_gateway_log", log)
+  setattr(
+    _build_chat_runtime_for_dispatch,
+    "_gateway_selected_content_admitter",
+    config.selected_content_admitter,
+  )
   setattr(_build_chat_runtime_for_dispatch, "_gateway_resolver_timeout_seconds", config.resolver_timeout_seconds)
   app.state.gateway_build_chat_runtime = _build_chat_runtime_for_dispatch
   app.state.user_event_bus = UserEventBus()
@@ -1228,6 +1262,25 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         return JSONResponse(error_payload, status_code=status)
     body.user_id = body.user_id or jwt_user_id
     body.request_id = body.request_id or str(uuid.uuid4())
+    if body.attachments and config.selected_content_admitter is None:
+      return JSONResponse(
+        {
+          "error": "chat_attachments_unsupported",
+          "message": "This gateway does not accept chat attachments.",
+        },
+        status_code=400,
+      )
+    if (
+      body.investment_artifact_selection is not None
+      and config.selected_content_admitter is None
+    ):
+      return JSONResponse(
+        {
+          "error": "investment_selected_content_unsupported",
+          "message": "This gateway does not accept Investment selections.",
+        },
+        status_code=400,
+      )
     if session.kind != "chat":
       return JSONResponse(
         {"error": "invalid_session_kind", "message": "control sessions cannot dispatch chat turns"},
@@ -1253,6 +1306,8 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       effort=body.effort,
       catalog_revision=body.catalog_revision,
       ui_blocks_contract=body.ui_blocks_contract,
+      attachments=tuple(body.attachments),
+      investment_artifact_selection=body.investment_artifact_selection,
     )
     commercial_gate = config.commercial_work_start_gate
     if (
@@ -1570,6 +1625,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       "fatal_error",
       None,
     )
+    additional_contracts: set[str] = set()
+    if config.selected_content_admitter is not None:
+      additional_contracts.add(CONTRACT_CHAT_ATTACHMENTS_V1)
+      if _has_investment_selected_content_reader(config.mcp_client):
+        additional_contracts.add(CONTRACT_INVESTMENT_SELECTED_CONTENT_V1)
     return JSONResponse(
       {
         "status": (
@@ -1577,7 +1637,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           if approval_delivery_fatal_error is not None
           else "ok"
         ),
-        "package": package_health(),
+        "package": package_health(
+          additional_contracts=frozenset(additional_contracts)
+        ),
         "counters": ui_blocks_metrics_snapshot(),
       },
       status_code=(

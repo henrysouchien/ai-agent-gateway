@@ -627,7 +627,7 @@ async def spawn_fork_agent(
     per_turn_timeout=parent._per_turn_timeout,
     stream_stall_timeout=parent._stream_stall_timeout,
     mcp_client=parent._mcp_client,
-    loaded_mcp_servers=parent._loaded_mcp_servers,
+    mcp_activation_fold=parent._mcp_activation_fold,
     excluded_tools=set(),
     get_tool_definitions=child_get_tool_definitions,
     on_tool_result=parent._on_tool_result,
@@ -757,6 +757,10 @@ async def spawn_fork_agent(
     timeout=timeout,
     runtime_error_detail=runtime_error_detail,
     external_terminal_signals=signals,
+    # B-3: the authority frozen at admission, never the ambient catalog.
+    admitted_task=(
+      task_entry.admitted_task if task_entry is not None else None
+    ),
   )
   if cancelled_error is not None:
     if task_entry is not None:

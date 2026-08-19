@@ -54,9 +54,6 @@ from .autonomous_event_channel import (
   create_autonomous_event_channel,
 )
 from .claim_signing_authority import GatewayClaimSigningAuthority
-from .control_plane.market_scan_occurrence import (
-  scheduled_investment_authority_from_context,
-)
 from .autonomous_runner_commands import normalize_autonomous_profile, normalize_max_budget_usd
 from .artifact_paths import canonicalize_ticker
 from .capability_binding import CredentialHandle
@@ -133,7 +130,6 @@ _AUTONOMOUS_CHILD_BASE_ENV_NAMES = frozenset({
   "MEMORY_VECTOR_WEIGHT",
   "MEMORY_MAX_PROMPT_TOKENS",
   "CITATION_SESSION_REGISTRY_RETENTION_DAYS",
-  "FMS_STAGE_ARTIFACT_API",
   "EDGAR_USE_UPSTREAM_EQUIVALENCE",
   "RISK_API_URL",
   "RISK_CLIENT_PATH",
@@ -152,10 +148,6 @@ _AUTONOMOUS_CHILD_PROVIDER_ENV_NAMES = {
   }),
   "codex": frozenset(),
   "xai": frozenset(),
-  "fixture": frozenset({
-    "AGENT_GATEWAY_FIXTURE_RUN_SECONDS",
-    "FIXTURE_RUN_SECONDS",
-  }),
 }
 _AUTONOMOUS_CHILD_RESEARCH_TOOL_ENV_NAMES = frozenset({
   "FMP_API_KEY",
@@ -195,11 +187,6 @@ _AUTONOMOUS_CHILD_PROFILE_ENV_NAMES = {
     f"{prefix}_AGENT_MAX_TURNS",
     f"{prefix}_AGENT_STREAM_STALL_TIMEOUT",
     f"{prefix}_AGENT_TIMEOUT_SECONDS",
-    f"{prefix}_DEV_MAX_BUDGET_USD",
-    f"{prefix}_DEV_MAX_TURNS",
-    f"{prefix}_DEV_MODE",
-    f"{prefix}_DEV_STREAM_STALL_TIMEOUT",
-    f"{prefix}_DEV_TIMEOUT",
   })
   for profile, prefix in (
     ("analyst", "ANALYST"),
@@ -1109,7 +1096,7 @@ class AutonomousRegistryStartMixin:
       pack=record.pack,
       context=record.context,
       ticker=record.ticker,
-      dev_mode=record.dev_mode if record.mode == "skill" else False,
+      dev_mode=False,
       max_budget_usd=record.max_budget_usd,
       deliver=record.deliver,
     )
@@ -1152,7 +1139,6 @@ class AutonomousRegistryStartMixin:
     ticker: str | None = None,
     max_budget_usd: float | None = None,
     channel: str | None = None,
-    dev_mode: bool = False,
     dispatch_scope: dict[str, Any] | None = None,
     resumed_from: str | None = None,
     schedule_id: str | None = None,
@@ -1244,7 +1230,6 @@ class AutonomousRegistryStartMixin:
         if isinstance(channel, str) and channel.strip()
         else None
       )
-      effective_dev_mode = bool(dev_mode or normalized_mode == "task")
       normalized_resumed_from = (
         resumed_from.strip()
         if isinstance(resumed_from, str) and resumed_from.strip()
@@ -1257,20 +1242,6 @@ class AutonomousRegistryStartMixin:
       )
       if normalized_resumed_from is not None and normalized_schedule_id is not None:
         raise ValueError("autonomous launch cannot be both a resume and a schedule fire")
-      scheduled_investment_authority = (
-        scheduled_investment_authority_from_context(
-          context,
-          expected_schedule_id=normalized_schedule_id,
-        )
-      )
-      if scheduled_investment_authority is not None and (
-        normalized_schedule_id is None
-        or normalized_mode != "skill"
-        or normalized_skill != "market-scan"
-      ):
-        raise ValueError(
-          "scheduled investment authority requires an exact market-scan schedule fire"
-        )
       resumed_record = None
       if normalized_resumed_from is not None:
         resumed_record = self._find_by_control_run_id(normalized_resumed_from)
@@ -1295,7 +1266,6 @@ class AutonomousRegistryStartMixin:
         deliver=normalized_deliver,
         context=context,
         ticker=ticker,
-        dev_mode=dev_mode,
         max_budget_usd=normalized_max_budget_usd,
       )
       os_module = _runtime_attr("os", os)
@@ -1328,7 +1298,6 @@ class AutonomousRegistryStartMixin:
           mode=normalized_mode,
           skill=normalized_skill,
           channel=normalized_channel,
-          dev_mode=effective_dev_mode,
           source=binding_source,
           run_mode=binding_run_mode,
           required_bind=required_bind,
@@ -1437,7 +1406,7 @@ class AutonomousRegistryStartMixin:
         context=context.strip() if isinstance(context, str) and context.strip() else None,
         ticker=canonicalize_ticker(ticker) if isinstance(ticker, str) and ticker.strip() else None,
         channel=normalized_channel,
-        dev_mode=effective_dev_mode,
+        dev_mode=False,
         dispatch_scope=normalized_dispatch_scope,
         cmd=cmd,
         log_path=log_path,
@@ -1562,8 +1531,6 @@ class AutonomousRegistryStartMixin:
       env[AUTONOMOUS_EVENT_CHANNEL_FD_ENV] = str(child_event_channel_fd)
       if record.tool_result_spill_dir is not None:
         env["AGENT_AUTONOMOUS_TOOL_RESULT_SPILL_DIR"] = str(record.tool_result_spill_dir)
-      if record.dev_mode:
-        env[f"{record.profile.upper().replace('-', '_')}_DEV_MODE"] = "true"
       env[AUTONOMOUS_CREDENTIAL_HANDOFF_ENV] = (
         AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN
       )

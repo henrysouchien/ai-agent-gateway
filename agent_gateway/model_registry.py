@@ -57,6 +57,7 @@ CORE_CAPABILITY_IDS = frozenset({
   "node.fork",
   "node.verify",
   "node.choose",
+  "citation.review",
 })
 RISK_CAPABILITY_IDS = frozenset({
   "risk.completion",

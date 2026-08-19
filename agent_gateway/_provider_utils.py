@@ -3,8 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from .fixture_gate import require_fixture_provider_available
-from .providers import AnthropicProvider, CodexProvider, FixtureProvider, ModelProvider, OpenAIProvider, XAIProvider
+from .providers import AnthropicProvider, CodexProvider, ModelProvider, OpenAIProvider, XAIProvider
 
 
 _SELECTION_AUTH_CONFIG_FIELDS = frozenset({
@@ -197,11 +196,8 @@ def _resolve_provider(
       provider_instance = OpenAIProvider()
     elif provider_name == "xai":
       provider_instance = XAIProvider()
-    elif provider_name == "fixture":
-      require_fixture_provider_available("fixture provider resolver", error_type=ValueError)
-      provider_instance = FixtureProvider()
     else:
-      raise ValueError(f"Unknown provider: {provider}. Use 'anthropic', 'codex', 'openai', 'xai', or dev-only 'fixture'.")
+      raise ValueError(f"Unknown provider: {provider}. Use 'anthropic', 'codex', 'openai', or 'xai'.")
   elif isinstance(provider, ModelProvider):
     provider_instance = provider
     provider_name = str(getattr(provider, "name", "custom") or "custom")
@@ -240,10 +236,8 @@ def _resolve_provider(
       provider="xai",
       auth_config=auth_config,
     )
-  elif isinstance(provider_instance, FixtureProvider):
-    resolved_auth_config = dict(auth_config or {})
   else:
-    resolved_auth_config = dict(auth_config)
+    resolved_auth_config = dict(auth_config or {})
 
   if "max_tokens" not in resolved_auth_config or auth_config is None:
     resolved_auth_config["max_tokens"] = max_tokens

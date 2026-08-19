@@ -191,3 +191,63 @@ def test_typed_tool_block_failure_is_structurally_valid_and_observable(
   ]
   assert secret not in json.dumps(projected)
   assert metrics_snapshot()["secret_boundary_sanitization_failed"] >= before + 2
+
+
+def test_dispatch_record_is_sanitized_on_tool_call_complete() -> None:
+  """D-B1-3: `dispatch.sources` carries URLs and document ids."""
+
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-DISPATCH-1f9c02"
+  boundary = SecretBoundary((secret,))
+
+  projected = sanitize_tool_event(
+    {
+      "type": "tool_call_complete",
+      "tool_call_id": "toolu_1",
+      "tool_name": "web_fetch",
+      "result": None,
+      "error": None,
+      "duration_ms": 3,
+      "server": None,
+      "is_error": False,
+      "dispatch": {
+        "outcome": "ok",
+        "attempts": 1,
+        "route_id": "local/web_fetch",
+        "sources": [
+          {
+            "document_id": "web:deadbeef",
+            "source_kind": "web",
+            "source_url": f"https://example.test/a?token={secret}",
+          }
+        ],
+      },
+    },
+    sink="replay",
+    boundary=boundary,
+  )
+
+  serialized = json.dumps(projected["dispatch"])
+  assert secret not in serialized
+  assert REDACTED_SECRET in serialized
+  assert projected["dispatch"]["outcome"] == "ok"
+
+
+def test_runtime_guard_message_is_boundary_sanitized() -> None:
+  """Guard messages carry the delivery nudges' objective echoes (CUR-E2E-08
+  observability) — free prose that must cross the boundary like every other
+  durable copy of the dispatch objective."""
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-cccccccc"
+  boundary = SecretBoundary.from_capability_execution(_execution(secret))
+  event = {
+    "type": "runtime_guard",
+    "guard": "unread_result_handle_nudge",
+    "message": f"task bg-1 (fetch filings with key {secret}): read it",
+  }
+  projected = sanitize_tool_event(
+    event,
+    sink="durable_event",
+    boundary=boundary,
+  )
+  assert secret not in json.dumps(projected)
+  assert projected["guard"] == "unread_result_handle_nudge"
+  assert "task bg-1" in projected["message"]

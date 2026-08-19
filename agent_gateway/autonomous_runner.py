@@ -43,7 +43,6 @@ from .autonomous_event_channel import (
   AutonomousEventRecord,
   ReceivedAutonomousEventStream,
 )
-from .fixture_gate import is_fixture_profile_name, is_fixture_skill_name, require_fixture_provider_available
 from .autonomous_runner_claims import (
   _AGENT_API_CLAIM_AUDIENCE as _AGENT_API_CLAIM_AUDIENCE,
   _AGENT_API_CLAIM_ENV_VARS as _AGENT_API_CLAIM_ENV_VARS,
@@ -60,6 +59,9 @@ from .autonomous_runner_state import (
   _REHYDRATED_ACTIVE_STATES,
   _REHYDRATION_INTERRUPTED_ERROR as _REHYDRATION_INTERRUPTED_ERROR,
   _RUN_SEQUENCE_CURSOR_FILE as _RUN_SEQUENCE_CURSOR_FILE,
+  _SKIP_WARNED as _SKIP_WARNED,
+  _SKIP_WARNED_FILE as _SKIP_WARNED_FILE,
+  _SKIP_WARNED_LOADED_DIRS as _SKIP_WARNED_LOADED_DIRS,
   _TASK_MANIFEST_VERSION as _TASK_MANIFEST_VERSION,
   _TERMINAL_AUTONOMOUS_STATES,
   AutonomousRegistryStateMixin,
@@ -213,7 +215,6 @@ def _append_control_record(
 def normalize_autonomous_profile(profile: str) -> str:
   return _runner_commands.normalize_autonomous_profile(
     profile,
-    is_fixture_profile_name_func=is_fixture_profile_name,
     profile_name_re=_AUTONOMOUS_PROFILE_NAME_RE,
   )
 
@@ -318,7 +319,6 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     pack: str | None = None,
     deliver: bool = True,
     ticker: str | None = None,
-    dev_mode: bool = False,
     max_budget_usd: float | None = None,
   ) -> list[str]:
     return _runner_commands.build_autonomous_cmd(
@@ -331,12 +331,8 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       deliver=deliver,
       context=context,
       ticker=ticker,
-      dev_mode=dev_mode,
       max_budget_usd=max_budget_usd,
       normalize_autonomous_profile_func=normalize_autonomous_profile,
-      is_fixture_profile_name_func=is_fixture_profile_name,
-      is_fixture_skill_name_func=is_fixture_skill_name,
-      require_fixture_provider_available_func=require_fixture_provider_available,
     )
 
   def _start_payload(self, record: AutonomousTask) -> dict[str, Any]:
@@ -620,13 +616,10 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         return True
     return False
 
-  def _tail_lines(self, log_path: Path, line_count: int) -> tuple[list[str], int]:
-    return _runner_status.tail_lines(log_path, line_count)
-
   def _status_payload(self, record: AutonomousTask) -> dict[str, Any]:
     return _runner_status.status_payload(
       record,
-      tail_lines_func=self._tail_lines,
+      tail_lines_func=_runner_status.tail_lines,
       status_tail_lines=_STATUS_TAIL_LINES,
     )
 
@@ -1422,7 +1415,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
 
   def logs(self, task_id: str, *, tail: int = 200) -> dict[str, Any]:
     record = self._get(task_id)
-    lines, total_lines = self._tail_lines(record.log_path, int(tail))
+    lines, total_lines = _runner_status.tail_lines(record.log_path, int(tail))
     return {
       "task_id": record.task_id,
       "log_path": str(record.log_path),

@@ -6,6 +6,15 @@ export const deliveryEnvelopeGolden = {
   "phase_number": 2,
   "primary": {
     "name": "report",
+    "preview": {
+      "complete": true,
+      "kind": "deterministic_text_preview",
+      "omitted_bytes": 0,
+      "source_end_byte": 46,
+      "source_start_byte": 0,
+      "source_total_bytes": 46,
+      "text": "# Canonical report\n\nLossless workflow output.\n"
+    },
     "published_output_ref": {
       "content": {
         "content_bytes": 46,
@@ -32,33 +41,6 @@ export const deliveryEnvelopeGolden = {
     }
   },
   "revision": 3,
-  "schema_version": "1.0",
-  "summary": {
-    "source": {
-      "content": {
-        "content_bytes": 29,
-        "content_chars": 29,
-        "content_id": "sha256:ed838d86b06cdaaefe5f86536bf02288bdd596f7c2bfb1643e49a5156da33503",
-        "content_sha256": "ed838d86b06cdaaefe5f86536bf02288bdd596f7c2bfb1643e49a5156da33503",
-        "contract": {
-          "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "name": "research-report",
-          "namespace": "workflow",
-          "version": "1.0"
-        },
-        "encoding": "utf-8",
-        "media_type": "text/markdown",
-        "retention": "durable"
-      },
-      "contract": {
-        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "name": "research-report",
-        "namespace": "workflow",
-        "version": "1.0"
-      },
-      "output_id": "wout:workflow-contract-golden:phase:2:revision:3:summary"
-    },
-    "text": "The exact report is attached."
-  },
+  "schema_version": "2.0",
   "workflow_run_id": "workflow-contract-golden"
 } as const satisfies DeliveryEnvelope;

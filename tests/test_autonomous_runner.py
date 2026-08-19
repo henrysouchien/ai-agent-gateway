@@ -912,34 +912,6 @@ def test_autonomous_event_identity_overwrites_payload_claims(
   assert source["control_run_id"] == "run-forged"
 
 
-def test_autonomous_runner_status_helper_preserves_parent_tail_override(tmp_path) -> None:
-  from agent_gateway import autonomous_runner
-  from agent_gateway import autonomous_runner_status
-  from agent_gateway.autonomous_runner import AutonomousRegistry
-
-  assert autonomous_runner.AutonomousRegistry._status_payload.__module__ == autonomous_runner.__name__
-  assert autonomous_runner_status.status_payload.__module__ == autonomous_runner_status.__name__
-
-  _write_manifest(tmp_path, "bg_0", state="failed", exit_code=2, error="boom")
-  registry = AutonomousRegistry(api_dir=tmp_path, log_dir=tmp_path)
-  record = registry._tasks["bg_0"]
-
-  def tail_lines(log_path: Path, line_count: int) -> tuple[list[str], int]:
-    assert log_path == record.log_path
-    assert line_count == autonomous_runner._STATUS_TAIL_LINES
-    return ["patched line"], 1
-
-  registry._tail_lines = tail_lines  # type: ignore[method-assign]
-
-  assert registry._status_payload(record) == {
-    "state": "failed",
-    "elapsed_sec": record.elapsed_sec,
-    "exit_code": 2,
-    "error": "boom",
-    "log_tail": "patched line",
-  }
-
-
 def test_autonomous_runner_status_tail_lines_counts_and_tails(tmp_path) -> None:
   from agent_gateway import autonomous_runner_status
 
@@ -951,7 +923,7 @@ def test_autonomous_runner_status_tail_lines_counts_and_tails(tmp_path) -> None:
   assert autonomous_runner_status.tail_lines(tmp_path / "missing.log", 10) == ([], 0)
 
 
-def test_autonomous_runner_command_helper_preserves_parent_override_seams(monkeypatch, tmp_path) -> None:
+def test_autonomous_runner_command_helper_preserves_profile_normalization_seam(monkeypatch, tmp_path) -> None:
   from agent_gateway import autonomous_runner
   from agent_gateway import autonomous_runner_commands
   from agent_gateway.autonomous_runner import AutonomousRegistry
@@ -969,35 +941,16 @@ def test_autonomous_runner_command_helper_preserves_parent_override_seams(monkey
     checks.append(f"profile:{profile}")
     return "patched_profile"
 
-  def is_fixture_profile(profile: str) -> bool:
-    checks.append(f"fixture-profile:{profile}")
-    return False
-
-  def is_fixture_skill(skill: str) -> bool:
-    checks.append(f"fixture-skill:{skill}")
-    return skill == "patched-fixture"
-
-  def require_fixture_provider_available(reason: str, **kwargs) -> None:
-    checks.append(f"guard:{reason}:{kwargs['error_type'].__name__}")
-
   monkeypatch.setattr(autonomous_runner, "normalize_autonomous_profile", normalize_profile)
-  monkeypatch.setattr(autonomous_runner, "is_fixture_profile_name", is_fixture_profile)
-  monkeypatch.setattr(autonomous_runner, "is_fixture_skill_name", is_fixture_skill)
-  monkeypatch.setattr(
-    autonomous_runner,
-    "require_fixture_provider_available",
-    require_fixture_provider_available,
-  )
 
   registry = AutonomousRegistry(api_dir=tmp_path, python_executable="py", log_dir=tmp_path)
   cmd = registry._build_cmd(
     profile="Analyst",
     mode="skill",
     task=None,
-    skill="patched-fixture",
+    skill="patched-skill",
     context=" context ",
     ticker="msft",
-    dev_mode=True,
     max_budget_usd=5.0,
   )
 
@@ -1007,9 +960,8 @@ def test_autonomous_runner_command_helper_preserves_parent_override_seams(monkey
     "agent.autonomous",
     "--profile",
     "patched_profile",
-    "--dev",
     "--skill",
-    "patched-fixture",
+    "patched-skill",
     "--max-budget-usd",
     "5.0",
     "--ticker",
@@ -1017,12 +969,7 @@ def test_autonomous_runner_command_helper_preserves_parent_override_seams(monkey
     "--context",
     "context",
   ]
-  assert checks == [
-    "profile:Analyst",
-    "fixture-profile:patched_profile",
-    "fixture-skill:patched-fixture",
-    "guard:fixture skill dispatch:ValueError",
-  ]
+  assert checks == ["profile:Analyst"]
 
 
 @pytest.mark.parametrize("max_budget_usd", [True, 0, -1, float("inf"), float("nan"), "5"])
@@ -1441,7 +1388,6 @@ def test_autonomous_start_signs_exact_session_authority_only(
         "skill": "  earnings-review  ",
         "context": "  compare guidance  ",
         "ticker": " msft ",
-        "dev_mode": True,
         "max_budget_usd": 12.5,
         "deliver": False,
       },
@@ -1453,7 +1399,7 @@ def test_autonomous_start_signs_exact_session_authority_only(
         "pack": None,
         "context": "compare guidance",
         "ticker": "MSFT",
-        "dev_mode": True,
+        "dev_mode": False,
         "max_budget_usd": 12.5,
         "deliver": False,
       },
@@ -2112,6 +2058,51 @@ def test_autonomous_registry_skips_corrupt_unknown_and_legacy_runs(tmp_path, cap
   assert "Skipping autonomous manifest with unsupported version" in caplog.text
 
 
+def test_autonomous_registry_warn_once_is_process_and_disk_scoped(tmp_path, caplog) -> None:
+  from agent_gateway import autonomous_runner_state
+
+  _write_manifest(tmp_path, "bg_1", manifest_version=999)
+  skip_path = tmp_path / autonomous_runner_state._SKIP_WARNED_FILE
+
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.autonomous_runner"):
+    first = _registry(tmp_path)
+    second = _registry(tmp_path)
+
+  assert first._tasks == {}
+  assert second._tasks == {}
+  assert caplog.text.count("Skipping autonomous manifest with unsupported version") == 1
+  assert skip_path.is_file()
+  persisted = json.loads(skip_path.read_text(encoding="utf-8"))
+  assert any(str(_manifest_path(tmp_path, "bg_1")) in item for item in persisted)
+
+  saved_warned = set(autonomous_runner_state._SKIP_WARNED)
+  saved_dirs = set(autonomous_runner_state._SKIP_WARNED_LOADED_DIRS)
+  autonomous_runner_state._SKIP_WARNED.clear()
+  autonomous_runner_state._SKIP_WARNED_LOADED_DIRS.clear()
+  caplog.clear()
+  try:
+    with caplog.at_level(logging.WARNING, logger="agent_gateway.autonomous_runner"):
+      restarted = _registry(tmp_path)
+
+    assert restarted._tasks == {}
+    assert "Skipping autonomous manifest with unsupported version" not in caplog.text
+
+    manifest_path = _manifest_path(tmp_path, "bg_1")
+    os.utime(manifest_path, (0, manifest_path.stat().st_mtime + 5))
+    autonomous_runner_state._SKIP_WARNED.clear()
+    autonomous_runner_state._SKIP_WARNED_LOADED_DIRS.clear()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="agent_gateway.autonomous_runner"):
+      rewritten = _registry(tmp_path)
+    assert rewritten._tasks == {}
+    assert caplog.text.count("Skipping autonomous manifest with unsupported version") == 1
+  finally:
+    autonomous_runner_state._SKIP_WARNED.clear()
+    autonomous_runner_state._SKIP_WARNED.update(saved_warned)
+    autonomous_runner_state._SKIP_WARNED_LOADED_DIRS.clear()
+    autonomous_runner_state._SKIP_WARNED_LOADED_DIRS.update(saved_dirs)
+
+
 def test_autonomous_registry_skips_manifest_with_invalid_task_invariants(
   tmp_path,
   caplog,
@@ -2530,7 +2521,6 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       context=" inspect current book ",
       ticker="msft",
       channel="TUI",
-      dev_mode=True,
       control_run_id="  run-custom  ",
       user_id=USER_ID,
       user_email=None,
@@ -2612,7 +2602,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       assert manifest["context"] == "inspect current book"
       assert manifest["ticker"] == "MSFT"
       assert manifest["channel"] == "tui"
-      assert manifest["dev_mode"] is True
+      assert manifest["dev_mode"] is False
       assert manifest["max_budget_usd"] == 5.0
       assert manifest["dispatch_scope"] is None
       assert manifest["containment_expectation"] == {
@@ -2625,7 +2615,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "expected_degraded": sys.platform == "darwin",
       }
       assert manifest["cmd"][:5] == ["python3", "-m", "agent.autonomous", "--profile", "analyst"]
-      assert "--dev" in manifest["cmd"]
+      assert "--dev" not in manifest["cmd"]
       assert manifest["cmd"][manifest["cmd"].index("--max-budget-usd") + 1] == "5.0"
       assert manifest["log_path"] == str(tmp_path / "bg_0.log")
       assert manifest["events_path"] == str(tmp_path / "bg_0.events.jsonl")
@@ -4519,7 +4509,13 @@ def test_autonomous_start_scrubs_ambient_credential_and_profile_dev_authority(
     "ADVISOR_DEV_MODE",
     "RESEARCH_PRODUCER_DEV_MODE",
   )
-  for env_name in authority_env_names:
+  dev_tuning_env_names = (
+    "ANALYST_DEV_MAX_BUDGET_USD",
+    "ANALYST_DEV_MAX_TURNS",
+    "ANALYST_DEV_STREAM_STALL_TIMEOUT",
+    "ANALYST_DEV_TIMEOUT",
+  )
+  for env_name in (*authority_env_names, *dev_tuning_env_names):
     monkeypatch.setenv(env_name, "hostile-ambient-value")
 
   non_dev_env = asyncio.run(
@@ -4530,32 +4526,29 @@ def test_autonomous_start_scrubs_ambient_credential_and_profile_dev_authority(
         "mode": "skill",
         "task": None,
         "skill": "earnings-review",
-        "dev_mode": False,
       },
     )
   )
   assert all(
     env_name not in non_dev_env
-    for env_name in authority_env_names
+    for env_name in (*authority_env_names, *dev_tuning_env_names)
   )
 
-  dev_env = asyncio.run(
+  task_env = asyncio.run(
     _start_and_capture_env(
       monkeypatch,
-      tmp_path / "dev",
+      tmp_path / "task",
       start_overrides={
-        "mode": "skill",
-        "task": None,
-        "skill": "earnings-review",
-        "dev_mode": True,
+        "mode": "task",
+        "task": "complete a product task",
+        "skill": None,
       },
     )
   )
-  assert dev_env["ANALYST_DEV_MODE"] == "true"
-  assert "ADVISOR_DEV_MODE" not in dev_env
-  assert "RESEARCH_PRODUCER_DEV_MODE" not in dev_env
-  assert "AGENT_AUTONOMOUS_USER_CREDENTIAL_HANDOFF" not in dev_env
-
+  assert all(
+    env_name not in task_env
+    for env_name in (*authority_env_names, *dev_tuning_env_names)
+  )
 
 def test_autonomous_start_fails_without_installed_claim_authority(
   monkeypatch,

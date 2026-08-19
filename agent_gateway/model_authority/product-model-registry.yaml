@@ -10,7 +10,7 @@
 # Content is frozen per docs/design/model-selection-authority-product-
 # decisions-2026-08-13.md section 6. Unknown fields are rejected by the loader.
 schema: "product-model-registry/v1"
-revision: "2026-08-13.1"
+revision: "2026-08-18.1"
 models:
   - key: "anthropic.claude-fable-5"
     label: "Fable 5"
@@ -29,6 +29,7 @@ models:
       node.fork: "internal"
       node.verify: "internal"
       node.choose: "internal"
+      citation.review: "internal"
     supported_efforts: ["low", "medium", "high", "xhigh", "max"]
     default_effort: "high"
     features: ["tools", "streaming"]
@@ -46,6 +47,7 @@ models:
       session.driver: "user_selectable"
       plan.author: "internal"
       node.fork: "internal"
+      citation.review: "internal"
     supported_efforts: ["none"]
     default_effort: "none"
     features: ["tools", "streaming"]
@@ -68,6 +70,7 @@ models:
       node.fork: "internal"
       node.verify: "internal"
       node.choose: "internal"
+      citation.review: "internal"
     supported_efforts: ["low", "medium", "high", "xhigh", "max"]
     default_effort: "high"
     features: ["tools", "streaming"]
@@ -90,6 +93,7 @@ models:
       node.fork: "internal"
       node.verify: "internal"
       node.choose: "internal"
+      citation.review: "internal"
     supported_efforts: ["none", "low", "medium", "high", "xhigh", "max"]
     default_effort: "high"
     features: ["tools", "streaming"]
@@ -112,6 +116,7 @@ models:
       node.fork: "internal"
       node.verify: "internal"
       node.choose: "internal"
+      citation.review: "internal"
     supported_efforts: ["none", "low", "medium", "high", "xhigh", "max"]
     default_effort: "high"
     features: ["tools", "streaming"]
@@ -133,7 +138,7 @@ models:
     supported_efforts: ["none", "low", "medium", "high", "xhigh", "max"]
     default_effort: "medium"
     features: ["tools", "streaming"]
-    reported_identities: ["gpt-5.6"]
+    reported_identities: ["gpt-5.6", "gpt-5.6-sol"]
 
   - key: "codex.gpt-5-6-luna"
     label: "GPT-5.6 Luna"

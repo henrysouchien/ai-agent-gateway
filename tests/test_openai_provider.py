@@ -1,10 +1,12 @@
 # ruff: noqa: E402
 
 import asyncio
+import builtins
 import json
 import stat
 import sys
 import types
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,9 +18,11 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner, EventLog
+from agent_gateway import AgentRunner, EventLog, ToolDispatcher
+from agent_gateway.capability_binding import CapabilityResolutionError
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.openai_history_fence import REASONING_SIGNATURE_MARKER, TEXT_SIGNATURE_MARKER
+from agent_gateway.model_registry import INITIAL_MODEL_REGISTRY, ProductModelRegistry
 from agent_gateway.provider_summarize import provider_summarize
 from agent_gateway.providers import OpenAIProvider, ThinkingLevel
 from agent_gateway.providers.openai import OpenAIConfigurationError
@@ -56,6 +60,71 @@ class _Responses:
 class _StreamingClient:
   def __init__(self, events: list[Any]):
     self.responses = _Responses(events)
+
+
+def _terminal_text_response_events(reported_model: str) -> list[dict[str, Any]]:
+  return [
+    {
+      "type": "response.output_item.added",
+      "item": {
+        "type": "message",
+        "id": "msg_reported_identity",
+        "status": "in_progress",
+        "content": [],
+      },
+    },
+    {
+      "type": "response.content_part.added",
+      "part": {"type": "output_text", "text": "", "annotations": []},
+    },
+    {"type": "response.output_text.delta", "delta": "ok"},
+    {
+      "type": "response.output_item.done",
+      "item": {
+        "type": "message",
+        "id": "msg_reported_identity",
+        "status": "completed",
+        "content": [
+          {"type": "output_text", "text": "ok", "annotations": []},
+        ],
+      },
+    },
+    {
+      "type": "response.completed",
+      "response": {
+        "model": reported_model,
+        "status": "completed",
+        "usage": {"input_tokens": 8, "output_tokens": 2},
+      },
+    },
+  ]
+
+
+def _shipped_openai_execution(provider: OpenAIProvider):
+  execution = stub_runner_capability_execution(
+    provider=provider,
+    model="gpt-5.6",
+    effort="none",
+    auth_config={"api_key": "sk-test"},
+  )
+  entry = execution.registry.require(execution.bind.model_key)
+  shipped_entry = INITIAL_MODEL_REGISTRY.require("openai.gpt-5-6")
+  admitted_entry = replace(
+    entry,
+    reported_identities=shipped_entry.reported_identities,
+  )
+  registry = ProductModelRegistry(
+    schema=execution.registry.schema,
+    revision=INITIAL_MODEL_REGISTRY.revision,
+    models={admitted_entry.key: admitted_entry},
+  )
+  return replace(
+    execution,
+    bind=execution.bind.model_copy(update={
+      "registry_revision": registry.revision,
+    }),
+    registry=registry,
+  )
 
 
 @pytest.fixture(autouse=True)
@@ -585,6 +654,237 @@ def test_runner_executes_responses_tool_loop_and_replays_function_output() -> No
   assert any(entry.event.get("type") == "stream_complete" for entry in event_log.entries)
 
 
+def test_standalone_runner_keeps_raw_execution_separate_from_safe_history(
+  monkeypatch,
+  tmp_path: Path,
+  caplog,
+) -> None:
+  secret = "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"
+  valid_input = {
+    "symbol": "AAPL",
+    "start_date": "2025-01-01",
+    "end_date": "2025-01-31",
+    "credential_note": secret,
+  }
+  response_batches = [
+    [
+      {
+        "type": "response.output_item.added",
+        "item": {
+          "type": "function_call",
+          "id": "fc_valid",
+          "call_id": "call_valid",
+          "name": "data_historical_prices",
+          "arguments": json.dumps(valid_input),
+        },
+      },
+      {
+        "type": "response.output_item.done",
+        "item": {
+          "type": "function_call",
+          "id": "fc_valid",
+          "call_id": "call_valid",
+          "name": "data_historical_prices",
+          "arguments": json.dumps(valid_input),
+        },
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "usage": {"input_tokens": 5, "output_tokens": 2},
+        },
+      },
+    ],
+    [
+      {
+        "type": "response.output_item.added",
+        "item": {
+          "type": "function_call",
+          "id": "fc_invalid",
+          "call_id": "call_invalid",
+          "name": "data_historical_prices",
+          "arguments": '{"start_date":"2025-01-01"}',
+        },
+      },
+      {
+        "type": "response.output_item.done",
+        "item": {
+          "type": "function_call",
+          "id": "fc_invalid",
+          "call_id": "call_invalid",
+          "name": "data_historical_prices",
+          "arguments": '{"start_date":"2025-01-01"}',
+        },
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "usage": {"input_tokens": 8, "output_tokens": 2},
+        },
+      },
+    ],
+    [
+      {
+        "type": "response.output_item.added",
+        "item": {
+          "type": "message",
+          "id": "msg_final",
+          "status": "in_progress",
+          "content": [],
+        },
+      },
+      {
+        "type": "response.content_part.added",
+        "part": {"type": "output_text", "text": "", "annotations": []},
+      },
+      {"type": "response.output_text.delta", "delta": "stopped after invalid input"},
+      {
+        "type": "response.output_item.done",
+        "item": {
+          "type": "message",
+          "id": "msg_final",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "stopped after invalid input",
+              "annotations": [],
+            },
+          ],
+        },
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "usage": {"input_tokens": 11, "output_tokens": 4},
+        },
+      },
+    ],
+  ]
+
+  class Responses:
+    def __init__(self):
+      self.requests: list[dict[str, Any]] = []
+
+    async def create(self, **params: Any):
+      self.requests.append(params)
+      return _EventStream(response_batches[len(self.requests) - 1])
+
+  responses = Responses()
+  client = SimpleNamespace(responses=responses)
+
+  class Provider(OpenAIProvider):
+    def create_client(self, config: dict[str, Any], *, timeout: float | None = None):
+      return client
+
+    async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+      return None
+
+  class Mcp:
+    def is_mcp_tool(self, _name: str) -> bool:
+      return False
+
+    def get_server_for_tool(self, _name: str) -> None:
+      return None
+
+  handler_inputs: list[dict[str, Any]] = []
+
+  async def handler(tool_input: dict[str, Any], **_kwargs: Any):
+    handler_inputs.append(dict(tool_input))
+    return {"rows": 1}, None
+
+  tool_definition = {
+    "name": "data_historical_prices",
+    "description": "Load historical prices",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "symbol": {"type": "string"},
+        "start_date": {"type": "string"},
+        "end_date": {"type": "string"},
+        "credential_note": {"type": "string"},
+      },
+      "required": ["symbol", "start_date", "end_date"],
+      "additionalProperties": False,
+    },
+  }
+  event_log = EventLog(session_id="standalone-redaction")
+  dispatcher = ToolDispatcher(
+    mcp_client=Mcp(),  # type: ignore[arg-type]
+    local_tool_handlers={"data_historical_prices": handler},
+    event_log=event_log,
+    session_id="standalone-redaction",
+    role="owner",
+    get_tool_definitions=lambda: [tool_definition],
+    local_tool_class_resolver=lambda _name: "read",
+    local_catalog_action_resolver=lambda _name: None,
+  )
+  session_log = AgentSessionLog(path=tmp_path / "sessions" / "redaction.jsonl")
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=dispatcher,
+    session_id="standalone-redaction",
+    capability_execution=stub_runner_capability_execution(
+      provider=Provider(),
+      model="gpt-5.6-terra",
+      effort="low",
+      auth_config={"api_key": "sk-test", "max_tokens": 512},
+    ),
+    get_tool_definitions=lambda: [tool_definition],
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="test",
+    agent_session_log=session_log,
+    emit_session_recap=False,
+  )
+
+  original_import = builtins.__import__
+
+  def import_without_host_redaction(name: str, *args: Any, **kwargs: Any):
+    if name == "agent.shared.tool_redaction":
+      raise ModuleNotFoundError("No module named 'agent'", name="agent")
+    return original_import(name, *args, **kwargs)
+
+  monkeypatch.setattr(builtins, "__import__", import_without_host_redaction)
+  caplog.set_level("INFO", logger="agent_gateway.runner")
+  asyncio.run(runner.run([{"role": "user", "content": "load prices"}], max_turns=4))
+
+  assert handler_inputs == [valid_input]
+  assert len(responses.requests) == 3
+  assert any(
+    entry.event.get("type") == "tool_input_validation_failed"
+    and entry.event.get("tool_name") == "data_historical_prices"
+    for entry in event_log.entries
+  )
+  serialized_event_log = json.dumps([entry.event for entry in event_log.entries])
+  serialized_history = json.dumps(responses.requests[1:])
+  serialized_session = session_log.path.read_text()
+  serialized_logs = caplog.text
+  for surface in (
+    serialized_event_log,
+    serialized_history,
+    serialized_session,
+    serialized_logs,
+  ):
+    assert secret not in surface
+    assert "_boundary_error" not in surface
+  assert "<redacted-secret>" in serialized_event_log
+  assert "<redacted-secret>" in serialized_history
+  first_replayed_call = next(
+    item
+    for item in responses.requests[1]["input"]
+    if item.get("type") == "function_call"
+  )
+  assert json.loads(first_replayed_call["arguments"]) == {
+    **valid_input,
+    "credential_note": "<redacted-secret>",
+  }
+  assert "<redacted-secret>" in serialized_session
+
+
 def test_openai_compaction_summary_uses_responses_with_effort_none() -> None:
   events = [
     {"type": "response.output_item.added", "item": {"type": "message", "id": "msg_summary", "status": "in_progress", "content": []}},
@@ -616,6 +916,123 @@ def test_openai_compaction_summary_uses_responses_with_effort_none() -> None:
   assert result.text == "compact summary"
   assert client.responses.params is not None
   assert client.responses.params["reasoning"] == {"effort": "none"}
+
+
+def test_shipped_openai_alias_is_retained_by_real_summary_response() -> None:
+  client = _StreamingClient(_terminal_text_response_events("gpt-5.6-sol"))
+
+  class Provider(OpenAIProvider):
+    def create_client(
+      self,
+      config: dict[str, Any],
+      *,
+      timeout: float | None = None,
+    ):
+      _ = config, timeout
+      return client
+
+    async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+      _ = client, timeout
+
+  execution = _shipped_openai_execution(Provider())
+  result = asyncio.run(provider_summarize(
+    capability_execution=execution,
+    messages=[{"role": "user", "content": "summarize"}],
+    system_prompt="summarize",
+    max_tokens=128,
+  ))
+
+  assert result.text == "ok"
+  assert result.usage["provider_reported_model"] == "gpt-5.6-sol"
+  assert result.usage["capability_bind"]["upstream_model"] == "gpt-5.6"
+  assert client.responses.params is not None
+  assert client.responses.params["model"] == "gpt-5.6"
+
+
+def test_shipped_openai_alias_is_retained_by_real_agent_runner_response() -> None:
+  client = _StreamingClient(_terminal_text_response_events("gpt-5.6-sol"))
+
+  class Provider(OpenAIProvider):
+    def create_client(
+      self,
+      config: dict[str, Any],
+      *,
+      timeout: float | None = None,
+    ):
+      _ = config, timeout
+      return client
+
+    async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+      _ = client, timeout
+
+  class Dispatcher:
+    async def dispatch(self, *_args: Any, **_kwargs: Any):
+      raise AssertionError("no tool dispatch expected")
+
+  execution = _shipped_openai_execution(Provider())
+  event_log = EventLog(session_id="openai-reported-identity")
+  usage_events: list[Any] = []
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=Dispatcher(),  # type: ignore[arg-type]
+    session_id="openai-reported-identity",
+    capability_execution=execution,
+    get_tool_definitions=lambda: [],
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="test",
+    on_usage=usage_events.append,
+    emit_session_recap=False,
+  )
+
+  asyncio.run(runner.run([
+    {"role": "user", "content": "answer"},
+  ]))
+
+  assert len(usage_events) == 1
+  assert usage_events[0].provider_reported_model == "gpt-5.6-sol"
+  assert usage_events[0].capability_bind["upstream_model"] == "gpt-5.6"
+  assert any(
+    entry.event.get("type") == "stream_complete"
+    for entry in event_log.entries
+  )
+  assert client.responses.params is not None
+  assert client.responses.params["model"] == "gpt-5.6"
+
+
+@pytest.mark.parametrize(
+  "reported_model",
+  ["gpt-5.6-terra", "gpt-5.6-sol-20260817", "gpt-5.6-unknown"],
+)
+def test_real_openai_summary_rejects_unadmitted_nearby_identity(
+  reported_model: str,
+) -> None:
+  client = _StreamingClient(_terminal_text_response_events(reported_model))
+
+  class Provider(OpenAIProvider):
+    def create_client(
+      self,
+      config: dict[str, Any],
+      *,
+      timeout: float | None = None,
+    ):
+      _ = config, timeout
+      return client
+
+    async def close_client(self, client: Any, timeout: float = 2.0) -> None:
+      _ = client, timeout
+
+  with pytest.raises(CapabilityResolutionError) as caught:
+    asyncio.run(provider_summarize(
+      capability_execution=_shipped_openai_execution(Provider()),
+      messages=[{"role": "user", "content": "summarize"}],
+      system_prompt="summarize",
+      max_tokens=128,
+    ))
+
+  assert caught.value.code == "reported_identity_mismatch"
+  assert client.responses.params is not None
+  assert client.responses.params["model"] == "gpt-5.6"
 
 
 def test_declared_adapter_support_matches_responses_only_implementation() -> None:

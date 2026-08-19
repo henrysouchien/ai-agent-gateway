@@ -1087,18 +1087,177 @@ def test_registry_counts_running_and_admission_slots_separately() -> None:
   assert registry.admission_count == 2
 
 
-def test_max_inflight_enforced_only_for_running_tasks() -> None:
+def _reject_over_capacity(
+  admission_count: int,
+  ceiling: int,
+) -> dict[str, str] | None:
+  if admission_count < ceiling:
+    return None
+  return {"code": "max_background_tasks"}
+
+
+def _reject_retrieval_backpressure(
+  pending_omitted_results: int,
+  retention_limit: int,
+) -> dict[str, object]:
+  return {
+    "code": "background_notification_retrieval_required",
+    "pending_omitted_results": pending_omitted_results,
+    "retention_limit": retention_limit,
+  }
+
+
+def _admit(registry: TaskRegistry, **kwargs: object):
+  return registry.admit(
+    "background_agent",
+    reject_over_capacity=_reject_over_capacity,
+    reject_retrieval_backpressure=_reject_retrieval_backpressure,
+    **kwargs,  # type: ignore[arg-type]
+  )
+
+
+def test_running_transition_over_ceiling_logs_invariant_violation_and_proceeds(
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  """T3-I04 / D-A8-5: the RUNNING gate is a detector, never a refusal.
+
+  It used to ``raise RuntimeError("Task inflight limit reached")`` after the
+  durable ``task_registered`` append, stranding the entry PENDING with no
+  terminal (CUR-E2E-03). Capacity is owned by ``admit`` now, so reaching this
+  branch is a code defect: record it and proceed.
+  """
+
   registry = TaskRegistry(max_inflight=1)
   first = registry.register("background_agent")
   second = registry.register("background_agent")
 
   registry.transition(first.task_id, TaskState.RUNNING)
-  with pytest.raises(RuntimeError, match="Task inflight limit reached"):
-    registry.transition(second.task_id, TaskState.RUNNING)
+  with caplog.at_level("ERROR", logger="agent_gateway.task_registry"):
+    entry = registry.transition(second.task_id, TaskState.RUNNING)
+
+  assert entry.state == TaskState.RUNNING
+  assert registry.inflight_count == 2
+  violations = [
+    record
+    for record in caplog.records
+    if "task registry invariant violation" in record.getMessage()
+  ]
+  assert len(violations) == 1
+  message = violations[0].getMessage()
+  assert second.task_id in message
+  assert "max_inflight=1" in message
 
   registry.transition(first.task_id, TaskState.COMPLETED)
-  registry.transition(second.task_id, TaskState.RUNNING)
   assert registry.inflight_count == 1
+
+
+def test_admit_refuses_capacity_instead_of_the_running_transition() -> None:
+  """The ceiling now lives at the single admission point (D-A8-1)."""
+
+  registry = TaskRegistry(max_inflight=1)
+  first, rejection = _admit(registry)
+  assert rejection is None
+  assert first is not None
+
+  refused, rejection = _admit(registry)
+  assert refused is None
+  assert rejection == {"code": "max_background_tasks"}
+  assert registry.admission_count == 1
+
+  registry.transition(first.task_id, TaskState.RUNNING)
+  registry.transition(first.task_id, TaskState.COMPLETED)
+
+  admitted, rejection = _admit(registry)
+  assert rejection is None
+  assert admitted is not None
+  assert registry.admission_count == 1
+
+
+def test_admit_discounts_an_already_reserved_pending_successor() -> None:
+  registry = TaskRegistry(max_inflight=1)
+  reserved = registry.claim_resume_successor(
+    "background_agent",
+    task_id="bg_root_r1",
+    original_task_id="bg_root",
+  )[0]
+  assert registry.admission_count == 1
+
+  entry, rejection = _admit(
+    registry,
+    task_id="bg_root_r1",
+    original_task_id="bg_root",
+  )
+  assert rejection is None
+  assert entry is reserved
+  assert registry.admission_count == 1
+
+
+def test_admit_refuses_when_notification_retrieval_retention_is_full() -> None:
+  registry = TaskRegistry(max_inflight=1, max_retained=1)
+  omitted = registry.register("background_agent")
+  registry.transition(omitted.task_id, TaskState.COMPLETED)
+  omitted.notification_delivery_state = "payload_omitted"
+  second = registry.register("background_agent")
+  registry.transition(second.task_id, TaskState.COMPLETED)
+  second.notification_delivery_state = "payload_omitted"
+
+  entry, rejection = _admit(registry)
+  assert entry is None
+  assert rejection is not None
+  assert rejection["code"] == "background_notification_retrieval_required"
+  assert rejection["retention_limit"] == (
+    registry.notification_retrieval_retention_limit
+  )
+
+
+def test_admit_returns_a_conflict_rejection_for_a_foreign_resume_lineage() -> None:
+  registry = TaskRegistry(max_inflight=4)
+  registry.claim_resume_successor(
+    "background_agent",
+    task_id="bg_root_r1",
+    original_task_id="bg_root",
+  )
+
+  entry, rejection = _admit(
+    registry,
+    task_id="bg_root_r1",
+    original_task_id="bg_other",
+  )
+  assert entry is None
+  assert rejection is not None
+  assert rejection["code"] == "resume_successor_conflict"
+
+
+def test_admit_is_atomic_under_concurrent_callers() -> None:
+  """Kills seam-map Hole 1: the verdict and the reservation are one step.
+
+  Every caller yields to the event loop right before admitting, which is
+  exactly what the old ``await self._lookup_task_in_log(...)`` between the
+  capacity check and ``register`` did.
+  """
+
+  registry = TaskRegistry(max_inflight=3)
+  admitted: list[str] = []
+  refused: list[dict[str, str]] = []
+
+  async def _case() -> None:
+    async def _one() -> None:
+      await asyncio.sleep(0)
+      entry, rejection = _admit(registry)
+      if rejection is not None:
+        refused.append(rejection)  # type: ignore[arg-type]
+        return
+      assert entry is not None
+      admitted.append(entry.task_id)
+
+    await asyncio.gather(*[_one() for _ in range(10)])
+
+  asyncio.run(_case())
+
+  assert len(admitted) == 3
+  assert len(refused) == 7
+  assert {rejection["code"] for rejection in refused} == {"max_background_tasks"}
+  assert registry.admission_count == 3
 
 
 def test_max_retained_auto_evicts_oldest_completed_entries() -> None:

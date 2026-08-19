@@ -1507,11 +1507,9 @@ def test_fms_business_model_pending_record_reconciles_original_approval(
       nonlocal policy_calls
       policy_calls += 1
       return PolicyApprovalDecision(
-        outcome="route_external",
-        reason="route exact plan",
-        route_target="phase6-review",
-        route_target_type="service",
-        expiry_seconds=600,
+        outcome="request_user_approval",
+        reason="review exact plan",
+        expiry_seconds=0.001,
       )
 
     async def on_resolve(self, **_kwargs: Any):
@@ -1637,7 +1635,6 @@ def test_batch_admission_cancel_between_pending_commit_and_publish_cleans_all_re
         return PolicyApprovalDecision(
           outcome="request_user_approval",
           reason="user review required",
-          route_target_type="pending_tools",
           expiry_seconds=600,
         )
 
@@ -2112,7 +2109,6 @@ def test_planned_dispatch_timeout_preserves_bound_row_and_skips_executor(
       return PolicyApprovalDecision(
         outcome="request_user_approval",
         reason="approval required",
-        route_target_type="pending_tools",
         expiry_seconds=0.001,
         allow_persistent_grant=True,
       )

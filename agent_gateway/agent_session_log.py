@@ -156,7 +156,26 @@ class AgentSessionLog:
     append_future.add_done_callback(
       self._pending_append_futures.discard
     )
-    return await asyncio.shield(append_future)
+    try:
+      return await asyncio.shield(append_future)
+    except asyncio.CancelledError:
+      # The synchronous append owns one durability decision.  A cancelled
+      # caller must not return while the executor may still fsync a new fact.
+      # Repeated cancellation is absorbed until the exact append outcome is
+      # known; the original cancellation is then propagated.
+      while not append_future.done():
+        try:
+          await asyncio.shield(append_future)
+        except asyncio.CancelledError:
+          continue
+        except Exception:
+          break
+      if append_future.done() and not append_future.cancelled():
+        try:
+          append_future.result()
+        except Exception:
+          pass
+      raise
 
   def append_sync(self, event: dict[str, Any]) -> LogEntry:
     """Durably append without yielding, for terminal settlement barriers."""

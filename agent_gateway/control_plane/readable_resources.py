@@ -244,7 +244,7 @@ def _chat_event_sources(
       task_id=None,
       events=session.event_history.snapshot(),
     )
-    for session in auth.session_store.sessions.values()
+    for session in auth.session_store.visible_sessions_snapshot()
     if (
       session.kind == "chat"
       and _session_matches_owner(session, owner_user_id)
@@ -338,7 +338,6 @@ def build_readable_resources_router(
   ) -> ReadableResourceListResponse:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
-    auth.session_store.cleanup_expired()
     resources = _find_visible_resources(
       auth=auth,
       autonomous_registry=autonomous_registry,
@@ -373,7 +372,6 @@ def build_readable_resources_router(
     normalized_resource_id = _validate_resource_id(resource_id)
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
-    auth.session_store.cleanup_expired()
     for _sort_ts, resource in _find_visible_resources(
       auth=auth,
       autonomous_registry=autonomous_registry,

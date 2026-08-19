@@ -49,6 +49,7 @@ def run_gateway_server(
   claim_signing_key_fd: int,
   workers: int = 1,
   timeout_keep_alive: int = 120,
+  timeout_graceful_shutdown: int = 30,
   app: str = _GATEWAY_APP,
   host: str = _TCP_HOST,
   port: int = _TCP_PORT,
@@ -67,6 +68,14 @@ def run_gateway_server(
     raise ValueError(
       "timeout_keep_alive must be a positive integer"
     )
+  if (
+    isinstance(timeout_graceful_shutdown, bool)
+    or not isinstance(timeout_graceful_shutdown, int)
+    or timeout_graceful_shutdown <= 0
+  ):
+    raise ValueError(
+      "timeout_graceful_shutdown must be a positive integer"
+    )
   if (ssl_keyfile is None) != (ssl_certfile is None):
     raise ValueError(
       "ssl_keyfile and ssl_certfile must be provided together"
@@ -81,6 +90,7 @@ def run_gateway_server(
     "port": port,
     "workers": 1,
     "timeout_keep_alive": timeout_keep_alive,
+    "timeout_graceful_shutdown": timeout_graceful_shutdown,
   }
   if ssl_keyfile is not None:
     config_kwargs["ssl_keyfile"] = ssl_keyfile
@@ -111,6 +121,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     type=int,
     default=120,
   )
+  parser.add_argument(
+    "--timeout-graceful-shutdown",
+    type=int,
+    default=30,
+  )
   parser.add_argument("--app", default=_GATEWAY_APP)
   parser.add_argument("--host", default=_TCP_HOST)
   parser.add_argument("--port", type=int, default=_TCP_PORT)
@@ -121,6 +136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     claim_signing_key_fd=args.claim_signing_key_fd,
     workers=args.workers,
     timeout_keep_alive=args.timeout_keep_alive,
+    timeout_graceful_shutdown=args.timeout_graceful_shutdown,
     app=args.app,
     host=args.host,
     port=args.port,

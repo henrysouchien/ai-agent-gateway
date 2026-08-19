@@ -279,17 +279,9 @@ MODULE_REGISTRY: dict[str, ModuleSpec] = {
 }
 
 
-def registry_description() -> dict[str, Any]:
-  return {
-    "kind": "hank_dashboard.v1",
-    "modules": [MODULE_REGISTRY[name].describe() for name in sorted(MODULE_REGISTRY)],
-  }
-
-
 __all__ = [
   "ALLOWED_STATUSES",
   "MODULE_REGISTRY",
   "ModuleSpec",
   "chart_minimum_errors",
-  "registry_description",
 ]

@@ -8,11 +8,13 @@ import shutil
 import pytest
 
 from agent_gateway.commercial_contract import (
+  canonical_usage_payload_sha256,
+  packaged_usage_v3_contract_directory,
+)
+from scripts.verify_commercial_contracts import (
   CONTRACT_FILES,
   USAGE_V3_CONTRACT_FILES,
-  canonical_usage_payload_sha256,
   packaged_contract_directory,
-  packaged_usage_v3_contract_directory,
   verify_contract_directory,
   verify_usage_v3_contract_directory,
 )

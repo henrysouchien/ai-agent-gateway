@@ -9,26 +9,30 @@ the live server catalog selects compatible routes, and the resulting exact
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
 from agent_workflow_contracts import (
   AgentOperationSnapshot,
-  CapabilityBinding,
+  ExecutionIdentity,
+  OperationUnavailable,
+  ResolvedAuthority,
   ToolGrant,
   ToolGrantEntry,
   sha256_digest,
 )
 
+from .capability_resolution import (
+  OperationDeclaration,
+  resolve_operation_authority,
+  snapshot_platform_catalog,
+)
 from .policy_imports import (
   load_server_policy_module,
   resolve_server_policy_tool_class,
 )
-from .semantic_capabilities import (
-  SemanticCapabilityCompilationError,
-  SemanticToolRoute,
-  compile_semantic_capabilities,
-)
+from .semantic_capability_routing import capability_for_tool
+from .semantic_capabilities import SemanticToolRoute
+from .tool_dispatch_declarations import canonical_dispatch_tool_name
 
 
 ADMITTED_TASK_METADATA_KEY = "admitted_task"
@@ -36,14 +40,6 @@ ADMITTED_TASK_METADATA_KEY = "admitted_task"
 
 class OperationToolAdmissionError(ValueError):
   """The live runtime cannot bind an operation's semantic requirements."""
-
-
-@dataclass(frozen=True, slots=True)
-class OperationToolAdmission:
-  tool_grant: ToolGrant
-  capability_bindings: tuple[CapabilityBinding, ...]
-  tool_ids: frozenset[str]
-  mcp_tools_by_server: Mapping[str, frozenset[str]]
 
 
 ToolEffectResolver = Callable[[str, str | None, bool], str | None]
@@ -100,18 +96,6 @@ def _server_owned_effect(
   return _normalized_effect(raw)
 
 
-def _allowed_effects(workspace_scope: str) -> frozenset[str]:
-  if workspace_scope == "read_only":
-    return frozenset({"read"})
-  if workspace_scope == "workspace_write":
-    return frozenset({"read", "propose", "write"})
-  if workspace_scope == "model_write":
-    return frozenset({"read", "propose", "write", "external_effect"})
-  raise OperationToolAdmissionError(
-    f"unknown operation workspace scope: {workspace_scope}"
-  )
-
-
 def _tool_route_facts(
   *,
   operation_tool_ids: frozenset[str],
@@ -155,6 +139,11 @@ def _tool_route_facts(
       tool_id=tool_id,
       effect=effect,
       server_id=server_id,
+      capability=capability_for_tool(
+        canonical_name=canonical_dispatch_tool_name(policy_tool_id),
+        server_id=server_id,
+        effect=effect,
+      ),
     )
   return tuple(routes[name] for name in sorted(routes))
 
@@ -187,37 +176,48 @@ def admit_operation_tools(
   local_tool_handlers: Mapping[str, Any],
   mcp_client: Any,
   effect_resolver: ToolEffectResolver | None = None,
-) -> OperationToolAdmission:
-  """Bind semantic requirements to live routes and compile an exact grant."""
+  identity: ExecutionIdentity | None = None,
+  exclusions: Iterable[str] = (),
+) -> ResolvedAuthority | OperationUnavailable:
+  """Resolve one ordinary-delegation operation's authority (B-6).
+
+  A thin adapter over :func:`resolve_operation_authority`: it names the
+  candidate ids (the operation's declared ceiling, intersected with the
+  definitions the parent can actually offer this child) and hands the exact
+  declaration to the one resolver.  Nothing here decides satisfaction, and
+  nothing re-derives a route the catalog snapshot did not describe.
+
+  The Left is returned, not raised: an operation the platform cannot authorize
+  is a visible :class:`OperationUnavailable`, and the ``operation_unavailable``
+  wire code at the ``run_agent`` boundary is exactly its projection.
+  """
 
   if not isinstance(operation, AgentOperationSnapshot):
     raise TypeError("operation must be an AgentOperationSnapshot")
-  resolver = effect_resolver or _server_owned_effect
   exact_ceiling = frozenset(operation_tool_ids)
-  route_facts = _tool_route_facts(
-    operation_tool_ids=exact_ceiling,
-    definitions=definitions,
-    local_tool_handlers=local_tool_handlers,
-    mcp_client=mcp_client,
-    effect_resolver=resolver,
+  candidate_ids = tuple(sorted({
+    tool_id
+    for definition in definitions
+    if (tool_id := str(definition.get("name") or "").strip())
+    and tool_id in exact_ceiling
+  }))
+  declaration = OperationDeclaration(
+    operation_name=operation.operation.name,
+    grant_id=grant_id,
+    workspace_scope=operation.workspace_scope,
+    required_capabilities=operation.required_capabilities,
+    tool_ceiling=exact_ceiling,
   )
-  allowed_effects = _allowed_effects(operation.workspace_scope)
-  scoped_routes = tuple(
-    route for route in route_facts if route.effect in allowed_effects
-  )
-  try:
-    compiled = compile_semantic_capabilities(
-      operation.required_capabilities,
-      grant_id=grant_id,
-      tool_routes=scoped_routes,
-    )
-  except SemanticCapabilityCompilationError as exc:
-    raise OperationToolAdmissionError(str(exc)) from exc
-  return OperationToolAdmission(
-    tool_grant=compiled.tool_grant,
-    capability_bindings=compiled.capability_bindings,
-    tool_ids=compiled.tool_ids,
-    mcp_tools_by_server=compiled.mcp_tools_by_server,
+  return resolve_operation_authority(
+    declaration,
+    catalog=snapshot_platform_catalog(
+      tool_ids=candidate_ids,
+      local_tool_handlers=local_tool_handlers,
+      mcp_client=mcp_client,
+      effect_resolver=effect_resolver or _server_owned_effect,
+    ),
+    identity=identity,
+    exclusions=exclusions,
   )
 
 
@@ -274,7 +274,6 @@ def scopes_from_tool_grant(
 
 __all__ = [
   "ADMITTED_TASK_METADATA_KEY",
-  "OperationToolAdmission",
   "OperationToolAdmissionError",
   "admit_operation_tools",
   "parse_tool_grant",

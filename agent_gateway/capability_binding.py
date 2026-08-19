@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Literal, Mapping, NoReturn, TypeAlias
+from typing import Any, Literal, Mapping, NoReturn, TypeAlias, get_args
 
 from agent_workflow_contracts import CapabilityBind
 
@@ -43,6 +43,14 @@ CapabilityResolutionCode: TypeAlias = Literal[
   "provider_unavailable",
   "reported_identity_mismatch",
 ]
+
+# Canonical typed selection-refusal code set, derived from the Literal above.
+# Clients must consume this constant (Python) or its generated TypeScript
+# artifact (scripts/generate_agent_workflow_contracts.py) instead of hand
+# copying the code list.
+CAPABILITY_RESOLUTION_CODES: frozenset[str] = frozenset(
+  get_args(CapabilityResolutionCode)
+)
 
 _RUN_MODES = frozenset({"interactive", "fleet", "batch", "autonomous", "cron"})
 _CREDENTIAL_PRINCIPALS = frozenset({"user", "service"})
@@ -415,6 +423,22 @@ def _validate_entry_for_policy(
     )
 
 
+def _implicit_effort(
+  policy_effort: str | None,
+  entry: ModelRegistryEntry,
+) -> str:
+  """Implicit effort for a selection whose source carries none.
+
+  The capability/channel policy effort applies when the selected model
+  supports it; otherwise the entry's own default keeps an eligible model
+  selectable (design: policy admission ensures the effort is supported by
+  the selected model — an unsupported implicit effort must not make an
+  advertised-eligible model unselectable)."""
+  if policy_effort and policy_effort in entry.supported_efforts:
+    return policy_effort
+  return entry.default_effort
+
+
 def _policy_effort(
   policy: CapabilitySelectionPolicy,
   trusted_channel: str | None,
@@ -581,8 +605,7 @@ def saved_preference_ineligibility(
     return "model_not_allowed"
   effort = (
     saved_preference.effort
-    or _policy_effort(policy, trusted_channel)
-    or entry.default_effort
+    or _implicit_effort(_policy_effort(policy, trusted_channel), entry)
   )
   if effort not in entry.supported_efforts:
     return "effort_unsupported"
@@ -622,8 +645,7 @@ def _selection_candidate(
     )
     effort = (
       explicit_intent.effort
-      or sourced_policy_effort
-      or entry.default_effort
+      or _implicit_effort(sourced_policy_effort, entry)
     )
     return entry, effort, "explicit_user"
 
@@ -642,8 +664,7 @@ def _selection_candidate(
     )
     effort = (
       saved_preference.effort
-      or sourced_policy_effort
-      or entry.default_effort
+      or _implicit_effort(sourced_policy_effort, entry)
     )
     return entry, effort, "saved_preference"
 
@@ -665,8 +686,7 @@ def _selection_candidate(
     )
     effort = (
       authenticated_run_override.effort
-      or sourced_policy_effort
-      or entry.default_effort
+      or _implicit_effort(sourced_policy_effort, entry)
     )
     return entry, effort, "explicit_user"
 

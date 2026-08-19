@@ -160,11 +160,6 @@ def test_build_audit_entry_uses_injected_tool_redactor() -> None:
     policy_id="test-policy",
     policy_version="1",
     policy_bundle_hash="bundle",
-    model_id=None,
-    model_version=None,
-    system_prompt_hash=None,
-    tool_schema_version=None,
-    mcp_server_version=None,
     tenant_id=None,
   )
 

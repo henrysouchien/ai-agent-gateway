@@ -1,0 +1,85 @@
+{
+  "contract_version": "control-run-v1",
+  "states": [
+    "starting",
+    "queued",
+    "waiting",
+    "running",
+    "approval_pending",
+    "completed",
+    "budget_limited",
+    "failed",
+    "interrupted",
+    "cancelled"
+  ],
+  "classification": {
+    "starting": {
+      "active": true,
+      "terminal": false,
+      "resumable": false,
+      "cancellable": true
+    },
+    "queued": {
+      "active": true,
+      "terminal": false,
+      "resumable": false,
+      "cancellable": true
+    },
+    "waiting": {
+      "active": true,
+      "terminal": false,
+      "resumable": false,
+      "cancellable": true
+    },
+    "running": {
+      "active": true,
+      "terminal": false,
+      "resumable": false,
+      "cancellable": true
+    },
+    "approval_pending": {
+      "active": true,
+      "terminal": false,
+      "resumable": false,
+      "cancellable": true
+    },
+    "completed": {
+      "active": false,
+      "terminal": true,
+      "resumable": false,
+      "cancellable": false
+    },
+    "budget_limited": {
+      "active": false,
+      "terminal": true,
+      "resumable": false,
+      "cancellable": false
+    },
+    "failed": {
+      "active": false,
+      "terminal": true,
+      "resumable": true,
+      "cancellable": false
+    },
+    "interrupted": {
+      "active": false,
+      "terminal": true,
+      "resumable": true,
+      "cancellable": false
+    },
+    "cancelled": {
+      "active": false,
+      "terminal": true,
+      "resumable": true,
+      "cancellable": false
+    }
+  },
+  "chat_messageable_states": [
+    "starting",
+    "queued",
+    "waiting",
+    "running",
+    "approval_pending",
+    "completed"
+  ]
+}

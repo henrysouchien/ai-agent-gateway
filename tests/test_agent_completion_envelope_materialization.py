@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -29,19 +30,23 @@ from agent_gateway.runner_background_tasks import (
   build_agent_completion_envelope,
   ordinary_parent_result_policy,
 )
+from agent_gateway.task_registry import TaskRegistry
 from agent_gateway.runner_run_loop import _agent_completion_contract_error
 from agent_workflow_contracts import (
   ActivityHandle,
+  AgentCompletionEnvelope,
   AgentOperationRef,
   AnalyticalOutcome,
   AttemptRef,
   CanonicalProjection,
+  ChildEvidenceProjection,
   ContentHandle,
   ContentReadGrant,
   ContractRef,
   EvidenceObservation,
   ExecutionSettlement,
   NamedArtifact,
+  ObservedSourceEvidenceRef,
   OrdinaryDelegationTaskRef,
   ParentResultPolicy,
   TaskObservation,
@@ -423,6 +428,71 @@ def test_artifact_only_result_does_not_emit_an_unreadable_handle() -> None:
     )
 
 
+def test_envelope_omits_child_evidence_when_the_child_observed_nothing() -> None:
+  """Absent means none: pre-B-4 payloads and digests must replay byte-identically."""
+
+  text = "Exact result"
+  result = _task_result(text)
+  envelope = build_agent_completion_envelope(
+    result,
+    policy=ordinary_parent_result_policy(result),
+    terminal_narrative_reader=lambda _result: text,
+    read_grant_factory=_read_grant,
+  )
+
+  assert envelope.child_evidence is None
+  payload = envelope.model_dump(mode="json")
+  assert "child_evidence" not in payload
+  # A historical row that never carried the field still validates and still
+  # dumps to exactly the bytes it was recorded with, so the durable event's
+  # digest over it is unchanged.
+  replayed = AgentCompletionEnvelope.model_validate(payload)
+  assert replayed.model_dump(mode="json") == payload
+  assert canonical_json_bytes(replayed.model_dump(mode="json")) == canonical_json_bytes(payload)
+  recorded = event_to_dict(AgentCompletionEvent(task_id="bg-1", envelope=replayed, ts=123.5))
+  assert recorded["fingerprint"] == event_to_dict(
+    AgentCompletionEvent(task_id="bg-1", envelope=envelope, ts=123.5)
+  )["fingerprint"]
+
+
+def test_envelope_carries_the_child_evidence_projection_when_the_child_read() -> None:
+  text = "Exact result"
+  result_payload = _task_result(text).model_dump(mode="json")
+  result_payload["evidence"] = EvidenceObservation(
+    observed_sources=(
+      ObservedSourceEvidenceRef(
+        source_kind="filing",
+        document_id="edgar:0000789019-26-000012",
+        produced_by_tool="filings_read",
+        source_url="https://www.sec.gov/Archives/msft-10k.htm",
+      ),
+    ),
+    tools_used=("filings_read",),
+  ).model_dump(mode="json")
+  result = TaskResult.model_validate(result_payload)
+
+  envelope = build_agent_completion_envelope(
+    result,
+    policy=ordinary_parent_result_policy(result),
+    terminal_narrative_reader=lambda _result: text,
+    read_grant_factory=_read_grant,
+  )
+
+  assert envelope.child_evidence is not None
+  assert envelope.child_evidence.evidence_tools == ("filings_read",)
+  assert [ref.document_id for ref in envelope.child_evidence.observed_sources] == [
+    "edgar:0000789019-26-000012",
+  ]
+  payload = envelope.model_dump(mode="json")
+  assert payload["child_evidence"]["observed_sources"][0]["produced_by_tool"] == "filings_read"
+  assert AgentCompletionEnvelope.model_validate(payload) == envelope
+
+
+def test_child_evidence_projection_must_record_an_observation() -> None:
+  with pytest.raises(ValidationError, match="must record an observation"):
+    ChildEvidenceProjection()
+
+
 def test_run_loop_rejects_a_clipped_normalized_completion_envelope() -> None:
   assert _agent_completion_contract_error(
     tool_uses=[(
@@ -467,3 +537,165 @@ def test_run_loop_accepts_a_complete_normalized_completion_envelope() -> None:
       "content": envelope.model_dump_json(),
     }],
   ) is None
+
+
+# --- CUR-E2E-08: handle-shaped deliveries must self-describe ---------------
+
+
+def _handle_shaped_envelope(text: str) -> AgentCompletionEnvelope:
+  result = _task_result(text)
+  return build_agent_completion_envelope(
+    result,
+    policy=ParentResultPolicy(
+      preferred="terminal_narrative_inline_exact",
+      max_inline_bytes=100,
+      on_overflow="result_handle",
+    ),
+    terminal_narrative_reader=lambda _result: text,
+    read_grant_factory=_read_grant,
+  )
+
+
+def test_handle_delivery_notification_summary_carries_dispatch_objective() -> None:
+  """A bare result_handle notification names the parent's own dispatch.
+
+  CUR-E2E-08: five identically-named children, a constant summary, and a
+  hex task_id gave the parent nothing to map a mid-recovery delivery back
+  to its own tracking; the unread result was later called "outstanding".
+  """
+  envelope = _handle_shaped_envelope("x" * 4_000)
+  assert envelope.parent_materialization.kind == "result_handle"
+
+  notification = agent_completion_notification(
+    SimpleNamespace(
+      task_id="bg-1",
+      agent_name="explore",
+      notification_generation=1,
+      metadata={},
+      admitted_task=SimpleNamespace(
+        objective="TRACK 3 — VRT margin trend across the last four quarters",
+      ),
+    ),
+    envelope,
+    timestamp=123.5,
+  )
+
+  assert "TRACK 3 — VRT margin trend" in notification.summary
+  assert "get_agent_result_content" in notification.summary
+  assert "settled, not running" in notification.summary
+  # The identity travels in the summary only: the durable envelope payload
+  # is untouched.
+  assert notification.payload == envelope.model_dump(mode="json")
+  assert notification.inline_payload()[1] is None
+  # Bounded under the 2000-char render truncation with room to spare.
+  assert len(notification.summary) < 800
+
+
+def test_handle_delivery_notification_summary_echo_is_bounded() -> None:
+  envelope = _handle_shaped_envelope("x" * 4_000)
+  notification = agent_completion_notification(
+    SimpleNamespace(
+      task_id="bg-1",
+      agent_name="explore",
+      notification_generation=1,
+      metadata={"admitted_task": {"objective": "T" * 5_000}},
+      admitted_task=None,
+    ),
+    envelope,
+    timestamp=123.5,
+  )
+  assert "TTTT" in notification.summary
+  assert len(notification.summary) < 800
+
+
+def test_handle_delivery_notification_summary_fails_open_without_objective() -> None:
+  envelope = _handle_shaped_envelope("x" * 4_000)
+  notification = agent_completion_notification(
+    SimpleNamespace(
+      task_id="bg-1",
+      agent_name="explore",
+      notification_generation=1,
+      metadata={},
+    ),
+    envelope,
+    timestamp=123.5,
+  )
+  assert "get_agent_result_content" in notification.summary
+  assert "Dispatched objective" not in notification.summary
+
+
+def test_inline_delivery_notification_summary_is_unchanged() -> None:
+  text = "Exact result"
+  result = _task_result(text)
+  envelope = build_agent_completion_envelope(
+    result,
+    policy=ordinary_parent_result_policy(result),
+    terminal_narrative_reader=lambda _result: text,
+    read_grant_factory=_read_grant,
+  )
+  assert envelope.parent_materialization.kind == "terminal_narrative_inline_exact"
+  notification = agent_completion_notification(
+    SimpleNamespace(
+      task_id="bg-1",
+      agent_name="explore",
+      notification_generation=1,
+      metadata={},
+    ),
+    envelope,
+    timestamp=123.5,
+  )
+  assert notification.summary == (
+    "Agent completed; consume the typed parent materialization."
+  )
+
+
+# --- CUR-E2E-08: recording that the parent read the delivered handle -------
+
+
+def test_mark_result_content_read_requires_matching_delivered_handle() -> None:
+  registry = TaskRegistry()
+  entry = registry.register("background_agent")
+  envelope = _handle_shaped_envelope("x" * 4_000)
+  content_id = envelope.parent_materialization.source.content_id
+
+  # No envelope yet: refused.
+  assert registry.mark_result_content_read(
+    entry.task_id, content_id=content_id
+  ) is False
+
+  entry.completion_envelope = envelope
+  # Wrong content: refused.
+  assert registry.mark_result_content_read(
+    entry.task_id, content_id="sha256:" + "0" * 64
+  ) is False
+  assert entry.result_content_read is False
+  # Unknown task: refused.
+  assert registry.mark_result_content_read(
+    "no-such-task", content_id=content_id
+  ) is False
+  # Exact delivered handle: recorded, idempotently.
+  assert registry.mark_result_content_read(
+    entry.task_id, content_id=content_id
+  ) is True
+  assert entry.result_content_read is True
+  assert registry.mark_result_content_read(
+    entry.task_id, content_id=content_id
+  ) is True
+
+
+def test_mark_result_content_read_refuses_inline_materialization() -> None:
+  registry = TaskRegistry()
+  entry = registry.register("background_agent")
+  text = "Exact result"
+  result = _task_result(text)
+  entry.completion_envelope = build_agent_completion_envelope(
+    result,
+    policy=ordinary_parent_result_policy(result),
+    terminal_narrative_reader=lambda _result: text,
+    read_grant_factory=_read_grant,
+  )
+  content_id = entry.completion_envelope.parent_materialization.source.content_id
+  assert registry.mark_result_content_read(
+    entry.task_id, content_id=content_id
+  ) is False
+  assert entry.result_content_read is False

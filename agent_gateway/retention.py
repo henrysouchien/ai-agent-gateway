@@ -176,16 +176,6 @@ class RetentionCatalogEntry:
   triage_input: bool = False
   invariants: tuple[str, ...] = ()
   deferred: bool = False
-  # Set ONLY for entries whose adapter delegates deletion to a component that
-  # enforces its own keep-set and re-verifies afterwards (today: runtime_versions
-  # -> local_gateway_runtime.gc_runtime). For those, `roots` is descriptive and the
-  # adapter never reads `authorized_roots`, so running the generic repo-containment
-  # check over it is both useless and actively harmful: a gateway running out of a
-  # runtime version has repo_root = <RUNTIME_ROOT>/versions/<VER>/ai-excel-addin, so
-  # the runtime-GC root is structurally a PARENT of repo_root and _is_broad_root
-  # rejects it on every sweep. This flag skips that pre-computation for such entries.
-  # It does NOT relax _is_broad_root, and it does NOT change any other entry.
-  adapter_owns_root_validation: bool = False
 
   def __post_init__(self) -> None:
     if not self.key.strip():
@@ -513,12 +503,8 @@ class RetentionSweeper:
             mode=effective_mode,
             now=snapshot,
             policy=entry.policy,
-            authorized_roots=(
-              ()
-              if entry.adapter_owns_root_validation
-              else tuple(
-                resolve_safe_root(root, repo_root=self.catalog.repo_root) for root in entry.roots
-              )
+            authorized_roots=tuple(
+              resolve_safe_root(root, repo_root=self.catalog.repo_root) for root in entry.roots
             ),
             install_id=install_id,
             migration_authorization=MappingProxyType(dict(migration_authorization or {})),

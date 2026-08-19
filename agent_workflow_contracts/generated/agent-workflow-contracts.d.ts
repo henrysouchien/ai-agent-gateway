@@ -22,7 +22,7 @@ export type AdmittedDataRef = {
   readonly "owner": OwnerBinding;
   readonly "read_grant"?: (ContentReadGrant) | (null);
   readonly "request": RequestedDataRef;
-  readonly "source_kind": "invocation_argument" | "literal" | "node_value" | "phase_output" | "durable_artifact";
+  readonly "source_kind": "invocation_argument" | "literal" | "selected_content" | "node_value" | "phase_output" | "durable_artifact";
 };
 
 export type AdmittedInputBinding = {
@@ -73,6 +73,7 @@ export type AgentOperationRef = {
 
 export type AgentOperationSnapshot = {
   readonly "description": string;
+  readonly "evidence_ports"?: ReadonlyArray<EvidencePort>;
   readonly "execution_class": string;
   readonly "instructions": string;
   readonly "methodology": ContractRef;
@@ -149,6 +150,18 @@ export type CapabilityBind = {
   readonly "upstream_model": string;
 };
 
+/** The bounded record of what one child actually read, for its parent.
+
+This is a projection over the child's already-durable
+``TaskResult.evidence`` — never agent-authored, never a new ledger. The
+parent runtime uses it to seed its own citation registry so a document the
+child read is citable without re-retrieval; it is stripped before the
+result reaches the model, which sees the resulting source map instead. */
+export type ChildEvidenceProjection = {
+  readonly "evidence_tools"?: ReadonlyArray<string>;
+  readonly "observed_sources"?: ReadonlyArray<ObservedSourceEvidenceRef>;
+};
+
 export type CitationEvidenceRef = {
   readonly "citation_id": string;
   readonly "kind"?: "citation";
@@ -214,13 +227,24 @@ export type DeliveryAdditionalOutput = {
   readonly "published_output_ref": PublishedOutputRef;
 };
 
-export type DeliveryEnvelope = {
+/** Historical authored-summary delivery envelope. */
+export type DeliveryEnvelopeV1 = {
   readonly "additional_outputs"?: ReadonlyArray<DeliveryAdditionalOutput>;
   readonly "phase_number": number;
   readonly "primary": DeliveryPrimary;
   readonly "revision": number;
-  readonly "schema_version"?: "1.0";
+  readonly "schema_version": "1.0";
   readonly "summary"?: (AuthoredDeliverySummary) | (null);
+  readonly "workflow_run_id": string;
+};
+
+/** Canonical deterministic-preview delivery envelope for version-2 runs. */
+export type DeliveryEnvelopeV2 = {
+  readonly "additional_outputs"?: ReadonlyArray<DeliveryAdditionalOutput>;
+  readonly "phase_number": number;
+  readonly "primary": DeliveryPrimaryV2;
+  readonly "revision": number;
+  readonly "schema_version": "2.0";
   readonly "workflow_run_id": string;
 };
 
@@ -230,17 +254,34 @@ export type DeliveryFailure = {
   readonly "missing_outputs"?: ReadonlyArray<string>;
 };
 
+/** Non-authoritative exact UTF-8 prefix of one published primary output. */
+export type DeliveryPreview = {
+  readonly "complete": boolean;
+  readonly "kind": "deterministic_text_preview";
+  readonly "omitted_bytes": number;
+  readonly "source_end_byte": number;
+  readonly "source_start_byte": 0;
+  readonly "source_total_bytes": number;
+  readonly "text": string;
+};
+
 export type DeliveryPrimary = {
   readonly "name": string;
   readonly "published_output_ref": PublishedOutputRef;
 };
 
+export type DeliveryPrimaryV2 = {
+  readonly "name": string;
+  readonly "preview": DeliveryPreview;
+  readonly "published_output_ref": PublishedOutputRef;
+};
+
 export type DeliverySettlement = {
-  readonly "envelope"?: (DeliveryEnvelope) | (null);
+  readonly "envelope"?: ((DeliveryEnvelopeV1) | (DeliveryEnvelopeV2)) | (null);
   readonly "failure"?: (DeliveryFailure) | (null);
   readonly "phase_number"?: (number) | (null);
   readonly "revision"?: (number) | (null);
-  readonly "spec"?: (WorkflowDeliverySpec) | (null);
+  readonly "spec"?: (WorkflowDeliverySpecV1) | (WorkflowDeliverySpecV2) | (null);
   readonly "status": "complete" | "failed" | "not_required";
   readonly "warning"?: (DeliveryWarning) | (null);
 };
@@ -260,6 +301,18 @@ export type DurableArtifactSelector = {
 export type EvidenceObservation = {
   readonly "observed_sources"?: ReadonlyArray<(CitationEvidenceRef) | (ContentEvidenceRef) | (ObservedSourceEvidenceRef)>;
   readonly "tools_used"?: ReadonlyArray<string>;
+};
+
+/** One declared multi-valued evidence input on an operation contract.
+
+An operation that cannot gather evidence itself declares where upstream
+results enter.  The catalog owns the fact that the port exists and its
+cardinality floor; the plan author selects only which upstream results
+feed it. */
+export type EvidencePort = {
+  readonly "max_selections"?: number;
+  readonly "min_selections"?: number;
+  readonly "name": string;
 };
 
 export type ExecuteTaskDisposition = {
@@ -391,7 +444,7 @@ export type RequestedDataRef = {
   readonly "expected_contract": ContractRef;
   readonly "kind"?: "requested_data";
   readonly "name": string;
-  readonly "selector": (InvocationArgumentSelector) | (LiteralSelector) | (NodeValueSelector) | (PhaseOutputSelector) | (DurableArtifactSelector);
+  readonly "selector": (InvocationArgumentSelector) | (LiteralSelector) | (SelectedContentSelector) | (NodeValueSelector) | (PhaseOutputSelector) | (DurableArtifactSelector);
 };
 
 export type ResultHandle = {
@@ -410,6 +463,11 @@ export type ResultRequirement = {
   readonly "outcome": OutcomeRequirement;
   readonly "projection"?: null;
   readonly "terminal_narrative"?: "required";
+};
+
+export type SelectedContentSelector = {
+  readonly "input_name": string;
+  readonly "kind"?: "selected_content_selector";
 };
 
 export type SemanticCapabilityRequirement = {
@@ -523,12 +581,52 @@ export type ValidationVerdictAcceptancePolicy = {
   readonly "projection_contract": ContractRef;
 };
 
-export type WorkflowDeliverySpec = {
+/** The active (D15) recorded anomaly parking one run at its boundary. */
+export type WorkflowAnomalyView = {
+  readonly "anomaly_id": string;
+  readonly "exception_class": string;
+  readonly "message": string;
+  readonly "origin": "phase_drive" | "continuation_drive" | "retry_drive";
+  readonly "phase_number"?: (number) | (null);
+  readonly "revision"?: (number) | (null);
+};
+
+/** One non-accepted plan-author operation result, never masked (T2-I08). */
+export type WorkflowAuthorFailureView = {
+  readonly "attempt_count": number;
+  readonly "authoring_operation_id": string;
+  readonly "failure_detail"?: (string) | (null);
+  readonly "latest_validation_summary"?: ReadonlyArray<JsonValue>;
+  readonly "phase_number": number;
+  readonly "proposed_revision": number;
+  readonly "status": "failed" | "interrupted" | "cancelled";
+  readonly "stop_reason"?: (string) | (null);
+  readonly "terminal_reason": "aborted" | "failed_validation" | "no_viable_plan" | "rate_limited" | "author_provider_unavailable" | "interrupted" | "cancelled";
+};
+
+/** The open durable continuation-authoring bracket (A-M4, T2-S06). */
+export type WorkflowContinuationAcceptedView = {
+  readonly "phase_number": number;
+  readonly "revision": number;
+};
+
+/** Historical read-only spec whose durable wire has no version field. */
+export type WorkflowDeliverySpecV1 = {
   readonly "additional_selectors"?: ReadonlyArray<string>;
   readonly "presentation": "attachment" | "inline";
   readonly "primary_selector": string;
   readonly "summary_inline_max_bytes"?: number;
   readonly "summary_selector"?: (string) | (null);
+};
+
+/** Explicit deterministic-preview policy recorded by a version-2 start. */
+export type WorkflowDeliverySpecV2 = {
+  readonly "additional_selectors"?: ReadonlyArray<string>;
+  readonly "presentation": "attachment" | "inline";
+  readonly "preview_max_bytes": number;
+  readonly "preview_policy_version": "deterministic_text_prefix/v1";
+  readonly "primary_selector": string;
+  readonly "schema_version": "2.0";
 };
 
 export type WorkflowNodeTaskRef = {
@@ -540,6 +638,79 @@ export type WorkflowNodeTaskRef = {
   readonly "plan_id": string;
   readonly "revision": number;
   readonly "workflow_run_id": string;
+};
+
+/** Executable read recipe for one published output (same shape as
+``WorkflowOutputAttachment.read``). */
+export type WorkflowOutputReadRecipe = {
+  readonly "action"?: "output";
+  readonly "output_id": string;
+  readonly "workflow_run_id": string;
+};
+
+/** Actionable recovery classification for the latest author failure.
+
+``relaunch_budget_field`` names the exact launch knob — the
+``author_output_budget_tokens`` tool field — whenever a larger authoring
+budget would make a relaunch viable (T2-I08). */
+export type WorkflowRecoveryHint = {
+  readonly "relaunch_budget_field"?: ("author_output_budget_tokens") | (null);
+  readonly "retryability": "retryable_relaunch_larger_budget" | "retryable_after_backoff" | "not_retryable";
+};
+
+/** The one canonical caller-facing projection of a workflow run (T2-I07).
+
+Every ``workflow_run`` surface renders this view; a fact the view carries
+cannot be omitted by any surface. */
+export type WorkflowView = {
+  readonly "admitted_cost_estimate_usd": number;
+  readonly "admitted_plan_ref"?: (AdmittedPlanRef) | (null);
+  readonly "author_cost_usd": number;
+  readonly "cancellation_reason"?: (string) | (null);
+  readonly "continuation_accepted"?: (WorkflowContinuationAcceptedView) | (null);
+  readonly "delivery_status": "pending" | "complete" | "failed" | "not_required";
+  readonly "estimated_cost_usd": number;
+  readonly "execution_status": "authoring" | "running" | "succeeded" | "failed" | "interrupted" | "cancelled";
+  readonly "latest_anomaly"?: (WorkflowAnomalyView) | (null);
+  readonly "latest_author_failure"?: (WorkflowAuthorFailureView) | (null);
+  readonly "legal_actions"?: ReadonlyArray<"observe" | "continue" | "finish" | "cancel">;
+  readonly "max_phases": number;
+  readonly "node_states"?: ReadonlyArray<WorkflowViewNodeState>;
+  readonly "observation_seq": number;
+  readonly "phase"?: (WorkflowViewPhase) | (null);
+  readonly "published_output_reads"?: ReadonlyArray<WorkflowOutputReadRecipe>;
+  readonly "recovery_hint"?: (WorkflowRecoveryHint) | (null);
+  readonly "state": "authoring" | "running" | "awaiting_action" | "cancel_requested" | "terminal";
+  readonly "terminal_phase_revision"?: (TerminalPhaseRevision) | (null);
+  readonly "terminal_reason"?: (string) | (null);
+  readonly "terminal_status"?: ("succeeded" | "failed" | "interrupted" | "cancelled") | (null);
+  readonly "workflow_name": string;
+  readonly "workflow_run_id": string;
+};
+
+/** One admitted node's state, embedding its settlement when settled.
+
+``settlement.outcome_disposition`` is pinned absent until B-3 populates
+outcome qualifiers; the embed exists now so that population is reshape-free
+(design A-M5-before-B-3 ordering). */
+export type WorkflowViewNodeState = {
+  readonly "action_required"?: ("publish_result" | "restart" | "retry" | "resume") | (null);
+  readonly "attempt_number"?: (number) | (null);
+  readonly "node_id": string;
+  readonly "phase_number": number;
+  readonly "revision": number;
+  readonly "settlement"?: (SettlementProjection) | (null);
+  readonly "status": "pending" | "ready" | "running" | "completed_unpublished" | "restart_requested" | "resume_requested" | "stop_requested" | "interrupted" | "settled";
+  readonly "task_id"?: (string) | (null);
+};
+
+/** The current admitted phase's identity and settlement progress. */
+export type WorkflowViewPhase = {
+  readonly "is_terminal": boolean;
+  readonly "phase_number": number;
+  readonly "revision": number;
+  readonly "settled_nodes": number;
+  readonly "total_nodes": number;
 };
 
 export type WorkspaceGrant = {
@@ -574,12 +745,15 @@ export type AdmittedTask = {
 };
 
 export type AgentCompletionEnvelope = {
+  readonly "child_evidence"?: (ChildEvidenceProjection) | (null);
   readonly "message_id": string;
   readonly "parent_materialization": (TerminalNarrativeInlineExact) | (ProjectionInline) | (AuthoredSummaryWithResultHandle) | (ResultHandle);
   readonly "schema_version"?: "1.0";
   readonly "settlement_projection": SettlementProjection;
   readonly "task_result_ref": TaskResultRef;
 };
+
+export type DeliveryEnvelope = (DeliveryEnvelopeV1) | (DeliveryEnvelopeV2);
 
 export type DependencyAcceptancePolicy = (TaskSettlementAcceptancePolicy) | (ValidationVerdictAcceptancePolicy);
 
@@ -593,7 +767,7 @@ export type ParentResultPolicy = {
   readonly "preferred": "terminal_narrative_inline_exact" | "projection_inline" | "authored_summary_with_result_handle" | "result_handle";
 };
 
-export type RequestedDataSelector = (InvocationArgumentSelector) | (LiteralSelector) | (NodeValueSelector) | (PhaseOutputSelector) | (DurableArtifactSelector);
+export type RequestedDataSelector = (InvocationArgumentSelector) | (LiteralSelector) | (SelectedContentSelector) | (NodeValueSelector) | (PhaseOutputSelector) | (DurableArtifactSelector);
 
 export type TaskResult = {
   readonly "attempt": AttemptRef;
@@ -608,17 +782,17 @@ export type TaskResult = {
   readonly "values"?: TaskResultValues;
 };
 
+export type WorkflowDeliverySpec = (WorkflowDeliverySpecV1) | (WorkflowDeliverySpecV2);
+
 export type WorkflowResult = {
   readonly "activity": ActivityHandle;
-  readonly "admitted_plan_ref": AdmittedPlanRef;
   readonly "continuation_state": ContinuationState;
-  readonly "delivery": DeliverySettlement;
-  readonly "execution_status": "succeeded" | "failed" | "interrupted" | "cancelled";
+  readonly "delivery"?: (DeliverySettlement) | (null);
   readonly "node_results"?: ReadonlyArray<TaskResultRef>;
   readonly "published_outputs"?: ReadonlyArray<PublishedOutput>;
-  readonly "schema_version"?: "1.0";
-  readonly "terminal_phase_revision": TerminalPhaseRevision;
+  readonly "schema_version"?: "2.0";
   readonly "transcript": TranscriptHandle;
   readonly "usage_observation"?: UsageObservation;
+  readonly "view": WorkflowView;
   readonly "workflow_run_id": string;
 };

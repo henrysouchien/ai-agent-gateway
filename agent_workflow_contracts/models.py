@@ -11,7 +11,7 @@ import hashlib
 import json
 import math
 import re
-from typing import Annotated, Any, Literal, TypeAlias
+from typing import Annotated, Any, Literal, Mapping, TypeAlias
 
 from pydantic import (
   BaseModel,
@@ -84,8 +84,6 @@ def _validate_safe_literal(value: JsonValue, *, key: str | None = None) -> None:
   elif isinstance(value, list):
     for child in value:
       _validate_safe_literal(child)
-  elif isinstance(value, str) and _RAW_PATH.match(value):
-    raise ValueError("literal selectors cannot carry raw filesystem paths")
 
 
 class ContractRef(WireModel):
@@ -93,6 +91,14 @@ class ContractRef(WireModel):
   name: Name
   version: Version
   digest: Digest
+
+
+SELECTED_CONTENT_UTF8_CONTRACT = ContractRef(
+  namespace="agent-gateway",
+  name="selected-content-utf8",
+  version="1.0",
+  digest="sha256:e8598f8c941b84145dbe018508c52f2c620867e8134f66c72c63e061da996aa9",
+)
 
 
 TERMINAL_NARRATIVE_CONTRACT = ContractRef(
@@ -220,6 +226,11 @@ class LiteralSelector(WireModel):
     return value
 
 
+class SelectedContentSelector(WireModel):
+  kind: Literal["selected_content_selector"] = "selected_content_selector"
+  input_name: Name
+
+
 class NodeValueSelector(WireModel):
   kind: Literal["node_value_selector"] = "node_value_selector"
   node_id: OpaqueId
@@ -259,6 +270,7 @@ class DurableArtifactSelector(WireModel):
 RequestedDataSelector: TypeAlias = Annotated[
   InvocationArgumentSelector
   | LiteralSelector
+  | SelectedContentSelector
   | NodeValueSelector
   | PhaseOutputSelector
   | DurableArtifactSelector,
@@ -291,7 +303,12 @@ class AdmittedDataRef(WireModel):
   kind: Literal["admitted_data"] = "admitted_data"
   request: RequestedDataRef
   source_kind: Literal[
-    "invocation_argument", "literal", "node_value", "phase_output", "durable_artifact"
+    "invocation_argument",
+    "literal",
+    "selected_content",
+    "node_value",
+    "phase_output",
+    "durable_artifact",
   ]
   logical_source_id: OpaqueId
   owner: OwnerBinding
@@ -443,6 +460,150 @@ class SemanticCapabilityRequirement(WireModel):
     return self
 
 
+# ---------------------------------------------------------------------------
+# One resolver, one artifact (T3-I11): the platform tool catalog, the exact
+# authority an operation resolves to, and the visible Left when it cannot.
+# ---------------------------------------------------------------------------
+
+
+class ExecutionIdentity(WireModel):
+  """The exact identity one admitted operation executes under (D-B6-1).
+
+  Credential *material* never rides here: ``credential_handle_id`` names a
+  server-held handle, never a secret.
+  """
+
+  kind: Literal["execution_identity"] = "execution_identity"
+  tenant_id: OpaqueId
+  credential_handle_id: OpaqueId | None = None
+
+
+class CatalogToolEntry(WireModel):
+  """One platform tool, described exactly once.
+
+  ``capability`` is **singular** (D-B5-2), matching ``SemanticToolRoute``:
+  a tool route targets at most one semantic capability.  ``effect`` is
+  ``None`` when the platform cannot resolve one — such a tool is describable
+  but never becomes authority.  ``success_signal`` / ``source_identity`` are
+  declarative descriptors (never callables) read at the dispatch boundary.
+  """
+
+  kind: Literal["catalog_tool"] = "catalog_tool"
+  tool_id: OpaqueId
+  canonical_name: OpaqueId
+  effect: Literal["read", "propose", "write", "external_effect"] | None = None
+  server_id: OpaqueId | None = None
+  capability: OpaqueId | None = None
+  idempotent: bool | None = None
+  success_signal: dict[str, JsonValue] | None = None
+  source_identity: dict[str, JsonValue] | None = None
+
+
+class PlatformToolCatalog(WireModel):
+  """The exact snapshot of describable platform tools at one instant."""
+
+  kind: Literal["platform_tool_catalog"] = "platform_tool_catalog"
+  tools: tuple[CatalogToolEntry, ...] = ()
+
+  @model_validator(mode="after")
+  def _sorted_unique_tools(self) -> PlatformToolCatalog:
+    ids = tuple(entry.tool_id for entry in self.tools)
+    if tuple(sorted(set(ids))) != ids:
+      raise ValueError("platform catalog tools must be sorted and unique")
+    return self
+
+  def entry(self, tool_id: str) -> CatalogToolEntry | None:
+    for item in self.tools:
+      if item.tool_id == tool_id:
+        return item
+    return None
+
+
+class UnsatisfiedCapability(WireModel):
+  """One declared semantic capability the live platform cannot satisfy."""
+
+  kind: Literal["unsatisfied_capability"] = "unsatisfied_capability"
+  capability: OpaqueId
+  required: bool = True
+  reason: Literal[
+    "no_compatible_route",
+    "unregistered_capability",
+    "ambiguous_route",
+  ]
+  detail: Annotated[str, StringConstraints(min_length=1, max_length=2_048)]
+
+
+class OperationUnavailable(WireModel):
+  """The Left of ``resolve_operation_authority`` — a **visible** offer.
+
+  An operation the platform cannot currently authorize is said out loud, not
+  dropped: this is the value that replaces every silent catalog drop.
+  """
+
+  kind: Literal["operation_unavailable"] = "operation_unavailable"
+  operation_name: Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=128),
+  ]
+  code: Literal[
+    "invalid_metadata",
+    "missing_route",
+    "policy_denial",
+    "credential_unavailable",
+    "version_digest_mismatch",
+  ]
+  detail: Annotated[str, StringConstraints(min_length=1, max_length=2_048)]
+  unsatisfied: tuple[UnsatisfiedCapability, ...] = ()
+
+
+class ResolvedAuthority(WireModel):
+  """The frozen authority one operation resolved to, credentials excluded.
+
+  ``bindings`` and ``grant`` are exactly the fields ``TaskAdmissionAuthority``
+  projects; ``routes`` carries the catalog entries the grant was cut from, so
+  the dispatcher allowlist is derived, never re-discovered.
+  """
+
+  kind: Literal["resolved_authority"] = "resolved_authority"
+  operation_name: Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=128),
+  ]
+  grant: ToolGrant
+  bindings: tuple[CapabilityBinding, ...] = ()
+  routes: tuple[CatalogToolEntry, ...] = ()
+  identity: ExecutionIdentity | None = None
+
+  @model_validator(mode="after")
+  def _routes_cover_the_grant(self) -> ResolvedAuthority:
+    route_ids = tuple(route.tool_id for route in self.routes)
+    if tuple(sorted(set(route_ids))) != route_ids:
+      raise ValueError("resolved routes must be sorted and unique")
+    if set(route_ids) != {entry.tool_id for entry in self.grant.tools}:
+      raise ValueError("resolved routes must be exactly the granted tools")
+    return self
+
+
+class EvidencePort(WireModel):
+  """One declared multi-valued evidence input on an operation contract.
+
+  An operation that cannot gather evidence itself declares where upstream
+  results enter.  The catalog owns the fact that the port exists and its
+  cardinality floor; the plan author selects only which upstream results
+  feed it.
+  """
+
+  name: Name
+  min_selections: int = Field(default=1, ge=1, le=8)
+  max_selections: int = Field(default=8, ge=1, le=8)
+
+  @model_validator(mode="after")
+  def _floor_within_ceiling(self) -> EvidencePort:
+    if self.max_selections < self.min_selections:
+      raise ValueError("evidence port max_selections must be >= min_selections")
+    return self
+
+
 class AgentOperationSnapshot(WireModel):
   operation: AgentOperationRef
   methodology: ContractRef
@@ -453,6 +614,14 @@ class AgentOperationSnapshot(WireModel):
   required_capabilities: tuple[SemanticCapabilityRequirement, ...] = ()
   workspace_scope: Literal["read_only", "workspace_write", "model_write"]
   required_context: tuple[Name, ...] = Field(default=(), max_length=8)
+  # Absent means none: the field is omitted from dumps when empty so durable
+  # snapshots and digests recorded before evidence ports existed replay
+  # byte-identically.
+  evidence_ports: tuple[EvidencePort, ...] = Field(
+    default=(),
+    max_length=4,
+    exclude_if=lambda value: not value,
+  )
   resumable: bool = False
   result_modes: tuple[Literal["narrative"], ...] = Field(min_length=1)
   projection_contracts: tuple[ContractRef, ...] = ()
@@ -464,6 +633,11 @@ class AgentOperationSnapshot(WireModel):
         "agent operations return a normal terminal message; typed result "
         "records are materialized by runtime code"
       )
+    port_names = tuple(port.name for port in self.evidence_ports)
+    if tuple(sorted(set(port_names))) != port_names:
+      raise ValueError("evidence_ports must be sorted and unique by name")
+    if set(port_names) & set(self.required_context):
+      raise ValueError("evidence port names cannot collide with required_context")
     return self
 
 
@@ -1148,12 +1322,42 @@ class SettlementProjection(WireModel):
   outcome_disposition: Literal["complete", "partial", "insufficient_evidence", "blocked", "not_assessed"] | None = None
 
 
+class ChildEvidenceProjection(WireModel):
+  """The bounded record of what one child actually read, for its parent.
+
+  This is a projection over the child's already-durable
+  ``TaskResult.evidence`` — never agent-authored, never a new ledger. The
+  parent runtime uses it to seed its own citation registry so a document the
+  child read is citable without re-retrieval; it is stripped before the
+  result reaches the model, which sees the resulting source map instead.
+  """
+
+  observed_sources: tuple[ObservedSourceEvidenceRef, ...] = Field(
+    default=(),
+    max_length=256,
+  )
+  evidence_tools: tuple[OpaqueId, ...] = Field(default=(), max_length=128)
+
+  @model_validator(mode="after")
+  def _projection_observes_something(self) -> ChildEvidenceProjection:
+    if not self.observed_sources and not self.evidence_tools:
+      raise ValueError("child evidence projection must record an observation")
+    return self
+
+
 class AgentCompletionEnvelope(WireModel):
   schema_version: Literal["1.0"] = "1.0"
   message_id: OpaqueId
   task_result_ref: TaskResultRef
   settlement_projection: SettlementProjection
   parent_materialization: ParentResultMaterialization
+  # Absent means none: the field is omitted from dumps when empty so durable
+  # completion events and digests recorded before child evidence existed
+  # replay byte-identically.
+  child_evidence: ChildEvidenceProjection | None = Field(
+    default=None,
+    exclude_if=lambda value: value is None,
+  )
 
 
 def _inline_content_bytes(value: JsonValue, handle: ContentHandle) -> bytes:
@@ -1222,6 +1426,120 @@ class PublishedOutputRef(WireModel):
     return cls(output_id=output.output_id, contract=output.contract, content=output.content)
 
 
+WORKFLOW_CONTENT_MAX_SEQUENCE = 9_007_199_254_740_991
+WORKFLOW_CONTENT_PAGE_MAX_BYTES = 32_000
+
+WorkflowContentView = Literal["paged_exact_content"]
+
+
+class WorkflowContentError(RuntimeError):
+  """Canonical workflow content could not be read or verified."""
+
+
+class WorkflowContentNotFoundError(WorkflowContentError):
+  """The requested content is not authorized for this principal and owner."""
+
+
+class WorkflowContentIntegrityError(WorkflowContentError):
+  """Stored content conflicts with its canonical handle."""
+
+
+# The content-page models were rebased from the api-side WorkflowModel
+# (extra="forbid", frozen=True, allow_inf_nan=False) onto WireModel; they
+# carry no float fields, so the dropped allow_inf_nan constraint is
+# behavior-neutral. A future float field here must restore it locally.
+class WorkflowContentCursor(WireModel):
+  """Character cursor that never splits a UTF-8 code point."""
+
+  after_char: int = Field(ge=1, le=WORKFLOW_CONTENT_MAX_SEQUENCE)
+
+
+class GrantContentPageAuthorization(WireModel):
+  """Derivative page authority from one admitted task/parent grant."""
+
+  kind: Literal["content_read_grant"] = "content_read_grant"
+  grant_id: str = Field(min_length=1, max_length=512)
+
+
+class PublishedOutputPageAuthorization(WireModel):
+  """Derivative page authority from one exact owned publication."""
+
+  kind: Literal["published_output"] = "published_output"
+  workflow_run_id: str = Field(min_length=1, max_length=512)
+  phase_number: int = Field(ge=1)
+  revision: int = Field(ge=1)
+  output_id: str = Field(min_length=1, max_length=1_024)
+
+
+WorkflowContentPageAuthorization = (
+  GrantContentPageAuthorization | PublishedOutputPageAuthorization
+)
+
+
+class WorkflowContentPage(WireModel):
+  """One explicitly derivative page of an exact canonical content value."""
+
+  view: Literal["paged_exact_content"] = "paged_exact_content"
+  source: ContentHandle
+  authorization: WorkflowContentPageAuthorization
+  after_char: int = Field(default=0, ge=0, le=WORKFLOW_CONTENT_MAX_SEQUENCE)
+  content: str
+  next_cursor: WorkflowContentCursor | None = None
+  end: bool
+  complete_source: bool
+
+  @model_validator(mode="after")
+  def _coherent_page(self) -> WorkflowContentPage:
+    source_chars = self.source.content_chars
+    if source_chars is None:
+      raise ValueError("workflow content paging requires textual content")
+    delivered_end = self.after_char + len(self.content)
+    if delivered_end > source_chars:
+      raise ValueError("workflow content page exceeds the source length")
+    if self.end != (self.next_cursor is None):
+      raise ValueError("workflow content end must agree with next_cursor")
+    if self.end:
+      if delivered_end != source_chars:
+        raise ValueError("terminal workflow content page must reach content end")
+    elif (
+      not self.content
+      or self.next_cursor is None
+      or self.next_cursor.after_char != delivered_end
+    ):
+      raise ValueError("workflow content cursor must exactly continue the page")
+    if self.complete_source != (self.after_char == 0 and self.end):
+      raise ValueError("complete_source must identify a whole-source page")
+    if len(canonical_json_bytes(self.model_dump(mode="json"))) > (
+      WORKFLOW_CONTENT_PAGE_MAX_BYTES
+    ):
+      raise ValueError("workflow content page exceeds its byte limit")
+    return self
+
+
+def verified_text(source: ContentHandle, payload: bytes) -> str:
+  if type(payload) is not bytes:
+    raise WorkflowContentIntegrityError("content store must return exact bytes")
+  if source.content_chars is None or source.encoding is None:
+    raise WorkflowContentIntegrityError(
+      "workflow content paging requires a textual handle"
+    )
+  if len(payload) != source.content_bytes:
+    raise WorkflowContentIntegrityError("workflow content byte size changed")
+  if hashlib.sha256(payload).hexdigest() != source.content_sha256:
+    raise WorkflowContentIntegrityError("workflow content digest changed")
+  try:
+    text = payload.decode(source.encoding)
+  except (LookupError, UnicodeDecodeError) as exc:
+    raise WorkflowContentIntegrityError(
+      "workflow content encoding is invalid"
+    ) from exc
+  if len(text) != source.content_chars:
+    raise WorkflowContentIntegrityError(
+      "workflow content character size changed"
+    )
+  return text
+
+
 # The exact code-owned presentation bound for one inline published-output
 # view.  A delivery summary larger than this many UTF-8 bytes cannot be
 # presented inline; the runtime then delivers the exact primary output alone
@@ -1231,7 +1549,9 @@ class PublishedOutputRef(WireModel):
 PUBLISHED_OUTPUT_INLINE_MAX_BYTES = 8_000
 
 
-class WorkflowDeliverySpec(WireModel):
+class WorkflowDeliverySpecV1(WireModel):
+  """Historical read-only spec whose durable wire has no version field."""
+
   presentation: Literal["attachment", "inline"]
   primary_selector: Name
   summary_selector: Name | None = None
@@ -1239,7 +1559,7 @@ class WorkflowDeliverySpec(WireModel):
   summary_inline_max_bytes: int = PUBLISHED_OUTPUT_INLINE_MAX_BYTES
 
   @model_validator(mode="after")
-  def _delivery_selection(self) -> WorkflowDeliverySpec:
+  def _delivery_selection(self) -> WorkflowDeliverySpecV1:
     if self.presentation == "attachment" and self.summary_selector is None:
       raise ValueError("attachment delivery requires a summary selector")
     if self.summary_inline_max_bytes != PUBLISHED_OUTPUT_INLINE_MAX_BYTES:
@@ -1253,6 +1573,55 @@ class WorkflowDeliverySpec(WireModel):
     if len(selectors) != len(set(selectors)):
       raise ValueError("delivery selectors must be unique")
     return self
+
+
+DELIVERY_PREVIEW_POLICY_VERSION = "deterministic_text_prefix/v1"
+DELIVERY_PREVIEW_MAX_BYTES = 8_000
+
+
+class WorkflowDeliverySpecV2(WireModel):
+  """Explicit deterministic-preview policy recorded by a version-2 start."""
+
+  # Required without a default: an absent-version historical payload must
+  # never be promoted into the version-2 branch by model defaults.
+  schema_version: Literal["2.0"]
+  presentation: Literal["attachment", "inline"]
+  primary_selector: Name
+  additional_selectors: tuple[Name, ...] = ()
+  preview_policy_version: Literal["deterministic_text_prefix/v1"]
+  preview_max_bytes: int
+
+  @model_validator(mode="after")
+  def _delivery_selection(self) -> WorkflowDeliverySpecV2:
+    if self.preview_policy_version != DELIVERY_PREVIEW_POLICY_VERSION:
+      raise ValueError("delivery preview policy version is unsupported")
+    if self.preview_max_bytes != DELIVERY_PREVIEW_MAX_BYTES:
+      raise ValueError(
+        "preview_max_bytes is the code-owned version-2 presentation bound; "
+        f"it must be exactly {DELIVERY_PREVIEW_MAX_BYTES}"
+      )
+    selectors = [self.primary_selector, *self.additional_selectors]
+    if len(selectors) != len(set(selectors)):
+      raise ValueError("delivery selectors must be unique")
+    return self
+
+
+WorkflowDeliverySpec: TypeAlias = WorkflowDeliverySpecV1 | WorkflowDeliverySpecV2
+
+
+def parse_workflow_delivery_spec(value: object) -> WorkflowDeliverySpec:
+  """Parse exactly one absent-version v1 or explicit-version v2 spec."""
+
+  if isinstance(value, (WorkflowDeliverySpecV1, WorkflowDeliverySpecV2)):
+    return value
+  if not isinstance(value, Mapping):
+    raise ValueError("workflow delivery spec must be an object")
+  version = value.get("schema_version")
+  if "schema_version" not in value:
+    return WorkflowDeliverySpecV1.model_validate(value)
+  if version == "2.0":
+    return WorkflowDeliverySpecV2.model_validate(value)
+  raise ValueError("workflow delivery spec has an unsupported schema_version")
 
 
 class AuthoredDeliverySummary(WireModel):
@@ -1283,8 +1652,10 @@ class DeliveryAdditionalOutput(WireModel):
   published_output_ref: PublishedOutputRef
 
 
-class DeliveryEnvelope(WireModel):
-  schema_version: Literal["1.0"] = "1.0"
+class DeliveryEnvelopeV1(WireModel):
+  """Historical authored-summary delivery envelope."""
+
+  schema_version: Literal["1.0"]
   workflow_run_id: OpaqueId
   phase_number: int = Field(ge=1)
   revision: int = Field(ge=1)
@@ -1293,7 +1664,7 @@ class DeliveryEnvelope(WireModel):
   additional_outputs: tuple[DeliveryAdditionalOutput, ...] = ()
 
   @model_validator(mode="after")
-  def _one_atomic_revision(self) -> DeliveryEnvelope:
+  def _one_atomic_revision(self) -> DeliveryEnvelopeV1:
     refs = [self.primary.published_output_ref]
     if self.summary is not None:
       refs.append(self.summary.source)
@@ -1308,6 +1679,97 @@ class DeliveryEnvelope(WireModel):
     if any(not ref.output_id.startswith(prefix) for ref in refs):
       raise ValueError("delivery outputs must belong to one workflow phase revision")
     return self
+
+
+class DeliveryPreview(WireModel):
+  """Non-authoritative exact UTF-8 prefix of one published primary output."""
+
+  kind: Literal["deterministic_text_preview"]
+  text: Annotated[str, StringConstraints(max_length=262_144)]
+  source_start_byte: Literal[0]
+  source_end_byte: int = Field(ge=0)
+  source_total_bytes: int = Field(ge=0)
+  complete: bool
+  omitted_bytes: int = Field(ge=0)
+
+  @model_validator(mode="after")
+  def _exact_interval(self) -> DeliveryPreview:
+    preview_bytes = self.text.encode("utf-8")
+    if len(preview_bytes) != self.source_end_byte:
+      raise ValueError("delivery preview byte range must match its UTF-8 text")
+    if self.source_end_byte > DELIVERY_PREVIEW_MAX_BYTES:
+      raise ValueError("delivery preview exceeds the version-2 byte bound")
+    if self.source_end_byte > self.source_total_bytes:
+      raise ValueError("delivery preview cannot exceed its exact source")
+    if self.omitted_bytes != self.source_total_bytes - self.source_end_byte:
+      raise ValueError("delivery preview omitted bytes must match its byte range")
+    if self.complete != (self.omitted_bytes == 0):
+      raise ValueError("delivery preview completeness must match omitted bytes")
+    return self
+
+
+class DeliveryPrimaryV2(WireModel):
+  name: Name
+  published_output_ref: PublishedOutputRef
+  preview: DeliveryPreview
+
+  @model_validator(mode="after")
+  def _preview_matches_primary(self) -> DeliveryPrimaryV2:
+    content = self.published_output_ref.content
+    if not content.media_type.lower().startswith("text/"):
+      raise ValueError("delivery preview requires a textual primary output")
+    if (content.encoding or "").lower() != "utf-8":
+      raise ValueError("delivery preview requires an exact UTF-8 primary output")
+    if self.preview.source_total_bytes != content.content_bytes:
+      raise ValueError("delivery preview total must match primary content bytes")
+    return self
+
+
+class DeliveryEnvelopeV2(WireModel):
+  """Canonical deterministic-preview delivery envelope for version-2 runs."""
+
+  schema_version: Literal["2.0"]
+  workflow_run_id: OpaqueId
+  phase_number: int = Field(ge=1)
+  revision: int = Field(ge=1)
+  primary: DeliveryPrimaryV2
+  additional_outputs: tuple[DeliveryAdditionalOutput, ...] = ()
+
+  @model_validator(mode="after")
+  def _one_atomic_revision(self) -> DeliveryEnvelopeV2:
+    refs = [self.primary.published_output_ref]
+    refs.extend(item.published_output_ref for item in self.additional_outputs)
+    ids = [ref.output_id for ref in refs]
+    if len(ids) != len(set(ids)):
+      raise ValueError("delivery outputs must be distinct")
+    prefix = (
+      f"wout:{self.workflow_run_id}:phase:{self.phase_number}:"
+      f"revision:{self.revision}:"
+    )
+    if any(not ref.output_id.startswith(prefix) for ref in refs):
+      raise ValueError("delivery outputs must belong to one workflow phase revision")
+    return self
+
+
+DeliveryEnvelope: TypeAlias = Annotated[
+  DeliveryEnvelopeV1 | DeliveryEnvelopeV2,
+  Field(discriminator="schema_version"),
+]
+
+
+def parse_delivery_envelope(value: object) -> DeliveryEnvelope:
+  """Parse one explicitly versioned canonical delivery envelope."""
+
+  if isinstance(value, (DeliveryEnvelopeV1, DeliveryEnvelopeV2)):
+    return value
+  if not isinstance(value, Mapping):
+    raise ValueError("delivery envelope must be an object")
+  version = value.get("schema_version")
+  if version == "1.0":
+    return DeliveryEnvelopeV1.model_validate(value)
+  if version == "2.0":
+    return DeliveryEnvelopeV2.model_validate(value)
+  raise ValueError("delivery envelope has an unsupported schema_version")
 
 
 class DeliveryFailure(WireModel):
@@ -1353,12 +1815,20 @@ class DeliverySettlement(WireModel):
     if self.status == "complete":
       if self.envelope is None or self.failure is not None:
         raise ValueError("complete delivery requires envelope and forbids failure")
+      v1_pair = isinstance(self.spec, WorkflowDeliverySpecV1) and isinstance(
+        self.envelope, DeliveryEnvelopeV1
+      )
+      v2_pair = isinstance(self.spec, WorkflowDeliverySpecV2) and isinstance(
+        self.envelope, DeliveryEnvelopeV2
+      )
+      if not (v1_pair or v2_pair):
+        raise ValueError("delivery spec and envelope versions must match")
       if (
         self.envelope.phase_number != self.phase_number
         or self.envelope.revision != self.revision
       ):
         raise ValueError("delivery envelope must match settlement revision")
-      if (
+      if v1_pair and (
         self.spec.summary_selector is not None
         and self.envelope.summary is None
         and self.warning is None
@@ -1367,11 +1837,27 @@ class DeliverySettlement(WireModel):
           "delivery without its admitted authored summary requires an "
           "explicit delivery warning"
         )
+      if v2_pair:
+        preview = self.envelope.primary.preview
+        if preview.source_end_byte > self.spec.preview_max_bytes:
+          raise ValueError("delivery preview exceeds its recorded byte bound")
+        if preview.complete != (
+          preview.source_total_bytes <= self.spec.preview_max_bytes
+        ):
+          raise ValueError(
+            "delivery preview completeness disagrees with its recorded policy"
+          )
+        if self.warning is not None:
+          raise ValueError("version-2 delivery forbids authored-summary warnings")
     elif self.envelope is not None or self.failure is None:
       raise ValueError("failed delivery requires failure and forbids envelope")
     if self.warning is not None:
+      if not isinstance(self.spec, WorkflowDeliverySpecV1):
+        raise ValueError("delivery warning requires a version-1 spec")
       if self.status != "complete" or self.envelope is None:
         raise ValueError("a delivery warning is only legal on a complete delivery")
+      if not isinstance(self.envelope, DeliveryEnvelopeV1):
+        raise ValueError("delivery warning requires a version-1 envelope")
       if self.envelope.summary is not None:
         raise ValueError("a delivery warning must explain an omitted authored summary")
       if (
@@ -1409,15 +1895,203 @@ class ContinuationState(WireModel):
     return self
 
 
-class WorkflowResult(WireModel):
-  schema_version: Literal["1.0"] = "1.0"
+WorkflowViewState = Literal[
+  "authoring",
+  "running",
+  "awaiting_action",
+  "cancel_requested",
+  "terminal",
+]
+WorkflowViewLegalAction = Literal["observe", "continue", "finish", "cancel"]
+
+
+class WorkflowViewPhase(WireModel):
+  """The current admitted phase's identity and settlement progress."""
+
+  phase_number: int = Field(ge=1)
+  revision: int = Field(ge=1)
+  is_terminal: bool
+  settled_nodes: int = Field(ge=0)
+  total_nodes: int = Field(ge=0)
+
+
+class WorkflowViewNodeState(WireModel):
+  """One admitted node's state, embedding its settlement when settled.
+
+  ``settlement.outcome_disposition`` is pinned absent until B-3 populates
+  outcome qualifiers; the embed exists now so that population is reshape-free
+  (design A-M5-before-B-3 ordering).
+  """
+
+  phase_number: int = Field(ge=1)
+  revision: int = Field(ge=1)
+  node_id: OpaqueId
+  status: Literal[
+    "pending",
+    "ready",
+    "running",
+    "completed_unpublished",
+    "restart_requested",
+    "resume_requested",
+    "stop_requested",
+    "interrupted",
+    "settled",
+  ]
+  attempt_number: int | None = Field(default=None, ge=1)
+  task_id: OpaqueId | None = None
+  action_required: Literal["publish_result", "restart", "retry", "resume"] | None = None
+  settlement: SettlementProjection | None = None
+
+
+class WorkflowAuthorFailureView(WireModel):
+  """One non-accepted plan-author operation result, never masked (T2-I08)."""
+
+  authoring_operation_id: OpaqueId
+  phase_number: int = Field(ge=1)
+  proposed_revision: int = Field(ge=1)
+  status: Literal["failed", "interrupted", "cancelled"]
+  terminal_reason: Literal[
+    "aborted",
+    "failed_validation",
+    "no_viable_plan",
+    "rate_limited",
+    "author_provider_unavailable",
+    "interrupted",
+    "cancelled",
+  ]
+  stop_reason: str | None = Field(default=None, min_length=1, max_length=128)
+  failure_detail: str | None = Field(default=None, min_length=1, max_length=512)
+  attempt_count: int = Field(ge=0)
+  latest_validation_summary: tuple[JsonValue, ...] = ()
+
+
+class WorkflowRecoveryHint(WireModel):
+  """Actionable recovery classification for the latest author failure.
+
+  ``relaunch_budget_field`` names the exact launch knob — the
+  ``author_output_budget_tokens`` tool field — whenever a larger authoring
+  budget would make a relaunch viable (T2-I08).
+  """
+
+  retryability: Literal[
+    "retryable_relaunch_larger_budget",
+    "retryable_after_backoff",
+    "not_retryable",
+  ]
+  relaunch_budget_field: Literal["author_output_budget_tokens"] | None = None
+
+  @model_validator(mode="after")
+  def _budget_field_names_the_knob(self) -> WorkflowRecoveryHint:
+    needs_field = self.retryability == "retryable_relaunch_larger_budget"
+    if needs_field != (self.relaunch_budget_field is not None):
+      raise ValueError(
+        "relaunch_budget_field must name author_output_budget_tokens exactly "
+        "when the hint is retryable_relaunch_larger_budget"
+      )
+    return self
+
+
+class WorkflowAnomalyView(WireModel):
+  """The active (D15) recorded anomaly parking one run at its boundary."""
+
+  anomaly_id: OpaqueId
+  origin: Literal["phase_drive", "continuation_drive", "retry_drive"]
+  exception_class: str = Field(min_length=1, max_length=128)
+  message: str = Field(min_length=1, max_length=512)
+  phase_number: int | None = Field(default=None, ge=1)
+  revision: int | None = Field(default=None, ge=1)
+
+
+class WorkflowContinuationAcceptedView(WireModel):
+  """The open durable continuation-authoring bracket (A-M4, T2-S06)."""
+
+  phase_number: int = Field(ge=2)
+  revision: int = Field(ge=1)
+
+
+class WorkflowOutputReadRecipe(WireModel):
+  """Executable read recipe for one published output (same shape as
+  ``WorkflowOutputAttachment.read``)."""
+
+  action: Literal["output"] = "output"
   workflow_run_id: OpaqueId
-  admitted_plan_ref: AdmittedPlanRef
-  terminal_phase_revision: TerminalPhaseRevision
-  execution_status: Literal["succeeded", "failed", "interrupted", "cancelled"]
+  output_id: OpaqueId
+
+
+class WorkflowView(WireModel):
+  """The one canonical caller-facing projection of a workflow run (T2-I07).
+
+  Every ``workflow_run`` surface renders this view; a fact the view carries
+  cannot be omitted by any surface.
+  """
+
+  workflow_run_id: OpaqueId
+  workflow_name: OpaqueId
+  state: WorkflowViewState
+  execution_status: Literal[
+    "authoring",
+    "running",
+    "succeeded",
+    "failed",
+    "interrupted",
+    "cancelled",
+  ]
+  delivery_status: Literal["pending", "complete", "failed", "not_required"]
+  terminal_status: Literal["succeeded", "failed", "interrupted", "cancelled"] | None = None
+  terminal_reason: str | None = Field(default=None, min_length=1, max_length=2_048)
+  cancellation_reason: str | None = Field(default=None, min_length=1, max_length=2_048)
+  continuation_accepted: WorkflowContinuationAcceptedView | None = None
+  latest_anomaly: WorkflowAnomalyView | None = None
+  latest_author_failure: WorkflowAuthorFailureView | None = None
+  recovery_hint: WorkflowRecoveryHint | None = None
+  legal_actions: tuple[WorkflowViewLegalAction, ...] = ()
+  observation_seq: int = Field(ge=0)
+  max_phases: int = Field(ge=1)
+  phase: WorkflowViewPhase | None = None
+  node_states: tuple[WorkflowViewNodeState, ...] = ()
+  published_output_reads: tuple[WorkflowOutputReadRecipe, ...] = ()
+  admitted_plan_ref: AdmittedPlanRef | None = None
+  terminal_phase_revision: TerminalPhaseRevision | None = None
+  estimated_cost_usd: float = Field(ge=0)
+  admitted_cost_estimate_usd: float = Field(ge=0)
+  author_cost_usd: float = Field(ge=0)
+
+  @model_validator(mode="after")
+  def _view_identity(self) -> WorkflowView:
+    if (self.state == "terminal") != (self.terminal_status is not None):
+      raise ValueError("terminal state and terminal_status must agree")
+    if self.admitted_plan_ref is not None and (
+      self.admitted_plan_ref.workflow_run_id != self.workflow_run_id
+    ):
+      raise ValueError("admitted plan must belong to workflow view")
+    if self.terminal_phase_revision is not None:
+      if self.admitted_plan_ref is None:
+        raise ValueError(
+          "terminal phase revision requires its admitted plan reference"
+        )
+      if (
+        self.admitted_plan_ref.phase_number
+        != self.terminal_phase_revision.phase_number
+        or self.admitted_plan_ref.revision != self.terminal_phase_revision.revision
+      ):
+        raise ValueError("terminal phase revision must match admitted plan reference")
+    if self.recovery_hint is not None and self.latest_author_failure is None:
+      raise ValueError("recovery hint requires its author failure")
+    for recipe in self.published_output_reads:
+      if recipe.workflow_run_id != self.workflow_run_id:
+        raise ValueError("published output read must belong to workflow view")
+    return self
+
+
+class WorkflowResult(WireModel):
+  schema_version: Literal["2.0"] = "2.0"
+  # ``workflow_run_id`` stays top-level (D-T2-8): it is load-bearing for the
+  # gateway attachment and continuation parsers on every rendered payload.
+  workflow_run_id: OpaqueId
+  view: WorkflowView
   node_results: tuple[TaskResultRef, ...] = ()
   published_outputs: tuple[PublishedOutput, ...] = ()
-  delivery: DeliverySettlement
+  delivery: DeliverySettlement | None = None
   transcript: TranscriptHandle
   activity: ActivityHandle
   usage_observation: UsageObservation = Field(default_factory=UsageObservation)
@@ -1425,27 +2099,47 @@ class WorkflowResult(WireModel):
 
   @model_validator(mode="after")
   def _aggregate_identity(self) -> WorkflowResult:
-    if self.admitted_plan_ref.workflow_run_id != self.workflow_run_id:
-      raise ValueError("admitted plan must belong to workflow result")
-    if (
-      self.admitted_plan_ref.phase_number != self.terminal_phase_revision.phase_number
-      or self.admitted_plan_ref.revision != self.terminal_phase_revision.revision
-    ):
-      raise ValueError("terminal phase revision must match admitted plan reference")
+    if self.view.workflow_run_id != self.workflow_run_id:
+      raise ValueError("workflow view must belong to workflow result")
+    if self.delivery is not None:
+      if self.view.delivery_status != self.delivery.status:
+        raise ValueError("view delivery status must match delivery settlement")
+    elif self.view.delivery_status not in {"pending", "not_required"}:
+      raise ValueError(
+        "workflow result without a delivery settlement requires a pending or "
+        "not-required view delivery status"
+      )
     ids = [output.output_id for output in self.published_outputs]
     if len(ids) != len(set(ids)):
       raise ValueError("workflow result cannot duplicate published output IDs")
     by_id = {output.output_id: PublishedOutputRef.from_output(output) for output in self.published_outputs}
-    if self.delivery.envelope is not None:
+    if self.delivery is not None and self.delivery.envelope is not None:
       envelope = self.delivery.envelope
       if envelope.workflow_run_id != self.workflow_run_id:
         raise ValueError("delivery envelope must belong to workflow result")
       refs = [envelope.primary.published_output_ref]
-      if envelope.summary is not None:
+      if isinstance(envelope, DeliveryEnvelopeV1) and envelope.summary is not None:
         refs.append(envelope.summary.source)
       refs.extend(item.published_output_ref for item in envelope.additional_outputs)
       if any(by_id.get(ref.output_id) != ref for ref in refs):
         raise ValueError("delivery must reference exact published outputs")
+      if isinstance(envelope, DeliveryEnvelopeV2):
+        publication = next(
+          (
+            output
+            for output in self.published_outputs
+            if output.output_id == envelope.primary.published_output_ref.output_id
+          ),
+          None,
+        )
+        inline = publication.inline_view if publication is not None else None
+        if envelope.primary.preview.complete and inline is not None and (
+          _inline_content_bytes(inline.value, publication.content)
+          != envelope.primary.preview.text.encode("utf-8")
+        ):
+          raise ValueError(
+            "complete delivery preview conflicts with exact inline primary"
+          )
     return self
 
 
@@ -1457,7 +2151,19 @@ __all__ = [
   and value.__module__ == __name__
   and value is not WireModel
 ] + [
+  "DELIVERY_PREVIEW_MAX_BYTES",
+  "DELIVERY_PREVIEW_POLICY_VERSION",
+  "DeliveryEnvelope",
   "PUBLISHED_OUTPUT_INLINE_MAX_BYTES",
+  "SELECTED_CONTENT_UTF8_CONTRACT",
+  "WORKFLOW_CONTENT_MAX_SEQUENCE",
+  "WORKFLOW_CONTENT_PAGE_MAX_BYTES",
+  "WorkflowContentError",
+  "WorkflowContentIntegrityError",
+  "WorkflowContentNotFoundError",
+  "WorkflowContentPageAuthorization",
+  "WorkflowContentView",
+  "WorkflowDeliverySpec",
   "RequestedDataSelector",
   "ContextView",
   "ContextMaterialization",
@@ -1470,5 +2176,8 @@ __all__ = [
   "ParentResultMaterialization",
   "canonical_json_bytes",
   "sha256_digest",
+  "parse_delivery_envelope",
+  "parse_workflow_delivery_spec",
   "terminal_task_result",
+  "verified_text",
 ]

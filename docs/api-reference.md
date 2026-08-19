@@ -222,6 +222,36 @@ Carries the exact `CapabilityBind`, admitting `ProductModelRegistry`,
 `ModelProvider` adapter, and immutable credential auth-config snapshot consumed
 by a runner. Call `validate()` at an execution boundary to recheck agreement.
 
+## Workflow Delivery Contracts
+
+The public `agent_workflow_contracts` package exposes one version-tolerant
+reader surface and explicit construction types:
+
+- `WorkflowDeliverySpec` is the read union of
+  `WorkflowDeliverySpecV1 | WorkflowDeliverySpecV2`.
+- `DeliveryEnvelope` is the discriminated read union of
+  `DeliveryEnvelopeV1 | DeliveryEnvelopeV2`.
+- `parse_workflow_delivery_spec(value)` admits only the deployed absent-version
+  v1 spec or an explicit `schema_version="2.0"` spec. An explicit version on a
+  v1 spec is rejected so historical bytes cannot silently change meaning.
+- `parse_delivery_envelope(value)` admits only explicit envelope versions
+  `"1.0"` and `"2.0"`; missing and unknown versions fail closed.
+
+Use the explicit V1 classes only to inspect or test historical records; live
+starts and settlement write V2 exclusively. V1 preserves the authored-summary
+delivery form. V2 removes summary coupling:
+its primary carries an exact `PublishedOutputRef` plus a bounded
+`DeliveryPreview` whose UTF-8 byte interval, total bytes, completeness, and
+omitted bytes are validated. `DeliverySettlement` accepts only matching
+V1/V1 or V2/V2 spec/envelope pairs. Exact output retrieval remains authoritative
+for both versions.
+
+`DELIVERY_PREVIEW_POLICY_VERSION` and `DELIVERY_PREVIEW_MAX_BYTES` identify the
+currently supported deterministic prefix policy. The wheel also includes the
+generated JSON Schemas, TypeScript declarations, frozen historical-v1 golden,
+and complete/truncated v2 goldens under
+`agent_workflow_contracts/generated/`.
+
 ### Autonomous capability handoff
 
 `AutonomousCapabilityBindingRequest` is passed only to the trusted

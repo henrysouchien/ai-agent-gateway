@@ -288,7 +288,6 @@ class ChatDispatchRequest(BaseModel):
   catalog_revision: str | None = None
   skill: str | None = None
   ticker: str | None = None
-  dev_mode: bool = False
   deadline_sec: int | None = Field(default=None, ge=1)
   max_budget_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
   context: dict[str, Any] = Field(default_factory=dict)
@@ -324,6 +323,8 @@ class ChatDispatchRequest(BaseModel):
 
 
 class AutonomousDispatchRequest(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
   kind: Literal["autonomous"]
   profile: str | None = None
   mode: Literal["once", "task", "skill"] | None = None
@@ -332,7 +333,6 @@ class AutonomousDispatchRequest(BaseModel):
   ticker: str | None = None
   context: str | None = None
   channel: str | None = None
-  dev_mode: bool = False
   max_budget_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
   dispatch_scope: DispatchScope | None = None
 

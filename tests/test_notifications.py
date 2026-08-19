@@ -33,6 +33,7 @@ from agent_gateway.runner_notifications import (  # noqa: E402
   build_notification_reminder,
   consume_notifications,
   inject_system_prompt_reminder,
+  notification_delivery_set,
 )
 from agent_gateway.runner_background_tasks import (  # noqa: E402
   _BACKGROUND_RESULT_ACK_RESULT_KEY,
@@ -429,6 +430,152 @@ def test_consume_notifications_helper_drains_requested_count() -> None:
 
   assert consume_notifications(queue, max_count=2) == 2
   assert [item.task_id for item in queue.peek()] == ["bg_2"]
+
+
+def test_notification_delivery_set_returns_the_rendered_objects() -> None:
+  queue = NotificationQueue()
+  for index in range(3):
+    queue.push(_notification(f"bg_{index}", summary=f"done {index}"))
+
+  delivered = notification_delivery_set(queue, max_count=2)
+  reminder = build_notification_reminder(queue, max_count=2)
+
+  # Exactly the objects the reminder rendered — same guard, same bound.
+  assert [item is queue.peek()[index] for index, item in enumerate(delivered)] == [
+    True,
+    True,
+  ]
+  assert [item.task_id for item in delivered] == ["bg_0", "bg_1"]
+  assert reminder.count("<task-notification") == 2
+  assert queue.pending_count == 3
+
+
+def test_notification_delivery_set_is_empty_when_nothing_is_queued() -> None:
+  queue = NotificationQueue()
+
+  assert notification_delivery_set(queue, max_count=5) == ()
+
+
+def test_drain_delivered_removes_exactly_the_delivered_objects() -> None:
+  queue = NotificationQueue()
+  for index in range(4):
+    queue.push(_notification(f"bg_{index}"))
+  first, second, third, fourth = queue.peek()
+
+  removed = queue.drain_delivered([first, third])
+
+  assert [item is first for item in removed[:1]] == [True]
+  assert [item.task_id for item in removed] == ["bg_0", "bg_2"]
+  assert [item.task_id for item in queue.peek()] == ["bg_1", "bg_3"]
+  assert queue.pending_count == 2
+  assert second is queue.peek()[0]
+  assert fourth is queue.peek()[1]
+
+
+def test_drain_delivered_ignores_equal_but_distinct_notifications() -> None:
+  # Identity, not value: a look-alike never drains the queued object.
+  queue = NotificationQueue()
+  queued = _notification("bg_same", summary="identical")
+  queue.push(queued)
+  look_alike = TaskNotification(
+    task_id=queued.task_id,
+    agent_name=queued.agent_name,
+    event=queued.event,
+    summary=queued.summary,
+    timestamp=queued.timestamp,
+    payload=dict(queued.payload),
+  )
+  look_alike._queue_token = queued._queue_token
+
+  assert queue.drain_delivered([look_alike]) == []
+  assert queue.pending_count == 1
+  assert queue.peek()[0] is queued
+
+
+def test_drain_delivered_clears_the_available_event_when_emptied() -> None:
+  async def case() -> None:
+    queue = NotificationQueue()
+    queue.push(_notification("bg_0"))
+    delivered = list(queue.peek())
+
+    assert queue.drain_delivered(delivered)
+    assert queue.pending_count == 0
+
+    waiter = asyncio.create_task(queue.wait_until_available())
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    queue.push(_notification("bg_1"))
+    await asyncio.wait_for(waiter, timeout=0.1)
+
+  asyncio.run(case())
+
+
+def test_drain_delivered_rotates_overflow_marker_exactly_like_drain() -> None:
+  def _queue_with_overflow() -> NotificationQueue:
+    queue = NotificationQueue(max_pending=2)
+    assert queue.push(_notification("bg_0")) is True
+    assert queue.push(_notification("bg_1")) is False
+    assert queue.push(_notification("bg_2")) is False
+    return queue
+
+  drained_queue = _queue_with_overflow()
+  delivered_queue = _queue_with_overflow()
+
+  drained = drained_queue.drain(max_count=2)
+  delivered = delivered_queue.drain_delivered(
+    list(delivered_queue.peek())
+  )
+
+  assert [item.task_id for item in drained] == ["bg_0", "multiple"]
+  assert [item.task_id for item in delivered] == ["bg_0", "multiple"]
+  assert (
+    [item.task_id for item in delivered_queue.peek()]
+    == [item.task_id for item in drained_queue.peek()]
+    == ["multiple"]
+  )
+  assert (
+    delivered_queue.peek()[0].format_xml()
+    == drained_queue.peek()[0].format_xml()
+  )
+  assert delivered_queue._deferred_overflow_marker is None
+  assert delivered_queue._deferred_overflow_count == 0
+
+
+def test_drain_delivered_leaves_a_replacement_the_model_never_saw(
+) -> None:
+  # D-A7-2: `push_or_replace_pending` reuses the replaced entry's
+  # `_queue_token` for a different, never-rendered payload. A token-keyed
+  # ack would discard the replacement; identity keeps it queued.
+  queue = NotificationQueue()
+  queue.push_or_replace_pending(
+    _notification(
+      "plan_0",
+      event="plan_progress",
+      payload={"items_complete": 1, "status": "running"},
+    )
+  )
+  rendered = queue.peek()[0]
+  delivered = notification_delivery_set(queue, max_count=5)
+  assert delivered == (rendered,)
+
+  queue.push_or_replace_pending(
+    _notification(
+      "plan_0",
+      event="plan_progress",
+      payload={"items_complete": 5, "status": "running"},
+    )
+  )
+  replacement = queue.peek()[0]
+  assert replacement is not rendered
+  assert replacement._queue_token == rendered._queue_token
+
+  assert queue.drain_delivered(delivered) == []
+  assert queue.pending_count == 1
+  assert queue.peek()[0] is replacement
+  assert _notification_result(
+    build_notification_reminder(queue, max_count=5)
+  ) == {"items_complete": 5, "status": "running"}
 
 
 def test_inject_system_prompt_reminder_helper_matches_runner_delegate() -> None:
@@ -1597,3 +1744,71 @@ def test_consume_notifications_drains_requested_count() -> None:
   assert consumed == 2
   assert runner._notification_queue.pending_count == 1
   assert [item.task_id for item in runner._notification_queue.peek()] == ["bg_2"]
+
+
+def test_ack_delivered_notifications_marks_delivered_and_fires_boundary_once() -> None:
+  runner = _make_runner()
+  entry = runner._task_registry.register("background_agent")
+  runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+  runner._task_registry.transition(
+    entry.task_id,
+    TaskState.COMPLETED,
+    result=_report_child_return("rendered result"),
+  )
+  assert entry.notification_delivery_state == "queued"
+  boundary = _notification("workflow-1", event="workflow_boundary_blocked")
+  acked: list[int] = []
+  boundary.workflow_boundary_delivered = lambda: acked.append(1)
+  runner._notification_queue.push(boundary)
+  survivor = _notification("bg_not_delivered")
+  runner._notification_queue.push(survivor)
+
+  delivered = runner._notification_delivery_set()[:2]
+  assert len(delivered) == 2
+
+  assert runner._ack_delivered_notifications(delivered) == 2
+
+  assert entry.notification_delivery_state == "delivered"
+  assert acked == [1]
+  assert runner._notification_queue.pending_count == 1
+  assert runner._notification_queue.peek()[0] is survivor
+  # Idempotent on the already-drained set: no second boundary callback.
+  assert runner._ack_delivered_notifications(delivered) == 0
+  assert acked == [1]
+  assert runner._ack_delivered_notifications(()) == 0
+
+
+def test_ack_delivered_notifications_swallows_a_failing_boundary_callback() -> None:
+  runner = _make_runner()
+
+  def _explode() -> None:
+    raise RuntimeError("boundary ack failed")
+
+  boundary = _notification("workflow-1", event="workflow_boundary_blocked")
+  boundary.workflow_boundary_delivered = _explode
+  runner._notification_queue.push(boundary)
+  delivered = runner._notification_delivery_set()
+
+  assert runner._ack_delivered_notifications(delivered) == 1
+  assert runner._notification_queue.pending_count == 0
+
+
+def test_ack_delivered_notifications_skips_a_superseded_generation() -> None:
+  runner = _make_runner()
+  entry = runner._task_registry.register("background_agent")
+  runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+  runner._task_registry.transition(
+    entry.task_id,
+    TaskState.COMPLETED,
+    result=_report_child_return("rendered result"),
+  )
+  delivered = runner._notification_delivery_set()
+  assert len(delivered) == 1
+  entry.notification_generation += 1
+
+  assert runner._ack_delivered_notifications(delivered) == 1
+
+  # The queue entry is gone, but the registry entry belongs to a newer
+  # generation the model has not seen: it stays retained.
+  assert runner._notification_queue.pending_count == 0
+  assert entry.notification_delivery_state == "queued"

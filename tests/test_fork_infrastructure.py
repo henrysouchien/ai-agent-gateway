@@ -18,16 +18,19 @@ from agent_workflow_contracts import (
   sha256_digest,
 )
 
+from agent_gateway.mcp_activation import McpActivationFold
 from agent_gateway.capability_binding import (
   CapabilityBind,
   CredentialHandle,
 )
 from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.event_log import EventLog
+from agent_gateway.execution_identity import resolved_execution_identity
 from agent_gateway.fork_request_handoff import (
   build_mid_turn_handoff,
   build_post_turn_handoff,
   credential_identity_or_none,
+  fork_credential_identity_available,
 )
 from agent_gateway.fork_scope_receipt import (
   ForkToolDecision,
@@ -46,6 +49,12 @@ from agent_gateway.providers import ModelInfo, ModelProvider
 from agent_gateway.model_registry import ModelRegistryEntry, ProductModelRegistry
 from agent_gateway.runner_sub_agents import (
   _authoritative_child_tool_getter,
+)
+from agent_gateway.task_registry import TaskEntry
+from tests.admitted_authority_test_support import (
+  SOURCE_TOOL_ID,
+  provenance_of,
+  sealed_admitted_task,
 )
 
 
@@ -161,14 +170,20 @@ def test_session_credential_identity_requires_provider_and_principal(
   assert credential_identity_or_none(runner) == expected
 
 
-def test_credential_identity_sources_are_all_or_nothing() -> None:
+def test_credential_identity_has_exactly_one_tier() -> None:
+  """B-6/D-B6-1: the three-tier fallback chain is gone.
+
+  Before WP7 a runner with no bound session handle still produced a credential
+  identity — from ``runner._tenant_id`` (tier 2), or from the
+  ``capability_execution.auth_config`` row (tier 3). Both tiers are deleted:
+  the session's own credential binding is the ONLY source, and its absence is
+  reported as absence.
+  """
+
   child = _runner()
   child._gateway_session = None
   child._tenant_id = "child-tenant"
-  assert credential_identity_or_none(child) == (
-    "credential-1",
-    "child-tenant",
-  )
+  assert credential_identity_or_none(child) is None
 
   autonomous = _runner()
   autonomous._gateway_session = None
@@ -176,16 +191,11 @@ def test_credential_identity_sources_are_all_or_nothing() -> None:
     "credential_handle_id": "credential-1",
     "tenant_id": "auth-tenant",
   })
-  assert credential_identity_or_none(autonomous) == (
-    "credential-1",
-    "auth-tenant",
-  )
+  assert credential_identity_or_none(autonomous) is None
 
-  mixed = _runner()
-  mixed._gateway_session = None
-  mixed._credential_handle_id = "child-handle"
-  mixed._capability_execution.auth_config["tenant_id"] = "auth-tenant"
-  assert credential_identity_or_none(mixed) is None
+  # The one live tier, and its guard: a handle that does not match the
+  # capability bind is a different identity, never a weaker one.
+  assert credential_identity_or_none(_runner()) == ("credential-1", "tenant-1")
 
   guarded = _runner()
   guarded._credential_handle_id = "child-handle"
@@ -198,6 +208,23 @@ def test_credential_identity_sources_are_all_or_nothing() -> None:
     actor_id="user-1",
   )
   assert credential_identity_or_none(guarded) is None
+
+
+def test_fork_capture_predicate_reads_the_resolved_identity() -> None:
+  """The two run-loop capture sites read one resolved identity, not a chain."""
+
+  unbound = _runner()
+  unbound._gateway_session.session_credential_handle = None
+  assert fork_credential_identity_available(unbound) is False
+
+  bound = _runner()
+  assert fork_credential_identity_available(bound) is True
+  identity = resolved_execution_identity(bound)
+  assert identity is not None
+  assert (identity.credential_handle_id, identity.tenant_id) == (
+    "credential-1",
+    "tenant-1",
+  )
 
 
 def _assistant(*tool_ids: str) -> dict[str, Any]:
@@ -500,18 +527,17 @@ class _ForkSessionLog:
     })], None
 
 
-def test_spawn_fork_reuses_resume_seed_and_fresh_tagged_log(
-  tmp_path,
-) -> None:
-  _SpawnRunner.children.clear()
-  parent = object.__new__(_SpawnRunner)
+def _fork_parent(tmp_path, cls: type = _SpawnRunner) -> Any:
+  # ``spawn_fork_agent`` builds the child as ``type(parent)``, so the parent's
+  # class chooses the child runner behavior.
+  parent = object.__new__(cls)
   parent._log = EventLog()
   parent._full_session_id = "parent-session"
   parent._cost_accumulator = None
   parent._per_turn_timeout = None
   parent._stream_stall_timeout = 60.0
   parent._mcp_client = None
-  parent._loaded_mcp_servers = set()
+  parent._mcp_activation_fold = McpActivationFold()
   parent._on_tool_result = None
   parent._on_usage = None
   parent._on_late_usage_event = None
@@ -533,6 +559,14 @@ def test_spawn_fork_reuses_resume_seed_and_fresh_tagged_log(
   parent._workspace_dir = str(tmp_path)
   parent._context_surfaces_provider = None
   parent._context_surfaces_static = []
+  return parent
+
+
+def test_spawn_fork_reuses_resume_seed_and_fresh_tagged_log(
+  tmp_path,
+) -> None:
+  _SpawnRunner.children.clear()
+  parent = _fork_parent(tmp_path)
   execution_bind = CapabilityBind(
     schema_version="1.0",
     capability_id="node.fork",
@@ -645,6 +679,139 @@ def test_spawn_fork_reuses_resume_seed_and_fresh_tagged_log(
     and entry.event["fork"] is True
     for entry in child._log.entries
   )
+
+
+class _FailedRetrievalForkRunner(_SpawnRunner):
+  """A fork whose only granted source-capability retrieval failed."""
+
+  async def run(self, **_kwargs: Any) -> None:
+    self._log.append({
+      "type": "tool_call_complete",
+      "tool_call_id": "call-web-search",
+      "tool_name": SOURCE_TOOL_ID,
+      "is_error": True,
+    })
+    self._log.append({"type": "text_delta", "text": "fork complete"})
+    self._log.append({"type": "stream_complete"})
+
+
+def test_fork_settlement_derives_the_outcome_from_admitted_authority(
+  tmp_path,
+) -> None:
+  # The third settlement site (B-3): ``spawn_fork_agent`` passes the entry's
+  # admitted task into settlement, so the fork's result carries the mechanical
+  # qualifier derived from the grant and bindings frozen at admission. Drop
+  # that pass and the fork settles with no outcome at all.
+  _SpawnRunner.children.clear()
+  parent = _fork_parent(tmp_path, cls=_FailedRetrievalForkRunner)
+  execution_bind = CapabilityBind(
+    schema_version="1.0",
+    capability_id="node.fork",
+    model_key="anthropic.test-sonnet",
+    provider="anthropic",
+    upstream_model="claude-sonnet-4-6",
+    adapter="anthropic.messages",
+    protocol_profile="messages.adaptive",
+    route="anthropic.public",
+    effort="high",
+    credential_principal="user",
+    credential_ref="credential-1",
+    run_mode="interactive",
+    registry_revision="registry-1",
+    policy_revision="policy-1",
+    selection_source="parent_binding",
+  )
+  execution = BoundCapabilityExecution(
+    bind=execution_bind,
+    registry=_registry_for_bind(execution_bind),
+    adapter=_Provider(),
+    auth_config={
+      "api_key": "secret",
+      "provider": "anthropic",
+    },
+  )
+  handoff = build_mid_turn_handoff(
+    _runner(),
+    [
+      {
+        "role": "user",
+        "content": [{"type": "text", "text": "parent"}],
+      },
+      _assistant("fork-1"),
+    ],
+  )
+  parent._capability_execution = SimpleNamespace(bind=handoff.capability_bind)
+  receipt = fork_scope_receipt_dict(
+    tool_decisions=(
+      ForkToolDecision("read_data", "allow", "parent surface"),
+      ForkToolDecision("run_agent", "deny", "orchestration surface"),
+    ),
+    capability_bind=execution.bind,
+    tenant_id=handoff.tenant_id,
+    billing_mode=handoff.billing_mode,
+    resolved_budget_usd=5.0,
+    max_turns=20,
+    suffix_ceiling=20_000,
+  )
+  operation = AgentOperationRef(
+    namespace="agent-operation",
+    name="test-fork",
+    version="1.0",
+    digest=sha256_digest({"operation": "test-fork"}),
+  )
+  logical_task = OrdinaryDelegationTaskRef(
+    delegation_id="test-fork-1",
+    operation=operation,
+  )
+  attempt = AttemptRef(
+    attempt_number=1,
+    attempt_id="attempt:test-fork:1",
+    physical_task_id="sub0:parent-session",
+  )
+  result_requirement = ResultRequirement(
+    mode="narrative",
+    terminal_narrative="required",
+    outcome=OutcomeRequirement(required=False, source="none"),
+  )
+  admitted = sealed_admitted_task(
+    logical_task=logical_task,
+    attempt=attempt,
+    result_requirement=result_requirement,
+  )
+  task_entry = TaskEntry(
+    task_id=attempt.physical_task_id,
+    task_type="agent",
+    admitted_task=admitted,
+  )
+
+  result, error = asyncio.run(
+    spawn_fork_agent(
+      parent,
+      "finish the side quest",
+      handoff=handoff,
+      capability_execution=execution,
+      logical_task=logical_task,
+      attempt=attempt,
+      result_requirement=result_requirement,
+      result_provenance=provenance_of(admitted),
+      dispatcher=_Dispatcher(handoff.wire_tools),
+      scope_receipt=receipt,
+      max_turns=20,
+      max_budget_usd=5.0,
+      suffix_ceiling=20_000,
+      task_entry=task_entry,
+    )
+  )
+
+  assert error is None
+  assert isinstance(result, TaskResult)
+  assert result.execution.status == "succeeded"
+  assert result.outcome is not None
+  assert result.outcome.assessment_source == "mechanically_derived"
+  # The grant intersected with the source-capability binding is exactly
+  # ``web_search``; its only retrieval failed.
+  assert result.outcome.disposition == "insufficient_evidence"
+  assert result.outcome.unmet_requirements == (SOURCE_TOOL_ID,)
 
 
 def test_dynamic_fork_bind_inherits_exact_parent_selection() -> None:

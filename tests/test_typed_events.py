@@ -40,7 +40,7 @@ from agent_workflow_contracts import (
   AuthoredDeliverySummary,
   ContentHandle,
   ContractRef,
-  DeliveryEnvelope,
+  DeliveryEnvelopeV1,
   DeliveryPrimary,
   PublishedOutputRef,
 )
@@ -134,7 +134,8 @@ def test_typed_events_round_trip_with_type_discriminator() -> None:
     ),
     WorkflowOutputAttachedEvent(
       assistant_message_seq=12,
-      delivery_envelope=DeliveryEnvelope(
+      delivery_envelope=DeliveryEnvelopeV1(
+        schema_version="1.0",
         workflow_run_id="workflow-1",
         phase_number=2,
         revision=3,

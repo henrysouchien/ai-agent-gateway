@@ -649,15 +649,15 @@ def test_explicit_choice_without_effort_uses_policy_effort_not_entry_default() -
   assert bind.effort == "high"
 
 
-def test_explicit_choice_with_unsupported_policy_effort_refuses_not_repairs() -> None:
-  # anthropic.claude-haiku-4-5 supports only "none"; the applicable policy
-  # effort "high" is not silently repaired to the entry default.
+def test_explicit_choice_with_user_supplied_unsupported_effort_refuses_not_repairs() -> None:
+  # anthropic.claude-haiku-4-5 supports only "none"; an effort the USER
+  # explicitly supplied is never silently repaired to something supported.
   with pytest.raises(CapabilityResolutionError) as refused:
     _resolve(
       "session.driver",
       explicit_intent=ModelSelectionIntent(
         model_key="anthropic.claude-haiku-4-5",
-        effort=None,
+        effort="high",
         source="explicit_user",
       ),
     )
@@ -956,3 +956,40 @@ def test_unknown_executable_capability_designation_is_rejected() -> None:
       adapter_resolver=lambda adapter_id: None,
       executable_capability_ids=frozenset({"session.driver", "made.up"}),
     )
+
+
+def test_explicit_choice_without_effort_uses_entry_default_when_policy_effort_unsupported() -> None:
+  """An eligible model whose supported set excludes the policy effort stays selectable.
+
+  session.driver policy effort is high; claude-haiku-4-5 supports only none.
+  Selecting it without an effort binds the entry default, not a refusal —
+  otherwise a model advertised eligible (with default_effort none) could
+  never be explicitly chosen."""
+  bind = _resolve(
+    "session.driver",
+    explicit_intent=ModelSelectionIntent(
+      model_key="anthropic.claude-haiku-4-5",
+      effort=None,
+      source="explicit_user",
+    ),
+  )
+  assert bind.model_key == "anthropic.claude-haiku-4-5"
+  assert bind.effort == "none"
+
+
+def test_explicit_choice_without_effort_uses_policy_effort_when_supported() -> None:
+  """The policy effort wins over the entry default when the model supports it."""
+  entry = INITIAL_MODEL_REGISTRY.models["openai.gpt-5-6"]
+  assert entry.default_effort != "high"
+  assert "high" in entry.supported_efforts
+  bind = _resolve(
+    "session.driver",
+    auth=_auth(providers=("anthropic", "openai")),
+    explicit_intent=ModelSelectionIntent(
+      model_key="openai.gpt-5-6",
+      effort=None,
+      source="explicit_user",
+    ),
+  )
+  assert bind.model_key == "openai.gpt-5-6"
+  assert bind.effort == "high"

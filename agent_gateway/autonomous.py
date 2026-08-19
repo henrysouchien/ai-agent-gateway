@@ -5,7 +5,6 @@ import inspect
 import logging
 import os
 import secrets
-import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
@@ -14,7 +13,6 @@ import httpx
 
 from ._io import _atomic_write_json, _read_json_object
 from .agent_session_log import AgentSessionLog, slugify
-from .autonomous_excel_dispatch import make_autonomous_message_excel_agent_handler
 from .autonomous_output import (
   RunOutput as RunOutput,
   _JSON_FENCE_RE as _JSON_FENCE_RE,
@@ -34,7 +32,6 @@ from .capability_execution import (
   CapabilityExecutionResolver,
 )
 from .event_log import EventLog
-from .excel_dispatch import make_message_excel_agent_tool_def
 from .mcp_client import McpClientManager
 from .multi_user.billing import SessionUsageSummary, UsageEvent
 from .openai_history_fence import (
@@ -64,9 +61,6 @@ log = logging.getLogger("agent_gateway.autonomous")
 _RUN_SESSION_FORCE_CLOSE_SECONDS = 2.0
 _RUN_SESSION_CANCEL_DRAIN_SECONDS = 5.0
 _SESSION_LOG_BASE_DIR_ENV = "AGENT_SESSION_LOG_BASE_DIR"
-_API_AUTONOMOUS_MCP_CONFIG_MODULE_NAMES = frozenset(
-  {"api", "api.agent", "api.agent.autonomous", "api.agent.autonomous.mcp_config"}
-)
 
 
 def _trusted_autonomous_mcp_policy(
@@ -276,71 +270,6 @@ def format_run_summary(
     format_state_fn=format_state_fn,
     extract_summary_fn=_extract_summary,
   )
-
-
-def _is_env_placeholder(value: str) -> bool:
-  stripped = value.strip()
-  return stripped.startswith("${") and stripped.endswith("}")
-
-
-def _resolve_autonomous_mcp_gateway_api_key(user_id: str, user_email: str | None) -> str:
-  try:
-    from api.agent.autonomous.mcp_config import _resolve_gateway_api_key
-
-    return str(_resolve_gateway_api_key(user_id, user_email)).strip()
-  except ModuleNotFoundError as exc:
-    if exc.name not in _API_AUTONOMOUS_MCP_CONFIG_MODULE_NAMES:
-      raise
-    api_dir = Path(__file__).resolve().parents[3] / "api"
-    if not api_dir.exists():
-      raise
-    api_dir_text = str(api_dir)
-    if api_dir_text not in sys.path:
-      sys.path.insert(0, api_dir_text)
-    from agent.autonomous.mcp_config import _resolve_gateway_api_key
-
-    return str(_resolve_gateway_api_key(user_id, user_email)).strip()
-
-
-def _resolve_message_excel_agent_gateway_config(user_id: str) -> tuple[str, str]:
-  gateway_url = os.getenv("GATEWAY_URL", "").strip()
-  if not gateway_url or _is_env_placeholder(gateway_url):
-    gateway_url = "https://localhost:8000"
-
-  env_key = os.getenv("GATEWAY_API_KEY", "").strip()
-  if env_key and not _is_env_placeholder(env_key):
-    return gateway_url, env_key
-
-  resolved_user_id = str(user_id or "").strip()
-  user_email = os.getenv("RISK_MODULE_USER_EMAIL", "").strip() or None
-  if not resolved_user_id:
-    raise RuntimeError(
-      "message_excel_agent registration requires GATEWAY_API_KEY or a user_id "
-      "for api/agent/autonomous/mcp_config._resolve_gateway_api_key"
-    )
-
-  try:
-    gateway_api_key = _resolve_autonomous_mcp_gateway_api_key(resolved_user_id, user_email)
-  except SystemExit as exc:
-    detail = str(exc) or "gateway API key resolver exited without a message"
-    raise RuntimeError(
-      "message_excel_agent registration requires GATEWAY_API_KEY or "
-      "GATEWAY_USER_KEYS channel='mcp' entry for "
-      f"user_id={resolved_user_id!r}, user_email={user_email!r}: {detail}"
-    ) from exc
-  except Exception as exc:
-    raise RuntimeError(
-      "message_excel_agent registration requires GATEWAY_API_KEY or "
-      "api/agent/autonomous/mcp_config._resolve_gateway_api_key; "
-      f"resolver failed for user_id={resolved_user_id!r}, user_email={user_email!r}: {exc}"
-    ) from exc
-
-  if not gateway_api_key:
-    raise RuntimeError(
-      "message_excel_agent registration requires a non-empty gateway API key from "
-      "GATEWAY_API_KEY or api/agent/autonomous/mcp_config._resolve_gateway_api_key"
-    )
-  return gateway_url, gateway_api_key
 
 
 async def _force_close_runner(runner: Any, *, timeout: float) -> None:
@@ -915,11 +844,6 @@ async def run_autonomous(
     profile="autonomous",
     channel=str(session.channel or "autonomous"),
     skill=trusted_skill_name,
-    scheduled_investment_authority=getattr(
-      session,
-      "scheduled_investment_authority",
-      None,
-    ),
     decider_role=session.role,
     policy_bundle_hash=policy_bundle_hash,
   )
@@ -944,24 +868,11 @@ async def run_autonomous(
       "run_autonomous requires capability_execution_resolver before "
       "registering the run_agent child surface"
     )
-  excel_dispatch_config: tuple[str, str] | None = None
-  excel_dispatch_enabled = os.getenv("EXCEL_ORCHESTRATION_DEV", "").strip() == "1"
-  if excel_dispatch_enabled and "message_excel_agent" not in (tool_handlers or {}):
-    # Non-fatal: a globally-set dev flag must not crash a non-Excel autonomous run.
-    # If the gateway URL/key can't be resolved, log and skip registering the tool.
-    try:
-      excel_dispatch_config = _resolve_message_excel_agent_gateway_config(user_id)
-    except Exception as exc:
-      log.warning("message_excel_agent registration skipped (gateway config unresolved): %s", exc)
-      excel_dispatch_config = None
-
   mcp_client: McpClientManager | None = None
   connected_servers: set[str] = set()
   active_servers: set[str] = set()
   if mcp_servers or mcp_config_path:
     builtin_names = set((tool_handlers or {}).keys())
-    if excel_dispatch_config is not None:
-      builtin_names.add("message_excel_agent")
     if skills_dir and "run_agent" not in builtin_names:
       builtin_names |= {
         "run_agent",
@@ -987,15 +898,6 @@ async def run_autonomous(
     local_handlers = dict(tool_handlers or {})
     extra_tool_defs = list(tool_definitions or [])
     runner_ref: list[Any] = [None]
-
-    if excel_dispatch_config is not None and "message_excel_agent" not in local_handlers:
-      gateway_url, gateway_api_key = excel_dispatch_config
-      local_handlers["message_excel_agent"] = make_autonomous_message_excel_agent_handler(
-        gateway_url=gateway_url,
-        gateway_api_key=gateway_api_key,
-      )
-      if not any(definition.get("name") == "message_excel_agent" for definition in extra_tool_defs):
-        extra_tool_defs.append(make_message_excel_agent_tool_def())
 
     if skill_loader is not None and "run_agent" not in local_handlers:
       local_handlers["run_agent"] = make_run_agent_handler(
@@ -1068,7 +970,7 @@ async def run_autonomous(
       max_tokens_override=max_tokens,
       per_turn_timeout=per_turn_timeout,
       mcp_client=mcp_client,
-      loaded_mcp_servers=active_servers,
+      mcp_activation_fold=session.mcp_activation_fold,
       excluded_tools=excluded_tools,
       get_tool_definitions=_get_tool_defs,
       on_tool_result=_combined_on_tool_result,

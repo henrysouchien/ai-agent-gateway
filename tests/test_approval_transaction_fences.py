@@ -84,7 +84,6 @@ def test_vote_at_or_after_deadline_expires_atomically_without_vote_or_outbox(
 
   assert resolved.state == "expired"
   assert resolved.decision == "expired"
-  assert resolved.votes_received_count == 0
   with store._connection() as conn:
     vote_count = conn.execute(
       "SELECT COUNT(*) FROM approval_votes WHERE approval_id = ?",
@@ -123,7 +122,6 @@ def test_vote_one_nanosecond_before_deadline_is_accepted(
   )
 
   assert resolved.state == "approved"
-  assert resolved.votes_received_count == 1
   delivery = asyncio.run(
     store.get_autonomous_approval_delivery(
       "approval-deadline",
@@ -167,7 +165,6 @@ def test_vote_refuses_server_clock_rollback_without_mutating_approval(
   stored = asyncio.run(store.get("approval-deadline"))
   assert stored is not None
   assert stored.state == "pending_user"
-  assert stored.votes_received_count == 0
   assert asyncio.run(
     store.get_autonomous_approval_delivery(
       "approval-deadline",

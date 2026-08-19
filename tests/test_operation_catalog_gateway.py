@@ -22,7 +22,6 @@ from agent_gateway.sub_agent import (
   _ordinary_admitted_task_factory,
 )
 from agent_gateway.sub_agent_helpers import make_run_agent_tool_def
-from agent_gateway.sub_agent_scope_receipt import OperationToolAdmission
 
 
 def _write_operation(path: Path) -> None:
@@ -38,7 +37,7 @@ semantic_metadata:
     - kind: local
       tool_id: file_read
   capability_requirements:
-    - name: research-evidence.read/v1
+    - name: corpus.read/v1
       required: true
       binding_modes: [live_tool]
 ---
@@ -62,9 +61,7 @@ def test_loader_resolves_only_full_operation_identity(tmp_path: Path) -> None:
   )
 
   assert resolved.snapshot == operation.snapshot
-  assert resolved.snapshot.required_capabilities[0].name == (
-    "research-evidence.read/v1"
-  )
+  assert resolved.snapshot.required_capabilities[0].name == "corpus.read/v1"
   with pytest.raises(ValueError, match="full AgentOperationRef"):
     loader.resolve_operation("filing-review")  # type: ignore[arg-type]
 
@@ -89,9 +86,9 @@ def test_omitted_operation_selects_registered_generic_explore(tmp_path: Path) ->
   assert resolved.snapshot.operation.name == "explore"
   assert resolved.snapshot.execution_class == "node.explore"
   assert resolved.snapshot.workspace_scope == "read_only"
-  assert resolved.snapshot.required_capabilities[0].name == (
-    "research-evidence.read/v1"
-  )
+  assert [
+    item.name for item in resolved.snapshot.required_capabilities
+  ] == ["corpus.read/v1", "web.read/v1"]
 
 
 def test_ordinary_and_resumed_admission_are_exact_execute_tasks(
@@ -117,12 +114,6 @@ Explore the admitted question.
     tools=(),
     digest=sha256_digest({"grant_id": grant_id, "tools": []}),
   )
-  admission = OperationToolAdmission(
-    tool_grant=grant,
-    capability_bindings=(),
-    tool_ids=frozenset(),
-    mcp_tools_by_server={},
-  )
   bind = CapabilityBind(
     schema_version="1.0",
     capability_id="node.explore",
@@ -145,6 +136,10 @@ Explore the admitted question.
     operation=operation,
     result_instructions=render_result_instructions(requirement),
     admission_date="2026-08-10",
+    persisted_methodology_state={
+      "reference": "/tmp/admitted-methodology.json",
+    },
+    methodology_state_instructions="Use the exact persisted methodology state.",
     max_turns=10,
     timeout_seconds=600,
     client_timeout_seconds=90,
@@ -155,10 +150,14 @@ Explore the admitted question.
   first = _ordinary_admitted_task_factory(
     operation=operation,
     execution_snapshot=execution_snapshot,
-    admission=admission,
+    capability_bindings=(),
+    tool_grant=grant,
     model_bind=bind,
     result_requirement=requirement,
-    objective="Investigate the admitted question.",
+    objective={
+      "goal": "Investigate the admitted question.",
+      "reference": "../selected/FY2026.md",
+    },
     parent_session=None,
   )(SimpleNamespace(task_id="bg_1"))
   resumed = _ordinary_admitted_task_factory(
@@ -167,7 +166,8 @@ Explore the admitted question.
       execution_snapshot,
       resume_instruction="Resume the exact admitted delegation.",
     ),
-    admission=admission,
+    capability_bindings=(),
+    tool_grant=grant,
     model_bind=bind,
     result_requirement=requirement,
     objective="Resume the admitted question.",
@@ -179,5 +179,10 @@ Explore the admitted question.
 
   assert isinstance(first.execution_disposition, ExecuteTaskDisposition)
   assert isinstance(resumed.execution_disposition, ExecuteTaskDisposition)
+  assert first.objective["reference"] == "../selected/FY2026.md"
+  assert first.execution_snapshot is not None
+  assert first.execution_snapshot.persisted_methodology_state == {
+    "reference": "/tmp/admitted-methodology.json",
+  }
   assert resumed.logical_task == first.logical_task
   assert resumed.attempt.resume_of_task_id == "bg_1"

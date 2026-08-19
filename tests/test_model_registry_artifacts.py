@@ -142,6 +142,7 @@ _EXPECTED_DEFAULTS = {
   "node.fork": ("inherit_parent", None, None),
   "node.verify": ("model", "anthropic.claude-opus-5", "high"),
   "node.choose": ("model", "anthropic.claude-opus-5", "high"),
+  "citation.review": ("model", "anthropic.claude-haiku-4-5", "none"),
   "risk.completion": ("model", "anthropic.claude-sonnet-4-6-sdk", "none"),
   "risk.interpretation": ("model", "anthropic.claude-sonnet-4-6-sdk", "none"),
   "risk.peer_generation": ("model", "openai.gpt-5-4-mini-sdk", "none"),
@@ -170,7 +171,7 @@ _DRIVER_KEYS = frozenset({
 
 
 def test_packaged_registry_artifact_matches_frozen_inventory() -> None:
-  assert INITIAL_MODEL_REGISTRY.revision == "2026-08-13.1"
+  assert INITIAL_MODEL_REGISTRY.revision == "2026-08-18.1"
   observed = {
     key: (
       entry.provider,
@@ -194,6 +195,9 @@ def test_packaged_registry_artifact_matches_frozen_inventory() -> None:
     "claude-haiku-4-5",
     "claude-haiku-4-5-20251001",
   })
+  assert INITIAL_MODEL_REGISTRY.require(
+    "openai.gpt-5-6"
+  ).reported_identities == frozenset({"gpt-5.6", "gpt-5.6-sol"})
   oauth = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-4-8-oauth")
   assert oauth.features == frozenset({"vision"})
   assert INITIAL_MODEL_REGISTRY.require("xai.grok-4-5").supported_efforts == (
@@ -205,7 +209,7 @@ def test_packaged_registry_artifact_matches_frozen_inventory() -> None:
 
 
 def test_packaged_selection_artifact_matches_frozen_policy() -> None:
-  assert INITIAL_MODEL_SELECTION_POLICY.revision == "2026-08-13.1"
+  assert INITIAL_MODEL_SELECTION_POLICY.revision == "2026-08-18.1"
   assert set(INITIAL_MODEL_SELECTION_POLICY.capabilities) == CAPABILITY_IDS
   observed = {
     capability_id: (
@@ -226,6 +230,17 @@ def test_packaged_selection_artifact_matches_frozen_policy() -> None:
   assert INITIAL_MODEL_SELECTION_POLICY.capabilities[
     "node.fork"
   ].allowed_model_keys == _DRIVER_KEYS
+  review = INITIAL_MODEL_SELECTION_POLICY.capabilities["citation.review"]
+  assert review.allowed_model_keys == frozenset({
+    "anthropic.claude-fable-5",
+    "anthropic.claude-haiku-4-5",
+    "anthropic.claude-mythos-5",
+    "anthropic.claude-opus-5",
+    "anthropic.claude-sonnet-5",
+  })
+  assert review.allow_explicit_user is False
+  assert review.allow_saved_preference is False
+  assert review.allow_authenticated_run_override is False
   node_keys = frozenset({
     "anthropic.claude-fable-5",
     "anthropic.claude-mythos-5",
@@ -639,7 +654,6 @@ def test_installed_declarations_cover_only_adapters_this_package_implements() ->
   assert set(supports) == {
     "anthropic.messages",
     "codex.responses",
-    "fixture.responses",
     "openai.responses",
     "xai.responses",
   }

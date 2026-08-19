@@ -2,19 +2,17 @@
 
 These primitives are defined by
 `docs/design/gateway-openai-responses-migration-plan.md` (section 10, "Durable
-history and rollback fence"). They are intentionally self-contained and are
-The current runtime is Responses-native. The marker predicate now routes
+history and rollback fence"). They are intentionally self-contained. The
+current runtime is Responses-native. The marker predicate now routes
 durable persistence and distinguishes legacy Chat history from native replay;
-it is not a rejecting fence in this release. The error type remains part of
-the retained rollback-preparation contract.
+it is not a rejecting fence in this release.
 
 Two independent concerns live here:
 
 1. **History version fence.** The Responses release persists version markers that
    a rolled-back Chat release cannot interpret. `contains_openai_responses_history`
-   detects those markers for native replay/persistence routing. A rolled-back
-   preparation release uses `OpenAIHistoryVersionError` rather than attempting
-   a Responses -> Chat translation (which is never implemented, by design).
+   detects those markers for native replay/persistence routing. The current
+   runtime never attempts a Responses -> Chat translation.
 2. **Durable session epoch.** `scope_provider_session_id` namespaces durable
    OpenAI session identifiers by epoch so a rollback quarantines old logs by
    namespace rather than deleting or rewriting them.
@@ -48,25 +46,6 @@ OPENAI_SESSION_EPOCH_ENV = "OPENAI_SESSION_EPOCH"
 _EPOCH_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
 _SCOPE_SEPARATOR = "--openai-"
 _OPENAI_PROVIDER = "openai"
-
-
-class OpenAIHistoryVersionError(RuntimeError):
-  """Raised when Responses-native history reaches a Chat-only code path.
-
-  Non-retryable: the caller must start a new session rather than retry, because
-  no Responses -> Chat translation exists.
-  """
-
-  requires_new_session = True
-
-  def __init__(self, message: str = "") -> None:
-    super().__init__(
-      message
-      or (
-        "History contains OpenAI Responses version markers that this release "
-        "cannot replay. A new session is required."
-      )
-    )
 
 
 class OpenAISessionEpochError(RuntimeError):
@@ -181,7 +160,6 @@ def scope_provider_session_id(
 __all__ = [
   "DURABLE_HISTORY_VERSION_KEY",
   "OPENAI_SESSION_EPOCH_ENV",
-  "OpenAIHistoryVersionError",
   "OpenAISessionEpochError",
   "REASONING_SIGNATURE_MARKER",
   "RESPONSES_HISTORY_VERSION",

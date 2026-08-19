@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from agent_gateway import ui_blocks_contract
+from scripts.ui_blocks_fixture_loader import load_ui_blocks_fixtures
 
 
 def test_packaged_contract_accessors_are_valid() -> None:
@@ -11,9 +12,10 @@ def test_packaged_contract_accessors_are_valid() -> None:
   assert ui_blocks_contract.manifest()["contract"]["contract_version"] == 1
   assert ui_blocks_contract.envelope_schema()["$id"] == "hank_ui_blocks.v1"
   assert ui_blocks_contract.fallback_projection_table()["projections"]
-  assert ui_blocks_contract.fixtures()
+  fixtures = load_ui_blocks_fixtures()
+  assert fixtures
   assert all(
     "expected_code" in fixture
-    for fixture in ui_blocks_contract.fixtures()
+    for fixture in fixtures
     if fixture["expectation"] == "reject"
   )

@@ -14,28 +14,37 @@ import yaml
 from agent_workflow_contracts import (
   AgentOperationRef,
   AgentOperationSnapshot,
+  CatalogToolEntry,
   ContractRef,
+  EvidencePort,
+  OperationUnavailable,
+  PlatformToolCatalog,
   SemanticCapabilityRequirement,
   canonical_json_bytes,
   sha256_digest,
 )
 
+from .capability_resolution import (
+  OperationDeclaration,
+  resolve_operation_authority,
+)
 from .canonical_json_target_lock import (
   LockedCanonicalJsonTarget,
   lock_canonical_json_path,
   read_locked_canonical_json_target,
   write_locked_canonical_json_target,
 )
-from .fixture_gate import fixture_provider_available, is_fixture_skill_name, require_fixture_provider_available
 from ._io import (
   _atomic_write_json as _atomic_write_json,
   _read_json_object,
 )
+from .semantic_capability_routing import capability_for_tool
 from .sub_agent_capability import (
   DelegationRoleResolutionError,
   resolve_delegation_role_capability,
   resolve_sub_agent_capability,
 )
+from .sub_agent_scope_receipt import _server_owned_effect
 from .thinking import resolve_effort_pair
 
 log = logging.getLogger("agent_gateway.skills")
@@ -67,6 +76,20 @@ GENERIC_EXPLORE_TOOL_IDS = frozenset({
   "web_fetch",
   "web_search",
 })
+#: The evidence domains the generic explore ceiling can reach, declared
+#: instead of inferred from the operation's name.
+#:
+#: Both are optional, deliberately.  The retired coarse row meant "at least one
+#: read route, of any kind", which the granular vocabulary cannot state: making
+#: either domain required would refuse `explore` in a parent that happens to
+#: offer only the other one, and `explore` is the fallback operation of last
+#: resort.  The "explore must have a live evidence route" rule keeps its own
+#: enforcement in the live catalog build, which refuses an empty tool scope for
+#: this operation by name.
+GENERIC_EXPLORE_CAPABILITIES: tuple[tuple[str, bool], ...] = (
+  ("corpus.read/v1", False),
+  ("web.read/v1", False),
+)
 _GENERIC_EXPLORE_DESCRIPTION = (
   "Investigate a focused question with the available read-only evidence routes."
 )
@@ -83,15 +106,6 @@ _COMMON_OPERATION_INSTRUCTIONS = (
   "suspicious data, identify the limitation explicitly instead of silently "
   "proceeding. You cannot delegate to another agent."
 )
-
-
-@dataclass(frozen=True)
-class DataRequirement:
-  endpoint: str
-  symbol: str
-  params: dict[str, Any]
-  required: bool
-  freshness: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,11 +189,14 @@ def _workspace_scope(profile: "SkillProfile") -> Literal[
 def _declared_semantic_requirements(
   profile: "SkillProfile",
 ) -> tuple[SemanticCapabilityRequirement, ...]:
-  """Compile route-independent requirements from methodology metadata.
+  """Read the route-independent requirements the methodology *declares*.
 
-  The migration fallback observes only whether an older profile expected an
-  evidence door; its concrete tool/server identifiers never select or grant a
-  runtime tool. The server-owned capability router performs that later step.
+  Nothing is inferred any more (B-8).  There is no coarse
+  ``research-evidence.read/v1`` minted from "this profile has tool refs", no
+  ``data_requirements`` side channel, and no ``profile.name in {"explore",
+  "verify-finding"}`` shim: a methodology that needs a capability says so.
+  The server-owned capability router still decides which exact live routes
+  satisfy the declaration.
   """
 
   semantic = (
@@ -237,87 +254,144 @@ def _declared_semantic_requirements(
         raise ValueError(f"conflicting semantic capability requirement: {name}")
       requirements[name] = requirement
 
-  if not requirements:
-    legacy_refs = semantic.get("tool_refs") if isinstance(semantic, dict) else None
-    expects_evidence = bool(profile.data_requirements) or (
-      isinstance(legacy_refs, (list, tuple)) and bool(legacy_refs)
-    )
-    if profile.name in {"explore", "verify-finding"}:
-      expects_evidence = True
-    if expects_evidence:
-      requirements["research-evidence.read/v1"] = SemanticCapabilityRequirement(
-        name="research-evidence.read/v1",
-        required=True,
-        binding_modes=("live_tool",),
-      )
-
-  workspace_scope = _workspace_scope(profile)
-  if workspace_scope == "workspace_write":
-    requirements.setdefault(
-      "artifact.propose/v1",
-      SemanticCapabilityRequirement(
-        name="artifact.propose/v1",
-        required=True,
-        binding_modes=("live_tool",),
-      ),
-    )
-  elif workspace_scope == "model_write":
-    requirements.setdefault(
-      "state.mutate/v1",
-      SemanticCapabilityRequirement(
-        name="state.mutate/v1",
-        required=True,
-        binding_modes=("live_tool",),
-      ),
-    )
   return tuple(requirements[name] for name in sorted(requirements))
 
 
-def validate_operation_tool_coherence(profile: "SkillProfile") -> None:
-  """Reject typed operation metadata that requires tools it cannot receive.
+def declared_ceiling_catalog(profile: "SkillProfile") -> PlatformToolCatalog:
+  """Describe the operation's declared ceiling as a platform catalog.
 
-  An operation whose typed metadata declares a required live-tool semantic
-  capability (explicit ``capability_requirements``, typed
-  ``data_requirements``, or a mutating workspace scope) must also declare a
-  non-empty private tool ceiling; otherwise admission would compile an empty
-  ``ToolGrant`` for a methodology that declared tool-assisted execution. This
-  check reads only typed/structured fields. Methodology prose is deliberately
-  invisible here: authority is never inferred from text, so a profile whose
-  only tool-use signal is prose is indistinguishable from a genuinely
-  tool-free operation and cannot be rejected deterministically.
+  Compile time has no live routing table, so the ceiling is projected as if
+  every declared tool were routable.  The columns that decide authority —
+  effect and capability — come from the same server-owned derivations the live
+  snapshot uses, which is what makes the compile-time check and the
+  admission-time check the same computation.
   """
 
-  live_tool_required = tuple(
-    requirement.name
-    for requirement in _declared_semantic_requirements(profile)
-    if requirement.required and "live_tool" in requirement.binding_modes
-  )
-  if not live_tool_required or operation_tool_ids(profile):
-    return
+  metadata = getattr(profile, "metadata", None)
   semantic = (
-    profile.metadata.get("semantic_metadata")
-    if isinstance(profile.metadata, dict)
-    else None
+    metadata.get("semantic_metadata") if isinstance(metadata, dict) else None
   )
-  explicitly_declared = bool(
-    isinstance(semantic, dict) and semantic.get("capability_requirements")
+  raw_refs = semantic.get("tool_refs") if isinstance(semantic, dict) else None
+  entries: dict[str, CatalogToolEntry] = {}
+  for raw in raw_refs if isinstance(raw_refs, (list, tuple)) else ():
+    if not isinstance(raw, dict):
+      continue
+    tool_id = str(raw.get("tool_id") or "").strip()
+    if not tool_id or tool_id in entries:
+      continue
+    is_local = raw.get("kind") != "mcp"
+    server_id = (
+      None if is_local else (str(raw.get("server_id") or "").strip() or None)
+    )
+    if not is_local and server_id is None:
+      continue
+    effect = _server_owned_effect(tool_id, server_id, is_local)
+    if effect is None:
+      continue
+    entries[tool_id] = CatalogToolEntry(
+      tool_id=tool_id,
+      canonical_name=tool_id,
+      effect=effect,
+      server_id=server_id,
+      capability=capability_for_tool(
+        canonical_name=tool_id,
+        server_id=server_id,
+        effect=effect,
+      ),
+    )
+  return PlatformToolCatalog(
+    tools=tuple(entries[name] for name in sorted(entries))
   )
-  if (
-    not explicitly_declared
-    and not profile.data_requirements
-    and _workspace_scope(profile) == "read_only"
-  ):
-    # The only remaining live-tool requirement source is the explore /
-    # verify-finding name-based migration fallback. That is not a declared
-    # methodology need; live catalog assembly separately rejects those names
-    # when no evidence-tool route exists.
+
+
+def validate_operation_tool_coherence(profile: "SkillProfile") -> None:
+  """Reject a declaration its own ceiling cannot satisfy.
+
+  This is the *resolver*, run at compile time over the declared ceiling
+  instead of a live catalog (B-8).  It used to be a separate hand-written rule
+  ("required live-tool capability plus empty ceiling"), which meant compile
+  time and admission time could disagree about what "satisfied" means — and
+  they did, because the rule never looked at effects or capabilities at all.
+  One computation now answers both.
+
+  Methodology prose stays invisible here: authority is never inferred from
+  text, so a profile whose only tool-use signal is prose is indistinguishable
+  from a genuinely tool-free operation and cannot be rejected deterministically.
+  """
+
+  requirements = _declared_semantic_requirements(profile)
+  if not requirements:
     return
-  raise ValueError(
-    f"Methodology '{profile.name}' declares required live-tool semantic "
-    f"capabilities ({', '.join(sorted(live_tool_required))}) but an empty "
-    "declared tool ceiling; declare the exact tools in "
-    "semantic_metadata.tool_refs or remove the capability/data requirements"
+  ceiling = operation_tool_ids(profile)
+  catalog = declared_ceiling_catalog(profile)
+  if len(catalog.tools) != len(ceiling):
+    # At least one declared tool has no resolvable effect here — either the
+    # effect table is not importable in this process, or the tool is not one
+    # the platform knows.  A platform that cannot fully describe the ceiling
+    # cannot refute a declaration over it, so this is silence, not a verdict.
+    return
+  verdict = resolve_operation_authority(
+    OperationDeclaration(
+      operation_name=profile.name,
+      grant_id=f"coherence:{profile.name}",
+      workspace_scope=_workspace_scope(profile),
+      required_capabilities=requirements,
+      tool_ceiling=ceiling,
+    ),
+    catalog=catalog,
   )
+  if isinstance(verdict, OperationUnavailable):
+    unmet = ", ".join(
+      sorted(item.capability for item in verdict.unsatisfied)
+    ) or verdict.detail
+    raise ValueError(
+      f"Methodology '{profile.name}' declares semantic capabilities its own "
+      f"declared tool ceiling cannot satisfy ({unmet}); declare the exact "
+      "tools in semantic_metadata.tool_refs or remove the capability "
+      "requirements"
+    )
+
+
+def _declared_evidence_ports(
+  profile: "SkillProfile",
+  required_context: tuple[str, ...],
+) -> tuple[EvidencePort, ...]:
+  """Read the operation's declared evidence ports from skill frontmatter.
+
+  ``evidence_ports`` is a list of ``{name, min_selections, max_selections}``
+  mappings.  It states a fact the catalog owns: this operation receives
+  upstream workflow results at these named ports, at least ``min_selections``
+  of them.  Tool-less operations must declare one; the live catalog refuses
+  to offer a tool-less operation with no port because every admissible plan
+  would starve it.
+  """
+
+  metadata = profile.metadata if isinstance(profile.metadata, dict) else {}
+  raw = metadata.get("evidence_ports")
+  if raw is None:
+    return ()
+  if not isinstance(raw, (list, tuple)):
+    raise ValueError(
+      f"Methodology '{profile.name}' evidence_ports must be a list of port mappings"
+    )
+  ports: list[EvidencePort] = []
+  for item in raw:
+    if not isinstance(item, dict):
+      raise ValueError(
+        f"Methodology '{profile.name}' evidence_ports entries must be mappings"
+      )
+    ports.append(EvidencePort.model_validate(item))
+  ports.sort(key=lambda port: port.name)
+  names = [port.name for port in ports]
+  if len(set(names)) != len(names):
+    raise ValueError(
+      f"Methodology '{profile.name}' evidence_ports must have unique names"
+    )
+  if set(names) & set(required_context):
+    raise ValueError(
+      f"Methodology '{profile.name}' evidence_ports cannot reuse required_context keys"
+    )
+  return tuple(ports)
 
 
 def compile_agent_operation(
@@ -381,6 +455,7 @@ def compile_agent_operation(
     required_context = tuple(sorted(set(
       str(item).strip() for item in raw_context if str(item).strip()
     )))
+  evidence_ports = _declared_evidence_ports(profile, required_context)
   description = (
     profile.agent_description
     or (profile.metadata or {}).get("description")
@@ -403,6 +478,11 @@ def compile_agent_operation(
     ],
     "workspace_scope": _workspace_scope(profile),
     "required_context": list(required_context),
+    **(
+      {"evidence_ports": [port.model_dump(mode="json") for port in evidence_ports]}
+      if evidence_ports
+      else {}
+    ),
     "resumable": profile.resumable,
     "result_modes": list(result_modes),
     "projection_contracts": [
@@ -420,6 +500,14 @@ def compile_agent_operation(
 
 
 def generic_explore_profile() -> "SkillProfile":
+  """The code-owned explore operation, with its needs *declared* (B-8).
+
+  Its requirements used to come from the same name-based inference fallback
+  the skill files relied on (`profile.name in {"explore", "verify-finding"}`).
+  That fallback is gone: this profile declares the two evidence domains its
+  fixed ceiling can actually reach, exactly as a skill file does.
+  """
+
   return SkillProfile(
     name=GENERIC_EXPLORE_OPERATION_NAME,
     system_prompt=_GENERIC_EXPLORE_INSTRUCTIONS,
@@ -429,6 +517,22 @@ def generic_explore_profile() -> "SkillProfile":
     resumable=False,
     mutation_mode="read_only",
     delegation_role="explore",
+    metadata={
+      "semantic_metadata": {
+        "tool_refs": [
+          {"kind": "local", "tool_id": tool_id}
+          for tool_id in sorted(GENERIC_EXPLORE_TOOL_IDS)
+        ],
+        "capability_requirements": [
+          {
+            "name": name,
+            "required": required,
+            "binding_modes": ["live_tool"],
+          }
+          for name, required in GENERIC_EXPLORE_CAPABILITIES
+        ],
+      }
+    },
   )
 
 
@@ -504,7 +608,6 @@ class SkillProfile:
   # breaks positional callers.
   effort: str | None = None
   provider: str | None = None
-  data_requirements: tuple[DataRequirement, ...] = ()
   max_structured_reads: int | None = None
   delegation_role: str | None = None
 
@@ -739,89 +842,6 @@ def _coerce_optional_state_class(value: Any, *, field_name: str, path: Path) -> 
   return text
 
 
-def _coerce_data_requirement_text(
-  value: Any,
-  *,
-  field_name: str,
-  path: Path,
-) -> str:
-  if not isinstance(value, str):
-    raise ValueError(f"{path}: '{field_name}' must be a string")
-  text = value.strip()
-  if not text:
-    raise ValueError(f"{path}: '{field_name}' must be a non-empty string")
-  return text
-
-
-def _coerce_optional_data_requirements(
-  value: Any,
-  *,
-  path: Path,
-) -> tuple[DataRequirement, ...]:
-  if value is None:
-    return ()
-  if not isinstance(value, (list, tuple)):
-    raise ValueError(f"{path}: 'data_requirements' must be a list of mappings")
-
-  requirements: list[DataRequirement] = []
-  for index, raw_item in enumerate(value):
-    field_prefix = f"data_requirements[{index}]"
-    if not isinstance(raw_item, dict):
-      raise ValueError(f"{path}: '{field_prefix}' must be a mapping")
-    allowed_keys = {"endpoint", "symbol", "params", "required", "freshness"}
-    extra_keys = set(raw_item) - allowed_keys
-    if extra_keys:
-      extras = ", ".join(sorted(str(key) for key in extra_keys))
-      raise ValueError(f"{path}: '{field_prefix}' has unsupported keys: {extras}")
-    missing_keys = allowed_keys - set(raw_item)
-    if missing_keys:
-      missing = ", ".join(sorted(missing_keys))
-      raise ValueError(f"{path}: '{field_prefix}' missing required keys: {missing}")
-
-    endpoint = _coerce_data_requirement_text(
-      raw_item.get("endpoint"),
-      field_name=f"{field_prefix}.endpoint",
-      path=path,
-    )
-    if not re.fullmatch(r"[A-Za-z0-9_]+", endpoint):
-      raise ValueError(f"{path}: '{field_prefix}.endpoint' must contain only letters, numbers, and underscores")
-    symbol = _coerce_data_requirement_text(
-      raw_item.get("symbol"),
-      field_name=f"{field_prefix}.symbol",
-      path=path,
-    )
-    raw_params = raw_item.get("params")
-    if not isinstance(raw_params, dict):
-      raise ValueError(f"{path}: '{field_prefix}.params' must be a mapping")
-    params: dict[str, Any] = {}
-    for raw_key, raw_value in raw_params.items():
-      if not isinstance(raw_key, str) or not raw_key.strip():
-        raise ValueError(f"{path}: '{field_prefix}.params' keys must be non-empty strings")
-      params[raw_key.strip()] = raw_value
-    required = _coerce_optional_bool(
-      raw_item.get("required"),
-      field_name=f"{field_prefix}.required",
-      path=path,
-    )
-    freshness = _coerce_data_requirement_text(
-      raw_item.get("freshness"),
-      field_name=f"{field_prefix}.freshness",
-      path=path,
-    )
-    if freshness not in {"immutable_history", "daily_ttl"}:
-      raise ValueError(f"{path}: '{field_prefix}.freshness' must be 'immutable_history' or 'daily_ttl'")
-    requirements.append(
-      DataRequirement(
-        endpoint=endpoint,
-        symbol=symbol,
-        params=params,
-        required=required,
-        freshness=freshness,
-      )
-    )
-  return tuple(requirements)
-
-
 def _split_frontmatter(text: str, *, path: Path) -> tuple[dict[str, Any], str]:
   lines = text.splitlines()
   if not lines or lines[0].strip() != _FRONTMATTER_DELIMITER:
@@ -884,7 +904,6 @@ def parse_skill_file(path: Path) -> SkillProfile:
   raw_mutation_mode = frontmatter.pop("mutation_mode", None)
   raw_extra_excluded_tools = frontmatter.pop("extra_excluded_tools", None)
   raw_tool_packs_enabled = frontmatter.pop("tool_packs_enabled", None)
-  raw_data_requirements = frontmatter.pop("data_requirements", None)
   raw_max_structured_reads = frontmatter.pop("max_structured_reads", None)
   raw_subagent_return_contract = frontmatter.pop("subagent_return_contract", None)
   raw_subagent_result_mode = frontmatter.pop("subagent_result_mode", None)
@@ -1002,10 +1021,6 @@ def parse_skill_file(path: Path) -> SkillProfile:
       path=path,
     )
   )
-  coerced_data_requirements = _coerce_optional_data_requirements(
-    raw_data_requirements,
-    path=path,
-  )
   coerced_max_structured_reads = _coerce_optional_int(
     raw_max_structured_reads,
     field_name="max_structured_reads",
@@ -1070,7 +1085,6 @@ def parse_skill_file(path: Path) -> SkillProfile:
     mutation_mode=_clean_string(raw_mutation_mode),
     effort=coerced_effort,
     provider=_clean_string(raw_provider),
-    data_requirements=coerced_data_requirements,
     max_structured_reads=coerced_max_structured_reads,
     delegation_role=_coerce_optional_delegation_role(
       raw_delegation_role,
@@ -1126,8 +1140,6 @@ class SkillLoader:
     return path
 
   def load(self, name: str) -> SkillProfile:
-    if is_fixture_skill_name(name):
-      require_fixture_provider_available("fixture skill", error_type=ValueError)
     path = self._skill_path(name)
     if not path.exists():
       available = self.list_skills()
@@ -1237,8 +1249,6 @@ class SkillLoader:
     if not self.skills_dir.exists():
       return []
     names = [path.stem for path in self.skills_dir.glob("*.md") if path.is_file()]
-    if not fixture_provider_available():
-      names = [name for name in names if not is_fixture_skill_name(name)]
     return sorted(names)
 
   def list_callable_skills_with_descriptions(self) -> list[tuple[str, str]]:
@@ -1443,7 +1453,8 @@ class SkillStateStore:
 __all__ = [
   "AGENT_DESCRIPTION_MAX_CHARS",
   "AGENT_DESCRIPTION_PLACEHOLDER",
-  "DataRequirement",
+  "GENERIC_EXPLORE_CAPABILITIES",
+  "GENERIC_EXPLORE_OPERATION_NAME",
   "GENERIC_EXPLORE_TOOL_IDS",
   "Mode",
   "SkillLoader",

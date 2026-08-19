@@ -9,6 +9,8 @@ import pytest
 from agent_gateway.sub_agent_result_evidence import (
   SubAgentResultEvidence,
   collect_sub_agent_result_evidence,
+  fold_dispatch_failures,
+  fold_observed_sources,
   merge_sub_agent_result_evidence,
   merge_usage_payloads,
 )
@@ -474,3 +476,291 @@ def test_merge_dedups_observed_sources_across_segments() -> None:
   merged = merge_sub_agent_result_evidence(first, second)
 
   assert merged.observed_sources == (record, other)
+
+
+# --- B-1: the dispatch fold ------------------------------------------------
+
+
+def _dispatch_event(
+  tool_name: str,
+  sources: list[dict[str, Any]],
+  *,
+  outcome: str = "ok",
+  blocks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+  event: dict[str, Any] = {
+    "type": "tool_call_complete",
+    "tool_name": tool_name,
+    "is_error": outcome != "ok",
+    "dispatch": {
+      "outcome": outcome,
+      "attempts": 1,
+      "route_id": f"local/{tool_name}",
+      "sources": sources,
+    },
+  }
+  if blocks is not None:
+    event["final_tool_result_blocks"] = blocks
+  return event
+
+
+def test_fold_reads_observed_sources_from_the_dispatch_record() -> None:
+  folded = fold_observed_sources(
+    [
+      _dispatch_event(
+        "filings_search",
+        [
+          {
+            "document_id": "edgar:0000789019-26-000012",
+            "source_kind": "filing",
+            "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+          },
+          {"document_id": "", "source_kind": "filing"},
+        ],
+      )
+    ]
+  )
+
+  assert folded == (
+    {
+      "kind": "observed_source",
+      "source_kind": "filing",
+      "document_id": "edgar:0000789019-26-000012",
+      "produced_by_tool": "filings_search",
+      "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+    },
+  )
+
+
+def test_fold_falls_back_to_blocks_for_pre_train_events() -> None:
+  legacy_event = {
+    "type": "tool_call_complete",
+    "tool_name": "filings_search",
+    "final_tool_result_blocks": [
+      {
+        "type": "source_observation",
+        "tool_name": "filings_search",
+        "observed_sources": [
+          {"document_id": "edgar:0000789019-26-000012", "source_kind": "filing"},
+        ],
+      },
+    ],
+  }
+
+  assert "dispatch" not in legacy_event
+  assert fold_observed_sources([legacy_event]) == (
+    {
+      "kind": "observed_source",
+      "source_kind": "filing",
+      "document_id": "edgar:0000789019-26-000012",
+      "produced_by_tool": "filings_search",
+    },
+  )
+
+
+def test_dispatch_wins_when_both_the_record_and_the_blocks_exist() -> None:
+  folded = fold_observed_sources(
+    [
+      _dispatch_event(
+        "filings_search",
+        [{"document_id": "edgar:0000789019-26-000012", "source_kind": "filing"}],
+        blocks=[
+          {
+            "type": "source_observation",
+            "tool_name": "filings_search",
+            "observed_sources": [
+              {"document_id": "edgar:9999999999-99-999999", "source_kind": "filing"},
+            ],
+          },
+        ],
+      )
+    ]
+  )
+
+  assert folded == (
+    {
+      "kind": "observed_source",
+      "source_kind": "filing",
+      "document_id": "edgar:0000789019-26-000012",
+      "produced_by_tool": "filings_search",
+    },
+  )
+
+
+def test_fold_falls_back_to_blocks_when_the_dispatch_record_settles_no_sources() -> None:
+  """Vendor and computation citations still mint on the api-side ledger path."""
+
+  folded = fold_observed_sources(
+    [
+      _dispatch_event(
+        "get_quote",
+        [],
+        blocks=[
+          {
+            "type": "source_envelope",
+            "tool_name": "get_quote",
+            "sources_for_call": [
+              {
+                "document_id": "fmp:quote:MSFT",
+                "source_kind": "vendor",
+                "produced_by_tool": "get_quote",
+              },
+            ],
+          },
+        ],
+      )
+    ]
+  )
+
+  assert folded == (
+    {
+      "kind": "observed_source",
+      "source_kind": "vendor",
+      "document_id": "fmp:quote:MSFT",
+      "produced_by_tool": "get_quote",
+    },
+  )
+
+
+@pytest.mark.parametrize(
+  "outcome",
+  [
+    "error_rate_limited",
+    "error_timeout",
+    "error_transport",
+    "error_semantic",
+    "cancelled",
+  ],
+)
+def test_a_failed_dispatch_contributes_nothing_even_when_blocks_name_sources(
+  outcome: str,
+) -> None:
+  """The 429 shape: a failed call observed nothing, blocks included (T3-I06)."""
+
+  folded = fold_observed_sources(
+    [
+      _dispatch_event(
+        "get_quote",
+        [],
+        outcome=outcome,
+        blocks=[
+          {
+            "type": "source_envelope",
+            "tool_name": "get_quote",
+            "sources_for_call": [
+              {
+                "document_id": "fmp:quote:AAPL",
+                "source_kind": "vendor",
+                "produced_by_tool": "get_quote",
+              },
+            ],
+          },
+          {
+            "type": "source_observation",
+            "tool_name": "get_quote",
+            "observed_sources": [
+              {"document_id": "fmp:quote:AAPL", "source_kind": "vendor"},
+            ],
+          },
+        ],
+      )
+    ]
+  )
+
+  assert folded == ()
+
+
+def test_a_dispatch_record_with_no_outcome_still_reads_the_legacy_blocks() -> None:
+  """A degenerate record is not a settled failure; keep the old reading."""
+
+  folded = fold_observed_sources(
+    [
+      {
+        "type": "tool_call_complete",
+        "tool_name": "filings_search",
+        "dispatch": {"attempts": 1, "sources": []},
+        "final_tool_result_blocks": [
+          {
+            "type": "source_observation",
+            "tool_name": "filings_search",
+            "observed_sources": [
+              {"document_id": "edgar:0000789019-26-000012", "source_kind": "filing"},
+            ],
+          },
+        ],
+      }
+    ]
+  )
+
+  assert folded == (
+    {
+      "kind": "observed_source",
+      "source_kind": "filing",
+      "document_id": "edgar:0000789019-26-000012",
+      "produced_by_tool": "filings_search",
+    },
+  )
+
+
+def test_collect_uses_the_dispatch_fold_for_observed_sources() -> None:
+  evidence = collect_sub_agent_result_evidence(
+    [
+      _entry({"type": "tool_call_start", "tool_name": "filings_search"}),
+      _entry(
+        _dispatch_event(
+          "filings_search",
+          [{"document_id": "edgar:0000789019-26-000012", "source_kind": "filing"}],
+        )
+      ),
+    ],
+    durable=False,
+  )
+
+  assert evidence.tools_used == ("filings_search",)
+  assert evidence.observed_sources == (
+    {
+      "kind": "observed_source",
+      "source_kind": "filing",
+      "document_id": "edgar:0000789019-26-000012",
+      "produced_by_tool": "filings_search",
+    },
+  )
+
+
+def test_fold_dispatch_failures_counts_outcomes_per_tool() -> None:
+  counts = fold_dispatch_failures(
+    [
+      _dispatch_event("filings_search", [], outcome="ok"),
+      _dispatch_event("filings_search", [], outcome="error_rate_limited"),
+      _dispatch_event("web_fetch", [], outcome="error_transport"),
+      {"type": "tool_call_start", "tool_name": "filings_search"},
+    ]
+  )
+
+  assert counts == {"filings_search": (1, 1), "web_fetch": (0, 1)}
+
+
+def test_fold_dispatch_failures_falls_back_to_is_error_for_old_logs() -> None:
+  counts = fold_dispatch_failures(
+    [
+      {"type": "tool_call_complete", "tool_name": "filings_search", "is_error": False},
+      {"type": "tool_call_complete", "tool_name": "filings_search", "is_error": True},
+    ]
+  )
+
+  assert counts == {"filings_search": (1, 1)}
+
+
+def test_tools_used_still_comes_from_tool_call_start_so_failed_calls_count() -> None:
+  evidence = collect_sub_agent_result_evidence(
+    [
+      _entry({"type": "tool_call_start", "tool_name": "filings_search"}),
+      _entry(
+        _dispatch_event("filings_search", [], outcome="error_rate_limited")
+      ),
+    ],
+    durable=False,
+  )
+
+  assert evidence.tools_used == ("filings_search",)
+  assert evidence.observed_sources == ()

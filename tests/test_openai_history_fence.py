@@ -17,7 +17,6 @@ from agent_gateway import AgentSessionLog, SessionContextBuilder
 from agent_gateway.event_log import EventLog
 from agent_gateway.openai_history_fence import (
   DURABLE_HISTORY_VERSION_KEY,
-  OpenAIHistoryVersionError,
   OpenAISessionEpochError,
   REASONING_SIGNATURE_MARKER,
   RESPONSES_HISTORY_VERSION,
@@ -144,15 +143,6 @@ def test_deeply_nested_payload_does_not_recurse_without_bound():
     cursor = child
   # Must terminate (depth-bounded) rather than raising RecursionError.
   assert contains_openai_responses_history(payload) is False
-
-
-# --- OpenAIHistoryVersionError --------------------------------------------
-
-
-def test_history_version_error_requires_new_session():
-  error = OpenAIHistoryVersionError()
-  assert error.requires_new_session is True
-  assert str(error)
 
 
 # --- scope_provider_session_id --------------------------------------------

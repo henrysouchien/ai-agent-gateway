@@ -6,6 +6,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from .capability_binding import CapabilityBind
+from .execution_identity import resolved_execution_identity
 
 
 MarkerPosition = tuple[int, int]
@@ -140,60 +141,34 @@ class ForkRequestHandoff:
 def _selected_credential_identity(
   runner: Any,
 ) -> tuple[str, str] | None:
-  bind = runner._capability_execution.bind
-  session = (
-    getattr(runner, "_gateway_session", None)
-    or getattr(getattr(runner, "_dispatcher", None), "_session", None)
-  )
-  handle = getattr(session, "session_credential_handle", None)
-  if handle is not None:
-    handle_id = str(
-      getattr(handle, "handle_id", "") or ""
-    ).strip()
-    handle_provider = str(
-      getattr(handle, "provider", "") or ""
-    ).strip().lower()
-    handle_principal = str(
-      getattr(handle, "principal", "") or ""
-    ).strip().lower()
-    if (
-      handle_id != bind.credential_ref
-      or handle_provider != str(bind.provider).strip().lower()
-      or handle_principal
-      != str(bind.credential_principal).strip().lower()
-    ):
-      return None
-    tenant_id = str(
-      getattr(handle, "tenant_id", "") or ""
-    ).strip()
-    return (
-      (handle_id, tenant_id)
-      if handle_id and tenant_id
-      else None
-    )
+  """Project the one resolved execution identity into the handoff pair.
 
-  child_tenant_id = str(
-    getattr(runner, "_tenant_id", "") or ""
-  ).strip()
-  if child_tenant_id:
-    return bind.credential_ref, child_tenant_id
+  B-6 (D-B6-1): a single read.  The three-tier fallback chain — session
+  handle, then ``runner._tenant_id``, then the ``auth_config`` row — is gone.
+  A runner whose session carries no bound credential handle has no credential
+  identity, and the fork capture sites say so instead of substituting one.
+  """
 
-  auth_config = runner._capability_execution.auth_config
-  auth_handle_id = str(
-    auth_config.get("credential_handle_id", "") or ""
-  ).strip()
-  auth_tenant_id = str(
-    auth_config.get("tenant_id", "") or ""
-  ).strip()
-  if auth_handle_id == bind.credential_ref and auth_tenant_id:
-    return auth_handle_id, auth_tenant_id
-  return None
+  identity = resolved_execution_identity(runner)
+  if identity is None or identity.credential_handle_id is None:
+    return None
+  return identity.credential_handle_id, identity.tenant_id
 
 
 def credential_identity_or_none(
   runner: Any,
 ) -> tuple[str, str] | None:
   return _selected_credential_identity(runner)
+
+
+def fork_credential_identity_available(runner: Any) -> bool:
+  """Whether a fork capture can be built for this runner's identity.
+
+  The two run-loop capture sites read this and nothing else: identity is
+  resolved once, and its absence is reported as absence.
+  """
+
+  return _selected_credential_identity(runner) is not None
 
 
 def _credential_identity(runner: Any) -> tuple[str, str]:
@@ -302,4 +277,5 @@ __all__ = [
   "build_mid_turn_handoff",
   "build_post_turn_handoff",
   "credential_identity_or_none",
+  "fork_credential_identity_available",
 ]

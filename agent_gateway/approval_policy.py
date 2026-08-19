@@ -52,7 +52,6 @@ ApprovalState = Literal[
   "auto_approved",
   "auto_denied",
   "pending_user",
-  "routed_external",
   "approved",
   "denied",
   "expired",
@@ -62,7 +61,6 @@ ApprovalOutcome = Literal[
   "auto_approve",
   "auto_deny",
   "request_user_approval",
-  "route_external",
 ]
 
 TerminalDecision = Literal["approved", "denied", "auto_approved", "auto_denied", "expired"]
@@ -228,19 +226,10 @@ class RunContext:
   channel: str = "web"
   skill: str | None = None
   research_file_id: int | None = None
-  scheduled_investment_authority: object | None = field(
-    default=None,
-    repr=False,
-  )
   decider_role: str | None = None
   tenant_id: str | None = None
   parent_approval_id: str | None = None
   delegation: DelegationGrant | None = None
-  model_id: str | None = None
-  model_version: str | None = None
-  system_prompt_hash: str | None = None
-  tool_schema_version: str | None = None
-  mcp_server_version: str | None = None
   policy_bundle_hash: str = "unknown"
   ui_blocks_run: UiBlocksRunContext | None = field(
     default_factory=current_ui_blocks_run,
@@ -275,25 +264,13 @@ class ApprovalRequest:
   decider_role: str | None = None
   decision: TerminalDecision | None = None
   decision_reason: str | None = None
-  required_decider_count: int = 1
-  eligible_decider_count: int = 1
-  votes_received_count: int = 0
   state_version: int = 0
   args_predicate: dict[str, Any] | None = None
-  chain_trust_window_seconds: int | None = None
-  route_target: str | None = None
-  route_target_type: str | None = None
-  external_callback_id: str | None = None
   policy_id: str = "single-user"
   policy_version: str = "1"
   policy_bundle_hash: str = "unknown"
   persistent_grant_scope: str | None = None
   tenant_id: str | None = None
-  model_id: str | None = None
-  model_version: str | None = None
-  system_prompt_hash: str | None = None
-  tool_schema_version: str | None = None
-  mcp_server_version: str | None = None
   skill: str | None = None
   notification_policy: ApprovalNotificationPolicy = "auto"
   notification: dict[str, Any] | None = None
@@ -426,16 +403,11 @@ def revalidate_approval_request(request: ApprovalRequest) -> ApprovalRequest:
 class ApprovalDecision:
   outcome: ApprovalOutcome
   reason: str
-  route_target: str | None = None
-  route_target_type: str | None = None
-  required_decider_count: int = 1
-  eligible_decider_count: int = 1
   expiry_seconds: float | int | None = None
   allow_persistent_grant: bool = False
   persistent_grant_scope_hint: str | None = None
   redacted_args_for_audit: dict[str, Any] | None = None
   modified_tool_args: dict[str, Any] | None = None
-  chain_trust_window_seconds: int | None = None
   args_predicate: dict[str, Any] | None = None
   notification_policy: ApprovalNotificationPolicy = "auto"
   policy_id: str = "single-user"
@@ -452,7 +424,6 @@ class ApprovalVote:
   decision: Literal["approved", "denied"]
   decision_reason: str | None
   decided_at: datetime
-  external_callback_id: str | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -559,11 +530,6 @@ def build_approval_request(
     state=state,
     requested_at=utc_now(),
     tenant_id=run_context.tenant_id,
-    model_id=run_context.model_id,
-    model_version=run_context.model_version,
-    system_prompt_hash=run_context.system_prompt_hash,
-    tool_schema_version=run_context.tool_schema_version,
-    mcp_server_version=run_context.mcp_server_version,
     policy_bundle_hash=run_context.policy_bundle_hash,
     approval_constraint=approval_constraint,
     required_owner_user_id=required_owner_user_id,
@@ -610,8 +576,6 @@ def constrain_approval_decision(
     decision,
     outcome="request_user_approval",
     reason="Exact promotion requires a fresh decision by its frozen owner",
-    route_target=None,
-    route_target_type="pending_tools",
     allow_persistent_grant=False,
     persistent_grant_scope_hint=None,
     grant_reference=None,
@@ -646,15 +610,10 @@ def apply_decision_to_request(request: ApprovalRequest, decision: ApprovalDecisi
     authorization_mode = "AUTO_ALLOW"
   return replace(
     request,
-    required_decider_count=max(1, int(decision.required_decider_count or 1)),
-    eligible_decider_count=max(1, int(decision.eligible_decider_count or 1)),
     args_predicate=copy.deepcopy(decision.args_predicate),
-    chain_trust_window_seconds=decision.chain_trust_window_seconds,
     persistent_grant_scope=decision.persistent_grant_scope_hint,
     policy_id=decision.policy_id,
     policy_version=decision.policy_version,
-    route_target=decision.route_target,
-    route_target_type=decision.route_target_type,
     reason=decision.reason,
     notification_policy=decision.notification_policy,
     authorization_mode=authorization_mode,

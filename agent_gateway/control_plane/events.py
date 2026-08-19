@@ -10,6 +10,11 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
+from agent_gateway.control_run_lifecycle import (
+  coerce_control_run_state,
+  is_control_run_active_state,
+  is_control_run_terminal_state,
+)
 from agent_gateway.event_adapter import adapt_control_event
 from agent_gateway.events import DEFAULT_SCHEMA_VERSION
 from agent_gateway.session import (
@@ -292,13 +297,15 @@ def _autonomous_replay_events_for_record(record: Any) -> list[dict[str, Any]]:
 
 
 def _autonomous_record_is_terminated(record: Any) -> bool:
-  state = str(getattr(record, "state", "") or "").strip().lower()
-  if state in {"completed", "finished", "failed", "killed", "cancelled", "interrupted", "budget_limited", "blocked"}:
+  state = coerce_control_run_state(getattr(record, "state", None))
+  if is_control_run_terminal_state(state):
     return True
   proc = getattr(record, "proc", None)
   if proc is not None and getattr(proc, "returncode", None) is None:
     return False
-  return state not in {"starting", "queued", "waiting", "running", "approval_pending", "remediating"}
+  if is_control_run_active_state(state):
+    return False
+  return True
 
 
 async def _seed_autonomous_replay_buffer(

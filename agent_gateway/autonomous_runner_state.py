@@ -52,7 +52,26 @@ _REHYDRATE_EVENTS_SIZE_CAP_BYTES = 5 * 1024 * 1024
 _REHYDRATE_EVENTS_TAIL_LINES = 2000
 _TASK_MANIFEST_VERSION = 7
 _RUN_SEQUENCE_CURSOR_FILE = ".autonomous-sequence.json"
+_SKIP_WARNED_FILE = ".manifest-skip-warned.json"
+_SKIP_WARNED: set[str] = set()
+_SKIP_WARNED_LOADED_DIRS: set[str] = set()
 _LOGGER = logging.getLogger("agent_gateway.autonomous_runner")
+
+
+def _skip_warned_key(manifest_path: Path, message: str, mtime_ns: int) -> str:
+  return f"{message}\0{manifest_path}\0{mtime_ns}"
+
+
+def _skip_warned_key_belongs_to_dir(key: str, dir_key: str) -> bool:
+  parts = key.split("\0")
+  if len(parts) < 2:
+    return False
+  path_text = parts[1]
+  if path_text == dir_key:
+    return True
+  return path_text.startswith(dir_key + "/") or path_text.startswith(dir_key + "\\")
+
+
 _DISPATCH_SCOPE_KEYS = frozenset({"kind", "source", "portfolio_name", "portfolio_id", "display_name"})
 _ROOT_TERMINAL_EVENT_TYPES = frozenset({"error", "stream_error", "stream_complete"})
 _AUTONOMOUS_TERMINAL_REASONS = frozenset({"writer_lease_already_held"})
@@ -629,24 +648,79 @@ def _manifest_identity_payload(manifest: dict[str, Any], *, user_id: str, user_e
 
 
 class AutonomousRegistryStateMixin:
-  _skip_warned: set[str]
+  def _skip_warned_path(self) -> Path:
+    return self._log_dir / _runtime_attr("_SKIP_WARNED_FILE", _SKIP_WARNED_FILE)
+
+  def _skip_warned_dir_key(self) -> str:
+    return str(self._log_dir)
+
+  def _load_skip_warned(self) -> set[str]:
+    """Load the process-wide skip set for this log dir, hydrating from disk once."""
+
+    skip_warned = _runtime_attr("_SKIP_WARNED", _SKIP_WARNED)
+    loaded_dirs = _runtime_attr("_SKIP_WARNED_LOADED_DIRS", _SKIP_WARNED_LOADED_DIRS)
+    dir_key = self._skip_warned_dir_key()
+    if dir_key in loaded_dirs:
+      return skip_warned
+
+    loaded_dirs.add(dir_key)
+    path = self._skip_warned_path()
+    try:
+      payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+      return skip_warned
+    except (OSError, json.JSONDecodeError):
+      _LOGGER.warning("Failed to read autonomous manifest skip-warned set: %s", path, exc_info=True)
+      return skip_warned
+    if isinstance(payload, list):
+      skip_warned.update(str(item) for item in payload if isinstance(item, str))
+    return skip_warned
+
+  def _persist_skip_warned(self, seen: set[str]) -> None:
+    """Persist skip keys for this log dir so a later process does not re-flood."""
+
+    dir_key = self._skip_warned_dir_key()
+    prefix = dir_key.rstrip("/\\")
+    keys = sorted(
+      item
+      for item in seen
+      if _skip_warned_key_belongs_to_dir(item, prefix)
+    )
+    path = self._skip_warned_path()
+    tmp_path = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+      path.parent.mkdir(parents=True, exist_ok=True)
+      tmp_path.write_text(json.dumps(keys) + "\n", encoding="utf-8")
+      _os_replace(tmp_path, path)
+    except Exception:
+      try:
+        tmp_path.unlink()
+      except OSError:
+        pass
+      _LOGGER.warning("Failed to write autonomous manifest skip-warned set: %s", path, exc_info=True)
 
   def _warn_once(self, manifest_path: Path, message: str) -> None:
-    """Log a manifest-skip once per path, not once per rehydrate cycle.
+    """Log a manifest-skip once per path+mtime, not once per registry instance.
 
-    Rehydrate runs repeatedly; an unreadable record is a standing condition,
-    not a new event each pass. Re-logging it every cycle produced a 353 MB
-    error log and buried real failures.
+    Rehydrate only runs from ``AutonomousRegistry.__init__``, so an
+    instance-local dedup set cannot implement a once-per-path contract.
+    Standing skip conditions (retired v6 manifests, unsupported versions)
+    must survive both a new registry in the same process and a later
+    process start. The durable sidecar is keyed by path and mtime so a
+    rewritten file can warn again. Re-logging every construction produced
+    a 353 MB error log and, later, a 67 MB ``chat.jsonl`` flood.
     """
 
-    seen = getattr(self, "_skip_warned", None)
-    if seen is None:
-      seen = set()
-      self._skip_warned = seen
-    key = f"{message}\0{manifest_path}"
+    seen = self._load_skip_warned()
+    try:
+      mtime_ns = manifest_path.stat().st_mtime_ns
+    except OSError:
+      mtime_ns = 0
+    key = _skip_warned_key(manifest_path, message, mtime_ns)
     if key in seen:
       return
     seen.add(key)
+    self._persist_skip_warned(seen)
     _LOGGER.warning(message, manifest_path)
 
   def _initial_task_seq(self) -> int:

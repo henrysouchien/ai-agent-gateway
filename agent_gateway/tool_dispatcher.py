@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from importlib import import_module
-from typing import AbstractSet, Any, Callable, Dict, Literal, Mapping, Optional, Sequence, Set, TYPE_CHECKING
+from typing import AbstractSet, Any, Callable, Dict, get_args, Literal, Mapping, Optional, Sequence, Set, TYPE_CHECKING
 
 from . import approval_settings
 from .approval_policy import (
@@ -18,6 +18,7 @@ from .approval_policy import (
   ApprovalPolicy,
   ApprovalRequest as PolicyApprovalRequest,
   RunContext,
+  ToolClass,
   approval_is_executable,
   sha256_args,
   utc_now,
@@ -28,14 +29,11 @@ from .approval_constraints import (
   trusted_catalog_action,
 )
 from .event_log import EventLog
+from .execution_identity import DispatchIdentity
 from .investment_capability_claim import (
   INVESTMENT_CAPABILITY_FACADE_TOOLS,
   InvestmentCapabilityClaimError,
   issue_investment_capability_claim,
-)
-from .control_plane.market_scan_occurrence import (
-  MarketScanOccurrenceMaterializationError,
-  ScheduledInvestmentRunAuthority,
 )
 from .mcp_client_catalog import tool_argument_guidance
 from .policy_imports import (
@@ -74,8 +72,6 @@ from .tool_dispatcher_helpers import (
   LocalToolHandler as LocalToolHandler,
   NeedsApprovalCallback as NeedsApprovalCallback,
   PlannedWritePlanningRejected as PlannedWritePlanningRejected,
-  RELAY_POLICY_DENIED_MESSAGE as RELAY_POLICY_DENIED_MESSAGE,
-  RELAY_POLICY_DENIED_SUB_CODE as RELAY_POLICY_DENIED_SUB_CODE,
   ToolExecutionContext as ToolExecutionContext,
   TrustedToolPlan as TrustedToolPlan,
   TrustedToolPlanError as TrustedToolPlanError,
@@ -88,7 +84,6 @@ from .tool_dispatcher_helpers import (
   format_expected_type as _format_expected_type_helper,
   json_type_name as _json_type_name_helper,
   matches_json_type as _matches_json_type_helper,
-  resolve_denied_provenance as resolve_denied_provenance,
   run_interceptors as _run_interceptors_helper,
   tool_input_schema_error as _tool_input_schema_error_helper,
   validate_against_local_schema as _validate_against_local_schema_helper,
@@ -111,6 +106,7 @@ _MCP_VALIDATION_ERROR_MARKERS = (
 )
 _PORTFOLIO_SCOPE_FIELDS = frozenset({"portfolio_id", "portfolio_name"})
 _CATALOG_ACTION_UNSET = object()
+_TOOL_CLASSES = frozenset(get_args(ToolClass))
 
 
 def _is_mcp_validation_error(error: Mapping[str, Any]) -> bool:
@@ -182,6 +178,7 @@ class ToolDispatcher:
     mcp_session_inject_servers: set[str] | None = None,
     mcp_meta_inject_servers: frozenset[str] | None = None,
     mcp_identity_overrides: Mapping[str, str | int] | None = None,
+    identity: DispatchIdentity | None = None,
     user_id: str | None = None,
     risk_user_id: int | None = None,
     channel: str | None = None,
@@ -199,9 +196,46 @@ class ToolDispatcher:
     commercial_work_start: Any | None = None,
     commercial_irreversible_recheck: Callable[[Any], None] | None = None,
     commercial_mcp_servers: frozenset[str] | None = None,
+    local_tool_class_resolver: Callable[[str], ToolClass] | None = None,
+    local_catalog_action_resolver: Callable[[str], Any | None] | None = None,
   ) -> None:
     self._mcp = mcp_client
     self._local = local_tool_handlers or {}
+    if (local_tool_class_resolver is None) != (
+      local_catalog_action_resolver is None
+    ):
+      raise ValueError(
+        "local tool class and catalog action resolvers must be provided together"
+      )
+    if local_tool_class_resolver is not None and session is not None:
+      raise ValueError(
+        "caller-owned local tool policy is available only without a host session"
+      )
+    self._local_tool_classes: dict[str, ToolClass] | None = None
+    self._local_catalog_actions: dict[str, Any | None] | None = None
+    if (
+      local_tool_class_resolver is not None
+      and local_catalog_action_resolver is not None
+    ):
+      local_tool_classes: dict[str, ToolClass] = {}
+      local_catalog_actions: dict[str, Any | None] = {}
+      for local_tool_name, local_handler in self._local.items():
+        tool_class = local_tool_class_resolver(local_tool_name)
+        if type(tool_class) is not str or tool_class not in _TOOL_CLASSES:
+          raise ValueError(
+            f"invalid local tool class for {local_tool_name!r}: {tool_class!r}"
+          )
+        catalog_action = local_catalog_action_resolver(local_tool_name)
+        constraint_for_catalog_action(catalog_action)
+        self._planned_handler_hooks(
+          local_tool_name,
+          local_handler,
+          catalog_action=catalog_action,
+        )
+        local_tool_classes[local_tool_name] = tool_class  # type: ignore[assignment]
+        local_catalog_actions[local_tool_name] = catalog_action
+      self._local_tool_classes = local_tool_classes
+      self._local_catalog_actions = local_catalog_actions
     self._needs_approval = self._normalize_needs_approval(needs_approval)
     self._request_approval = request_approval
     self._approved_tool_types = approved_tool_types if approved_tool_types is not None else set()
@@ -215,6 +249,30 @@ class ToolDispatcher:
     self._mcp_session_inject_servers = mcp_session_inject_servers or set()
     self._mcp_meta_inject_servers = mcp_meta_inject_servers or frozenset()
     self._mcp_identity_overrides = dict(mcp_identity_overrides or {})
+    if identity is not None:
+      # D-B6-1: one identity value, not five arguments assembled per call
+      # site. Passing both would let the two disagree, so it is refused.
+      if (
+        session is not None
+        or user_id is not None
+        or risk_user_id is not None
+        or channel is not None
+        or credentials_resolver_active
+      ):
+        raise ValueError(
+          "dispatch identity supersedes the separate identity arguments"
+        )
+      if not isinstance(identity, DispatchIdentity):
+        raise TypeError("dispatcher identity must be a DispatchIdentity")
+      session = identity.session
+      user_id = identity.user_id
+      risk_user_id = identity.risk_user_id
+      channel = identity.channel
+      credentials_resolver_active = identity.credentials_resolver_active
+    self._identity = identity
+    self._execution_identity = (
+      identity.execution if identity is not None else None
+    )
     self._user_id = user_id
     self._risk_user_id = risk_user_id
     self._channel = channel
@@ -236,7 +294,10 @@ class ToolDispatcher:
     self._mcp_accepts_abort_event = self._callable_accepts_kw(getattr(self._mcp, "call_tool", None), "abort_event")
     if allowed_mcp_tools_by_server is None:
       self._allowed_mcp_tools_by_server = None
-    elif isinstance(allowed_mcp_tools_by_server, dict):
+    elif isinstance(allowed_mcp_tools_by_server, Mapping):
+      # Kept by reference, never copied: the interactive scope is a live
+      # derivation over the session's activation fold (T3-I12), and a snapshot
+      # here would re-open the desync the fold closes.
       self._allowed_mcp_tools_by_server = allowed_mcp_tools_by_server
     else:
       self._allowed_mcp_tools_by_server = {
@@ -412,6 +473,11 @@ class ToolDispatcher:
       return trusted_catalog_action(tool_name, import_module_fn=import_module)
     except ApprovalConstraintError as exc:
       raise TrustedToolPlanError(str(exc)) from exc
+
+  def _resolved_catalog_action(self, tool_name: str) -> Any | None:
+    if self._local_catalog_actions is not None and tool_name in self._local:
+      return self._local_catalog_actions[tool_name]
+    return self._catalog_action(tool_name)
 
   @staticmethod
   def _catalog_planning_identity(tool_name: str) -> str | None:
@@ -772,7 +838,7 @@ class ToolDispatcher:
             }
           tool_ctx.durable_business_model_payload = durable.prepared_payload
       try:
-        catalog_action = self._catalog_action(tool_name)
+        catalog_action = self._resolved_catalog_action(tool_name)
         if constraint_for_catalog_action(catalog_action) == "fresh_human_owner":
           return None, {
             "code": "owner_control_route_required",
@@ -1316,9 +1382,8 @@ class ToolDispatcher:
           "message": "User did not respond within timeout",
         }
       if not lifecycle.get("approved"):
-        decision_source, error_dict = resolve_denied_provenance(
-          lifecycle.get("denied_by")
-        )
+        decision_source = "user_denied"
+        error_dict = {"code": "user_denied", "message": "User denied execution"}
         if lifecycle.get("decision_source") == "headless_auto_deny":
           error_dict = {
             "code": "headless_auto_deny",
@@ -1470,7 +1535,8 @@ class ToolDispatcher:
             )
             return None, {"code": "approval_timeout", "message": "User did not respond within timeout"}
           if not lifecycle.get("approved"):
-            decision_source, error_dict = resolve_denied_provenance(lifecycle.get("denied_by"))
+            decision_source = "user_denied"
+            error_dict = {"code": "user_denied", "message": "User denied execution"}
             self._emit_approval_decided(
               tool_call_id,
               tool_name,
@@ -1537,11 +1603,11 @@ class ToolDispatcher:
             tool_call_id,
             tool_name,
             outcome="approved" if decision.approved else "denied",
-            decision_source="user_approved" if decision.approved else resolve_denied_provenance(decision.denied_by)[0],
+            decision_source="user_approved" if decision.approved else "user_denied",
             allow_tool_type_applied=will_install,
           )
           if not decision.approved:
-            return None, resolve_denied_provenance(decision.denied_by)[1]
+            return None, {"code": "user_denied", "message": "User denied execution"}
           if will_install:
             self._approved_tool_types.add(self._qualified_key(tool_name, qualifier))
 
@@ -1681,49 +1747,17 @@ class ToolDispatcher:
           and lifecycle_tool_name in INVESTMENT_CAPABILITY_FACADE_TOOLS
         ):
           run_context = self._resolve_run_context()
-          scheduled_authority = run_context.scheduled_investment_authority
           if (
-            scheduled_authority is not None
-            and type(scheduled_authority) is not ScheduledInvestmentRunAuthority
+            lifecycle_tool_name == "start_investment_run"
+            and "external_refs" in final_tool_input
           ):
             return None, {
-              "code": "scheduled_investment_authority_invalid",
-              "message": "Trusted scheduled investment authority is invalid.",
-            }
-          if (
-            scheduled_authority is not None
-            and lifecycle_tool_name != "start_investment_run"
-          ):
-            return None, {
-              "code": "scheduled_investment_tool_not_allowed",
+              "code": "investment_external_refs_not_allowed",
               "message": (
-                "Trusted scheduled investment authority permits only the exact "
-                "scheduled start operation."
+                "Investment run provenance references cannot be supplied by "
+                "the model."
               ),
             }
-          if lifecycle_tool_name == "start_investment_run":
-            if scheduled_authority is None:
-              if "external_refs" in final_tool_input:
-                return None, {
-                  "code": "scheduled_investment_authority_required",
-                  "message": (
-                    "Schedule references require trusted scheduled investment "
-                    "authority."
-                  ),
-                }
-            else:
-              try:
-                final_tool_input = scheduled_authority.bind_tool_arguments(
-                  final_tool_input
-                )
-              except MarketScanOccurrenceMaterializationError:
-                return None, {
-                  "code": "scheduled_investment_authority_mismatch",
-                  "message": (
-                    "Investment facade arguments do not match the trusted "
-                    "scheduled occurrence."
-                  ),
-                }
           run_context_skill = str(run_context.skill or "").strip()
           active_skill = str(current_skill() or "").strip()
           if (
@@ -1955,7 +1989,7 @@ class ToolDispatcher:
       return False
 
     try:
-      action = self._catalog_action(tool_name)
+      action = self._resolved_catalog_action(tool_name)
     except TrustedToolPlanError:
       # Dispatch will return the precise invalid-contract error. Keep the
       # generic timeout from masking that approval-bound planning path.
@@ -2069,6 +2103,8 @@ class ToolDispatcher:
     )
 
   def _resolve_tool_class(self, tool_name: str) -> str:
+    if self._local_tool_classes is not None and tool_name in self._local:
+      return self._local_tool_classes[tool_name]
     return _approval_lifecycle_helpers.resolve_tool_class(
       tool_name, mcp=self._mcp, resolve_server_policy_tool_class_fn=resolve_server_policy_tool_class
     )

@@ -6,7 +6,6 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_prompt_rules import (  # noqa: E402
   last_user_message,
   message_content_text,
@@ -15,11 +14,6 @@ from agent_gateway.runner_prompt_rules import (  # noqa: E402
   system_prompt_requires_tool_only_turns,
   system_prompt_text,
 )
-
-
-def test_runner_preserves_last_user_message_helper_alias() -> None:
-  assert gateway_runner._last_user_message is last_user_message
-
 
 def test_system_prompt_text_accepts_string_list_and_missing_values() -> None:
   assert system_prompt_text("plain") == "plain"
@@ -93,9 +87,6 @@ def test_last_user_message_returns_copy_of_latest_user_message() -> None:
 
   assert result == latest_user
   assert result is not latest_user
-  runner = gateway_runner.AgentRunner.__new__(gateway_runner.AgentRunner)
-  assert runner._extract_last_user_message(messages) == latest_user
-
   assert result is not None
   result["content"] = "changed"
   assert latest_user["content"] == "latest"
@@ -108,10 +99,6 @@ def test_last_user_message_returns_none_without_user_message() -> None:
   ]
 
   assert last_user_message(messages) is None
-  runner = gateway_runner.AgentRunner.__new__(gateway_runner.AgentRunner)
-  assert runner._extract_last_user_message(messages) is None
-
-
 def test_messages_detect_tool_only_turn_instruction_in_any_message_content() -> None:
   messages = [
     {"role": "user", "content": "ordinary"},

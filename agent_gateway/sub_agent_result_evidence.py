@@ -8,6 +8,7 @@ from typing import Any
 from .sub_agent_result_contract import (
   child_evidence_fits_externalization_bound,
 )
+from .tool_dispatch_classification import OUTCOME_OK
 
 
 _EVIDENCE_ADMISSION_WARNING = (
@@ -177,32 +178,121 @@ def _dedup_observed_source_records(
   return tuple(deduped)
 
 
+def _records_from_dispatch(event: Mapping[str, Any]) -> list[dict[str, Any]]:
+  """Read the settled dispatch record's source identities off one event."""
+
+  dispatch = event.get("dispatch")
+  if not isinstance(dispatch, Mapping):
+    return []
+  raw_sources = dispatch.get("sources")
+  event_tool = event.get("tool_name")
+  records: list[dict[str, Any]] = []
+  for source in raw_sources if isinstance(raw_sources, list) else []:
+    if not isinstance(source, Mapping):
+      continue
+    record = _observed_source_record(
+      source_kind=source.get("source_kind"),
+      document_id=source.get("document_id"),
+      produced_by_tool=source.get("produced_by_tool") or event_tool,
+      source_url=source.get("source_url"),
+      excerpt_handle_id=source.get("excerpt_handle_id"),
+    )
+    if record is not None:
+      records.append(record)
+  return records
+
+
+def _records_from_result_blocks(event: Mapping[str, Any]) -> list[dict[str, Any]]:
+  blocks = event.get("final_tool_result_blocks")
+  if not isinstance(blocks, list):
+    return []
+  records: list[dict[str, Any]] = []
+  for block in blocks:
+    if not isinstance(block, Mapping):
+      continue
+    block_type = block.get("type")
+    if block_type == "source_envelope":
+      records.extend(_records_from_source_envelope(block))
+    elif block_type == "source_observation":
+      records.extend(_records_from_source_observation(block))
+  return records
+
+
+def fold_observed_sources(
+  events: Iterable[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], ...]:
+  """Fold the child's observed sources out of its durable tool events.
+
+  Evidence is a fold, not a side effect (T3-I06). The settled ``dispatch``
+  record is the authority for any event that carries one:
+
+  * outcome other than ``ok`` — the call observed **nothing**, and the legacy
+    event-only blocks are not consulted. This is the 429 shape: a rate-limited
+    vendor payload can still carry a ``source_envelope`` naming the source it
+    never delivered, and reading it here would re-open the minting hole the
+    classifier closes at the boundary.
+  * outcome ``ok`` with source identities — those identities win over any
+    blocks on the same event.
+  * outcome ``ok`` with none of its own — the block readers supply that
+    event's records, because vendor and computation citations still mint on
+    the api-side ledger path and legitimately settle no dispatch source.
+
+  Pre-train events carry no dispatch record at all and keep the historical
+  ``source_envelope`` / ``source_observation`` block reading.
+  """
+
+  records: list[dict[str, Any]] = []
+  for event in events:
+    if event.get("type") != "tool_call_complete":
+      continue
+    dispatch = event.get("dispatch")
+    if isinstance(dispatch, Mapping) and dispatch.get("outcome") is not None:
+      if str(dispatch.get("outcome")) != OUTCOME_OK:
+        continue
+      dispatch_records = _records_from_dispatch(event)
+      if dispatch_records:
+        records.extend(dispatch_records)
+        continue
+    records.extend(_records_from_result_blocks(event))
+  return _dedup_observed_source_records(records)
+
+
+def fold_dispatch_failures(
+  events: Iterable[Mapping[str, Any]],
+) -> Mapping[str, tuple[int, int]]:
+  """Fold per-tool ``(ok, failed)`` counts out of the durable tool events.
+
+  Reads the normalized ``dispatch.outcome`` where it exists and falls back to
+  the coarse ``is_error`` bit for pre-train logs (D-B3-5).
+  """
+
+  counts: dict[str, list[int]] = {}
+  for event in events:
+    if event.get("type") != "tool_call_complete":
+      continue
+    tool_id = str(event.get("tool_name") or "").strip()
+    if not tool_id:
+      continue
+    dispatch = event.get("dispatch")
+    if isinstance(dispatch, Mapping) and dispatch.get("outcome") is not None:
+      succeeded = str(dispatch.get("outcome")) == "ok"
+    else:
+      succeeded = not bool(event.get("is_error"))
+    bucket = counts.setdefault(tool_id, [0, 0])
+    bucket[0 if succeeded else 1] += 1
+  return {tool_id: (bucket[0], bucket[1]) for tool_id, bucket in counts.items()}
+
+
 def _collect_observed_source_records(
   event_list: list[Mapping[str, Any]],
 ) -> tuple[Mapping[str, Any], ...]:
   """Collect typed source observations from durable child tool events.
 
-  Source envelopes and suppressed-context source observations ride the
-  ``final_tool_result_blocks`` of each ``tool_call_complete`` event as
-  event-only blocks; the child never authors these records.
+  Retained as the fold's call name at this seam; see
+  :func:`fold_observed_sources` for the dispatch-first rule.
   """
 
-  records: list[dict[str, Any]] = []
-  for event in event_list:
-    if event.get("type") != "tool_call_complete":
-      continue
-    blocks = event.get("final_tool_result_blocks")
-    if not isinstance(blocks, list):
-      continue
-    for block in blocks:
-      if not isinstance(block, Mapping):
-        continue
-      block_type = block.get("type")
-      if block_type == "source_envelope":
-        records.extend(_records_from_source_envelope(block))
-      elif block_type == "source_observation":
-        records.extend(_records_from_source_observation(block))
-  return _dedup_observed_source_records(records)
+  return fold_observed_sources(event_list)
 
 
 def collect_sub_agent_result_evidence(
@@ -491,6 +581,8 @@ __all__ = [
   "SubAgentResultEvidence",
   "UsageEvidenceMergeError",
   "collect_sub_agent_result_evidence",
+  "fold_dispatch_failures",
+  "fold_observed_sources",
   "merge_sub_agent_result_evidence",
   "merge_usage_payloads",
 ]

@@ -25,6 +25,8 @@ _TARGET_ARGV = (
   "1",
   "--timeout-keep-alive",
   "120",
+  "--timeout-graceful-shutdown",
+  "30",
 )
 _TARGET_ENV = {
   "PATH": (
@@ -42,6 +44,9 @@ _TARGET_ENV = {
   "USER_DATA_DIR": "/mnt/hank-data/agent_gateway/data",
   "AGENT_SESSION_LOG_BASE_DIR": (
     "/mnt/hank-data/agent_gateway/data/agent-sessions"
+  ),
+  "AGENT_GATEWAY_SKILLS_DIR": (
+    "/var/www/agent_gateway/api/memory/workspace/notes/skills"
   ),
   "GATEWAY_APPROVAL_DB_PATH": (
     "/mnt/hank-data/agent_gateway/data/gateway/approvals.sqlite3"

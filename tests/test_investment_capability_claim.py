@@ -32,6 +32,8 @@ from agent_gateway.investment_capability_claim import (
   InvestmentCapabilitySkillGrant,
   InvestmentCapabilityClaimError,
   issue_investment_capability_claim,
+  issue_investment_selected_content_claim,
+  investment_capability_signing_available,
 )
 from agent_gateway.skill_context import reset_current_skill, set_current_skill
 from agent_gateway.tool_dispatcher import ToolDispatcher
@@ -67,6 +69,19 @@ def _set_signing_key(monkeypatch: pytest.MonkeyPatch) -> None:
 def _decode_segment(value: str) -> dict[str, Any]:
   padded = value + ("=" * (-len(value) % 4))
   return json.loads(base64.urlsafe_b64decode(padded).decode("ascii"))
+
+
+def test_signer_availability_uses_the_existing_key_loader(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.delenv(INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV, raising=False)
+  assert investment_capability_signing_available() is False
+
+  monkeypatch.setenv(INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV, "malformed")
+  assert investment_capability_signing_available() is False
+
+  _set_signing_key(monkeypatch)
+  assert investment_capability_signing_available() is True
 
 
 def _decode_claim(token: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -171,6 +186,68 @@ def test_facade_tool_boundary_is_exact() -> None:
     "start_investment_run",
     "start_quant_research",
   })
+
+
+def test_selected_content_claim_is_the_exact_minimal_v2_contract(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _set_signing_key(monkeypatch)
+
+  token = issue_investment_selected_content_claim(
+    user_id="sia-alice",
+    artifact_id="artifact:quant-1",
+    view="excerpt",
+    now=1_800_000_000,
+  )
+
+  header, payload = _decode_claim(token)
+  assert header == {"alg": "EdDSA", "kid": _KEY_ID, "typ": "JWT"}
+  assert payload == {
+    "artifact_id": "artifact:quant-1",
+    "aud": "investment-tools",
+    "exp": 1_800_000_060,
+    "iat": 1_800_000_000,
+    "iss": "ai-excel-addin",
+    "purpose": "selected_content_read",
+    "sub": "sia-alice",
+    "tool_name": "get_investment_artifact",
+    "v": 2,
+    "view": "excerpt",
+  }
+  header_segment, payload_segment, signature_segment = token.split(".")
+  signature = base64.urlsafe_b64decode(
+    signature_segment + "=" * (-len(signature_segment) % 4)
+  )
+  _PUBLIC_KEY.verify(
+    signature,
+    f"{header_segment}.{payload_segment}".encode("ascii"),
+  )
+
+
+@pytest.mark.parametrize(
+  ("artifact_id", "view", "now"),
+  [
+    ("", "summary", 1_800_000_000),
+    ("artifact-1", "schema", 1_800_000_000),
+    ("artifact-1", "SUMMARY", 1_800_000_000),
+    ("artifact-1", "summary", True),
+  ],
+)
+def test_selected_content_claim_rejects_noncanonical_coordinates(
+  monkeypatch: pytest.MonkeyPatch,
+  artifact_id: str,
+  view: str,
+  now: object,
+) -> None:
+  _set_signing_key(monkeypatch)
+
+  with pytest.raises(InvestmentCapabilityClaimError):
+    issue_investment_selected_content_claim(
+      user_id="sia-alice",
+      artifact_id=artifact_id,
+      view=view,
+      now=now,  # type: ignore[arg-type]
+    )
 
 
 def test_investment_capability_skill_grants_are_exact_and_gateway_owned() -> None:
@@ -486,6 +563,55 @@ def test_quant_skill_claim_is_issued_for_quant_read_and_cancel_routes(
     assert "research_file_id" not in payload
 
 
+def test_quant_invalid_request_is_returned_after_one_signed_mcp_call(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class _RejectingMcpClient(_FakeMcpClient):
+    async def call_tool(
+      self,
+      name: str,
+      tool_input: dict[str, Any],
+      meta: dict[str, Any] | None = None,
+    ):
+      self.calls.append({
+        "name": name,
+        "tool_input": tool_input,
+        "meta": meta,
+      })
+      return None, {
+        "code": "invalid_request",
+        "message": "source_refs[0] uses an unsupported reference scheme",
+      }
+
+  _set_signing_key(monkeypatch)
+  mcp = _RejectingMcpClient(tool_name="start_quant_research")
+
+  result, error = _dispatch(
+    _dispatcher(mcp),
+    tool_call_id="call-invalid-quant-request",
+    tool_name="start_quant_research",
+    tool_input={
+      "request": {
+        "research_file_id": 2,
+        "source_refs": ["fmp:income-statement"],
+      },
+    },
+  )
+
+  assert result is None
+  assert error == {
+    "code": "invalid_request",
+    "message": "source_refs[0] uses an unsupported reference scheme",
+  }
+  assert len(mcp.calls) == 1
+  assert mcp.calls[0]["name"] == "start_quant_research"
+  _header, payload = _decode_claim(
+    mcp.calls[0]["meta"]["investment_capability_claim"]
+  )
+  assert payload["tool_name"] == "start_quant_research"
+  assert payload["research_file_id"] == 2
+
+
 @pytest.mark.parametrize(
   "tool_name",
   [
@@ -530,6 +656,32 @@ def test_market_scan_claim_is_issued_for_only_its_exact_facade_routes(
   ]
   assert "approved_budget" not in payload
   assert "research_file_id" not in payload
+
+
+def test_model_cannot_supply_investment_run_provenance_refs(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _set_signing_key(monkeypatch)
+  mcp = _FakeMcpClient(tool_name="start_investment_run")
+
+  result, error = _dispatch(
+    _dispatcher(mcp, skill="market-scan", research_file_id=None),
+    tool_call_id="call-market-forged-refs",
+    tool_name="start_investment_run",
+    tool_input={
+      "capability_id": "quality_screen",
+      "external_refs": {"source_schedule_id": "forged"},
+    },
+  )
+
+  assert result is None
+  assert error == {
+    "code": "investment_external_refs_not_allowed",
+    "message": (
+      "Investment run provenance references cannot be supplied by the model."
+    ),
+  }
+  assert mcp.calls == []
 
 
 def test_market_scan_quant_submission_fails_closed_before_mcp(

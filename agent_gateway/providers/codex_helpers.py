@@ -757,18 +757,12 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
       call_id = str(item.get("call_id") or "")
       item_id = str(item.get("id") or "")
       tool_id = f"{call_id}|{item_id}" if item_id else call_id
-      try:
-        from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
+      from ..runner_tool_audit import redact_tool_input_for_event
 
-        redacted_tool_input = redact_tool_input(
-          str(item.get("name") or ""),
-          tool_input,
-          deployment_secret=get_audit_hmac_secret(),
-        )
-      except Exception:
-        from ..secret_boundary import sanitization_failure_tool_input
-
-        redacted_tool_input = sanitization_failure_tool_input()
+      redacted_tool_input = redact_tool_input_for_event(
+        str(item.get("name") or ""),
+        tool_input,
+      )
       raw_block = {
         "type": "tool_use",
         "id": tool_id,

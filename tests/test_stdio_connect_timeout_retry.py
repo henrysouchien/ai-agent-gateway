@@ -35,6 +35,7 @@ def _runtime(
     build_mcp_env=lambda _env: {},
     preflight_stdio_executable=lambda _command, _args, _env: None,
     build_http_headers=lambda _headers: {},
+    parse_allowed_tools=lambda _value: None,
     safe_cache_name=lambda name: name,
     close_contexts=lambda _contexts: None,
     server_state_factory=lambda **kwargs: kwargs,

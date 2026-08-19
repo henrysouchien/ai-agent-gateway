@@ -5,6 +5,7 @@ import hashlib
 import pytest
 from agent_workflow_contracts import (
   AgentOperationRef,
+  AnalyticalOutcome,
   AttemptRef,
   ExecutionSettlement,
   OrdinaryDelegationTaskRef,
@@ -179,3 +180,96 @@ def test_contract_validation_result_requires_exactly_one_arm() -> None:
     ContractValidationResult()
   with pytest.raises(ValueError, match="exactly one"):
     ContractValidationResult(report=report, error=error)
+
+
+def _narrative_requirement() -> ResultRequirement:
+  return ResultRequirement(
+    mode="narrative",
+    terminal_narrative="required",
+    outcome=OutcomeRequirement(required=False, source="none"),
+  )
+
+
+def _build(**overrides):
+  logical_task, attempt, provenance = _identity()
+  kwargs = {
+    "logical_task": logical_task,
+    "attempt": attempt,
+    "requirement": _narrative_requirement(),
+    "provenance": provenance,
+    "execution": ExecutionSettlement(status="succeeded"),
+    "outcome": None,
+    "terminal_narrative": _narrative_reference("exact terminal prose"),
+    "projection": None,
+  }
+  kwargs.update(overrides)
+  return build_task_result(**kwargs)
+
+
+def test_runtime_outcome_carries_a_mechanically_derived_qualifier() -> None:
+  # D-B3-4: the mechanical door is a separate keyword, so the authored door's
+  # strict rule can stay welded shut without a caller-identity check.
+  derived = AnalyticalOutcome(
+    disposition="partial",
+    assessment_source="mechanically_derived",
+    assessment_rationale="the child reached its turn ceiling",
+    unmet_requirements=("turns_exhausted",),
+  )
+
+  result = _build(runtime_outcome=derived)
+
+  assert result.outcome == derived
+
+
+def test_runtime_outcome_and_authored_outcome_are_mutually_exclusive() -> None:
+  derived = AnalyticalOutcome(
+    disposition="complete",
+    assessment_source="mechanically_derived",
+  )
+  authored = AnalyticalOutcome(
+    disposition="not_assessed",
+    assessment_source="none",
+  )
+
+  with pytest.raises(ValueError, match="both an authored and a runtime"):
+    _build(outcome=authored, runtime_outcome=derived)
+
+
+def test_runtime_outcome_rejects_any_non_mechanical_assessment_source() -> None:
+  for source in ("domain_tool", "none"):
+    disposition = "not_assessed" if source == "none" else "complete"
+    with pytest.raises(ValueError, match="must be mechanically derived"):
+      _build(
+        runtime_outcome=AnalyticalOutcome(
+          disposition=disposition,  # type: ignore[arg-type]
+          assessment_source=source,  # type: ignore[arg-type]
+        )
+      )
+
+
+def test_non_succeeded_settlement_cannot_carry_a_runtime_outcome() -> None:
+  # T3-I08: non-succeeded results carry no outcome, structurally.
+  with pytest.raises(ValueError, match="non-successful execution cannot carry"):
+    _build(
+      execution=ExecutionSettlement(
+        status="failed",
+        terminal_reason="run_error: boom",
+      ),
+      terminal_narrative=None,
+      runtime_outcome=AnalyticalOutcome(
+        disposition="complete",
+        assessment_source="mechanically_derived",
+      ),
+    )
+
+
+def test_authored_outcome_door_stays_welded_shut() -> None:
+  # The pre-B-3 rule, verbatim: with a non-assessing requirement the public
+  # ``outcome=`` parameter may only ever carry ``not_assessed``.
+  with pytest.raises(ValueError, match="non-assessing result may only carry"):
+    _build(
+      outcome=AnalyticalOutcome(
+        disposition="complete",
+        assessment_source="mechanically_derived",
+      )
+    )

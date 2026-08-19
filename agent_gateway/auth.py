@@ -5,7 +5,6 @@ from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from .capability_binding import CredentialPrincipal
-from .fixture_gate import fixture_provider_available
 from .model_registry import CAPABILITY_IDS
 from .session_capabilities import normalize_session_capabilities
 
@@ -15,18 +14,11 @@ _VALID_BILLING_MODES = {"byok", "metered"}
 CredentialFailureKind = Literal["rate_limit", "billing", "auth"]
 
 
-def _valid_providers() -> set[str]:
-  providers = set(_VALID_PROVIDERS)
-  if fixture_provider_available():
-    providers.add("fixture")
-  return providers
-
-
 @dataclass(frozen=True)
 class AuthConfig:
   """Typed wrapper over the existing auth_config dict shape."""
 
-  provider: Literal["anthropic", "openai", "codex", "xai", "fixture"]
+  provider: Literal["anthropic", "openai", "codex", "xai"]
   billing_mode: Literal["byok", "metered"]
   max_tokens: int | None
   _raw: Mapping[str, Any] = field(repr=False)
@@ -42,9 +34,8 @@ class AuthConfig:
 
     provider = str(d["provider"]).strip().lower()
     billing_mode = str(d["billing_mode"]).strip().lower()
-    valid_providers = _valid_providers()
-    if provider not in valid_providers:
-      expected = ", ".join(sorted(valid_providers))
+    if provider not in _VALID_PROVIDERS:
+      expected = ", ".join(sorted(_VALID_PROVIDERS))
       raise ValueError(f"Unsupported provider '{provider}'. Expected one of: {expected}.")
     if billing_mode not in _VALID_BILLING_MODES:
       raise ValueError(f"Unsupported billing_mode '{billing_mode}'. Expected 'byok' or 'metered'.")

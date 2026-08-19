@@ -16,6 +16,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.mcp_activation import McpActivationFold
 from agent_gateway import AgentRunner, AgentSessionLog, EventLog, ModelInfo, ModelProvider, SessionStore, ToolDispatcher  # noqa: E402
 from agent_gateway.code_execution import CodeExecutionConfig, DockerBackend, build_code_execution  # noqa: E402
 from agent_gateway.providers import StreamEvent  # noqa: E402
@@ -989,7 +990,7 @@ def test_interactive_model_provider_runner_threads_spill_provider(
     approval_policy=None,
     user_id="alice",
     session_id="sess-runtime",
-    loaded_mcp_servers=set(),
+    mcp_activation_fold=McpActivationFold(),
     channel="web",
     role="owner",
   )

@@ -11,11 +11,24 @@ import sys
 import pytest
 
 from agent_gateway.privileged_claim_launcher import (
+  _TARGET_ARGV,
+  _TARGET_ENV,
   _consume_secret,
 )
 
 
 _SECRET = b"privileged-launcher-test-key-at-least-32-bytes"
+
+
+def test_production_target_bounds_uvicorn_graceful_shutdown() -> None:
+  index = _TARGET_ARGV.index("--timeout-graceful-shutdown")
+  assert _TARGET_ARGV[index + 1] == "30"
+
+
+def test_production_target_uses_deployed_skill_catalog() -> None:
+  assert _TARGET_ENV["AGENT_GATEWAY_SKILLS_DIR"] == (
+    "/var/www/agent_gateway/api/memory/workspace/notes/skills"
+  )
 
 
 def test_launcher_reads_only_canonical_private_source(

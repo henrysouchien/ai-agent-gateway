@@ -16,7 +16,6 @@ from typing import (
   Mapping,
   Protocol,
   Sequence,
-  TYPE_CHECKING,
   TypeAlias,
   runtime_checkable,
 )
@@ -53,11 +52,6 @@ from pydantic import (
   StringConstraints,
 )
 
-if TYPE_CHECKING:
-  from agent.skills.authoring.learning_draft import (
-    LEARNING_DRAFT_BODY_MAX_BYTES,
-  )
-
 DEFAULT_SUBAGENT_RETURN_CONTRACT = "report-base-v1"
 EXPLORE_FINDINGS_RETURN_CONTRACT = "explore-findings-v1"
 VERIFY_FINDING_RETURN_CONTRACT = "verify-finding-v1"
@@ -88,12 +82,6 @@ def _learning_draft_body_max_bytes() -> int:
   )
 
   return LEARNING_DRAFT_BODY_MAX_BYTES
-
-
-def __getattr__(name: str) -> Any:
-  if name == "LEARNING_DRAFT_BODY_MAX_BYTES":
-    return _learning_draft_body_max_bytes()
-  raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def report_contract_ref(contract_name: str) -> ContractRef:
@@ -207,13 +195,35 @@ def build_task_result(
   observed_sources: Sequence[Any] = (),
   tools_used: Sequence[str] = (),
   usage: Mapping[str, Any] | None = None,
+  runtime_outcome: AnalyticalOutcome | None = None,
 ) -> TaskResult:
   """Build and validate the sole canonical child settlement envelope.
 
   Result-mode validation belongs at acquisition, while :class:`TaskResult`
   remains reusable by deterministic operations that have no agent narrative.
   No prose is parsed to infer an outcome or projection.
+
+  ``outcome`` remains the strict authored door: with the Literal-frozen
+  ``OutcomeRequirement`` (``required=False``/``source="none"``) it may only
+  ever carry ``not_assessed``, which is what keeps a child from authoring its
+  own verdict.  ``runtime_outcome`` is the separate *mechanical* door
+  (D-B3-4): this function cannot see its caller, so the restriction is
+  structural — a distinct keyword, accepted only for a ``mechanically_derived``
+  assessment, mutually exclusive with ``outcome``, never on a non-successful
+  settlement, and pinned to a single non-test caller by
+  ``packages/agent-gateway/tests/test_runtime_outcome_import_restriction.py``.
   """
+
+  if runtime_outcome is not None:
+    if outcome is not None:
+      raise ValueError(
+        "task result cannot carry both an authored and a runtime outcome"
+      )
+    if runtime_outcome.assessment_source != "mechanically_derived":
+      raise ValueError("runtime outcome must be mechanically derived")
+    if execution.status != "succeeded":
+      raise ValueError("non-successful execution cannot carry a runtime outcome")
+  settled_outcome = outcome if outcome is not None else runtime_outcome
 
   narrative_handle = (
     terminal_narrative_content_handle(terminal_narrative)
@@ -286,7 +296,9 @@ def build_task_result(
     "attempt": attempt.model_dump(mode="json"),
     "execution": execution.model_dump(mode="json"),
     "outcome": (
-      outcome.model_dump(mode="json") if outcome is not None else None
+      settled_outcome.model_dump(mode="json")
+      if settled_outcome is not None
+      else None
     ),
     "evidence": evidence_value.model_dump(mode="json"),
     "values": values.model_dump(mode="json"),
@@ -298,7 +310,7 @@ def build_task_result(
     logical_task=logical_task,
     attempt=attempt,
     execution=execution,
-    outcome=outcome,
+    outcome=settled_outcome,
     evidence=evidence_value,
     values=values,
     observation=observation_value,
@@ -900,7 +912,6 @@ __all__ = [
   "FUNDAMENTAL_RESEARCH_PROPOSAL_RETURN_CONTRACT",
   "FundamentalResearchProposalReport",
   "FmsArtifactReference",
-  "LEARNING_DRAFT_BODY_MAX_BYTES",
   "LEARNING_REPORT_RETURN_CONTRACT",
   "LearningDraftReference",
   "LearningMemoryWrite",

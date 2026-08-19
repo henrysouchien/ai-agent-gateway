@@ -19,15 +19,18 @@ if str(PKG_DIR) not in sys.path:
 # entry.py validates PRODUCT_ID at import time. Keep collection hermetic in CI.
 os.environ.setdefault("PRODUCT_ID", "hank-test")
 
-from agent.profiles import load_profile
-from agent.shared.tool_handlers import _build_local_tool_handlers
 from agent_gateway import AgentRunner, EventLog, ToolDispatcher
-from agent_gateway.fixture_gate import FIXTURE_APPROVAL_TOOL_NAME, FIXTURE_MODEL_ID
-from agent_gateway.providers.fixture import FixtureProvider
 from api.agent.autonomous import entry as autonomous_entry
 from tests.capability_execution_test_support import (
   stub_capability_execution_resolver,
   stub_runner_capability_execution,
+)
+from tests.deterministic_fixture_support import (
+  FIXTURE_APPROVAL_TOOL_NAME,
+  FIXTURE_MODEL_ID,
+  FixtureProvider,
+  build_fixture_profile,
+  fixture_approval_handler,
 )
 
 
@@ -87,42 +90,31 @@ def _fixture_session_driver_execution():
   return resolver.resolve("session.driver")
 
 
-def test_fixture_profile_budgets_validate_through_runner_config(monkeypatch) -> None:
+def test_fixture_profile_budget_validates_through_runner_config(monkeypatch) -> None:
   monkeypatch.setenv("APP_ENV", "test")
   monkeypatch.delenv("ENVIRONMENT", raising=False)
   monkeypatch.delenv("AGENT_GATEWAY_ENV", raising=False)
   monkeypatch.delenv("NODE_ENV", raising=False)
 
-  profile = load_profile("_fixture")
+  profile = build_fixture_profile()
   execution = _fixture_session_driver_execution()
   run_config = autonomous_entry._run_once_config(
     profile,
     session_driver_execution=execution,
   )
-  dev_config = autonomous_entry._dev_config(
-    profile,
-    session_driver_execution=execution,
-  )
-
   assert run_config.max_budget_usd == profile.max_budget_usd > 0
-  assert dev_config.max_budget_usd == profile.dev_max_budget_usd > 0
 
   _construct_runner_from_runtime_config(run_config, session_id="fixture-profile-run")
-  _construct_runner_from_runtime_config(dev_config, session_id="fixture-profile-dev")
 
 
-def test_fixture_profile_carries_and_builds_fixture_gate_handler(monkeypatch) -> None:
+def test_fixture_profile_carries_explicitly_injected_approval_handler(monkeypatch) -> None:
   monkeypatch.setenv("APP_ENV", "test")
   monkeypatch.delenv("ENVIRONMENT", raising=False)
   monkeypatch.delenv("AGENT_GATEWAY_ENV", raising=False)
   monkeypatch.delenv("NODE_ENV", raising=False)
 
-  profile = load_profile("_fixture")
-  handlers = _build_local_tool_handlers(
-    "cli",
-    set(),
-    enabled_local_tool_names=profile.local_tool_names,
-  )
+  profile = build_fixture_profile()
+  handlers = {FIXTURE_APPROVAL_TOOL_NAME: fixture_approval_handler}
 
   assert profile.local_tool_names == {FIXTURE_APPROVAL_TOOL_NAME}
   assert set(handlers) == {FIXTURE_APPROVAL_TOOL_NAME}
@@ -144,21 +136,14 @@ def test_fixture_profile_timeout_defaults_to_live_qa_window(monkeypatch) -> None
   monkeypatch.delenv("FIXTURE_PROFILE_TIMEOUT_SECONDS", raising=False)
   monkeypatch.delenv("AGENT_GATEWAY_FIXTURE_PROFILE_TIMEOUT_SECONDS", raising=False)
 
-  profile = load_profile("_fixture")
+  profile = build_fixture_profile()
   execution = _fixture_session_driver_execution()
   run_config = autonomous_entry._run_once_config(
     profile,
     session_driver_execution=execution,
   )
-  dev_config = autonomous_entry._dev_config(
-    profile,
-    session_driver_execution=execution,
-  )
-
   assert profile.timeout_seconds == 300
-  assert profile.dev_timeout == 300
   assert run_config.timeout_seconds == 300
-  assert dev_config.timeout_seconds == 300
 
 
 def test_fixture_profile_timeout_can_be_overridden_for_fast_tests(monkeypatch) -> None:
@@ -169,18 +154,11 @@ def test_fixture_profile_timeout_can_be_overridden_for_fast_tests(monkeypatch) -
   monkeypatch.setenv("FIXTURE_PROFILE_TIMEOUT_SECONDS", "42")
   monkeypatch.delenv("AGENT_GATEWAY_FIXTURE_PROFILE_TIMEOUT_SECONDS", raising=False)
 
-  profile = load_profile("_fixture")
+  profile = build_fixture_profile()
   execution = _fixture_session_driver_execution()
   run_config = autonomous_entry._run_once_config(
     profile,
     session_driver_execution=execution,
   )
-  dev_config = autonomous_entry._dev_config(
-    profile,
-    session_driver_execution=execution,
-  )
-
   assert profile.timeout_seconds == 42
-  assert profile.dev_timeout == 42
   assert run_config.timeout_seconds == 42
-  assert dev_config.timeout_seconds == 42

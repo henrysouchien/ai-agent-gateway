@@ -20,6 +20,7 @@ from .capability_execution import BoundCapabilityExecution
 from .context_builder import SessionContextBuilder
 from .context_capture import ContextCapture
 from .event_log import EventLog
+from .mcp_activation import McpActivationFold
 from .mcp_client import McpClientManager
 from .multi_user.billing import (
   DEFAULT_USAGE_DLQ_PATH,
@@ -42,7 +43,6 @@ from .runner_limits import (
   model_context_window as _model_context_window,  # noqa: F401 - compatibility alias
   token_estimate_snapshot as _token_estimate_snapshot,  # noqa: F401 - compatibility alias
 )
-from .runner_prompt_rules import last_user_message as _last_user_message
 from .runner_run_loop_defaults import (
   MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFICATIONS_PER_TURN,  # noqa: F401 - compatibility alias
   MAX_TOKENS_CONTINUATIONS as _MAX_TOKENS_CONTINUATIONS,  # noqa: F401 - compatibility alias
@@ -73,6 +73,7 @@ from .runner_callbacks import (
 from .runner_notifications import (
   build_notification_reminder as _build_notification_reminder,  # noqa: F401 - compatibility alias
   consume_notifications as _consume_notifications,  # noqa: F401 - compatibility alias
+  notification_delivery_set as _notification_delivery_set,  # noqa: F401 - compatibility alias
 )
 from .runner_session_lifecycle import RunnerSessionLifecycleMixin
 from .skill_lifecycle import (
@@ -84,6 +85,7 @@ from .skill_lifecycle import (
 from .runner_sub_agents import RunnerSubAgentMixin
 from .sub_agent_skill_state import result_response_text
 from .runner_stream_turn import RunnerStreamTurnMixin
+from .selected_content import SelectedContentBinding
 from .runner_run_loop import RunnerRunLoopMixin
 from .runner_tool_execution import RunnerToolExecutionMixin
 from .workflow_output_attachment import WorkflowOutputAttachment
@@ -235,6 +237,33 @@ class AgentRunner(
   - `max_budget_usd` and `max_turns` stop the loop before it runs away.
   """
 
+  @property
+  def _max_background_tasks(self) -> int:
+    """The single background-capacity ceiling (D-A8-1 / T3-I04).
+
+    The value lives on ``TaskRegistry._max_inflight``, the one place every
+    capacity decision reads: ``TaskRegistry.admit`` for admission and the
+    RUNNING invariant check. This runner-facing name is a *view* onto it, so
+    writing either one writes both and the two ceilings that used to drift
+    apart (admission vs. inflight) cannot desynchronize.
+    """
+
+    ceiling = getattr(
+      getattr(self, "_task_registry", None),
+      "_max_inflight",
+      None,
+    )
+    if ceiling is None:
+      return self._max_background_tasks_seed
+    return ceiling
+
+  @_max_background_tasks.setter
+  def _max_background_tasks(self, value: int) -> None:
+    self._max_background_tasks_seed = value
+    registry = getattr(self, "_task_registry", None)
+    if registry is not None:
+      registry._max_inflight = value
+
   def __init__(
     self,
     event_log: EventLog,
@@ -248,7 +277,7 @@ class AgentRunner(
     per_turn_timeout: float | None = None,
     stream_stall_timeout: float | None = None,
     mcp_client: McpClientManager | None = None,
-    loaded_mcp_servers: Set[str] | None = None,
+    mcp_activation_fold: McpActivationFold | None = None,
     excluded_tools: Set[str] | None = None,
     purpose: str | None = None,
     get_tool_definitions: Callable[[], List[Dict[str, Any]]] | None = None,
@@ -434,6 +463,8 @@ class AgentRunner(
 
     self._log = event_log
     self._dispatcher = dispatcher
+    self._selected_content_bindings: tuple[SelectedContentBinding, ...] = ()
+    self._selected_content_bindings_bound = False
     self._gateway_session = gateway_session
     self._spill_dir_provider = normalize_spill_sink(code_execution_spill_dir_provider)
     self._capability_execution = capability_execution
@@ -470,7 +501,15 @@ class AgentRunner(
     self._per_turn_timeout = per_turn_timeout
     self._stream_stall_timeout = stream_stall_timeout
     self._mcp_client = mcp_client
-    self._loaded_mcp_servers = loaded_mcp_servers if loaded_mcp_servers is not None else set()
+    # Pass-through only: the runner neither reads nor writes this fold. It
+    # exists so fork and sub-agent children inherit the parent's activations
+    # (`runner_fork_agents`, `runner_sub_agents`); the surface the runner
+    # advertises comes from the tool-definition getter, which reads the same
+    # fold through the session. The retired `_loaded_mcp_servers` had the same
+    # shape — this field is deliberately not a second copy of load state.
+    self._mcp_activation_fold = (
+      mcp_activation_fold if mcp_activation_fold is not None else McpActivationFold()
+    )
     self._excluded_tools = set(excluded_tools or set())
     self.set_purpose(purpose)
     self._active_skill_allow: set[str] = set()
@@ -566,7 +605,6 @@ class AgentRunner(
       self._dispatcher_accepts_skill_run_context = False
       self._dispatcher_accepts_readable_resource_snapshot = False
       self._dispatcher_accepts_advertised_tool_names = False
-    task_registry_auto_created = task_registry is None
     self._task_registry = task_registry or TaskRegistry(
       max_inflight=self._max_background_tasks,
       id_prefix="bg",
@@ -575,10 +613,17 @@ class AgentRunner(
     self._operator_pause_event = operator_pause_event or asyncio.Event()
     self._shutdown_signal_provider = shutdown_signal_provider
     self._notification_queue = NotificationQueue()
-    if self._coordinator is not None and self._coordinator.enabled:
-      self._max_background_tasks = self._coordinator.max_workers
-      if task_registry_auto_created:
-        self._task_registry._max_inflight = self._max_background_tasks
+    # D-A8-1 / T3-I04: one ceiling, written unconditionally. The assignment
+    # goes through the ``_max_background_tasks`` property, which is a view
+    # onto ``TaskRegistry._max_inflight`` — the single value every capacity
+    # decision reads. Injected registries and the coordinator override take
+    # the same path, so admission and the RUNNING invariant cannot
+    # desynchronize.
+    self._max_background_tasks = (
+      self._coordinator.max_workers
+      if (self._coordinator is not None and self._coordinator.enabled)
+      else self._max_background_tasks_seed
+    )
     notification_queue = self._notification_queue
 
     class _NotificationListener:
@@ -724,6 +769,19 @@ class AgentRunner(
   @property
   def capability_execution(self) -> BoundCapabilityExecution:
     return self._capability_execution
+
+  def bind_selected_content(
+    self,
+    bindings: tuple[SelectedContentBinding, ...],
+  ) -> None:
+    if self._selected_content_bindings_bound:
+      raise RuntimeError("selected content is already bound for this runner")
+    if not isinstance(bindings, tuple) or not all(
+      isinstance(binding, SelectedContentBinding) for binding in bindings
+    ):
+      raise TypeError("selected content must be an immutable binding tuple")
+    self._selected_content_bindings = bindings
+    self._selected_content_bindings_bound = True
 
   @property
   def committed_top_level_skill_result_event(
@@ -916,10 +974,6 @@ class AgentRunner(
   def set_credential_refresher(self, callback: OnCredentialRefresh | None) -> None:
     self._on_credential_failure = callback
 
-  def _extract_last_user_message(self, request_messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    return _last_user_message(request_messages)
-
-
   @staticmethod
   def _annotate_result(result: Any, tool_name: str = "") -> Any:
     return annotate_result(result, tool_name=tool_name)
@@ -1045,8 +1099,15 @@ class AgentRunner(
     self._rebuild_filtered_tool_definitions(base_kwargs)
     return True
 
-  def _refresh_tools(self, base_kwargs: Dict[str, Any], new_servers: List[str]) -> None:
-    self._loaded_mcp_servers.update(new_servers)
+  def _refresh_tools(self, base_kwargs: Dict[str, Any], _new_servers: List[str]) -> None:
+    """Re-advertise after a load; the activation itself is already recorded.
+
+    The handler that loaded the servers appended the activation to the fold,
+    which is what the tool-definition getter reads.  The runner used to also
+    update its own copy of the loaded-server set, and that second write is the
+    desync WP8 removes (T3-I12): there is nothing left here to write.
+    """
+
     self._rebuild_filtered_tool_definitions(base_kwargs)
 
   async def _emit_stub_response(self, messages: List[Dict[str, Any]]) -> None:

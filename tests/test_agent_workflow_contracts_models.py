@@ -8,6 +8,7 @@ from pydantic import JsonValue, ValidationError
 
 from agent_workflow_contracts import (
   AdmittedDataRef,
+  AdmittedPlanRef,
   AgentCompletionEnvelope,
   AgentOperationRef,
   AnalyticalOutcome,
@@ -18,10 +19,16 @@ from agent_workflow_contracts import (
   ContentEvidenceRef,
   ContentHandle,
   ContentReadGrant,
+  ContinuationState,
   ContractRef,
-  DeliveryEnvelope,
+  DELIVERY_PREVIEW_MAX_BYTES,
+  DELIVERY_PREVIEW_POLICY_VERSION,
+  DeliveryEnvelopeV1,
+  DeliveryEnvelopeV2,
   DeliveryFailure,
+  DeliveryPreview,
   DeliveryPrimary,
+  DeliveryPrimaryV2,
   DeliverySettlement,
   DeliveryWarning,
   EvidenceObservation,
@@ -46,12 +53,18 @@ from agent_workflow_contracts import (
   TaskResultProvenance,
   TaskResultRef,
   TaskResultValues,
+  TerminalPhaseRevision,
   TerminalNarrativeInlineExact,
   TranscriptHandle,
   ActivityHandle,
   UsageObservation,
-  WorkflowDeliverySpec,
+  WorkflowDeliverySpecV1,
+  WorkflowDeliverySpecV2,
+  WorkflowResult,
+  WorkflowView,
   canonical_json_bytes,
+  parse_delivery_envelope,
+  parse_workflow_delivery_spec,
 )
 
 
@@ -215,8 +228,10 @@ def test_requested_selector_is_discriminated_and_not_authority() -> None:
 
   with pytest.raises(ValidationError, match="secret-bearing"):
     LiteralSelector(value={"api_key": "do-not-transport"})
-  with pytest.raises(ValidationError, match="raw filesystem"):
-    LiteralSelector(value="/tmp/internal-report.json")
+  assert (
+    LiteralSelector(value="/tmp/internal-report.json").value
+    == "/tmp/internal-report.json"
+  )
 
 
 def test_admitted_ref_binds_owner_contract_content_and_read_grant() -> None:
@@ -377,19 +392,19 @@ def test_exact_parent_materialization_has_no_clipping_semantics() -> None:
 
 def test_attachment_spec_requires_summary_but_inline_does_not() -> None:
   with pytest.raises(ValidationError, match="summary"):
-    WorkflowDeliverySpec(presentation="attachment", primary_selector="primary")
-  inline = WorkflowDeliverySpec(presentation="inline", primary_selector="primary")
+    WorkflowDeliverySpecV1(presentation="attachment", primary_selector="primary")
+  inline = WorkflowDeliverySpecV1(presentation="inline", primary_selector="primary")
   assert inline.summary_selector is None
 
 
 def test_delivery_spec_serializes_the_exact_code_owned_presentation_bound() -> None:
-  spec = WorkflowDeliverySpec(presentation="inline", primary_selector="primary")
+  spec = WorkflowDeliverySpecV1(presentation="inline", primary_selector="primary")
   assert spec.summary_inline_max_bytes == PUBLISHED_OUTPUT_INLINE_MAX_BYTES
   assert spec.model_dump(mode="json")["summary_inline_max_bytes"] == (
     PUBLISHED_OUTPUT_INLINE_MAX_BYTES
   )
   with pytest.raises(ValidationError, match="code-owned presentation bound"):
-    WorkflowDeliverySpec(
+    WorkflowDeliverySpecV1(
       presentation="inline",
       primary_selector="primary",
       summary_inline_max_bytes=PUBLISHED_OUTPUT_INLINE_MAX_BYTES + 1,
@@ -405,12 +420,13 @@ def test_delivery_without_authored_summary_requires_explicit_warning() -> None:
     content=text_handle(primary_text),
     inline_view=None,
   )
-  spec = WorkflowDeliverySpec(
+  spec = WorkflowDeliverySpecV1(
     presentation="attachment",
     primary_selector="primary_report",
     summary_selector="delivery_summary",
   )
-  envelope = DeliveryEnvelope(
+  envelope = DeliveryEnvelopeV1(
+    schema_version="1.0",
     workflow_run_id="workflow-1",
     phase_number=2,
     revision=1,
@@ -484,7 +500,8 @@ def test_delivery_envelope_is_atomic_and_summary_is_exact() -> None:
     content=text_handle(report_text),
     inline_view=None,
   )
-  envelope = DeliveryEnvelope(
+  envelope = DeliveryEnvelopeV1(
+    schema_version="1.0",
     workflow_run_id=workflow_id,
     phase_number=2,
     revision=1,
@@ -497,7 +514,7 @@ def test_delivery_envelope_is_atomic_and_summary_is_exact() -> None:
       published_output_ref=PublishedOutputRef.from_output(primary_output),
     ),
   )
-  spec = WorkflowDeliverySpec(
+  spec = WorkflowDeliverySpecV1(
     presentation="attachment",
     primary_selector="primary_report",
     summary_selector="delivery_summary",
@@ -511,10 +528,265 @@ def test_delivery_envelope_is_atomic_and_summary_is_exact() -> None:
   )
   assert DeliverySettlement.model_validate_json(settled.model_dump_json()) == settled
   with pytest.raises(ValidationError, match="one workflow phase"):
-    DeliveryEnvelope(
+    DeliveryEnvelopeV1(
+      schema_version="1.0",
       workflow_run_id=workflow_id,
       phase_number=3,
       revision=1,
       summary=envelope.summary,
       primary=envelope.primary,
+    )
+
+
+def test_delivery_spec_reader_keeps_absent_version_v1_exact_and_requires_v2_version() -> None:
+  raw_v1 = {
+    "additional_selectors": [],
+    "presentation": "attachment",
+    "primary_selector": "report",
+    "summary_inline_max_bytes": 8000,
+    "summary_selector": "summary",
+  }
+  v1 = parse_workflow_delivery_spec(raw_v1)
+  assert isinstance(v1, WorkflowDeliverySpecV1)
+  assert v1.model_dump(mode="json") == raw_v1
+  assert v1.model_dump_json() == (
+    '{"presentation":"attachment","primary_selector":"report",'
+    '"summary_selector":"summary","additional_selectors":[],'
+    '"summary_inline_max_bytes":8000}'
+  )
+  with pytest.raises(ValueError, match="unsupported schema_version"):
+    parse_workflow_delivery_spec({**raw_v1, "schema_version": "1.0"})
+  with pytest.raises(ValidationError, match="schema_version"):
+    WorkflowDeliverySpecV2(
+      presentation="attachment",
+      primary_selector="report",
+      preview_policy_version=DELIVERY_PREVIEW_POLICY_VERSION,
+      preview_max_bytes=DELIVERY_PREVIEW_MAX_BYTES,
+    )
+
+  v2 = parse_workflow_delivery_spec({
+    "schema_version": "2.0",
+    "presentation": "attachment",
+    "primary_selector": "report",
+    "additional_selectors": [],
+    "preview_policy_version": DELIVERY_PREVIEW_POLICY_VERSION,
+    "preview_max_bytes": DELIVERY_PREVIEW_MAX_BYTES,
+  })
+  assert isinstance(v2, WorkflowDeliverySpecV2)
+
+
+def test_v2_delivery_preview_is_a_bounded_exact_utf8_interval() -> None:
+  with pytest.raises(ValidationError, match="kind|source_start_byte"):
+    DeliveryPreview(
+      text="brief",
+      source_end_byte=5,
+      source_total_bytes=5,
+      complete=True,
+      omitted_bytes=0,
+    )
+  with pytest.raises(ValidationError, match="byte range"):
+    DeliveryPreview(
+      kind="deterministic_text_preview",
+      text="β",
+      source_start_byte=0,
+      source_end_byte=1,
+      source_total_bytes=2,
+      complete=False,
+      omitted_bytes=1,
+    )
+  with pytest.raises(ValidationError, match="version-2 byte bound"):
+    DeliveryPreview(
+      kind="deterministic_text_preview",
+      text="x" * (DELIVERY_PREVIEW_MAX_BYTES + 1),
+      source_start_byte=0,
+      source_end_byte=DELIVERY_PREVIEW_MAX_BYTES + 1,
+      source_total_bytes=DELIVERY_PREVIEW_MAX_BYTES + 1,
+      complete=True,
+      omitted_bytes=0,
+    )
+  with pytest.raises(ValidationError, match="omitted bytes"):
+    DeliveryPreview(
+      kind="deterministic_text_preview",
+      text="brief",
+      source_start_byte=0,
+      source_end_byte=5,
+      source_total_bytes=7,
+      complete=False,
+      omitted_bytes=1,
+    )
+  with pytest.raises(ValidationError, match="completeness"):
+    DeliveryPreview(
+      kind="deterministic_text_preview",
+      text="brief",
+      source_start_byte=0,
+      source_end_byte=5,
+      source_total_bytes=5,
+      complete=False,
+      omitted_bytes=0,
+    )
+
+
+def test_v2_delivery_pairing_uses_the_recorded_preview_policy() -> None:
+  workflow_id = "workflow-1"
+  primary_text = "Lossless report"
+  primary_output = PublishedOutput(
+    name="primary_report",
+    output_id=f"wout:{workflow_id}:phase:2:revision:1:primary_report",
+    contract=contract("report"),
+    content=text_handle(primary_text),
+    inline_view=PublishedInlineView(value=primary_text),
+  )
+  envelope = DeliveryEnvelopeV2(
+    schema_version="2.0",
+    workflow_run_id=workflow_id,
+    phase_number=2,
+    revision=1,
+    primary=DeliveryPrimaryV2(
+      name="report",
+      published_output_ref=PublishedOutputRef.from_output(primary_output),
+      preview=DeliveryPreview(
+        kind="deterministic_text_preview",
+        text=primary_text,
+        source_start_byte=0,
+        source_end_byte=len(primary_text.encode("utf-8")),
+        source_total_bytes=len(primary_text.encode("utf-8")),
+        complete=True,
+        omitted_bytes=0,
+      ),
+    ),
+  )
+  spec = WorkflowDeliverySpecV2(
+    schema_version="2.0",
+    presentation="attachment",
+    primary_selector="primary_report",
+    preview_policy_version=DELIVERY_PREVIEW_POLICY_VERSION,
+    preview_max_bytes=DELIVERY_PREVIEW_MAX_BYTES,
+  )
+  settlement = DeliverySettlement(
+    status="complete",
+    phase_number=2,
+    revision=1,
+    spec=spec,
+    envelope=envelope,
+  )
+  assert isinstance(parse_delivery_envelope(envelope.model_dump(mode="json")), DeliveryEnvelopeV2)
+  assert DeliverySettlement.model_validate_json(settlement.model_dump_json()) == settlement
+  with pytest.raises(ValidationError, match="versions must match"):
+    DeliverySettlement(
+      status="complete",
+      phase_number=2,
+      revision=1,
+      spec=WorkflowDeliverySpecV1(
+        presentation="inline",
+        primary_selector="primary_report",
+      ),
+      envelope=envelope,
+    )
+  with pytest.raises(ValidationError, match="version-2 delivery forbids"):
+    DeliverySettlement(
+      status="complete",
+      phase_number=2,
+      revision=1,
+      spec=spec,
+      envelope=envelope,
+      warning=DeliveryWarning(
+        code="delivery_summary_oversized",
+        message="not part of the version-2 contract",
+        omitted_outputs=("summary",),
+      ),
+    )
+
+
+def test_complete_v2_preview_rejects_mismatched_non_string_exact_inline_value() -> None:
+  workflow_id = "workflow-1"
+  inline_value: JsonValue = {"a": 1}
+  raw_inline = canonical_json_bytes(inline_value)
+  inline_sha = hashlib.sha256(raw_inline).hexdigest()
+  primary_output = PublishedOutput(
+    name="primary_report",
+    output_id=f"wout:{workflow_id}:phase:2:revision:1:primary_report",
+    contract=contract("report"),
+    content=ContentHandle(
+      content_id=f"sha256:{inline_sha}",
+      content_sha256=inline_sha,
+      content_bytes=len(raw_inline),
+      content_chars=len(raw_inline.decode("utf-8")),
+      contract=contract("report"),
+      media_type="text/plain",
+      encoding="utf-8",
+      retention="durable",
+    ),
+    inline_view=PublishedInlineView(value=inline_value),
+  )
+  envelope = DeliveryEnvelopeV2(
+    schema_version="2.0",
+    workflow_run_id=workflow_id,
+    phase_number=2,
+    revision=1,
+    primary=DeliveryPrimaryV2(
+      name="report",
+      published_output_ref=PublishedOutputRef.from_output(primary_output),
+      preview=DeliveryPreview(
+        kind="deterministic_text_preview",
+        text="x" * len(raw_inline),
+        source_start_byte=0,
+        source_end_byte=len(raw_inline),
+        source_total_bytes=len(raw_inline),
+        complete=True,
+        omitted_bytes=0,
+      ),
+    ),
+  )
+  spec = WorkflowDeliverySpecV2(
+    schema_version="2.0",
+    presentation="attachment",
+    primary_selector="primary_report",
+    preview_policy_version=DELIVERY_PREVIEW_POLICY_VERSION,
+    preview_max_bytes=DELIVERY_PREVIEW_MAX_BYTES,
+  )
+  with pytest.raises(ValidationError, match="conflicts with exact inline primary"):
+    WorkflowResult(
+      workflow_run_id=workflow_id,
+      view=WorkflowView(
+        workflow_run_id=workflow_id,
+        workflow_name="dynamic-workflow",
+        state="terminal",
+        execution_status="succeeded",
+        delivery_status="complete",
+        terminal_status="succeeded",
+        legal_actions=(),
+        observation_seq=1,
+        max_phases=2,
+        admitted_plan_ref=AdmittedPlanRef(
+          workflow_run_id=workflow_id,
+          plan_id="plan-1",
+          phase_number=2,
+          revision=1,
+          digest=DIGEST,
+        ),
+        terminal_phase_revision=TerminalPhaseRevision(
+          phase_number=2,
+          revision=1,
+        ),
+        estimated_cost_usd=0.0,
+        admitted_cost_estimate_usd=0.0,
+        author_cost_usd=0.0,
+      ),
+      published_outputs=(primary_output,),
+      delivery=DeliverySettlement(
+        status="complete",
+        phase_number=2,
+        revision=1,
+        spec=spec,
+        envelope=envelope,
+      ),
+      transcript=TranscriptHandle(
+        kind="workflow_transcript",
+        owner_id=workflow_id,
+      ),
+      activity=ActivityHandle(
+        kind="workflow_activity",
+        owner_id=workflow_id,
+      ),
+      continuation_state=ContinuationState(status="not_available"),
     )

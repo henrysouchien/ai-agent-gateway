@@ -44,7 +44,6 @@ from agent_gateway.model_registry import (
 from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )
-from agent_gateway.fixture_gate import fixture_provider_available, fixture_unavailable_message
 from agent_gateway.role_validation import require_exact_role
 from agent_gateway.session import AuthManager, GatewaySession
 
@@ -493,46 +492,6 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     return {"workflows": _batch_workflow_catalog()}
-
-  @router.post("/fixture")
-  async def seed_fixture_batch(
-    request: Request,
-    payload: dict[str, Any] | None = Body(default=None),
-  ) -> dict[str, Any]:
-    authenticated = _require_bearer_session(request, auth)
-    _require_control_session(authenticated)
-    owner_user_id = _session_owner_user_id(authenticated)
-    if payload is not None and not isinstance(payload, dict):
-      raise HTTPException(status_code=422, detail="fixture batch spec must be an object")
-    body = payload or {}
-    if body.get("dev_mode") is not True:
-      raise HTTPException(status_code=403, detail="fixture batch seed requires dev_mode=true")
-    if not fixture_provider_available():
-      raise HTTPException(status_code=403, detail=fixture_unavailable_message("fixture batch seed"))
-    fixture = str(body.get("fixture") or "mixed").strip().lower()
-    if fixture != "mixed":
-      raise HTTPException(status_code=422, detail="unknown fixture batch: expected 'mixed'")
-
-    registry = _registry_for_user(owner_user_id)
-    try:
-      try:
-        _resolver, fixture_execution = _batch_capability_execution_context(
-          app_state=request.app.state,
-          user_id=owner_user_id,
-          authenticated_session=authenticated,
-        )
-        batch_id = _seed_fixture_batch(
-          registry,
-          user_id=owner_user_id,
-          host=socket.gethostname(),
-          pid=os.getpid(),
-          capability_bind=fixture_execution.bind,
-        )
-      except _active_batch_error_type() as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-      return _batch_detail_payload(registry, batch_id, top_n=10)
-    finally:
-      registry.close()
 
   @router.get("/{batch_id}")
   async def get_batch(
@@ -1883,8 +1842,6 @@ def _authenticated_batch_auth_config(authenticated: Any) -> dict[str, Any] | Non
 def _has_active_credential(auth_config: dict[str, Any] | None) -> bool:
   if not auth_config:
     return False
-  if str(auth_config.get("provider") or "").strip().lower() == "fixture":
-    return True
   auth_mode = str(auth_config.get("auth_mode") or "").strip().lower()
   if auth_mode == "oauth":
     return bool(str(auth_config.get("auth_token") or "").strip())
@@ -2000,85 +1957,6 @@ def _force_rerun_retry_spec(batch: dict[str, Any], *, ticker: str) -> dict[str, 
   retry_spec["gates"] = {**gates, "force_rerun_existing": True}
   retry_spec["force_rerun_existing"] = True
   return retry_spec
-
-
-def _seed_fixture_batch(
-  registry: Any,
-  *,
-  user_id: str,
-  host: str,
-  pid: int | None,
-  capability_bind: CapabilityBind,
-) -> int:
-  now = time.time()
-  spec = {
-    "fixture": "mixed",
-    "source": "_fixture",
-    "universe": ["MSFT", "AAPL", "TSLA"],
-    "budget_usd": 0.0,
-    "dev_mode": True,
-  }
-  batch_id = registry.acquire_batch(
-    user_id=user_id,
-    host=host,
-    spec=spec,
-    capability_bind=capability_bind.receipt(),
-    budget_usd=0.0,
-    pid=pid,
-    now=now,
-  )
-  registry.allocate_run(
-    batch_id=batch_id,
-    ticker="MSFT",
-    stage="quality",
-    skill="business-quality-assessment",
-    status="completed",
-    dispatch_status="reported",
-    result_status="staged",
-    gate_code="PROCEED",
-    confidence=0.82,
-    composite=0.74,
-    proposal_id="fixture-proposal-msft",
-    proposal_expires_at=now + 3600,
-    artifact_id="fixture-artifact-msft",
-    artifact_ref="fixtures/batches/msft-quality.json",
-    cost_usd=0.0,
-    started_at=now,
-    finished_at=now + 1,
-  )
-  registry.allocate_run(
-    batch_id=batch_id,
-    ticker="AAPL",
-    stage="valuation",
-    skill="dcf-relative-valuation",
-    status="rejected",
-    dispatch_status="reported",
-    result_status="noop",
-    gate_code="STOP",
-    confidence=0.58,
-    composite=0.31,
-    cost_usd=0.0,
-    started_at=now + 1,
-    finished_at=now + 2,
-  )
-  registry.allocate_run(
-    batch_id=batch_id,
-    ticker="TSLA",
-    stage="industry",
-    skill="industry-landscape",
-    status="failed",
-    dispatch_status="failed",
-    result_status="error",
-    gate_code="INSUFFICIENT_DATA",
-    confidence=0.0,
-    composite=0.0,
-    cost_usd=0.0,
-    error="fixture failure for renderer QA",
-    started_at=now + 2,
-    finished_at=now + 3,
-  )
-  registry.set_status(batch_id, "completed", now=now + 3)
-  return batch_id
 
 
 def _set_status_if_not_terminal(registry: Any, batch_id: int, status: str, *, error: str | None = None) -> None:

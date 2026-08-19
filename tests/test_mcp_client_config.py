@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
@@ -226,3 +228,26 @@ def test_resolve_missing_stdio_executable_keeps_ambiguous_shapes_silent(
   ) is None
   # Empty command stays ambiguous (existing missing-command handling owns it).
   assert mcp_client_config.resolve_missing_stdio_executable("", [], {}) is None
+
+
+def test_allowed_tools_parser_preserves_exact_canonical_order() -> None:
+  assert mcp_client_config.parse_allowed_tools(
+    ["list_investment_capabilities", "get_investment_artifact"]
+  ) == ("list_investment_capabilities", "get_investment_artifact")
+  assert mcp_client_config.parse_allowed_tools(None) is None
+
+
+@pytest.mark.parametrize(
+  "value",
+  (
+    [],
+    "get_investment_artifact",
+    [""],
+    [" get_investment_artifact"],
+    ["get_investment_artifact", "get_investment_artifact"],
+    [1],
+  ),
+)
+def test_allowed_tools_parser_rejects_malformed_lists(value) -> None:
+  with pytest.raises(ValueError, match="allowed_tools"):
+    mcp_client_config.parse_allowed_tools(value)

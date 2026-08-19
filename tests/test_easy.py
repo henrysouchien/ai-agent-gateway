@@ -1024,16 +1024,29 @@ Research deeply.
     api_key="test-key",
     skills_dir=skills_dir,
     session_log_base_dir=tmp_path / "session-logs",
-    tool_handlers={"file_read": _file_read},
-    tool_definitions=[{
-      "name": "file_read",
-      "description": "Read exact test evidence.",
-      "input_schema": {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
+    # `explore` declares the open-web domain as a required capability (B-8),
+    # so a parent offering only `file_read` could not authorize it.
+    tool_handlers={"file_read": _file_read, "web_search": _file_read},
+    tool_definitions=[
+      {
+        "name": "file_read",
+        "description": "Read exact test evidence.",
+        "input_schema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": False,
+        },
       },
-    }],
+      {
+        "name": "web_search",
+        "description": "Search exact test evidence.",
+        "input_schema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": False,
+        },
+      },
+    ],
   )
 
   session, runtime = _build_runtime(

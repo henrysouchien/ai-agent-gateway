@@ -13,7 +13,7 @@ from .context_capture import build_context_manifest_event, canonical_manifest_di
 from .fork_request_handoff import (
   build_mid_turn_handoff,
   build_post_turn_handoff,
-  credential_identity_or_none,
+  fork_credential_identity_available,
 )
 from .learning_fork_trigger import (
   claim_learning_receipts,
@@ -42,7 +42,11 @@ from .server_compaction import (
   maybe_compact_current_messages,
   portable_compaction_enabled,
 )
-from .runner_prompt_rules import prepend_system_prompt_preamble as _prepend_system_prompt_preamble
+from .runner_prompt_rules import (
+  last_user_message,
+  prepend_system_prompt_preamble as _prepend_system_prompt_preamble,
+)
+from .runner_background_tasks import dispatch_objective_echo
 from .runner_cleanup import attach_cleanup_failure
 from .runner_run_loop_defaults import (
   MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFICATIONS_PER_TURN,
@@ -248,6 +252,79 @@ def _discard_unavailable_background_result_acks(
       and not isinstance(acknowledgement[1], bool)
     ):
       recovery_pairs.add(acknowledgement)
+
+
+def _unread_settled_handle_entries(runner: Any) -> list[Any]:
+  """Settled tasks whose delivered result handle was never read (CUR-E2E-08).
+
+  These are NOT delivery obligations and NOT success blockers: the
+  notification was rendered and acked, the settlement is real, and finish
+  stays allowed after one ignored reminder. The predicate is deliberately
+  narrow: a terminal entry, an envelope whose materialization is a bare
+  ``result_handle`` (an authored summary already delivers usable inline
+  text), a notification the model has already consumed (``delivered`` —
+  queued/omitted states are owned by the existing delivery machinery), an
+  unexercised read grant, and settlement this writer owns.
+  """
+  entries: list[Any] = []
+  for entry in runner._task_registry.list_tasks():
+    if not getattr(entry, "completed", False):
+      continue
+    if getattr(entry, "result_content_read", False):
+      continue
+    if getattr(entry, "notification_delivery_state", None) != "delivered":
+      continue
+    envelope = getattr(entry, "completion_envelope", None)
+    materialization = getattr(envelope, "parent_materialization", None)
+    if getattr(materialization, "kind", None) != "result_handle":
+      continue
+    settlement_owned = (
+      not bool(getattr(entry, "reconstructed_from_log", False))
+      or getattr(runner, "_role", None) == "writer"
+    )
+    if not settlement_owned:
+      continue
+    entries.append(entry)
+  return entries
+
+
+#: Tasks named per reminder turn. The arms slice to this bound BEFORE adding
+#: to the reminded set, so an over-cap fan-out gets its remaining tasks named
+#: at the next stop boundary instead of being silently marked reminded.
+_UNREAD_HANDLE_NUDGE_MAX_TASKS = 10
+
+
+def _unread_result_handle_nudge(entries: list[Any]) -> str:
+  lines: list[str] = []
+  for entry in entries[:_UNREAD_HANDLE_NUDGE_MAX_TASKS]:
+    materialization = getattr(
+      getattr(entry, "completion_envelope", None),
+      "parent_materialization",
+      None,
+    )
+    content_id = getattr(
+      getattr(materialization, "source", None), "content_id", ""
+    )
+    grant_id = getattr(
+      getattr(materialization, "read_grant", None), "grant_id", ""
+    )
+    echo = dispatch_objective_echo(entry) or "objective unavailable"
+    lines.append(
+      f"- task {getattr(entry, 'task_id', '')} ({echo}): "
+      f"get_agent_result_content(content_id=\"{content_id}\", "
+      f"read_grant_id=\"{grant_id}\")"
+    )
+  listing = "\n".join(lines)
+  return (
+    "[System: The following background task result(s) were delivered as "
+    "content handles and have never been read:\n"
+    f"{listing}\n"
+    "Each of these tasks is SETTLED — completed, not running, not "
+    "outstanding. Before finishing, either read each result now and "
+    "integrate it, or state explicitly in your answer that it was not "
+    "integrated and why. Do not describe any of these tasks as still "
+    "running or outstanding.]"
+  )
 
 
 def _pending_omitted_background_task_ids(runner: Any) -> list[str]:
@@ -733,6 +810,9 @@ class RunnerRunLoopMixin:
     learning_tool_calling_iters = 0
     learning_real_final_response = False
     terminal_success_reason: str | None = None
+    selected_content_committed = not bool(
+      getattr(self, "_selected_content_bindings", ())
+    )
     top_level_user_input = self._preflight_top_level_skill_run(
       messages,
       resume_initial_messages,
@@ -764,12 +844,13 @@ class RunnerRunLoopMixin:
           new_user_input = (
             top_level_user_input
             if top_level_user_input is not None
-            else self._extract_last_user_message(messages)
+            else last_user_message(messages)
           )
           if new_user_input is not None:
             user_entry = await self._append_user_message_event(
               new_user_input
             )
+            selected_content_committed = user_entry is not None
             if (
               top_level_user_input is not None
               and user_entry is None
@@ -785,12 +866,13 @@ class RunnerRunLoopMixin:
           new_user_input = (
             top_level_user_input
             if top_level_user_input is not None
-            else self._extract_last_user_message(messages)
+            else last_user_message(messages)
           )
           if new_user_input is not None:
             user_entry = await self._append_user_message_event(
               new_user_input
             )
+            selected_content_committed = user_entry is not None
             if (
               top_level_user_input is not None
               and user_entry is None
@@ -807,6 +889,11 @@ class RunnerRunLoopMixin:
               system_prompt
             )
           )
+
+      if not selected_content_committed:
+        raise RuntimeError(
+          "Selected content was not durably committed before model work."
+        )
 
       if self._coordinator is not None and self._coordinator.enabled:
         preamble = self._coordinator.preamble or coordinator_default_preamble
@@ -969,6 +1056,8 @@ class RunnerRunLoopMixin:
       delivery_grace_credits_granted = 0
       delivery_epoch_active = False
       delivery_epoch_from_max = False
+      delivery_turn_compelled = False
+      unread_handle_reminded_task_ids: set[str] = set()
       tools_used: List[str] = []
       final_answer_guard_fired = False
       max_tokens_continuations = 0
@@ -1178,7 +1267,15 @@ class RunnerRunLoopMixin:
                     )
           obligations = self._background_delivery_grace_obligations()
           if (
-            pending_model_visible_tool_result_ids
+            (
+              pending_model_visible_tool_result_ids
+              # B-3: at turn exhaustion the synthesis obligation is minted
+              # unconditionally — this is the completion reserve that elicits a
+              # terminal narrative, and without it the honest-partial remap has
+              # no narrative to settle on. Still credit-capped below by the one
+              # synthesis credit and by delivery_grace_credit_limit.
+              or delivery_epoch_from_max
+            )
             and not obligations
           ):
             obligations[
@@ -1214,15 +1311,32 @@ class RunnerRunLoopMixin:
               model_visible_synthesis_credits_granted += (
                 granted_credits
               )
-          active_delivery_obligation = next(
-            (
-              obligation
-              for obligation in obligations
-              if delivery_grace_credits.get(obligation, 0) > 0
-            ),
-            None,
+          # Credits count the turns that *cannot* settle a delivery: the
+          # compelled ones, where the loop re-invokes the provider itself
+          # (a continuation the model never completed, or a delivery nudge
+          # after it tried to stop). A completed turn acks what was rendered
+          # to it, so it makes progress on its own and is not charged --
+          # otherwise a parent that legitimately keeps working between
+          # deliveries, which is exactly what a staged fan-out does, spends a
+          # budget sized for draining a queue and dies mid-flight. The frozen
+          # post-`max_turns` epoch stays metered unconditionally: there the
+          # turn budget is already spent and every turn is a delivery turn.
+          metered_delivery_turn = (
+            delivery_epoch_from_max or delivery_turn_compelled
           )
-          if active_delivery_obligation is not None:
+          delivery_turn_compelled = False
+          if metered_delivery_turn:
+            active_delivery_obligation = next(
+              (
+                obligation
+                for obligation in obligations
+                if delivery_grace_credits.get(obligation, 0) > 0
+              ),
+              None,
+            )
+          if not metered_delivery_turn:
+            active_delivery_obligation = None
+          elif active_delivery_obligation is not None:
             delivery_grace_credits[
               active_delivery_obligation
             ] -= 1
@@ -1342,8 +1456,17 @@ class RunnerRunLoopMixin:
           notif_reminder,
           pending_notification_count=self._notification_queue.pending_count,
           max_notifications_per_turn=max_notifications_per_turn,
+          delivered=self._notification_delivery_set(),
         )
-        peeked_notification_count = turn_reminder.peeked_notification_count
+        # The delivered set for this provider request. Recorded once per
+        # outer turn (the inner request-preparation loop re-sends the same
+        # reminder unchanged) and acked at the response boundary that saw
+        # it (A-M7, T3-I01).
+        delivered_notifications: list[Any] = list(turn_reminder.delivered)
+        delivered_notifications_recorded = False
+        pending_notifications_at_render = (
+          self._notification_queue.pending_count
+        )
         est_for_compaction = int(estimate_snapshot.est_total_tokens)
         if last_real_stream_input_tokens is not None:
           est_for_compaction = max(est_for_compaction, last_real_stream_input_tokens)
@@ -1354,6 +1477,7 @@ class RunnerRunLoopMixin:
         provisional_anchor_message: dict[str, Any] | None = None
         request_scoped_nudge_message: dict[str, Any] | None = None
         delivery_request_nudge_message: dict[str, Any] | None = None
+        delivery_request_nudge_recorded = False
         fork_suffix_reminder_text: str | None = None
 
         def remove_current_message(target: dict[str, Any] | None) -> None:
@@ -1505,14 +1629,16 @@ class RunnerRunLoopMixin:
             and active_delivery_obligation[2]
             in {"exact_retrieval", "ack_recovery"}
           ):
+            omitted_nudge_text = _omitted_background_result_nudge(
+              [active_delivery_obligation[0]]
+            )
             delivery_request_nudge_message = user_turn_message(
-              _omitted_background_result_nudge(
-                [active_delivery_obligation[0]]
-              )
+              omitted_nudge_text
             )
             current_messages.append(
               delivery_request_nudge_message
             )
+
           combined_reminder = "\n\n".join(
             part
             for part in (
@@ -1638,6 +1764,65 @@ class RunnerRunLoopMixin:
             except Exception as exc:
               logger.warning(
                 "[%s] context capture failed; manifest suppressed | exception_type=%s",
+                self._sid,
+                type(exc).__name__,
+              )
+          if delivered_notifications and not delivered_notifications_recorded:
+            # Durable render record (CUR-E2E-08 observability): which
+            # request boundary showed each queued notification to the
+            # model. Identifiers only — the notification's summary/payload
+            # is untrusted child content and stays out of unsanitized
+            # event fields. Durable-only, like context_manifest: never on
+            # the client wire, ignored by every fold. Sits after budget
+            # admission so the record means "carried by an issued request";
+            # a request the provider failed to process can still leave a
+            # record whose notifications were never acked, so forensics
+            # dedupe by (task_id, notification_generation). Observability
+            # never vetoes work: append failures are logged and suppressed.
+            delivered_notifications_recorded = True
+            try:
+              await self._append_durable_event({
+                "type": "background_notifications_rendered",
+                "turn": turn_count,
+                "request_id": self._request_id,
+                "pending_count": pending_notifications_at_render,
+                "notifications": [
+                  {
+                    "task_id": str(getattr(notification, "task_id", "")),
+                    "notification_generation": getattr(
+                      notification, "notification_generation", None
+                    ),
+                    "event": str(getattr(notification, "event", "")),
+                  }
+                  for notification in delivered_notifications
+                ],
+              })
+            except Exception as exc:
+              logger.warning(
+                "[%s] notification render record suppressed | exception_type=%s",
+                self._sid,
+                type(exc).__name__,
+              )
+          if (
+            delivery_request_nudge_message is not None
+            and not delivery_request_nudge_recorded
+          ):
+            # The matching durable record for the request-scoped delivery
+            # nudge — emitted here, after budget admission, so it attests a
+            # nudge an issued request actually carried.
+            delivery_request_nudge_recorded = True
+            try:
+              await self._append_durable_event(
+                build_runtime_guard_event(
+                  guard="omitted_background_result_nudge",
+                  message=str(
+                    (delivery_request_nudge_message.get("content") or "")
+                  ),
+                )
+              )
+            except Exception as exc:
+              logger.warning(
+                "[%s] delivery nudge record suppressed | exception_type=%s",
                 self._sid,
                 type(exc).__name__,
               )
@@ -1978,30 +2163,39 @@ class RunnerRunLoopMixin:
             self._append(build_runtime_guard_event(guard=guard, message=message))
           if no_tool_outcome.action == "continue":
             current_messages.extend(no_tool_outcome.messages)
+            # The pause/compaction/max_tokens arm cannot ack (D-A7-1): it
+            # re-invokes the provider on a turn the model never completed, so
+            # nothing discharges an outstanding delivery. These are the turns
+            # the bounded credits exist to count.
+            delivery_turn_compelled = True
             continue
           if terminal_failure is not None:
             break
-          notification_ack_allowed = (
-            turn.stop_reason == "end_turn"
-          )
           delivery_follow_up_allowed = turn.stop_reason in {
             "end_turn",
             "tool_use",
           }
+          # Ack follows delivery: this response consumed the reminder that
+          # rendered `delivered_notifications`, so the model has seen them
+          # (A-M7, T3-I01). Reached only on a completed model turn — the
+          # `error` arm broke earlier at `terminal_failure`, and the
+          # pause/compaction/max_tokens continuation arm `continue`d above
+          # (D-A7-1).
+          if delivered_notifications:
+            self._ack_delivered_notifications(delivered_notifications)
+            delivered_notifications = []
           if (
-            notification_ack_allowed
-            and peeked_notification_count > 0
-          ):
-            self._consume_notifications(
-              max_count=peeked_notification_count
-            )
-          if (
-            notification_ack_allowed
-            and turn.stop_reason == "end_turn"
+            turn.stop_reason == "end_turn"
             and self._background_notifications_enabled
             and self._notification_queue.pending_count == 0
-            and self._task_registry.list_tasks(
-              state=task_state_cls.RUNNING
+            and (
+              self._task_registry.list_tasks(
+                state=task_state_cls.RUNNING
+              )
+              # An unsettled workflow obligation holds the session open
+              # (§5.3, T2-I04): a parked or authoring run has no RUNNING
+              # registry task.
+              or self._workflow_settlement_obstructed()
             )
             and (max_turns is None or turn_count < max_turns)
           ):
@@ -2039,9 +2233,19 @@ class RunnerRunLoopMixin:
             current_messages.append(
               background_tasks_completed_user_message()
             )
+            # Metering the delivery turns is all this arm does. It must NOT
+            # latch `_background_delivery_grace_active`: that flag closes
+            # admission of new background tasks and says so in words the run
+            # would be lying about here ("past its normal turn limit" — this
+            # arm runs precisely when `max_turns is None`). Latching it on the
+            # first arriving notification made staged fan-out impossible: a
+            # parent that dispatches its next track once a slot frees had that
+            # dispatch rejected, and did the work inline instead until the
+            # delivery credits ran out. Only the post-`max_turns` epoch and the
+            # end of the loop close admission.
             if max_turns is None:
               delivery_epoch_active = True
-              self._background_delivery_grace_active = True
+              delivery_turn_compelled = True
             continue
           pending_omitted_task_ids = (
             _pending_omitted_background_task_ids(self)
@@ -2058,16 +2262,103 @@ class RunnerRunLoopMixin:
                 stop_reason=turn.stop_reason,
               )
             )
+            omitted_nudge_text = _omitted_background_result_nudge(
+              pending_omitted_task_ids
+            )
             current_messages.append(
-              user_turn_message(
-                _omitted_background_result_nudge(
-                  pending_omitted_task_ids
+              user_turn_message(omitted_nudge_text)
+            )
+            try:
+              await self._append_durable_event(
+                build_runtime_guard_event(
+                  guard="omitted_background_result_nudge",
+                  message=omitted_nudge_text,
                 )
               )
-            )
+            except Exception as exc:
+              logger.warning(
+                "[%s] delivery nudge record suppressed | exception_type=%s",
+                self._sid,
+                type(exc).__name__,
+              )
             if max_turns is None:
               delivery_epoch_active = True
-              self._background_delivery_grace_active = True
+              delivery_turn_compelled = True
+            continue
+          unread_handle_entries = [
+            entry
+            for entry in _unread_settled_handle_entries(self)
+            if entry.task_id not in unread_handle_reminded_task_ids
+          ][:_UNREAD_HANDLE_NUDGE_MAX_TASKS]
+          if (
+            delivery_follow_up_allowed
+            and unread_handle_entries
+            and not delivery_epoch_from_max
+            # The reminder must never consume the run's LAST budgeted turn:
+            # crossing `max_turns` here would latch the from-max epoch and
+            # `_background_delivery_grace_active`, spend the synthesis
+            # credit, and turn an obeying model's read into a
+            # `max_turns_reached` interruption. On a bounded run whose
+            # finish lands on the limit, the reminder yields (fail-open).
+            and (max_turns is None or turn_count < max_turns)
+          ):
+            # CUR-E2E-08: the delivery contract ended at "rendered once and
+            # acked", and a handle-shaped result whose notification landed
+            # while the model was firefighting another child was never read
+            # — the run then closed claiming the settled task was still
+            # outstanding. One reminder turn per task, keyed by the
+            # unexercised read grant (typed ground truth, not claim
+            # parsing). Deliberately UNMETERED and epoch-free: this is not a
+            # delivery obligation, so it must not spend delivery grace
+            # credits (a5fe21207) and must not latch
+            # `_background_delivery_grace_active` (e6b071335). The
+            # reminded-once set is the liveness bound: a model that ignores
+            # the reminder finishes on its next stop.
+            unread_handle_reminded_task_ids.update(
+              entry.task_id for entry in unread_handle_entries
+            )
+            # Every delivery obligation is discharged here (no queued
+            # notifications, no omitted payloads), so the live delivery
+            # epoch is over — close it. Left latched, the model's answer to
+            # this reminder could stop at max_tokens/pause, and that
+            # compelled continuation would hit a metered turn with zero
+            # obligations and commit `background_delivery_settled` success
+            # mid-sentence, truncating the very integration the reminder
+            # asked for. A later arriving notification re-latches the epoch
+            # exactly as the first one did.
+            if (
+              delivery_epoch_active
+              and not delivery_epoch_from_max
+              and not self._background_delivery_grace_obligations()
+            ):
+              delivery_epoch_active = False
+            current_messages.append(
+              assistant_turn_message(
+                turn.content_blocks,
+                provider=self._provider.name,
+                model=upstream_model,
+                stop_reason=turn.stop_reason,
+              )
+            )
+            unread_handle_nudge_text = _unread_result_handle_nudge(
+              unread_handle_entries
+            )
+            current_messages.append(
+              user_turn_message(unread_handle_nudge_text)
+            )
+            try:
+              await self._append_durable_event(
+                build_runtime_guard_event(
+                  guard="unread_result_handle_nudge",
+                  message=unread_handle_nudge_text,
+                )
+              )
+            except Exception as exc:
+              logger.warning(
+                "[%s] reminder record suppressed | exception_type=%s",
+                self._sid,
+                type(exc).__name__,
+              )
             continue
           if turn.stop_reason == "end_turn":
             terminal_success_reason = "end_turn"
@@ -2080,6 +2371,14 @@ class RunnerRunLoopMixin:
           break
 
         await persist_assistant_message_once()
+        # Same boundary that acknowledges consumed background results: the
+        # model answered the request that rendered these notifications, so
+        # ack before the tool batch runs. A batch ending in
+        # `stop_after_tool_results_reason` (or a budget stop) can then no
+        # longer strand what the model already saw (A-M7, CUR-E2E-04).
+        if delivered_notifications:
+          self._ack_delivered_notifications(delivered_notifications)
+          delivered_notifications = []
         learning_tool_calling_iters += 1
         current_messages.append(
           assistant_turn_message(
@@ -2096,7 +2395,7 @@ class RunnerRunLoopMixin:
           for _, tool_name, tool_input in turn.tool_uses
         ):
           self._mid_turn_fork_handoff = None
-          if credential_identity_or_none(self) is None:
+          if not fork_credential_identity_available(self):
             logger.warning(
               "[%s] Mid-turn fork capture unavailable: no visible "
               "credential identity",
@@ -2225,8 +2524,13 @@ class RunnerRunLoopMixin:
           if (
             self._background_notifications_enabled
             and self._notification_queue.pending_count == 0
-            and self._task_registry.list_tasks(
-              state=task_state_cls.RUNNING
+            and (
+              self._task_registry.list_tasks(
+                state=task_state_cls.RUNNING
+              )
+              # An unsettled workflow obligation holds the session open
+              # (§5.3, T2-I04).
+              or self._workflow_settlement_obstructed()
             )
             and (max_turns is None or turn_count < max_turns)
           ):
@@ -2255,7 +2559,7 @@ class RunnerRunLoopMixin:
             )
             if max_turns is None:
               delivery_epoch_active = True
-              self._background_delivery_grace_active = True
+              delivery_turn_compelled = True
             continue
           if (
             getattr(self, "_pending_background_result_acks", {})
@@ -2263,9 +2567,52 @@ class RunnerRunLoopMixin:
           ):
             if max_turns is None:
               delivery_epoch_active = True
-              self._background_delivery_grace_active = True
+              delivery_turn_compelled = True
             continue
           if pending_model_visible_tool_result_ids:
+            continue
+          unread_handle_entries = [
+            entry
+            for entry in _unread_settled_handle_entries(self)
+            if entry.task_id not in unread_handle_reminded_task_ids
+          ][:_UNREAD_HANDLE_NUDGE_MAX_TASKS]
+          if (
+            unread_handle_entries
+            and not delivery_epoch_from_max
+            and (max_turns is None or turn_count < max_turns)
+          ):
+            # CUR-E2E-08, tools-then-end_turn stop boundary: same one
+            # reminder per task, same unmetered/epoch-free contract, same
+            # turn-budget guard and epoch close-out as the no-tool arm (the
+            # assistant turn is already in current_messages here).
+            unread_handle_reminded_task_ids.update(
+              entry.task_id for entry in unread_handle_entries
+            )
+            if (
+              delivery_epoch_active
+              and not delivery_epoch_from_max
+              and not self._background_delivery_grace_obligations()
+            ):
+              delivery_epoch_active = False
+            unread_handle_nudge_text = _unread_result_handle_nudge(
+              unread_handle_entries
+            )
+            current_messages.append(
+              user_turn_message(unread_handle_nudge_text)
+            )
+            try:
+              await self._append_durable_event(
+                build_runtime_guard_event(
+                  guard="unread_result_handle_nudge",
+                  message=unread_handle_nudge_text,
+                )
+              )
+            except Exception as exc:
+              logger.warning(
+                "[%s] reminder record suppressed | exception_type=%s",
+                self._sid,
+                type(exc).__name__,
+              )
             continue
           terminal_success_reason = "end_turn_after_tools"
           break
@@ -2419,7 +2766,7 @@ class RunnerRunLoopMixin:
           is not None
         ):
           self._post_turn_fork_handoff = None
-          if credential_identity_or_none(self) is None:
+          if not fork_credential_identity_available(self):
             if not getattr(
               self,
               "_post_turn_fork_identity_unavailable_logged",
@@ -2590,6 +2937,9 @@ class RunnerRunLoopMixin:
         drain_state = session_drain_state(
           running_entries,
           shutdown_failed=shutdown_failed,
+          unsettled_workflow_obstructions=(
+            self._unsettled_workflow_obstruction_count()
+          ),
         )
         try:
           await self._finalize_top_level_skill_result(

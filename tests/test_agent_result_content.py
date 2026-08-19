@@ -11,6 +11,7 @@ from agent_gateway.agent_result_content import (
   make_get_agent_result_content_tool_def,
 )
 from agent_gateway.agent_session_log import AgentSessionLog
+from agent_gateway.task_registry import TaskRegistry
 from agent_gateway.final_narrative_artifact import publish_final_narrative
 from agent_gateway.runner_session_events import build_agent_completion_event
 from agent_gateway.sub_agent_result_contract import (
@@ -285,3 +286,61 @@ def test_invalid_cursor_is_rejected_before_content_read(tmp_path: Path) -> None:
   assert page is None
   assert error is not None
   assert error["code"] == "invalid_input"
+
+
+def test_successful_read_marks_registry_result_content_read(tmp_path: Path) -> None:
+  """The handler records grant redemption on the live registry (CUR-E2E-08).
+
+  End-to-end through the real handler: without this seam, the
+  natural-finish reminder fires spuriously for results the parent DID
+  read. The mark is best-effort — a registry-less runner (the other tests
+  here) must keep working, and an entry-less registry must not error.
+  """
+
+  async def _case() -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    reference = publish_final_narrative(
+      workspace_dir=workspace,
+      sub_agent_id="sub:1",
+      terminal_event_seq=7,
+      text="## TRACK 3\n" + ("margin analysis " * 400),
+    )
+    result = _task_result(values=TaskResultValues(
+      terminal_narrative=terminal_narrative_content_handle(reference),
+    ))
+    envelope = _envelope(result)
+    log = AgentSessionLog(tmp_path / "session.jsonl")
+    await _append_completion(log, result, envelope)
+
+    registry = TaskRegistry()
+    entry = registry.register(
+      "background_agent",
+      task_id=result.attempt.physical_task_id,
+    )
+    entry.completion_envelope = envelope
+    runner = _runner(log, workspace)
+    runner._task_registry = registry
+    handler = make_get_agent_result_content_handler([runner])
+
+    assert entry.result_content_read is False
+    page, error = await handler({
+      "content_id": envelope.parent_materialization.source.content_id,
+      "read_grant_id": envelope.parent_materialization.read_grant.grant_id,
+    })
+    assert error is None
+    assert page is not None
+    assert entry.result_content_read is True
+
+    # Entry-less registry: the read itself must stay unaffected.
+    bare_runner = _runner(log, workspace)
+    bare_runner._task_registry = TaskRegistry()
+    bare_handler = make_get_agent_result_content_handler([bare_runner])
+    page, error = await bare_handler({
+      "content_id": envelope.parent_materialization.source.content_id,
+      "read_grant_id": envelope.parent_materialization.read_grant.grant_id,
+    })
+    assert error is None
+    assert page is not None
+
+  _run(_case())

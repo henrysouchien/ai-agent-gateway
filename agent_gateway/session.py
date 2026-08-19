@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import inspect
 import shutil
-from threading import Lock
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -13,6 +12,8 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Literal, Mappi
 
 import jwt
 from fastapi import HTTPException
+
+from agent_workflow_contracts import WorkflowContentPage
 
 from .capability_binding import (
   CAPABILITY_IDS,
@@ -23,6 +24,7 @@ from .capability_binding import (
 )
 from .events import DEFAULT_SCHEMA_VERSION
 from .event_log import EventLog
+from .mcp_activation import McpActivationFold
 from .session_event_history import SessionEventHistory
 from .session_capabilities import normalize_session_capabilities
 
@@ -32,10 +34,11 @@ if TYPE_CHECKING:
 
 JWT_ALGORITHM = "HS256"
 JWT_HS256_MIN_SECRET_BYTES = 32
+SESSION_EXPIRY_RETRY_SECONDS = 0.05
 OnSessionExpiry = Callable[["GatewaySession"], Awaitable[None] | None]
+SessionExpiryBlocker = Callable[["GatewaySession"], int]
 _RESERVED_USER_IDS = {"_default"}
-EventDeliveryDomain = Literal["ordinary", "proof"]
-WorkflowOutputReader = Callable[[str, str, int], Awaitable[object]]
+WorkflowOutputReader = Callable[[str, str, int], Awaitable[WorkflowContentPage]]
 
 
 def _normalize_required_user_id(user_id: str | None) -> str:
@@ -63,25 +66,6 @@ def session_owner_user_id(session: "GatewaySession") -> str:
   if not owner_user_id:
     raise ValueError("session owner_user_id is required")
   return owner_user_id
-
-
-def bind_session_event_delivery(
-  session: "GatewaySession",
-  *,
-  proof: bool,
-) -> EventDeliveryDomain:
-  """Freeze one session onto exactly one event-delivery domain."""
-
-  domain: EventDeliveryDomain = "proof" if proof else "ordinary"
-  with session._event_delivery_lock:
-    current = session._event_delivery_domain
-    if current is None:
-      session._event_delivery_domain = domain
-    elif current != domain:
-      raise RuntimeError(
-        "session event delivery domain cannot change after binding"
-      )
-    return domain
 
 
 def _normalize_required_tenant_id(tenant_id: str | None) -> str:
@@ -211,7 +195,11 @@ class GatewaySession:
   cached_usage: SessionUsageSummary | None = None
   pending_tools: Dict[str, Dict] = field(default_factory=dict)
   approved_tool_types: Set[str] = field(default_factory=set)
-  loaded_mcp_servers: Set[str] = field(default_factory=set)
+  # The single writer of MCP load state (T3-I12). The loaded-server set, the
+  # deferred-tool set and the dispatcher allowlist are all derived from this
+  # fold by `mcp_activation.derive_live_surface`; none of them is stored, so
+  # none of them can disagree with another.
+  mcp_activation_fold: McpActivationFold = field(default_factory=McpActivationFold)
   loaded_local_tools: Set[str] = field(default_factory=set)
   approval_queues: Dict[str, asyncio.Queue] = field(default_factory=dict)
   approval_store: Any | None = None
@@ -236,18 +224,16 @@ class GatewaySession:
     default=None,
     repr=False,
   )
-  _event_delivery_domain: EventDeliveryDomain | None = field(
+  _commercial_dispatch_owner: object | None = field(default=None, repr=False)
+  _capability_selections_bound: bool = field(default=False, repr=False)
+  _expired: bool = field(default=False, repr=False)
+  _expiry_hooks_complete: bool = field(default=False, repr=False)
+  _final_expiry_hook_index: int = field(default=0, repr=False)
+  _expiry_task: asyncio.Task[None] | None = field(default=None, repr=False)
+  _expiry_retry_handle: asyncio.TimerHandle | None = field(
     default=None,
     repr=False,
   )
-  _event_delivery_lock: Any = field(
-    default_factory=Lock,
-    init=False,
-    repr=False,
-    compare=False,
-  )
-  _commercial_dispatch_owner: object | None = field(default=None, repr=False)
-  _capability_selections_bound: bool = field(default=False, repr=False)
   _expiring: bool = False
 
 
@@ -347,6 +333,8 @@ class SessionStore:
     self._session_kinds: Dict[str, Literal["chat", "control"]] = {}
     self._on_expiry: OnSessionExpiry | None = None
     self._on_expiry_hooks: list[OnSessionExpiry] = []
+    self._on_final_expiry_hooks: list[OnSessionExpiry] = []
+    self._expiry_blockers: list[SessionExpiryBlocker] = []
 
   def set_on_expiry(self, hook: OnSessionExpiry) -> None:
     """Replace the session-expiry cleanup hook.
@@ -357,8 +345,20 @@ class SessionStore:
     self._on_expiry_hooks = [hook]
 
   def add_on_expiry(self, hook: OnSessionExpiry) -> None:
-    """Register an additional session-expiry cleanup hook."""
+    """Register immediate cleanup run exactly once when expiry begins."""
     self._on_expiry_hooks.append(hook)
+
+  def add_on_final_expiry(self, hook: OnSessionExpiry) -> None:
+    """Register teardown deferred until every runtime owner is finished."""
+
+    self._on_final_expiry_hooks.append(hook)
+
+  def add_expiry_blocker(self, blocker: SessionExpiryBlocker) -> None:
+    """Register a side-effect-free runtime-ownership count for expiry."""
+
+    if not callable(blocker):
+      raise TypeError("session expiry blocker must be callable")
+    self._expiry_blockers.append(blocker)
 
   def create_session(
     self,
@@ -467,24 +467,47 @@ class SessionStore:
     return session
 
   def get_session(self, session_id: str) -> Optional[GatewaySession]:
-    return self.sessions.get(session_id)
+    session = self.sessions.get(session_id)
+    if session is None or session._expired:
+      return None
+    return session
+
+  def visible_sessions_snapshot(self) -> tuple[GatewaySession, ...]:
+    """Return sessions still usable at one captured wall-clock instant."""
+
+    now = int(time.time())
+    return tuple(
+      session
+      for session in tuple(self.sessions.values())
+      if not session._expired and session.expires_at > now
+    )
 
   def expire_session(self, session_id: str) -> None:
     session = self.sessions.get(session_id)
-    if session is None or session._expiring:
+    if session is None:
       return
-    session._expiring = True
-    self.sessions.pop(session_id, None)
-    self._session_kinds.pop(session_id, None)
-    if self._on_expiry_hooks or self._on_expiry is not None:
-      try:
-        loop = asyncio.get_running_loop()
-      except RuntimeError:
-        pass
-      else:
-        loop.create_task(self._safe_on_expiry(session))
+    session._expired = True
+    try:
+      loop = asyncio.get_running_loop()
+    except RuntimeError:
+      if (
+        self._expiry_blocked(session)
+        or self._immediate_expiry_hooks()
+        or self._on_final_expiry_hooks
+      ):
         return
-    self._cleanup_session_files(session)
+      session._expiring = True
+      self.sessions.pop(session_id, None)
+      self._session_kinds.pop(session_id, None)
+      self._cleanup_session_files(session)
+      return
+    task = session._expiry_task
+    if task is None or task.done():
+      task = loop.create_task(
+        self._expire_session_async(session),
+        name=f"{session.session_id}:expiry",
+      )
+      session._expiry_task = task
 
   def cleanup_expired(self) -> None:
     now = int(time.time())
@@ -494,12 +517,18 @@ class SessionStore:
 
   async def expire_session_async(self, session_id: str) -> None:
     session = self.sessions.get(session_id)
-    if session is None or session._expiring:
+    if session is None:
       return
-    session._expiring = True
-    self.sessions.pop(session_id, None)
-    self._session_kinds.pop(session_id, None)
-    await self._safe_on_expiry(session)
+    session._expired = True
+    task = session._expiry_task
+    if task is None or task.done():
+      task = asyncio.create_task(
+        self._expire_session_async(session),
+        name=f"{session.session_id}:expiry",
+      )
+      session._expiry_task = task
+    if task is not asyncio.current_task():
+      await asyncio.shield(task)
 
   async def cleanup_expired_async(self) -> None:
     now = int(time.time())
@@ -507,10 +536,52 @@ class SessionStore:
     for session_id in expired_ids:
       await self.expire_session_async(session_id)
 
-  async def _safe_on_expiry(self, session: GatewaySession) -> None:
+  async def _expire_session_async(self, session: GatewaySession) -> None:
+    handle = session._expiry_retry_handle
+    if handle is not None:
+      handle.cancel()
+      session._expiry_retry_handle = None
+    if not session._expiry_hooks_complete:
+      await self._safe_expiry_hooks(session, self._immediate_expiry_hooks())
+      session._expiry_hooks_complete = True
+    if self._expiry_blocked(session):
+      self._schedule_expiry_retry(session)
+      return
+    session._expiring = True
+    if not await self._run_final_expiry_hooks(session):
+      self._schedule_expiry_retry(session)
+      return
+    self._cleanup_session_files(session)
+    self.sessions.pop(session.session_id, None)
+    self._session_kinds.pop(session.session_id, None)
+
+  def _schedule_expiry_retry(self, session: GatewaySession) -> None:
+    existing = session._expiry_retry_handle
+    if existing is not None and not existing.cancelled():
+      return
+    loop = asyncio.get_running_loop()
+
+    def retry() -> None:
+      session._expiry_retry_handle = None
+      if self.sessions.get(session.session_id) is session:
+        self.expire_session(session.session_id)
+
+    session._expiry_retry_handle = loop.call_later(
+      SESSION_EXPIRY_RETRY_SECONDS,
+      retry,
+    )
+
+  def _immediate_expiry_hooks(self) -> tuple[OnSessionExpiry, ...]:
     hooks = list(self._on_expiry_hooks)
     if not hooks and self._on_expiry is not None:
       hooks = [self._on_expiry]
+    return tuple(hooks)
+
+  async def _safe_expiry_hooks(
+    self,
+    session: GatewaySession,
+    hooks: tuple[OnSessionExpiry, ...],
+  ) -> None:
     for hook in hooks:
       try:
         result = hook(session)
@@ -518,7 +589,31 @@ class SessionStore:
           await result
       except Exception:
         pass
-    self._cleanup_session_files(session)
+
+  async def _run_final_expiry_hooks(self, session: GatewaySession) -> bool:
+    """Advance retry-safe final teardown without skipping a failed hook."""
+
+    hooks = tuple(self._on_final_expiry_hooks)
+    while session._final_expiry_hook_index < len(hooks):
+      hook = hooks[session._final_expiry_hook_index]
+      try:
+        result = hook(session)
+        if inspect.isawaitable(result):
+          await result
+      except Exception:
+        return False
+      session._final_expiry_hook_index += 1
+    return True
+
+  def _expiry_blocked(self, session: GatewaySession) -> bool:
+    for blocker in tuple(self._expiry_blockers):
+      try:
+        count = blocker(session)
+      except Exception:
+        return True
+      if type(count) is not int or count < 0 or count != 0:
+        return True
+    return False
 
   @staticmethod
   def _cleanup_session_files(session: GatewaySession) -> None:
@@ -707,10 +802,8 @@ class AuthManager:
 
 __all__ = [
   "AuthManager",
-  "EventDeliveryDomain",
   "GatewaySession",
   "SessionStore",
   "bind_session_capability_selections",
-  "bind_session_event_delivery",
   "session_owner_user_id",
 ]

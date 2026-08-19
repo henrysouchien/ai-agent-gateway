@@ -312,6 +312,27 @@ def safe_cache_name(name: str) -> str:
   return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "server"
 
 
+def parse_allowed_tools(value: Any) -> tuple[str, ...] | None:
+  """Return one configured server's exact tool allowlist, when present."""
+
+  if value is None:
+    return None
+  if not isinstance(value, list) or not value:
+    raise ValueError("allowed_tools must be a non-empty list of tool names")
+  if any(
+    not isinstance(name, str)
+    or not name
+    or name != name.strip()
+    or any(ord(character) < 32 or ord(character) == 127 for character in name)
+    for name in value
+  ):
+    raise ValueError("allowed_tools must contain canonical non-empty tool names")
+  names = tuple(value)
+  if len(set(names)) != len(names):
+    raise ValueError("allowed_tools must not contain duplicate tool names")
+  return names
+
+
 __all__ = [
   "DEFAULT_ENV_ALLOWLIST",
   "ENV_REF_RE",
@@ -338,6 +359,7 @@ __all__ = [
   "is_retryable_stdio_connect_error",
   "is_retryable_stdio_startup_error",
   "iter_exception_tree",
+  "parse_allowed_tools",
   "resolve_mcp_config_path",
   "resolve_missing_stdio_executable",
   "safe_cache_name",

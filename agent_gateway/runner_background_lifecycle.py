@@ -56,6 +56,7 @@ from .runner_background_tasks import (
   task_registered_event_payload as _task_registered_event_payload,
   wait_for_background_tasks as _wait_for_background_tasks,
   WorkflowTaskMetadata,
+  workflow_obstruction_blocks_settlement,
   workflow_owns_terminal_notification as _workflow_owns_terminal_notification,
 )
 from .runner_introspection import (
@@ -66,6 +67,7 @@ from .runner_notifications import (
   build_notification_reminder as _build_notification_reminder,
   consume_notifications as _consume_notifications,
   inject_system_prompt_reminder as _inject_system_prompt_reminder,
+  notification_delivery_set as _notification_delivery_set,
 )
 from .runner_run_loop_defaults import MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFICATIONS_PER_TURN
 from .runner_session_events import build_agent_completion_event as _build_agent_completion_event
@@ -303,6 +305,57 @@ class RunnerBackgroundLifecycleMixin:
       max_count=_runner_attr(self, "_MAX_NOTIFICATIONS_PER_TURN", _MAX_NOTIFICATIONS_PER_TURN),
     )
 
+  def _notification_delivery_set(self) -> Tuple[Any, ...]:
+    """The notification objects this request's reminder renders (A-M7)."""
+    return _runner_attr(
+      self,
+      "_notification_delivery_set",
+      _notification_delivery_set,
+    )(
+      self._notification_queue,
+      max_count=_runner_attr(
+        self,
+        "_MAX_NOTIFICATIONS_PER_TURN",
+        _MAX_NOTIFICATIONS_PER_TURN,
+      ),
+    )
+
+  def _settle_consumed_notifications(
+    self,
+    notifications: List[Any],
+  ) -> None:
+    """Mark consumed notifications delivered and release their boundaries.
+
+    Runs only under the parent's ack path, so it is the §5.3 guard's
+    "acked" fact: a workflow boundary notification carries a
+    delivered-callback that releases its settlement obstruction
+    (T2-I04, D-T2-4a). Never called at reminder-build time — a
+    rendered-but-unanswered boundary must keep obstructing (T3-I02).
+    """
+    registry = getattr(self, "_task_registry", None)
+    registry_get = getattr(registry, "get", None)
+    if callable(registry_get):
+      for notification in notifications:
+        entry = registry_get(notification.task_id)
+        if (
+          entry is not None
+          and entry.notification_delivery_state == "queued"
+          and notification.notification_generation
+          == entry.notification_generation
+        ):
+          entry.notification_delivery_state = "delivered"
+    for notification in notifications:
+      boundary_delivered = getattr(
+        notification,
+        "workflow_boundary_delivered",
+        None,
+      )
+      if callable(boundary_delivered):
+        try:
+          boundary_delivered()
+        except Exception:
+          pass
+
   def _consume_notifications(self, max_count: int) -> int:
     peek = getattr(self._notification_queue, "peek", None)
     notifications = (
@@ -318,19 +371,76 @@ class RunnerBackgroundLifecycleMixin:
       self._notification_queue,
       max_count=max_count,
     )
-    registry = getattr(self, "_task_registry", None)
-    registry_get = getattr(registry, "get", None)
-    if callable(registry_get):
-      for notification in notifications[:consumed]:
-        entry = registry_get(notification.task_id)
-        if (
-          entry is not None
-          and entry.notification_delivery_state == "queued"
-          and notification.notification_generation
-          == entry.notification_generation
-        ):
-          entry.notification_delivery_state = "delivered"
+    self._settle_consumed_notifications(notifications[:consumed])
     return consumed
+
+  def _ack_delivered_notifications(self, delivered: Any) -> int:
+    """Ack the notifications the delivering provider request rendered.
+
+    Delivery is **at-least-once**, deliberately. The delivered set is
+    in-memory state of one request; the durable carrier of a child's
+    result is its ``agent_completion`` event, not the queue. A crash
+    between rendering the reminder and acking it therefore redelivers the
+    notification on the next run rather than losing it, and redelivery is
+    deduplicated at build time: a child produces one queue entry per
+    ``(task_id, notification_generation)``, and a workflow boundary is
+    deduped by ``(run, phase, revision)`` in ``_boundary_notifications``.
+
+    Acking here — not at build — is what keeps the §5.3 settlement guard
+    honest: a boundary that was rendered but never answered still
+    obstructs (T3-I02).
+    """
+    notifications = list(delivered or ())
+    if not notifications:
+      return 0
+    drain_delivered = getattr(
+      self._notification_queue,
+      "drain_delivered",
+      None,
+    )
+    if callable(drain_delivered):
+      consumed = list(drain_delivered(notifications))
+    else:
+      # Duck-typed queues without identity draining keep the historical
+      # front-slice contract.
+      count = _runner_attr(
+        self,
+        "_consume_notifications",
+        _consume_notifications,
+      )(
+        self._notification_queue,
+        max_count=len(notifications),
+      )
+      consumed = notifications[:count]
+    self._settle_consumed_notifications(consumed)
+    return len(consumed)
+
+  def _workflow_settlement_obstructions(self) -> tuple[Any, ...]:
+    """Read the session's unsettled workflow obligations, failing open."""
+
+    session = getattr(self, "_gateway_session", None)
+    query = getattr(session, "workflow_settlement_obstruction", None)
+    if not callable(query):
+      return ()
+    try:
+      return tuple(query())
+    except Exception:
+      return ()
+
+  def _workflow_settlement_obstructed(self) -> bool:
+    """Return whether any workflow obligation blocks clean settlement."""
+
+    return any(
+      workflow_obstruction_blocks_settlement(row)
+      for row in self._workflow_settlement_obstructions()
+    )
+
+  def _unsettled_workflow_obstruction_count(self) -> int:
+    return sum(
+      1
+      for row in self._workflow_settlement_obstructions()
+      if workflow_obstruction_blocks_settlement(row)
+    )
 
   async def _wait_for_background_notification(self) -> bool:
     """Wait event-first for a terminal child notification or pause request."""
@@ -358,7 +468,26 @@ class RunnerBackgroundLifecycleMixin:
           and not done()
         ):
           live_tasks.add(task)
-      if not live_tasks:
+      # An unsettled workflow obligation holds the session open even with
+      # no RUNNING registry task (§5.3, T2-I04): the authoring window and
+      # a parked-but-unacked boundary have no running children.  A row's
+      # wake handle (the in-process drive) joins the wait set so a run
+      # settling terminally releases the hold without a notification.
+      workflow_obstructed = False
+      for row in self._workflow_settlement_obstructions():
+        if not workflow_obstruction_blocks_settlement(row):
+          continue
+        workflow_obstructed = True
+        wake = getattr(row, "wake", None)
+        done = getattr(wake, "done", None)
+        if (
+          wake is not None
+          and is_future(wake)
+          and callable(done)
+          and not done()
+        ):
+          live_tasks.add(wake)
+      if not live_tasks and not workflow_obstructed:
         return False
 
       notification_waiter = asyncio_module.create_task(
@@ -1931,10 +2060,17 @@ class RunnerBackgroundLifecycleMixin:
     )
     registration_committed = registration_state == "committed"
 
-    async def _reject_if_resume_source_changed() -> tuple[
+    async def _reject_if_resume_source_changed(
+      registration_committed: bool,
+    ) -> tuple[
       dict[str, Any] | None,
       dict[str, Any] | None,
     ] | None:
+      # ``registration_committed`` is an argument, not a closed-over local:
+      # the durable append now happens in
+      # ``_append_task_registered_then_start`` and only that frame knows
+      # whether a durable record exists yet. Pre-append the reservation is
+      # discarded; post-append it must be settled with a terminal.
       if not validate_resume_source or original_task_id is None:
         return None
       source_error = _resume_source_admission_error(
@@ -2016,9 +2152,66 @@ class RunnerBackgroundLifecycleMixin:
         )
         return self._background_task_payload(entry), None
 
-    source_rejection = await _reject_if_resume_source_changed()
+    source_rejection = await _reject_if_resume_source_changed(
+      registration_committed,
+    )
     if source_rejection is not None:
       return source_rejection
+
+    return await self._append_task_registered_then_start(
+      entry=entry,
+      tool_input=tool_input,
+      handler=handler,
+      agent_name=agent_name,
+      on_before_start=on_before_start,
+      on_complete=on_complete,
+      call_index=call_index,
+      original_task_id=original_task_id,
+      reconcile_registration=reconcile_registration,
+      registration_committed=registration_committed,
+      durable_existing=durable_existing,
+      reject_if_resume_source_changed=_reject_if_resume_source_changed,
+    )
+
+  async def _append_task_registered_then_start(
+    self,
+    *,
+    entry: TaskEntry,
+    tool_input: Dict[str, Any],
+    handler: BackgroundTaskHandler,
+    agent_name: str | None,
+    on_before_start: Callable[[], None] | None,
+    on_complete: BackgroundTaskCallback | None,
+    call_index: int,
+    original_task_id: str | None,
+    reconcile_registration: bool,
+    registration_committed: bool,
+    durable_existing: TaskEntry | None,
+    reject_if_resume_source_changed: Callable[
+      [bool],
+      Awaitable[
+        Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]] | None
+      ],
+    ],
+  ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Append ``task_registered`` and bracket every exit that follows it.
+
+    A-M8 / T3-I03. Admission (``TaskRegistry.admit``) already reserved the
+    slot synchronously, so the durable append below is the next ``await`` on
+    the registration path. The rule this method encodes:
+
+    * **pre-append** failure -> ``discard_unstarted``: no durable record
+      exists, so the reservation is simply released. On the resume lane the
+      reservation is deliberately retained for the retry and is caller-owned
+      (D-A8-2).
+    * **post-append** failure -> a compensating durable
+      ``task_completed(final_state="failed", reason="registration_aborted:…")``
+      before the exception leaves, shielded on cancellation. Without it a
+      PENDING ghost holds ``admission_count > 0`` forever, the run loop
+      refuses clean success with ``background_delivery_incomplete``, and
+      replay rebuilds the task as INTERRUPTED instead of FAILED
+      (CUR-E2E-03, seam-map Hole 2).
+    """
 
     if not registration_committed:
       entry.registration_persistence_state = "in_flight"
@@ -2077,94 +2270,158 @@ class RunnerBackgroundLifecycleMixin:
       entry.registration_persistence_error = None
       registration_committed = True
 
-    if durable_existing is not None and durable_existing.state in {
-      TaskState.COMPLETED,
-      TaskState.FAILED,
-      TaskState.KILLED,
-    }:
-      entry.completion_persistence_state = "committed"
-      entry.completion_persistence_error = None
-      await self._settle_and_commit_background_completion_live(
-        entry,
-        final_state=durable_existing.state,
-        result=durable_existing.result,
-        error=durable_existing.error,
-      )
-      return self._background_task_payload(entry), None
+    # ---- Post-append bracket (D-A8-2/3) ---------------------------------
+    # A durable ``task_registered`` now exists for this task. Every exit
+    # below must leave a durable terminal behind it.
+    try:
+      if durable_existing is not None and durable_existing.state in {
+        TaskState.COMPLETED,
+        TaskState.FAILED,
+        TaskState.KILLED,
+      }:
+        entry.completion_persistence_state = "committed"
+        entry.completion_persistence_error = None
+        await self._settle_and_commit_background_completion_live(
+          entry,
+          final_state=durable_existing.state,
+          result=durable_existing.result,
+          error=durable_existing.error,
+        )
+        return self._background_task_payload(entry), None
 
-    source_rejection = await _reject_if_resume_source_changed()
-    if source_rejection is not None:
-      return source_rejection
+      source_rejection = await reject_if_resume_source_changed(
+        registration_committed,
+      )
+      if source_rejection is not None:
+        return source_rejection
 
-    if entry.termination_intent is not None:
-      result = self._background_termination_result(
-        entry,
-        entry.termination_intent,
-      )
-      final_state = (
-        _task_state_from_task_result(entry.task_result)
-        if entry.task_result is not None
-        else TaskState.KILLED
-      )
-      await self._finalize_background_agent(
-        entry,
-        final_state=final_state,
-        result=result,
-        error=None,
-      )
-      return self._background_task_payload(entry), None
+      if entry.termination_intent is not None:
+        result = self._background_termination_result(
+          entry,
+          entry.termination_intent,
+        )
+        final_state = (
+          _task_state_from_task_result(entry.task_result)
+          if entry.task_result is not None
+          else TaskState.KILLED
+        )
+        await self._finalize_background_agent(
+          entry,
+          final_state=final_state,
+          result=result,
+          error=None,
+        )
+        return self._background_task_payload(entry), None
 
-    if not getattr(entry, "start_hook_invoked", False):
-      entry.start_hook_invoked = True
-      _runner_attr(
+      if not getattr(entry, "start_hook_invoked", False):
+        entry.start_hook_invoked = True
+        _runner_attr(
+          self,
+          "_call_before_background_task_start_hook",
+          _call_before_background_task_start_hook,
+        )(
+          on_before_start,
+          log_session_id=lambda: self._sid,
+          logger=log,
+        )
+
+      asyncio_module = _runner_attr(self, "asyncio", asyncio)
+      worker_coro = self._run_background_agent(
+        entry,
+        _runner_attr(
+          self,
+          "_entry_aware_background_handler",
+          _entry_aware_background_handler,
+        )(handler, entry),
+        dict(tool_input),
+        call_index,
+        on_complete=on_complete,
+      )
+      try:
+        worker_task = asyncio_module.create_task(
+          worker_coro,
+          name=entry.task_id,
+        )
+      except BaseException:
+        worker_coro.close()
+        raise
+      entry.asyncio_task = worker_task
+      try:
+        self._task_registry.transition(entry.task_id, TaskState.RUNNING)
+      except BaseException:
+        entry.asyncio_task = None
+        worker_task.cancel()
+        worker_task.add_done_callback(
+          self._consume_background_task_exception
+        )
+        raise
+
+      return _runner_attr(
         self,
-        "_call_before_background_task_start_hook",
-        _call_before_background_task_start_hook,
+        "_background_task_started_result",
+        _background_task_started_result,
       )(
-        on_before_start,
-        log_session_id=lambda: self._sid,
-        logger=log,
-      )
+        entry,
+        agent_name=agent_name,
+      ), None
+    except BaseException as exc:
+      await self._compensate_aborted_registration(entry, exc)
+      raise
 
-    asyncio_module = _runner_attr(self, "asyncio", asyncio)
-    worker_coro = self._run_background_agent(
+  async def _compensate_aborted_registration(
+    self,
+    entry: TaskEntry,
+    exc: BaseException,
+  ) -> None:
+    """Settle a durably registered task that never reached its worker.
+
+    The compensating terminal is what makes registration transactional: the
+    durable ``task_registered`` is answered by a durable
+    ``task_completed(final_state="failed")`` so replay rebuilds FAILED rather
+    than a ghost INTERRUPTED entry, and ``admission_count`` returns to zero
+    so the session-completion guard stops reporting
+    ``pending_or_running_tasks`` (D-A8-2/3; the notification the FAILED
+    transition emits is the accepted D-A8-4 cost for direct dispatch —
+    workflow children stay exempt via the existing predicate).
+    """
+
+    detail = (
+      f"{type(exc).__name__}: {str(exc).strip() or type(exc).__name__}"
+    )[:2000]
+    canonical = _terminal_task_result(
       entry,
-      _runner_attr(
-        self,
-        "_entry_aware_background_handler",
-        _entry_aware_background_handler,
-      )(handler, entry),
-      dict(tool_input),
-      call_index,
-      on_complete=on_complete,
+      status="failed",
+      reason=f"registration_aborted: {detail}",
     )
-    try:
-      worker_task = asyncio_module.create_task(
-        worker_coro,
-        name=entry.task_id,
-      )
-    except BaseException:
-      worker_coro.close()
-      raise
-    entry.asyncio_task = worker_task
-    try:
-      self._task_registry.transition(entry.task_id, TaskState.RUNNING)
-    except BaseException:
-      entry.asyncio_task = None
-      worker_task.cancel()
-      worker_task.add_done_callback(
-        self._consume_background_task_exception
-      )
-      raise
-
-    return _runner_attr(
-      self,
-      "_background_task_started_result",
-      _background_task_started_result,
-    )(
+    if canonical is not None:
+      entry.task_result = canonical
+      aborted_result = canonical.model_dump(mode="json")
+    else:
+      aborted_result = {
+        "status": "failed",
+        "reason": "registration_aborted",
+        "detail": detail,
+      }
+    finalize = self._finalize_background_agent(
       entry,
-      agent_name=agent_name,
-    ), None
+      final_state=TaskState.FAILED,
+      result=aborted_result,
+      error=None,
+    )
+    if not isinstance(exc, asyncio.CancelledError):
+      await finalize
+      return
+    # The terminal must survive the cancellation that caused it, or the
+    # ghost simply reappears.
+    terminal_task = asyncio.ensure_future(finalize)
+    terminal_task.add_done_callback(self._consume_background_task_exception)
+    self._track_background_initialization(terminal_task)
+    try:
+      await asyncio.shield(terminal_task)
+    except asyncio.CancelledError:
+      # Our waiter was cancelled again; the shielded append continues and is
+      # tracked. The original cancellation is re-raised by the caller.
+      pass
 
   async def _register_background_task(
     self,
@@ -2297,42 +2554,53 @@ class RunnerBackgroundLifecycleMixin:
         }
       resolved_task_id = resume_task_id
 
-    if resolved_task_id is not None and original_task_id is not None:
+    # ---- Pre-decision replay/reuse checks (A-M8 / T3-I03) -----------------
+    # Every ``await`` on the registration path lives ABOVE the admission
+    # point. Both durable replay lookups used to sit between the capacity
+    # verdict and the reservation, so N concurrent registrations could all
+    # read the same stale ``admission_count`` and all register afterwards
+    # (CUR-E2E-03, Hole 1). They are pure pre-checks now.
+    if resolved_task_id is not None:
       existing = self._task_registry.get(resolved_task_id)
       if existing is not None:
-        source_error = _source_error()
-        if source_error is not None:
-          return None, source_error
-        try:
-          entry, _created = self._task_registry.claim_resume_successor(
-            task_type,
-            agent_name=agent_name,
-            task_id=resolved_task_id,
-            original_task_id=original_task_id,
-          )
-        except ResumeSuccessorConflictError as exc:
-          return None, {
-            "code": "resume_successor_conflict",
-            "message": str(exc),
-          }
-        if entry.state != TaskState.PENDING:
-          return await _replay_existing(entry)
-        initialization_task = entry.initialization_task
+        if original_task_id is not None:
+          source_error = _source_error()
+          if source_error is not None:
+            return None, source_error
+          try:
+            existing, _created = self._task_registry.claim_resume_successor(
+              task_type,
+              agent_name=agent_name,
+              task_id=resolved_task_id,
+              original_task_id=original_task_id,
+            )
+          except ResumeSuccessorConflictError as exc:
+            return None, {
+              "code": "resume_successor_conflict",
+              "message": str(exc),
+            }
+        if existing.state != TaskState.PENDING:
+          return await _replay_existing(existing)
+        initialization_task = existing.initialization_task
         if (
           initialization_task is not None
           and not initialization_task.done()
         ):
           return await asyncio.shield(initialization_task)
-      if (
-        existing is None
-        and getattr(self, "_agent_session_log", None) is not None
+      elif (
+        original_task_id is None
+        or getattr(self, "_agent_session_log", None) is not None
       ):
         durable_existing = await self._lookup_task_in_log(resolved_task_id)
-        source_error = _source_error()
-        if source_error is not None:
-          return None, source_error
+        if original_task_id is not None:
+          source_error = _source_error()
+          if source_error is not None:
+            return None, source_error
         if durable_existing is not None:
-          if durable_existing.original_task_id != original_task_id:
+          if (
+            original_task_id is not None
+            and durable_existing.original_task_id != original_task_id
+          ):
             exc = ResumeSuccessorConflictError(
               task_id=resolved_task_id,
               original_task_id=original_task_id,
@@ -2344,7 +2612,6 @@ class RunnerBackgroundLifecycleMixin:
             }
           return await _replay_existing(durable_existing)
 
-    admission_count = self._task_registry.admission_count
     if getattr(self, "_background_delivery_grace_active", False):
       return None, {
         "code": "background_delivery_grace_active",
@@ -2354,117 +2621,55 @@ class RunnerBackgroundLifecycleMixin:
           "not admitted during this delivery-only phase."
         ),
       }
-    if resolved_task_id is not None:
-      reserved_successor = self._task_registry.get(resolved_task_id)
-      if (
-        reserved_successor is not None
-        and reserved_successor.state == TaskState.PENDING
-      ):
-        admission_count -= 1
-    limit_error = _runner_attr(self, "_background_task_limit_error", _background_task_limit_error)(
-      admission_count=admission_count,
-      max_background_tasks=self._max_background_tasks,
-    )
-    if limit_error is not None:
-      return None, limit_error
-    if not self._task_registry.notification_retrieval_capacity_available(
-      admission_count=admission_count,
-    ):
-      return None, {
-        "code": "background_notification_retrieval_required",
-        "message": (
-          "Omitted background results have filled bounded retrieval "
-          "retention. Call get_background_result with task_id='*' to "
-          "list eligible task IDs, then retrieve each exact ID before "
-          "starting more background tasks."
-        ),
-        "pending_omitted_results": (
-          self._task_registry.pending_notification_retrieval_count
-        ),
-        "retention_limit": (
-          self._task_registry.notification_retrieval_retention_limit
-        ),
-      }
-
-    if resolved_task_id is not None and original_task_id is not None:
+    if original_task_id is not None:
       source_error = _source_error()
       if source_error is not None:
         return None, source_error
-      try:
-        entry, created = self._task_registry.claim_resume_successor(
-          task_type,
-          agent_name=agent_name,
-          task_id=resolved_task_id,
-          original_task_id=original_task_id,
-        )
-      except ResumeSuccessorConflictError as exc:
-        return None, {
-          "code": "resume_successor_conflict",
-          "message": str(exc),
-        }
-      if not created and entry.state != TaskState.PENDING:
-        return await _replay_existing(entry)
-      initialization_task = entry.initialization_task
-      if (
-        initialization_task is not None
-        and not initialization_task.done()
-      ):
-        return await asyncio.shield(initialization_task)
 
-      initialization_task = asyncio.create_task(
-        self._prepare_and_start_background_task(
-          entry=entry,
-          tool_input=tool_input,
-          handler=handler,
-          agent_name=agent_name,
-          parent_turn_id=parent_turn_id,
-          on_complete=on_complete,
-          on_before_start=on_before_start,
-          required_skill_lifecycle=required_skill_lifecycle,
-          workflow_task_metadata=workflow_task_metadata,
-          required_skill_result_event_factory=(
-            required_skill_result_event_factory
+    # ---- Atomic admission -------------------------------------------------
+    # One synchronous critical section folds the capacity ceiling, the
+    # notification-retrieval ceiling, and the reservation. A rejection here
+    # produces no durable ``task_registered`` at all (D-A8-3).
+    entry, rejection = self._task_registry.admit(
+      task_type,
+      agent_name=agent_name,
+      task_id=resolved_task_id,
+      original_task_id=original_task_id,
+      reject_over_capacity=lambda admission_count, ceiling: _runner_attr(
+        self,
+        "_background_task_limit_error",
+        _background_task_limit_error,
+      )(
+        admission_count=admission_count,
+        max_background_tasks=ceiling,
+      ),
+      reject_retrieval_backpressure=(
+        lambda pending_omitted_results, retention_limit: {
+          "code": "background_notification_retrieval_required",
+          "message": (
+            "Omitted background results have filled bounded retrieval "
+            "retention. Call get_background_result with task_id='*' to "
+            "list eligible task IDs, then retrieve each exact ID before "
+            "starting more background tasks."
           ),
-          required_skill_result_projector=(
-            required_skill_result_projector
-          ),
-          original_task_id=original_task_id,
-          capability_bind_receipt=capability_bind_receipt,
-          admitted_task=admitted_task,
-          parent_result_policy=parent_result_policy,
-          reconcile_registration=True,
-          validate_resume_source=validate_resume_source,
-          resume_source_entry=resume_source_entry,
-        ),
-        name=f"{entry.task_id}:initialize",
-      )
-      entry.initialization_task = initialization_task
-      self._track_background_initialization(initialization_task)
+          "pending_omitted_results": pending_omitted_results,
+          "retention_limit": retention_limit,
+        }
+      ),
+    )
+    if rejection is not None:
+      return None, rejection
+    if entry is None:
+      raise RuntimeError("task admission returned neither entry nor rejection")
+
+    # ``admit`` may hand back a reservation another caller took while this
+    # one was in its pre-decision awaits. Re-read the reservation's live
+    # state synchronously (no slot is at stake — it is the same entry).
+    if entry.state != TaskState.PENDING:
+      return await _replay_existing(entry)
+    initialization_task = entry.initialization_task
+    if initialization_task is not None and not initialization_task.done():
       return await asyncio.shield(initialization_task)
-    else:
-      if resolved_task_id is not None:
-        existing = self._task_registry.get(resolved_task_id)
-        if existing is not None:
-          if existing.state != TaskState.PENDING:
-            return await _replay_existing(existing)
-          initialization_task = existing.initialization_task
-          if initialization_task is not None and not initialization_task.done():
-            return await asyncio.shield(initialization_task)
-          entry = existing
-        else:
-          durable_existing = await self._lookup_task_in_log(resolved_task_id)
-          if durable_existing is not None:
-            return await _replay_existing(durable_existing)
-          entry = self._task_registry.register(
-            task_type,
-            agent_name=agent_name,
-            task_id=resolved_task_id,
-          )
-      else:
-        entry = self._task_registry.register(
-          task_type,
-          agent_name=agent_name,
-        )
 
     initialization_task = asyncio.create_task(
       self._prepare_and_start_background_task(

@@ -8,9 +8,12 @@ from typing import Any, Literal, Mapping
 
 from agent_workflow_contracts import (
   DeliveryEnvelope,
+  DeliveryEnvelopeV1,
+  DeliveryEnvelopeV2,
   PublishedOutput,
   PublishedOutputRef,
   WorkflowResult,
+  parse_delivery_envelope,
 )
 
 
@@ -20,11 +23,12 @@ class WorkflowOutputAttachmentError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class WorkflowOutputAttachment:
-  """One atomic authored summary plus its lossless primary output reference.
+  """One atomic delivery view plus its lossless primary output reference.
 
-  The envelope is retained as a unit so phase, revision, summary provenance,
-  primary identity, and any additional output identities cannot drift while an
-  assistant message is waiting to be persisted or rendered.
+  The envelope is retained as a unit so phase, revision, presentation,
+  primary identity, and any additional output identities cannot drift while
+  an assistant message is waiting to be persisted or rendered. Historical v1
+  carries an authored summary; v2 carries a deterministic primary preview.
   """
 
   envelope: DeliveryEnvelope
@@ -35,11 +39,14 @@ class WorkflowOutputAttachment:
       raise WorkflowOutputAttachmentError(
         "workflow output attachment has the wrong kind"
       )
-    if not isinstance(self.envelope, DeliveryEnvelope):
+    if not isinstance(self.envelope, (DeliveryEnvelopeV1, DeliveryEnvelopeV2)):
       raise WorkflowOutputAttachmentError(
         "workflow output attachment requires a DeliveryEnvelope"
       )
-    if self.envelope.summary is None:
+    if (
+      isinstance(self.envelope, DeliveryEnvelopeV1)
+      and self.envelope.summary is None
+    ):
       raise WorkflowOutputAttachmentError(
         "workflow output attachment requires an authored summary"
       )
@@ -129,7 +136,7 @@ class WorkflowOutputAttachment:
       )
     raw_envelope = value.get("delivery_envelope")
     try:
-      envelope = DeliveryEnvelope.model_validate(raw_envelope)
+      envelope = parse_delivery_envelope(raw_envelope)
     except Exception as exc:
       raise WorkflowOutputAttachmentError(
         "workflow output attachment has an invalid delivery envelope"
@@ -149,8 +156,8 @@ def completed_workflow_output_attachment(
   """Extract an attachment only from a validated aggregate workflow result.
 
   Inline presentation intentionally yields no attachment. Attachment
-  presentation fails closed unless its authored summary and primary reference
-  both match publications from the same terminal phase and revision.
+  presentation fails closed unless its canonical presentation and primary
+  reference match publications from the same terminal phase and revision.
   """
 
   if tool_name != "workflow_run" or not isinstance(result, Mapping):
@@ -168,7 +175,9 @@ def completed_workflow_output_attachment(
       "completed workflow result violates WorkflowResult"
     ) from exc
   settlement = workflow_result.delivery
-  if settlement.status != "complete":
+  if settlement is None or settlement.status != "complete":
+    # A composed result at a parked or blocked boundary carries no settled
+    # delivery (A-M5); only a durably complete delivery stages an attachment.
     return None
   if settlement.spec is None:
     raise WorkflowOutputAttachmentError(
@@ -179,9 +188,9 @@ def completed_workflow_output_attachment(
   envelope = settlement.envelope
   if envelope is None:
     raise WorkflowOutputAttachmentError(
-      "attachment delivery requires an authored summary and primary output"
+      "attachment delivery requires a canonical delivery envelope"
     )
-  if envelope.summary is None:
+  if isinstance(envelope, DeliveryEnvelopeV1) and envelope.summary is None:
     # A validated complete delivery without its authored summary carries an
     # explicit warning (oversized summary fallback); the exact primary output
     # remains readable through the workflow output route, so no assistant
@@ -201,12 +210,18 @@ def completed_workflow_output_attachment(
     envelope.primary.published_output_ref,
     field_name="primary",
   )
-  summary_publication = _require_publication(
-    publications,
-    envelope.summary.source,
-    field_name="summary",
-  )
-  _require_exact_summary(envelope.summary.text, summary_publication)
+  if isinstance(envelope, DeliveryEnvelopeV1):
+    summary = envelope.summary
+    if summary is None:  # guarded above; retained for static narrowing
+      raise WorkflowOutputAttachmentError(
+        "attachment delivery requires an authored summary and primary output"
+      )
+    summary_publication = _require_publication(
+      publications,
+      summary.source,
+      field_name="summary",
+    )
+    _require_exact_summary(summary.text, summary_publication)
   return attachment
 
 
@@ -226,10 +241,23 @@ def accepted_workflow_continuation_run_id(
 
   if tool_name != "workflow_run" or not isinstance(result, Mapping):
     return None
-  if result.get("ok") is not True or result.get("action") != "continue":
+  if result.get("ok") is not True:
     return None
   workflow_run_id = result.get("workflow_run_id")
   if not isinstance(workflow_run_id, str) or not workflow_run_id:
+    return None
+  # Durable-backed marker first (A-M4, T2-S06): the render's top-level
+  # ``continuation_accepted`` key carries the open continuation bracket
+  # recorded by ``workflow_continuation_accepted``, so invalidation keys on
+  # a durable fact rather than an in-memory action sniff.
+  if isinstance(result.get("continuation_accepted"), Mapping):
+    return workflow_run_id
+  # Legacy sniff for runs whose accepted continuation predates the A-M4
+  # bracket and therefore renders no marker.  Retirement condition: delete
+  # this fallback when no live (unsettled) run predates A-M4 —
+  # operationally, one release after the A-M4 generation with a log sweep
+  # confirming no open pre-M4 runs.
+  if result.get("action") != "continue":
     return None
   return workflow_run_id
 

@@ -442,7 +442,6 @@ def _install_batch_pending_approval(
   batch_id: int,
   owner_user_id: str = "alice",
   channel: str = "tui",
-  required_decider_count: int = 1,
   request_id_override: str | None = None,
   durable_owner_user_id: str | None = None,
   tool_class: str = "state_write",
@@ -474,8 +473,6 @@ def _install_batch_pending_approval(
     approval_constraint="standard",
     state="pending_user",
     requested_at=utc_now(),
-    required_decider_count=required_decider_count,
-    eligible_decider_count=max(1, required_decider_count),
     persistent_grant_scope=persistent_grant_scope,
   )
   _run(app.state.gateway_approval_store.create(request_record))
@@ -1908,114 +1905,16 @@ def test_control_batches_workflows_catalog(fake_batch_control: FakeBatchControll
   assert workflows["valuation-ready"]["pipeline_template"] == "valuation-ready"
   assert workflows["valuation-ready"]["source_pipeline_template"] == "compounder"
   assert workflows["valuation-ready"]["default_max_concurrency"] == 2
-  assert workflows["full-diligence"]["reservation_budget_usd_per_name"] == 55.0
-  assert workflows["full-diligence"]["suggested_budget_usd_per_name"] == 55.0
-  assert workflows["valuation-ready"]["reservation_budget_usd_per_name"] == 26.0
+  # earnings-scenarios carries max_budget_usd: 6.0 (vs the $2 stage fallback),
+  # so full-diligence reserves 59.0 and valuation-ready 30.0.
+  assert workflows["full-diligence"]["reservation_budget_usd_per_name"] == 59.0
+  assert workflows["full-diligence"]["suggested_budget_usd_per_name"] == 59.0
+  assert workflows["valuation-ready"]["reservation_budget_usd_per_name"] == 30.0
   assert (
     workflows["full-diligence"]["budget_model"]["admission_formula"]
     == "spent_usd + in_flight_reserved_usd + next_stage_reserved_usd <= budget_usd"
   )
   assert workflows["full-diligence"]["budget_model"]["includes_goal_remediation_capacity"] is False
-
-
-def test_fixture_batch_requires_dev_mode(fake_batch_control: FakeBatchController) -> None:
-  app = _make_app()
-  with TestClient(app) as client:
-    headers = _headers(_control_session(client))
-    response = client.post("/api/control/batches/fixture", headers=headers, json={"fixture": "mixed"})
-
-  assert response.status_code == 403
-  assert response.json()["detail"] == "fixture batch seed requires dev_mode=true"
-  assert fake_batch_control.acquire_calls == []
-  assert fake_batch_control.run_calls == []
-
-
-def test_fixture_batch_refuses_production_even_with_dev_flags(
-  fake_batch_control: FakeBatchController,
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  monkeypatch.setenv("APP_ENV", "production")
-  monkeypatch.setenv("AGENT_GATEWAY_ENV", "development")
-
-  app = _make_app()
-  with TestClient(app) as client:
-    headers = _headers(_control_session(client))
-    response = client.post("/api/control/batches/fixture", headers=headers, json={"fixture": "mixed", "dev_mode": True})
-
-  assert response.status_code == 403
-  assert "fixture batch seed is dev-only" in response.json()["detail"]
-  assert fake_batch_control.acquire_calls == []
-  assert fake_batch_control.run_calls == []
-
-
-def test_fixture_batch_seeds_registry_without_controller(
-  fake_batch_control: FakeBatchController,
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  monkeypatch.setenv("APP_ENV", "test")
-  app = _make_app()
-  with TestClient(app) as client:
-    headers = _headers(_control_session(client))
-    response = client.post("/api/control/batches/fixture", headers=headers, json={"fixture": "mixed", "dev_mode": True})
-
-    assert response.status_code == 200, response.text
-    payload = response.json()
-    batch_id = int(payload["batch"]["batch_id"])
-    assert payload["batch"]["status"] == "completed"
-    assert payload["batch"]["cost_usd"] == 0
-    assert payload["batch"]["counts_by_status"] == {
-      "completed": 1,
-      "failed": 1,
-      "rejected": 1,
-    }
-    assert payload["batch"]["counts_by_gate_code"] == {
-      "INSUFFICIENT_DATA": 1,
-      "PROCEED": 1,
-      "STOP": 1,
-    }
-    assert [row["ticker"] for row in payload["verdict_matrix"]] == ["MSFT", "AAPL", "TSLA"]
-    assert payload["candidates"][0]["proposal_id"] == "fixture-proposal-msft"
-    assert payload["proposals"] == [
-      {
-        "ticker": "MSFT",
-        "source_skill": "business-quality-assessment",
-        "proposal_id": "fixture-proposal-msft",
-        "proposal_expires_at": payload["candidates"][0]["proposal_expires_at"],
-        "artifact_id": "fixture-artifact-msft",
-        "artifact_ref": "fixtures/batches/msft-quality.json",
-        "lifecycle": "staged",
-        "source_run_seq": 1,
-        "source_status": "completed",
-        "apply_run_seq": None,
-        "apply_status": None,
-        "apply_result_status": None,
-        "apply_error": None,
-        "undo": {
-          "status": "not_issued",
-          "undo_token_id": None,
-          "undo_expires_at": None,
-        },
-      }
-    ]
-    assert set(payload) == {"batch", "verdict_matrix", "candidates", "proposals", "failures"}
-    assert payload["failures"] == [
-      {
-        "ticker": "TSLA",
-        "skill": "industry-landscape",
-        "status": "failed",
-        "error": "fixture failure for renderer QA",
-      }
-    ]
-
-    detail_response = client.get(f"/api/control/batches/{batch_id}", headers=headers)
-    list_response = client.get("/api/control/batches", headers=headers)
-
-  assert detail_response.status_code == 200, detail_response.text
-  assert detail_response.json()["batch"]["batch_id"] == batch_id
-  assert list_response.status_code == 200, list_response.text
-  assert [item["batch_id"] for item in list_response.json()["batches"]] == [batch_id]
-  assert fake_batch_control.acquire_calls == []
-  assert fake_batch_control.run_calls == []
 
 
 def test_control_batches_cancel_awaits_terminal_state(fake_batch_control: FakeBatchController) -> None:
@@ -2893,7 +2792,6 @@ def test_control_batches_cancel_denies_pending_approval_before_task_teardown(
       "approved": False,
       "allow_tool_type": False,
       "approval_id": request_record.approval_id,
-      "denied_by": None,
     }
     assert app.state.batch_task_registry.approval_projections.projections_for_owner(
       owner_user_id="alice",
@@ -3024,7 +2922,6 @@ def test_control_batches_cancel_respects_policy_role_authorization(
     request_record, queue, batch_session = _install_batch_pending_approval(
       app=app,
       batch_id=batch_id,
-      required_decider_count=3,
     )
     task = app.state.batch_task_registry.get(
       owner_user_id="alice",
@@ -3040,7 +2937,6 @@ def test_control_batches_cancel_respects_policy_role_authorization(
     )
     stored = _run(app.state.gateway_approval_store.get(request_record.approval_id))
     assert stored.state == "pending_user"
-    assert stored.votes_received_count == 0
     assert queue.empty()
     detail = client.get(f"/api/control/batches/{batch_id}", headers=headers)
     assert detail.json()["batch"]["status"] == "running"
@@ -3444,7 +3340,6 @@ def test_control_batches_unauthorized_cancel_with_late_registration_changes_noth
       stored = _run(original_get(request_record.approval_id))
       assert stored.state == "pending_user"
       assert stored.state_version == 0
-      assert stored.votes_received_count == 0
     assert _run(original_get("late-rejected-approval")) is None
     assert allowed_queue.empty()
     assert denied_queue.empty()
@@ -3474,7 +3369,7 @@ def test_control_batches_unauthorized_cancel_with_late_registration_changes_noth
     assert set(projection_registry._carriers) == before_carrier_keys
 
 
-def test_control_batches_cancel_terminalizes_multi_decider_approval_without_quorum(
+def test_control_batches_cancel_terminalizes_pending_approval(
   fake_batch_control: FakeBatchController,
 ) -> None:
   fake_batch_control.wait_for_cancel = True
@@ -3486,7 +3381,6 @@ def test_control_batches_cancel_terminalizes_multi_decider_approval_without_quor
     request_record, queue, _batch_session = _install_batch_pending_approval(
       app=app,
       batch_id=batch_id,
-      required_decider_count=2,
     )
 
     cancel_response = client.delete(f"/api/control/batches/{batch_id}", headers=headers)
@@ -3494,8 +3388,6 @@ def test_control_batches_cancel_terminalizes_multi_decider_approval_without_quor
     assert cancel_response.status_code == 200, cancel_response.text
     stored = _run(app.state.gateway_approval_store.get(request_record.approval_id))
     assert stored.state == "denied"
-    assert stored.required_decider_count == 2
-    assert stored.votes_received_count == 0
     assert queue.get_nowait()["approved"] is False
 
 
@@ -3739,7 +3631,6 @@ def test_batch_approval_cancel_interleaving_never_releases_approved_tool(
       "approved": False,
       "allow_tool_type": False,
       "approval_id": request_record.approval_id,
-      "denied_by": None,
     }
     assert queue.empty()
 
@@ -3805,7 +3696,6 @@ def test_http_approval_handler_racing_batch_cancel_never_releases_approved_tool(
       "approved": False,
       "allow_tool_type": False,
       "approval_id": request_record.approval_id,
-      "denied_by": None,
     }
     assert queue.empty()
 
@@ -4043,8 +3933,6 @@ def test_batch_task_registry_shutdown_terminalizes_pending_before_projection_cle
       approval_constraint="standard",
       state="pending_user",
       requested_at=utc_now(),
-      required_decider_count=3,
-      eligible_decider_count=3,
     )
     await store.create(request_record)
     queue: asyncio.Queue = asyncio.Queue(maxsize=1)

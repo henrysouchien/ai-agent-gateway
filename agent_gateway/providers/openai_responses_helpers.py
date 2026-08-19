@@ -409,13 +409,9 @@ def _parse_tool_input(raw: str) -> dict[str, Any]:
 
 
 def _redacted_tool_input(name: str, value: dict[str, Any]) -> dict[str, Any]:
-  try:
-    from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
-    return redact_tool_input(name, value, deployment_secret=get_audit_hmac_secret())
-  except Exception:
-    from ..secret_boundary import sanitization_failure_tool_input
+  from ..runner_tool_audit import redact_tool_input_for_event
 
-    return sanitization_failure_tool_input()
+  return redact_tool_input_for_event(name, value)
 
 
 def _terminal_events(response: dict[str, Any], state: _ResponsesStreamState) -> list[StreamEvent]:

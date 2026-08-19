@@ -177,7 +177,7 @@ async def startup_manager(
     try:
       prepared_config = manager._prepare_server_config_for_startup(server_config)
     except ValueError as exc:
-      logger.warning("Skipping MCP server %s: invalid per-user config", server_name)
+      logger.warning("Skipping MCP server %s: invalid config", server_name)
       manager._set_startup_diagnostic(
         server_name,
         category="invalid_config",

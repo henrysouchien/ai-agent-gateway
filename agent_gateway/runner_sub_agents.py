@@ -116,7 +116,9 @@ def _build_child_event_log(
         progress_cb(event_copy, session_id)
       except Exception:
         pass
-    if original_on_event is not None:
+    if event_copy.get("type") == "tool_approval_request":
+      parent_log.append(event_copy)
+    elif original_on_event is not None:
       try:
         original_on_event(event_copy, session_id)
       except Exception:
@@ -242,6 +244,7 @@ class RunnerSubAgentMixin:
       progress_cb=progress_cb,
       on_sub_event=on_sub_event,
     )
+    dispatcher._event_log = sub_log
     child_cost_accumulator = _child_cost_observation_accumulator(
       self,
       cost_observation_threshold_usd=cost_observation_threshold_usd,
@@ -257,7 +260,7 @@ class RunnerSubAgentMixin:
       per_turn_timeout=per_turn_timeout if per_turn_timeout is not None else self._per_turn_timeout,
       stream_stall_timeout=self._stream_stall_timeout,
       mcp_client=self._mcp_client,
-      loaded_mcp_servers=self._loaded_mcp_servers,
+      mcp_activation_fold=self._mcp_activation_fold,
       excluded_tools=excluded_tools or set(),
       get_tool_definitions=child_get_tool_definitions,
       on_tool_result=self._on_tool_result,
@@ -384,6 +387,10 @@ class RunnerSubAgentMixin:
         if cancellation_signal is not None
         else []
       ),
+      # B-3: the authority frozen at admission, never the ambient catalog.
+      admitted_task=(
+        task_entry.admitted_task if task_entry is not None else None
+      ),
     )
     if cancelled_error is not None:
       if task_entry is not None:
@@ -472,6 +479,7 @@ class RunnerSubAgentMixin:
       progress_cb=progress_cb,
       on_sub_event=on_sub_event,
     )
+    dispatcher._event_log = sub_log
     child_cost_accumulator = _child_cost_observation_accumulator(
       self,
       cost_observation_threshold_usd=cost_observation_threshold_usd,
@@ -487,7 +495,7 @@ class RunnerSubAgentMixin:
       per_turn_timeout=per_turn_timeout if per_turn_timeout is not None else self._per_turn_timeout,
       stream_stall_timeout=self._stream_stall_timeout,
       mcp_client=self._mcp_client,
-      loaded_mcp_servers=self._loaded_mcp_servers,
+      mcp_activation_fold=self._mcp_activation_fold,
       excluded_tools=excluded_tools or set(),
       get_tool_definitions=child_get_tool_definitions,
       on_tool_result=self._on_tool_result,
@@ -617,6 +625,10 @@ class RunnerSubAgentMixin:
         else []
       ),
       prior_evidence=prior_evidence,
+      # B-3: the authority frozen at admission, never the ambient catalog.
+      admitted_task=(
+        task_entry.admitted_task if task_entry is not None else None
+      ),
     )
     if cancelled_error is not None:
       if task_entry is not None:

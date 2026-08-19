@@ -15,69 +15,24 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway.providers import CodexProvider
 from agent_gateway.providers.base import ThinkingLevel
-import agent_gateway.providers.codex as codex_provider_module
 import agent_gateway.providers.codex_helpers as codex_helpers
 import agent_gateway.providers.codex_model_info as codex_model_info
 from agent_gateway.providers.codex import (
-  JWT_CLAIM_PATH,
   _ResponsesStreamState,
   _convert_messages,
   _convert_tools,
-  _encode_text_signature_v1,
   _extract_account_id,
   _map_event,
   _parse_sse,
   _resolve_codex_url,
 )
+from agent_gateway.providers.codex_helpers import (
+  JWT_CLAIM_PATH,
+  _encode_text_signature_v1,
+)
 
 
-def test_codex_provider_helper_exports_are_parent_aliases() -> None:
-  helper_names = (
-    "DEFAULT_CODEX_BASE_URL",
-    "JWT_CLAIM_PATH",
-    "DEFAULT_INSTRUCTIONS",
-    "_BETA_HEADER",
-    "_CODEX_ORIGINATOR",
-    "_CODEX_USER_AGENT",
-    "_RETRYABLE_STATUSES",
-    "_RETRYABLE_RE",
-    "_CODEX_RESPONSE_STATUSES",
-    "_TOOL_ID_RE",
-    "_SURROGATE_RE",
-    "_MODEL_INFO_BY_TAG",
-    "_ResponsesStreamState",
-    "_config_base_url",
-    "_model_matches_tag",
-    "_credential_token",
-    "_json_dumps_compact",
-    "_encode_text_signature_v1",
-    "_parse_text_signature",
-    "_short_hash",
-    "_sanitize_surrogates",
-    "_system_prompt_text",
-    "_resolve_codex_url",
-    "_normalize_codex_status",
-    "_map_reasoning_effort",
-    "_clamp_reasoning_effort",
-    "_same_model_message",
-    "_synthetic_tool_result",
-    "_normalize_responses_tool_call_id",
-    "_assistant_text_block",
-    "_tool_result_output",
-    "_parse_streaming_json",
-    "_extract_account_id",
-    "_build_headers",
-    "_convert_tools",
-    "_convert_messages",
-    "_parse_sse",
-    "_map_stop_reason",
-    "_map_event",
-    "_parse_error_response",
-  )
-
-  for name in helper_names:
-    assert getattr(codex_provider_module, name) is getattr(codex_helpers, name)
-
+def test_codex_model_info_helper_exports_are_parent_aliases() -> None:
   model_info_helper_names = (
     "_MODEL_INFO_BY_TAG",
     "_model_matches_tag",

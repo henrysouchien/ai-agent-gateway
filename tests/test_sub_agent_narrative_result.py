@@ -6,10 +6,13 @@ import pytest
 from agent_workflow_contracts import (
   AgentOperationRef,
   AttemptRef,
+  LiveToolCapabilityBinding,
   OrdinaryDelegationTaskRef,
   OutcomeRequirement,
   ResultRequirement,
   TaskResultProvenance,
+  ToolGrant,
+  ToolGrantEntry,
   sha256_digest,
 )
 
@@ -351,3 +354,197 @@ async def test_no_citation_context_child_yields_no_fabricated_citations(
   assert observed[0].kind == "observed_source"
   assert observed[0].excerpt_handle_id is None
   assert all(ref.kind != "citation" for ref in observed)
+
+
+def _admitted_task(*, tool_ids: tuple[str, ...] = ("filings_search",)):
+  """The two authority fields the settlement site reads, and nothing else."""
+
+  return SimpleNamespace(
+    tool_grant=ToolGrant(
+      grant_id="grant-1",
+      tools=tuple(
+        ToolGrantEntry(tool_id=tool_id, route_id="route-1", effect="read")
+        for tool_id in tool_ids
+      ),
+      digest=sha256_digest({"grant": list(tool_ids)}),
+    ),
+    capability_bindings=(
+      LiveToolCapabilityBinding(
+        capability="research-filings.read/v1",
+        route_id="route-1",
+        tool_ids=tool_ids,
+      ),
+    ),
+  )
+
+
+async def _narrative(tmp_path, text: str = "Partial but real answer."):
+  visible = await final_child_visible_text(
+    _NarrativeLog([
+      _assistant_entry(text, seq=11, ordinal=0, terminal=True)
+    ]),
+    sub_session_id="child-1",
+    workspace_dir=str(tmp_path),
+  )
+  return visible.final_narrative
+
+
+@pytest.mark.asyncio
+async def test_turns_exhausted_with_narrative_settles_succeeded_and_partial(
+  tmp_path,
+) -> None:
+  # B-3 (design §4.5): a child that hit its turn ceiling and still published a
+  # durable terminal narrative did real work. The discard branch is gone.
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    ({"type": "max_turns_reached", "turn_count": 4, "max_turns": 3},),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path),
+    timed_out=False,
+    timeout=None,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.execution.status == "succeeded"
+  # ExecutionSettlement forbids a terminal_reason on succeeded: the exhaustion
+  # fact rides the outcome instead.
+  assert result.execution.terminal_reason is None
+  assert result.outcome is not None
+  assert result.outcome.disposition == "partial"
+  assert result.outcome.assessment_source == "mechanically_derived"
+  assert result.outcome.unmet_requirements == ("turns_exhausted",)
+  assert result.values.terminal_narrative is not None
+
+
+def test_turns_exhausted_without_narrative_still_fails() -> None:
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    ({"type": "max_turns_reached", "turn_count": 4, "max_turns": 3},),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=None,
+    timed_out=False,
+    timeout=None,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.execution.status == "failed"
+  assert result.execution.terminal_reason == "turns_exhausted"
+  assert result.outcome is None
+  assert result.values.terminal_narrative is None
+
+
+@pytest.mark.asyncio
+async def test_turns_exhausted_beside_another_signal_keeps_failing(
+  tmp_path,
+) -> None:
+  # The remap fires only when exhaustion is the SOLE terminal signal; the
+  # precedence tuple already orders the harder failures ahead of it.
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    ({"type": "max_turns_reached", "turn_count": 4, "max_turns": 3},),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path),
+    timed_out=True,
+    timeout=30.0,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.execution.status == "interrupted"
+  assert result.execution.terminal_reason.startswith("timeout:")
+  assert result.outcome is None
+  assert result.values.terminal_narrative is None
+
+
+@pytest.mark.asyncio
+async def test_clean_execution_derives_a_complete_mechanical_outcome(
+  tmp_path,
+) -> None:
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    (
+      {"type": "tool_call_start", "tool_name": "filings_search"},
+      {
+        "type": "tool_call_complete",
+        "tool_name": "filings_search",
+        "dispatch": {"outcome": "ok"},
+      },
+    ),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path, "Complete answer."),
+    timed_out=False,
+    timeout=None,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.execution.status == "succeeded"
+  assert result.outcome is not None
+  assert result.outcome.disposition == "complete"
+  assert result.outcome.assessment_source == "mechanically_derived"
+
+
+@pytest.mark.asyncio
+async def test_failed_source_retrievals_derive_insufficient_evidence(
+  tmp_path,
+) -> None:
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    (
+      {"type": "tool_call_start", "tool_name": "filings_search"},
+      {
+        "type": "tool_call_complete",
+        "tool_name": "filings_search",
+        "dispatch": {"outcome": "error_rate_limited"},
+      },
+    ),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path, "I could not read the filings."),
+    timed_out=False,
+    timeout=None,
+    admitted_task=_admitted_task(),
+  )
+
+  assert result.outcome is not None
+  assert result.outcome.disposition == "insufficient_evidence"
+
+
+@pytest.mark.asyncio
+async def test_settlement_without_an_admitted_task_derives_no_outcome(
+  tmp_path,
+) -> None:
+  # task_entry is Optional at all three settlement sites. No admission in
+  # scope means no assessment occurred — never a false ``complete``.
+  logical, attempt, provenance = _task_identity()
+
+  result = task_result_from_execution(
+    (),
+    logical_task=logical,
+    attempt=attempt,
+    requirement=_narrative_requirement(),
+    provenance=provenance,
+    final_narrative=await _narrative(tmp_path, "Unadmitted answer."),
+    timed_out=False,
+    timeout=None,
+  )
+
+  assert result.execution.status == "succeeded"
+  assert result.outcome is None

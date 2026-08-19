@@ -27,6 +27,14 @@ def test_lh16_explicit_ticker_canonicalization_rejects_invalid_shapes(ticker: st
     canonicalize_ticker(ticker)
 
 
+@pytest.mark.parametrize("ticker", [None, 123, True])
+def test_explicit_ticker_canonicalization_rejects_non_strings(
+  ticker: object,
+) -> None:
+  with pytest.raises(ValueError, match="must be a string|required"):
+    canonicalize_ticker(ticker)
+
+
 def test_share_class_tickers_normalize_to_letter_only_artifact_paths(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,

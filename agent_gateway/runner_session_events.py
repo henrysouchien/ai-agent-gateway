@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import json
 from typing import Any, Callable, Dict, Iterable, List
 
@@ -99,12 +100,14 @@ def build_user_message_event(
   content: Any,
   client_kind: str,
   received_at: float,
+  selected_content: tuple[dict[str, object], ...],
 ) -> Dict[str, Any]:
   return {
     "type": "user_message",
     "content": content,
     "client_kind": client_kind,
     "received_at": received_at,
+    "selected_content": list(selected_content),
   }
 
 
@@ -287,8 +290,18 @@ def build_tool_call_complete_event(
   error: Dict[str, Any] | None,
   duration_ms: int,
   server: str | None,
+  dispatch: Mapping[str, Any],
   semantic_error: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+  """Build the settled tool event.
+
+  ``dispatch`` is required and emitted unconditionally: every tool call in
+  every runtime settles exactly one dispatch record (outcome, attempts,
+  route_id, plural sources).  Both producers — this choke point and the SDK
+  runner stream — go through here so no runtime silently degrades the
+  evidence fold to the block-reading fallback (D-B1-1).
+  """
+
   payload: Dict[str, Any] = {
     "type": "tool_call_complete",
     "tool_call_id": tool_call_id,
@@ -301,7 +314,21 @@ def build_tool_call_complete_event(
   }
   if semantic_error is not None:
     payload["semantic_error"] = dict(semantic_error)
+  payload["dispatch"] = _normalized_dispatch_record(dispatch)
   return payload
+
+
+def _normalized_dispatch_record(dispatch: Mapping[str, Any]) -> Dict[str, Any]:
+  if not isinstance(dispatch, Mapping):
+    raise TypeError("tool_call_complete requires a dispatch record mapping")
+  record = dict(dispatch)
+  raw_sources = record.get("sources")
+  record["sources"] = [
+    dict(source)
+    for source in (raw_sources if isinstance(raw_sources, (list, tuple)) else ())
+    if isinstance(source, Mapping)
+  ]
+  return record
 
 
 def build_turn_complete_event(*, turn: int, usage: Dict[str, Any]) -> Dict[str, Any]:

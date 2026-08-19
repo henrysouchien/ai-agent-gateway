@@ -13,6 +13,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentRunner, AgentSessionLog  # noqa: E402
+from agent_gateway.agent_session_log_records import EVENT_SCHEMA_VERSION  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_session_lifecycle import RunnerSessionLifecycleMixin  # noqa: E402
 from agent_gateway.product_config import gateway_product_id  # noqa: E402
@@ -50,6 +51,7 @@ from agent_gateway.runner_session_events import (  # noqa: E402
   shutdown_interrupted_reason,
   write_lease_metadata,
 )
+from agent_gateway.skill_completion_wal import SkillCompletionWalCorruptError  # noqa: E402
 
 
 def test_context_pressure_reminder_copy_is_model_actionable() -> None:
@@ -86,6 +88,31 @@ def test_runner_session_lifecycle_methods_are_inherited_from_mixin() -> None:
     "_release_write_lease",
   ):
     assert getattr(AgentRunner, method_name) is getattr(RunnerSessionLifecycleMixin, method_name)
+
+
+@pytest.mark.parametrize(
+  "outer_version",
+  (True, False, 2.0, "2", 1, 3, None),
+)
+def test_top_level_durable_envelopes_require_exact_current_integer_version(
+  outer_version: object,
+) -> None:
+  runner = object.__new__(AgentRunner)
+  event = {
+    "type": "stream_complete",
+    "event_schema_version": outer_version,
+    "runner_id": "runner-1",
+    "role": "writer",
+  }
+
+  with pytest.raises(RuntimeError, match="invalid schema"):
+    runner._expected_durable_top_level_event(event)
+  with pytest.raises(RuntimeError, match="invalid schema"):
+    runner._append_exact_durable_top_level_envelope_sync(event)
+  with pytest.raises(SkillCompletionWalCorruptError, match="invalid schema"):
+    runner._durable_top_level_wrapper(event)
+
+  assert EVENT_SCHEMA_VERSION == 2
 
 
 def test_runner_session_lifecycle_resolves_parent_module_event_builders(monkeypatch: Any) -> None:
@@ -252,11 +279,17 @@ def test_session_event_builders_copy_inputs_and_shape_payloads() -> None:
     "started_at": 1.5,
     "hostname": "host",
   }
-  assert build_user_message_event(content="question", client_kind="web", received_at=2.5) == {
+  assert build_user_message_event(
+    content="question",
+    client_kind="web",
+    received_at=2.5,
+    selected_content=(),
+  ) == {
     "type": "user_message",
     "content": "question",
     "client_kind": "web",
     "received_at": 2.5,
+    "selected_content": [],
   }
   assert assistant == {
     "type": "assistant_message",
@@ -536,6 +569,12 @@ def test_tool_lifecycle_event_builders_shape_payloads_and_copy_result_fields() -
 
   result = {"ok": True}
   semantic_error = {"code": "low_match"}
+  dispatch = {
+    "outcome": "error_semantic",
+    "attempts": 1,
+    "route_id": "mcp:research/lookup",
+    "sources": [],
+  }
   complete_event = build_tool_call_complete_event(
     tool_call_id="toolu_1",
     tool_name="lookup",
@@ -543,10 +582,12 @@ def test_tool_lifecycle_event_builders_shape_payloads_and_copy_result_fields() -
     error=None,
     duration_ms=42,
     server="research",
+    dispatch=dispatch,
     semantic_error=semantic_error,
   )
   result["ok"] = False
   semantic_error["code"] = "mutated"
+  dispatch["outcome"] = "mutated"
 
   assert complete_event == {
     "type": "tool_call_complete",
@@ -558,6 +599,12 @@ def test_tool_lifecycle_event_builders_shape_payloads_and_copy_result_fields() -
     "server": "research",
     "is_error": True,
     "semantic_error": {"code": "low_match"},
+    "dispatch": {
+      "outcome": "error_semantic",
+      "attempts": 1,
+      "route_id": "mcp:research/lookup",
+      "sources": [],
+    },
   }
   assert build_tool_call_complete_event(
     tool_call_id="toolu_2",
@@ -566,6 +613,12 @@ def test_tool_lifecycle_event_builders_shape_payloads_and_copy_result_fields() -
     error={"code": "tool_error"},
     duration_ms=5,
     server=None,
+    dispatch={
+      "outcome": "error_semantic",
+      "attempts": 1,
+      "route_id": "local/lookup",
+      "sources": (),
+    },
   ) == {
     "type": "tool_call_complete",
     "tool_call_id": "toolu_2",
@@ -575,7 +628,25 @@ def test_tool_lifecycle_event_builders_shape_payloads_and_copy_result_fields() -
     "duration_ms": 5,
     "server": None,
     "is_error": True,
+    "dispatch": {
+      "outcome": "error_semantic",
+      "attempts": 1,
+      "route_id": "local/lookup",
+      "sources": [],
+    },
   }
+
+
+def test_tool_call_complete_requires_a_dispatch_record() -> None:
+  with pytest.raises(TypeError):
+    build_tool_call_complete_event(  # type: ignore[call-arg]
+      tool_call_id="toolu_3",
+      tool_name="lookup",
+      result={"status": "success"},
+      error=None,
+      duration_ms=1,
+      server=None,
+    )
 
 
 def test_run_terminal_and_limit_event_builders_shape_payloads() -> None:

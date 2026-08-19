@@ -62,7 +62,6 @@ except Exception as exc:
 
 log = logging.getLogger("agent_gateway.mcp_client")
 _UNSET = _config_helpers.UNSET
-_ENV_REF_RE = _config_helpers.ENV_REF_RE
 _STREAMABLE_HTTP_TYPES = _config_helpers.STREAMABLE_HTTP_TYPES
 _SUPPORTED_SERVER_TYPES = _config_helpers.SUPPORTED_SERVER_TYPES
 _DEFAULT_ENV_ALLOWLIST = _config_helpers.DEFAULT_ENV_ALLOWLIST
@@ -90,15 +89,6 @@ PER_USER_IDLE_REAP_SECONDS = 30 * 60
 PER_USER_REAPER_INTERVAL_SECONDS = 60.0
 PER_USER_INSTANCE_CAP = 32
 PER_USER_DRAIN_TIMEOUT_SECONDS = 60.0
-_MCP_STDIO_CONNECT_RETRIES_ENV = _config_helpers.MCP_STDIO_CONNECT_RETRIES_ENV
-_MCP_STDIO_CONNECT_BACKOFF_ENV = _config_helpers.MCP_STDIO_CONNECT_BACKOFF_ENV
-_MCP_STDIO_CONNECT_STABILIZE_ENV = _config_helpers.MCP_STDIO_CONNECT_STABILIZE_ENV
-_MCP_STARTUP_CONCURRENCY_ENV = _config_helpers.MCP_STARTUP_CONCURRENCY_ENV
-_MCP_STDIO_CONNECT_RETRIES_DEFAULT = _config_helpers.MCP_STDIO_CONNECT_RETRIES_DEFAULT
-_MCP_STDIO_CONNECT_BACKOFF_DEFAULT = _config_helpers.MCP_STDIO_CONNECT_BACKOFF_DEFAULT
-_MCP_STDIO_CONNECT_STABILIZE_DEFAULT = _config_helpers.MCP_STDIO_CONNECT_STABILIZE_DEFAULT
-_MCP_STDIO_RETRYABLE_EXCEPTION_NAMES = _config_helpers.MCP_STDIO_RETRYABLE_EXCEPTION_NAMES
-_MCP_STDIO_RETRYABLE_MESSAGE_MARKERS = _config_helpers.MCP_STDIO_RETRYABLE_MESSAGE_MARKERS
 _PROVIDER_SYMBOL_SYMBOL_TOOLS = frozenset({
   "check_market_cap",
   "compare_peers",
@@ -619,6 +609,7 @@ class McpClientManager:
       build_mcp_env=_build_mcp_env,
       preflight_stdio_executable=_preflight_stdio_executable,
       build_http_headers=_build_http_headers,
+      parse_allowed_tools=_config_helpers.parse_allowed_tools,
       safe_cache_name=_safe_cache_name,
       close_contexts=self._close_contexts,
       server_state_factory=_ServerState,
@@ -702,6 +693,7 @@ class McpClientManager:
     session: ClientSession,
     exit_contexts: List[Any],
     tool_prefix: str,
+    allowed_tools: tuple[str, ...] | None = None,
   ) -> _ServerState:
     return await _connection_helpers.initialize_session_state(
       self,
@@ -709,6 +701,7 @@ class McpClientManager:
       session=session,
       exit_contexts=exit_contexts,
       tool_prefix=tool_prefix,
+      allowed_tools=allowed_tools,
       runtime=self._connection_runtime(),
     )
 
@@ -835,6 +828,11 @@ class McpClientManager:
     config: Mapping[str, Any],
   ) -> Dict[str, Any]:
     prepared = copy.deepcopy(dict(config))
+    allowed_tools = _config_helpers.parse_allowed_tools(
+      prepared.get("allowed_tools")
+    )
+    if allowed_tools is not None:
+      prepared["allowed_tools"] = list(allowed_tools)
     dynamic_env_names = self._declared_per_user_env(prepared)
     if not dynamic_env_names:
       return prepared

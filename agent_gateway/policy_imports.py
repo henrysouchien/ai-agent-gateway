@@ -117,6 +117,15 @@ def authority_policy_denies_tool(
   profile_name: str | None = None,
 ) -> bool:
   """Evaluate authenticated role and scoped session capabilities together."""
+  if session is None:
+    # A sessionless runtime has no scoped capability to evaluate.  Its exact
+    # inherited role is therefore owned by the package-level role policy;
+    # invite authority still fails closed when the host policy is unavailable.
+    return role_policy_denies_tool(
+      role=role,
+      tool_name=tool_name,
+      is_local=is_local,
+    )
   policy_module = load_server_policy_module()
   if policy_module is None:
     return True

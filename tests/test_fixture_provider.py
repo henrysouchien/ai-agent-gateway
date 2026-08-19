@@ -21,15 +21,17 @@ from agent_gateway import AgentRunner, EventLog, ParentMessage, ToolDispatcher
 from agent_gateway.approval_policy import RunContext
 from agent_gateway.approval_resolver import resolve_policy
 from agent_gateway.approval_store import SQLiteApprovalStore
-from agent_gateway.fixture_gate import (
+from tests.deterministic_fixture_support import (
   FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME,
   FIXTURE_CANVAS_ARTIFACT_SKILL_NAME,
   FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME,
   FIXTURE_APPROVAL_TOOL_NAME,
   FIXTURE_MODEL_ID,
   FIXTURE_TERMINAL_FAILURE_SKILL_NAME,
+  FixtureClient,
+  FixtureProvider,
+  fixture_approval_handler,
 )
-from agent_gateway.providers.fixture import FixtureClient, FixtureProvider
 from tests.capability_execution_test_support import (
   stub_runner_capability_execution,
 )
@@ -59,7 +61,7 @@ async def _collect_terminal_failure_prefix(provider: FixtureProvider, client: Fi
 
 
 def test_fixture_stream_turn_one_yields_complete_gated_tool(monkeypatch) -> None:
-  monkeypatch.setattr("agent_gateway.providers.fixture._fixture_run_seconds", lambda: 0.0)
+  monkeypatch.setattr("tests.deterministic_fixture_support._fixture_run_seconds", lambda: 0.0)
   provider = FixtureProvider()
   client = provider.create_client({"model": FIXTURE_MODEL_ID})
 
@@ -85,7 +87,7 @@ def test_fixture_stream_turn_one_yields_complete_gated_tool(monkeypatch) -> None
 
 
 def test_fixture_stream_turn_two_echoes_operator_steering(monkeypatch) -> None:
-  monkeypatch.setattr("agent_gateway.providers.fixture._fixture_run_seconds", lambda: 0.0)
+  monkeypatch.setattr("tests.deterministic_fixture_support._fixture_run_seconds", lambda: 0.0)
   provider = FixtureProvider()
   client = provider.create_client({"model": FIXTURE_MODEL_ID})
   asyncio.run(_collect(provider, client, {"messages": []}))
@@ -116,7 +118,7 @@ def test_fixture_stream_turn_two_echoes_operator_steering(monkeypatch) -> None:
 
 
 def test_fixture_canvas_artifact_stream_emits_complete_canvas_tool_call(monkeypatch) -> None:
-  monkeypatch.setattr("agent_gateway.providers.fixture._fixture_run_seconds", lambda: 0.0)
+  monkeypatch.setattr("tests.deterministic_fixture_support._fixture_run_seconds", lambda: 0.0)
   provider = FixtureProvider()
   client = provider.create_client({"model": FIXTURE_MODEL_ID})
 
@@ -171,7 +173,7 @@ def test_fixture_canvas_artifact_stream_emits_complete_canvas_tool_call(monkeypa
 
 
 def test_fixture_dashboard_artifact_stream_emits_checked_in_payload(monkeypatch) -> None:
-  monkeypatch.setattr("agent_gateway.providers.fixture._fixture_run_seconds", lambda: 0.0)
+  monkeypatch.setattr("tests.deterministic_fixture_support._fixture_run_seconds", lambda: 0.0)
   provider = FixtureProvider()
   client = provider.create_client({"model": FIXTURE_MODEL_ID})
   expected_payload = json.loads(
@@ -227,7 +229,7 @@ def test_fixture_dashboard_artifact_stream_emits_checked_in_payload(monkeypatch)
 
 
 def test_fixture_approval_canvas_artifact_stream_requests_approval_with_evidence(monkeypatch) -> None:
-  monkeypatch.setattr("agent_gateway.providers.fixture._fixture_run_seconds", lambda: 0.0)
+  monkeypatch.setattr("tests.deterministic_fixture_support._fixture_run_seconds", lambda: 0.0)
   provider = FixtureProvider()
   client = provider.create_client({"model": FIXTURE_MODEL_ID})
 
@@ -319,7 +321,7 @@ def test_fixture_approval_canvas_artifact_stream_requests_approval_with_evidence
 
 
 def test_fixture_terminal_failure_stream_raises_deterministic_error(monkeypatch) -> None:
-  monkeypatch.setattr("agent_gateway.providers.fixture._fixture_run_seconds", lambda: 0.0)
+  monkeypatch.setattr("tests.deterministic_fixture_support._fixture_run_seconds", lambda: 0.0)
   provider = FixtureProvider()
   client = provider.create_client({"model": FIXTURE_MODEL_ID})
 
@@ -344,7 +346,7 @@ def test_fixture_terminal_failure_stream_raises_deterministic_error(monkeypatch)
 
 def test_fixture_runner_reaches_approval_pending_then_completes(monkeypatch, tmp_path) -> None:
   monkeypatch.setenv("APP_ENV", "test")
-  monkeypatch.setattr("agent_gateway.providers.fixture._fixture_run_seconds", lambda: 0.0)
+  monkeypatch.setattr("tests.deterministic_fixture_support._fixture_run_seconds", lambda: 0.0)
 
   async def _run() -> EventLog:
     provider = FixtureProvider()
@@ -375,12 +377,9 @@ def test_fixture_runner_reaches_approval_pending_then_completes(monkeypatch, tmp
       ),
     )
 
-    async def _fixture_gate_handler(tool_input: dict[str, Any], **_kwargs: Any):
-      return {"ok": True, "input": dict(tool_input)}, None
-
     dispatcher = ToolDispatcher(
       mcp_client=_NullMcpClient(),
-      local_tool_handlers={FIXTURE_APPROVAL_TOOL_NAME: _fixture_gate_handler},
+      local_tool_handlers={FIXTURE_APPROVAL_TOOL_NAME: fixture_approval_handler},
       needs_approval=lambda name, _tool_input=None, _qualifier="": name == FIXTURE_APPROVAL_TOOL_NAME,
       event_log=event_log,
       session_id="fixture-session",

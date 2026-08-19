@@ -16,10 +16,28 @@ from agent_workflow_contracts import (
   AuthoredDeliverySummary,
   ContentHandle,
   ContractRef,
-  DeliveryEnvelope,
+  DeliveryEnvelopeV1,
   DeliveryPrimary,
+  OwnerBinding,
+  PublishedOutput,
+  PublishedOutputPageAuthorization,
   PublishedOutputRef,
+  WorkflowContentCursor,
+  WorkflowContentPage,
 )
+
+# Real pages come from the api-side store and published-output reader — the
+# exact production seam behind the wired read_output.
+try:
+  from api.agent.orchestration.workflow_content import (
+    AuthorizedPublishedOutputReader,
+    WorkspaceWorkflowContentStore,
+  )
+except ModuleNotFoundError:  # pragma: no cover - depends on invocation path
+  from agent.orchestration.workflow_content import (
+    AuthorizedPublishedOutputReader,
+    WorkspaceWorkflowContentStore,
+  )
 
 
 class _Auth:
@@ -75,7 +93,7 @@ def _attachment(content: str) -> WorkflowOutputAttachment:
       content_bytes=len(payload),
       contract=primary_contract,
       media_type="application/json",
-      encoding="canonical-json",
+      encoding="utf-8",
       retention="durable",
     ),
   )
@@ -89,7 +107,8 @@ def _attachment(content: str) -> WorkflowOutputAttachment:
     digest=f"sha256:{'c' * 64}",
   )
   return WorkflowOutputAttachment(
-    envelope=DeliveryEnvelope(
+    envelope=DeliveryEnvelopeV1(
+      schema_version="1.0",
       workflow_run_id="workflow-1",
       phase_number=2,
       revision=1,
@@ -131,42 +150,119 @@ def _record_attachment(
   })
 
 
-def _reader(content: str, attachment: WorkflowOutputAttachment):
+def _published_reader(
+  tmp_path: Path,
+  content: str,
+  attachment: WorkflowOutputAttachment,
+):
+  """Serve real pages through the production store and authorized reader."""
+
+  workspace = tmp_path / "content-workspace"
+  workspace.mkdir(exist_ok=True)
+  store = WorkspaceWorkflowContentStore(workspace)
+  owner = OwnerBinding(
+    tenant_id="tenant-1",
+    workflow_run_id=attachment.workflow_run_id,
+  )
+  handle = store.publish_serialized(
+    content,
+    contract=attachment.published_output_ref.contract,
+    owner=owner,
+    media_type=attachment.media_type,
+  )
+  publication = PublishedOutput(
+    name=attachment.output_name,
+    output_id=attachment.output_id,
+    contract=attachment.published_output_ref.contract,
+    content=handle,
+  )
+  reader = AuthorizedPublishedOutputReader(
+    payload_reader=store,
+    owner=owner,
+    principal_id="alice",
+    workflow_run_id=attachment.workflow_run_id,
+    phase_number=attachment.delivery_phase_number,
+    revision=attachment.delivery_revision,
+    publications=(publication,),
+  )
+
   async def read(
     workflow_run_id: str,
     output_id: str,
     after_char: int,
-  ) -> dict[str, object]:
+  ) -> WorkflowContentPage:
     assert workflow_run_id == attachment.workflow_run_id
     assert output_id == attachment.output_id
-    chunk = content[after_char : after_char + 7]
-    next_after = after_char + len(chunk)
-    end = next_after == len(content)
-    return {
-      "ok": True,
-      "action": "output",
-      "workflow_run_id": workflow_run_id,
-      "output_id": output_id,
-      "view": "paged_exact_content",
-      "source": attachment.published_output_ref.content.model_dump(mode="json"),
-      "authorization": {
-        "kind": "published_output",
-        "workflow_run_id": workflow_run_id,
-        "phase_number": attachment.delivery_phase_number,
-        "revision": attachment.delivery_revision,
-        "output_id": output_id,
-      },
-      "encoding": "canonical-json",
-      "after_char": after_char,
-      "content": chunk,
-      "content_sha256": attachment.content_sha256,
-      "content_chars": attachment.content_chars,
-      "content_bytes": attachment.content_bytes,
-      "next_cursor": None if end else {"after_char": next_after},
-      "end": end,
-    }
+    return reader.page(
+      publication,
+      owner=owner,
+      principal_id="alice",
+      after_char=after_char,
+    )
 
   return read
+
+
+def _content_page(
+  content: str,
+  attachment: WorkflowOutputAttachment,
+  after_char: int,
+  *,
+  source: ContentHandle | None = None,
+  authorization: PublishedOutputPageAuthorization | None = None,
+) -> WorkflowContentPage:
+  """Build an internally-valid typed page claiming the given identity."""
+
+  chunk = content[after_char : after_char + 7]
+  next_after = after_char + len(chunk)
+  end = next_after == len(content)
+  return WorkflowContentPage(
+    source=source or attachment.published_output_ref.content,
+    authorization=authorization
+    or PublishedOutputPageAuthorization(
+      workflow_run_id=attachment.workflow_run_id,
+      phase_number=attachment.delivery_phase_number,
+      revision=attachment.delivery_revision,
+      output_id=attachment.output_id,
+    ),
+    after_char=after_char,
+    content=chunk,
+    next_cursor=(
+      None if end else WorkflowContentCursor(after_char=next_after)
+    ),
+    end=end,
+    complete_source=after_char == 0 and end,
+  )
+
+
+def _lying_page_reader(content: str, attachment: WorkflowOutputAttachment):
+  """Typed pages claiming the attachment's exact source over different text.
+
+  Every per-page check passes; only the final joined-digest defense can
+  catch the substitution.
+  """
+
+  async def read(
+    workflow_run_id: str,
+    output_id: str,
+    after_char: int,
+  ) -> WorkflowContentPage:
+    assert workflow_run_id == attachment.workflow_run_id
+    assert output_id == attachment.output_id
+    return _content_page(content, attachment, after_char)
+
+  return read
+
+
+def _variant_source(
+  attachment: WorkflowOutputAttachment,
+  **overrides: object,
+) -> ContentHandle:
+  dump = attachment.published_output_ref.content.model_dump(mode="json")
+  dump.update(overrides)
+  if "content_sha256" in overrides:
+    dump["content_id"] = f"sha256:{overrides['content_sha256']}"
+  return ContentHandle.model_validate(dump)
 
 
 @pytest.mark.asyncio
@@ -181,7 +277,9 @@ async def test_authenticated_route_materializes_and_verifies_exact_output(
   session, session_log = _session(tmp_path)
   attachment = _attachment(canonical)
   _record_attachment(session_log, attachment)
-  session.workflow_output_reader = _reader(canonical, attachment)
+  session.workflow_output_reader = _published_reader(
+    tmp_path, canonical, attachment
+  )
 
   response = await workflow_output_response(
     _request(),
@@ -198,6 +296,110 @@ async def test_authenticated_route_materializes_and_verifies_exact_output(
   assert response.headers["content-disposition"] == (
     'attachment; filename="synthesis.json"'
   )
+
+
+@pytest.mark.asyncio
+async def test_acc_e2e_01_typed_service_pages_materialize_across_cursors(
+  tmp_path: Path,
+) -> None:
+  """Regression for ACC-E2E-01 (the deterministic envelope-dialect 409).
+
+  The wired reader returns bare typed WorkflowContentPage values — never a
+  workflow_run TOOL envelope — so real store-produced pages for a valid
+  attachment must materialize end to end across multiple content pages.
+  """
+
+  canonical = json.dumps(
+    {"narrative": "n" * 30_000},
+    ensure_ascii=False,
+    separators=(",", ":"),
+  )
+  session, session_log = _session(tmp_path)
+  attachment = _attachment(canonical)
+  _record_attachment(session_log, attachment)
+  session.workflow_output_reader = _published_reader(
+    tmp_path, canonical, attachment
+  )
+
+  response = await workflow_output_response(
+    _request(),
+    attachment.workflow_run_id,
+    attachment.output_id,
+    auth=_Auth(session),  # type: ignore[arg-type]
+  )
+
+  assert response.status_code == 200
+  assert response.body == canonical.encode("utf-8")
+  assert response.headers["x-content-sha256"] == attachment.content_sha256
+
+
+@pytest.mark.asyncio
+async def test_legacy_workflow_run_tool_envelope_dialect_is_rejected(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  """The old workflow_run TOOL-envelope dialect is not what the wired reader
+  produces; an untyped mapping speaking it must fail as an invalid page."""
+
+  canonical = '"canonical"'
+  session, session_log = _session(tmp_path)
+  attachment = _attachment(canonical)
+  _record_attachment(session_log, attachment)
+
+  async def envelope_reader(
+    workflow_run_id: str,
+    output_id: str,
+    after_char: int,
+  ) -> dict[str, object]:
+    chunk = canonical[after_char : after_char + 7]
+    next_after = after_char + len(chunk)
+    end = next_after == len(canonical)
+    return {
+      "ok": True,
+      "action": "output",
+      "workflow_run_id": workflow_run_id,
+      "output_id": output_id,
+      "view": "paged_exact_content",
+      "source": attachment.published_output_ref.content.model_dump(
+        mode="json"
+      ),
+      "authorization": {
+        "kind": "published_output",
+        "workflow_run_id": workflow_run_id,
+        "phase_number": attachment.delivery_phase_number,
+        "revision": attachment.delivery_revision,
+        "output_id": output_id,
+      },
+      "encoding": "utf-8",
+      "after_char": after_char,
+      "content": chunk,
+      "content_sha256": attachment.content_sha256,
+      "content_chars": attachment.content_chars,
+      "content_bytes": attachment.content_bytes,
+      "next_cursor": None if end else {"after_char": next_after},
+      "end": end,
+    }
+
+  session.workflow_output_reader = envelope_reader
+  with caplog.at_level(
+    logging.WARNING,
+    logger="agent_gateway.server_workflow_output_routes",
+  ):
+    response = await workflow_output_response(
+      _request(),
+      attachment.workflow_run_id,
+      attachment.output_id,
+      auth=_Auth(session),  # type: ignore[arg-type]
+    )
+
+  assert response.status_code == 409
+  assert b"workflow_output_integrity_failed" in response.body
+  assert [
+    record.data["reason_code"]
+    for record in caplog.records
+    if getattr(record, "data", {}).get("event")
+    == "workflow_output_integrity_failed"
+  ] == ["invalid_page_shape"]
 
 
 @pytest.mark.asyncio
@@ -234,7 +436,9 @@ async def test_bearer_session_cannot_read_another_sessions_attachment(
   owner, owner_log = _session(tmp_path / "owner")
   attachment = _attachment(canonical)
   _record_attachment(owner_log, attachment)
-  owner.workflow_output_reader = _reader(canonical, attachment)
+  owner.workflow_output_reader = _published_reader(
+    tmp_path, canonical, attachment
+  )
 
   other, _other_log = _session(tmp_path / "other")
   other.session_id = "session-2"
@@ -277,7 +481,7 @@ async def test_route_rejects_materialized_bytes_that_conflict_with_attachment(
   session, session_log = _session(tmp_path)
   attachment = _attachment(canonical)
   _record_attachment(session_log, attachment)
-  session.workflow_output_reader = _reader('"tampered!"', attachment)
+  session.workflow_output_reader = _lying_page_reader('"tampered!"', attachment)
 
   response = await workflow_output_response(
     _request(),
@@ -307,16 +511,14 @@ async def test_route_rejects_page_hash_or_size_that_conflicts_with_attachment(
   session, session_log = _session(tmp_path)
   attachment = _attachment(canonical)
   _record_attachment(session_log, attachment)
-  exact_reader = _reader(canonical, attachment)
+  variant = _variant_source(attachment, **{field_name: field_value})
 
   async def tampered_reader(
     workflow_run_id: str,
     output_id: str,
     after_char: int,
-  ) -> dict[str, object]:
-    page = await exact_reader(workflow_run_id, output_id, after_char)
-    page[field_name] = field_value
-    return page
+  ) -> WorkflowContentPage:
+    return _content_page(canonical, attachment, after_char, source=variant)
 
   session.workflow_output_reader = tampered_reader
   response = await workflow_output_response(
@@ -330,59 +532,51 @@ async def test_route_rejects_page_hash_or_size_that_conflicts_with_attachment(
   assert b"workflow_output_integrity_failed" in response.body
 
 
-def _tamper_view(page: dict[str, object]) -> None:
-  page["view"] = "wrong_view"
+def _tampered_source_page(
+  content: str,
+  attachment: WorkflowOutputAttachment,
+  after_char: int,
+) -> WorkflowContentPage:
+  return _content_page(
+    content,
+    attachment,
+    after_char,
+    source=_variant_source(attachment, retention="session"),
+  )
 
 
-def _tamper_source(page: dict[str, object]) -> None:
-  page["source"] = {"tampered": True}
+def _tampered_authorization_page(
+  content: str,
+  attachment: WorkflowOutputAttachment,
+  after_char: int,
+) -> WorkflowContentPage:
+  return _content_page(
+    content,
+    attachment,
+    after_char,
+    authorization=PublishedOutputPageAuthorization(
+      workflow_run_id=attachment.workflow_run_id,
+      phase_number=attachment.delivery_phase_number,
+      revision=99,
+      output_id=attachment.output_id,
+    ),
+  )
 
 
-def _tamper_authorization(page: dict[str, object]) -> None:
-  authorization = dict(page["authorization"])  # type: ignore[arg-type]
-  authorization["revision"] = 99
-  page["authorization"] = authorization
-
-
-def _tamper_content_identity(page: dict[str, object]) -> None:
-  page["content_sha256"] = "c" * 64
-
-
-def _tamper_cursor_echo(page: dict[str, object]) -> None:
-  page["after_char"] = 999
-
-
-def _tamper_empty_page(page: dict[str, object]) -> None:
-  page["content"] = ""
-
-
-def _tamper_terminal_cursor(page: dict[str, object]) -> None:
-  if page["end"] is True:
-    page["next_cursor"] = {"after_char": 999}
-
-
-def _tamper_continuation_cursor(page: dict[str, object]) -> None:
-  if page["end"] is False:
-    page["end"] = "later"
-
-
-def _tamper_paging_advance(page: dict[str, object]) -> None:
-  if page["end"] is False:
-    page["next_cursor"] = {"after_char": 3}
+def _tampered_cursor_echo_page(
+  content: str,
+  attachment: WorkflowOutputAttachment,
+  after_char: int,
+) -> WorkflowContentPage:
+  return _content_page(content, attachment, after_char + 1)
 
 
 @pytest.mark.parametrize(
-  ("expected_reason", "tamper"),
+  ("expected_reason", "page_factory"),
   [
-    ("page_envelope_mismatch", _tamper_view),
-    ("source_handle_mismatch", _tamper_source),
-    ("authorization_mismatch", _tamper_authorization),
-    ("content_identity_mismatch", _tamper_content_identity),
-    ("paging_cursor_mismatch", _tamper_cursor_echo),
-    ("empty_page", _tamper_empty_page),
-    ("terminal_cursor_invalid", _tamper_terminal_cursor),
-    ("continuation_cursor_invalid", _tamper_continuation_cursor),
-    ("paging_advance_mismatch", _tamper_paging_advance),
+    ("source_handle_mismatch", _tampered_source_page),
+    ("authorization_mismatch", _tampered_authorization_page),
+    ("paging_cursor_mismatch", _tampered_cursor_echo_page),
   ],
 )
 @pytest.mark.asyncio
@@ -390,22 +584,23 @@ async def test_each_integrity_variant_logs_its_distinct_internal_reason(
   tmp_path: Path,
   caplog: pytest.LogCaptureFixture,
   expected_reason: str,
-  tamper: object,
+  page_factory: object,
 ) -> None:
+  """Internally-valid typed pages claiming a different source, authorization,
+  or cursor echo still 409 with their distinct retained reasons; the tamper
+  shapes the page validator itself rejects need no route arm."""
+
   canonical = '"canonical"'
   session, session_log = _session(tmp_path)
   attachment = _attachment(canonical)
   _record_attachment(session_log, attachment)
-  exact_reader = _reader(canonical, attachment)
 
   async def tampered_reader(
     workflow_run_id: str,
     output_id: str,
     after_char: int,
-  ) -> dict[str, object]:
-    page = await exact_reader(workflow_run_id, output_id, after_char)
-    tamper(page)  # type: ignore[operator]
-    return page
+  ) -> WorkflowContentPage:
+    return page_factory(canonical, attachment, after_char)  # type: ignore[operator]
 
   session.workflow_output_reader = tampered_reader
   with caplog.at_level(
@@ -443,6 +638,40 @@ async def test_each_integrity_variant_logs_its_distinct_internal_reason(
     "revision": attachment.delivery_revision,
     "output_name": "synthesis",
   }
+
+
+@pytest.mark.asyncio
+async def test_empty_source_page_logs_empty_page_reason(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  """A non-empty content page over a non-empty source cannot echo the cursor
+  and still be empty (the page validator forbids it), so the loop-progress
+  guard is reachable only through a genuinely empty published source."""
+
+  session, session_log = _session(tmp_path)
+  attachment = _attachment("")
+  _record_attachment(session_log, attachment)
+  session.workflow_output_reader = _published_reader(tmp_path, "", attachment)
+
+  with caplog.at_level(
+    logging.WARNING,
+    logger="agent_gateway.server_workflow_output_routes",
+  ):
+    response = await workflow_output_response(
+      _request(),
+      attachment.workflow_run_id,
+      attachment.output_id,
+      auth=_Auth(session),  # type: ignore[arg-type]
+    )
+
+  assert response.status_code == 409
+  assert [
+    record.data["reason_code"]
+    for record in caplog.records
+    if getattr(record, "data", {}).get("event")
+    == "workflow_output_integrity_failed"
+  ] == ["empty_page"]
 
 
 @pytest.mark.asyncio
@@ -488,7 +717,7 @@ async def test_materialized_hash_mismatch_logs_its_internal_reason(
   session, session_log = _session(tmp_path)
   attachment = _attachment(canonical)
   _record_attachment(session_log, attachment)
-  session.workflow_output_reader = _reader('"tampered!"', attachment)
+  session.workflow_output_reader = _lying_page_reader('"tampered!"', attachment)
 
   with caplog.at_level(
     logging.WARNING,
@@ -548,7 +777,9 @@ async def test_durable_attachment_conflict_logs_lookup_stage_reason(
     )
   )
   _record_attachment(session_log, conflicting)
-  session.workflow_output_reader = _reader(canonical, attachment)
+  session.workflow_output_reader = _published_reader(
+    tmp_path, canonical, attachment
+  )
 
   with caplog.at_level(
     logging.WARNING,

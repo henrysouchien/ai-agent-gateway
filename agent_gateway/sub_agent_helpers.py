@@ -7,6 +7,11 @@ import secrets
 import time
 from typing import Any, Callable, FrozenSet
 
+from agent_workflow_contracts.ticker_contract import (
+  is_entity_ticker,
+  normalize_contract_ticker,
+)
+
 from .session import GatewaySession
 from .artifact_paths import canonicalize_ticker
 from .skills import SkillLoader, SkillProfile, operation_tool_ids
@@ -61,7 +66,9 @@ _RESUME_AGENT_DESCRIPTION = (
 )
 
 
-_CONTEXT_TICKER_RE = re.compile(r"\b([A-Z0-9]{1,6}(?:\.[A-Z]{1,2})?)\b")
+_TICKER_DISCOVERY_TOKEN_RE = re.compile(
+  r"(?<![A-Za-z0-9.-])([A-Z0-9][A-Z0-9.-]{0,14})(?![A-Za-z0-9.-])"
+)
 _DISCOVERY_EXCLUSION_RE = re.compile(
   r"^(?:(?:FY)?\d{2,4}E|FY\d{2,4}E?|(?:[1-4]Q|Q[1-4])(?:FY)?\d{0,4}E?|"
   r"(?:[12]H|H[12])\d{0,4}|\d{1,2}[KQ]|(?:10K|10Q|8K|6K|20F)|"
@@ -108,6 +115,14 @@ _TICKER_STOPWORDS = {
   "API",
   "SQL",
   "CLI",
+  "TRACK",
+  "REVIEW",
+  "REPORT",
+  "FOCUS",
+  "BUILD",
+  "CREATE",
+  "UPDATE",
+  "CHECK",
 }
 
 
@@ -136,16 +151,58 @@ def _render_agent_param_description(entries: list[tuple[Any, str]]) -> str:
   return "\n".join(lines)
 
 
-def _extract_ticker_from_task(task: str) -> str:
-  for match in _CONTEXT_TICKER_RE.finditer(task):
-    candidate = match.group(1).strip().upper()
-    if candidate.startswith("20") or candidate.startswith("Q") or _DISCOVERY_EXCLUSION_RE.fullmatch(candidate):
+def _extract_ticker_from_task(task: str) -> str | None:
+  candidates: list[str] = []
+  for match in _TICKER_DISCOVERY_TOKEN_RE.finditer(task):
+    candidate = match.group(1)
+    if _DISCOVERY_EXCLUSION_RE.fullmatch(candidate):
       continue
     if any(char.isdigit() for char in candidate) and not _B3_DISCOVERY_RE.fullmatch(candidate):
       continue
-    if candidate not in _TICKER_STOPWORDS:
-      return canonicalize_ticker(candidate)
-  return ""
+    try:
+      normalized = normalize_contract_ticker(candidate)
+    except ValueError:
+      continue
+    if normalized in _TICKER_STOPWORDS or not is_entity_ticker(normalized):
+      continue
+    if normalized not in candidates:
+      candidates.append(normalized)
+  if len(candidates) > 1:
+    raise ValueError("objective contains multiple plausible ticker subjects")
+  return candidates[0] if candidates else None
+
+
+def _resolve_context_ticker(
+  *,
+  typed_ticker: object | None,
+  verified_server_ticker: object | None,
+  prose_fallback: Callable[[], str | None] | None,
+) -> str | None:
+  """Resolve one canonical subject without consulting prose unnecessarily."""
+
+  typed = (
+    normalize_contract_ticker(typed_ticker)
+    if typed_ticker is not None
+    else None
+  )
+  verified = (
+    normalize_contract_ticker(
+      verified_server_ticker,
+      field_name="verified_server_ticker",
+    )
+    if verified_server_ticker is not None
+    else None
+  )
+  if typed is not None and verified is not None and typed != verified:
+    raise ValueError("typed ticker conflicts with the verified server subject")
+  if typed is not None:
+    return typed
+  if verified is not None:
+    return verified
+  if prose_fallback is None:
+    return None
+  fallback = prose_fallback()
+  return normalize_contract_ticker(fallback) if fallback is not None else None
 
 
 def _extract_research_file_id_from_task(task: object) -> int | None:
@@ -195,25 +252,6 @@ def _message_content_text(content: Any) -> str:
   return "\n".join(parts)
 
 
-def _extract_ticker_from_resume_messages(
-  reconstructed_messages: list[dict[str, Any]],
-  parent_messages: list[ParentMessage],
-  additional_context: str | None,
-) -> str:
-  for message in reconstructed_messages:
-    if message.get("role") != "user":
-      continue
-    ticker = _extract_ticker_from_task(_message_content_text(message.get("content")))
-    if ticker:
-      return ticker
-    break
-  for message in parent_messages:
-    ticker = _extract_ticker_from_task(message.text)
-    if ticker:
-      return ticker
-  return _extract_ticker_from_task(additional_context or "")
-
-
 def _extract_research_file_id_from_resume_messages(
   reconstructed_messages: list[dict[str, Any]],
   parent_messages: list[ParentMessage],
@@ -247,6 +285,13 @@ def _dashboard_artifact_ticker(profile: SkillProfile, context_ticker: str) -> st
 
 def _dashboard_artifact_scope(profile: SkillProfile, context_ticker: str) -> str:
   return "ticker" if _dashboard_artifact_ticker(profile, context_ticker) else "portfolio"
+
+
+def _current_context_ticker(
+  value: str | Callable[[], str | None],
+) -> str:
+  resolved = value() if callable(value) else value
+  return resolved or ""
 
 
 def _skill_extra_excluded_tool_names(skill_profile: SkillProfile | None) -> set[str]:
@@ -287,7 +332,8 @@ def _skill_artifact_excluded_tools(
 
 def _install_emit_canvas_artifact_handler(
   *, sub_local: dict[str, Any], profile: SkillProfile, skill_run_id: str,
-  context_ticker: str, context_research_file_id: int | None,
+  context_ticker: str | Callable[[], str | None],
+  context_research_file_id: int | None,
   parent_session: GatewaySession | None, fallback_user_id: str | None,
   emit_parent_event: Callable[[dict[str, Any]], None],
 ) -> bool:
@@ -322,7 +368,10 @@ def _install_emit_canvas_artifact_handler(
         copy_as_json=tool_input.get("copy_as_json"),
         sources=[SourceRecord.model_validate(value) for value in raw_sources],
         source_skill=profile.name, skill_run_id=skill_run_id,
-        ticker=_artifact_ticker(profile, context_ticker),
+        ticker=_artifact_ticker(
+          profile,
+          _current_context_ticker(context_ticker),
+        ),
         session_id=str(getattr(parent_session, "session_id", "") or "").strip() or None,
         research_file_id=research_file_id,
         control_run_id=str(getattr(parent_session, "session_id", "") or "").strip() or None,
@@ -342,7 +391,7 @@ def _install_emit_dashboard_artifact_handler(
   sub_local: dict[str, Any],
   profile: SkillProfile,
   skill_run_id: str,
-  context_ticker: str,
+  context_ticker: str | Callable[[], str | None],
   context_research_file_id: int | None,
   parent_session: GatewaySession | None,
   fallback_user_id: str | None,
@@ -356,7 +405,11 @@ def _install_emit_dashboard_artifact_handler(
   ):
     dashboard_tool_ctx = handler_kwargs.get("tool_ctx")
     tool_call_id = getattr(dashboard_tool_ctx, "tool_call_id", None)
-    artifact_ticker = _dashboard_artifact_ticker(profile, context_ticker)
+    admitted_context_ticker = _current_context_ticker(context_ticker)
+    artifact_ticker = _dashboard_artifact_ticker(
+      profile,
+      admitted_context_ticker,
+    )
     try:
       from memory import get_workspace_dir
       from schema.dashboard_artifact import DashboardArtifact
@@ -414,7 +467,7 @@ def _install_emit_dashboard_artifact_handler(
         "contract_name": "DashboardArtifact",
         "data_source": "live",
         "ts": time.time(),
-        "scope": _dashboard_artifact_scope(profile, context_ticker),
+        "scope": _dashboard_artifact_scope(profile, admitted_context_ticker),
         "portfolio_id": None,
       })
       return {
@@ -480,21 +533,23 @@ def make_run_agent_tool_def(skill_loader: SkillLoader | None = None) -> dict[str
         },
         "ticker": {
           "type": "string",
-          "pattern": "^[A-Z0-9]{1,6}(?:\\.[A-Z]{1,2})?$",
+          "minLength": 1,
+          "maxLength": 64,
           "description": (
-            "Optional exact context ticker. When supplied, it must match the "
-            "ticker stated in objective; the server never uses it to select an "
-            "artifact or widen scope."
+            "Optional typed security subject. The server canonicalizes and "
+            "admits this value independently of objective prose; it never "
+            "uses the value to widen operation or artifact authority."
           ),
         },
         "research_file_id": {
           "type": "integer",
           "minimum": 1,
           "description": (
-            "Optional exact research-file context. Supply it for operations "
-            "whose required_context includes research_file_id. When the "
-            "objective also states an ID, both must match; the server never "
-            "uses it to select a latest or substitute artifact."
+            "Optional research-file assertion. When a server-verified active "
+            "research turn exists, this value must match it and cannot "
+            "override it. At the private Investment quant boundary it never "
+            "supplies authority and that verified turn is required. Other "
+            "operations retain their declared context semantics."
           ),
         },
         "cost_observation_threshold_usd": {

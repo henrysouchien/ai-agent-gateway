@@ -22,6 +22,7 @@ class McpConnectionRuntime:
   # spawn env; a no-op for anything it cannot decisively resolve.
   preflight_stdio_executable: Callable[[str, Sequence[str], Mapping[str, str]], None]
   build_http_headers: Callable[[dict[str, Any] | None], dict[str, str]]
+  parse_allowed_tools: Callable[[Any], tuple[str, ...] | None]
   safe_cache_name: Callable[[str], str]
   close_contexts: Callable[[list[Any]], Any]
   server_state_factory: Callable[..., Any]
@@ -192,6 +193,7 @@ async def connect_stdio(
       session=session,
       exit_contexts=exit_contexts,
       tool_prefix=tool_prefix,
+      allowed_tools=runtime.parse_allowed_tools(config.get("allowed_tools")),
     )
     await manager._verify_stdio_session_stable(session)
     state.config = dict(config)
@@ -253,6 +255,7 @@ async def connect_streamable_http(
       session=session,
       exit_contexts=exit_contexts,
       tool_prefix=tool_prefix,
+      allowed_tools=runtime.parse_allowed_tools(config.get("allowed_tools")),
     )
     success = True
     return state
@@ -310,6 +313,7 @@ async def initialize_session_state(
   session: Any,
   exit_contexts: list[Any],
   tool_prefix: str,
+  allowed_tools: tuple[str, ...] | None,
   runtime: McpConnectionRuntime,
 ) -> Any:
   await asyncio.wait_for(session.initialize(), timeout=manager._startup_timeout)
@@ -325,6 +329,17 @@ async def initialize_session_state(
     if listed.nextCursor is None:
       break
     cursor = listed.nextCursor
+
+  advertised_names = {str(tool.name) for tool in tools}
+  if allowed_tools is not None:
+    missing = [name for name in allowed_tools if name not in advertised_names]
+    if missing:
+      raise ValueError(
+        "MCP server did not advertise configured allowed_tools: "
+        + ", ".join(missing)
+      )
+    allowed_names = frozenset(allowed_tools)
+    tools = [tool for tool in tools if str(tool.name) in allowed_names]
 
   tool_definitions: list[dict[str, Any]] = []
   for tool in tools:

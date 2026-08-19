@@ -1,103 +1,85 @@
 from __future__ import annotations
 
 import json
-import os
+from importlib import resources
 from pathlib import Path
+import subprocess
+import sys
 from typing import get_args
 
-import pytest
-
 from agent_gateway.control_run_lifecycle import (
-  CONTROL_ACTIVE_RUN_STATES,
-  CONTROL_CANCELLABLE_RUN_STATES,
-  CONTROL_CHAT_MESSAGEABLE_RUN_STATES,
-  CONTROL_RESUMABLE_RUN_STATES,
+  CONTROL_RUN_CONTRACT_VERSION,
   CONTROL_RUN_STATE_CLASSIFICATION,
-  CONTROL_TERMINAL_RUN_STATES,
+  ControlRunState,
+)
+from agent_gateway.control_run_lifecycle_contract import (
+  control_run_lifecycle_contract_payload,
+  render_control_run_lifecycle_contract,
 )
 from agent_gateway.control_plane.runs_models import AutonomousRunState, ChatRunState
 
 
-RISK_MODULE_ROOT = Path(
-  os.environ.get("RISK_MODULE_ROOT", "/Users/henrychien/Documents/Jupyter/risk_module")
+ROOT = Path(__file__).resolve().parents[4]
+CONTRACT_RESOURCE = resources.files("agent_gateway").joinpath(
+  "contracts/control-run-v1/control_run_lifecycle.json"
 )
-CONTRACT_SCHEMA_PATH = RISK_MODULE_ROOT / "docs" / "interfaces" / "agent-control-contracts.schema.json"
 
 
-def _ordered_states(states: frozenset[str]) -> list[str]:
-  return [state for state in CONTROL_RUN_STATE_CLASSIFICATION if state in states]
+def test_checked_in_control_run_lifecycle_contract_has_no_generation_drift() -> None:
+  result = subprocess.run(
+    [
+      sys.executable,
+      str(ROOT / "scripts" / "generate_control_run_lifecycle_contract.py"),
+      "--check",
+    ],
+    cwd=ROOT,
+    text=True,
+    capture_output=True,
+    check=False,
+  )
+
+  assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.skipif(
-  not CONTRACT_SCHEMA_PATH.exists(),
-  reason="risk_module checked-in Agent Control contract schema bundle is unavailable",
-)
-def test_control_run_lifecycle_matches_risk_module_contract_bundle() -> None:
-  bundle = json.loads(CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
-  lifecycle = bundle["run_lifecycle"]
+def test_control_run_lifecycle_contract_check_fails_on_local_drift(
+  tmp_path: Path,
+) -> None:
+  stale_output = tmp_path / "control_run_lifecycle.json"
+  stale_output.write_text("{}\n", encoding="utf-8")
 
-  assert lifecycle["states"] == list(CONTROL_RUN_STATE_CLASSIFICATION)
-  assert lifecycle["classification"] == {
-    state: dict(classification)
-    for state, classification in CONTROL_RUN_STATE_CLASSIFICATION.items()
-  }
-  assert lifecycle["active_states"] == _ordered_states(CONTROL_ACTIVE_RUN_STATES)
-  assert lifecycle["terminal_states"] == _ordered_states(CONTROL_TERMINAL_RUN_STATES)
-  assert lifecycle["resumable_states"] == _ordered_states(CONTROL_RESUMABLE_RUN_STATES)
-  assert lifecycle["cancellable_states"] == _ordered_states(CONTROL_CANCELLABLE_RUN_STATES)
-  assert lifecycle["chat_messageable_states"] == _ordered_states(CONTROL_CHAT_MESSAGEABLE_RUN_STATES)
+  result = subprocess.run(
+    [
+      sys.executable,
+      str(ROOT / "scripts" / "generate_control_run_lifecycle_contract.py"),
+      "--check",
+      "--output",
+      str(stale_output),
+    ],
+    cwd=ROOT,
+    text=True,
+    capture_output=True,
+    check=False,
+  )
+
+  assert result.returncode == 1
+  assert "stale control-run lifecycle contract" in result.stderr
 
 
-@pytest.mark.skipif(
-  not CONTRACT_SCHEMA_PATH.exists(),
-  reason="risk_module checked-in Agent Control contract schema bundle is unavailable",
-)
-def test_control_run_response_models_expose_only_contract_states() -> None:
-  bundle = json.loads(CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
-  contract_states = set(bundle["run_lifecycle"]["states"])
+def test_packaged_control_run_lifecycle_contract_matches_python_owner() -> None:
+  resource_text = CONTRACT_RESOURCE.read_text(encoding="utf-8")
+  payload = json.loads(resource_text)
 
+  assert resource_text == render_control_run_lifecycle_contract()
+  assert payload == control_run_lifecycle_contract_payload()
+  assert payload["contract_version"] == CONTROL_RUN_CONTRACT_VERSION
+
+
+def test_control_run_response_literals_match_python_owner() -> None:
+  contract_states = set(CONTROL_RUN_STATE_CLASSIFICATION)
+
+  assert set(get_args(ControlRunState)) == contract_states
   assert set(get_args(ChatRunState)) == contract_states
   assert set(get_args(AutonomousRunState)) == contract_states
   assert "budget_limited" in contract_states
   assert "blocked" not in contract_states
   assert "remediating" not in contract_states
-
-
-@pytest.mark.skipif(
-  not CONTRACT_SCHEMA_PATH.exists(),
-  reason="risk_module checked-in Agent Control contract schema bundle is unavailable",
-)
-def test_projected_control_event_shapes_are_covered_by_risk_module_contract_bundle() -> None:
-  bundle = json.loads(CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
-  models = bundle["models"]
-
-  assert bundle["contract_versions"]["event"] == "control-event-v1"
-  assert bundle["route_schemas"]["control_events"]["GET /control/events"] == {
-    "projected_envelope": "ControlEventEnvelopeContract",
-    "event_payload": "ControlEventPayloadContract",
-    "known_event_payloads": [
-      "RunStateChangedControlEventContract",
-      "TextDeltaControlEventContract",
-      "ParentMessageSentControlEventContract",
-      "RunResumedControlEventContract",
-      "RunResumedFromControlEventContract",
-      "EventsDroppedControlEventContract",
-      "ReplayTruncatedControlEventContract",
-    ],
-    "future_event_payload": "FutureControlEventContract",
-  }
-  assert models["RunStateChangedControlEventContract"]["properties"]["state"]["enum"] == list(
-    CONTROL_RUN_STATE_CLASSIFICATION
-  )
-  assert {
-    "resumed_run_id",
-    "resumed_task_id",
-    "request_id",
-  }.issubset(models["RunResumedControlEventContract"]["properties"])
-  assert {
-    "resumed_from",
-    "resumed_from_task_id",
-    "request_id",
-  }.issubset(models["RunResumedFromControlEventContract"]["properties"])
-  assert "dropped_before_seq" in models["ReplayTruncatedControlEventContract"]["properties"]
-  assert "dropped_through_seq" in models["EventsDroppedControlEventContract"]["properties"]

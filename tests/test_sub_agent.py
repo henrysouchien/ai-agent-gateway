@@ -26,25 +26,26 @@ from agent_workflow_contracts import (
   canonical_json_bytes,
   sha256_digest,
 )
+from agent_workflow_contracts.ticker_contract import TICKER_INPUT_CONTRACT
 from agent_gateway.agent_result_content import (
   make_get_agent_result_content_handler,
 )
 from agent_gateway.agent_session_log import AgentSessionLog
-from agent_gateway.capability_binding import (
-  CapabilityBind,
-)
 from agent_gateway.event_log import EventLog
 from agent_gateway.final_narrative_artifact import publish_final_narrative
 from agent_gateway.tool_dispatcher_helpers import ToolExecutionContext
 from agent_gateway.session import GatewaySession
 from agent_gateway.skills import SkillLoader
 from agent_gateway.sub_agent import (
+  _ticker_admitted_input,
+  _ticker_from_admitted_inputs,
   make_get_background_result_handler,
   make_get_background_result_tool_def,
   make_run_agent_handler,
   make_run_agent_tool_def,
   make_resume_tool_def,
 )
+from agent_gateway.sub_agent_helpers import _resolve_context_ticker
 from agent_gateway.sub_agent_scope_receipt import ADMITTED_TASK_METADATA_KEY
 from agent_gateway.sub_agent_result_contract import (
   terminal_narrative_content_handle,
@@ -73,6 +74,38 @@ class _McpClient:
 
   async def call_tool(self, name: str, _tool_input: dict[str, Any]):
     return None, {"code": "unknown_tool", "message": name}
+
+
+class _InvestmentMcpClient(_McpClient):
+  @staticmethod
+  def is_mcp_tool(name: str) -> bool:
+    return name == "start_quant_research"
+
+  @staticmethod
+  def get_server_for_tool(name: str) -> str | None:
+    return (
+      "idea-workbench-mcp"
+      if name == "start_quant_research"
+      else None
+    )
+
+  @staticmethod
+  def get_server_tool_definitions(
+    server_names: set[str],
+  ) -> list[dict[str, Any]]:
+    if "idea-workbench-mcp" not in server_names:
+      return []
+    return [{
+      "name": "start_quant_research",
+      "description": "Start exact quant research.",
+      "input_schema": {"type": "object"},
+    }]
+
+  @staticmethod
+  def get_tool_definitions() -> list[dict[str, Any]]:
+    return _InvestmentMcpClient.get_server_tool_definitions({
+      "idea-workbench-mcp"
+    })
 
 
 class _CapabilityResolver:
@@ -228,6 +261,8 @@ def _handler(
   approval_store: Any | None = None,
   approval_policy: Any | None = None,
   approved_tool_types: set[str] | None = None,
+  trusted_research_file_id: int | None = None,
+  mcp_client: Any | None = None,
 ):
   handlers = {"web_search": _tool}
   handlers.update(background_handlers or {})
@@ -251,36 +286,83 @@ def _handler(
     [runner],
     parent_session=parent_session,
     skill_loader=loader,
-    mcp_client=_McpClient(),
+    mcp_client=mcp_client or _McpClient(),
     local_tool_handlers=handlers,
     capability_execution_resolver=resolver or _CapabilityResolver(),
     operation_mcp_activator=operation_mcp_activator,
     mcp_meta_inject_servers=mcp_meta_inject_servers,
     fms_rebinder=fms_rebinder,
+    trusted_research_file_id=trusted_research_file_id,
   )
 
 
-def _write_operation(path: Path, *, resumable: bool = True) -> SkillLoader:
+def _write_operation(
+  path: Path,
+  *,
+  resumable: bool = True,
+  required_context: tuple[str, ...] = (),
+  operation_name: str = "filing-review",
+  investment_start_route: bool = False,
+) -> SkillLoader:
   path.mkdir(parents=True, exist_ok=True)
-  (path / "filing-review.md").write_text(
+  required_context_yaml = (
+    "\n".join(f"    - {name}" for name in required_context)
+    if required_context
+    else "    []"
+  )
+  scope_yaml = "scope: ticker\n" if "ticker" in required_context else ""
+  allowed_tools_yaml = (
+    "  - web_search\n  - start_quant_research"
+    if investment_start_route
+    else "  - web_search"
+  )
+  mcp_tools_yaml = (
+    """mcp_tools:
+  idea-workbench-mcp:
+    - start_quant_research"""
+    if investment_start_route
+    else "mcp_tools: {}"
+  )
+  investment_tool_ref_yaml = (
+    """
+    - kind: mcp
+      server_id: idea-workbench-mcp
+      tool_id: start_quant_research"""
+    if investment_start_route
+    else ""
+  )
+  mutation_mode = "thesis_writer" if investment_start_route else "read_only"
+  investment_capability_yaml = (
+    """
+    - name: state.mutate/v1
+      required: true
+      binding_modes: [live_tool]"""
+    if investment_start_route
+    else ""
+  )
+  (path / f"{operation_name}.md").write_text(
     f"""---
-name: filing-review
+name: {operation_name}
 version: '1.0'
 agent_callable: true
 agent_description: Review filing evidence.
-mutation_mode: read_only
+mutation_mode: {mutation_mode}
 resumable: {str(resumable).lower()}
-allowed_tools:
-  - web_search
-mcp_tools: {{}}
+{scope_yaml}allowed_tools:
+{allowed_tools_yaml}
+{mcp_tools_yaml}
 semantic_metadata:
+  required_context:
+{required_context_yaml}
   tool_refs:
     - kind: local
       tool_id: web_search
+{investment_tool_ref_yaml}
   capability_requirements:
-    - name: research-evidence.read/v1
+    - name: web.read/v1
       required: true
       binding_modes: [live_tool]
+{investment_capability_yaml}
 ---
 Review the admitted filing evidence and return a source-aware conclusion.
 """,
@@ -293,7 +375,7 @@ def _operation(loader: SkillLoader) -> dict[str, Any]:
   return next(
     item.snapshot.operation.model_dump(mode="json")
     for item in loader.list_callable_operations()
-    if item.snapshot.operation.name == "filing-review"
+    if item.snapshot.operation.name != "explore"
   )
 
 
@@ -305,7 +387,9 @@ def test_run_agent_tool_schema_is_operation_first(tmp_path: Path) -> None:
   assert set(schema["properties"]) >= {
     "operation", "objective", "ticker", "research_file_id", "background",
   }
-  assert schema["properties"]["ticker"]["pattern"].startswith("^[A-Z0-9]")
+  ticker = schema["properties"]["ticker"]
+  assert "pattern" not in ticker
+  assert "independently of objective prose" in ticker["description"]
   assert schema["properties"]["research_file_id"]["minimum"] == 1
   threshold = schema["properties"]["cost_observation_threshold_usd"]
   assert threshold["exclusiveMinimum"] == 0
@@ -313,6 +397,122 @@ def test_run_agent_tool_schema_is_operation_first(tmp_path: Path) -> None:
   assert "max_budget_usd" not in schema["properties"]
   assert "agent" not in schema["properties"]
   assert "task" not in schema["properties"]
+
+
+def test_ticker_precedence_equal_typed_and_verified_skips_fallback() -> None:
+  calls = 0
+
+  def fallback() -> str:
+    nonlocal calls
+    calls += 1
+    return "MSFT"
+
+  assert _resolve_context_ticker(
+    typed_ticker=" googl ",
+    verified_server_ticker="GOOGL",
+    prose_fallback=fallback,
+  ) == "GOOGL"
+  assert calls == 0
+
+
+def test_ticker_precedence_conflicting_typed_facts_fail_without_fallback() -> None:
+  calls = 0
+
+  def fallback() -> str:
+    nonlocal calls
+    calls += 1
+    return "MSFT"
+
+  with pytest.raises(ValueError, match="conflicts"):
+    _resolve_context_ticker(
+      typed_ticker="GOOGL",
+      verified_server_ticker="MSFT",
+      prose_fallback=fallback,
+    )
+  assert calls == 0
+
+
+def test_ticker_precedence_verified_server_subject_skips_fallback() -> None:
+  calls = 0
+
+  def fallback() -> str:
+    nonlocal calls
+    calls += 1
+    return "MSFT"
+
+  assert _resolve_context_ticker(
+    typed_ticker=None,
+    verified_server_ticker=" qcom ",
+    prose_fallback=fallback,
+  ) == "QCOM"
+  assert calls == 0
+
+
+def test_ticker_precedence_only_absent_typed_facts_invoke_fallback_once() -> None:
+  calls = 0
+
+  def fallback() -> str:
+    nonlocal calls
+    calls += 1
+    return "PCTY"
+
+  assert _resolve_context_ticker(
+    typed_ticker=None,
+    verified_server_ticker=None,
+    prose_fallback=fallback,
+  ) == "PCTY"
+  assert calls == 1
+
+
+def test_ticker_admitted_binding_rejects_alternate_mechanics() -> None:
+  binding = _ticker_admitted_input(
+    "GOOGL",
+    invocation_id="task-1",
+    parent_session=SimpleNamespace(
+      tenant_id="tenant-1",
+      session_id="session-1",
+    ),
+  )
+  assert _ticker_from_admitted_inputs(
+    (binding,),
+    required=True,
+    owner_invocation_id="task-1",
+  ) == "GOOGL"
+
+  with_context_policy = binding.model_copy(update={
+    "source": binding.source.model_copy(update={
+      "request": binding.source.request.model_copy(update={
+        "context_policy": object(),
+      }),
+    }),
+  })
+  with_read_grant = binding.model_copy(update={
+    "source": binding.source.model_copy(update={"read_grant": object()}),
+  })
+  wrong_owner = binding.model_copy(update={
+    "source": binding.source.model_copy(update={
+      "owner": binding.source.owner.model_copy(update={
+        "tenant_id": "",
+      }),
+    }),
+  })
+
+  for alternate in (with_context_policy, with_read_grant, wrong_owner):
+    with pytest.raises(ValueError):
+      _ticker_from_admitted_inputs(
+        (alternate,),
+        required=True,
+        owner_invocation_id="task-1",
+      )
+
+
+def test_typed_ticker_admission_requires_exact_tenant_and_session_owner() -> None:
+  with pytest.raises(ValueError, match="tenant and session ownership"):
+    _ticker_admitted_input(
+      "GOOGL",
+      invocation_id="task-1",
+      parent_session=SimpleNamespace(user_id="alice"),
+    )
 
 
 def test_direct_handler_rejects_retired_budget_input_without_dispatch(
@@ -335,25 +535,245 @@ def test_direct_handler_rejects_retired_budget_input_without_dispatch(
   assert runner.background_calls == []
 
 
-def test_direct_handler_rejects_ticker_that_conflicts_with_objective(
+def test_direct_handler_typed_ticker_bypasses_prose_and_is_admitted(
   tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, required_context=("ticker",))
+  runner = _Runner()
+  extractor_calls = 0
+
+  def _unexpected_extractor(_objective: str) -> str | None:
+    nonlocal extractor_calls
+    extractor_calls += 1
+    return "TRACK"
+
+  monkeypatch.setattr(
+    "agent_gateway.sub_agent._extract_ticker_from_task",
+    _unexpected_extractor,
+  )
+
+  result, error = asyncio.run(_handler(runner, loader=loader)({
+    "operation": _operation(loader),
+    "objective": "TRACK 1: review the filing evidence.",
+    "ticker": "GOOGL",
+    "background": True,
+  }))
+
+  assert error is None
+  assert result is not None and result["status"] == "running"
+  assert extractor_calls == 0
+  admitted = runner.background_calls[0]["admitted_task"]
+  assert len(admitted.inputs) == 1
+  binding = admitted.inputs[0]
+  assert binding.name == "ticker"
+  assert binding.source.source_kind == "invocation_argument"
+  assert binding.source.request.selector.argument_name == "ticker"
+  assert binding.source.actual_contract == TICKER_INPUT_CONTRACT
+  assert binding.source.owner.tenant_id == "tenant-test"
+  assert binding.source.owner.session_id == "session-test"
+  assert binding.source.owner.invocation_id == admitted.attempt.physical_task_id
+  assert binding.context.content == "GOOGL"
+  dispatch_result, dispatch_error = asyncio.run(
+    runner.background_calls[0]["handler"](
+      runner.background_calls[0]["tool_input"],
+    )
+  )
+  assert dispatch_error is None
+  assert dispatch_result is not None
+  assert runner.spawn_calls != []
+  started = next(
+    event for event in runner.durable_events
+    if event["type"] == "skill_run_started"
+  )
+  assert started["ticker"] == "GOOGL"
+  assert extractor_calls == 0
+
+
+@pytest.mark.parametrize("operation_name", ["filing-review", "quant-research"])
+def test_non_investment_research_context_keeps_existing_asserted_id_dispatch(
+  tmp_path: Path,
+  operation_name: str,
+) -> None:
+  loader = _write_operation(
+    tmp_path,
+    required_context=("research_file_id",),
+    operation_name=operation_name,
+  )
   runner = _Runner()
 
   result, error = asyncio.run(_handler(runner, loader=loader)({
     "operation": _operation(loader),
-    "objective": "Review MSFT filing evidence.",
-    "ticker": "PCTY",
+    "objective": "Review the admitted research file.",
+    "research_file_id": 42,
+    "background": False,
+  }))
+
+  assert error is None
+  assert result is not None
+  assert len(runner.spawn_calls) == 1
+  assert runner.spawn_calls[0]["dispatcher"]._run_context.research_file_id == 42
+
+
+@pytest.mark.parametrize(
+  "required_context",
+  [("research_file_id",), ()],
+)
+def test_investment_start_route_requires_verified_turn_despite_metadata_drift(
+  tmp_path: Path,
+  required_context: tuple[str, ...],
+) -> None:
+  loader = _write_operation(
+    tmp_path,
+    required_context=required_context,
+    operation_name="alternate-quant-method",
+    investment_start_route=True,
+  )
+  runner = _Runner()
+
+  result, error = asyncio.run(_handler(runner, loader=loader)({
+    "operation": _operation(loader),
+    "objective": "Run a bounded quantitative study.",
+    "research_file_id": 42,
     "background": False,
   }))
 
   assert result is None
-  assert error == {
-    "code": "context_ticker_mismatch",
-    "message": "ticker must match the exact ticker stated in objective",
-  }
+  assert error is not None
+  assert error["code"] == "required_context_missing"
   assert runner.spawn_calls == []
+  assert runner.background_calls == []
+
+  trusted_runner = _Runner()
+  trusted_result, trusted_error = asyncio.run(_handler(
+    trusted_runner,
+    loader=loader,
+    trusted_research_file_id=42,
+    mcp_client=_InvestmentMcpClient(),
+  )({
+    "operation": _operation(loader),
+    "objective": "Run a bounded quantitative study.",
+    "background": True,
+  }))
+
+  assert trusted_error is None
+  assert trusted_result is not None and trusted_result["status"] == "running"
+  registration = trusted_runner.background_calls[0]
+  admitted_task = registration["admitted_task"]
+  assert len(admitted_task.inputs) == 1
+  assert admitted_task.inputs[0].name == "research_file_id"
+  assert admitted_task.inputs[0].context.content == 42
+  dispatch_result, dispatch_error = asyncio.run(
+    registration["handler"](registration["tool_input"])
+  )
+  assert dispatch_error is None
+  assert dispatch_result is not None
+  assert (
+    trusted_runner.spawn_calls[0]["dispatcher"]._run_context.research_file_id
+    == 42
+  )
+
+
+def test_verified_turn_remains_authoritative_for_non_investment_child(
+  tmp_path: Path,
+) -> None:
+  loader = _write_operation(
+    tmp_path,
+    required_context=("research_file_id",),
+  )
+  runner = _Runner()
+  handler = _handler(
+    runner,
+    loader=loader,
+    trusted_research_file_id=42,
+  )
+
+  result, error = asyncio.run(handler({
+    "operation": _operation(loader),
+    "objective": "Review the active research file.",
+    "background": False,
+  }))
+
+  assert error is None
+  assert result is not None
+  assert runner.spawn_calls[0]["dispatcher"]._run_context.research_file_id == 42
+
+  conflicting_runner = _Runner()
+  conflicting_handler = _handler(
+    conflicting_runner,
+    loader=loader,
+    trusted_research_file_id=42,
+  )
+  mismatch_result, mismatch_error = asyncio.run(conflicting_handler({
+    "operation": _operation(loader),
+    "objective": "Review the active research file.",
+    "research_file_id": 43,
+    "background": False,
+  }))
+  assert mismatch_result is None
+  assert mismatch_error is not None
+  assert mismatch_error["code"] == "context_research_file_id_mismatch"
+  assert conflicting_runner.spawn_calls == []
+
+
+@pytest.mark.parametrize(
+  ("objective", "message"),
+  [
+    ("Review the filing evidence.", "requires one unambiguous"),
+    ("Compare AAPL and MSFT.", "multiple plausible ticker"),
+    ("TRACK 1: review the filing evidence.", "requires one unambiguous"),
+    ("REVIEW REPORT.", "requires one unambiguous"),
+    ("INVESTIGATIONONLY", "requires one unambiguous"),
+  ],
+)
+def test_direct_handler_required_ticker_fails_before_effects(
+  tmp_path: Path,
+  objective: str,
+  message: str,
+) -> None:
+  loader = _write_operation(tmp_path, required_context=("ticker",))
+  runner = _Runner()
+  resolver = _CapabilityResolver()
+
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=loader,
+    resolver=resolver,
+  )({
+    "operation": _operation(loader),
+    "objective": objective,
+    "background": True,
+  }))
+
+  assert result is None
+  assert error is not None and error["code"] in {
+    "invalid_input",
+    "required_context_missing",
+  }
+  assert message in error["message"]
+  assert resolver.calls == []
+  assert runner.spawn_calls == []
+  assert runner.background_calls == []
+
+
+@pytest.mark.parametrize("ticker", ["PCTY", "QCOM"])
+def test_direct_handler_unambiguous_legacy_prose_is_promoted_once(
+  tmp_path: Path,
+  ticker: str,
+) -> None:
+  loader = _write_operation(tmp_path, required_context=("ticker",))
+  runner = _Runner()
+
+  result, error = asyncio.run(_handler(runner, loader=loader)({
+    "operation": _operation(loader),
+    "objective": f"Analyze {ticker} filing evidence.",
+    "background": True,
+  }))
+
+  assert error is None
+  assert result is not None and result["status"] == "running"
+  admitted = runner.background_calls[0]["admitted_task"]
+  assert admitted.inputs[0].context.content == ticker
 
 
 def test_direct_handler_rejects_research_file_that_conflicts_with_objective(

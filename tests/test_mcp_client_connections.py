@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
@@ -10,6 +12,81 @@ if str(PKG_DIR) not in sys.path:
 
 import agent_gateway.mcp_client as mcp_client_module  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
+
+
+class _ListedToolsSession:
+  def __init__(self, names: list[str]) -> None:
+    self.names = names
+
+  async def initialize(self):
+    return None
+
+  async def list_tools(self, cursor=None):
+    return SimpleNamespace(
+      tools=[
+        SimpleNamespace(
+          name=name,
+          description=f"Tool {name}",
+          inputSchema={"type": "object", "properties": {}},
+        )
+        for name in self.names
+      ],
+      nextCursor=None,
+    )
+
+
+def test_session_allowed_tools_filter_definitions_and_dispatch_surface() -> None:
+  manager = McpClientManager(config_path=None)
+  state = asyncio.run(manager._initialize_session_state(
+    name="idea-workbench-mcp",
+    session=_ListedToolsSession(["get_investment_artifact", "generic_write"]),
+    exit_contexts=[],
+    tool_prefix="",
+    allowed_tools=("get_investment_artifact",),
+  ))
+
+  manager._servers[state.name] = state
+  manager._apply_collision_filtering()
+
+  assert [tool["name"] for tool in state.tool_definitions] == [
+    "get_investment_artifact"
+  ]
+  assert manager.get_server_for_tool("get_investment_artifact") == (
+    "idea-workbench-mcp"
+  )
+  assert manager.get_server_for_tool("generic_write") is None
+
+
+def test_session_allowed_tools_reject_missing_remote_definition() -> None:
+  manager = McpClientManager(config_path=None)
+
+  with pytest.raises(ValueError, match="start_quant_research"):
+    asyncio.run(manager._initialize_session_state(
+      name="idea-workbench-mcp",
+      session=_ListedToolsSession(["get_investment_artifact"]),
+      exit_contexts=[],
+      tool_prefix="",
+      allowed_tools=("get_investment_artifact", "start_quant_research"),
+    ))
+
+
+def test_invalid_allowed_tools_leaves_optional_server_unadvertised() -> None:
+  manager = McpClientManager(
+    config_path=None,
+    inline_servers={
+      "idea-workbench-mcp": {
+        "command": "unused",
+        "allowed_tools": [],
+      }
+    },
+  )
+
+  asyncio.run(manager.startup())
+
+  assert manager.get_server_names() == set()
+  assert manager.get_startup_diagnostics()["idea-workbench-mcp"]["category"] == (
+    "invalid_config"
+  )
 
 
 def test_connect_stdio_wrapper_uses_parent_module_runtime(monkeypatch) -> None:

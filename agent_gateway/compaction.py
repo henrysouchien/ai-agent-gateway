@@ -269,25 +269,6 @@ def _build_summary_prompt_slice(
   )
 
 
-def _format_summary_prompt(
-  *,
-  prior_summary_text: str | None,
-  entries: list[LogEntry],
-  prompt: str,
-  from_seq: int,
-  to_seq: int,
-  max_chars: int | None = None,
-) -> str:
-  return _build_summary_prompt_slice(
-    prior_summary_text=prior_summary_text,
-    entries=entries,
-    prompt=prompt,
-    from_seq=from_seq,
-    to_seq=to_seq,
-    max_chars=max_chars,
-  ).text
-
-
 async def generate_and_append_summary(
   log: AgentSessionLog,
   *,

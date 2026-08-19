@@ -149,14 +149,9 @@ def policy_owner_mismatch(tool_name: str) -> tuple[str, str, str] | None:
 
 
 def redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
-  try:
-    from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
+  from .runner_tool_audit import redact_tool_input_for_event as redact
 
-    return redact_tool_input(tool_name, tool_input, deployment_secret=get_audit_hmac_secret())
-  except Exception:
-    from .secret_boundary import sanitization_failure_tool_input
-
-    return sanitization_failure_tool_input()
+  return redact(tool_name, tool_input)
 
 
 def policy_tool_name(tool_name: str) -> str:

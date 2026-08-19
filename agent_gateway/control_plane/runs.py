@@ -32,9 +32,6 @@ from .runs_helpers import (  # noqa: F401
   _AUTONOMOUS_RESUME_CONTEXT_MAX_CHARS,
   _AUTONOMOUS_RESUME_OPERATOR_BLOCK_MAX_CHARS,
   _AUTONOMOUS_RESUME_ORIGINAL_CONTEXT_BLOCK_MAX_CHARS,
-  _QA_FIXTURE_BRIDGE_HEADER,
-  _QA_FIXTURE_APPROVAL_ARTIFACT_VALUE,
-  _QA_FIXTURE_TERMINAL_FAILURE_VALUE,
   VerdictSummaryResponse,
   PendingApprovalResponse,
   ChatRunResponse,
@@ -91,9 +88,6 @@ from .runs_helpers import (  # noqa: F401
   _run_channel_matches,
   _require_run_channel,
   _require_autonomous_channel,
-  _payload_field_was_set,
-  _require_web_safe_autonomous_dispatch,
-  _qa_fixture_bridge_requested,
 )
 from .runs_resume_helpers import (  # noqa: F401
   _clip_resume_text,
@@ -226,8 +220,6 @@ def build_runs_router(
         context["stage_skill_route"] = dict(stage_skill_route)
       if payload.ticker is not None:
         context["ticker"] = payload.ticker
-      if payload.dev_mode:
-        context["dev_mode"] = True
       dispatch_scope = await _validated_dispatch_scope_payload(
         payload.dispatch_scope,
         session=authenticated,
@@ -299,12 +291,6 @@ def build_runs_router(
     if session_channel is not None and requested_channel is not None and session_channel != requested_channel:
       raise HTTPException(status_code=401, detail="Channel mismatch")
     channel = session_channel or requested_channel
-    _require_web_safe_autonomous_dispatch(
-      payload,
-      channel=channel,
-      qa_fixture_bridge=_qa_fixture_bridge_requested(request),
-    )
-
     if not payload.profile or not payload.mode:
       raise HTTPException(status_code=422, detail="profile and mode are required")
 
@@ -321,7 +307,6 @@ def build_runs_router(
         ticker=payload.ticker,
         max_budget_usd=payload.max_budget_usd,
         channel=channel,
-        dev_mode=payload.dev_mode,
         user_id=authenticated.user_id,
         user_email=authenticated.user_email,
         owner_user_id=owner_user_id,
@@ -479,7 +464,6 @@ def build_runs_router(
           ticker=record.ticker,
           max_budget_usd=getattr(record, "max_budget_usd", None),
           channel=record.channel,
-          dev_mode=record.dev_mode,
           user_id=getattr(record, "raw_user_id", None) or authenticated.user_id,
           user_email=authenticated.user_email,
           owner_user_id=owner_user_id,
@@ -538,7 +522,6 @@ def build_runs_router(
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     owner_user_id = _session_owner_user_id(authenticated)
-    auth.session_store.cleanup_expired()
     if kind is not None and kind not in {"chat", "autonomous"}:
       return RunsListResponse(runs=[])
 
@@ -546,7 +529,7 @@ def build_runs_router(
     if kind in {None, "chat"}:
       runs.extend(
         _chat_run_from_session(session)
-        for session in auth.session_store.sessions.values()
+        for session in auth.session_store.visible_sessions_snapshot()
         if (
           session.kind == "chat"
           and _session_matches_owner(session, owner_user_id)

@@ -565,18 +565,18 @@ def test_child_environment_is_profile_scoped_and_secret_minimal() -> None:
   assert "OPENAI_MODEL" not in advisor
   assert forbidden.isdisjoint(advisor)
 
-  fixture = _positive_autonomous_child_env(
+  custom_provider = _positive_autonomous_child_env(
     source,
-    provider="fixture",
-    profile="fixture",
+    provider="custom",
+    profile="custom",
     deliver=True,
   )
-  assert "FMP_API_KEY" not in fixture
-  assert fixture["AGENT_GATEWAY_RATES_FILE"] == "/opt/hank/rates.json"
-  assert "IBKR_FLEX_TOKEN" not in fixture
-  assert "OPENAI_SESSION_EPOCH" not in fixture
-  assert not any("TELEGRAM" in name for name in fixture)
-  assert forbidden.isdisjoint(fixture)
+  assert "FMP_API_KEY" not in custom_provider
+  assert custom_provider["AGENT_GATEWAY_RATES_FILE"] == "/opt/hank/rates.json"
+  assert "IBKR_FLEX_TOKEN" not in custom_provider
+  assert "OPENAI_SESSION_EPOCH" not in custom_provider
+  assert not any("TELEGRAM" in name for name in custom_provider)
+  assert forbidden.isdisjoint(custom_provider)
 
 
 def test_non_anthropic_child_rates_override_reaches_provider_construction(
@@ -1230,7 +1230,6 @@ def test_resolver_helper_rejects_missing_and_mismatched_results() -> None:
     mode="task",
     skill=None,
     channel="web",
-    dev_mode=True,
     source="start",
     run_mode="autonomous",
   )

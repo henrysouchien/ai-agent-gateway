@@ -56,12 +56,21 @@ from tests.capability_execution_test_support import (  # noqa: E402
 )
 from agent_workflow_contracts import (  # noqa: E402
   ActivityHandle,
+  AgentCompletionEnvelope,
+  AgentOperationRef,
+  AttemptRef,
+  ContentReadGrant,
+  OrdinaryDelegationTaskRef,
+  ResultHandle,
+  SettlementProjection,
+  TaskResultRef,
+  ParentResultPolicy,
   AdmittedPlanRef,
   AuthoredDeliverySummary,
   ContentHandle,
   ContractRef,
   ContinuationState,
-  DeliveryEnvelope,
+  DeliveryEnvelopeV1,
   DeliveryFailure,
   DeliveryPrimary,
   DeliverySettlement,
@@ -70,9 +79,51 @@ from agent_workflow_contracts import (  # noqa: E402
   PublishedOutputRef,
   TerminalPhaseRevision,
   TranscriptHandle,
-  WorkflowDeliverySpec,
+  WorkflowDeliverySpecV1,
   WorkflowResult,
 )
+
+
+
+def _workflow_view(
+  *,
+  plan_id: str,
+  phase_number: int,
+  revision: int,
+  digest: str,
+  delivery_status: str = "complete",
+  state: str = "terminal",
+  terminal_status: str | None = "succeeded",
+):
+  """The canonical view every composed WorkflowResult carries (A-M5)."""
+
+  from agent_workflow_contracts import WorkflowView
+
+  return WorkflowView(
+    workflow_run_id="workflow-1",
+    workflow_name="dynamic-workflow",
+    state=state,
+    execution_status="succeeded",
+    delivery_status=delivery_status,
+    terminal_status=terminal_status,
+    legal_actions=(),
+    observation_seq=1,
+    max_phases=2,
+    admitted_plan_ref=AdmittedPlanRef(
+      workflow_run_id="workflow-1",
+      plan_id=plan_id,
+      phase_number=phase_number,
+      revision=revision,
+      digest=digest,
+    ),
+    terminal_phase_revision=TerminalPhaseRevision(
+      phase_number=phase_number,
+      revision=revision,
+    ),
+    estimated_cost_usd=0.0,
+    admitted_cost_estimate_usd=0.0,
+    author_cost_usd=0.0,
+  )
 
 
 def _bind_receipt() -> dict[str, str]:
@@ -1289,7 +1340,8 @@ def test_completed_workflow_output_attaches_to_final_summary_and_replays(
       content=content("Executive summary only.", summary_contract),
       inline_view=PublishedInlineView(value="Executive summary only."),
     )
-    envelope = DeliveryEnvelope(
+    envelope = DeliveryEnvelopeV1(
+      schema_version="1.0",
       workflow_run_id="workflow-1",
       phase_number=1,
       revision=1,
@@ -1304,24 +1356,18 @@ def test_completed_workflow_output_attaches_to_final_summary_and_replays(
     )
     workflow_result = WorkflowResult(
       workflow_run_id="workflow-1",
-      admitted_plan_ref=AdmittedPlanRef(
-        workflow_run_id="workflow-1",
+      view=_workflow_view(
         plan_id="plan-1",
         phase_number=1,
         revision=1,
         digest="sha256:" + "b" * 64,
       ),
-      terminal_phase_revision=TerminalPhaseRevision(
-        phase_number=1,
-        revision=1,
-      ),
-      execution_status="succeeded",
       published_outputs=(primary_output, summary_output),
       delivery=DeliverySettlement(
         status="complete",
         phase_number=1,
         revision=1,
-        spec=WorkflowDeliverySpec(
+        spec=WorkflowDeliverySpecV1(
           presentation="attachment",
           primary_selector="synthesis",
           summary_selector="delivery_summary",
@@ -1492,32 +1538,29 @@ def test_accepted_continuation_invalidates_stale_pending_attachment(
       content=content("Phase one summary.", summary_contract),
       inline_view=PublishedInlineView(value="Phase one summary."),
     )
-    delivery_spec = WorkflowDeliverySpec(
+    delivery_spec = WorkflowDeliverySpecV1(
       presentation="attachment",
       primary_selector="synthesis",
       summary_selector="delivery_summary",
     )
     phase_one_result = WorkflowResult(
       workflow_run_id="workflow-1",
-      admitted_plan_ref=AdmittedPlanRef(
-        workflow_run_id="workflow-1",
+      view=_workflow_view(
         plan_id="plan-1",
         phase_number=1,
         revision=1,
         digest="sha256:" + "b" * 64,
+        state="awaiting_action",
+        terminal_status=None,
       ),
-      terminal_phase_revision=TerminalPhaseRevision(
-        phase_number=1,
-        revision=1,
-      ),
-      execution_status="succeeded",
       published_outputs=(phase_one_primary, phase_one_summary),
       delivery=DeliverySettlement(
         status="complete",
         phase_number=1,
         revision=1,
         spec=delivery_spec,
-        envelope=DeliveryEnvelope(
+        envelope=DeliveryEnvelopeV1(
+          schema_version="1.0",
           workflow_run_id="workflow-1",
           phase_number=1,
           revision=1,
@@ -1554,18 +1597,13 @@ def test_accepted_continuation_invalidates_stale_pending_attachment(
     )
     phase_two_failed_result = WorkflowResult(
       workflow_run_id="workflow-1",
-      admitted_plan_ref=AdmittedPlanRef(
-        workflow_run_id="workflow-1",
+      view=_workflow_view(
         plan_id="plan-2",
         phase_number=2,
         revision=1,
         digest="sha256:" + "c" * 64,
+        delivery_status="failed",
       ),
-      terminal_phase_revision=TerminalPhaseRevision(
-        phase_number=2,
-        revision=1,
-      ),
-      execution_status="succeeded",
       published_outputs=(phase_two_primary,),
       delivery=DeliverySettlement(
         status="failed",
@@ -1876,7 +1914,13 @@ def test_provider_error_turn_retains_inline_notification_and_fails_terminally() 
   asyncio.run(case())
 
 
-def test_empty_tool_use_turn_repeats_inline_notification_until_end_turn() -> None:
+def test_empty_tool_use_turn_acks_inline_notification_it_rendered() -> None:
+  # A-M7 (T3-I01): a `tool_use` stop reason with no usable tool block is
+  # still a completed model turn — the response consumed the reminder that
+  # rendered the notification, so it is acked at that request's boundary
+  # and never re-shown. A second notification that arrives *during* the
+  # request was not delivered, so it survives the ack and is what the next
+  # request carries.
   async def case() -> None:
     runner = _make_credential_runner()
     runner._notification_queue.push(
@@ -1884,7 +1928,7 @@ def test_empty_tool_use_turn_repeats_inline_notification_until_end_turn() -> Non
         task_id="bg_empty_tool_use",
         agent_name="reviewer",
         event="completed",
-        summary="repeat after malformed tool turn",
+        summary="rendered before the malformed tool turn",
         timestamp=1.0,
         payload={"kind": "report"},
       )
@@ -1894,6 +1938,16 @@ def test_empty_tool_use_turn_repeats_inline_notification_until_end_turn() -> Non
     async def stream_turn(**kwargs: Any):
       seen_prompts.append(str(kwargs["system_prompt"]))
       if len(seen_prompts) == 1:
+        runner._notification_queue.push(
+          TaskNotification(
+            task_id="bg_arrived_mid_request",
+            agent_name="reviewer",
+            event="completed",
+            summary="arrived during the malformed tool turn",
+            timestamp=2.0,
+            payload={"kind": "report"},
+          )
+        )
         return object(), StreamTurnResult(
           full_text="malformed tool boundary",
           stop_reason="tool_use",
@@ -1918,10 +1972,11 @@ def test_empty_tool_use_turn_repeats_inline_notification_until_end_turn() -> Non
     )
 
     assert len(seen_prompts) == 2
-    assert all(
-      "repeat after malformed tool turn" in prompt
-      for prompt in seen_prompts
-    )
+    assert "rendered before the malformed tool turn" in seen_prompts[0]
+    assert "arrived during the malformed tool turn" not in seen_prompts[0]
+    # The inversion: the delivered notification is not repeated.
+    assert "rendered before the malformed tool turn" not in seen_prompts[1]
+    assert "arrived during the malformed tool turn" in seen_prompts[1]
     assert runner._notification_queue.pending_count == 0
 
   asyncio.run(case())
@@ -1997,9 +2052,13 @@ def test_empty_tool_use_turn_retains_exact_ack_until_end_turn() -> None:
   asyncio.run(case())
 
 
-def test_tool_use_turn_repeats_notification_until_completed_turn(
+def test_tool_use_turn_acks_notification_before_the_tool_batch(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+  # A-M7 (T3-I01, CUR-E2E-04): a `tool_use` response is a completed model
+  # turn — it saw the reminder. The delivered set is acked before
+  # `execute_tool_use_loop` runs, so the notification is not re-rendered on
+  # the next request.
   async def case() -> None:
     runner = _make_credential_runner()
     runner._notification_queue.push(
@@ -2071,8 +2130,12 @@ def test_tool_use_turn_repeats_notification_until_completed_turn(
     )
 
     assert len(seen_prompts) == 2
-    assert all("bg_tool_repeat" in prompt for prompt in seen_prompts)
-    assert all("7.13" in prompt for prompt in seen_prompts)
+    assert "bg_tool_repeat" in seen_prompts[0]
+    assert "7.13" in seen_prompts[0]
+    # The inversion: acked at the delivering request boundary, so the
+    # second request no longer carries what the model already saw.
+    assert "bg_tool_repeat" not in seen_prompts[1]
+    assert "7.13" not in seen_prompts[1]
     assert runner._notification_queue.pending_count == 0
 
   asyncio.run(case())
@@ -2234,35 +2297,47 @@ def test_natural_finish_delivery_epoch_exhausts_bounded_notification_credits(
     runner._agent_session_log = durable_log
     entry = runner._task_registry.register("background_agent")
     runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
-    runner._task_registry.transition(
-      entry.task_id,
-      TaskState.COMPLETED,
-      result={
-        "kind": "report",
-        "report": {"summary": "never acknowledged"},
-      },
-    )
     stream_calls = 0
 
     async def stream_turn(**kwargs: Any):
       nonlocal stream_calls
       stream_calls += 1
+      if stream_calls == 1:
+        # The child completes *during* the first request, so the
+        # notification is not in that request's delivered set and A-M7
+        # cannot ack it at its response boundary (D-A7-4).
+        runner._task_registry.transition(
+          entry.task_id,
+          TaskState.COMPLETED,
+          result={
+            "kind": "report",
+            "report": {"summary": "never acknowledged"},
+          },
+        )
+        turn = StreamTurnResult(
+          full_text="",
+          stop_reason="end_turn",
+          content_blocks=[
+            {
+              "type": "tool_use",
+              "id": "unrelated-1",
+              "name": "lookup",
+              "input": {},
+            }
+          ],
+        )
+        turn.tool_uses = [("unrelated-1", "lookup", {})]
+        return object(), turn
+      # Every later request renders the retained notification, and every
+      # response is a non-completed turn: the continuation arm never acks
+      # (D-A7-1), so the bounded credits are the only thing that ends the
+      # run.
       assert "never acknowledged" in str(kwargs["system_prompt"])
-      tool_id = f"unrelated-{stream_calls}"
-      turn = StreamTurnResult(
-        full_text="",
-        stop_reason="end_turn",
-        content_blocks=[
-          {
-            "type": "tool_use",
-            "id": tool_id,
-            "name": "lookup",
-            "input": {},
-          }
-        ],
+      return object(), StreamTurnResult(
+        full_text="still thinking",
+        stop_reason="pause_turn",
+        content_blocks=[{"type": "text", "text": "still thinking"}],
       )
-      turn.tool_uses = [(tool_id, "lookup", {})]
-      return object(), turn
 
     async def execute_tool_use_loop(
       tool_uses: list[tuple[str, str, dict[str, Any]]],
@@ -2422,6 +2497,807 @@ def test_delivery_epoch_freezes_admission_but_allows_exact_omitted_retrieval() -
     assert stream_calls == 2
     assert handler_called is False
     assert entry.notification_delivery_state == "delivered"
+
+  asyncio.run(case())
+
+
+def test_live_run_working_turns_do_not_spend_delivery_credits(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Productive turns are not charged to the delivery budget.
+
+  The bounded credits count the turns the loop compels -- continuations the
+  model never completed, and nudges after it tried to stop. A completed turn
+  acks what was rendered to it, so it settles delivery by making progress.
+  Charging those too killed staged fan-out mid-flight: a parent that keeps
+  dispatching and computing while its children report back exhausted a
+  budget sized for draining a notification queue, and the run died
+  terminally with every finished child's work discarded.
+  """
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    working_turns = 9
+    stream_calls = 0
+
+    async def stream_turn(**_kwargs: Any):
+      nonlocal stream_calls
+      stream_calls += 1
+      if stream_calls == 1:
+        # Completes during the request, so its notification lands on the
+        # next turn and is outstanding while the parent keeps working.
+        runner._task_registry.transition(
+          entry.task_id,
+          TaskState.COMPLETED,
+          result={
+            "kind": "report",
+            "report": {"summary": "track two reported"},
+          },
+        )
+      if stream_calls >= working_turns:
+        return object(), StreamTurnResult(
+          full_text="integrated",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "integrated"}],
+        )
+      call_id = f"work-{stream_calls}"
+      turn = StreamTurnResult(
+        full_text="",
+        stop_reason="end_turn",
+        content_blocks=[
+          {
+            "type": "tool_use",
+            "id": call_id,
+            "name": "lookup",
+            "input": {},
+          }
+        ],
+      )
+      turn.tool_uses = [(call_id, "lookup", {})]
+      return object(), turn
+
+    async def execute_tool_use_loop(
+      tool_uses: list[tuple[str, str, dict[str, Any]]],
+      **_kwargs: Any,
+    ) -> ToolUseLoopResult:
+      return ToolUseLoopResult(
+        tool_results_content=[
+          {
+            "type": "tool_result",
+            "tool_use_id": tool_uses[0][0],
+            "content": '{"ok":true}',
+          }
+        ],
+        tools_used=["lookup"],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    monkeypatch.setattr(
+      gateway_runner,
+      "_execute_tool_use_loop",
+      execute_tool_use_loop,
+    )
+    await runner.run(
+      messages=[{"role": "user", "content": "five tracks"}],
+      max_turns=None,
+    )
+
+    events = [log_entry.event for log_entry in runner._log.entries]
+    errors = [
+      event for event in events if event.get("type") == "error"
+    ]
+    assert errors == []
+    assert stream_calls == working_turns
+
+  asyncio.run(case())
+
+
+def test_live_run_delivery_does_not_freeze_background_admission() -> None:
+  """A live run keeps admitting background tasks while results arrive.
+
+  Admission freezes because the run is past `max_turns` and may only wind
+  down — never merely because a notification is outstanding. Latching the
+  freeze on the first arriving result broke staged fan-out: a parent that
+  dispatches its next track once a concurrency slot frees had that dispatch
+  rejected, with a message asserting a turn limit the run did not have.
+  """
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+    stream_calls = 0
+    admission_error: dict[str, Any] | None = None
+    admitted_task_id: str | None = None
+    grace_active_at_dispatch: bool | None = None
+
+    async def next_track_handler(
+      _tool_input: dict[str, Any],
+      **_kwargs: Any,
+    ):
+      return {
+        "kind": "report",
+        "report": {"summary": "track five"},
+      }, None
+
+    async def stream_turn(**_kwargs: Any):
+      nonlocal stream_calls, admission_error, admitted_task_id
+      nonlocal grace_active_at_dispatch
+      stream_calls += 1
+      assert stream_calls <= 12, "run failed to settle"
+      if stream_calls == 1:
+        # The child completes *during* the first request, so its notification
+        # is not in that request's delivered set: the next turn is the one
+        # that carries it, and that is where admission used to freeze.
+        runner._task_registry.transition(
+          entry.task_id,
+          TaskState.COMPLETED,
+          result={
+            "kind": "report",
+            "report": {"summary": "track two reported"},
+          },
+        )
+        return object(), StreamTurnResult(
+          full_text="four launched",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "four launched"}],
+        )
+      if stream_calls == 2:
+        # The delivery arm has run: a result is outstanding on a run with no
+        # turn limit. Dispatching the next track must still be admitted.
+        grace_active_at_dispatch = (
+          runner._background_delivery_grace_active
+        )
+        admitted, admission_error = (
+          await runner._register_background_task(
+            tool_input={"task": "track five"},
+            handler=next_track_handler,
+            capability_bind_receipt=_bind_receipt(),
+          )
+        )
+        if admitted is not None:
+          admitted_task_id = (
+            admitted["task_id"]
+            if isinstance(admitted, dict)
+            else admitted.task_id
+          )
+      return object(), StreamTurnResult(
+        full_text="integrated",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "integrated"}],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "five tracks"}],
+      max_turns=None,
+    )
+
+    assert grace_active_at_dispatch is False
+    assert admission_error is None
+    assert admitted_task_id is not None
+
+  asyncio.run(case())
+
+
+def _unread_handle_fixture() -> tuple[AgentCompletionEnvelope, str]:
+  """A handle-shaped completion envelope, as a >20KB narrative produces."""
+  text = "## TRACK 3 - margins\n" + ("x" * 4_000)
+  encoded = text.encode("utf-8")
+  digest = hashlib.sha256(encoded).hexdigest()
+  source = ContentHandle(
+    content_id=f"sha256:{digest}",
+    content_sha256=digest,
+    content_bytes=len(encoded),
+    content_chars=len(text),
+    contract=ContractRef(
+      namespace="agent-gateway",
+      name="terminal-narrative",
+      version="1.0",
+      digest="sha256:" + hashlib.sha256(b"terminal-narrative").hexdigest(),
+    ),
+    media_type="text/markdown; charset=utf-8",
+    encoding="utf-8",
+    retention="durable",
+  )
+  envelope = AgentCompletionEnvelope(
+    message_id="agent-completion:" + ("0" * 64),
+    task_result_ref=TaskResultRef(
+      task_result_id="task-result-1",
+      logical_task=OrdinaryDelegationTaskRef(
+        delegation_id="delegation-1",
+        operation=AgentOperationRef(
+          namespace="agent-operation",
+          name="explore",
+          version="1.0",
+          digest="sha256:" + hashlib.sha256(b"explore").hexdigest(),
+        ),
+      ),
+      attempt=AttemptRef(
+        attempt_number=1,
+        attempt_id="attempt-1",
+        physical_task_id="bg-1",
+      ),
+    ),
+    settlement_projection=SettlementProjection(
+      execution_status="succeeded",
+      outcome_disposition="complete",
+    ),
+    parent_materialization=ResultHandle(
+      source=source,
+      read_grant=ContentReadGrant(
+        grant_id=f"grant:{digest}",
+        content_id=source.content_id,
+        scope="direct_parent",
+        principal_id="parent-1",
+      ),
+    ),
+  )
+  return envelope, text
+
+
+def test_natural_finish_reminds_once_for_unread_handle_result(
+  tmp_path: Path,
+) -> None:
+  """CUR-E2E-08: a settled, delivered, never-read handle earns ONE reminder.
+
+  The VRT run-4 shape: a child's oversized result arrives as a bare
+  result_handle while the parent is busy; the parent never reads it and
+  stops, with its final message calling the settled task outstanding. The
+  natural-finish arm must inject exactly one reminder turn naming the task
+  and its dispatch objective — then allow finish even if the model still
+  ignores it. The reminder is unmetered: it must not spend delivery grace
+  credits (a5fe21207) and must not freeze admission (e6b071335).
+  """
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    entry.metadata["admitted_task"] = {
+      "objective": "TRACK 3 - VRT margin trend across the last four quarters",
+    }
+    envelope, _text = _unread_handle_fixture()
+
+    stream_calls = 0
+    seen_messages: list[str] = []
+
+    async def stream_turn(**kwargs: Any):
+      nonlocal stream_calls
+      stream_calls += 1
+      assert stream_calls <= 6, "run failed to settle"
+      seen_messages.append(json.dumps(kwargs.get("current_messages", [])))
+      if stream_calls == 1:
+        # The child completes *during* the first request with a
+        # handle-shaped envelope, exactly like a >20KB narrative.
+        entry.completion_envelope = envelope
+        runner._task_registry.transition(
+          entry.task_id,
+          TaskState.COMPLETED,
+          result={"kind": "report", "report": {"summary": "done"}},
+        )
+        return object(), StreamTurnResult(
+          full_text="dispatched",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "dispatched"}],
+        )
+      if stream_calls == 3:
+        # The reminder turn: admission must still be open (e6b071335 —
+        # the reminder is not a delivery wind-down and must not latch
+        # the grace flag that closes background-task admission).
+        grace_active_at_reminder.append(
+          runner._background_delivery_grace_active
+        )
+
+        async def late_track_handler(
+          _tool_input: dict[str, Any],
+          **_kwargs: Any,
+        ):
+          return {
+            "kind": "report",
+            "report": {"summary": "late track"},
+          }, None
+
+        admitted, admission_error = (
+          await runner._register_background_task(
+            tool_input={"task": "late track"},
+            handler=late_track_handler,
+            capability_bind_receipt=_bind_receipt(),
+          )
+        )
+        admission_results.append((admitted, admission_error))
+      return object(), StreamTurnResult(
+        full_text="wrapping up",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "wrapping up"}],
+      )
+
+    grace_active_at_reminder: list[bool] = []
+    admission_results: list[Any] = []
+    durable_log = AgentSessionLog(
+      path=tmp_path / "sessions" / "unread-handle.jsonl",
+    )
+    runner._agent_session_log = durable_log
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "five tracks"}],
+      max_turns=None,
+    )
+
+    # Turn 1 works, turn 2 carries the delivery, turn 3 is the reminder;
+    # the late admission's own completion earns turn 4's delivery and the
+    # final stop on turn 5 needs no further reminder (inline report).
+    assert stream_calls >= 3
+    assert grace_active_at_reminder == [False]
+    late_admitted, late_admission_error = admission_results[0]
+    assert late_admission_error is None
+    assert late_admitted is not None
+    reminder_marker = "delivered as content handles and have never been read"
+    assert reminder_marker not in seen_messages[0]
+    assert reminder_marker not in seen_messages[1]
+    assert reminder_marker in seen_messages[2]
+    assert entry.task_id in seen_messages[2]
+    assert "TRACK 3 - VRT margin trend" in seen_messages[2]
+    assert "not running, not outstanding" in seen_messages[2]
+
+    events = [log_entry.event for log_entry in runner._log.entries]
+    errors = [event for event in events if event.get("type") == "error"]
+    assert errors == []
+    assert any(
+      event.get("type") == "stream_complete" for event in events
+    )
+    assert entry.notification_delivery_state == "delivered"
+    assert entry.result_content_read is False
+
+    # Observability: the durable log records which request rendered the
+    # notification and that the reminder turn was injected — the two facts
+    # run-4 forensics could only infer.
+    durable_entries, _ = await durable_log.query(order="asc")
+    rendered = [
+      item.event
+      for item in durable_entries
+      if item.event.get("type") == "background_notifications_rendered"
+    ]
+    first_rendered = [
+      event
+      for event in rendered
+      if any(
+        notification.get("task_id") == entry.task_id
+        for notification in event.get("notifications", [])
+      )
+    ]
+    assert len(first_rendered) == 1
+    assert first_rendered[0]["turn"] == 2
+    assert first_rendered[0]["notifications"][0][
+      "notification_generation"
+    ] == entry.notification_generation
+    guard_events = [
+      item.event
+      for item in durable_entries
+      if item.event.get("type") == "runtime_guard"
+      and item.event.get("guard") == "unread_result_handle_nudge"
+    ]
+    assert len(guard_events) == 1
+    assert entry.task_id in guard_events[0]["message"]
+    # Durable-only: the live event stream carries neither record.
+    live_types = {
+      log_entry.event.get("type") for log_entry in runner._log.entries
+    }
+    assert "background_notifications_rendered" not in live_types
+
+  asyncio.run(case())
+
+
+def test_omitted_payload_nudge_is_durably_recorded(tmp_path: Path) -> None:
+  """The compelled omitted-payload nudge leaves a durable runtime_guard.
+
+  Before this record, the injected delivery nudges lived only in the
+  in-flight message list: a session log could not show that the loop
+  compelled a retrieval turn, or with what instruction.
+  """
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+    stream_calls = 0
+
+    async def stream_turn(**_kwargs: Any):
+      nonlocal stream_calls
+      stream_calls += 1
+      assert stream_calls <= 25, "run failed to settle"
+      if stream_calls == 1:
+        # An oversized legacy result: its notification payload exceeds the
+        # 32KB inline transport, so delivery state becomes payload_omitted
+        # and the loop must compel explicit retrieval.
+        runner._task_registry.transition(
+          entry.task_id,
+          TaskState.COMPLETED,
+          result={
+            "kind": "report",
+            "report": {"summary": "x" * 40_000},
+          },
+        )
+        return object(), StreamTurnResult(
+          full_text="dispatched",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "dispatched"}],
+        )
+      # The model never retrieves; the run winds down on delivery credits.
+      return object(), StreamTurnResult(
+        full_text="ignoring",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "ignoring"}],
+      )
+
+    durable_log = AgentSessionLog(
+      path=tmp_path / "sessions" / "omitted-nudge.jsonl",
+    )
+    runner._agent_session_log = durable_log
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "one track"}],
+      max_turns=None,
+    )
+
+    assert entry.notification_delivery_state == "payload_omitted"
+    durable_entries, _ = await durable_log.query(order="asc")
+    nudge_events = [
+      item.event
+      for item in durable_entries
+      if item.event.get("type") == "runtime_guard"
+      and item.event.get("guard") == "omitted_background_result_nudge"
+    ]
+    assert nudge_events, "no durable record of the compelled nudge"
+    assert entry.task_id in nudge_events[0]["message"]
+    rendered = [
+      item.event
+      for item in durable_entries
+      if item.event.get("type") == "background_notifications_rendered"
+    ]
+    assert rendered, "the omission-marker render was not recorded"
+    assert rendered[0]["notifications"][0]["task_id"] == entry.task_id
+
+  asyncio.run(case())
+
+
+def test_unread_handle_reminder_suppressed_after_content_read() -> None:
+  """Reading the delivered handle discharges the reminder entirely."""
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    envelope, _text = _unread_handle_fixture()
+    content_id = envelope.parent_materialization.source.content_id
+
+    stream_calls = 0
+    seen_messages: list[str] = []
+
+    async def stream_turn(**kwargs: Any):
+      nonlocal stream_calls
+      stream_calls += 1
+      assert stream_calls <= 6, "run failed to settle"
+      seen_messages.append(json.dumps(kwargs.get("current_messages", [])))
+      if stream_calls == 1:
+        entry.completion_envelope = envelope
+        runner._task_registry.transition(
+          entry.task_id,
+          TaskState.COMPLETED,
+          result={"kind": "report", "report": {"summary": "done"}},
+        )
+        return object(), StreamTurnResult(
+          full_text="dispatched",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "dispatched"}],
+        )
+      if stream_calls == 2:
+        # The parent reads the handle on the delivery turn — the same
+        # registry mark the get_agent_result_content handler records.
+        marked = runner._task_registry.mark_result_content_read(
+          entry.task_id,
+          content_id=content_id,
+        )
+        assert marked is True
+      return object(), StreamTurnResult(
+        full_text="integrated",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "integrated"}],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "five tracks"}],
+      max_turns=None,
+    )
+
+    assert stream_calls == 2
+    reminder_marker = "delivered as content handles and have never been read"
+    assert all(reminder_marker not in seen for seen in seen_messages)
+    events = [log_entry.event for log_entry in runner._log.entries]
+    assert [event for event in events if event.get("type") == "error"] == []
+    assert entry.result_content_read is True
+
+  asyncio.run(case())
+
+
+def test_unread_handle_reminder_yields_when_finish_lands_on_max_turns() -> None:
+  """A bounded run whose natural finish lands on the limit gets NO reminder.
+
+  Crossing `max_turns` on the reminder turn would latch the from-max
+  delivery epoch and `_background_delivery_grace_active`, spend the single
+  synthesis credit, and convert an obeying model's read into a
+  `max_turns_reached` interruption. The reminder is fail-open there: the
+  run finishes exactly as pre-fix code did.
+  """
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    envelope, _text = _unread_handle_fixture()
+
+    stream_calls = 0
+    seen_messages: list[str] = []
+
+    async def stream_turn(**kwargs: Any):
+      nonlocal stream_calls
+      stream_calls += 1
+      assert stream_calls <= 4, "run failed to settle"
+      seen_messages.append(json.dumps(kwargs.get("current_messages", [])))
+      if stream_calls == 1:
+        entry.completion_envelope = envelope
+        runner._task_registry.transition(
+          entry.task_id,
+          TaskState.COMPLETED,
+          result={"kind": "report", "report": {"summary": "done"}},
+        )
+        return object(), StreamTurnResult(
+          full_text="dispatched",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "dispatched"}],
+        )
+      return object(), StreamTurnResult(
+        full_text="wrapping up",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "wrapping up"}],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "one track"}],
+      max_turns=2,
+    )
+
+    # Turn 1 works, turn 2 carries the delivery and stops ON the limit:
+    # the reminder yields rather than crossing it.
+    assert stream_calls == 2
+    reminder_marker = "delivered as content handles and have never been read"
+    assert all(reminder_marker not in seen for seen in seen_messages)
+    events = [log_entry.event for log_entry in runner._log.entries]
+    assert [event for event in events if event.get("type") == "error"] == []
+    assert not any(
+      event.get("type") == "max_turns_reached" for event in events
+    )
+    assert any(
+      event.get("type") == "stream_complete" for event in events
+    )
+
+  asyncio.run(case())
+
+
+def test_unread_handle_reminder_answer_survives_compelled_continuation() -> None:
+  """The answer to the reminder may pause without being truncated.
+
+  The reminder arm closes the drained live delivery epoch before
+  continuing. Left latched, a reminder answer stopping at
+  pause_turn/max_tokens would hit a metered continuation with zero
+  obligations and the run would commit `background_delivery_settled`
+  success mid-sentence — the reminder defeating the very integration it
+  asked for.
+  """
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    envelope, _text = _unread_handle_fixture()
+
+    stream_calls = 0
+
+    async def stream_turn(**_kwargs: Any):
+      nonlocal stream_calls
+      stream_calls += 1
+      assert stream_calls <= 6, "run failed to settle"
+      if stream_calls == 1:
+        entry.completion_envelope = envelope
+        runner._task_registry.transition(
+          entry.task_id,
+          TaskState.COMPLETED,
+          result={"kind": "report", "report": {"summary": "done"}},
+        )
+        return object(), StreamTurnResult(
+          full_text="dispatched",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "dispatched"}],
+        )
+      if stream_calls == 3:
+        # The model obeys the reminder and its integration pauses mid-way:
+        # the loop's own continuation must actually run turn 4.
+        return object(), StreamTurnResult(
+          full_text="Integrating TRACK 3: the margin trend shows",
+          stop_reason="pause_turn",
+          content_blocks=[{
+            "type": "text",
+            "text": "Integrating TRACK 3: the margin trend shows",
+          }],
+        )
+      return object(), StreamTurnResult(
+        full_text="integrated fully",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "integrated fully"}],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "one track"}],
+      max_turns=None,
+    )
+
+    # 1 work, 2 delivery, 3 reminder (pauses), 4 completes the answer.
+    assert stream_calls == 4
+    events = [log_entry.event for log_entry in runner._log.entries]
+    assert [event for event in events if event.get("type") == "error"] == []
+    assert any(
+      event.get("type") == "stream_complete" for event in events
+    )
+
+  asyncio.run(case())
+
+
+def test_tools_then_end_turn_stop_still_reminds_for_unread_handle(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """The after-tools stop boundary carries the same reminder contract."""
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    envelope, _text = _unread_handle_fixture()
+
+    stream_calls = 0
+    seen_messages: list[str] = []
+
+    async def execute_tool_use_loop(*_args: Any, **_kwargs: Any):
+      return ToolUseLoopResult(
+        tool_results_content=[],
+        tools_used=["lookup"],
+      )
+
+    async def stream_turn(**kwargs: Any):
+      nonlocal stream_calls
+      stream_calls += 1
+      assert stream_calls <= 6, "run failed to settle"
+      seen_messages.append(json.dumps(kwargs.get("current_messages", [])))
+      if stream_calls == 1:
+        entry.completion_envelope = envelope
+        runner._task_registry.transition(
+          entry.task_id,
+          TaskState.COMPLETED,
+          result={"kind": "report", "report": {"summary": "done"}},
+        )
+        turn = StreamTurnResult(
+          full_text="",
+          stop_reason="tool_use",
+          content_blocks=[{
+            "type": "tool_use",
+            "id": "call-1",
+            "name": "lookup",
+            "input": {},
+          }],
+        )
+        turn.tool_uses = [("call-1", "lookup", {})]
+        return object(), turn
+      if stream_calls == 2:
+        # The delivery turn answers with ANOTHER tool batch that yields no
+        # model-visible tool results, then the after-tools natural-finish
+        # arm is the boundary in play.
+        turn = StreamTurnResult(
+          full_text="",
+          stop_reason="tool_use",
+          content_blocks=[{
+            "type": "tool_use",
+            "id": "call-2",
+            "name": "lookup",
+            "input": {},
+          }],
+        )
+        turn.tool_uses = [("call-2", "lookup", {})]
+        return object(), turn
+      return object(), StreamTurnResult(
+        full_text="wrapping up",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "wrapping up"}],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    monkeypatch.setattr(
+      gateway_runner,
+      "_execute_tool_use_loop",
+      execute_tool_use_loop,
+    )
+    await runner.run(
+      messages=[{"role": "user", "content": "one track"}],
+      max_turns=None,
+    )
+
+    reminder_marker = "delivered as content handles and have never been read"
+    reminded_requests = [
+      index
+      for index, seen in enumerate(seen_messages)
+      if reminder_marker in seen
+    ]
+    assert reminded_requests, "the after-tools boundary never reminded"
+    assert len(reminded_requests) == 1
+    events = [log_entry.event for log_entry in runner._log.entries]
+    assert [event for event in events if event.get("type") == "error"] == []
+    assert any(
+      event.get("type") == "stream_complete" for event in events
+    )
+    assert entry.notification_delivery_state == "delivered"
+
+  asyncio.run(case())
+
+
+def test_inline_delivery_never_triggers_unread_handle_reminder() -> None:
+  """Legacy/inline completions carry their prose; no reminder fires."""
+
+  async def case() -> None:
+    runner = _make_credential_runner()
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+
+    stream_calls = 0
+    seen_messages: list[str] = []
+
+    async def stream_turn(**kwargs: Any):
+      nonlocal stream_calls
+      stream_calls += 1
+      assert stream_calls <= 6, "run failed to settle"
+      seen_messages.append(json.dumps(kwargs.get("current_messages", [])))
+      if stream_calls == 1:
+        runner._task_registry.transition(
+          entry.task_id,
+          TaskState.COMPLETED,
+          result={"kind": "report", "report": {"summary": "inline"}},
+        )
+        return object(), StreamTurnResult(
+          full_text="dispatched",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "dispatched"}],
+        )
+      return object(), StreamTurnResult(
+        full_text="done",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "one track"}],
+      max_turns=None,
+    )
+
+    assert stream_calls == 2
+    reminder_marker = "delivered as content handles and have never been read"
+    assert all(reminder_marker not in seen for seen in seen_messages)
+    events = [log_entry.event for log_entry in runner._log.entries]
+    assert [event for event in events if event.get("type") == "error"] == []
 
   asyncio.run(case())
 
@@ -3172,6 +4048,7 @@ def test_run_loop_context_pressure_estimate_includes_fixed_turn_reminder(
       lambda *_args, **_kwargs: SimpleNamespace(
         text="fixed notification payload",
         peeked_notification_count=0,
+        delivered=(),
       ),
     )
 
@@ -3247,6 +4124,7 @@ def test_run_loop_context_pressure_requires_full_ten_point_hysteresis(
       lambda *_args, **_kwargs: SimpleNamespace(
         text="steady turn reminder",
         peeked_notification_count=0,
+        delivered=(),
       ),
     )
     request_totals = iter((650, 740, 750))
@@ -4041,21 +4919,16 @@ def test_max_tokens_exhaustion_cannot_commit_with_queued_notification() -> None:
   asyncio.run(_case())
 
 
-def test_terminal_tool_cannot_commit_with_queued_notification(
+def test_terminal_tool_cannot_commit_with_mid_batch_notification(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+  # D-A7-4: the refusal stays for notifications that arrive *during* the
+  # tool batch. A-M7 shrinks this guard's population — it never softens it.
+  # The arrival happens inside `execute_tool_use_loop`, i.e. after the
+  # request boundary that acked the delivered set, so the model has not
+  # seen it and a terminal tool cannot commit success.
   async def _case() -> None:
     runner = _make_credential_runner()
-    runner._notification_queue.push(
-      TaskNotification(
-        task_id="bg_terminal_tool",
-        agent_name="reviewer",
-        event="completed",
-        summary="retained result",
-        timestamp=1.0,
-        payload={"kind": "report"},
-      )
-    )
 
     async def stream_turn(**_kwargs: Any):
       turn = StreamTurnResult(
@@ -4077,6 +4950,16 @@ def test_terminal_tool_cannot_commit_with_queued_notification(
       *_args: Any,
       **_kwargs: Any,
     ) -> ToolUseLoopResult:
+      runner._notification_queue.push(
+        TaskNotification(
+          task_id="bg_terminal_tool",
+          agent_name="reviewer",
+          event="completed",
+          summary="arrived during the terminal batch",
+          timestamp=1.0,
+          payload={"kind": "report"},
+        )
+      )
       runner._stop_after_tool_results_reason = "terminal_tool_result"
       runner._stop_after_tool_results_tool_name = "fms_report_demo"
       return ToolUseLoopResult(
@@ -4107,6 +4990,92 @@ def test_terminal_tool_cannot_commit_with_queued_notification(
       for event in events
     )
     assert not any(
+      event.get("type") == "stream_complete"
+      for event in events
+    )
+
+  asyncio.run(_case())
+
+
+def test_terminal_tool_commits_cleanly_after_acking_delivered_notification(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  # The CUR-E2E-04 witness (twin of the mid-batch refusal above): the
+  # notification is queued *before* the request, so it rides that request's
+  # reminder and is acked at the `tool_use` response boundary — before
+  # `execute_tool_use_loop`. The terminal tool's batch can no longer strand
+  # a result the model already read, so the run commits cleanly instead of
+  # ending `background_delivery_incomplete` (the GOOGL exit-1 ending).
+  async def _case() -> None:
+    runner = _make_credential_runner()
+    entry = runner._task_registry.register("background_agent")
+    runner._task_registry.transition(entry.task_id, TaskState.RUNNING)
+    runner._task_registry.transition(
+      entry.task_id,
+      TaskState.COMPLETED,
+      result={
+        "kind": "report",
+        "report": {"summary": "rendered before the terminal batch"},
+      },
+    )
+    assert entry.notification_delivery_state == "queued"
+    assert runner._notification_queue.pending_count == 1
+    seen_prompts: list[str] = []
+
+    async def stream_turn(**kwargs: Any):
+      seen_prompts.append(str(kwargs["system_prompt"]))
+      turn = StreamTurnResult(
+        full_text="",
+        stop_reason="tool_use",
+        content_blocks=[{
+          "type": "tool_use",
+          "id": "terminal-tool",
+          "name": "fms_report_demo",
+          "input": {},
+        }],
+      )
+      turn.tool_uses = [
+        ("terminal-tool", "fms_report_demo", {}),
+      ]
+      return object(), turn
+
+    async def execute_tool_use_loop(
+      *_args: Any,
+      **_kwargs: Any,
+    ) -> ToolUseLoopResult:
+      # The batch runs after the ack: nothing is left queued to strand.
+      assert runner._notification_queue.pending_count == 0
+      runner._stop_after_tool_results_reason = "terminal_tool_result"
+      runner._stop_after_tool_results_tool_name = "fms_report_demo"
+      return ToolUseLoopResult(
+        tool_results_content=[{
+          "type": "tool_result",
+          "tool_use_id": "terminal-tool",
+          "content": '{"status":"ok"}',
+        }],
+        tools_used=["fms_report_demo"],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    monkeypatch.setattr(
+      gateway_runner,
+      "_execute_tool_use_loop",
+      execute_tool_use_loop,
+    )
+    await runner.run(
+      messages=[{"role": "user", "content": "finish"}],
+      max_turns=None,
+    )
+
+    events = [item.event for item in runner._log.entries]
+    assert "rendered before the terminal batch" in seen_prompts[0]
+    assert runner._notification_queue.pending_count == 0
+    assert entry.notification_delivery_state == "delivered"
+    assert not any(
+      event.get("type") == "error"
+      for event in events
+    )
+    assert any(
       event.get("type") == "stream_complete"
       for event in events
     )
@@ -4723,3 +5692,447 @@ def test_terminal_event_has_one_guarded_commit_owner() -> None:
     < live_receipt_index
     < commit_index
   )
+
+
+def test_workflow_obstruction_blocks_settlement_maps_states() -> None:
+  # §5.3 states map (T2-I04): authoring/running/cancel_requested obstruct
+  # unconditionally; awaiting_action until its boundary notification is
+  # delivered and acked; terminal or unknown rows never obstruct.
+  from agent_gateway.runner_background_tasks import (
+    workflow_obstruction_blocks_settlement,
+  )
+
+  def row(state: str, acked: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+      state=state,
+      boundary_notification_acked=acked,
+      wake=None,
+    )
+
+  assert workflow_obstruction_blocks_settlement(row("authoring"))
+  assert workflow_obstruction_blocks_settlement(row("running"))
+  assert workflow_obstruction_blocks_settlement(row("cancel_requested"))
+  assert workflow_obstruction_blocks_settlement(row("awaiting_action"))
+  assert not workflow_obstruction_blocks_settlement(
+    row("awaiting_action", acked=True)
+  )
+  assert not workflow_obstruction_blocks_settlement(row("terminal"))
+  assert not workflow_obstruction_blocks_settlement(object())
+
+
+def test_both_hold_open_sites_consult_workflow_obstruction() -> None:
+  # Both end_turn hold-open sites extend RUNNING-task keying with the
+  # workflow settlement obstruction (§5.3, T2-I04).
+  source = inspect.getsource(RunnerRunLoopMixin.run)
+  assert source.count("self._workflow_settlement_obstructed()") == 2
+
+
+def test_workflow_obstruction_holds_final_turn_until_drive_settles() -> None:
+  # A running/authoring workflow obstructs unconditionally even with no
+  # RUNNING registry task (the authoring window): the final turn waits on
+  # the obstruction's wake handle and settles once the drive resolves the
+  # run terminally without any notification.
+  def run_case(state: str) -> None:
+    async def case() -> None:
+      runner = _make_credential_runner()
+      rows: list[SimpleNamespace] = []
+      runner._gateway_session = SimpleNamespace(
+        workflow_settlement_obstruction=lambda: tuple(rows),
+      )
+      release = asyncio.Event()
+
+      async def drive() -> None:
+        await release.wait()
+        rows.clear()
+
+      drive_task = asyncio.create_task(drive())
+      rows.append(SimpleNamespace(
+        state=state,
+        boundary_notification_acked=False,
+        wake=drive_task,
+      ))
+
+      original_wait = runner._wait_for_background_notification
+      wait_calls = 0
+
+      async def tracked_wait() -> bool:
+        nonlocal wait_calls
+        wait_calls += 1
+        release.set()
+        return await original_wait()
+
+      runner._wait_for_background_notification = tracked_wait  # type: ignore[method-assign]
+
+      async def stream_turn(**_kwargs: Any):
+        return object(), StreamTurnResult(
+          full_text="done",
+          stop_reason="end_turn",
+          content_blocks=[{"type": "text", "text": "done"}],
+        )
+
+      runner._stream_turn = stream_turn  # type: ignore[method-assign]
+      await runner.run(
+        messages=[{"role": "user", "content": "finish"}],
+        max_turns=3,
+      )
+
+      assert wait_calls == 1
+      assert drive_task.done()
+      assert runner._unsettled_workflow_obstruction_count() == 0
+      events = [entry.event for entry in runner._log.entries]
+      assert any(
+        event.get("type") == "stream_complete"
+        and event.get("terminal_disposition") == "completed"
+        for event in events
+      )
+
+    asyncio.run(case())
+
+  run_case("running")
+  run_case("authoring")
+
+
+def test_unacked_workflow_boundary_delivers_reminder_then_acks_on_completed_turn() -> None:
+  # An unacked awaiting_action boundary rides the existing notification
+  # queue: the reminder carries the boundary event, and the ack at the
+  # delivering request's response boundary invokes the delivered-callback
+  # — the §5.3 guard's "acked" fact — releasing the hold with the run left
+  # parked. T3-I02: the callback fires exactly once per consumed
+  # notification, under the ack path, never at build.
+  async def case() -> None:
+    runner = _make_credential_runner()
+    rows: list[SimpleNamespace] = [
+      SimpleNamespace(
+        state="awaiting_action",
+        boundary_notification_acked=False,
+        wake=None,
+      ),
+    ]
+    runner._gateway_session = SimpleNamespace(
+      workflow_settlement_obstruction=lambda: tuple(rows),
+    )
+    acked: list[bool] = []
+
+    def acknowledge() -> None:
+      acked.append(True)
+      rows[0] = SimpleNamespace(
+        state="awaiting_action",
+        boundary_notification_acked=True,
+        wake=None,
+      )
+
+    notification = TaskNotification(
+      task_id="workflow-1",
+      agent_name=None,
+      event="workflow_boundary_blocked",
+      summary=(
+        "Workflow workflow-1 parked at an awaiting_action boundary "
+        "(phase 1 revision 1, failed)."
+      ),
+      timestamp=1.0,
+      payload={
+        "workflow_run_id": "workflow-1",
+        "phase_number": 1,
+        "revision": 1,
+        "execution_status": "failed",
+        "origin": "blocked_boundary",
+        "legal_actions": ["continue", "finish", "cancel"],
+      },
+    )
+    notification.workflow_boundary_delivered = acknowledge
+    assert runner._notification_queue.push(notification)
+    assert runner._unsettled_workflow_obstruction_count() == 1
+
+    prompts: list[str] = []
+
+    async def stream_turn(**kwargs: Any):
+      prompts.append(str(kwargs["system_prompt"]))
+      return object(), StreamTurnResult(
+        full_text="Acknowledged the parked workflow.",
+        stop_reason="end_turn",
+        content_blocks=[
+          {"type": "text", "text": "Acknowledged the parked workflow."},
+        ],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "run the workflow"}],
+      system_prompt="base",
+      max_turns=3,
+    )
+
+    # Delivered in the reminder, consumed exactly once under the ack path,
+    # and the drain sees no remaining obligation: the session settles
+    # cleanly with the run left parked (D-T2-4a).
+    assert "workflow_boundary_blocked" in prompts[0]
+    assert acked == [True]
+    assert runner._notification_queue.pending_count == 0
+    assert runner._unsettled_workflow_obstruction_count() == 0
+
+  asyncio.run(case())
+
+
+def test_unacked_workflow_boundary_acks_on_tool_use_turn(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  # The tool-use twin (T3-I02): a boundary notification rendered into a
+  # request that the model answers with tool calls is acked at that
+  # response boundary, before the batch runs. The delivered-callback fires
+  # exactly once and the §5.3 obstruction clears — §5.3's "once the parent
+  # has been told and has responded", now honoured on `tool_use` too.
+  async def case() -> None:
+    runner = _make_credential_runner()
+    rows: list[SimpleNamespace] = [
+      SimpleNamespace(
+        state="awaiting_action",
+        boundary_notification_acked=False,
+        wake=None,
+      ),
+    ]
+    runner._gateway_session = SimpleNamespace(
+      workflow_settlement_obstruction=lambda: tuple(rows),
+    )
+    acked: list[bool] = []
+
+    def acknowledge() -> None:
+      acked.append(True)
+      rows[0] = SimpleNamespace(
+        state="awaiting_action",
+        boundary_notification_acked=True,
+        wake=None,
+      )
+
+    notification = TaskNotification(
+      task_id="workflow-1",
+      agent_name=None,
+      event="workflow_boundary_blocked",
+      summary=(
+        "Workflow workflow-1 parked at an awaiting_action boundary "
+        "(phase 1 revision 1, failed)."
+      ),
+      timestamp=1.0,
+      payload={
+        "workflow_run_id": "workflow-1",
+        "phase_number": 1,
+        "revision": 1,
+        "execution_status": "failed",
+        "origin": "blocked_boundary",
+        "legal_actions": ["continue", "finish", "cancel"],
+      },
+    )
+    notification.workflow_boundary_delivered = acknowledge
+    assert runner._notification_queue.push(notification)
+    assert runner._unsettled_workflow_obstruction_count() == 1
+
+    prompts: list[str] = []
+    obstruction_inside_batch: list[int] = []
+
+    async def stream_turn(**kwargs: Any):
+      prompts.append(str(kwargs["system_prompt"]))
+      if len(prompts) == 1:
+        turn = StreamTurnResult(
+          full_text="",
+          stop_reason="tool_use",
+          content_blocks=[{
+            "type": "tool_use",
+            "id": "tool-1",
+            "name": "lookup",
+            "input": {},
+          }],
+        )
+        turn.tool_uses = [("tool-1", "lookup", {})]
+        return object(), turn
+      return object(), StreamTurnResult(
+        full_text="Acknowledged the parked workflow.",
+        stop_reason="end_turn",
+        content_blocks=[
+          {"type": "text", "text": "Acknowledged the parked workflow."},
+        ],
+      )
+
+    async def execute_tool_use_loop(
+      *_args: Any,
+      **_kwargs: Any,
+    ) -> ToolUseLoopResult:
+      obstruction_inside_batch.append(
+        runner._unsettled_workflow_obstruction_count()
+      )
+      return ToolUseLoopResult(
+        tool_results_content=[{
+          "type": "tool_result",
+          "tool_use_id": "tool-1",
+          "content": '{"ok":true}',
+        }],
+        tools_used=["lookup"],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    monkeypatch.setattr(
+      gateway_runner,
+      "_execute_tool_use_loop",
+      execute_tool_use_loop,
+    )
+    await runner.run(
+      messages=[{"role": "user", "content": "run the workflow"}],
+      system_prompt="base",
+      max_turns=3,
+    )
+
+    assert "workflow_boundary_blocked" in prompts[0]
+    # Acked before the batch ran, exactly once.
+    assert obstruction_inside_batch == [0]
+    assert acked == [True]
+    assert "workflow_boundary_blocked" not in prompts[1]
+    assert runner._notification_queue.pending_count == 0
+    assert runner._unsettled_workflow_obstruction_count() == 0
+
+  asyncio.run(case())
+
+
+def test_rendered_but_unanswered_workflow_boundary_still_obstructs() -> None:
+  # T3-I02's other half: building the reminder must NOT ack. While the
+  # delivering request is still in flight the boundary is rendered but
+  # unanswered, so the callback has not fired and the §5.3 guard still
+  # obstructs settlement.
+  runner = _make_credential_runner()
+  rows: list[SimpleNamespace] = [
+    SimpleNamespace(
+      state="awaiting_action",
+      boundary_notification_acked=False,
+      wake=None,
+    ),
+  ]
+  runner._gateway_session = SimpleNamespace(
+    workflow_settlement_obstruction=lambda: tuple(rows),
+  )
+  acked: list[bool] = []
+
+  notification = TaskNotification(
+    task_id="workflow-1",
+    agent_name=None,
+    event="workflow_boundary_blocked",
+    summary="Workflow workflow-1 parked at an awaiting_action boundary.",
+    timestamp=1.0,
+    payload={"workflow_run_id": "workflow-1"},
+  )
+  notification.workflow_boundary_delivered = lambda: acked.append(True)
+  assert runner._notification_queue.push(notification)
+
+  reminder = runner._build_notification_reminder()
+  delivered = runner._notification_delivery_set()
+
+  assert "workflow_boundary_blocked" in reminder
+  assert [item is notification for item in delivered] == [True]
+  assert acked == []
+  assert runner._notification_queue.pending_count == 1
+  assert runner._unsettled_workflow_obstruction_count() == 1
+
+  assert runner._ack_delivered_notifications(delivered) == 1
+
+  assert acked == [True]
+  assert runner._notification_queue.pending_count == 0
+
+
+def test_background_wait_blocks_on_unacked_boundary_until_notification() -> None:
+  # The hold-open wait itself blocks over an unacked awaiting_action
+  # boundary with no RUNNING task and wakes on the boundary notification
+  # push (the queue is the wake channel, §5.3).
+  async def case() -> None:
+    runner = _make_credential_runner()
+    rows = [
+      SimpleNamespace(
+        state="awaiting_action",
+        boundary_notification_acked=False,
+        wake=None,
+      ),
+    ]
+    runner._gateway_session = SimpleNamespace(
+      workflow_settlement_obstruction=lambda: tuple(rows),
+    )
+
+    waiter = asyncio.create_task(runner._wait_for_background_notification())
+    await asyncio.sleep(0.01)
+    assert not waiter.done()
+
+    runner._notification_queue.push(
+      TaskNotification(
+        task_id="workflow-1",
+        agent_name=None,
+        event="workflow_boundary_blocked",
+        summary="parked",
+        timestamp=1.0,
+        payload={"workflow_run_id": "workflow-1"},
+      )
+    )
+
+    assert await waiter is True
+
+  asyncio.run(case())
+
+
+def test_turn_exhaustion_grants_the_synthesis_credit_without_pending_results() -> None:
+  # B-3 / design §4.4: "the one synthesis credit is granted unconditionally at
+  # exhaustion; the dispatch loop owns eliciting the terminal narrative."
+  # Before this, the obligation was minted only when model-visible tool
+  # results were still pending, so a run that exhausted its turns any other
+  # way went straight to max_turns_reached with no committal turn — and the
+  # honest-partial remap had no narrative to settle on.
+  async def case() -> None:
+    runner = _make_credential_runner()
+    stop_reasons = ["pause_turn", "end_turn"]
+    seen: list[str] = []
+
+    async def stream_turn(**kwargs: Any):
+      stop_reason = stop_reasons[len(seen)]
+      seen.append(str(kwargs.get("system_prompt")))
+      return object(), StreamTurnResult(
+        full_text="committal answer",
+        stop_reason=stop_reason,
+        content_blocks=[{"type": "text", "text": "committal answer"}],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "work"}],
+      max_turns=1,
+    )
+
+    # The exhaustion turn happened: the model was asked once more, and its
+    # end_turn response is the terminal narrative a settled partial rides.
+    assert len(seen) == 2
+    events = [entry.event for entry in runner._log.entries]
+    assert any(event.get("type") == "stream_complete" for event in events)
+
+  asyncio.run(case())
+
+
+def test_the_exhaustion_synthesis_credit_is_still_capped_at_one() -> None:
+  # The generalization does not become an escape hatch: a model that keeps
+  # calling tools still terminates at max_turns_reached.
+  async def case() -> None:
+    runner = _make_credential_runner()
+    calls = 0
+
+    async def stream_turn(**_kwargs: Any):
+      nonlocal calls
+      calls += 1
+      return object(), StreamTurnResult(
+        full_text="",
+        stop_reason="pause_turn",
+        content_blocks=[{"type": "text", "text": "still thinking"}],
+      )
+
+    runner._stream_turn = stream_turn  # type: ignore[method-assign]
+    await runner.run(
+      messages=[{"role": "user", "content": "work"}],
+      max_turns=1,
+    )
+
+    assert calls == 2
+    assert any(
+      entry.event.get("type") == "max_turns_reached"
+      for entry in runner._log.entries
+    )
+
+  asyncio.run(case())

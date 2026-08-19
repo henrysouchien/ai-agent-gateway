@@ -54,7 +54,6 @@ def resolve_run_context(
   request_id: str,
   session_id: str,
   channel: str | None,
-  effective_model: str,
 ) -> RunContext:
   if run_context is not None:
     owner_user_id = str(getattr(session, "owner_user_id", None) or "").strip()
@@ -74,7 +73,6 @@ def resolve_run_context(
     channel=str(channel or getattr(session, "channel", None) or "web"),
     decider_role=resolve_effective_role(getattr(session, "role", None)),
     policy_bundle_hash=str(getattr(approval_policy, "policy_bundle_hash", "unknown")),
-    model_id=effective_model,
     run_id=run_id,
   )
 
@@ -220,8 +218,6 @@ async def can_use_tool_callback(
   utc_now_fn: Callable[[], Any] = utc_now,
   uuid_hex_fn: Callable[[], str],
   os_urandom_fn: Callable[[int], bytes],
-  relay_policy_denied_sub_code: str,
-  relay_policy_denied_message: str,
 ) -> Any:
   arguments = dict(locals())
   batch_admission = acquire_batch_approval_admission(runner._session)
@@ -256,8 +252,6 @@ async def _can_use_tool_callback_impl(
   utc_now_fn: Callable[[], Any] = utc_now,
   uuid_hex_fn: Callable[[], str],
   os_urandom_fn: Callable[[int], bytes],
-  relay_policy_denied_sub_code: str,
-  relay_policy_denied_message: str,
   batch_admission: Any | None = None,
 ) -> Any:
   import claude_agent_sdk
@@ -355,21 +349,9 @@ async def _can_use_tool_callback_impl(
     request = await store.transition_state(request.approval_id, "auto_denied", expected_state_version=request.state_version)
     await policy.on_resolve(request=request)
     return deny_cls(message=decision.reason)
-  if decision.outcome == "route_external":
-    await store.transition_state(
-      request.approval_id,
-      "routed_external",
-      route_target=decision.route_target,
-      route_target_type=decision.route_target_type,
-      expires_at=utc_now_fn() + timedelta(seconds=decision.expiry_seconds or 600),
-      expected_state_version=request.state_version,
-    )
-    return deny_cls(message="external approval route is pending")
-
   request = await store.transition_state(
     request.approval_id,
     "pending_user",
-    route_target_type="pending_tools",
     expires_at=utc_now_fn() + timedelta(seconds=decision.expiry_seconds or 600),
     expected_state_version=request.state_version,
   )
@@ -383,8 +365,6 @@ async def _can_use_tool_callback_impl(
     if raw_modified_tool_args is not None:
       return allow_cls(updated_input=raw_modified_tool_args)
     return allow_cls()
-  if approval and approval.get("denied_by") == "relay_policy":
-    return deny_cls(message=f"[{relay_policy_denied_sub_code}] {relay_policy_denied_message}")
   return deny_cls(message="user denied")
 
 

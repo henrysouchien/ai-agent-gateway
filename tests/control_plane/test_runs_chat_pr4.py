@@ -470,6 +470,24 @@ def test_control_chat_dispatch_reuses_immutable_credential_handle(
   assert response.json()["run"]["max_budget_usd"] == 5.0
 
 
+def test_control_chat_dispatch_rejects_product_dev_mode(
+  client: TestClient,
+  test_control_session: dict[str, Any],
+) -> None:
+  response = client.post(
+    "/api/control/runs",
+    headers={"Authorization": f"Bearer {test_control_session['session_token']}"},
+    json={
+      "kind": "chat",
+      "message": "Start a developer chat.",
+      "channel": "tui",
+      "dev_mode": True,
+    },
+  )
+
+  assert response.status_code == 422, response.text
+
+
 def test_control_session_token_response_is_private_no_store(
   client: TestClient,
   test_api_key: str,
@@ -1442,7 +1460,7 @@ def test_delete_running_control_chat_cancels_background_task_and_disconnects() -
     assert app.state.auth.session_store.get_session(chat_session_id) is None
 
 
-def test_expiring_running_control_chat_cancels_background_task_and_disconnects() -> None:
+def test_listing_elapsed_running_chat_is_read_only_until_explicit_cancel() -> None:
   app, runner = _make_hanging_app()
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -1472,6 +1490,17 @@ def test_expiring_running_control_chat_cancels_background_task_and_disconnects()
     listed = client.get("/api/control/runs?kind=chat", headers=_headers(control))
     assert listed.status_code == 200, listed.text
     assert [run["run_id"] for run in listed.json()["runs"]] == []
+
+    assert session._expired is False
+    assert chat_session_id in app.state.auth.session_store.sessions
+    assert runner.disconnected.is_set() is False
+    assert runner.cancelled.is_set() is False
+
+    deleted = client.delete(
+      f"/api/control/runs/{chat_session_id}",
+      headers=_headers(control),
+    )
+    assert deleted.status_code == 200, deleted.text
 
     assert runner.disconnected.wait(timeout=1.0)
     assert runner.cancelled.wait(timeout=1.0)

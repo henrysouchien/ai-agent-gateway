@@ -49,6 +49,11 @@ from .run_identity import (
   validate_run_identity,
 )
 from .runner_skill_gate import is_report_door_clear_event as _is_report_door_clear_event
+from .runner_session_events import build_user_message_event
+from .selected_content import (
+  SelectedContentBinding,
+  serialize_selected_content_bindings,
+)
 from .session_recap import emit_recap_then_terminal
 from .secret_boundary import SecretBoundary, sanitize_boundary_value, sanitize_tool_event
 from .skill_context import clear_current_skill, current_skill
@@ -58,10 +63,7 @@ from .workflow_evidence_provenance import (
 from . import sdk_runner_approval as _sdk_runner_approval
 from . import sdk_runner_context as _sdk_runner_context
 from . import sdk_runner_helpers as _sdk_runner_helpers
-from .sdk_runner_stream import ToolCallInfo, _ActiveToolUse, _SDKRunnerStreamMixin
-from .tool_dispatcher import RELAY_POLICY_DENIED_MESSAGE, RELAY_POLICY_DENIED_SUB_CODE
-from .tool_display import resolve_display  # noqa: F401 - compatibility alias for stream helpers
-from .tool_result_semantics import classify_semantic_tool_error  # noqa: F401 - compatibility alias for helpers
+from . import sdk_runner_stream as _sdk_runner_stream
 
 
 log = logging.getLogger("agent_gateway.sdk_runner")
@@ -86,8 +88,6 @@ _redact_tool_input_for_event = _sdk_runner_helpers.redact_tool_input_for_event
 _server_for_tool = _sdk_runner_helpers.server_for_tool
 _should_escrow_raw_tool_input = _sdk_runner_helpers.should_escrow_raw_tool_input
 _summarize_error_payload = _sdk_runner_helpers.summarize_error_payload
-ToolCallInfo.__module__ = __name__
-_ActiveToolUse.__module__ = __name__
 
 
 def _approval_queue_timeout_seconds(expiry_seconds: float | int | None) -> float:
@@ -509,7 +509,7 @@ class _SDKSegmentQueryIterator:
     await self._close_current()
 
 
-class AgentSDKRunner(_SDKRunnerStreamMixin):
+class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
   """Run a conversation through the Anthropic agent SDK.
 
   This is an alternative to `AgentRunner` when you want to delegate tool-loop
@@ -549,6 +549,7 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     context_surfaces: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]] | None = None,
     context_capture: ContextCapture | None = None,
     commercial_usage_producer: Any | None = None,
+    agent_session_log: Any | None = None,
   ) -> None:
     if not isinstance(capability_execution, BoundCapabilityExecution):
       raise TypeError(
@@ -698,8 +699,8 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     self._context_capture = context_capture
     self._last_context_manifest_digest: str | None = None
     self._context_manifest_invocation = 0
-    self._pending_tool_calls: Dict[str, ToolCallInfo] = {}
-    self._active_tool_use: _ActiveToolUse | None = None
+    self._pending_tool_calls: Dict[str, _sdk_runner_stream.ToolCallInfo] = {}
+    self._active_tool_use: _sdk_runner_stream._ActiveToolUse | None = None
     self._suppress_text_after_accepted_ui_blocks = False
     self._active_skill_allow: set[str] = set()
     self._active_skill_deny: set[str] = set()
@@ -742,6 +743,9 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
     )
     self._summary_emitted = False
     self._session = session
+    self._agent_session_log = agent_session_log
+    self._selected_content_bindings: tuple[SelectedContentBinding, ...] = ()
+    self._selected_content_bindings_bound = False
     self._approval_store = store or getattr(session, "approval_store", None)
     self._approval_policy = policy or getattr(session, "approval_policy", None)
     self._run_context = run_context
@@ -752,6 +756,19 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
   @property
   def capability_execution(self) -> BoundCapabilityExecution:
     return self._capability_execution
+
+  def bind_selected_content(
+    self,
+    bindings: tuple[SelectedContentBinding, ...],
+  ) -> None:
+    if self._selected_content_bindings_bound:
+      raise RuntimeError("selected content is already bound for this runner")
+    if not isinstance(bindings, tuple) or not all(
+      isinstance(binding, SelectedContentBinding) for binding in bindings
+    ):
+      raise TypeError("selected content must be an immutable binding tuple")
+    self._selected_content_bindings = bindings
+    self._selected_content_bindings_bound = True
 
   @staticmethod
   def _normalize_context_surfaces(surfaces: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -1337,7 +1354,6 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
       request_id=self._request_id,
       session_id=self._session_id,
       channel=self._channel,
-      effective_model=self._effective_model,
     )
 
   def _resolve_tool_class(self, tool_name: str) -> str:
@@ -1416,8 +1432,6 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
       utc_now_fn=utc_now,
       uuid_hex_fn=lambda: uuid.uuid4().hex,
       os_urandom_fn=os.urandom,
-      relay_policy_denied_sub_code=RELAY_POLICY_DENIED_SUB_CODE,
-      relay_policy_denied_message=RELAY_POLICY_DENIED_MESSAGE,
     )
 
   async def _close_query_iterator(self) -> None:
@@ -1641,6 +1655,28 @@ class AgentSDKRunner(_SDKRunnerStreamMixin):
   ) -> None:
     if self._summary_emitted:
       raise RuntimeError("AgentSDKRunner is single-use; construct a new runner for subsequent runs")
+    if self._selected_content_bindings:
+      append = getattr(self._agent_session_log, "append", None)
+      user_content = next(
+        (
+          message.get("content")
+          for message in reversed(messages)
+          if message.get("role") == "user"
+        ),
+        None,
+      )
+      if not callable(append) or user_content is None:
+        raise RuntimeError(
+          "Selected content was not durably committed before model work."
+        )
+      await append(build_user_message_event(
+        content=user_content,
+        client_kind=self._channel or "chat",
+        received_at=time.time(),
+        selected_content=serialize_selected_content_bindings(
+          self._selected_content_bindings
+        ),
+      ))
     self._capability_execution.validate()
     capability_bind = self._capability_execution.bind
     effective_model = capability_bind.upstream_model

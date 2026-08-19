@@ -404,13 +404,12 @@ def build_approvals_router(
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     owner_user_id = _session_owner_user_id(authenticated)
-    auth.session_store.cleanup_expired()
     store = getattr(request.app.state, "gateway_approval_store", None)
 
     approvals: list[dict[str, Any]] = []
     delegation_grant_cache: dict[str, Any | None] = {}
     if store is not None:
-      for session in auth.session_store.sessions.values():
+      for session in auth.session_store.visible_sessions_snapshot():
         if session.kind != "chat" or not _session_matches_owner(session, owner_user_id):
           continue
         if _channel_matches(session.channel, authenticated.channel):

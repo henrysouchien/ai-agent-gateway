@@ -10,7 +10,7 @@
 # Content is frozen per docs/design/model-selection-authority-product-
 # decisions-2026-08-13.md section 6. Unknown fields are rejected by the loader.
 schema: "product-model-selection/v1"
-revision: "2026-08-13.1"
+revision: "2026-08-18.1"
 capabilities:
   session.driver:
     default: {kind: "model", model_key: "anthropic.claude-opus-5", effort: "high"}
@@ -101,6 +101,16 @@ capabilities:
     by_channel: {}
     allowed_model_keys:
       - "anthropic.claude-fable-5"
+      - "anthropic.claude-mythos-5"
+      - "anthropic.claude-opus-5"
+      - "anthropic.claude-sonnet-5"
+
+  citation.review:
+    default: {kind: "model", model_key: "anthropic.claude-haiku-4-5", effort: "none"}
+    by_channel: {}
+    allowed_model_keys:
+      - "anthropic.claude-fable-5"
+      - "anthropic.claude-haiku-4-5"
       - "anthropic.claude-mythos-5"
       - "anthropic.claude-opus-5"
       - "anthropic.claude-sonnet-5"

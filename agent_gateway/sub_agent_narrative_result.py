@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_workflow_contracts import (
+  AdmittedTask,
   AnalyticalOutcome,
   AttemptRef,
   ExecutionSettlement,
@@ -20,6 +21,7 @@ from .final_narrative_artifact import (
   publish_final_narrative,
   read_final_narrative_by_content_handle,
 )
+from .mechanical_outcome import derive_mechanical_outcome
 from .sub_agent_result_contract import (
   FinalNarrativeArtifactReference,
   build_task_result,
@@ -27,6 +29,7 @@ from .sub_agent_result_contract import (
 from .sub_agent_result_evidence import (
   SubAgentResultEvidence,
   collect_sub_agent_result_evidence,
+  fold_dispatch_failures,
   merge_sub_agent_result_evidence,
 )
 
@@ -345,12 +348,19 @@ def task_result_from_execution(
   runtime_error_detail: str | None = None,
   external_terminal_signals: Sequence[str] = (),
   prior_evidence: SubAgentResultEvidence | None = None,
+  admitted_task: AdmittedTask | None = None,
 ) -> TaskResult:
   """Materialize a typed runtime result from the exact terminal message.
 
   The child never authors this envelope.  Logical/physical identity,
   provenance, observations, and content handles are all deterministic runtime
   values; terminal prose is treated only as opaque content.
+
+  This is the **sole** constructor of a mechanically derived outcome
+  (T3-I08).  ``admitted_task`` carries the authority frozen at admission —
+  ``tool_grant`` and ``capability_bindings``, never the ambient catalog.  When
+  it is absent no admission is in scope, so no assessment occurred and the
+  outcome stays ``None``.
   """
 
   if not isinstance(
@@ -384,10 +394,12 @@ def task_result_from_execution(
     if runtime_error_detail is not None
     else None
   )
+  event_list: list[Mapping[str, Any]] = []
   for entry in entry_list:
     event = getattr(entry, "event", entry)
     if not isinstance(event, Mapping):
       continue
+    event_list.append(event)
     event_type = event.get("type")
     if event_type == "max_turns_reached":
       signals.append("turns_exhausted")
@@ -442,14 +454,50 @@ def task_result_from_execution(
     signals.append("runtime_error")
     error_detail = "agent execution cannot forbid its terminal assistant message"
 
-  execution = _execution_settlement(
-    tuple(dict.fromkeys(signals)),
-    error_detail=error_detail,
+  settled_signals = tuple(dict.fromkeys(signals))
+  # The honest partial (design §4.5): a child that hit its turn ceiling and
+  # still published a durable terminal narrative did real work. Exhaustion is
+  # the SOLE signal here — cancelled/killed/timeout/budget/runtime failures
+  # co-occurring keep the old failed settlement, and ``ExecutionSettlement``
+  # forbids a ``terminal_reason`` on ``succeeded``, so the exhaustion fact
+  # rides the outcome's ``unmet_requirements`` instead of the settlement.
+  turns_exhausted_only = set(settled_signals) == {"turns_exhausted"}
+  honest_partial = (
+    turns_exhausted_only
+    and final_narrative is not None
+    and requirement.mode == "narrative"
   )
+  if honest_partial:
+    execution = ExecutionSettlement(status="succeeded")
+  else:
+    execution = _execution_settlement(
+      settled_signals,
+      error_detail=error_detail,
+    )
   if execution.status != "succeeded":
     final_narrative = None
     projection = None
     acquired_outcome = None
+  runtime_outcome = None
+  if execution.status == "succeeded" and acquired_outcome is None:
+    runtime_outcome = derive_mechanical_outcome(
+      grant=(
+        admitted_task.tool_grant if admitted_task is not None else None
+      ),
+      bindings=(
+        admitted_task.capability_bindings
+        if admitted_task is not None
+        else ()
+      ),
+      failures=fold_dispatch_failures(event_list),
+      sources=evidence.observed_sources,
+      narrative_present=final_narrative is not None,
+      turns_exhausted=honest_partial,
+      # D-B3-1: the only "unavailable input" fact at this HEAD settles through
+      # ``terminal_task_result`` (status ``skipped``), which forbids an
+      # outcome; the derivation's missing-inputs arm stays live but unreached.
+      missing_inputs=(),
+    )
   return build_task_result(
     logical_task=logical_task,
     attempt=attempt,
@@ -462,6 +510,7 @@ def task_result_from_execution(
     observed_sources=evidence.observed_sources,
     tools_used=evidence.tools_used,
     usage=evidence.usage,
+    runtime_outcome=runtime_outcome,
   )
 
 

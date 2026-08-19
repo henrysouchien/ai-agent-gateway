@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from typing import Any
 
@@ -81,3 +82,74 @@ def test_spawn_and_resume_both_use_strict_child_log_builder() -> None:
 
   assert "_build_child_event_log(" in spawn_source
   assert "_build_child_event_log(" in resume_source
+
+
+def test_foreground_child_approval_is_replayable_from_parent_log_once() -> None:
+  delivered_events: list[dict[str, Any]] = []
+  captured_events: list[dict[str, Any]] = []
+  parent_log = EventLog(
+    on_event=lambda event, _session_id: delivered_events.append(event),
+    session_id="parent-session",
+  )
+  child_log = _build_child_event_log(
+    parent_log=parent_log,
+    event_log_cls=EventLog,
+    sub_session_id="sub0:parent-session",
+    progress_cb=None,
+    on_sub_event=lambda event, _session_id: captured_events.append(event),
+  )
+  approval = {
+    "type": "tool_approval_request",
+    "approval_id": "approval-start-quant",
+    "tool_call_id": "call-start-quant",
+    "nonce": "nonce-start-quant",
+    "tool_name": "start_quant_research",
+    "tool_input": {"request": {"research_file_id": 42}},
+    "allow_persistent_approval": False,
+  }
+
+  child_log.append(approval)
+  parent_log.append({"type": "text_delta", "text": "after approval"})
+
+  expected = {
+    **approval,
+    "sub_agent_id": "sub0:parent-session",
+  }
+  assert [entry.seq for entry in parent_log.entries] == [1, 2]
+  assert parent_log.entries[0].event == expected
+  assert delivered_events == [
+    expected,
+    {"type": "text_delta", "text": "after approval"},
+  ]
+  assert captured_events == [expected]
+  assert child_log.entries[0].event == approval
+
+  async def _replay() -> dict[str, Any]:
+    replay = parent_log.iter_from(after_seq=0)
+    return (await anext(replay)).event
+
+  assert asyncio.run(_replay()) == expected
+
+
+def test_non_approval_child_events_remain_isolated_from_parent_log() -> None:
+  delivered_events: list[dict[str, Any]] = []
+  parent_log = EventLog(
+    on_event=lambda event, _session_id: delivered_events.append(event),
+    session_id="parent-session",
+  )
+  child_log = _build_child_event_log(
+    parent_log=parent_log,
+    event_log_cls=EventLog,
+    sub_session_id="sub0:parent-session",
+    progress_cb=None,
+    on_sub_event=None,
+  )
+
+  child_log.append({"type": "text_delta", "text": "child-only"})
+
+  assert parent_log.entries == []
+  assert delivered_events == [{
+    "type": "text_delta",
+    "text": "child-only",
+    "sub_agent_id": "sub0:parent-session",
+  }]

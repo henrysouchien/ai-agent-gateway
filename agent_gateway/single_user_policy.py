@@ -80,15 +80,6 @@ class SingleUserApprovalPolicy:
           policy_version=self.policy_version,
         )
 
-    if self._chain_trust_allows(request=request, run_context=run_context):
-      return ApprovalDecision(
-        outcome="auto_approve",
-        reason="Parent approval chain trust matched",
-        persistent_grant_scope_hint=scope_hint,
-        policy_id=self.policy_id,
-        policy_version=self.policy_version,
-      )
-
     return self._request_user(
       "Tool requires user approval",
       allow_persistent_grant=request.tool_class in {"state_write", "external_write", "artifact_write"},
@@ -107,7 +98,7 @@ class SingleUserApprovalPolicy:
     role = resolve_effective_role(decider_role)
     if tool_class == "irreversible":
       return role == "owner"
-    return role in {"owner", "invite", "approver", "compliance", "pm"}
+    return role in {"owner", "invite"}
 
   def _request_user(
     self,
@@ -119,9 +110,6 @@ class SingleUserApprovalPolicy:
     return ApprovalDecision(
       outcome="request_user_approval",
       reason=reason,
-      route_target_type="pending_tools",
-      required_decider_count=1,
-      eligible_decider_count=1,
       expiry_seconds=600,
       allow_persistent_grant=allow_persistent_grant,
       persistent_grant_scope_hint=scope_hint,
@@ -139,27 +127,6 @@ class SingleUserApprovalPolicy:
         qualifier = str(value)
         break
     return f"{request.tool_class}:{request.tool_name}:{qualifier}" if qualifier else f"{request.tool_class}:{request.tool_name}"
-
-  @staticmethod
-  def _chain_trust_allows(*, request: ApprovalRequest, run_context: RunContext) -> bool:
-    if request.approval_constraint != "standard":
-      return False
-    if not request.parent_approval_id:
-      return False
-    if request.tool_class in {"external_write", "portfolio_config", "irreversible"}:
-      return False
-    if request.user_id != run_context.user_id:
-      return False
-    if request.profile != run_context.profile:
-      return False
-    if request.channel != run_context.channel:
-      return False
-    if request.args_predicate is None:
-      return False
-    if not request.chain_trust_window_seconds:
-      return False
-    return True
-
 
 class DelegationApprovalPolicy:
   """Approval policy wrapper for server-authoritative delegated Excel turns."""
@@ -233,9 +200,6 @@ class DelegationApprovalPolicy:
     return ApprovalDecision(
       outcome="request_user_approval",
       reason=reason,
-      route_target_type="pending_tools",
-      required_decider_count=1,
-      eligible_decider_count=1,
       expiry_seconds=600,
       allow_persistent_grant=False,
       policy_id=self.policy_id,

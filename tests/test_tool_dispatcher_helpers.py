@@ -18,8 +18,6 @@ import agent_gateway.tool_dispatcher_helpers as dispatcher_helpers
 
 def test_tool_dispatcher_helper_exports_are_parent_aliases() -> None:
   helper_names = (
-    "RELAY_POLICY_DENIED_SUB_CODE",
-    "RELAY_POLICY_DENIED_MESSAGE",
     "ToolResult",
     "NeedsApprovalCallback",
     "ApprovalKeyQualifier",
@@ -30,7 +28,6 @@ def test_tool_dispatcher_helper_exports_are_parent_aliases() -> None:
     "LocalToolHandler",
     "ApprovalRequest",
     "ApprovalDecision",
-    "resolve_denied_provenance",
     "InterceptContext",
     "InterceptDecision",
     "InterceptResult",
@@ -41,15 +38,6 @@ def test_tool_dispatcher_helper_exports_are_parent_aliases() -> None:
 
   for name in helper_names:
     assert getattr(dispatcher_module, name) is getattr(dispatcher_helpers, name)
-
-
-def test_resolve_denied_provenance_preserves_relay_policy_message() -> None:
-  source, error = dispatcher_module.resolve_denied_provenance("relay_policy")
-
-  assert source == dispatcher_module.RELAY_POLICY_DENIED_SUB_CODE
-  assert error["sub_code"] == dispatcher_module.RELAY_POLICY_DENIED_SUB_CODE
-  assert error["message"] == dispatcher_module.RELAY_POLICY_DENIED_MESSAGE
-
 
 def test_tool_execution_context_emits_and_tracks_abort() -> None:
   event_log = EventLog()

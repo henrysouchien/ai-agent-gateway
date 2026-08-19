@@ -63,3 +63,95 @@ def test_redact_tool_input_fails_closed_when_policy_import_fails(monkeypatch) ->
   redacted = redact_tool_input_for_event("web_fetch", original)
 
   assert redacted == {"_boundary_error": "<secret-sanitization-failed>"}
+
+
+def test_redact_tool_input_uses_packaged_projection_only_when_host_is_absent(
+  monkeypatch,
+) -> None:
+  original_import = builtins.__import__
+
+  def import_without_host_redaction(name: str, *args: Any, **kwargs: Any):
+    if name == "agent.shared.tool_redaction":
+      raise ModuleNotFoundError(
+        "No module named 'agent'",
+        name="agent",
+      )
+    return original_import(name, *args, **kwargs)
+
+  monkeypatch.setattr(builtins, "__import__", import_without_host_redaction)
+
+  secret = "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"
+  original = {
+    "symbol": "AAPL",
+    "start_date": "2025-01-01",
+    "end_date": "2025-01-31",
+    "credential_note": secret,
+  }
+
+  redacted = redact_tool_input_for_event("data_historical_prices", original)
+
+  assert redacted == {
+    "symbol": "AAPL",
+    "start_date": "2025-01-01",
+    "end_date": "2025-01-31",
+    "credential_note": "<redacted-secret>",
+  }
+  assert original["credential_note"] == secret
+
+
+def test_redact_tool_input_does_not_fallback_for_host_transitive_import_failure(
+  monkeypatch,
+) -> None:
+  original_import = builtins.__import__
+
+  def import_with_broken_host_dependency(name: str, *args: Any, **kwargs: Any):
+    if name == "agent.shared.tool_redaction":
+      raise ModuleNotFoundError(
+        "No module named 'host_redaction_dependency'",
+        name="host_redaction_dependency",
+      )
+    return original_import(name, *args, **kwargs)
+
+  monkeypatch.setattr(builtins, "__import__", import_with_broken_host_dependency)
+
+  assert redact_tool_input_for_event(
+    "data_historical_prices",
+    {"symbol": "AAPL"},
+  ) == {"_boundary_error": "<secret-sanitization-failed>"}
+
+
+def test_redact_tool_input_isolates_raw_input_from_selected_host_redactor(
+  monkeypatch,
+) -> None:
+  def mutating_redactor(
+    _tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    deployment_secret: bytes,
+  ) -> dict[str, Any]:
+    assert deployment_secret == b"test-audit-secret"
+    tool_input["symbol"] = "MUTATED"
+    return tool_input
+
+  original_import = builtins.__import__
+
+  def import_mutating_redactor(name: str, globals=None, locals=None, fromlist=(), level=0):
+    if name == "agent.shared.tool_redaction":
+      return type(
+        "_MutatingRedactionModule",
+        (),
+        {
+          "get_audit_hmac_secret": staticmethod(lambda: b"test-audit-secret"),
+          "redact_tool_input": staticmethod(mutating_redactor),
+        },
+      )()
+    return original_import(name, globals, locals, fromlist, level)
+
+  monkeypatch.setattr(builtins, "__import__", import_mutating_redactor)
+  original = {"symbol": "AAPL"}
+
+  assert redact_tool_input_for_event(
+    "data_historical_prices",
+    original,
+  ) == {"symbol": "MUTATED"}
+  assert original == {"symbol": "AAPL"}

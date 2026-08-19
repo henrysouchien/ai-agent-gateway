@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -9,9 +10,12 @@ import pytest
 from agent_workflow_contracts import (  # noqa: E402
   AgentOperationRef,
   AttemptRef,
+  ContentHandle,
   OrdinaryDelegationTaskRef,
   OutcomeRequirement,
+  OwnerBinding,
   ResultRequirement,
+  SELECTED_CONTENT_UTF8_CONTRACT,
   TaskResultProvenance,
   sha256_digest,
 )
@@ -34,8 +38,12 @@ from agent_gateway import (  # noqa: E402
   ToolDispatcher,
 )
 from agent_gateway.providers import StreamEvent  # noqa: E402
+from agent_gateway.selected_content import SelectedContentBinding  # noqa: E402
 from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
+from agent_gateway.runner_run_loop import (  # noqa: E402
+  _background_success_snapshot,
+)
 from tests.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
 )
@@ -379,6 +387,52 @@ def test_runner_emits_durable_envelope_in_order(tmp_path: Path) -> None:
   assert entries[3].event["parent_assistant_message_seq"] == entries[2].seq
   assert "final_tool_result_blocks" in entries[4].event
   assert entries[6].event["reason"] == "completed"
+
+
+def test_runner_commits_selected_content_on_user_fact_before_provider_setup(
+  tmp_path: Path,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "selected.jsonl")
+  payload = b"exact selected bytes"
+  digest = hashlib.sha256(payload).hexdigest()
+  binding = SelectedContentBinding(
+    input_name="selection_0123456789abcdef01234567",
+    display_name="facts.txt",
+    owner=OwnerBinding(tenant_id="tenant-1", session_id="sess-parent"),
+    content=ContentHandle(
+      content_id=f"sha256:{digest}",
+      content_sha256=digest,
+      content_chars=len(payload.decode("utf-8")),
+      content_bytes=len(payload),
+      contract=SELECTED_CONTENT_UTF8_CONTRACT,
+      media_type="text/plain",
+      encoding="utf-8",
+      retention="durable",
+    ),
+  )
+
+  class _CommitCheckingProvider(_ScriptedProvider):
+    def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
+      entries, _cursor = log.query_sync(event_types={"user_message"}, order="asc")
+      assert entries[-1].event["selected_content"] == [binding.model_dump(mode="json")]
+      return super().create_client(config, timeout=timeout)
+
+  provider = _CommitCheckingProvider([_text_turn("done")])
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=_make_dispatcher(event_log=event_log),
+    session_id="sess-parent",
+    capability_execution=_runner_execution(provider),
+    agent_session_log=log,
+    workspace_dir=str(tmp_path),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  runner.bind_selected_content((binding,))
+
+  _run(runner.run(messages=[{"role": "user", "content": "Use it"}]))
 
 
 @pytest.mark.parametrize(
@@ -1270,6 +1324,315 @@ def test_register_background_task_emits_task_registered_with_correlation(
     assert calls == [("sess-parent", 0)]
 
   _run(_case())
+
+
+# --------------------------------------------------------------------------
+# A-M8 / T3-I03 + T3-I04 — transactional background registration (WP2).
+# --------------------------------------------------------------------------
+
+
+def _a_m8_runner(
+  log: AgentSessionLog | None,
+  *,
+  max_concurrent_sub_agents: int | None = None,
+) -> AgentRunner:
+  provider = _ScriptedProvider([_text_turn("unused")])
+  runner = AgentRunner(
+    event_log=EventLog(),
+    dispatcher=_make_dispatcher(),
+    session_id="sess-parent",
+    capability_execution=_runner_execution(provider),
+    agent_session_log=log,
+    max_concurrent_sub_agents=max_concurrent_sub_agents,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+  runner._runner_id = "runner_new"
+  return runner
+
+
+def _a_m8_bind_receipt(runner: AgentRunner) -> dict[str, str]:
+  return _child_execution(runner._provider).bind.receipt()
+
+
+async def _durable_task_events(
+  log: AgentSessionLog,
+  task_id: str,
+) -> list[dict[str, Any]]:
+  entries, _ = await log.query(
+    event_types={"task_registered", "task_completed"},
+    order="asc",
+  )
+  return [
+    entry.event
+    for entry in entries
+    if entry.event.get("task_id") == task_id
+  ]
+
+
+def test_concurrent_registration_admits_exactly_the_ceiling(
+  tmp_path: Path,
+) -> None:
+  """Kills seam-map Hole 1 through the real registration path (CUR-E2E-03).
+
+  The durable replay lookup used to sit *between* the capacity verdict and
+  ``register``. With a slow lookup, N concurrent callers all read the same
+  stale ``admission_count`` and all registered afterwards. The lookup is a
+  pre-check now and ``TaskRegistry.admit`` owns the whole decision.
+  """
+
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "race.jsonl")
+    runner = _a_m8_runner(log, max_concurrent_sub_agents=2)
+    capability_bind_receipt = _a_m8_bind_receipt(runner)
+    release = asyncio.Event()
+    slow_lookups = 0
+    original_lookup = runner._lookup_task_in_log
+
+    async def _slow_lookup(task_id: str):
+      nonlocal slow_lookups
+      slow_lookups += 1
+      await asyncio.sleep(0)
+      return await original_lookup(task_id)
+
+    runner._lookup_task_in_log = _slow_lookup  # type: ignore[method-assign]
+
+    async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
+      await release.wait()
+      return _child_report(), None
+
+    async def _register(index: int):
+      return await runner._register_background_task(
+        tool_input={"task": f"collect-{index}"},
+        handler=_handler,
+        agent_name="writer",
+        capability_bind_receipt=capability_bind_receipt,
+        task_id_override=f"bg_race_{index}",
+      )
+
+    outcomes = await asyncio.gather(*[_register(index) for index in range(6)])
+
+    admitted = [result for result, error in outcomes if error is None]
+    refused = [error for _result, error in outcomes if error is not None]
+    assert len(admitted) == 2
+    assert len(refused) == 4
+    assert {error["code"] for error in refused} == {"max_background_tasks"}
+    assert refused[0]["message"] == (
+      "Background task limit reached (2). "
+      "Wait for an existing background task to finish before launching another."
+    )
+    assert runner._task_registry.admission_count == 2
+    assert slow_lookups == 6
+
+    # D-A8-3: a capacity-rejected dispatch leaves no durable registration.
+    registered, _ = await log.query(
+      event_types={"task_registered"},
+      order="asc",
+    )
+    assert len(registered) == 2
+
+    release.set()
+    for result in admitted:
+      entry = runner._task_registry.get(result["task_id"])
+      assert entry is not None
+      await asyncio.wait_for(entry.asyncio_task, timeout=1.0)
+
+  _run(_case())
+
+
+def test_post_append_failure_appends_a_compensating_terminal(
+  tmp_path: Path,
+) -> None:
+  """Kills seam-map Hole 2 (D-A8-2/3): no durable registration without a terminal.
+
+  This is the live CUR-E2E-03 shape: the append committed and then the
+  RUNNING transition blew up, leaving a PENDING ghost that held
+  ``admission_count > 0`` forever and made the run loop refuse clean success
+  with ``background_delivery_incomplete``.
+  """
+
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "bracket.jsonl")
+    runner = _a_m8_runner(log)
+    original_transition = runner._task_registry.transition
+
+    def _transition(task_id: str, new_state: TaskState, **kwargs: Any):
+      if new_state == TaskState.RUNNING:
+        raise RuntimeError("post-append transition failure")
+      return original_transition(task_id, new_state, **kwargs)
+
+    runner._task_registry.transition = _transition  # type: ignore[method-assign]
+
+    async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
+      raise AssertionError("worker must never run")
+
+    with pytest.raises(RuntimeError, match="post-append transition failure"):
+      await runner._register_background_task(
+        tool_input={"task": "collect"},
+        handler=_handler,
+        agent_name="writer",
+        capability_bind_receipt=_a_m8_bind_receipt(runner),
+        task_id_override="bg_bracket",
+      )
+
+    entry = runner._task_registry.get("bg_bracket")
+    assert entry is not None
+    assert entry.state == TaskState.FAILED
+    assert entry.asyncio_task is None
+
+    events = await _durable_task_events(log, "bg_bracket")
+    assert [event["type"] for event in events] == [
+      "task_registered",
+      "task_completed",
+    ]
+    assert events[-1]["final_state"] == "failed"
+    assert str(events[-1]["result"]["reason"]).startswith("registration_aborted")
+
+    # The acceptance signal for CUR-E2E-03/04: the completion guard clears.
+    assert runner._task_registry.admission_count == 0
+    blockers, _fingerprint = _background_success_snapshot(runner)
+    assert "pending_or_running_tasks" not in blockers
+
+    # T3-I03: replay rebuilds FAILED, never a ghost INTERRUPTED.
+    replayed = TaskRegistry()
+    replayed.load_from_events(events)
+    rebuilt = replayed.get("bg_bracket")
+    assert rebuilt is not None
+    assert rebuilt.state == TaskState.FAILED
+
+  _run(_case())
+
+
+def test_post_append_worker_spawn_failure_appends_a_compensating_terminal(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """The second post-append exit the seam map names: ``create_task`` raising."""
+
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "spawn.jsonl")
+    runner = _a_m8_runner(log)
+
+    def _refuse_create_task(coro: Any, *, name: str | None = None):
+      _ = name
+      coro.close()
+      raise RuntimeError("worker spawn failure")
+
+    monkeypatch.setattr(
+      gateway_runner,
+      "asyncio",
+      _AsyncioProxy(create_task=_refuse_create_task),
+    )
+
+    async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
+      raise AssertionError("worker must never run")
+
+    with pytest.raises(RuntimeError, match="worker spawn failure"):
+      await runner._register_background_task(
+        tool_input={"task": "collect"},
+        handler=_handler,
+        agent_name="writer",
+        capability_bind_receipt=_a_m8_bind_receipt(runner),
+        task_id_override="bg_spawn",
+      )
+
+    events = await _durable_task_events(log, "bg_spawn")
+    assert [event["type"] for event in events] == [
+      "task_registered",
+      "task_completed",
+    ]
+    assert events[-1]["final_state"] == "failed"
+    assert runner._task_registry.admission_count == 0
+
+  _run(_case())
+
+
+def test_post_append_cancellation_shields_the_compensating_terminal(
+  tmp_path: Path,
+) -> None:
+  """D-A8-2: a ``CancelledError`` after the append still leaves a terminal."""
+
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "cancelled.jsonl")
+    runner = _a_m8_runner(log)
+    original_transition = runner._task_registry.transition
+
+    def _transition(task_id: str, new_state: TaskState, **kwargs: Any):
+      if new_state == TaskState.RUNNING:
+        raise asyncio.CancelledError()
+      return original_transition(task_id, new_state, **kwargs)
+
+    runner._task_registry.transition = _transition  # type: ignore[method-assign]
+
+    async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
+      raise AssertionError("worker must never run")
+
+    with pytest.raises(asyncio.CancelledError):
+      await runner._register_background_task(
+        tool_input={"task": "collect"},
+        handler=_handler,
+        agent_name="writer",
+        capability_bind_receipt=_a_m8_bind_receipt(runner),
+        task_id_override="bg_cancelled",
+      )
+
+    events = await _durable_task_events(log, "bg_cancelled")
+    assert [event["type"] for event in events] == [
+      "task_registered",
+      "task_completed",
+    ]
+    assert events[-1]["final_state"] == "failed"
+    assert runner._task_registry.admission_count == 0
+
+  _run(_case())
+
+
+def test_pre_append_failure_still_discards_the_reservation(
+  tmp_path: Path,
+) -> None:
+  """D-A8-2's other half: pre-append -> ``discard_unstarted``, no terminal."""
+
+  async def _case() -> None:
+    log = AgentSessionLog(path=tmp_path / "sessions" / "pre-append.jsonl")
+    runner = _a_m8_runner(log)
+
+    async def _refuse_append(event: dict[str, Any]):
+      raise RuntimeError("durable registration unavailable")
+
+    runner._append_durable_event = _refuse_append  # type: ignore[method-assign]
+
+    async def _handler(_tool_input: dict[str, Any], **_kwargs: Any):
+      raise AssertionError("worker must never run")
+
+    result, error = await runner._register_background_task(
+      tool_input={"task": "collect"},
+      handler=_handler,
+      agent_name="writer",
+      capability_bind_receipt=_a_m8_bind_receipt(runner),
+      task_id_override="bg_pre_append",
+    )
+
+    assert result is None
+    assert error is not None
+    assert error["code"] == "background_registration_failed"
+    assert runner._task_registry.get("bg_pre_append") is None
+    assert runner._task_registry.admission_count == 0
+    assert await _durable_task_events(log, "bg_pre_append") == []
+
+  _run(_case())
+
+
+class _AsyncioProxy:
+  """Expose the real ``asyncio`` module with a few attributes replaced."""
+
+  def __init__(self, **overrides: Any) -> None:
+    self._overrides = overrides
+
+  def __getattr__(self, name: str) -> Any:
+    if name in self._overrides:
+      return self._overrides[name]
+    return getattr(asyncio, name)
 
 
 def test_task_completed_is_durable_before_terminal_transition() -> None:

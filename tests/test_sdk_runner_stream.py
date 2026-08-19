@@ -21,7 +21,7 @@ from agent_gateway import (  # noqa: E402
   ProductModelRegistry,
 )
 import agent_gateway.sdk_runner as sdk_runner  # noqa: E402
-from agent_gateway.sdk_runner_stream import _SDKRunnerStreamMixin  # noqa: E402
+from agent_gateway.sdk_runner_stream import ToolCallInfo, _SDKRunnerStreamMixin  # noqa: E402
 from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution  # noqa: E402
 
 
@@ -54,8 +54,6 @@ def test_sdk_runner_stream_methods_remain_on_runner_class() -> None:
   assert AgentSDKRunner._normalize_tool_result is _SDKRunnerStreamMixin._normalize_tool_result
   assert AgentSDKRunner._complete_tool_call is _SDKRunnerStreamMixin._complete_tool_call
   assert AgentSDKRunner._emit_stream_complete is _SDKRunnerStreamMixin._emit_stream_complete
-  assert sdk_runner.ToolCallInfo.__module__ == "agent_gateway.sdk_runner"
-  assert sdk_runner._ActiveToolUse.__module__ == "agent_gateway.sdk_runner"
 
 
 def test_sdk_runner_exposes_exact_capability_execution() -> None:
@@ -171,7 +169,7 @@ def test_sdk_runner_stream_complete_requires_closed_terminal_contract() -> None:
 
 def test_sdk_runner_non_success_flush_interrupts_pending_tool() -> None:
   runner = _make_runner()
-  runner._pending_tool_calls["tool-1"] = sdk_runner.ToolCallInfo(
+  runner._pending_tool_calls["tool-1"] = ToolCallInfo(
     tool_call_id="tool-1",
     tool_name="Read",
     tool_input={"file_path": "partial.txt"},
@@ -189,10 +187,9 @@ def test_sdk_runner_non_success_flush_interrupts_pending_tool() -> None:
   assert "tool-1" not in runner._pending_tool_calls
 
 
-def test_sdk_runner_stream_parent_monkeypatches_drive_tool_start(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sdk_runner_stream_uses_canonical_display_for_tool_start(monkeypatch: pytest.MonkeyPatch) -> None:
   runner = _make_runner()
   monkeypatch.setattr(sdk_runner, "_redact_tool_input_for_event", lambda _name, _payload: {"redacted": True})
-  monkeypatch.setattr(sdk_runner, "resolve_display", lambda _name, _payload: {"summary": "patched"})
   monkeypatch.setattr(sdk_runner, "_should_escrow_raw_tool_input", lambda _name: False)
   monkeypatch.setattr(sdk_runner, "gateway_product_id", lambda: "hank-test")
 
@@ -217,7 +214,7 @@ def test_sdk_runner_stream_parent_monkeypatches_drive_tool_start(monkeypatch: py
       "tool_call_id": "tool-1",
       "tool_name": "mcp__portfolio-reads-mcp__preview_trade",
       "tool_input": {"redacted": True},
-      "display": {"summary": "patched"},
+      "display": {"label": "Preview trade"},
       "product_id": "hank-test",
     }
   ]
@@ -227,22 +224,26 @@ def test_sdk_runner_stream_parent_monkeypatches_drive_tool_completion(monkeypatc
   timing_calls: list[tuple] = []
   runner = _make_runner(on_tool_timing=lambda *args: timing_calls.append(args))
   monkeypatch.setattr(sdk_runner, "_server_for_tool", lambda _name: "patched-server")
-  monkeypatch.setattr(sdk_runner, "classify_semantic_tool_error", lambda _result: {"code": "patched"})
   monkeypatch.setattr(sdk_runner, "time", SimpleNamespace(time=lambda: 12.5))
-  runner._pending_tool_calls["tool-1"] = sdk_runner.ToolCallInfo(
+  runner._pending_tool_calls["tool-1"] = ToolCallInfo(
     tool_call_id="tool-1",
     tool_name="tool",
     tool_input={},
     started_at=10.0,
   )
 
-  runner._complete_tool_call("tool-1", result={"status": "ok"})
+  runner._complete_tool_call("tool-1", result={"success": False, "message": "rejected"})
 
   events = [entry.event for entry in runner._log.entries]
   assert events[0]["server"] == "patched-server"
   assert events[0]["duration_ms"] == 2500
   assert events[0]["is_error"] is True
-  assert events[0]["semantic_error"] == {"code": "patched"}
+  assert events[0]["semantic_error"] == {
+    "code": "tool_success_false",
+    "message": "rejected",
+    "source": "success",
+    "success": False,
+  }
   assert timing_calls[0][2] == "patched-server"
   assert timing_calls[0][3] == 2500
   assert timing_calls[0][4] is True
@@ -250,7 +251,7 @@ def test_sdk_runner_stream_parent_monkeypatches_drive_tool_completion(monkeypatc
 
 def test_sdk_runner_suppresses_text_after_accepted_ui_blocks() -> None:
   runner = _make_runner()
-  runner._pending_tool_calls["tool-ui"] = sdk_runner.ToolCallInfo(
+  runner._pending_tool_calls["tool-ui"] = ToolCallInfo(
     tool_call_id="tool-ui",
     tool_name="emit_ui_blocks",
     tool_input={},
@@ -273,7 +274,7 @@ def test_sdk_runner_suppresses_text_after_accepted_ui_blocks() -> None:
 
 def test_sdk_runner_keeps_text_after_ui_blocks_validation_failure() -> None:
   runner = _make_runner()
-  runner._pending_tool_calls["tool-ui"] = sdk_runner.ToolCallInfo(
+  runner._pending_tool_calls["tool-ui"] = ToolCallInfo(
     tool_call_id="tool-ui",
     tool_name="emit_ui_blocks",
     tool_input={},
@@ -291,3 +292,73 @@ def test_sdk_runner_keeps_text_after_ui_blocks_validation_failure() -> None:
 
   events = [entry.event for entry in runner._log.entries]
   assert any(event.get("type") == "text_delta" for event in events)
+
+
+def test_sdk_producer_settles_a_dispatch_record_through_the_shared_builder() -> None:
+  """D-B1-1: the second producer must not degrade the fold to the fallback."""
+
+  runner = _make_runner()
+  runner._pending_tool_calls["tool-1"] = ToolCallInfo(
+    tool_call_id="tool-1",
+    tool_name="filings_search",
+    tool_input={},
+    started_at=0.0,
+  )
+
+  runner._complete_tool_call(
+    "tool-1",
+    result={
+      "status": "success",
+      "hits": [
+        {
+          "document_id": "edgar:0000789019-26-000012",
+          "ticker": "MSFT",
+          "source": "filing",
+          "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+        }
+      ],
+    },
+  )
+
+  event = next(
+    entry.event
+    for entry in runner._log.entries
+    if entry.event.get("type") == "tool_call_complete"
+  )
+  assert event["dispatch"]["outcome"] == "ok"
+  # The SDK owns its own dispatch: this producer never retries.
+  assert event["dispatch"]["attempts"] == 1
+  assert event["dispatch"]["sources"] == [
+    {
+      "document_id": "edgar:0000789019-26-000012",
+      "source_kind": "filing",
+      "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+    }
+  ]
+
+
+def test_sdk_producer_settles_a_failure_outcome_with_no_sources() -> None:
+  runner = _make_runner()
+  runner._pending_tool_calls["tool-1"] = ToolCallInfo(
+    tool_call_id="tool-1",
+    tool_name="get_quote",
+    tool_input={},
+    started_at=0.0,
+  )
+
+  runner._complete_tool_call(
+    "tool-1",
+    result={
+      "status": "error",
+      "error": {"code": "rate_limited", "message": "HTTP 429 Too Many Requests"},
+    },
+  )
+
+  event = next(
+    entry.event
+    for entry in runner._log.entries
+    if entry.event.get("type") == "tool_call_complete"
+  )
+  assert event["dispatch"]["outcome"] == "error_rate_limited"
+  assert event["dispatch"]["sources"] == []
+  assert event["is_error"] is True

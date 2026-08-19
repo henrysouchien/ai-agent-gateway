@@ -2,7 +2,39 @@
 
 ## Unreleased (post-0.16.2)
 
-_No unreleased changes recorded yet._
+### Added
+
+- Added explicit `WorkflowDeliverySpecV1` / `WorkflowDeliverySpecV2` and
+  `DeliveryEnvelopeV1` / `DeliveryEnvelopeV2` public construction models,
+  shared version-tolerant parsers, deterministic-preview models/constants,
+  generated JSON Schema and TypeScript unions, a frozen historical-v1 golden,
+  and complete/truncated v2 goldens in installed package resources.
+
+### Changed
+
+- `WorkflowDeliverySpec` and `DeliveryEnvelope` are now public read unions.
+  Historical specs remain byte-exact and absent-version; v2 specs require an
+  explicit `schema_version="2.0"`, and settlements reject cross-version pairs.
+- Gateway attachments, CLI delivery, the Excel taskpane, and the gateway TUI
+  now read both versions. V1 authored-summary presentation is preserved; V2
+  renders an explicitly complete or truncated deterministic preview while the
+  exact `PublishedOutputRef` remains authoritative.
+- The workflow service now writes only explicit V2 starts and envelopes. It
+  derives the bounded preview from owner-authorized exact publication bytes,
+  retains V1 as a historical reader only, and replays an already-recorded
+  envelope without regeneration. An unsettled historical V1 specification is
+  durably completed as a typed delivery failure; it does not revive a V1 writer
+  or leave computation settlement indefinitely pending.
+- Expired sessions reject normal use immediately while privately retained
+  session resources remain available to already-owned workflow activity until
+  that activity completes. Deployment coordination remains outside product
+  health and workflow contracts; the release controller uses process absence,
+  journal inspection, and assembled-artifact verification.
+- Workflow lifecycle readers now accept exact integer AgentSessionLog outer
+  envelope versions 1 and 2 because that cutover changed only
+  `task_registered` payload semantics. Durable task rebuild remains strictly
+  version-2-only; malformed, missing, and unknown workflow envelope versions
+  fail closed.
 
 ## 0.16.2 (2026-08-14)
 

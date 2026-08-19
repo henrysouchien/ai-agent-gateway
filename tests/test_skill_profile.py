@@ -16,7 +16,6 @@ if str(API_DIR) not in sys.path:
 from agent_gateway.skills import (
   AGENT_DESCRIPTION_MAX_CHARS,
   AGENT_DESCRIPTION_PLACEHOLDER,
-  DataRequirement,
   SKILL_STATE_CLASSES,
   SkillLoader,
   SkillProfile,
@@ -148,7 +147,17 @@ def test_parse_lifts_metadata_keys(tmp_path: Path) -> None:
   }
 
 
-def test_parse_data_requirements_typed_field(tmp_path: Path) -> None:
+def test_data_requirements_frontmatter_is_no_longer_a_declaration(
+  tmp_path: Path,
+) -> None:
+  """B-8: the second need vocabulary is gone, not merely unused.
+
+  A ``data_requirements`` block is now ordinary metadata — it declares
+  nothing, warms nothing, and cannot reach admission.  The dataset need is
+  declared as a capability and resolved through the capability -> dataset
+  registry instead (D-B8-2).
+  """
+
   skill_path = _write_skill(
     tmp_path,
     """
@@ -167,16 +176,10 @@ def test_parse_data_requirements_typed_field(tmp_path: Path) -> None:
 
   profile = parse_skill_file(skill_path)
 
-  assert profile.data_requirements == (
-    DataRequirement(
-      endpoint="key_metrics",
-      symbol="{ticker}",
-      params={"period": "annual", "limit": 12},
-      required=True,
-      freshness="immutable_history",
-    ),
-  )
-  assert profile.metadata == {"custom": "value"}
+  assert not hasattr(profile, "data_requirements")
+  assert profile.metadata is not None
+  assert profile.metadata["custom"] == "value"
+  assert "data_requirements" in profile.metadata
 
 
 @pytest.mark.parametrize("raw", ["7", 7, 7.0])
@@ -635,7 +638,6 @@ def test_none_defaults(tmp_path: Path) -> None:
   assert profile.extra_excluded_tools == set()
   assert profile.tool_packs_enabled is True
   assert profile.state_class is None
-  assert profile.data_requirements == ()
   assert profile.max_structured_reads is None
   assert profile.delegation_role is None
 
@@ -658,7 +660,6 @@ def test_dataclass_construction_defaults() -> None:
   assert profile.extra_excluded_tools == set()
   assert profile.tool_packs_enabled is True
   assert profile.state_class is None
-  assert profile.data_requirements == ()
   assert profile.max_structured_reads is None
   assert profile.delegation_role is None
 
@@ -666,8 +667,7 @@ def test_dataclass_construction_defaults() -> None:
 def test_positional_construction_compat() -> None:
   profile = SkillProfile("name", "prompt", None, None, None, None, None, False, None, False, {"custom": 1})
 
-  assert [field.name for field in fields(SkillProfile)][-3:] == [
-    "data_requirements",
+  assert [field.name for field in fields(SkillProfile)][-2:] == [
     "max_structured_reads",
     "delegation_role",
   ]
@@ -680,7 +680,6 @@ def test_positional_construction_compat() -> None:
   assert profile.mode == "full"
   assert profile.extra_excluded_tools == set()
   assert profile.tool_packs_enabled is True
-  assert profile.data_requirements == ()
   assert profile.max_structured_reads is None
   assert profile.delegation_role is None
 
@@ -853,6 +852,15 @@ def test_fundamental_research_typed_contract_scopes_memory_write_to_standard_art
   ) == {"skills/fundamental-research/2026-06-11T120000.000Z-run123-MSFT.md"}
 
 
+def test_error_extraction_is_registered_as_product_observation_skill() -> None:
+  loader = SkillLoader(SKILLS_DIR)
+
+  assert (SKILLS_DIR / "error-extraction.md").is_file()
+  assert "error-extraction" in loader.list_skills()
+  assert loader.exists("error-extraction") is True
+  assert loader.load("error-extraction").name == "error-extraction"
+
+
 def _compact_rollout_model_writer_skills() -> list[str]:
   loader = SkillLoader(SKILLS_DIR)
   return [
@@ -915,6 +923,35 @@ class _StaticMcpClient:
     return name
 
 
+def test_evidence_synthesis_compiles_its_declared_evidence_port() -> None:
+  # A tool-less integrator states, in the catalog, where upstream results
+  # enter and how many at minimum.  The digest covers the port; snapshots
+  # without ports keep their pre-port byte shape.
+  profile = SkillLoader(SKILLS_DIR).load("evidence-synthesis")
+  operation = compile_agent_operation(profile, execution_class="node.implement")
+
+  assert [port.model_dump() for port in operation.evidence_ports] == [
+    {"name": "evidence", "min_selections": 1, "max_selections": 6},
+  ]
+  assert operation.required_context == ()
+  assert "evidence_ports" in operation.model_dump(mode="json")
+
+  explore = compile_agent_operation(
+    SkillLoader(SKILLS_DIR).load("explore"),
+    execution_class="node.explore",
+  )
+  assert explore.evidence_ports == ()
+  assert "evidence_ports" not in explore.model_dump(mode="json")
+
+
+def test_evidence_port_cannot_reuse_a_required_context_key() -> None:
+  profile = SkillLoader(SKILLS_DIR).load("evidence-synthesis")
+  profile.metadata["evidence_ports"] = [{"name": "ticker"}]
+  profile.metadata["required_context"] = ["ticker"]
+  with pytest.raises(ValueError, match="cannot reuse required_context"):
+    compile_agent_operation(profile, execution_class="node.implement")
+
+
 def test_peer_comparison_analysis_declares_evidence_capability_and_ceiling() -> None:
   profile = SkillLoader(SKILLS_DIR).load("peer-comparison-analysis")
 
@@ -922,8 +959,11 @@ def test_peer_comparison_analysis_declares_evidence_capability_and_ceiling() -> 
 
   operation = compile_agent_operation(profile, execution_class="node.explore")
 
+  # B-8: the 8-tool data ceiling now names the two evidence universes it can
+  # actually reach, instead of the single coarse row any read tool satisfied.
   assert [item.name for item in operation.required_capabilities] == [
-    "research-evidence.read/v1"
+    "filings.read/v1",
+    "market-data.read/v1",
   ]
   assert all(
     "live_tool" in item.binding_modes for item in operation.required_capabilities
@@ -937,7 +977,7 @@ def test_peer_comparison_analysis_compiles_non_empty_tool_grant() -> None:
   operation = compile_agent_operation(profile, execution_class="node.explore")
   declared = operation_tool_ids(profile)
 
-  admission = admit_operation_tools(
+  authority = admit_operation_tools(
     operation,
     grant_id="grant:test-peer-comparison",
     operation_tool_ids=declared,
@@ -947,38 +987,42 @@ def test_peer_comparison_analysis_compiles_non_empty_tool_grant() -> None:
     effect_resolver=lambda tool_id, server_id, is_local: "read",
   )
 
-  assert admission.tool_grant.tools
+  assert authority.grant.tools
   assert {
-    entry.tool_id for entry in admission.tool_grant.tools
+    entry.tool_id for entry in authority.grant.tools
   } == _PEER_COMPARISON_DECLARED_TOOLS
 
 
 def test_operation_tool_coherence_rejects_requirements_without_ceiling(
   tmp_path: Path,
 ) -> None:
+  """The coherence check IS the resolver now (B-8).
+
+  A declared capability with no ceiling entry that can serve it is refused at
+  compile time by exactly the computation that would refuse it at admission
+  time, so the two can no longer drift.
+  """
+
   skill_path = _write_skill(
     tmp_path,
     """
     name: contradictory-skill
     agent_callable: true
-    agent_description: Fixture profile with data needs but no tool ceiling.
+    agent_description: Fixture profile with declared needs but no tool ceiling.
     mutation_mode: read_only
-    data_requirements:
-      - endpoint: key_metrics
-        symbol: "{ticker}"
-        params:
-          period: annual
-        required: true
-        freshness: immutable_history
     semantic_metadata:
       tool_refs: []
+      capability_requirements:
+        - name: market-data.read/v1
+          required: true
+          binding_modes: [live_tool]
     """,
   )
   profile = parse_skill_file(skill_path)
 
-  with pytest.raises(ValueError, match="empty\\s+declared tool ceiling"):
+  with pytest.raises(ValueError, match="cannot satisfy"):
     validate_operation_tool_coherence(profile)
-  with pytest.raises(ValueError, match="research-evidence.read/v1"):
+  with pytest.raises(ValueError, match="market-data.read/v1"):
     compile_agent_operation(profile, execution_class="node.explore")
 
 
@@ -1017,13 +1061,18 @@ def test_operation_tool_coherence_holds_for_all_callable_catalog_skills() -> Non
     validate_operation_tool_coherence(profile)
 
 
-def test_operation_tool_coherence_exempts_name_shim_only_profiles(
+def test_shim_named_profile_without_declarations_needs_nothing(
   tmp_path: Path,
 ) -> None:
-  # The research-evidence requirement here comes only from the explore /
-  # verify-finding name-based migration fallback, not from declared typed
-  # metadata; live catalog assembly separately rejects those names when no
-  # evidence-tool route exists.
+  """The explore / verify-finding name shim is gone (B-8).
+
+  A profile named after a shim used to have a required evidence capability
+  *invented* for it by ``_declared_semantic_requirements``.  Nothing is
+  inferred from a name any more: a profile that declares nothing needs
+  nothing, and the live catalog still refuses to offer a tool-less operation
+  with no evidence port.
+  """
+
   profile = parse_skill_file(
     _write_skill(
       tmp_path,
@@ -1041,6 +1090,4 @@ def test_operation_tool_coherence_exempts_name_shim_only_profiles(
   validate_operation_tool_coherence(profile)
   operation = compile_agent_operation(profile, execution_class="node.verify")
 
-  assert [item.name for item in operation.required_capabilities] == [
-    "research-evidence.read/v1"
-  ]
+  assert operation.required_capabilities == ()

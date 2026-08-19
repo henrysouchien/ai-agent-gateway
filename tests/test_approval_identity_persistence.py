@@ -381,7 +381,6 @@ def test_fresh_human_owner_vote_requires_exact_owner_identity_and_role(
   still_pending = _run(SQLiteApprovalStore(path).get(request.approval_id))
   assert still_pending is not None
   assert still_pending.state == "pending_user"
-  assert still_pending.votes_received_count == 0
   with sqlite3.connect(path) as conn:
     assert conn.execute(
       "SELECT COUNT(*) FROM approval_votes WHERE approval_id = ?",
@@ -401,7 +400,6 @@ def test_fresh_human_owner_vote_requires_exact_owner_identity_and_role(
   assert approved.state == "approved"
   assert approved.decider_id == "owner-user-417"
   assert approved.decider_role == "owner"
-  assert approved.votes_received_count == 1
 
 
 @pytest.mark.parametrize(

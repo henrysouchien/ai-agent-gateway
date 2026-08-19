@@ -9,7 +9,6 @@ from typing import Any
 
 _MANIFEST_FILE = "ui_blocks_manifest.v1.json"
 _ENVELOPE_SCHEMA_FILE = "schemas/hank_ui_blocks.v1.schema.json"
-_FIXTURES_DIRECTORY = "fixtures"
 
 
 def packaged_contract_directory() -> Path:
@@ -52,29 +51,6 @@ def envelope_schema() -> dict[str, Any]:
   if not isinstance(value, dict):
     raise ValueError("UI blocks envelope schema must be an object")
   return value
-
-
-def fixtures() -> list[dict[str, Any]]:
-  """Return all positive and negative fixtures by file name."""
-
-  directory = packaged_contract_directory()
-  fixture_directory = directory / _FIXTURES_DIRECTORY
-  fixture_paths = sorted(
-    fixture_directory.glob("*.json"), key=lambda path: path.name.encode("utf-8")
-  )
-  if not fixture_paths:
-    raise ValueError("UI blocks fixtures are absent")
-  loaded: list[dict[str, Any]] = []
-  for path in fixture_paths:
-    fixture = _read_json(path)
-    if not isinstance(fixture, dict):
-      raise ValueError(f"UI blocks fixture must be an object: {path.name}")
-    if fixture.get("expectation") == "reject" and not isinstance(
-      fixture.get("expected_code"), str
-    ):
-      raise ValueError(f"UI blocks negative fixture lacks expected_code: {path.name}")
-    loaded.append(fixture)
-  return loaded
 
 
 def fallback_projection_table() -> dict[str, Any]:

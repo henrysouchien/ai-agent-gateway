@@ -5,6 +5,24 @@ from typing import Any, List, Optional, Tuple, Union
 from .child_result_trust import UNTRUSTED_CHILD_RESULTS_POLICY
 
 
+def notification_delivery_set(
+  notification_queue: Any,
+  *,
+  max_count: int,
+) -> Tuple[Any, ...]:
+  """Return exactly the notification objects the reminder will render.
+
+  Same guard and same ``peek`` bound as ``build_notification_reminder``:
+  this is the delivered set for one provider request, recorded at build
+  time and acked at that request's response boundary (A-M7).
+  """
+  return tuple(
+    notification_queue.peek(max_count=max_count)
+    if notification_queue.pending_count > 0
+    else []
+  )
+
+
 def build_notification_reminder(notification_queue: Any, *, max_count: int) -> str:
   """Return the resident child-result trust policy and queued notifications."""
   notifications = (

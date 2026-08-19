@@ -31,8 +31,6 @@ AuditEventType = Literal[
   "auto_approved",
   "auto_denied",
   "user_hold_started",
-  "external_route_started",
-  "external_callback_received",
   "vote_recorded",
   "approved",
   "denied",
@@ -81,11 +79,6 @@ class ApprovalAuditEntry:
   policy_id: str
   policy_version: str
   policy_bundle_hash: str
-  model_id: str | None
-  model_version: str | None
-  system_prompt_hash: str | None
-  tool_schema_version: str | None
-  mcp_server_version: str | None
   approval_constraint: str = "legacy_unknown"
   required_owner_user_id: str | None = None
   identity_source: str | None = None
@@ -272,11 +265,6 @@ def build_audit_entry(
     policy_id=request.policy_id,
     policy_version=request.policy_version,
     policy_bundle_hash=request.policy_bundle_hash,
-    model_id=request.model_id,
-    model_version=request.model_version,
-    system_prompt_hash=request.system_prompt_hash,
-    tool_schema_version=request.tool_schema_version,
-    mcp_server_version=request.mcp_server_version,
     approval_constraint=request.approval_constraint,
     required_owner_user_id=request.required_owner_user_id,
     identity_source=request.identity_source,

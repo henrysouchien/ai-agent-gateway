@@ -12,6 +12,7 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+from agent_gateway.mcp_activation import DerivedToolScope, McpActivationFold
 from agent_gateway import ToolDispatcher
 from agent_gateway import tool_dispatcher_runtime as runtime
 
@@ -499,17 +500,24 @@ def test_tool_dispatcher_denies_mcp_when_advertisement_getter_is_absent() -> Non
   assert mcp.calls == []
 
 
-def test_tool_dispatcher_still_copies_non_dict_allowlist_mappings() -> None:
+def test_tool_dispatcher_enforces_the_live_scope_its_owner_derives() -> None:
+  # T3-I12: the dispatcher's scope is one read of the session's activation
+  # fold. It is held by reference, never snapshotted, because a snapshot is
+  # precisely the second copy that used to reject a tool `load_tools` had just
+  # advertised.
   mcp = _ScopedCorpusMcpClient()
-  source = {"research-corpus-mcp": {"corpus_search"}}
+  fold = McpActivationFold()
+  fold.record("research-corpus-mcp", tools=["corpus_search"], source="load_tools")
+  scope = DerivedToolScope(
+    lambda: {"research-corpus-mcp": fold.granted_tools("research-corpus-mcp")}
+  )
   dispatcher = ToolDispatcher(
     mcp_client=mcp,
     local_tool_handlers={},
-    allowed_mcp_tools_by_server=MappingProxyType(source),
+    allowed_mcp_tools_by_server=scope,
   )
 
-  source["research-corpus-mcp"].add("corpus_write")
-  result, error = asyncio.run(
+  blocked, error = asyncio.run(
     dispatcher.dispatch(
       "call-1",
       "corpus_write",
@@ -518,11 +526,42 @@ def test_tool_dispatcher_still_copies_non_dict_allowlist_mappings() -> None:
     )
   )
 
-  assert dispatcher._allowed_mcp_tools_by_server is not source
-  assert result is None
+  assert blocked is None
   assert error is not None
   assert error["code"] == "mcp_tool_not_allowed"
   assert mcp.calls == []
+
+  fold.record("research-corpus-mcp", tools=["corpus_write"], source="load_tools")
+  allowed, error = asyncio.run(
+    dispatcher.dispatch(
+      "call-2",
+      "corpus_write",
+      {"ticker": "MSFT"},
+      advertised_tool_names=frozenset({"corpus_write"}),
+    )
+  )
+
+  assert error is None
+  assert allowed is not None
+  assert [call[0] for call in mcp.calls] == ["corpus_write"]
+
+
+def test_tool_dispatcher_normalizes_a_non_mapping_allowlist() -> None:
+  mcp = _ScopedCorpusMcpClient()
+
+  class _PairScope:
+    def items(self):
+      return [("research-corpus-mcp", ["corpus_search"])]
+
+  dispatcher = ToolDispatcher(
+    mcp_client=mcp,
+    local_tool_handlers={},
+    allowed_mcp_tools_by_server=_PairScope(),
+  )
+
+  assert dispatcher._allowed_mcp_tools_by_server == {
+    "research-corpus-mcp": {"corpus_search"},
+  }
 
 
 def test_tool_dispatcher_enforces_mcp_scope_with_empty_identity_overrides() -> None:

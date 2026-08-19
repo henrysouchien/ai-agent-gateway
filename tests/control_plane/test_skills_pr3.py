@@ -55,6 +55,7 @@ def test_control_skills_lists_catalog_metadata(
   assert len(skills) > 50
   assert names == sorted(names)
   assert "comparative-analysis" in names
+  assert "error-extraction" in names
   assert "tutor" not in names
   assert "_playbook" not in names
   assert all(entry["catalog"] is True for entry in skills)
@@ -104,9 +105,9 @@ def test_control_skills_lists_catalog_metadata(
   assert macro_review["required_context"] == []
   valuation_inputs = next(entry for entry in skills if entry["name"] == "valuation-inputs")
   assert valuation_inputs["required_context"] == ["ticker"]
-  assert valuation_inputs["blocked_reason"] == "dev_mode_required"
-  assert valuation_inputs["can_launch"] is False
-  assert valuation_inputs["can_schedule"] is False
+  assert valuation_inputs["blocked_reason"] is None
+  assert valuation_inputs["can_launch"] is True
+  assert valuation_inputs["can_schedule"] is True
 
 
 def test_control_skill_detail_returns_metadata_and_resolved_body(
@@ -143,7 +144,7 @@ def test_control_skill_detail_resolves_block_references(
   assert "### Output Quality Rules" in body
 
 
-def test_control_skill_detail_404s_for_unknown_and_catalog_false(
+def test_control_skill_detail_handles_unknown_catalog_false_and_error_extraction(
   client: TestClient,
   test_control_session: dict,
 ) -> None:
@@ -151,11 +152,17 @@ def test_control_skill_detail_404s_for_unknown_and_catalog_false(
 
   unknown = client.get("/api/control/skills/not-a-skill", headers=headers)
   hidden = client.get("/api/control/skills/tutor", headers=headers)
+  error_extraction = client.get(
+    "/api/control/skills/error-extraction",
+    headers=headers,
+  )
 
   assert unknown.status_code == 404
   assert unknown.json()["detail"] == "Skill not found"
   assert hidden.status_code == 404
   assert hidden.json()["detail"] == "Skill not found"
+  assert error_extraction.status_code == 200
+  assert error_extraction.json()["name"] == "error-extraction"
 
 
 def test_fixture_artifacts_are_hidden_but_resumable_for_live_qa(monkeypatch) -> None:
@@ -166,7 +173,6 @@ def test_fixture_artifacts_are_hidden_but_resumable_for_live_qa(monkeypatch) -> 
   expected_allowed_tools = {
     "fixture-canvas-artifact": ["emit_canvas_artifact"],
     "fixture-dashboard-artifact": ["emit_dashboard_artifact"],
-    "fixture-approval-canvas-artifact": ["emit_canvas_artifact", "fixture_approval_gate"],
   }
   for skill_name, allowed_tools in expected_allowed_tools.items():
     metadata = load_skill_metadata(skill_name, SKILLS_DIR, include_catalog_false=True)

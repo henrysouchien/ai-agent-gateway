@@ -15,9 +15,11 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_workflow_contracts import (  # noqa: E402
   ActivityHandle,
+  AgentCompletionEnvelope,
   AgentOperationRef,
   AttemptRef,
   ContentHandle,
+  ContentReadGrant,
   ContractRef,
   ExecutionSettlement,
   OrdinaryDelegationTaskRef,
@@ -33,6 +35,8 @@ import agent_gateway.runner as gateway_runner  # noqa: E402
 import agent_gateway.runner_tool_execution as runner_tool_execution  # noqa: E402
 from agent_gateway.runner_background_tasks import (  # noqa: E402
   _BACKGROUND_RESULT_ACK_RESULT_KEY,
+  build_agent_completion_envelope,
+  ordinary_parent_result_policy,
 )
 from agent_gateway.runner_tool_execution import RunnerToolExecutionMixin  # noqa: E402
 from tests.capability_execution_test_support import (  # noqa: E402
@@ -1136,19 +1140,33 @@ def _aggregate_workflow_result_payload() -> dict[str, Any]:
     DeliverySettlement,
     TerminalPhaseRevision,
     WorkflowResult,
+    WorkflowView,
   )
 
   return WorkflowResult(
     workflow_run_id="workflow-1",
-    admitted_plan_ref=AdmittedPlanRef(
+    view=WorkflowView(
       workflow_run_id="workflow-1",
-      plan_id="plan-1",
-      phase_number=1,
-      revision=1,
-      digest=f"sha256:{'a' * 64}",
+      workflow_name="dynamic-workflow",
+      state="terminal",
+      execution_status="succeeded",
+      delivery_status="not_required",
+      terminal_status="succeeded",
+      legal_actions=(),
+      observation_seq=1,
+      max_phases=2,
+      admitted_plan_ref=AdmittedPlanRef(
+        workflow_run_id="workflow-1",
+        plan_id="plan-1",
+        phase_number=1,
+        revision=1,
+        digest=f"sha256:{'a' * 64}",
+      ),
+      terminal_phase_revision=TerminalPhaseRevision(phase_number=1, revision=1),
+      estimated_cost_usd=0.0,
+      admitted_cost_estimate_usd=0.0,
+      author_cost_usd=0.0,
     ),
-    terminal_phase_revision=TerminalPhaseRevision(phase_number=1, revision=1),
-    execution_status="succeeded",
     delivery=DeliverySettlement(status="not_required"),
     transcript=TranscriptHandle(kind="workflow_transcript", owner_id="workflow-1"),
     activity=ActivityHandle(kind="workflow_activity", owner_id="workflow-1"),
@@ -1209,3 +1227,447 @@ def test_workflow_evidence_projection_registers_without_model_leak() -> None:
       ],
     },
   }
+
+
+def test_workflow_evidence_projection_reaches_the_tool_result_hook() -> None:
+  """The private key is popped before the hook runs, so it must ride the context."""
+
+  seen: list[Any] = []
+
+  async def _capture(ctx: Any) -> list[dict[str, Any]]:
+    seen.append(ctx.child_evidence)
+    return []
+
+  runner = AgentRunner(
+    event_log=EventLog(session_id="test"),
+    dispatcher=_WorkflowEvidenceDispatcher(),  # type: ignore[arg-type]
+    session_id="control-run-evidence-context",
+    capability_execution=_capability_execution(),
+    on_tool_result=_capture,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  _run(
+    runner._execute_single_tool(
+      "tool-workflow",
+      "workflow_run",
+      {"action": "result", "workflow_run_id": "workflow-1"},
+      {"tools": []},
+    )
+  )
+
+  assert seen == [
+    {
+      "workflow_run_id": "workflow-1",
+      "evidence_tools": ["filings_search", "get_financials"],
+      "observed_sources": [
+        {"source_kind": "filing", "document_id": "edgar:1"},
+      ],
+    },
+  ]
+
+
+def _foreground_completion_envelope(*, with_evidence: bool) -> AgentCompletionEnvelope:
+  payload = _canonical_narrative_task_result().model_dump(mode="json")
+  if with_evidence:
+    payload["evidence"] = {
+      "observed_sources": [
+        {
+          "kind": "observed_source",
+          "source_kind": "filing",
+          "document_id": "edgar:0000789019-26-000012",
+          "produced_by_tool": "filings_read",
+          "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+        }
+      ],
+      "tools_used": ["filings_read"],
+    }
+  result = TaskResult.model_validate(payload)
+  return build_agent_completion_envelope(
+    result,
+    policy=ordinary_parent_result_policy(result),
+    terminal_narrative_reader=lambda _result: "Exact foreground terminal message",
+    read_grant_factory=lambda source: ContentReadGrant(
+      grant_id=f"content-read:{source.content_sha256}",
+      content_id=source.content_id,
+      scope="direct_parent",
+      principal_id="parent-runner",
+    ),
+  )
+
+
+def test_foreground_completion_child_evidence_is_stripped_and_routed_to_the_hook() -> None:
+  envelope = _foreground_completion_envelope(with_evidence=True)
+  assert envelope.child_evidence is not None
+
+  seen: list[Any] = []
+
+  async def _capture(ctx: Any) -> list[dict[str, Any]]:
+    seen.append(ctx.child_evidence)
+    return []
+
+  runner = AgentRunner(
+    event_log=EventLog(session_id="test"),
+    dispatcher=_TaskResultDispatcher(envelope),  # type: ignore[arg-type]
+    session_id="test-foreground-child-evidence",
+    capability_execution=_capability_execution(),
+    on_tool_result=_capture,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  live_entry, _tool_name, _extra_blocks = _run(
+    runner._execute_single_tool(
+      "tool-run-agent",
+      "run_agent",
+      {"operation": {"name": "explore"}, "objective": "Research"},
+      {"tools": []},
+    )
+  )
+
+  model_payload = json.loads(live_entry["content"])
+  assert "child_evidence" not in model_payload
+  events = [entry.event for entry in runner._log.entries]
+  complete = next(event for event in events if event.get("type") == "tool_call_complete")
+  assert "child_evidence" not in complete["result"]
+  assert seen == [
+    {
+      "evidence_tools": ["filings_read"],
+      "observed_sources": [
+        {
+          "kind": "observed_source",
+          "source_kind": "filing",
+          "document_id": "edgar:0000789019-26-000012",
+          "produced_by_tool": "filings_read",
+          "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+          "excerpt_handle_id": None,
+        }
+      ],
+    },
+  ]
+
+
+def test_foreground_completion_without_child_evidence_leaves_the_channel_empty() -> None:
+  envelope = _foreground_completion_envelope(with_evidence=False)
+  assert envelope.child_evidence is None
+
+  seen: list[Any] = []
+
+  async def _capture(ctx: Any) -> list[dict[str, Any]]:
+    seen.append(ctx.child_evidence)
+    return []
+
+  runner = AgentRunner(
+    event_log=EventLog(session_id="test"),
+    dispatcher=_TaskResultDispatcher(envelope),  # type: ignore[arg-type]
+    session_id="test-foreground-no-child-evidence",
+    capability_execution=_capability_execution(),
+    on_tool_result=_capture,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  live_entry, _tool_name, _extra_blocks = _run(
+    runner._execute_single_tool(
+      "tool-run-agent",
+      "run_agent",
+      {"operation": {"name": "explore"}, "objective": "Research"},
+      {"tools": []},
+    )
+  )
+
+  assert json.loads(live_entry["content"]) == envelope.model_dump(mode="json")
+  assert seen == [None]
+
+
+# --- B-1 / B-2: the dispatch record and the retry loop ---------------------
+
+
+class _RecordedDispatcher:
+  """Return a scripted sequence of (result, error) pairs, one per attempt."""
+
+  def __init__(self, script: list[tuple[Any, dict[str, Any] | None]]) -> None:
+    self.script = list(script)
+    self.calls = 0
+
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+  ):
+    _ = tool_id, tool_name, tool_input, call_index
+    index = min(self.calls, len(self.script) - 1)
+    self.calls += 1
+    return self.script[index]
+
+
+class _HangingDispatcher:
+  def __init__(self) -> None:
+    self.calls = 0
+
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+  ):
+    _ = tool_id, tool_name, tool_input, call_index
+    self.calls += 1
+    await asyncio.sleep(10)
+    raise AssertionError("unreachable")
+
+
+def _dispatch_runner(dispatcher: Any, **kwargs: Any) -> AgentRunner:
+  return AgentRunner(
+    event_log=EventLog(session_id="dispatch"),
+    dispatcher=dispatcher,  # type: ignore[arg-type]
+    session_id="test-dispatch-record",
+    capability_execution=_capability_execution(),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+    **kwargs,
+  )
+
+
+def _complete_event(runner: AgentRunner) -> dict[str, Any]:
+  events = [
+    entry.event
+    for entry in runner._log.entries
+    if entry.event.get("type") == "tool_call_complete"
+  ]
+  assert events
+  return events[-1]
+
+
+def _start_event_count(runner: AgentRunner) -> int:
+  return len(
+    [
+      entry
+      for entry in runner._log.entries
+      if entry.event.get("type") == "tool_call_start"
+    ]
+  )
+
+
+@pytest.fixture
+def declared_read_effects(monkeypatch: pytest.MonkeyPatch):
+  """Pin the derived `effect` column so retry eligibility is deterministic."""
+
+  from agent_gateway import tool_dispatch_declarations as declarations
+
+  monkeypatch.setattr(
+    declarations,
+    "_CACHED_DECLARATIONS",
+    declarations.build_tool_dispatch_declarations(
+      effect_resolver=lambda _tool_name: "read"
+    ),
+  )
+  yield
+
+
+def test_dispatch_record_is_emitted_on_the_ok_exit_path() -> None:
+  runner = _dispatch_runner(
+    _RecordedDispatcher(
+      [
+        (
+          {
+            "status": "success",
+            "hits": [
+              {
+                "document_id": "edgar:0000789019-26-000012",
+                "ticker": "MSFT",
+                "source": "filing",
+                "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+              }
+            ],
+          },
+          None,
+        )
+      ]
+    )
+  )
+
+  _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
+
+  dispatch = _complete_event(runner)["dispatch"]
+  assert dispatch["outcome"] == "ok"
+  assert dispatch["attempts"] == 1
+  assert dispatch["route_id"] == "local/filings_search"
+  assert dispatch["sources"] == [
+    {
+      "document_id": "edgar:0000789019-26-000012",
+      "source_kind": "filing",
+      "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+    }
+  ]
+
+
+def test_dispatch_record_is_emitted_on_the_semantic_error_exit_path() -> None:
+  runner = _dispatch_runner(
+    _RecordedDispatcher([({"status": "error", "error": {"code": "no_rows"}}, None)])
+  )
+
+  _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
+
+  event = _complete_event(runner)
+  assert event["dispatch"]["outcome"] == "error_semantic"
+  assert event["dispatch"]["sources"] == []
+  # D-B1-4: `semantic_error` stays on the event; the outcome rides beside it.
+  assert event["semantic_error"]["code"] == "tool_status_error"
+
+
+def test_dispatch_record_is_emitted_on_the_exclusion_exit_path() -> None:
+  runner = _dispatch_runner(_ExplodingDispatcher())
+  runner._excluded_tools = {"filings_search"}
+
+  _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
+
+  dispatch = _complete_event(runner)["dispatch"]
+  assert dispatch["outcome"] == "error_semantic"
+  assert dispatch["attempts"] == 1
+  assert dispatch["sources"] == []
+
+
+def test_dispatch_record_is_emitted_on_the_rate_limited_exit_path() -> None:
+  runner = _dispatch_runner(
+    _RecordedDispatcher(
+      [(None, {"code": "rate_limited", "message": "Rate limit: max 5 calls per 60s"})]
+    )
+  )
+
+  _run(runner._execute_single_tool("tool-1", "get_quote", {}, {"tools": []}))
+
+  assert _complete_event(runner)["dispatch"]["outcome"] == "error_rate_limited"
+
+
+def test_dispatch_record_is_emitted_on_the_transport_exit_path() -> None:
+  class _Boom:
+    async def dispatch(self, tool_id, tool_name, tool_input, *, call_index=0):
+      _ = tool_id, tool_name, tool_input, call_index
+      raise RuntimeError("connection reset by peer")
+
+  runner = _dispatch_runner(_Boom())
+
+  _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
+
+  event = _complete_event(runner)
+  assert event["error"]["code"] == "internal_error"
+  assert event["dispatch"]["outcome"] == "error_transport"
+
+
+def test_dispatch_record_is_emitted_on_the_timeout_exit_path() -> None:
+  dispatcher = _HangingDispatcher()
+  runner = _dispatch_runner(dispatcher, tool_call_timeout=0.01)
+
+  _run(runner._execute_single_tool("tool-1", "file_read", {}, {"tools": []}))
+
+  event = _complete_event(runner)
+  assert event["error"]["code"] == "tool_timeout"
+  assert event["dispatch"]["outcome"] == "error_timeout"
+
+
+def test_dispatch_record_is_on_the_event_before_the_cancelled_arm_appends() -> None:
+  class _Cancelling:
+    async def dispatch(self, tool_id, tool_name, tool_input, *, call_index=0):
+      _ = tool_id, tool_name, tool_input, call_index
+      raise asyncio.CancelledError()
+
+  runner = _dispatch_runner(_Cancelling())
+
+  with pytest.raises(asyncio.CancelledError):
+    _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
+
+  event = _complete_event(runner)
+  assert event["dispatch"]["outcome"] == "cancelled"
+  assert event["final_tool_result_blocks"]
+
+
+def test_transient_read_failure_is_retried_and_settles_ok(
+  declared_read_effects: None,
+) -> None:
+  dispatcher = _RecordedDispatcher(
+    [
+      (None, {"code": "internal_error", "message": "connection reset"}),
+      ({"status": "success", "hits": []}, None),
+    ]
+  )
+  runner = _dispatch_runner(dispatcher)
+
+  _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
+
+  event = _complete_event(runner)
+  assert dispatcher.calls == 2
+  assert event["dispatch"]["outcome"] == "ok"
+  assert event["dispatch"]["attempts"] == 2
+  assert "retries_exhausted" not in event["dispatch"]
+  # No re-emitted tool_call_start: `attempts` carries the multiplicity.
+  assert _start_event_count(runner) == 1
+
+
+def test_retries_stop_at_two_and_emit_retries_exhausted(
+  declared_read_effects: None,
+) -> None:
+  dispatcher = _RecordedDispatcher(
+    [(None, {"code": "rate_limited", "message": "HTTP 429 Too Many Requests"})]
+  )
+  runner = _dispatch_runner(dispatcher)
+
+  _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
+
+  event = _complete_event(runner)
+  assert dispatcher.calls == 3
+  assert event["dispatch"]["outcome"] == "error_rate_limited"
+  assert event["dispatch"]["attempts"] == 3
+  assert event["dispatch"]["retries_exhausted"] is True
+  assert _start_event_count(runner) == 1
+
+
+def test_semantic_failures_are_never_retried(declared_read_effects: None) -> None:
+  dispatcher = _RecordedDispatcher(
+    [({"status": "error", "error": {"code": "no_rows"}}, None)]
+  )
+  runner = _dispatch_runner(dispatcher)
+
+  _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
+
+  assert dispatcher.calls == 1
+  assert _complete_event(runner)["dispatch"]["attempts"] == 1
+
+
+def test_undeclared_tools_are_never_retried(declared_read_effects: None) -> None:
+  dispatcher = _RecordedDispatcher(
+    [(None, {"code": "internal_error", "message": "connection reset"})]
+  )
+  runner = _dispatch_runner(dispatcher)
+
+  _run(runner._execute_single_tool("tool-1", "memory_write", {}, {"tools": []}))
+
+  assert dispatcher.calls == 1
+  assert _complete_event(runner)["dispatch"]["attempts"] == 1
+
+
+def test_a_set_abort_event_stops_retrying_between_attempts(
+  declared_read_effects: None,
+) -> None:
+  dispatcher = _RecordedDispatcher(
+    [(None, {"code": "internal_error", "message": "connection reset"})]
+  )
+  runner = _dispatch_runner(dispatcher)
+  abort = asyncio.Event()
+  abort.set()
+  runner._tool_abort_event = abort
+
+  _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
+
+  assert dispatcher.calls == 1
+  assert _complete_event(runner)["dispatch"]["attempts"] == 1

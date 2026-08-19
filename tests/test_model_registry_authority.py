@@ -139,6 +139,27 @@ def test_initial_artifacts_are_complete_and_adapter_closed() -> None:
   )
 
 
+def test_citation_review_resolves_haiku_without_user_picker() -> None:
+  bind = resolve_capability_model(
+    "citation.review",
+    registry=INITIAL_MODEL_REGISTRY,
+    selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+    auth=_auth(
+      capabilities=frozenset({"citation.review"}),
+      model_keys=frozenset({"anthropic.claude-haiku-4-5"}),
+    ),
+  )
+
+  assert bind.capability_id == "citation.review"
+  assert bind.model_key == "anthropic.claude-haiku-4-5"
+  assert bind.upstream_model == "claude-haiku-4-5"
+  assert bind.effort == "none"
+  assert bind.selection_source == "internal_policy"
+  policy = INITIAL_MODEL_SELECTION_POLICY.capabilities["citation.review"]
+  assert policy.allow_explicit_user is False
+  assert policy.allow_authenticated_run_override is False
+
+
 def test_omitted_selection_resolves_complete_opus_five_high_bind() -> None:
   bind = _resolve_driver(_auth())
 
@@ -155,8 +176,8 @@ def test_omitted_selection_resolves_complete_opus_five_high_bind() -> None:
     "credential_principal": "user",
     "credential_ref": "credential:anthropic:user-7",
     "run_mode": "interactive",
-    "registry_revision": "2026-08-13.1",
-    "policy_revision": "2026-08-13.1",
+    "registry_revision": "2026-08-18.1",
+    "policy_revision": "2026-08-18.1",
     "selection_source": "capability_default",
   }
 
@@ -472,6 +493,40 @@ def test_interactive_haiku_admits_the_provider_dated_report_without_rebinding() 
     validate_reported_identity(
       bind,
       "claude-haiku-4-5-20990101",
+      registry=INITIAL_MODEL_REGISTRY,
+    )
+  assert caught.value.code == "reported_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+  "reported_identity",
+  ["gpt-5.6-terra", "gpt-5.6-sol-20260817", "gpt-5.6-unknown"],
+)
+def test_openai_gpt_five_six_admits_only_exact_observed_sol_alias(
+  reported_identity: str,
+) -> None:
+  bind = _resolve_driver(
+    _auth(
+      providers=frozenset({"openai"}),
+      model_keys=frozenset({"openai.gpt-5-6"}),
+    ),
+    explicit_intent=ModelSelectionIntent(
+      model_key="openai.gpt-5-6",
+      effort="medium",
+      source="explicit_user",
+    ),
+  )
+
+  assert bind.upstream_model == "gpt-5.6"
+  assert validate_reported_identity(
+    bind,
+    "gpt-5.6-sol",
+    registry=INITIAL_MODEL_REGISTRY,
+  ) == "gpt-5.6-sol"
+  with pytest.raises(CapabilityResolutionError) as caught:
+    validate_reported_identity(
+      bind,
+      reported_identity,
       registry=INITIAL_MODEL_REGISTRY,
     )
   assert caught.value.code == "reported_identity_mismatch"

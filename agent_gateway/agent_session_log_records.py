@@ -13,14 +13,22 @@ from typing import Any, Callable, Literal
 
 
 # v2 (2026-08-14): task_registered records carry the complete capability_bind
-# receipt. v1 records are drained, not migrated (model-selection-authority plan
-# section 6): rebuild loudly skips them instead of reconstructing bind-less
-# tasks that fail only at resume.
+# receipt. v1 task records are drained, not migrated (model-selection-authority
+# plan section 6): rebuild loudly skips them instead of reconstructing bind-less
+# tasks that fail only at resume. AgentSessionLog stamps this version on every
+# event type; consumers whose payload did not change at this cutover own their
+# bounded event-type-specific historical read policy.
 EVENT_SCHEMA_VERSION = 2
 _REVERSE_SCAN_CHUNK_SIZE = 64 * 1024
 _SLUG_RE = re.compile(r"[^a-z0-9_-]")
 _SEGMENT_FILE_RE = re.compile(r"^(?P<first>\d{12})-(?P<last>\d{12})-g(?P<generation>\d{6})\.jsonl$")
 _MANIFEST_SCHEMA_VERSION = 1
+
+
+def is_current_event_schema_version(value: object) -> bool:
+  """Return whether ``value`` is the exact current durable outer version."""
+
+  return type(value) is int and value == EVENT_SCHEMA_VERSION
 
 
 @dataclass(frozen=True)
@@ -316,6 +324,7 @@ __all__ = [
   "_parse_entry",
   "_read_json_dict",
   "agent_session_logical_path_for_jsonl",
+  "is_current_event_schema_version",
   "resolve_agent_session_id",
   "slugify",
 ]

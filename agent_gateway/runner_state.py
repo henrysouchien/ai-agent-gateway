@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Sequence, Set, Tuple
 
 from .runner_budget import (
   BudgetCostProgress as BudgetCostProgress,
@@ -131,6 +131,9 @@ def tool_execution_order_indices(
 class TurnReminderState:
   text: str
   peeked_notification_count: int
+  # The notification objects this request's reminder renders — the
+  # delivered set acked at that request's response boundary (A-M7).
+  delivered: Tuple[Any, ...] = ()
 
 
 def turn_reminder_state(
@@ -139,6 +142,7 @@ def turn_reminder_state(
   *,
   pending_notification_count: int,
   max_notifications_per_turn: int,
+  delivered: Sequence[Any] = (),
 ) -> TurnReminderState:
   return TurnReminderState(
     text="\n\n".join(filter(None, [background_reminder, notification_reminder])),
@@ -147,6 +151,7 @@ def turn_reminder_state(
       if notification_reminder
       else 0
     ),
+    delivered=tuple(delivered),
   )
 
 
@@ -688,21 +693,36 @@ def sub_agent_batch_error(exc: BaseException) -> SubAgentBatchError:
 class SessionDrainState:
   drain_complete: bool
   in_flight_task_count: int
+  unsettled_workflow_obstruction_count: int = 0
 
 
 def session_drain_state(
   running_entries: List[Any],
   *,
   shutdown_failed: bool,
+  unsettled_workflow_obstructions: int = 0,
 ) -> SessionDrainState:
+  """Derive drain completion from in-flight tasks and workflow obligations.
+
+  An unsettled workflow obligation — a live drive or an unacked
+  awaiting_action boundary — keeps the drain incomplete (§5.3, T2-I04) so
+  a session can never report a clean settlement over a silently orphaned
+  workflow run.
+  """
+
   in_flight_task_count = sum(
     1
     for task in running_entries
     if task.asyncio_task is not None and not task.asyncio_task.done()
   )
   return SessionDrainState(
-    drain_complete=not shutdown_failed and in_flight_task_count == 0,
+    drain_complete=(
+      not shutdown_failed
+      and in_flight_task_count == 0
+      and unsettled_workflow_obstructions == 0
+    ),
     in_flight_task_count=in_flight_task_count,
+    unsettled_workflow_obstruction_count=unsettled_workflow_obstructions,
   )
 
 
@@ -744,6 +764,15 @@ class ToolResultContext:
   workspace_dir: str | None = None
   registry_scope: RegistryScope | None = None
   batch_id: int | str | None = None
+  # Runtime-built, never model-visible: the bounded projection of what a
+  # delegated child actually read, stripped from the tool result before the
+  # model or the durable log sees it and delivered here instead so the parent
+  # runtime can seed its citation registry (D-B4-2).
+  child_evidence: Mapping[str, Any] | None = None
+  # The dispatch boundary's own verdict for this call (B-1). Hooks that mint
+  # citable evidence consume it instead of re-deriving success from per-tool
+  # status conventions: a failed retrieval must never become a source.
+  dispatch: Mapping[str, Any] | None = None
   boundary_sanitizer: Callable[[Any, str], Any] | None = field(
     default=None,
     repr=False,

@@ -1065,18 +1065,12 @@ class AnthropicProvider(ModelProvider):
               block = _to_plain_dict(current_tool_block)
               if not isinstance(block, dict):
                 block = {"type": "tool_use", "id": current_tool_id, "name": current_tool_name}
-              try:
-                from agent.shared.tool_redaction import get_audit_hmac_secret, redact_tool_input
+              from ..runner_tool_audit import redact_tool_input_for_event
 
-                block["input"] = redact_tool_input(
-                  str(current_tool_name or ""),
-                  tool_input,
-                  deployment_secret=get_audit_hmac_secret(),
-                )
-              except Exception:
-                from ..secret_boundary import sanitization_failure_tool_input
-
-                block["input"] = sanitization_failure_tool_input()
+              block["input"] = redact_tool_input_for_event(
+                str(current_tool_name or ""),
+                tool_input,
+              )
               yield StreamEvent(
                 type="tool_use_end",
                 tool_id=str(current_tool_id),

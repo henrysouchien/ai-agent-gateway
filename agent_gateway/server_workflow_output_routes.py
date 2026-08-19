@@ -9,6 +9,11 @@ from typing import Any, Mapping
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
+from agent_workflow_contracts import (
+  PublishedOutputPageAuthorization,
+  WorkflowContentPage,
+)
+
 from .agent_session_log import AgentSessionLog
 from .session import AuthManager
 from .workflow_output_attachment import (
@@ -93,7 +98,7 @@ async def workflow_output_response(
       status_code=503,
     )
   try:
-    content = await _materialize_verified_content(
+    payload = await _materialize_verified_content(
       reader,
       attachment=attachment,
     )
@@ -118,7 +123,7 @@ async def workflow_output_response(
   disposition = "attachment" if download else "inline"
   filename = f'{attachment.output_name}{_filename_suffix(attachment.media_type)}'
   return Response(
-    content=content.encode("utf-8"),
+    content=payload,
     media_type=attachment.media_type.split(";", 1)[0],
     headers={
       "Cache-Control": "private, no-store",
@@ -187,96 +192,59 @@ async def _materialize_verified_content(
   reader: Any,
   *,
   attachment: WorkflowOutputAttachment,
-) -> str:
+) -> bytes:
+  # The wired reader returns the typed WorkflowContentPage the service seam
+  # produces; the page's own validator already enforces end/next_cursor
+  # agreement, exact cursor continuation, and terminal pages reaching the
+  # source length. Verification here pins each page to this durable
+  # attachment and re-verifies the joined value end to end.
+  source = attachment.published_output_ref.content
+  authorization = PublishedOutputPageAuthorization(
+    workflow_run_id=attachment.workflow_run_id,
+    phase_number=attachment.delivery_phase_number,
+    revision=attachment.delivery_revision,
+    output_id=attachment.output_id,
+  )
   pieces: list[str] = []
   after_char = 0
   while True:
-    raw_page = await reader(
+    page = await reader(
       attachment.workflow_run_id,
       attachment.output_id,
       after_char,
     )
-    page = _page_mapping(raw_page)
-    source = page.get("source")
-    authorization = page.get("authorization")
-    if (
-      page.get("ok") is not True
-      or page.get("action") != "output"
-      or page.get("workflow_run_id") != attachment.workflow_run_id
-      or page.get("output_id") != attachment.output_id
-      or page.get("view") != "paged_exact_content"
-    ):
+    if not isinstance(page, WorkflowContentPage):
       raise _OutputIntegrityFailure(
-        "page_envelope_mismatch",
-        "workflow output page conflicts with its durable attachment",
+        "invalid_page_shape",
+        "workflow output reader returned an invalid page",
       )
-    if (
-      not isinstance(source, Mapping)
-      or source != attachment.published_output_ref.content.model_dump(mode="json")
-    ):
+    if page.source != source:
       raise _OutputIntegrityFailure(
         "source_handle_mismatch",
         "workflow output page conflicts with its durable attachment",
       )
-    if (
-      not isinstance(authorization, Mapping)
-      or authorization.get("kind") != "published_output"
-      or authorization.get("workflow_run_id") != attachment.workflow_run_id
-      or authorization.get("phase_number") != attachment.delivery_phase_number
-      or authorization.get("revision") != attachment.delivery_revision
-      or authorization.get("output_id") != attachment.output_id
-    ):
+    if page.authorization != authorization:
       raise _OutputIntegrityFailure(
         "authorization_mismatch",
         "workflow output page conflicts with its durable attachment",
       )
-    if (
-      page.get("encoding") != attachment.encoding
-      or page.get("content_sha256") != attachment.content_sha256
-      or page.get("content_chars") != attachment.content_chars
-      or page.get("content_bytes") != attachment.content_bytes
-    ):
-      raise _OutputIntegrityFailure(
-        "content_identity_mismatch",
-        "workflow output page conflicts with its durable attachment",
-      )
-    if page.get("after_char") != after_char:
+    if page.after_char != after_char:
       raise _OutputIntegrityFailure(
         "paging_cursor_mismatch",
         "workflow output page conflicts with its durable attachment",
       )
-    chunk = page.get("content")
-    if not isinstance(chunk, str) or not chunk:
+    if not page.content:
       raise _OutputIntegrityFailure(
         "empty_page",
         "workflow output reader returned an empty page",
       )
-    pieces.append(chunk)
-    next_after = after_char + len(chunk)
-    end = page.get("end")
-    raw_cursor = page.get("next_cursor")
-    if end is True:
-      if raw_cursor is not None or next_after != attachment.content_chars:
-        raise _OutputIntegrityFailure(
-          "terminal_cursor_invalid",
-          "workflow output terminal page has an invalid cursor",
-        )
+    pieces.append(page.content)
+    if page.end or page.next_cursor is None:
       break
-    if end is not False or not isinstance(raw_cursor, Mapping):
-      raise _OutputIntegrityFailure(
-        "continuation_cursor_invalid",
-        "workflow output page has an invalid continuation cursor",
-      )
-    cursor_after = raw_cursor.get("after_char")
-    if cursor_after != next_after or next_after >= attachment.content_chars:
-      raise _OutputIntegrityFailure(
-        "paging_advance_mismatch",
-        "workflow output page did not advance exactly",
-      )
-    after_char = next_after
+    after_char = page.next_cursor.after_char
 
   content = "".join(pieces)
-  payload = content.encode("utf-8")
+  payload = content.encode(attachment.encoding)
   if (
     len(content) != attachment.content_chars
     or len(payload) != attachment.content_bytes
@@ -286,21 +254,7 @@ async def _materialize_verified_content(
       "materialized_content_mismatch",
       "materialized workflow output failed identity verification",
     )
-  return content
-
-
-def _page_mapping(page: object) -> Mapping[str, Any]:
-  if isinstance(page, Mapping):
-    return page
-  model_dump = getattr(page, "model_dump", None)
-  if callable(model_dump):
-    dumped = model_dump(mode="json")
-    if isinstance(dumped, Mapping):
-      return dumped
-  raise _OutputIntegrityFailure(
-    "invalid_page_shape",
-    "workflow output reader returned an invalid page",
-  )
+  return payload
 
 
 def _log_integrity_failure(

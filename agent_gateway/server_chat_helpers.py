@@ -31,6 +31,7 @@ from .capability_binding import (
   saved_preference_ineligibility,
 )
 from .capability_execution import CapabilityExecutionResolver
+from .control_run_lifecycle import coerce_control_run_state
 from .model_registry import (
   GATEWAY_EXECUTED_CAPABILITY_IDS,
   ProductModelRegistry,
@@ -50,6 +51,7 @@ from .session import (
   bind_session_capability_selections,
 )
 from .session_recap import emit_recap_then_terminal
+from .selected_content import SelectedContentAdmission
 from . import server_chat_stream_core as _chat_stream_core
 from . import server_chat_transcripts as _chat_transcripts
 from .tool_dispatcher import ApprovalDecision, ApprovalRequest
@@ -425,7 +427,6 @@ def _legacy_request_approval(session: GatewaySession, event_log: EventLog) -> Re
     return ApprovalDecision(
       approved=bool(approval.get("approved")),
       allow_tool_type=bool(approval.get("allow_tool_type")),
-      denied_by=None if approval.get("approved") else approval.get("denied_by"),
     )
 
   return request_approval
@@ -486,9 +487,9 @@ def _latest_chat_run_state(session: GatewaySession, session_id: str) -> str | No
     event_run_id = event.get("run_id") or event.get("control_run_id")
     if event_run_id is not None and event_run_id != session_id:
       continue
-    state = event.get("state")
-    if state in {"starting", "running", "approval_pending", "completed", "failed", "cancelled"}:
-      return str(state)
+    state = coerce_control_run_state(event.get("state"))
+    if state is not None:
+      return state
   return None
 
 
@@ -853,6 +854,8 @@ def prepare_session_driver_turn(
     effort=inputs.effort,
     catalog_revision=inputs.catalog_revision,
     ui_blocks_contract=inputs.ui_blocks_contract,
+    attachments=tuple(inputs.attachments),
+    investment_artifact_selection=inputs.investment_artifact_selection,
   )
 
   raw_channel = context.get("channel")
@@ -1164,7 +1167,38 @@ async def _dispatch_chat_turn_body(
         raise RuntimeError(
           "chat runtime did not preserve the exact session.driver execution"
         )
+      selected_content_admitter = getattr(
+        build_chat_runtime,
+        "_gateway_selected_content_admitter",
+        None,
+      )
+      selected_content_admission = SelectedContentAdmission()
+      if selected_content_admitter is not None:
+        selected_content_admission = selected_content_admitter(session, request)
+        if inspect.isawaitable(selected_content_admission):
+          selected_content_admission = await selected_content_admission
+        if not isinstance(selected_content_admission, SelectedContentAdmission):
+          raise TypeError(
+            "selected_content_admitter must return SelectedContentAdmission"
+          )
+        if selected_content_admission.model_context:
+          if isinstance(runtime.system_prompt, str):
+            runtime.system_prompt = (
+              f"{runtime.system_prompt}\n\n{selected_content_admission.model_context}"
+            )
+          else:
+            runtime.system_prompt = [
+              *runtime.system_prompt,
+              (selected_content_admission.model_context, False),
+            ]
       runner = _build_runner_with_started_at(runtime.build_runner, event_log, sid, started_at)
+      bind_selected_content = getattr(runner, "bind_selected_content", None)
+      if selected_content_admission.bindings and not callable(bind_selected_content):
+        raise RuntimeError(
+          "chat runner cannot commit selected content"
+        )
+      if callable(bind_selected_content):
+        bind_selected_content(selected_content_admission.bindings)
       set_purpose = getattr(runner, "set_purpose", None)
       if callable(set_purpose):
         set_purpose(runtime.purpose)

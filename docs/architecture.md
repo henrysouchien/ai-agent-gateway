@@ -99,6 +99,33 @@ identity. The child verifies and removes the envelope, materializes the exact
 bind, and never re-selects a model or credential. Resume requires the persisted
 bind; a scheduled run receives a fresh `cron` bind.
 
+### Workflow output delivery
+
+Workflow presentation is a projection over an exact published output, not a
+second authored source of truth. The shared `agent_workflow_contracts` package
+owns the version-discriminated delivery reader used by journal recovery,
+gateway attachment materialization, the CLI, and generated TypeScript clients.
+
+Historical V1 starts retain their absent-version `WorkflowDeliverySpecV1`
+bytes and pair only with a `DeliveryEnvelopeV1` authored-summary envelope. V2
+starts require an explicit `WorkflowDeliverySpecV2(schema_version="2.0")` and
+pair only with `DeliveryEnvelopeV2`: one exact `PublishedOutputRef` plus a
+bounded deterministic UTF-8 preview. The preview is non-authoritative; clients
+keep the exact-output read recipe and verify the returned identity, byte count,
+and digest.
+
+Every reader in the assembled artifact accepts V1 and V2 before the single
+writer is activated. The service admits only explicit V2 starts, derives the
+preview from owner-authorized exact bytes, and appends one V2 envelope;
+already-recorded V1 or V2 envelopes replay through the shared reader without
+regeneration. An unsettled historical V1 specification resolves to a typed
+failed delivery under the current protocol; it never revives the V1 writer.
+Historical compatibility is product behavior. Writer exclusivity
+is external release evidence: stop the prior gateway, prove the managed process
+is absent, inspect durable journals for unsettled runs, and only then start the
+coherent reader-and-writer artifact. Product health and workflow APIs do not
+carry deployment switches, drain counters, or rollout state.
+
 ### `HeartbeatLoop`
 
 `HeartbeatLoop` wraps a `run_fn` (typically a `functools.partial` of `run_autonomous()`) and calls it at regular intervals.

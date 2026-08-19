@@ -268,8 +268,6 @@ def sanitize_approval_decision_projection(
   projected_fields = sanitize_boundary_value(
     {
       "reason": getattr(decision, "reason", ""),
-      "route_target": getattr(decision, "route_target", None),
-      "route_target_type": getattr(decision, "route_target_type", None),
       "persistent_grant_scope_hint": getattr(
         decision,
         "persistent_grant_scope_hint",
@@ -291,8 +289,6 @@ def sanitize_approval_decision_projection(
   if not isinstance(projected_fields, dict):
     projected_fields = {
       "reason": SANITIZATION_FAILED,
-      "route_target": None,
-      "route_target_type": None,
       "persistent_grant_scope_hint": None,
       "redacted_args_for_audit": None,
       "args_predicate": None,
@@ -305,16 +301,6 @@ def sanitize_approval_decision_projection(
       projected_fields["reason"]
       if isinstance(projected_fields.get("reason"), str)
       else SANITIZATION_FAILED
-    ),
-    "route_target": (
-      projected_fields.get("route_target")
-      if isinstance(projected_fields.get("route_target"), str)
-      else None
-    ),
-    "route_target_type": (
-      projected_fields.get("route_target_type")
-      if isinstance(projected_fields.get("route_target_type"), str)
-      else None
     ),
     "persistent_grant_scope_hint": (
       projected_fields.get("persistent_grant_scope_hint")
@@ -355,8 +341,6 @@ def sanitize_approval_decision_projection(
     fallback_updates = {
       **updates,
       "reason": SANITIZATION_FAILED,
-      "route_target": None,
-      "route_target_type": None,
       "persistent_grant_scope_hint": None,
       "redacted_args_for_audit": None,
       "args_predicate": None,
@@ -384,16 +368,33 @@ def sanitize_tool_event(
   }:
     fields = ("tool_input", "display")
   elif event_type == "tool_call_complete":
+    # `dispatch` carries source URLs and document ids extracted from the tool
+    # payload, so it is sanitized like any other tool-derived field. Unknown
+    # keys pass through unsanitized, which makes this tuple a silent-failure
+    # surface — additions here are deliberate (D-B1-3).
     fields = (
       "result",
       "error",
       "semantic_error",
       "final_tool_result_blocks",
+      "dispatch",
     )
+  elif event_type == "mcp_server_activated":
+    # Session-log-only activation record (D-B7-1). `error.message` names the
+    # server and tools an agent declared, which is operator-supplied config
+    # text, so it is sanitized like any other tool-derived field. `server_id`,
+    # `tools` and `whole_server` are catalog identifiers, never payload.
+    fields = ("error",)
   elif event_type == "tool_output_chunk":
     fields = ("text", "content")
   elif event_type in {"error", "run_error", "stream_retry"}:
     fields = ("error", "message", "detail", "reason")
+  elif event_type == "runtime_guard":
+    # Guard messages were runner-authored constants until the delivery
+    # nudges began echoing the parent's dispatch objective (CUR-E2E-08
+    # observability) — free prose that every other durable copy of the
+    # objective already routes through this boundary.
+    fields = ("message",)
   elif event_type in {"readable_resource_ready", "artifact_ready"}:
     fields = ("content", "artifact", "metadata")
 

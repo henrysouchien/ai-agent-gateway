@@ -9,7 +9,10 @@ import sys
 import time
 from typing import Any, Dict, List
 
-from .agent_session_log_records import EVENT_SCHEMA_VERSION
+from .agent_session_log_records import (
+  EVENT_SCHEMA_VERSION,
+  is_current_event_schema_version,
+)
 from .product_config import gateway_product_id
 from .runner_introspection import format_exc as _format_exc
 from .runner_session_events import (
@@ -47,6 +50,7 @@ from .skill_completion_wal import (
   envelope_digest,
 )
 from .runner_tool_audit import get_tool_risk_value as _get_tool_risk_value
+from .selected_content import serialize_selected_content_bindings
 from .secret_boundary import sanitize_tool_event
 from .task_registry import ParentMessage, TaskEntry, TaskRegistry, TaskState
 from .workflow_output_attachment import WorkflowOutputAttachment
@@ -567,7 +571,9 @@ class RunnerSessionLifecycleMixin:
     event: Dict[str, Any],
   ) -> Dict[str, Any]:
     if "event_schema_version" in event:
-      if event.get("event_schema_version") != EVENT_SCHEMA_VERSION:
+      if not is_current_event_schema_version(
+        event.get("event_schema_version")
+      ):
         raise RuntimeError(
           "Prepared durable top-level envelope has an invalid schema"
         )
@@ -584,7 +590,9 @@ class RunnerSessionLifecycleMixin:
     self,
     event: Dict[str, Any],
   ) -> Any:
-    if event.get("event_schema_version") != EVENT_SCHEMA_VERSION:
+    if not is_current_event_schema_version(
+      event.get("event_schema_version")
+    ):
       raise RuntimeError(
         "Exact durable top-level envelope has an invalid schema"
       )
@@ -798,7 +806,9 @@ class RunnerSessionLifecycleMixin:
       for field_name in _DURABLE_TOP_LEVEL_ENVELOPE_FIELDS
       if field_name in event
     }
-    if wrapper.get("event_schema_version") != EVENT_SCHEMA_VERSION:
+    if not is_current_event_schema_version(
+      wrapper.get("event_schema_version")
+    ):
       raise SkillCompletionWalCorruptError(
         "Completion intent durable envelope has an invalid schema"
       )
@@ -1707,6 +1717,9 @@ class RunnerSessionLifecycleMixin:
         content=message.get("content"),
         client_kind=self._client_kind,
         received_at=_runner_attr(self, "time", time).time(),
+        selected_content=serialize_selected_content_bindings(
+          getattr(self, "_selected_content_bindings", ())
+        ),
       )
     )
 

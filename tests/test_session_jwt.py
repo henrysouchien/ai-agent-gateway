@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -84,6 +85,38 @@ def test_session_store_ttl_override_and_kind_are_store_only() -> None:
   assert "kind" not in claims
 
 
+def test_visible_session_snapshot_matches_auth_expiry_without_mutation(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  now = [1_000]
+  monkeypatch.setattr("agent_gateway.session.time.time", lambda: now[0])
+  store = SessionStore(ttl=10)
+  current = store.create_session(api_key_hash="hash", user_id="current")
+  retained_expired = store.create_session(api_key_hash="hash", user_id="retained")
+  elapsed = store.create_session(
+    api_key_hash="hash",
+    user_id="elapsed",
+    ttl_seconds=1,
+  )
+  retained_expired._expired = True
+  now[0] = elapsed.expires_at
+  clock_reads = 0
+
+  def captured_now() -> int:
+    nonlocal clock_reads
+    clock_reads += 1
+    return now[0]
+
+  monkeypatch.setattr("agent_gateway.session.time.time", captured_now)
+  before = dict(store.sessions)
+
+  assert store.visible_sessions_snapshot() == (current,)
+  assert clock_reads == 1
+  assert store.sessions == before
+  assert elapsed._expired is False
+  assert retained_expired._expired is True
+
+
 @pytest.mark.parametrize(
   "claim_name",
   ("risk_user_id", "role", "capabilities", "channel", "is_public", "schema_version"),
@@ -120,3 +153,174 @@ def test_session_jwt_rejects_capability_claim_mismatch() -> None:
 
   assert exc_info.value.status_code == 401
   assert exc_info.value.detail == "Session capabilities mismatch"
+
+
+def test_expired_session_runs_immediate_cleanup_once_and_waits_for_blockers() -> None:
+  async def scenario() -> None:
+    store = SessionStore(ttl=3600)
+    session = store.create_session(api_key_hash="hash", user_id="alice")
+    immediate: list[str] = []
+    final: list[str] = []
+    finalized = asyncio.Event()
+    active = [1]
+    store.add_on_expiry(lambda item: immediate.append(item.session_id))
+
+    def record_final(item) -> None:
+      final.append(item.session_id)
+      finalized.set()
+
+    store.add_on_final_expiry(record_final)
+    store.add_expiry_blocker(lambda item: active[0])
+
+    await store.expire_session_async(session.session_id)
+    assert session._expired is True
+    assert store.get_session(session.session_id) is None
+    assert session.session_id in store.sessions
+    assert immediate == [session.session_id]
+    assert final == []
+
+    await store.expire_session_async(session.session_id)
+    assert immediate == [session.session_id]
+    assert final == []
+
+    active[0] = 0
+    await asyncio.wait_for(finalized.wait(), timeout=1)
+    assert session.session_id not in store.sessions
+    assert immediate == [session.session_id]
+    assert final == [session.session_id]
+
+  asyncio.run(scenario())
+
+
+def test_expiry_remains_visible_until_async_final_hook_completes() -> None:
+  async def scenario() -> None:
+    store = SessionStore(ttl=3600)
+    session = store.create_session(api_key_hash="hash", user_id="alice")
+    final_started = asyncio.Event()
+    release_final = asyncio.Event()
+
+    async def final_hook(_session) -> None:
+      final_started.set()
+      await release_final.wait()
+
+    store.add_on_final_expiry(final_hook)
+    expiry = asyncio.create_task(store.expire_session_async(session.session_id))
+    await final_started.wait()
+
+    assert session.session_id in store.sessions
+    assert store.get_session(session.session_id) is None
+
+    release_final.set()
+    await expiry
+    assert session.session_id not in store.sessions
+
+  asyncio.run(scenario())
+
+
+def test_final_expiry_hook_failure_retains_and_retries_from_failed_hook() -> None:
+  async def scenario() -> None:
+    store = SessionStore(ttl=3600)
+    session = store.create_session(api_key_hash="hash", user_id="alice")
+    calls: list[str] = []
+    failing_attempts = 0
+    finalized = asyncio.Event()
+
+    def first(_session) -> None:
+      calls.append("first")
+
+    def fail_once(_session) -> None:
+      nonlocal failing_attempts
+      failing_attempts += 1
+      calls.append(f"retry:{failing_attempts}")
+      if failing_attempts == 1:
+        raise OSError("teardown unavailable")
+
+    def last(_session) -> None:
+      calls.append("last")
+      finalized.set()
+
+    store.add_on_final_expiry(first)
+    store.add_on_final_expiry(fail_once)
+    store.add_on_final_expiry(last)
+
+    await store.expire_session_async(session.session_id)
+
+    assert session.session_id in store.sessions
+    assert store.get_session(session.session_id) is None
+    assert calls == ["first", "retry:1"]
+
+    await asyncio.wait_for(finalized.wait(), timeout=1)
+    assert calls == ["first", "retry:1", "retry:2", "last"]
+    assert session.session_id not in store.sessions
+
+  asyncio.run(scenario())
+
+
+def test_sync_expiry_defers_async_hooks_without_exposing_session() -> None:
+  store = SessionStore(ttl=3600)
+  session = store.create_session(api_key_hash="hash", user_id="alice")
+  immediate: list[str] = []
+  final: list[str] = []
+  store.add_on_expiry(lambda item: immediate.append(item.session_id))
+  store.add_on_final_expiry(lambda item: final.append(item.session_id))
+
+  store.expire_session(session.session_id)
+
+  assert store.get_session(session.session_id) is None
+  assert session.session_id in store.sessions
+  assert immediate == []
+  assert final == []
+  asyncio.run(store.expire_session_async(session.session_id))
+  assert session.session_id not in store.sessions
+  assert immediate == [session.session_id]
+  assert final == [session.session_id]
+
+
+@pytest.mark.parametrize("blocker_value", (True, -1, "0", None))
+def test_expiry_blocker_malformed_or_unknown_retains_session(
+  blocker_value: object,
+) -> None:
+  async def scenario() -> None:
+    store = SessionStore(ttl=3600)
+    session = store.create_session(api_key_hash="hash", user_id="alice")
+    store.add_expiry_blocker(lambda _session: blocker_value)  # type: ignore[return-value]
+
+    await store.expire_session_async(session.session_id)
+
+    assert session._expired is True
+    assert session.session_id in store.sessions
+    assert store.get_session(session.session_id) is None
+
+  asyncio.run(scenario())
+
+
+def test_expiry_blocker_exception_retains_session_and_token_stays_rejected(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def scenario() -> None:
+    store = SessionStore(ttl=3600)
+    auth = AuthManager(
+      secret=_JWT_SECRET,
+      valid_keys={"gateway-key"},
+      session_store=store,
+    )
+    session = store.create_session(api_key_hash="hash", user_id="alice")
+    token = auth.issue_token(session)
+    store.add_expiry_blocker(
+      lambda _session: (_ for _ in ()).throw(RuntimeError("unknown"))
+    )
+    monkeypatch.setattr(
+      "agent_gateway.session.time.time",
+      lambda: session.expires_at,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+      auth.verify_token(token)
+    await asyncio.sleep(0)
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Session expired"
+    assert session.session_id in store.sessions
+    assert store.get_session(session.session_id) is None
+
+  asyncio.run(scenario())

@@ -470,7 +470,6 @@ async def _run_approval_lifecycle_impl(
       "approved": False,
       "allow_tool_type": False,
       "request": request,
-      "denied_by": "headless_policy",
       "decision_source": "headless_auto_deny",
     }
 
@@ -532,24 +531,6 @@ async def _run_approval_lifecycle_impl(
       "policy_modified_tool_args": policy_modified_tool_args,
     }
 
-  if decision.outcome == "route_external":
-    expires_at = utc_now_fn() + timedelta(seconds=decision.expiry_seconds or 600)
-    request = await store.transition_state(
-      request.approval_id,
-      "routed_external",
-      route_target=decision.route_target,
-      route_target_type=decision.route_target_type,
-      expires_at=expires_at,
-      expected_state_version=request.state_version,
-    )
-    return {
-      "approved": False,
-      "allow_tool_type": False,
-      "request": request,
-      "timeout": True,
-      "policy_modified_tool_args": policy_modified_tool_args,
-    }
-
   if deny_user_prompt:
     request = await store.transition_state(
       request.approval_id,
@@ -564,7 +545,6 @@ async def _run_approval_lifecycle_impl(
       "approved": False,
       "allow_tool_type": False,
       "request": request,
-      "denied_by": "headless_policy",
       "decision_source": "headless_auto_deny",
       "policy_modified_tool_args": policy_modified_tool_args,
     }
@@ -573,7 +553,6 @@ async def _run_approval_lifecycle_impl(
   request = await store.transition_state(
     request.approval_id,
     "pending_user",
-    route_target_type="pending_tools",
     expires_at=expires_at,
     expected_state_version=request.state_version,
   )
@@ -616,7 +595,6 @@ async def _run_approval_lifecycle_impl(
       and request.approval_constraint == "standard"
       and bool(approval.get("allow_tool_type"))
     ),
-    "denied_by": approval.get("denied_by"),
     "request": request,
     "tool_input": final_tool_input,
     "policy_modified_tool_args": policy_modified_tool_args,

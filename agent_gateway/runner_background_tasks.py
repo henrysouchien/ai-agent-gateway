@@ -10,6 +10,7 @@ from agent_workflow_contracts import (
   AgentCompletionEnvelope,
   AgentOperationRef,
   AuthoredSummaryWithResultHandle,
+  ChildEvidenceProjection,
   ContentHandle,
   ContentReadGrant,
   OrdinaryDelegationTaskRef,
@@ -30,6 +31,7 @@ from .skill_lifecycle import (
   TopLevelSkillLifecycleMetadata,
 )
 from .task_registry import NotificationQueue, TaskNotification, TaskState
+from .workflow_evidence_provenance import build_child_evidence_projection
 
 _BACKGROUND_RESULT_ACK_RESULT_KEY = "_background_result_ack"
 _BACKGROUND_ERROR_CODE_MAX_CHARS = 128
@@ -223,6 +225,24 @@ def workflow_owns_terminal_notification(entry: Any) -> bool:
   )
 
 
+def workflow_obstruction_blocks_settlement(row: Any) -> bool:
+  """Map one workflow-obstruction row to the §5.3 hold decision (T2-I04).
+
+  States map per design §5.3: ``authoring``/``running``/``cancel_requested``
+  obstruct clean session settlement unconditionally; ``awaiting_action``
+  obstructs until its boundary notification was delivered and acked;
+  ``terminal`` (or any unknown row) never obstructs.  Rows are duck-typed —
+  the provider lives outside this package.
+  """
+
+  state = getattr(row, "state", None)
+  if state in {"authoring", "running", "cancel_requested"}:
+    return True
+  if state == "awaiting_action":
+    return not bool(getattr(row, "boundary_notification_acked", False))
+  return False
+
+
 class ParentResultMaterializationError(ValueError):
   """A canonical task result cannot satisfy its admitted parent policy."""
 
@@ -398,6 +418,7 @@ def build_agent_completion_envelope(
   else:
     materialization = result_handle()
 
+  child_evidence_payload = build_child_evidence_projection(task_result)
   return AgentCompletionEnvelope(
     message_id=message_id or agent_completion_message_id(task_result),
     task_result_ref=TaskResultRef.from_result(task_result),
@@ -410,6 +431,89 @@ def build_agent_completion_envelope(
       ),
     ),
     parent_materialization=materialization,
+    child_evidence=(
+      ChildEvidenceProjection.model_validate(child_evidence_payload)
+      if child_evidence_payload is not None
+      else None
+    ),
+  )
+
+
+#: Kept for inline materializations, whose full prose already renders in the
+#: notification payload and self-identifies.
+_INLINE_COMPLETION_SUMMARY = (
+  "Agent completed; consume the typed parent materialization."
+)
+
+#: The dispatch-objective echo is bounded well under TaskNotification's
+#: 2000-char render truncation, leaving room for the instruction text.
+_DISPATCH_OBJECTIVE_ECHO_MAX_CHARS = 360
+
+
+def dispatch_objective_echo(entry: Any) -> str | None:
+  """A bounded echo of the parent's own dispatch objective, or None.
+
+  Fail-open by design (CUR-E2E-08): this runs inside the registry
+  transition's notification listener, so it must never raise and must do no
+  I/O. The objective is the parent's own words for the task — the identity a
+  hex task_id cannot carry.
+  """
+  try:
+    objective = getattr(getattr(entry, "admitted_task", None), "objective", None)
+    if not isinstance(objective, str):
+      metadata = getattr(entry, "metadata", None)
+      admitted = metadata.get("admitted_task") if isinstance(metadata, dict) else None
+      objective = admitted.get("objective") if isinstance(admitted, dict) else None
+    if not isinstance(objective, str):
+      return None
+    echo = " ".join(objective.split())
+    if not echo:
+      return None
+    if len(echo) > _DISPATCH_OBJECTIVE_ECHO_MAX_CHARS:
+      echo = echo[: _DISPATCH_OBJECTIVE_ECHO_MAX_CHARS - 1] + "…"
+    return echo
+  except Exception:  # noqa: BLE001 - listener context: never raise
+    return None
+
+
+def _completion_notification_summary(
+  entry: Any,
+  envelope: AgentCompletionEnvelope,
+) -> str:
+  """A self-describing summary for handle-shaped deliveries (CUR-E2E-08).
+
+  A bare ``result_handle`` notification used to carry only a constant
+  string, a hex task_id, and an agent name identical across siblings — no
+  token of what the child did. A parent juggling several children (VRT
+  run 4: a delivery landing mid-recovery on another child's failure) never
+  mapped the hex id back to its own dispatch, never read the handle, and
+  closed claiming the settled task was still outstanding. The summary now
+  carries the parent's own dispatch objective and the exact next action.
+  Inline materializations keep the constant summary: their full prose is
+  already in the payload.
+  """
+  materialization = getattr(envelope, "parent_materialization", None)
+  if getattr(materialization, "kind", None) != "result_handle":
+    return _INLINE_COMPLETION_SUMMARY
+  source = getattr(materialization, "source", None)
+  content_bytes = getattr(source, "content_bytes", None)
+  size = (
+    f" ({content_bytes} bytes)"
+    if isinstance(content_bytes, int)
+    else ""
+  )
+  echo = dispatch_objective_echo(entry)
+  objective_clause = (
+    f" Dispatched objective: {echo}"
+    if echo is not None
+    else ""
+  )
+  return (
+    f"Agent completed. The full result{size} was delivered as a content "
+    "handle — read it with get_agent_result_content (content_id and "
+    "read_grant_id are in this notification's payload) before relying on "
+    "or reporting this task's outcome. This task is settled, not running."
+    f"{objective_clause}"
   )
 
 
@@ -440,7 +544,7 @@ def agent_completion_notification(
     task_id=str(entry.task_id),
     agent_name=getattr(entry, "agent_name", None),
     event="completed",
-    summary="Agent completed; consume the typed parent materialization.",
+    summary=_completion_notification_summary(entry, envelope),
     timestamp=timestamp,
     payload=payload,
     notification_generation=getattr(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import sys
 import time
 from typing import Any, Sequence
 
@@ -10,17 +9,7 @@ from . import sdk_runner_helpers as _sdk_runner_helpers
 from .model_bound_wire import serialize_model_bound_result
 from .runner import ToolResultContext
 from .secret_boundary import sanitize_boundary_value
-from .tool_result_semantics import classify_semantic_tool_error as _classify_semantic_tool_error
-
-
-_PARENT_MODULE = "agent_gateway.sdk_runner"
-
-
-def _compat(name: str, fallback: Any) -> Any:
-  parent = sys.modules.get(_PARENT_MODULE)
-  if parent is not None and hasattr(parent, name):
-    return getattr(parent, name)
-  return fallback
+from .tool_result_semantics import classify_semantic_tool_error
 
 
 def normalize_context_surfaces(surfaces: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -241,8 +230,7 @@ def make_result_entry(
     "tool_use_id": tool_call_id,
     "content": serialize_model_bound_result(result),
   }
-  classify = _compat("classify_semantic_tool_error", _classify_semantic_tool_error)
-  if classify(result) is not None:
+  if classify_semantic_tool_error(result) is not None:
     entry["is_error"] = True
   return entry
 
@@ -254,16 +242,14 @@ def format_additional_context(
   extra_blocks: Sequence[dict[str, Any]],
 ) -> str | None:
   parts: list[str] = []
-  parse_result_payload = _compat("_parse_result_payload", _sdk_runner_helpers.parse_result_payload)
-  summarize_error_payload = _compat("_summarize_error_payload", _sdk_runner_helpers.summarize_error_payload)
-  parsed = parse_result_payload(result_entry.get("content"))
+  parsed = _sdk_runner_helpers.parse_result_payload(result_entry.get("content"))
   if isinstance(parsed, dict):
     warning = parsed.get("_runner_warning") or parsed.get("warning")
     if isinstance(warning, str) and warning.strip():
       parts.append(f"WARNING: {warning.strip()}")
 
     if result_entry.get("is_error") is True:
-      summary = summarize_error_payload(parsed)
+      summary = _sdk_runner_helpers.summarize_error_payload(parsed)
       parts.append(
         f"ERROR: The previous tool call ({tool_name}) returned a structured error: {summary}. "
         "Treat this result as a failure."
@@ -295,11 +281,9 @@ async def build_hook_additional_context(
   error: dict[str, Any] | None,
   logger: Any,
 ) -> str | None:
-  parent_time = _compat("time", time)
   pending = runner._pending_tool_calls.get(tool_call_id)
-  duration_ms = int((parent_time.time() - pending.started_at) * 1000) if pending is not None else 0
+  duration_ms = int((time.time() - pending.started_at) * 1000) if pending is not None else 0
   result_entry = runner._make_result_entry(tool_call_id, result, error)
-  server_for_tool = _compat("_server_for_tool", _sdk_runner_helpers.server_for_tool)
   provider_id_for_tool = getattr(runner, "_provider_id_for_tool", None)
   extra_blocks = await runner._call_on_tool_result(
     ToolResultContext(
@@ -310,7 +294,7 @@ async def build_hook_additional_context(
       duration_ms=duration_ms,
       tool_call_id=tool_call_id,
       session_id=runner._session_id,
-      server=server_for_tool(tool_name),
+      server=_sdk_runner_helpers.server_for_tool(tool_name),
       result_entry=result_entry,
       provider_id=(provider_id_for_tool(tool_name) if callable(provider_id_for_tool) else None),
       skill_run_id=runner._skill_run_id,

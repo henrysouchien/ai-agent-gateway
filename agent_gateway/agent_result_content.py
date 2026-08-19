@@ -38,6 +38,9 @@ class _AuthorizedResultContent:
   handle: ContentHandle
   task_result: TaskResult
   value_kind: Literal["terminal_narrative", "projection"]
+  #: The durably recovered owning task — carried so a successful read can be
+  #: recorded against the live registry entry (CUR-E2E-08), best-effort.
+  task_id: str
 
 
 def make_get_agent_result_content_tool_def() -> dict[str, Any]:
@@ -135,6 +138,19 @@ def make_get_agent_result_content_handler(runner_ref: list[Any]):
         "code": "result_content_unavailable",
         "message": "Agent result content is unavailable or failed verification",
       }
+    # Record the redemption on the live registry entry when one exists
+    # (CUR-E2E-08). Strictly best-effort: authorization above is durable-log
+    # only, and the entry may be evicted, rebuilt, or absent — a miss is not
+    # an error, and no failure here may break the read the parent just made.
+    try:
+      registry = getattr(runner, "_task_registry", None)
+      if registry is not None:
+        registry.mark_result_content_read(
+          authorized.task_id,
+          content_id=content_id,
+        )
+    except Exception:  # noqa: BLE001 - reads must never fail on bookkeeping
+      pass
     return page, None
 
   return _handle_get_agent_result_content
@@ -259,6 +275,7 @@ async def _authorized_result_content(
       handle=content,
       task_result=task_result,
       value_kind=value_kind,
+      task_id=task_id,
     ))
 
   if not candidates:

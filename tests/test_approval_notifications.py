@@ -332,7 +332,6 @@ def test_lifecycle_persistence_failure_emits_no_notification_intent() -> None:
         return PolicyApprovalDecision(
           outcome="request_user_approval",
           reason="Tool requires approval",
-          route_target_type="pending_tools",
           expiry_seconds=600,
         )
 

@@ -167,6 +167,29 @@ def test_turn_reminder_state_combines_background_and_notification_reminders() ->
 
   assert state.text == "background\n\nnotification"
   assert state.peeked_notification_count == 2
+  assert state.delivered == ()
+
+
+def test_turn_reminder_state_carries_the_delivered_notification_objects() -> None:
+  # A-M7: the request's delivered set travels with the reminder that
+  # rendered it, so the response boundary can ack exactly those objects.
+  first = object()
+  second = object()
+
+  state = turn_reminder_state(
+    "background",
+    "notification",
+    pending_notification_count=4,
+    max_notifications_per_turn=2,
+    delivered=[first, second],
+  )
+
+  assert state.delivered == (first, second)
+  assert state.delivered[0] is first
+  assert state.delivered[1] is second
+  # In production the delivered set is the peeked prefix, so the retained
+  # epoch/logging count agrees with it.
+  assert len(state.delivered) == state.peeked_notification_count
 
 
 def test_turn_reminder_state_preserves_single_reminders_and_empty_state() -> None:
@@ -194,6 +217,12 @@ def test_turn_reminder_state_preserves_single_reminders_and_empty_state() -> Non
     pending_notification_count=1,
     max_notifications_per_turn=5,
   ).text == ""
+  assert turn_reminder_state(
+    "background",
+    "",
+    pending_notification_count=4,
+    max_notifications_per_turn=2,
+  ).delivered == ()
 
 
 def test_completed_assistant_content_blocks_filters_tool_use_blocks() -> None:
@@ -1164,6 +1193,28 @@ def test_session_drain_state_requires_no_shutdown_failure() -> None:
 
   assert failed.in_flight_task_count == 0
   assert failed.drain_complete is False
+
+
+def test_session_drain_state_carries_unsettled_workflow_obstructions() -> None:
+  # §5.3 (T2-I04): an unsettled workflow obligation keeps the drain
+  # incomplete even with zero in-flight tasks, and clears once acked.
+  obstructed = session_drain_state(
+    [],
+    shutdown_failed=False,
+    unsettled_workflow_obstructions=1,
+  )
+
+  assert obstructed.in_flight_task_count == 0
+  assert obstructed.unsettled_workflow_obstruction_count == 1
+  assert obstructed.drain_complete is False
+
+  settled = session_drain_state(
+    [],
+    shutdown_failed=False,
+    unsettled_workflow_obstructions=0,
+  )
+  assert settled.unsettled_workflow_obstruction_count == 0
+  assert settled.drain_complete is True
 
 
 def test_usage_cache_status_formats_read_write_and_miss() -> None:

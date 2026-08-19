@@ -64,7 +64,6 @@ def test_sdk_approval_context_uses_canonical_session_owner_identity() -> None:
     request_id="request-1",
     session_id="session-1",
     channel="cli",
-    effective_model="test-model",
   )
 
   assert resolved.user_id == "1"
@@ -467,7 +466,7 @@ def test_sdk_runner_catalog_constraint_failure_denies_before_lifecycle(
   assert "[approval_constraint_unavailable]" in denied.message
 
 
-def test_sdk_runner_relay_policy_denial_uses_machine_readable_message(
+def test_sdk_runner_user_denial_uses_ordinary_message(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
@@ -487,7 +486,6 @@ def test_sdk_runner_relay_policy_denial_uses_machine_readable_message(
       return PolicyApprovalDecision(
         outcome="request_user_approval",
         reason="Tool requires approval",
-        route_target_type="pending_tools",
         expiry_seconds=600,
         allow_persistent_grant=True,
       )
@@ -547,14 +545,11 @@ def test_sdk_runner_relay_policy_denial_uses_machine_readable_message(
       allow_tool_type=False,
       reason=None,
       app_state=SimpleNamespace(gateway_approval_store=store, gateway_approval_policy=policy),
-      denied_by="relay_policy",
     )
     denied = await callback_task
 
     assert denied.behavior == "deny"
-    assert denied.message.startswith("[relay_policy_denied]")
-    assert "relay chat policy" in denied.message
-    assert "taskpane composer" in denied.message
+    assert denied.message == "user denied"
 
   _run(_case())
 
@@ -583,7 +578,6 @@ def test_sdk_batch_admission_cancel_before_pending_publish_aborts_durable_row(
       return PolicyApprovalDecision(
         outcome="request_user_approval",
         reason="Tool requires approval",
-        route_target_type="pending_tools",
         expiry_seconds=600,
       )
 
@@ -906,7 +900,6 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
       return PolicyApprovalDecision(
         outcome="request_user_approval",
         reason="Tool requires approval",
-        route_target_type="pending_tools",
         expiry_seconds=600,
         allow_persistent_grant=True,
       )

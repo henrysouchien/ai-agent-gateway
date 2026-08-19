@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
+from agent_workflow_contracts.ticker_contract import normalize_contract_ticker
+
 
 _EXCHANGE_SUFFIXES = (
   ".TO",
@@ -313,13 +315,7 @@ def normalize_ticker_for_artifact_request(ticker: str) -> str:
 
 def canonicalize_ticker(ticker: object) -> str:
   """Canonicalize and validate an explicit ticker without app imports."""
-  raw = str(ticker or "").strip().upper()
-  if ".." in raw:
-    raise ValueError("ticker must match the CONTRACT rule")
-  normalized = _normalize_ticker(raw)
-  if not _EXTENDED_TICKER_RE.fullmatch(normalized) or normalized.endswith("."):
-    raise ValueError("ticker must match the CONTRACT rule")
-  return normalized
+  return normalize_contract_ticker(ticker)
 
 
 def _validate_skill(skill: str) -> str:

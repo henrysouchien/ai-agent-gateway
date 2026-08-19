@@ -7,25 +7,41 @@ import secrets
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Mapping
+from collections.abc import Set as AbstractSet
 
 from agent_workflow_contracts import (
   AgentCompletionEnvelope,
+  AdmittedDataRef,
+  AdmittedInputBinding,
   AdmittedTask,
   AttemptRef,
   ContentHandle,
   ContentReadGrant,
+  ContractRef,
+  ContextSourceRef,
   ExecuteTaskDisposition,
+  InlineExactContextView,
+  InvocationArgumentSelector,
+  LiteralSelector,
+  OperationUnavailable,
   OrdinaryDelegationTaskRef,
   OutcomePolicy,
   OutcomeRequirement,
   OutcomeRoute,
+  OwnerBinding,
   ParentResultPolicy,
+  RequestedDataRef,
   ResultRequirement,
   TaskResult,
   TaskResultProvenance,
   WorkspaceGrant,
+  canonical_json_bytes,
   sha256_digest,
   terminal_task_result,
+)
+from agent_workflow_contracts.ticker_contract import (
+  TICKER_INPUT_CONTRACT,
+  require_canonical_contract_ticker,
 )
 
 from .autonomous_output import extract_state_update
@@ -59,8 +75,10 @@ from .runner_background_tasks import (
 from .runner_session_events import build_agent_completion_event
 from .session import GatewaySession
 from .skills import (
+  GENERIC_EXPLORE_OPERATION_NAME,
   ResolvedAgentOperation,
   SkillLoader,
+  SkillProfile,
   SkillStateStore,
   compile_agent_operation,
   generic_explore_profile,
@@ -80,9 +98,13 @@ from .sub_agent_skill_events import (
   DurableSkillEventPersistenceError,
   SkillRunEventEmitter,
 )
+from .capability_resolution import (
+  derive_dispatcher_allowlist,
+  granted_tool_ids,
+)
+from .execution_identity import dispatch_identity, execution_identity_from_session
 from .sub_agent_scope_receipt import (
   ADMITTED_TASK_METADATA_KEY,
-  OperationToolAdmission,
   OperationToolAdmissionError,
   admit_operation_tools,
   reissue_tool_grant,
@@ -94,7 +116,6 @@ from .sub_agent_helpers import (
   MutationModeExclusionsApplier as MutationModeExclusionsApplier,
   NeedsApprovalResolver as NeedsApprovalResolver,
   _ARTIFACT_EMIT_TOOLS as _ARTIFACT_EMIT_TOOLS,
-  _CONTEXT_TICKER_RE as _CONTEXT_TICKER_RE,
   _DEFAULT_SYSTEM_PROMPT_TEMPLATE as _DEFAULT_SYSTEM_PROMPT_TEMPLATE,
   _DEFAULT_EXCLUDED_TOOLS as _DEFAULT_EXCLUDED_TOOLS,
   _RESEARCH_FILE_ID_RE as _RESEARCH_FILE_ID_RE,
@@ -107,7 +128,6 @@ from .sub_agent_helpers import (
   _dashboard_artifact_ticker as _dashboard_artifact_ticker,
   _extract_research_file_id_from_resume_messages as _extract_research_file_id_from_resume_messages,
   _extract_research_file_id_from_task as _extract_research_file_id_from_task,
-  _extract_ticker_from_resume_messages as _extract_ticker_from_resume_messages,
   _extract_ticker_from_task as _extract_ticker_from_task,
   _artifact_scope as _artifact_scope,
   _artifact_ticker as _artifact_ticker,
@@ -116,6 +136,7 @@ from .sub_agent_helpers import (
   _message_content_text as _message_content_text,
   _optional_research_file_id as _optional_research_file_id,
   _render_agent_param_description as _render_agent_param_description,
+  _resolve_context_ticker as _resolve_context_ticker,
   _skill_extra_excluded_tool_names as _skill_extra_excluded_tool_names,
   _skill_artifact_excluded_tools as _skill_artifact_excluded_tools,
   make_get_background_result_tool_def as make_get_background_result_tool_def,
@@ -143,6 +164,21 @@ from .transcript import (
   reconstruct_child_run_lineage,
   reconstruct_messages_for_task,
   reconstruct_parent_messages,
+)
+
+
+_RESEARCH_FILE_ID_CONTRACT_MANIFEST = {
+  "namespace": "workflow",
+  "name": "research-file-id",
+  "version": "1.0",
+  "canonical_encoding": "utf-8-json-integer",
+  "persisted_rule": "positive-signed-64-bit-integer/v1",
+}
+_RESEARCH_FILE_ID_INPUT_CONTRACT = ContractRef(
+  namespace=_RESEARCH_FILE_ID_CONTRACT_MANIFEST["namespace"],
+  name=_RESEARCH_FILE_ID_CONTRACT_MANIFEST["name"],
+  version=_RESEARCH_FILE_ID_CONTRACT_MANIFEST["version"],
+  digest=sha256_digest(_RESEARCH_FILE_ID_CONTRACT_MANIFEST),
 )
 
 
@@ -208,13 +244,19 @@ def _durable_skill_event_transport(
 def _effective_mcp_session_inject_servers(
   *,
   admitted_mcp_scope: Mapping[str, set[str] | frozenset[str]],
-  configured_servers: set[str] | None,
+  configured_servers: AbstractSet[str] | None,
 ) -> set[str] | None:
-  """Bound configured session injection to the exact admitted MCP routes."""
+  """Bound configured session injection to the exact admitted MCP routes.
+
+  ``configured_servers`` may be a live view onto the parent's activation fold
+  (the autonomous and interactive child handlers hand one through), so it is
+  read — and materialized — here, at spawn time: a server the parent loaded
+  after its handlers were installed is still an injection target.
+  """
 
   effective = set(admitted_mcp_scope)
   if configured_servers is not None:
-    effective &= configured_servers
+    effective &= set(configured_servers)
   return effective
 
 
@@ -258,6 +300,64 @@ def _child_tool_definitions_getter(
     ]
 
   return _declared_tool_definitions
+
+
+def _operation_private_mcp_tool_definitions(
+  *,
+  profile: SkillProfile,
+  mcp_client: Any,
+  exact_tool_ids: frozenset[str],
+) -> list[dict[str, Any]]:
+  """Read connected schemas for one operation without exposing them to its parent."""
+
+  get_server_definitions = getattr(
+    mcp_client,
+    "get_server_tool_definitions",
+    None,
+  )
+  if not callable(get_server_definitions):
+    return []
+  declared_servers = set(profile.mcp_tools or {})
+  return [
+    definition
+    for definition in get_server_definitions(declared_servers)
+    if isinstance(definition, dict)
+    and str(definition.get("name") or "") in exact_tool_ids
+  ]
+
+
+def _operation_private_mcp_tool_ids(
+  profile: SkillProfile,
+  *,
+  exact_tool_ids: frozenset[str],
+) -> frozenset[str]:
+  return frozenset(
+    tool_id
+    for tool_ids in (profile.mcp_tools or {}).values()
+    for tool_id in tool_ids
+    if tool_id in exact_tool_ids
+  )
+
+
+def _operation_has_investment_claim_routes(
+  profile: SkillProfile,
+  *,
+  exact_tool_ids: frozenset[str],
+) -> bool:
+  declared = profile.mcp_tools or {}
+  investment_tools = declared.get("idea-workbench-mcp", ())
+  return "start_quant_research" in (
+    exact_tool_ids & frozenset(investment_tools)
+  )
+
+
+def _tool_grant_has_investment_claim_routes(
+  tool_grant: Any,
+) -> bool:
+  return any(
+    entry.tool_id == "start_quant_research"
+    for entry in tool_grant.tools
+  )
 
 
 def _artifact_emit_tool_definitions(installed_tool_names: set[str]) -> list[dict[str, Any]]:
@@ -473,15 +573,293 @@ def seal_admitted_task_payload(payload: dict[str, Any]) -> dict[str, Any]:
   return payload
 
 
+def _ticker_admitted_input(
+  ticker: str,
+  *,
+  invocation_id: str,
+  parent_session: Any | None,
+) -> AdmittedInputBinding:
+  canonical = require_canonical_contract_ticker(ticker)
+  tenant_id = str(getattr(parent_session, "tenant_id", "") or "").strip()
+  session_id = str(getattr(parent_session, "session_id", "") or "").strip()
+  if not tenant_id or not session_id:
+    raise ValueError(
+      "typed ticker admission requires exact tenant and session ownership"
+    )
+  encoded = canonical_json_bytes(canonical)
+  content_id = sha256_digest(canonical)
+  logical_source_id = "invocation-argument:ticker"
+  source_ref = ContextSourceRef(
+    logical_source_id=logical_source_id,
+    content_id=content_id,
+  )
+  requested = RequestedDataRef(
+    name="ticker",
+    selector=InvocationArgumentSelector(argument_name="ticker"),
+    expected_contract=TICKER_INPUT_CONTRACT,
+  )
+  content = ContentHandle(
+    content_id=content_id,
+    content_sha256=content_id.removeprefix("sha256:"),
+    content_bytes=len(encoded),
+    content_chars=len(encoded.decode("utf-8")),
+    contract=TICKER_INPUT_CONTRACT,
+    media_type="application/json",
+    encoding="utf-8",
+    retention="session",
+  )
+  return AdmittedInputBinding(
+    name="ticker",
+    source=AdmittedDataRef(
+      request=requested,
+      source_kind="invocation_argument",
+      logical_source_id=logical_source_id,
+      owner=OwnerBinding(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        invocation_id=invocation_id,
+      ),
+      actual_contract=TICKER_INPUT_CONTRACT,
+      content=content,
+    ),
+    context=InlineExactContextView(
+      source=source_ref,
+      content=canonical,
+      content_bytes=len(encoded),
+    ),
+  )
+
+
+def _require_research_file_id(value: object) -> int:
+  if (
+    isinstance(value, bool)
+    or not isinstance(value, int)
+    or not 1 <= value < (1 << 63)
+  ):
+    raise ValueError(
+      "research_file_id must be a positive signed 64-bit integer"
+    )
+  return value
+
+
+def _research_file_id_admitted_input(
+  research_file_id: int,
+  *,
+  invocation_id: str,
+  parent_session: Any | None,
+) -> AdmittedInputBinding:
+  canonical = _require_research_file_id(research_file_id)
+  tenant_id = str(getattr(parent_session, "tenant_id", "") or "").strip()
+  session_id = str(getattr(parent_session, "session_id", "") or "").strip()
+  if not tenant_id or not session_id:
+    raise ValueError(
+      "typed research-file admission requires exact tenant and session ownership"
+    )
+  encoded = canonical_json_bytes(canonical)
+  content_id = sha256_digest(canonical)
+  logical_source_id = "research-turn:research_file_id"
+  source_ref = ContextSourceRef(
+    logical_source_id=logical_source_id,
+    content_id=content_id,
+  )
+  requested = RequestedDataRef(
+    name="research_file_id",
+    selector=LiteralSelector(value=canonical),
+    expected_contract=_RESEARCH_FILE_ID_INPUT_CONTRACT,
+  )
+  content = ContentHandle(
+    content_id=content_id,
+    content_sha256=content_id.removeprefix("sha256:"),
+    content_bytes=len(encoded),
+    content_chars=len(encoded.decode("utf-8")),
+    contract=_RESEARCH_FILE_ID_INPUT_CONTRACT,
+    media_type="application/json",
+    encoding="utf-8",
+    retention="session",
+  )
+  return AdmittedInputBinding(
+    name="research_file_id",
+    source=AdmittedDataRef(
+      request=requested,
+      source_kind="literal",
+      logical_source_id=logical_source_id,
+      owner=OwnerBinding(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        invocation_id=invocation_id,
+      ),
+      actual_contract=_RESEARCH_FILE_ID_INPUT_CONTRACT,
+      content=content,
+    ),
+    context=InlineExactContextView(
+      source=source_ref,
+      content=canonical,
+      content_bytes=len(encoded),
+    ),
+  )
+
+
+def _research_file_id_from_admitted_inputs(
+  inputs: tuple[AdmittedInputBinding, ...],
+  *,
+  required: bool,
+  owner_invocation_id: str | None = None,
+) -> int | None:
+  matches = tuple(
+    binding for binding in inputs if binding.name == "research_file_id"
+  )
+  if not matches:
+    if required:
+      raise ValueError(
+        "research-file-required admission has no typed identity binding"
+      )
+    return None
+  if len(matches) != 1:
+    raise ValueError(
+      "admission must contain exactly one typed research-file binding"
+    )
+  binding = matches[0]
+  source = binding.source
+  request = source.request
+  selector = request.selector
+  context = binding.context
+  selector_research_file_id = (
+    _require_research_file_id(selector.value)
+    if isinstance(selector, LiteralSelector)
+    else None
+  )
+  if (
+    not isinstance(selector, LiteralSelector)
+    or request.name != "research_file_id"
+    or selector_research_file_id != context.content
+    or request.context_policy is not None
+    or request.expected_contract != _RESEARCH_FILE_ID_INPUT_CONTRACT
+    or source.source_kind != "literal"
+    or source.logical_source_id != "research-turn:research_file_id"
+    or source.actual_contract != _RESEARCH_FILE_ID_INPUT_CONTRACT
+    or source.content.contract != _RESEARCH_FILE_ID_INPUT_CONTRACT
+    or source.read_grant is not None
+    or not isinstance(context, InlineExactContextView)
+  ):
+    raise ValueError(
+      "admission contains a non-canonical typed research-file binding"
+    )
+  if (
+    not source.owner.tenant_id
+    or not source.owner.session_id
+    or not source.owner.invocation_id
+    or (
+      owner_invocation_id is not None
+      and source.owner.invocation_id != owner_invocation_id
+    )
+  ):
+    raise ValueError(
+      "admission research-file binding has invalid owner identity"
+    )
+  research_file_id = _require_research_file_id(context.content)
+  encoded = canonical_json_bytes(research_file_id)
+  content_id = sha256_digest(research_file_id)
+  if (
+    context.source.logical_source_id != source.logical_source_id
+    or context.source.content_id != content_id
+    or context.content_bytes != len(encoded)
+    or source.content.content_id != content_id
+    or source.content.content_sha256 != content_id.removeprefix("sha256:")
+    or source.content.content_bytes != len(encoded)
+    or source.content.content_chars != len(encoded.decode("utf-8"))
+    or source.content.media_type != "application/json"
+    or source.content.encoding != "utf-8"
+    or source.content.retention != "session"
+  ):
+    raise ValueError(
+      "admission research-file content does not match its exact binding"
+    )
+  return research_file_id
+
+
+def _ticker_from_admitted_inputs(
+  inputs: tuple[AdmittedInputBinding, ...],
+  *,
+  required: bool,
+  owner_invocation_id: str | None = None,
+) -> str | None:
+  matches = tuple(binding for binding in inputs if binding.name == "ticker")
+  if not matches:
+    if required:
+      raise ValueError("ticker-required admission has no typed ticker binding")
+    return None
+  if len(matches) != 1:
+    raise ValueError("admission must contain exactly one typed ticker binding")
+  binding = matches[0]
+  source = binding.source
+  request = source.request
+  selector = request.selector
+  context = binding.context
+  if not isinstance(selector, InvocationArgumentSelector):
+    raise ValueError("ticker binding must use the invocation argument selector")
+  if (
+    request.name != "ticker"
+    or selector.argument_name != "ticker"
+    or request.context_policy is not None
+    or request.expected_contract != TICKER_INPUT_CONTRACT
+    or source.source_kind != "invocation_argument"
+    or source.logical_source_id != "invocation-argument:ticker"
+    or source.actual_contract != TICKER_INPUT_CONTRACT
+    or source.content.contract != TICKER_INPUT_CONTRACT
+    or source.read_grant is not None
+    or not isinstance(context, InlineExactContextView)
+  ):
+    raise ValueError("admission contains a non-canonical typed ticker binding")
+  if (
+    not source.owner.tenant_id
+    or not source.owner.session_id
+    or not source.owner.invocation_id
+    or (
+      owner_invocation_id is not None
+      and source.owner.invocation_id != owner_invocation_id
+    )
+  ):
+    raise ValueError("admission ticker binding has invalid owner identity")
+  ticker = require_canonical_contract_ticker(context.content)
+  encoded = canonical_json_bytes(ticker)
+  content_id = sha256_digest(ticker)
+  if (
+    context.source.logical_source_id != source.logical_source_id
+    or context.source.content_id != content_id
+    or context.content_bytes != len(encoded)
+    or source.content.content_id != content_id
+    or source.content.content_sha256 != content_id.removeprefix("sha256:")
+    or source.content.content_bytes != len(encoded)
+    or source.content.content_chars != len(encoded.decode("utf-8"))
+    or source.content.media_type != "application/json"
+    or source.content.encoding != "utf-8"
+    or source.content.retention != "session"
+  ):
+    raise ValueError("admission ticker content does not match its exact binding")
+  return ticker
+
+
+def _ordinary_logical_invocation_owner(admitted_task: AdmittedTask) -> str:
+  logical_task = admitted_task.logical_task
+  if not isinstance(logical_task, OrdinaryDelegationTaskRef):
+    raise ValueError("ordinary ticker admission requires a delegation identity")
+  delegation_id = str(logical_task.delegation_id or "").strip()
+  if not delegation_id:
+    raise ValueError("ordinary ticker admission has no logical invocation owner")
+  return delegation_id
+
+
 def _ordinary_admitted_task_factory(
   *,
   operation: Any,
   execution_snapshot: Any,
-  admission: OperationToolAdmission,
+  capability_bindings: tuple[Any, ...],
+  tool_grant: Any,
   model_bind: CapabilityBind,
   result_requirement: ResultRequirement,
   objective: str,
   parent_session: Any | None,
+  inputs: tuple[AdmittedInputBinding, ...] = (),
   attempt_number: int = 1,
   resume_of_task_id: str | None = None,
   logical_task_override: OrdinaryDelegationTaskRef | None = None,
@@ -489,7 +867,7 @@ def _ordinary_admitted_task_factory(
   model_bind_digest = sha256_digest(model_bind)
   capability_binding_digest = sha256_digest([
     binding.model_dump(mode="json")
-    for binding in admission.capability_bindings
+    for binding in capability_bindings
   ])
 
   def _factory(entry: Any) -> AdmittedTask:
@@ -526,12 +904,12 @@ def _ordinary_admitted_task_factory(
       ),
       "execution_snapshot": execution_snapshot.model_dump(mode="json"),
       "operation": operation.model_dump(mode="json"),
-      "inputs": [],
+      "inputs": [binding.model_dump(mode="json") for binding in inputs],
       "capability_bindings": [
         binding.model_dump(mode="json")
-        for binding in admission.capability_bindings
+        for binding in capability_bindings
       ],
-      "tool_grant": admission.tool_grant.model_dump(mode="json"),
+      "tool_grant": tool_grant.model_dump(mode="json"),
       "content_read_grants": [],
       "workspace_grant": workspace.model_dump(mode="json"),
       "model_bind": model_bind.model_dump(mode="json"),
@@ -540,7 +918,7 @@ def _ordinary_admitted_task_factory(
       "admitted_plan_digest": None,
       "model_bind_digest": model_bind_digest,
       "capability_binding_digest": capability_binding_digest,
-      "tool_grant_digest": admission.tool_grant.digest,
+      "tool_grant_digest": tool_grant.digest,
     }
     seal_admitted_task_payload(payload)
     return AdmittedTask.model_validate(payload)
@@ -754,10 +1132,11 @@ def make_run_agent_handler(
   skill_loader: SkillLoader | None = None,
   mcp_client: Any,
   needs_approval: Callable[..., bool] | None = None,
-  mcp_session_inject_servers: set[str] | None = None,
+  mcp_session_inject_servers: AbstractSet[str] | None = None,
   mcp_meta_inject_servers: frozenset[str] | None = None,
   user_id: str | None = None,
   user_email: str | None = None,
+  trusted_research_file_id: int | None = None,
   parent_user_id: str | None = None,
   parent_user_email: str | None = None,
   credentials_resolver_active: bool = False,
@@ -798,6 +1177,8 @@ def make_run_agent_handler(
       make_get_agent_result_content_handler(runner_ref),
     )
   effective_coordinator = coordinator_config if coordinator_config is not None and coordinator_config.enabled else None
+  if trusted_research_file_id is not None:
+    _require_research_file_id(trusted_research_file_id)
   skill_state_lock = asyncio.Lock()
   parent_dispatch_scope = (
     parent_session.dispatch_scope
@@ -861,17 +1242,10 @@ def make_run_agent_handler(
             "research_file_id must match the exact ID stated in objective"
           ),
         }
-    context_research_file_id = raw_research_file_id or derived_research_file_id
+    asserted_research_file_id = (
+      raw_research_file_id or derived_research_file_id
+    )
     raw_context_ticker = tool_input.get("ticker")
-    if raw_context_ticker is not None:
-      if not isinstance(raw_context_ticker, str):
-        return None, {"code": "invalid_input", "message": "ticker must be a string"}
-      raw_context_ticker = raw_context_ticker.strip().upper()
-      if _CONTEXT_TICKER_RE.fullmatch(raw_context_ticker) is None:
-        return None, {
-          "code": "invalid_input",
-          "message": "ticker must be a canonical uppercase security symbol",
-        }
     raw_operation = tool_input.get("operation")
     named_operation = raw_operation is not None
 
@@ -906,17 +1280,112 @@ def make_run_agent_handler(
     operation = resolved_operation.snapshot
     profile = resolved_operation.methodology_profile
     agent_name = operation.operation.name
-    derived_context_ticker = _extract_ticker_from_task(task)
+    exact_operation_tool_ids = operation_tool_ids(profile)
+    ticker_required = "ticker" in operation.required_context
+    research_file_required = (
+      "research_file_id" in operation.required_context
+    )
+    trusted_research_origin_required = _operation_has_investment_claim_routes(
+      profile,
+      exact_tool_ids=exact_operation_tool_ids,
+    )
     if (
-      raw_context_ticker is not None
-      and derived_context_ticker
-      and raw_context_ticker != derived_context_ticker
+      trusted_research_file_id is None
+      and trusted_research_origin_required
     ):
       return None, {
-        "code": "context_ticker_mismatch",
-        "message": "ticker must match the exact ticker stated in objective",
+        "code": "required_context_missing",
+        "message": (
+          "operation requires a verified research_file_id from the active "
+          "research turn"
+        ),
       }
-    context_ticker = raw_context_ticker or derived_context_ticker
+    if (
+      trusted_research_file_id is not None
+      and asserted_research_file_id is not None
+      and asserted_research_file_id != trusted_research_file_id
+    ):
+      return None, {
+        "code": "context_research_file_id_mismatch",
+        "message": (
+          "research_file_id must match the verified active research turn"
+        ),
+      }
+    context_research_file_id = (
+      trusted_research_file_id
+      if trusted_research_file_id is not None
+      else asserted_research_file_id
+    )
+    try:
+      resolved_context_ticker = _resolve_context_ticker(
+        typed_ticker=raw_context_ticker,
+        verified_server_ticker=None,
+        prose_fallback=(
+          (lambda: _extract_ticker_from_task(task))
+          if ticker_required
+          else None
+        ),
+      )
+    except ValueError as exc:
+      return None, {
+        "code": "invalid_input",
+        "message": str(exc),
+      }
+    if ticker_required and resolved_context_ticker is None:
+      return None, {
+        "code": "required_context_missing",
+        "message": "operation requires one unambiguous typed ticker subject",
+      }
+    try:
+      admitted_inputs = tuple(
+        [
+          _ticker_admitted_input(
+            resolved_context_ticker,
+            invocation_id=ordinary_task_id,
+            parent_session=parent_session,
+          )
+        ]
+        if resolved_context_ticker is not None
+        else []
+      ) + tuple(
+        [
+          _research_file_id_admitted_input(
+            context_research_file_id,
+            invocation_id=ordinary_task_id,
+            parent_session=parent_session,
+          )
+        ]
+        if (
+          (research_file_required or trusted_research_origin_required)
+          and trusted_research_file_id is not None
+          and context_research_file_id is not None
+        )
+        else []
+      )
+    except ValueError as exc:
+      return None, {"code": "invalid_context", "message": str(exc)}
+    admitted_task_ref: list[AdmittedTask | None] = [None]
+
+    def _admitted_context_ticker() -> str | None:
+      admitted_task = admitted_task_ref[0]
+      if admitted_task is None:
+        raise RuntimeError("admitted task is unavailable before dispatch")
+      return _ticker_from_admitted_inputs(
+        admitted_task.inputs,
+        required=ticker_required,
+        owner_invocation_id=_ordinary_logical_invocation_owner(admitted_task),
+      )
+
+    def _admitted_context_research_file_id() -> int | None:
+      admitted_task = admitted_task_ref[0]
+      if admitted_task is None:
+        raise RuntimeError("admitted task is unavailable before dispatch")
+      return _research_file_id_from_admitted_inputs(
+        admitted_task.inputs,
+        required=trusted_research_origin_required,
+        owner_invocation_id=_ordinary_logical_invocation_owner(admitted_task),
+      ) or context_research_file_id
+
     skill_run_id: str | None = None
     durable_skill_event_transport: tuple[
       DurableSkillEventAppender,
@@ -1037,11 +1506,24 @@ def make_run_agent_handler(
     )
     system_prompt = execution_snapshot.system_prompt
 
-    effective_excluded = _DEFAULT_EXCLUDED_TOOLS | set(excluded_tools or set())
+    operation_private_mcp_tool_ids = (
+      _operation_private_mcp_tool_ids(
+        profile,
+        exact_tool_ids=exact_operation_tool_ids,
+      )
+      if named_operation and profile is not None
+      else frozenset()
+    )
+    inherited_excluded = set(excluded_tools or set())
+    inherited_excluded -= operation_private_mcp_tool_ids
+    effective_excluded = _DEFAULT_EXCLUDED_TOOLS | inherited_excluded
     role_denied_tools = role_denied_tools_for_session(parent_session)
     if effective_coordinator is not None and effective_coordinator.worker_excluded_tools:
       effective_excluded = effective_excluded | effective_coordinator.worker_excluded_tools
-    if profile is not None:
+    if profile is not None and not named_operation:
+      # Unnamed delegation retains the legacy Phase-0 deny surface. Registered
+      # operations instead compile authority from their exact source-owned
+      # ceiling, workspace scope, live server effects, and semantic needs.
       from agent.shared.mutation_enforcement import apply_skill_mutation_mode_exclusions
 
       effective_excluded = apply_skill_mutation_mode_exclusions(
@@ -1050,6 +1532,7 @@ def make_run_agent_handler(
         role_denied_tools=role_denied_tools,
         local_tool_names=set(local_tool_handlers or {}) | set(_ARTIFACT_EMIT_TOOLS),
       )
+    if profile is not None:
       try:
         effective_excluded |= _skill_extra_excluded_tool_names(profile)
       except ValueError as exc:
@@ -1081,26 +1564,7 @@ def make_run_agent_handler(
       or getattr(parent_session, "user_email", None)
     )
 
-    skill_event_emitter = (
-      SkillRunEventEmitter(
-        skill_run_id=skill_run_id,
-        profile=profile,
-        semantic_scope=profile.scope,
-        context_ticker=context_ticker or None,
-        portfolio_id=parent_portfolio_id,
-        event_log_getter=lambda: sub_log,
-        tool_ctx=tool_ctx,
-        durable_appender=durable_skill_event_transport[0],
-        durable_confirmer=durable_skill_event_transport[1],
-      )
-      if (
-        skill_run_id
-        and profile is not None
-        and agent_name
-        and durable_skill_event_transport is not None
-      )
-      else None
-    )
+    skill_event_emitter: SkillRunEventEmitter | None = None
 
     def _emit_parent_event(event: dict[str, Any]) -> None:
       if skill_event_emitter is not None:
@@ -1136,7 +1600,7 @@ def make_run_agent_handler(
       if "emit_canvas_artifact" not in child_excluded:
         _install_emit_canvas_artifact_handler(
           sub_local=sub_local, profile=profile, skill_run_id=skill_run_id,
-          context_ticker=context_ticker,
+          context_ticker=_admitted_context_ticker,
           context_research_file_id=context_research_file_id,
           parent_session=parent_session, fallback_user_id=effective_parent_user_id,
           emit_parent_event=_emit_parent_event,
@@ -1146,7 +1610,7 @@ def make_run_agent_handler(
           sub_local=sub_local,
           profile=profile,
           skill_run_id=skill_run_id,
-          context_ticker=context_ticker,
+          context_ticker=_admitted_context_ticker,
           context_research_file_id=context_research_file_id,
           parent_session=parent_session,
           fallback_user_id=effective_parent_user_id,
@@ -1159,6 +1623,12 @@ def make_run_agent_handler(
       if profile is not None
       else []
     )
+    if named_operation and profile is not None:
+      extra_tool_definitions.extend(_operation_private_mcp_tool_definitions(
+        profile=profile,
+        mcp_client=mcp_client,
+        exact_tool_ids=operation_private_mcp_tool_ids,
+      ))
 
     candidate_definitions_getter = _child_tool_definitions_getter(
       runner=runner,
@@ -1167,25 +1637,52 @@ def make_run_agent_handler(
       extra_tool_definitions=extra_tool_definitions,
       local_tool_handlers=sub_local,
     )
-    try:
-      operation_admission = admit_operation_tools(
-        operation,
-        grant_id=f"grant:{ordinary_task_id}",
-        operation_tool_ids=operation_tool_ids(profile),
-        definitions=(
-          candidate_definitions_getter()
-          if candidate_definitions_getter is not None
-          else ()
-        ),
-        local_tool_handlers=sub_local,
-        mcp_client=mcp_client,
-      )
-    except OperationToolAdmissionError as exc:
+    # D-B6-2: the caller's exclusions are an INPUT to authority resolution,
+    # not a subtraction applied to a grant that already exists. An excluded
+    # tool is never granted, so no later pass has to take it back.
+    operation_authority = admit_operation_tools(
+      operation,
+      grant_id=f"grant:{ordinary_task_id}",
+      operation_tool_ids=exact_operation_tool_ids,
+      definitions=(
+        candidate_definitions_getter()
+        if candidate_definitions_getter is not None
+        else ()
+      ),
+      local_tool_handlers=sub_local,
+      mcp_client=mcp_client,
+      identity=execution_identity_from_session(parent_session),
+      exclusions=frozenset(child_excluded),
+    )
+    if isinstance(operation_authority, OperationUnavailable):
       return None, {
         "code": "operation_unavailable",
-        "message": str(exc),
+        "message": operation_authority.detail,
       }
-    admitted_dispatch_tools = operation_admission.tool_ids
+    if (
+      operation.operation.name == GENERIC_EXPLORE_OPERATION_NAME
+      and not operation_authority.grant.tools
+    ):
+      # The generic explore operation declares its evidence domains as
+      # *optional* — the retired coarse row meant "at least one read route, of
+      # any kind", which the granular vocabulary cannot state, and requiring
+      # either domain would refuse a parent that only offers the other.  The
+      # floor itself survives here, as the same by-name rule the live workflow
+      # catalog already applies: an explore with no evidence route at all is a
+      # visible unavailable offer, never a child sent out blind.
+      declared = ", ".join(
+        sorted(item.name for item in operation.required_capabilities)
+      )
+      return None, {
+        "code": "operation_unavailable",
+        "message": (
+          "required semantic capability "
+          f"{declared} has no compatible admitted route"
+        ),
+      }
+    admitted_dispatch_tools = granted_tool_ids(operation_authority)
+    admitted_mcp_scope = derive_dispatcher_allowlist(operation_authority)
+    child_excluded |= operation_private_mcp_tool_ids - admitted_dispatch_tools
     candidate_local_names = set(sub_local)
     sub_local = {
       name: handler
@@ -1196,15 +1693,19 @@ def make_run_agent_handler(
     admitted_task_factory = _ordinary_admitted_task_factory(
       operation=operation,
       execution_snapshot=execution_snapshot,
-      admission=operation_admission,
+      capability_bindings=operation_authority.bindings,
+      tool_grant=operation_authority.grant,
       model_bind=execution.bind,
       result_requirement=admitted_result_requirement,
       objective=task,
       parent_session=parent_session,
+      inputs=admitted_inputs,
     )
     admitted_task = admitted_task_factory(
       SimpleNamespace(task_id=ordinary_task_id)
     )
+    admitted_task_ref[0] = admitted_task
+    context_ticker = _admitted_context_ticker()
     result_provenance = TaskResultProvenance(
       admitted_task_digest=admitted_task.admitted_task_digest,
       model_bind_digest=admitted_task.model_bind_digest,
@@ -1213,9 +1714,29 @@ def make_run_agent_handler(
     )
 
     sub_log = EventLog()
+    skill_event_emitter = (
+      SkillRunEventEmitter(
+        skill_run_id=skill_run_id,
+        profile=profile,
+        semantic_scope=profile.scope,
+        context_ticker=context_ticker,
+        portfolio_id=parent_portfolio_id,
+        event_log_getter=lambda: sub_log,
+        tool_ctx=tool_ctx,
+        durable_appender=durable_skill_event_transport[0],
+        durable_confirmer=durable_skill_event_transport[1],
+      )
+      if (
+        skill_run_id
+        and profile is not None
+        and agent_name
+        and durable_skill_event_transport is not None
+      )
+      else None
+    )
     effective_session_inject_servers = (
       _effective_mcp_session_inject_servers(
-        admitted_mcp_scope=operation_admission.mcp_tools_by_server,
+        admitted_mcp_scope=admitted_mcp_scope,
         configured_servers=mcp_session_inject_servers,
       )
     )
@@ -1234,12 +1755,16 @@ def make_run_agent_handler(
       approval_key_qualifier=approval_key_qualifier,
       mcp_session_inject_servers=effective_session_inject_servers,
       mcp_meta_inject_servers=mcp_meta_inject_servers,
-      user_id=effective_parent_user_id,
-      risk_user_id=getattr(parent_session, "risk_user_id", None),
-      channel=getattr(parent_session, "channel", None),
+      # D-B6-1: one identity value, carrying the authority's frozen
+      # ExecutionIdentity beside the authenticated session the per-user MCP
+      # projection reads.
+      identity=dispatch_identity(
+        session=parent_session,
+        execution=operation_authority.identity,
+        user_id=effective_parent_user_id,
+        credentials_resolver_active=credentials_resolver_active,
+      ),
       role=require_inherited_role(parent_session),
-      credentials_resolver_active=credentials_resolver_active,
-      session=parent_session,
       store=getattr(parent_session, "approval_store", None),
       policy=getattr(parent_session, "approval_policy", None),
       run_context=_child_run_context(
@@ -1247,12 +1772,12 @@ def make_run_agent_handler(
         tool_ctx=tool_ctx,
         skill_run_id=skill_run_id,
         skill_name=agent_name,
-        research_file_id=context_research_file_id,
+        research_file_id=_admitted_context_research_file_id(),
         user_id=effective_parent_user_id,
         session_id=getattr(runner, "_full_session_id", ""),
         approval_policy=getattr(parent_session, "approval_policy", None),
       ),
-      allowed_mcp_tools_by_server=operation_admission.mcp_tools_by_server,
+      allowed_mcp_tools_by_server=admitted_mcp_scope,
       get_tool_definitions=_child_tool_definitions_getter(
         runner=runner,
         mcp_client=mcp_client,
@@ -1453,7 +1978,7 @@ def make_resume_handler(
   mcp_client: Any,
   needs_approval: Callable[..., bool] | None = None,
   needs_approval_resolver: NeedsApprovalResolver | None = None,
-  mcp_session_inject_servers: set[str] | None = None,
+  mcp_session_inject_servers: AbstractSet[str] | None = None,
   mcp_meta_inject_servers: frozenset[str] | None = None,
   user_id: str | None = None,
   credentials_resolver_active: bool = False,
@@ -1632,6 +2157,29 @@ def make_resume_handler(
       return None, source_state_error
 
     operation = original_admitted_task.operation
+    ticker_required = "ticker" in operation.required_context
+    trusted_research_origin_required = _tool_grant_has_investment_claim_routes(
+      original_admitted_task.tool_grant,
+    )
+    try:
+      logical_invocation_owner = _ordinary_logical_invocation_owner(
+        original_admitted_task
+      )
+      _ticker_from_admitted_inputs(
+        original_admitted_task.inputs,
+        required=ticker_required,
+        owner_invocation_id=logical_invocation_owner,
+      )
+      admitted_research_file_id = _research_file_id_from_admitted_inputs(
+        original_admitted_task.inputs,
+        required=trusted_research_origin_required,
+        owner_invocation_id=logical_invocation_owner,
+      )
+    except ValueError as exc:
+      return await _abandon(
+        "invalid_task_metadata",
+        f"Task {task_id} has invalid admitted typed context: {exc}",
+      )
     original_execution_snapshot = original_admitted_task.execution_snapshot
     if original_execution_snapshot is None:
       return await _abandon(
@@ -1744,16 +2292,16 @@ def make_resume_handler(
     parent_turn_id = getattr(tool_ctx, "tool_call_id", None)
     call_index = int(kwargs.get("call_index", 0) or 0)
     skill_run_id = secrets.token_hex(16)
-    context_ticker = _extract_ticker_from_resume_messages(
-      reconstructed_messages,
-      parent_messages,
-      additional_context,
-    )
-    context_research_file_id = _extract_research_file_id_from_resume_messages(
-      reconstructed_messages,
-      parent_messages,
-      additional_context,
-    )
+    context_research_file_id = admitted_research_file_id
+    if (
+      context_research_file_id is None
+      and not trusted_research_origin_required
+    ):
+      context_research_file_id = _extract_research_file_id_from_resume_messages(
+        reconstructed_messages,
+        parent_messages,
+        additional_context,
+      )
     if context_research_file_id == 0:
       context_research_file_id = None
     if fms_rebinder is not None and context_research_file_id is not None and context_research_file_id > 0:
@@ -1769,28 +2317,32 @@ def make_resume_handler(
       physical_task_id=successor_task_id,
       resume_of_task_id=task_id,
     )
-    skill_event_emitter = SkillRunEventEmitter(
-      skill_run_id=skill_run_id,
-      profile=profile,
-      semantic_scope=profile.scope,
-      context_ticker=context_ticker or None,
-      portfolio_id=parent_portfolio_id,
-      event_log_getter=lambda: sub_log,
-      tool_ctx=tool_ctx,
-      durable_appender=runner._append_durable_event,
-      durable_confirmer=runner._confirm_durable_skill_event,
-    )
+    successor_admitted_task_ref: list[AdmittedTask | None] = [None]
+
+    def _successor_context_ticker() -> str | None:
+      successor_admitted_task = successor_admitted_task_ref[0]
+      if successor_admitted_task is None:
+        raise RuntimeError("successor admission is unavailable before dispatch")
+      return _ticker_from_admitted_inputs(
+        successor_admitted_task.inputs,
+        required=ticker_required,
+        owner_invocation_id=logical_invocation_owner,
+      )
+
+    skill_event_emitter: SkillRunEventEmitter | None = None
 
     def _emit_parent_event(event: dict[str, Any]) -> None:
-      skill_event_emitter.emit_parent_event(event)
+      if skill_event_emitter is not None:
+        skill_event_emitter.emit_parent_event(event)
 
     async def _emit_skill_run_started() -> None:
-      await skill_event_emitter.emit_started()
+      if skill_event_emitter is not None:
+        await skill_event_emitter.emit_started()
 
     if "emit_canvas_artifact" not in child_excluded:
       _install_emit_canvas_artifact_handler(
         sub_local=sub_local, profile=profile, skill_run_id=skill_run_id,
-        context_ticker=context_ticker,
+        context_ticker=_successor_context_ticker,
         context_research_file_id=context_research_file_id,
         parent_session=parent_session,
         fallback_user_id=user_id or getattr(parent_session, "user_id", None),
@@ -1801,7 +2353,7 @@ def make_resume_handler(
         sub_local=sub_local,
         profile=profile,
         skill_run_id=skill_run_id,
-        context_ticker=context_ticker,
+        context_ticker=_successor_context_ticker,
         context_research_file_id=context_research_file_id,
         parent_session=parent_session,
         fallback_user_id=user_id or getattr(parent_session, "user_id", None),
@@ -1825,22 +2377,14 @@ def make_resume_handler(
       if name in admitted_dispatch_tools
     }
     child_excluded |= candidate_local_names - admitted_dispatch_tools
-    successor_admission = OperationToolAdmission(
+    successor_factory = _ordinary_admitted_task_factory(
+      operation=operation,
+      execution_snapshot=successor_execution_snapshot,
+      capability_bindings=original_admitted_task.capability_bindings,
       tool_grant=reissue_tool_grant(
         original_admitted_task.tool_grant,
         grant_id=f"grant:{successor_task_id}",
       ),
-      capability_bindings=original_admitted_task.capability_bindings,
-      tool_ids=admitted_tool_ids,
-      mcp_tools_by_server={
-        server: frozenset(names)
-        for server, names in admitted_mcp_scope.items()
-      },
-    )
-    successor_factory = _ordinary_admitted_task_factory(
-      operation=operation,
-      execution_snapshot=successor_execution_snapshot,
-      admission=successor_admission,
       model_bind=execution.bind,
       result_requirement=result_requirement,
       objective=f"Resume interrupted delegation {task_id}",
@@ -1848,10 +2392,13 @@ def make_resume_handler(
       attempt_number=successor_attempt.attempt_number,
       resume_of_task_id=task_id,
       logical_task_override=original_admitted_task.logical_task,
+      inputs=original_admitted_task.inputs,
     )
     successor_admitted_task = successor_factory(
       SimpleNamespace(task_id=successor_task_id)
     )
+    successor_admitted_task_ref[0] = successor_admitted_task
+    context_ticker = _successor_context_ticker()
     successor_provenance = TaskResultProvenance(
       admitted_task_digest=successor_admitted_task.admitted_task_digest,
       model_bind_digest=successor_admitted_task.model_bind_digest,
@@ -1861,6 +2408,17 @@ def make_resume_handler(
       tool_grant_digest=successor_admitted_task.tool_grant_digest,
     )
     sub_log = EventLog()
+    skill_event_emitter = SkillRunEventEmitter(
+      skill_run_id=skill_run_id,
+      profile=profile,
+      semantic_scope=profile.scope,
+      context_ticker=context_ticker,
+      portfolio_id=parent_portfolio_id,
+      event_log_getter=lambda: sub_log,
+      tool_ctx=tool_ctx,
+      durable_appender=runner._append_durable_event,
+      durable_confirmer=runner._confirm_durable_skill_event,
+    )
     effective_session_inject_servers = (
       _effective_mcp_session_inject_servers(
         admitted_mcp_scope=admitted_mcp_scope,
@@ -1878,15 +2436,17 @@ def make_resume_handler(
       ),
       event_log=sub_log,
       session_id=getattr(runner, "_full_session_id", ""),
-      should_avoid_permission_prompts=False,
+      should_avoid_permission_prompts=True,
       mcp_session_inject_servers=effective_session_inject_servers,
       mcp_meta_inject_servers=mcp_meta_inject_servers,
-      user_id=user_id or getattr(parent_session, "user_id", None),
-      risk_user_id=getattr(parent_session, "risk_user_id", None),
-      channel=getattr(parent_session, "channel", None),
+      # Resume keeps its authority exactly as persisted (the reissued grant);
+      # only the identity threading is new.
+      identity=dispatch_identity(
+        session=parent_session,
+        user_id=user_id or getattr(parent_session, "user_id", None),
+        credentials_resolver_active=credentials_resolver_active,
+      ),
       role=require_inherited_role(parent_session),
-      credentials_resolver_active=credentials_resolver_active,
-      session=parent_session,
       store=getattr(parent_session, "approval_store", None),
       policy=getattr(parent_session, "approval_policy", None),
       run_context=_child_run_context(

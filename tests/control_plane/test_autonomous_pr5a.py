@@ -449,7 +449,7 @@ def test_autonomous_resume_uses_live_role_in_both_directions(
   stored_role: str,
   live_role: str,
 ) -> None:
-  processes, _envs = _install_fake_spawn(monkeypatch)
+  processes, envs = _install_fake_spawn(monkeypatch)
   skills_dir = tmp_path / "skills"
   _write_resumable_skill(skills_dir)
   app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
@@ -476,6 +476,7 @@ def test_autonomous_resume_uses_live_role_in_both_directions(
     assert started.status_code == 200, started.text
     original = app.state.subprocess_registry._tasks["bg_0"]
     assert original.role == stored_role
+    original.dev_mode = True  # Historical manifests may retain this retired field.
     original.state = "failed"
     original.exit_code = 1
     original.completed_at = time.time()
@@ -491,7 +492,11 @@ def test_autonomous_resume_uses_live_role_in_both_directions(
       json={},
     )
     assert resumed.status_code == 200, resumed.text
-    assert app.state.subprocess_registry._tasks["bg_1"].role == live_role
+    resumed_record = app.state.subprocess_registry._tasks["bg_1"]
+    assert resumed_record.role == live_role
+    assert resumed_record.dev_mode is False
+    assert "--dev" not in resumed_record.cmd
+    assert "ANALYST_DEV_MODE" not in envs[1]
 
 
 def _install_fake_spawn(monkeypatch) -> tuple[list[_FakeAutonomousProcess], list[dict[str, str]]]:
@@ -2340,124 +2345,40 @@ def test_autonomous_dispatch_rejects_control_session_channel_override(monkeypatc
     assert app.state.subprocess_registry._tasks == {}
 
 
-def test_autonomous_dispatch_rejects_web_fixture_and_dev_mode_before_spawn(monkeypatch, tmp_path) -> None:
+def test_autonomous_dispatch_rejects_retired_dev_mode_before_spawn(monkeypatch, tmp_path) -> None:
   processes, envs = _install_fake_spawn(monkeypatch)
   app = _make_app(monkeypatch, tmp_path)
-  cases = [
-    {"profile": "_fixture", "skill": "earnings-review"},
-    {"profile": "analyst", "skill": "fixture-sleep"},
-    {"profile": "analyst", "skill": "earnings-review", "dev_mode": True},
-    {"profile": "analyst", "skill": "earnings-review", "dev_mode": False},
-  ]
 
   with TestClient(app) as client:
     web_session = _control_session(client, "alice", channel="web")
-    payload_web_session = _control_session(client, "bob", channel=None)
+    cli_session = _control_session(client, "bob", channel="cli")
 
-    for session, payload_channel in (
-      (web_session, None),
-      (payload_web_session, "web"),
-    ):
-      for overrides in cases:
+    for session in (web_session, cli_session):
+      for retired_value in (True, False):
         payload = {
           "kind": "autonomous",
           "profile": "analyst",
           "mode": "skill",
           "skill": "earnings-review",
-          "context": "Exercise fixture guard.",
+          "context": "Retired dev authority must not be accepted.",
           "ticker": "AAPL",
-          **overrides,
+          "dev_mode": retired_value,
         }
-        if payload_channel is not None:
-          payload["channel"] = payload_channel
         response = client.post(
           "/api/control/runs",
           headers=_headers(session),
           json=payload,
         )
 
-        assert response.status_code == 403
-        assert response.json() == {
-          "detail": {
-            "error": "web_control_dev_dispatch_forbidden",
-            "message": "Web Agent Control cannot launch fixture or dev-mode autonomous runs.",
-          }
-        }
+        assert response.status_code == 422
+        assert "dev_mode" in response.text
 
   assert app.state.subprocess_registry._tasks == {}
   assert processes == []
   assert envs == []
 
 
-def test_autonomous_dispatch_allows_scoped_web_fixture_qa_bridge(monkeypatch, tmp_path) -> None:
-  _processes, envs = _install_fake_spawn(monkeypatch)
-  monkeypatch.setenv("APP_ENV", "test")
-  app = _make_app(monkeypatch, tmp_path)
-
-  with TestClient(app) as client:
-    web_session = _control_session(client, "alice", channel="web")
-
-    response = client.post(
-      "/api/control/runs",
-      headers={
-        **_headers(web_session),
-        "X-Agent-Control-QA-Bridge": "fixture-approval-artifact",
-      },
-      json={
-        "kind": "autonomous",
-        "profile": "_fixture",
-        "mode": "skill",
-        "skill": "fixture-approval-canvas-artifact",
-        "context": "Exercise paused approval evidence fixture.",
-        "dev_mode": True,
-      },
-    )
-
-  assert response.status_code == 200, response.text
-  assert response.json()["run_id"] == "bg_0"
-  record = app.state.subprocess_registry._tasks["bg_0"]
-  assert record.channel == "web"
-  assert record.profile == "_fixture"
-  assert record.skill == "fixture-approval-canvas-artifact"
-  assert record.dev_mode is True
-  assert envs[-1]["_FIXTURE_DEV_MODE"] == "true"
-
-
-def test_autonomous_dispatch_allows_scoped_web_terminal_failure_fixture_qa_bridge(monkeypatch, tmp_path) -> None:
-  _processes, envs = _install_fake_spawn(monkeypatch)
-  monkeypatch.setenv("APP_ENV", "test")
-  app = _make_app(monkeypatch, tmp_path)
-
-  with TestClient(app) as client:
-    web_session = _control_session(client, "alice", channel="web")
-
-    response = client.post(
-      "/api/control/runs",
-      headers={
-        **_headers(web_session),
-        "X-Agent-Control-QA-Bridge": "fixture-terminal-failure",
-      },
-      json={
-        "kind": "autonomous",
-        "profile": "_fixture",
-        "mode": "skill",
-        "skill": "fixture-terminal-failure",
-        "context": "Exercise terminal failure presentation fixture.",
-        "dev_mode": True,
-      },
-    )
-
-  assert response.status_code == 200, response.text
-  assert response.json()["run_id"] == "bg_0"
-  record = app.state.subprocess_registry._tasks["bg_0"]
-  assert record.channel == "web"
-  assert record.profile == "_fixture"
-  assert record.skill == "fixture-terminal-failure"
-  assert record.dev_mode is True
-  assert envs[-1]["_FIXTURE_DEV_MODE"] == "true"
-
-
-def test_autonomous_dispatch_qa_bridge_does_not_allow_other_web_fixtures(monkeypatch, tmp_path) -> None:
+def test_autonomous_dispatch_ignores_retired_qa_bridge_header(monkeypatch, tmp_path) -> None:
   processes, envs = _install_fake_spawn(monkeypatch)
   monkeypatch.setenv("APP_ENV", "test")
   app = _make_app(monkeypatch, tmp_path)
@@ -2473,21 +2394,16 @@ def test_autonomous_dispatch_qa_bridge_does_not_allow_other_web_fixtures(monkeyp
       },
       json={
         "kind": "autonomous",
-        "profile": "_fixture",
+        "profile": "analyst",
         "mode": "skill",
-        "skill": "fixture-sleep",
-        "context": "This fixture is not approval-evidence QA.",
+        "skill": "earnings-review",
+        "context": "A retired QA header must not bypass the web guard.",
         "dev_mode": True,
       },
     )
 
-  assert response.status_code == 403
-  assert response.json() == {
-    "detail": {
-      "error": "web_control_dev_dispatch_forbidden",
-      "message": "Web Agent Control cannot launch fixture or dev-mode autonomous runs.",
-    }
-  }
+  assert response.status_code == 422
+  assert "dev_mode" in response.text
   assert app.state.subprocess_registry._tasks == {}
   assert processes == []
   assert envs == []
@@ -2564,7 +2480,7 @@ def test_autonomous_dispatch_validation_error_returns_422_and_releases_slot(monk
     assert valid.status_code == 200, valid.text
     assert valid.json()["run_id"] == "bg_2"
     record = app.state.subprocess_registry._tasks["bg_2"]
-    assert record.dev_mode is True
+    assert record.dev_mode is False
     assert record.cmd == [
       sys.executable,
       "-m",
@@ -2574,7 +2490,7 @@ def test_autonomous_dispatch_validation_error_returns_422_and_releases_slot(monk
       "--task",
       "summarize",
     ]
-    assert envs[-1]["ANALYST_DEV_MODE"] == "true"
+    assert "ANALYST_DEV_MODE" not in envs[-1]
 
 
 def test_autonomous_dispatch_accepts_module_safe_profile_names(monkeypatch, tmp_path) -> None:
@@ -2847,8 +2763,8 @@ def test_agents_mcp_relay_round_trips_all_autonomous_tools(monkeypatch, tmp_path
       gateway_client.autonomous_run_start(
         config,
         profile="analyst",
-        mode="task",
-        task="summarize",
+        mode="skill",
+        skill="summarize",
         channel=None,
       )
     )

@@ -84,6 +84,25 @@ def _route(
   )
 
 
+@pytest.mark.parametrize(
+  ("state", "proc", "expected"),
+  [
+    ("finished", None, True),
+    ("remediating", None, False),
+    ("future_state", SimpleNamespace(returncode=None), False),
+    ("future_state", SimpleNamespace(returncode=0), True),
+  ],
+)
+def test_autonomous_replay_termination_uses_owner_and_process_fallback(
+  state: str,
+  proc: Any,
+  expected: bool,
+) -> None:
+  record = SimpleNamespace(state=state, proc=proc)
+
+  assert events_module._autonomous_record_is_terminated(record) is expected
+
+
 async def _open_events(
   *,
   bus: UserEventBus,

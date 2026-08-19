@@ -9,7 +9,14 @@ from typing import Any, Dict, List, Tuple
 
 from . import sdk_runner_helpers as _sdk_runner_helpers
 from .capability_binding import validate_reported_identity
+from .runner_session_events import (
+  build_tool_call_complete_event as _build_tool_call_complete_event,
+)
 from .tool_display import resolve_display
+from .tool_dispatch_classification import (
+  build_dispatch_record as _build_dispatch_record,
+  resolve_dispatch_entry as _resolve_dispatch_entry,
+)
 from .tool_result_semantics import classify_semantic_tool_error
 from .providers.anthropic import _server_tool_unit_deltas
 from .runner_tool_audit import get_tool_risk_value
@@ -75,14 +82,6 @@ def _redact_tool_input_for_event(tool_name: str, tool_input: Dict[str, Any]) -> 
     "_redact_tool_input_for_event",
     _sdk_runner_helpers.redact_tool_input_for_event,
   )(tool_name, tool_input)
-
-
-def _resolve_display(tool_name: str, tool_input: Dict[str, Any]) -> Any:
-  return _parent_attr("resolve_display", resolve_display)(tool_name, tool_input)
-
-
-def _classify_semantic_tool_error(result: Any) -> Dict[str, Any] | None:
-  return _parent_attr("classify_semantic_tool_error", classify_semantic_tool_error)(result)
 
 
 def _time() -> float:
@@ -203,7 +202,7 @@ class _SDKRunnerStreamMixin:
             tool_input=tool_input,
           )
       redacted_tool_input = _redact_tool_input_for_event(tool_name, tool_input)
-      display = _resolve_display(tool_name, redacted_tool_input)
+      display = resolve_display(tool_name, redacted_tool_input)
       tool_start_event = {
         "type": "tool_call_start",
         "tool_call_id": tool_call_id,
@@ -269,19 +268,28 @@ class _SDKRunnerStreamMixin:
     server = _server_for_tool(info.tool_name)
     duration_ms = int((_time() - info.started_at) * 1000)
     result_bytes = len(json.dumps(result, default=str)) if result is not None else 0
-    semantic_error = _classify_semantic_tool_error(result) if error is None else None
-    event = {
-      "type": "tool_call_complete",
-      "tool_call_id": tool_call_id,
-      "tool_name": info.tool_name,
-      "result": result,
-      "error": error,
-      "duration_ms": duration_ms,
-      "server": server,
-      "is_error": error is not None or semantic_error is not None,
-    }
-    if semantic_error is not None:
-      event["semantic_error"] = dict(semantic_error)
+    semantic_error = classify_semantic_tool_error(result) if error is None else None
+    # D-B1-1: the SDK runtime is the second `tool_call_complete` producer.
+    # It goes through the shared builder so its sessions carry the dispatch
+    # record too; the SDK owns its own dispatch, so attempts is always 1 and
+    # this producer never retries.
+    dispatch_entry = _resolve_dispatch_entry(info.tool_name, server=server)
+    event = _build_tool_call_complete_event(
+      tool_call_id=tool_call_id,
+      tool_name=info.tool_name,
+      result=result,
+      error=error,
+      duration_ms=duration_ms,
+      server=server,
+      dispatch=_build_dispatch_record(
+        entry=dispatch_entry,
+        result=result,
+        error=error,
+        semantic_error=semantic_error,
+        attempts=1,
+      ),
+      semantic_error=semantic_error,
+    )
     if semantic_error is None and _is_accepted_ui_blocks_result(info.tool_name, result, error):
       self._suppress_text_after_accepted_ui_blocks = True
     self._clear_active_skill_if_report_door_completed(

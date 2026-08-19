@@ -31,7 +31,6 @@ class AutonomousCapabilityBindingRequest:
   mode: str
   skill: str | None
   channel: str | None
-  dev_mode: bool
   source: AutonomousCapabilityBindingSource
   run_mode: RunMode
   required_bind: CapabilityBind | None = None
@@ -69,8 +68,6 @@ class AutonomousCapabilityBindingRequest:
         "channel",
         _required_text(self.channel, field_name="channel").lower(),
       )
-    if not isinstance(self.dev_mode, bool):
-      raise ValueError("dev_mode must be a bool")
     if self.source not in {"start", "resume", "schedule"}:
       raise ValueError(f"unsupported autonomous capability binding source: {self.source!r}")
     if self.run_mode not in {"autonomous", "cron"}:

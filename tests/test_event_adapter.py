@@ -471,3 +471,38 @@ def test_credential_refreshed_preserves_current_runner_fields() -> None:
     "kind": "auth",
     "status_code": 401,
   }
+
+
+def test_dispatch_record_is_session_log_only_and_never_reaches_the_wire() -> None:
+  """D-B1-3: `dispatch` rides the session log, not the v1 wire projection."""
+
+  assert "dispatch" not in V1_FIELD_PROJECTION["tool_call_complete"]
+
+  adapted = V1Adapter().transform(
+    {
+      "type": "tool_call_complete",
+      "tool_call_id": "toolu_1",
+      "tool_name": "filings_search",
+      "result": {"status": "success"},
+      "error": None,
+      "duration_ms": 12,
+      "server": "research-corpus-mcp",
+      "is_error": False,
+      "dispatch": {
+        "outcome": "ok",
+        "attempts": 1,
+        "route_id": "mcp:research-corpus-mcp/filings_search",
+        "sources": [
+          {
+            "document_id": "edgar:0000789019-26-000012",
+            "source_kind": "filing",
+            "source_url": "https://www.sec.gov/Archives/msft-10k.htm",
+          }
+        ],
+      },
+    }
+  )
+
+  assert adapted is not None
+  assert "dispatch" not in adapted
+  assert adapted["is_error"] is False

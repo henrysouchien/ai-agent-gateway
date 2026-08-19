@@ -28,6 +28,7 @@ INVESTMENT_CAPABILITY_CLAIM_ISSUER: Final = "ai-excel-addin"
 INVESTMENT_CAPABILITY_CLAIM_AUDIENCE: Final = "investment-tools"
 INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS: Final = 60
 INVESTMENT_CAPABILITY_CLAIM_KEY_BYTES: Final = 32
+INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE: Final = "selected_content_read"
 _MAX_ID_CHARS = 256
 _MAX_CHANNEL_CHARS = 64
 _MAX_TOKEN_CHARS = 16_384
@@ -175,6 +176,16 @@ def _signing_key() -> tuple[Ed25519PrivateKey, str]:
   )
   key_id = f"ed25519-sha256:{hashlib.sha256(raw_public_key).hexdigest()}"
   return private_key, key_id
+
+
+def investment_capability_signing_available() -> bool:
+  """Whether the hydrated private key can issue Investment claims."""
+
+  try:
+    _signing_key()
+  except InvestmentCapabilityClaimError:
+    return False
+  return True
 
 
 def _skills_dir() -> Path:
@@ -369,6 +380,59 @@ def issue_investment_capability_claim(
   return token
 
 
+def issue_investment_selected_content_claim(
+  *,
+  user_id: str,
+  artifact_id: str,
+  view: str,
+  now: int | None = None,
+) -> str:
+  """Authorize one exact bounded Investment artifact view for admission."""
+
+  subject = _required_text(user_id, "user_id")
+  selected_artifact_id = _required_text(artifact_id, "artifact_id")
+  selected_view = _required_text(view, "view", maximum=32)
+  if selected_view not in {"summary", "excerpt"}:
+    raise InvestmentCapabilityClaimError(
+      "investment selected-content claim requires a supported view"
+    )
+  issued_at = int(time.time()) if now is None else now
+  if isinstance(issued_at, bool) or not isinstance(issued_at, int):
+    raise InvestmentCapabilityClaimError(
+      "investment selected-content claim requires an integer issuance time"
+    )
+
+  private_key, key_id = _signing_key()
+  header: dict[str, object] = {
+    "alg": "EdDSA",
+    "kid": key_id,
+    "typ": "JWT",
+  }
+  payload: dict[str, object] = {
+    "artifact_id": selected_artifact_id,
+    "aud": INVESTMENT_CAPABILITY_CLAIM_AUDIENCE,
+    "exp": issued_at + INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS,
+    "iat": issued_at,
+    "iss": INVESTMENT_CAPABILITY_CLAIM_ISSUER,
+    "purpose": INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE,
+    "sub": subject,
+    "tool_name": "get_investment_artifact",
+    "v": 2,
+    "view": selected_view,
+  }
+  signing_input = b".".join((
+    _b64url(_canonical_json(header)).encode("ascii"),
+    _b64url(_canonical_json(payload)).encode("ascii"),
+  ))
+  signature = private_key.sign(signing_input)
+  token = f"{signing_input.decode('ascii')}.{_b64url(signature)}"
+  if len(token) > _MAX_TOKEN_CHARS:
+    raise InvestmentCapabilityClaimError(
+      "investment selected-content claim exceeds its transport bound"
+    )
+  return token
+
+
 __all__ = [
   "INVESTMENT_CAPABILITY_CLAIM_AUDIENCE",
   "INVESTMENT_CAPABILITY_CLAIM_ISSUER",
@@ -376,9 +440,12 @@ __all__ = [
   "INVESTMENT_CAPABILITY_CLAIM_PRIVATE_KEY_ENV",
   "INVESTMENT_CAPABILITY_CLAIM_PUBLIC_KEY_ENV",
   "INVESTMENT_CAPABILITY_CLAIM_TTL_SECONDS",
+  "INVESTMENT_SELECTED_CONTENT_CLAIM_PURPOSE",
   "INVESTMENT_CAPABILITY_FACADE_TOOLS",
   "INVESTMENT_CAPABILITY_SKILL_GRANTS",
   "InvestmentCapabilitySkillGrant",
   "InvestmentCapabilityClaimError",
   "issue_investment_capability_claim",
+  "issue_investment_selected_content_claim",
+  "investment_capability_signing_available",
 ]

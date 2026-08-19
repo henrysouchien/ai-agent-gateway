@@ -5,7 +5,7 @@ import html
 import json
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 import re
@@ -19,7 +19,10 @@ from agent_workflow_contracts import (
   TaskResultRef,
 )
 
-from .agent_session_log_records import EVENT_SCHEMA_VERSION
+from .agent_session_log_records import (
+  EVENT_SCHEMA_VERSION,
+  is_current_event_schema_version,
+)
 from .events import AgentCompletionEvent, event_from_dict
 from .skill_lifecycle import (
   SKILL_RESULT_CORE_FIELDS,
@@ -718,6 +721,12 @@ class TaskEntry:
   completion_persistence_error: str | None = None
   notification_delivery_state: NotificationDeliveryState = "not_queued"
   notification_generation: int = 0
+  #: The parent exercised the delivered result handle's read grant at least
+  #: once (CUR-E2E-08). In-memory only. After a registry rebuild the
+  #: delivery state itself resets to "not_queued", so the natural-finish
+  #: reminder does not re-fire in a resumed process at all — the protection
+  #: is per-live-run and fail-open, never at-least-once across restarts.
+  result_content_read: bool = False
   finalization_lock: asyncio.Lock = field(
     default_factory=asyncio.Lock,
     repr=False,
@@ -1057,26 +1066,60 @@ class NotificationQueue:
       bounded_notification=bounded_notification,
     )
 
+  def _rotate_overflow_marker(
+    self,
+    removed: list[TaskNotification],
+  ) -> None:
+    """Promote the deferred overflow marker once the live one leaves."""
+    if self._overflow_marker is None:
+      return
+    if not any(
+      notification is self._overflow_marker
+      for notification in removed
+    ):
+      return
+    self._overflow_marker = self._deferred_overflow_marker
+    self._deferred_overflow_marker = None
+    self._deferred_overflow_count = 0
+    self._deferred_overflow_sample_task_ids = []
+    if self._overflow_marker is not None:
+      self._enqueue(self._overflow_marker)
+
   def drain(self, max_count: int = 5) -> list[TaskNotification]:
     """Remove and return up to max_count notifications from the front."""
     result = self._queue[:max_count]
     self._queue = self._queue[max_count:]
-    if (
-      self._overflow_marker is not None
-      and any(
-        notification is self._overflow_marker
-        for notification in result
-      )
-    ):
-      self._overflow_marker = self._deferred_overflow_marker
-      self._deferred_overflow_marker = None
-      self._deferred_overflow_count = 0
-      self._deferred_overflow_sample_task_ids = []
-      if self._overflow_marker is not None:
-        self._enqueue(self._overflow_marker)
+    self._rotate_overflow_marker(result)
     if not self._queue:
       self._available.clear()
     return result
+
+  def drain_delivered(
+    self,
+    delivered: Sequence[TaskNotification],
+  ) -> list[TaskNotification]:
+    """Remove exactly the delivered notification objects from the queue.
+
+    Keyed by **object identity**, never by ``_queue_token``:
+    ``push_or_replace_pending`` reuses a pending entry's token for a
+    different, never-rendered payload, so a token-keyed drain would
+    silently discard a replacement the model has not seen. Overflow-marker
+    rotation matches ``drain``.
+    """
+    if not delivered:
+      return []
+    removed: list[TaskNotification] = []
+    remaining: list[TaskNotification] = []
+    for notification in self._queue:
+      if any(notification is candidate for candidate in delivered):
+        removed.append(notification)
+      else:
+        remaining.append(notification)
+    self._queue = remaining
+    self._rotate_overflow_marker(removed)
+    if not self._queue:
+      self._available.clear()
+    return removed
 
   def peek(self, max_count: int | None = None) -> list[TaskNotification]:
     """Non-destructive peek at front of queue."""
@@ -1199,6 +1242,75 @@ class TaskRegistry:
       True,
     )
 
+  def admit(
+    self,
+    task_type: str,
+    *,
+    agent_name: str | None = None,
+    task_id: str | None = None,
+    original_task_id: str | None = None,
+    reject_over_capacity: Callable[[int, int], dict[str, Any] | None],
+    reject_retrieval_backpressure: Callable[[int, int], dict[str, Any]],
+    **metadata_kwargs: Any,
+  ) -> tuple[TaskEntry | None, dict[str, Any] | None]:
+    """Decide background capacity and reserve the slot in one critical section.
+
+    Synchronous by contract (A-M8 / T3-I03): no ``await`` may be introduced
+    between the capacity verdict and the reservation, or N concurrent
+    callers can all read the same stale ``admission_count`` and then all
+    register afterwards. ``_max_inflight`` is the single ceiling (T3-I04);
+    the RUNNING transition only logs an invariant violation.
+
+    Returns ``(entry, None)`` when the slot is taken, or
+    ``(None, rejection)`` when it is refused. A rejection means no slot was
+    reserved and therefore no durable ``task_registered`` may be appended.
+    """
+
+    admission_count = self.admission_count
+    reserved = self._tasks.get(task_id) if task_id else None
+    if reserved is not None and reserved.state == TaskState.PENDING:
+      admission_count -= 1
+    limit_error = reject_over_capacity(admission_count, self._max_inflight)
+    if limit_error is not None:
+      return None, limit_error
+    if not self.notification_retrieval_capacity_available(
+      admission_count=admission_count,
+    ):
+      return None, reject_retrieval_backpressure(
+        self.pending_notification_retrieval_count,
+        self.notification_retrieval_retention_limit,
+      )
+    if original_task_id is not None:
+      if not task_id:
+        raise ValueError(
+          "resume admission requires a deterministic successor task_id"
+        )
+      try:
+        entry, _created = self.claim_resume_successor(
+          task_type,
+          agent_name=agent_name,
+          task_id=task_id,
+          original_task_id=original_task_id,
+          **metadata_kwargs,
+        )
+      except ResumeSuccessorConflictError as exc:
+        return None, {
+          "code": "resume_successor_conflict",
+          "message": str(exc),
+        }
+      return entry, None
+    if reserved is not None and reserved.state == TaskState.PENDING:
+      return reserved, None
+    return (
+      self.register(
+        task_type,
+        agent_name=agent_name,
+        task_id=task_id,
+        **metadata_kwargs,
+      ),
+      None,
+    )
+
   def discard_unstarted(
     self,
     task_id: str,
@@ -1235,7 +1347,21 @@ class TaskRegistry:
       and entry.state != TaskState.RUNNING
       and self.inflight_count >= self._max_inflight
     ):
-      raise RuntimeError(f"Task inflight limit reached ({self._max_inflight})")
+      # T3-I04 / D-A8-5: capacity is owned by ``admit`` alone. Reaching this
+      # branch means an admitted task escaped the single ceiling, which is a
+      # code defect, not a runtime condition to enforce against. Record the
+      # invariant violation (this log line is the CUR-E2E-03 recurrence
+      # detector) and proceed — refusing here strands the task with a durable
+      # ``task_registered`` and no terminal.
+      log.error(
+        "task registry invariant violation: RUNNING transition exceeded the "
+        "inflight ceiling (task_id=%s current_state=%s inflight_count=%d "
+        "max_inflight=%d); admission is owned by TaskRegistry.admit",
+        task_id,
+        entry.state.value,
+        self.inflight_count,
+        self._max_inflight,
+      )
 
     old_state = entry.state
     entry.state = new_state
@@ -1430,11 +1556,7 @@ class TaskRegistry:
       if suffix is not None:
         max_suffix = suffix if max_suffix is None else max(max_suffix, suffix)
       raw_event_schema_version = registered.get("event_schema_version")
-      if (
-        isinstance(raw_event_schema_version, bool)
-        or not isinstance(raw_event_schema_version, int)
-        or raw_event_schema_version != EVENT_SCHEMA_VERSION
-      ):
+      if not is_current_event_schema_version(raw_event_schema_version):
         self._warn_skipped_durable_task(
           task_id,
           "task_registered record has unsupported event_schema_version "
@@ -1767,6 +1889,35 @@ class TaskRegistry:
       self.pending_notification_retrieval_count + admitted
       < self.notification_retrieval_retention_limit
     )
+
+  def mark_result_content_read(
+    self,
+    task_id: str,
+    *,
+    content_id: str,
+  ) -> bool:
+    """Record that the parent read the delivered result-handle content.
+
+    Best-effort by design (CUR-E2E-08): the reader tool authorizes purely
+    from the durable log and must keep working when the registry holds no
+    live entry, so a miss here is not an error. The guard requires the
+    entry's own completion envelope to have delivered exactly this
+    ``content_id`` through a handle-shaped materialization.
+    """
+    entry = self._tasks.get(task_id)
+    if entry is None or entry.completion_envelope is None:
+      return False
+    materialization = entry.completion_envelope.parent_materialization
+    if getattr(materialization, "kind", None) not in {
+      "result_handle",
+      "authored_summary_with_result_handle",
+    }:
+      return False
+    source = getattr(materialization, "source", None)
+    if getattr(source, "content_id", None) != content_id:
+      return False
+    entry.result_content_read = True
+    return True
 
   def mark_notification_payload_retrieved(
     self,

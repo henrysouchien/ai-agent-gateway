@@ -6,10 +6,10 @@ from pathlib import Path
 import subprocess
 import sys
 
-from agent_gateway.dashboard_artifact.generate_description import render_description
 from agent_gateway.dashboard_artifact.qa import build_dashboard_artifact, validate_dashboard_payload
 from agent_gateway.dashboard_artifact.registry import MODULE_REGISTRY
 from schema.dashboard_artifact import DashboardArtifact
+from scripts.generate_dashboard_artifact_description import render_description
 
 
 ROOT = Path(__file__).resolve().parents[3]

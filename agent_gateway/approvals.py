@@ -140,7 +140,6 @@ def _release_cancelled_approval(
         "approved": False,
         "allow_tool_type": False,
         "approval_id": approval_id,
-        "denied_by": None,
       },
     )
 
@@ -174,7 +173,6 @@ async def _record_vote_and_unblock(
   allow_tool_type: bool,
   reason: str | None,
   app_state: Any,
-  denied_by: str | None = None,
   authoritative_store: Any | None = None,
   authoritative_policy: Any | None = None,
   authoritative_identity: Mapping[str, Any] | None = None,
@@ -193,7 +191,6 @@ async def _record_vote_and_unblock(
       allow_tool_type=allow_tool_type,
       reason=reason,
       app_state=app_state,
-      denied_by=denied_by,
       authoritative_store=authoritative_store,
       authoritative_policy=authoritative_policy,
       authoritative_identity=authoritative_identity,
@@ -213,7 +210,6 @@ async def _record_vote_and_unblock_locked(
   allow_tool_type: bool,
   reason: str | None,
   app_state: Any,
-  denied_by: str | None = None,
   authoritative_store: Any | None = None,
   authoritative_policy: Any | None = None,
   authoritative_identity: Mapping[str, Any] | None = None,
@@ -232,8 +228,6 @@ async def _record_vote_and_unblock_locked(
     authoritative_store=authoritative_store,
     authoritative_policy=authoritative_policy,
   )
-  effective_denied_by = denied_by if not approved else None
-
   if not approval_id:
     effective_allow = effective_allow_tool_type(
       pending_entry.get("tool_class"),
@@ -242,7 +236,7 @@ async def _record_vote_and_unblock_locked(
     )
     pending_entry["allow_tool_type"] = effective_allow
     pending_entry["status"] = "approval_received"
-    await approval_queue.put({"approved": approved, "allow_tool_type": effective_allow, "denied_by": effective_denied_by})
+    await approval_queue.put({"approved": approved, "allow_tool_type": effective_allow})
     return {"status": "ok"}
 
   if store is None or policy is None:
@@ -325,9 +319,8 @@ async def _record_vote_and_unblock_locked(
     decider_id=decider_id,
     decider_role=decider_role,
     decision="approved" if approved else "denied",
-    decision_reason="Auto-denied by relay chat policy" if effective_denied_by == "relay_policy" and reason is None else reason,
+    decision_reason=reason,
     decided_at=utc_now(),
-    external_callback_id=None,
   )
   try:
     if autonomous_delivery is None:
@@ -367,14 +360,13 @@ async def _record_vote_and_unblock_locked(
   if request_record.state == "expired":
     raise ApprovalActionError(410, {"error": "Approval request expired", "approval_id": str(approval_id)})
   if request_record.state not in ("approved", "denied"):
-    if request_record.state in TERMINAL_APPROVAL_STATES:
-      raise ApprovalActionError(409, {"error": "Approval request already resolved", "approval_id": str(approval_id)})
-    return {
-      "status": "vote_recorded",
-      "votes_received_count": request_record.votes_received_count,
-      "required_decider_count": request_record.required_decider_count,
-      "eligible_decider_count": request_record.eligible_decider_count,
-    }
+    raise ApprovalActionError(
+      409,
+      {
+        "error": "Approval request did not resolve",
+        "approval_id": str(approval_id),
+      },
+    )
 
   await policy.on_resolve(request=request_record)
   if _cancellation_requested(pending_entry):
@@ -430,7 +422,6 @@ async def _record_vote_and_unblock_locked(
       "approved": executable,
       "allow_tool_type": effective_allow,
       "approval_id": str(approval_id),
-      "denied_by": effective_denied_by,
     }
   )
   log.info(
@@ -536,7 +527,6 @@ async def _force_deny_pending_and_unblock(
       "approved": False,
       "allow_tool_type": False,
       "approval_id": str(approval_id),
-      "denied_by": "runtime_teardown",
     }
   )
   return {"approval": _approval_request_to_dict(request_record)}

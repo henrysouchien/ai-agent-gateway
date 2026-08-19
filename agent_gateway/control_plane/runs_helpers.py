@@ -20,13 +20,6 @@ from agent_gateway.autonomous_runner_state import (
   is_root_run_event,
   is_root_terminal_event,
 )
-from agent_gateway.fixture_gate import (
-  FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME,
-  FIXTURE_TERMINAL_FAILURE_SKILL_NAME,
-  fixture_provider_available,
-  is_fixture_profile_name,
-  is_fixture_skill_name,
-)
 from agent_gateway.session import AuthManager, GatewaySession
 from agent_gateway.control_run_lifecycle import (
   CONTROL_ACTIVE_RUN_STATES,
@@ -122,11 +115,6 @@ _AUTONOMOUS_RESUME_TOOL_RESULT_VALUE_MAX_CHARS = 280
 _AUTONOMOUS_RESUME_CONTEXT_MAX_CHARS = 12000
 _AUTONOMOUS_RESUME_OPERATOR_BLOCK_MAX_CHARS = 1500
 _AUTONOMOUS_RESUME_ORIGINAL_CONTEXT_BLOCK_MAX_CHARS = 1200
-_QA_FIXTURE_BRIDGE_HEADER = "x-agent-control-qa-bridge"
-_QA_FIXTURE_APPROVAL_ARTIFACT_VALUE = "fixture-approval-artifact"
-_QA_FIXTURE_TERMINAL_FAILURE_VALUE = "fixture-terminal-failure"
-
-
 def _iso_from_unix(timestamp: int | float | None) -> str:
   try:
     value = float(timestamp if timestamp is not None else 0)
@@ -999,61 +987,3 @@ def _require_run_channel(run_channel: str | None, authenticated_channel: str | N
 
 def _require_autonomous_channel(record: AutonomousTask, channel: str | None) -> None:
   _require_run_channel(record.channel, channel)
-
-
-def _payload_field_was_set(payload: Any, field_name: str) -> bool:
-  fields_set = getattr(payload, "model_fields_set", None)
-  if fields_set is None:
-    fields_set = getattr(payload, "__fields_set__", set())
-  return field_name in fields_set
-
-
-def _require_web_safe_autonomous_dispatch(
-  payload: AutonomousDispatchRequest,
-  *,
-  channel: str | None,
-  qa_fixture_bridge: str | None = None,
-) -> None:
-  if _normalize_channel(channel) != "web":
-    return
-
-  profile = str(payload.profile or "").strip()
-  skill = str(payload.skill or "").strip()
-  if (
-    qa_fixture_bridge == _QA_FIXTURE_APPROVAL_ARTIFACT_VALUE
-    and fixture_provider_available()
-    and is_fixture_profile_name(profile)
-    and skill == FIXTURE_APPROVAL_CANVAS_ARTIFACT_SKILL_NAME
-    and bool(payload.dev_mode)
-  ):
-    return
-  if (
-    qa_fixture_bridge == _QA_FIXTURE_TERMINAL_FAILURE_VALUE
-    and fixture_provider_available()
-    and is_fixture_profile_name(profile)
-    and skill == FIXTURE_TERMINAL_FAILURE_SKILL_NAME
-    and bool(payload.dev_mode)
-  ):
-    return
-
-  if (
-    _payload_field_was_set(payload, "dev_mode")
-    or bool(payload.dev_mode)
-    or is_fixture_profile_name(profile)
-    or is_fixture_skill_name(skill)
-  ):
-    raise HTTPException(
-      status_code=403,
-      detail={
-        "error": "web_control_dev_dispatch_forbidden",
-        "message": "Web Agent Control cannot launch fixture or dev-mode autonomous runs.",
-      },
-    )
-
-
-def _qa_fixture_bridge_requested(request: Request) -> str | None:
-  marker = request.headers.get(_QA_FIXTURE_BRIDGE_HEADER, "")
-  normalized = marker.strip().lower()
-  if normalized in {_QA_FIXTURE_APPROVAL_ARTIFACT_VALUE, _QA_FIXTURE_TERMINAL_FAILURE_VALUE}:
-    return normalized
-  return None

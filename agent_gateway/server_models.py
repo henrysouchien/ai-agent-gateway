@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import inspect
 import json
 import logging
 import re
 import secrets
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -17,6 +19,7 @@ from typing import (
   Callable,
   Dict,
   List,
+  Literal,
   Mapping,
   Optional,
   Protocol,
@@ -25,7 +28,14 @@ from typing import (
 )
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import (
+  BaseModel,
+  ConfigDict,
+  Field,
+  PrivateAttr,
+  field_validator,
+  model_validator,
+)
 from pydantic_core import PydanticCustomError
 
 from .auth import CredentialsResolver
@@ -61,6 +71,7 @@ from .providers import ModelProvider
 from .providers.agent_sdk import AgentSDKConfig
 from .runner import AgentRunner
 from .sdk_runner import AgentSDKRunner
+from .selected_content import SelectedContentAdmission
 from .session import AuthManager, GatewaySession
 from .tool_dispatcher import ApprovalDecision, ApprovalRequest
 from .tool_redaction import get_audit_hmac_key_id, get_audit_hmac_secret
@@ -75,6 +86,10 @@ if TYPE_CHECKING:
 SystemPrompt = str | List[Tuple[str, bool]]
 ExecutionLocationResolver = Callable[[str], Optional[str]]
 BuildChatRuntime = Callable[[GatewaySession, "ChatRequest", Optional[str], AuthManager], Awaitable["ChatRuntime"]]
+SelectedContentAdmitter = Callable[
+  [GatewaySession, "ChatRequest"],
+  Awaitable[SelectedContentAdmission] | SelectedContentAdmission,
+]
 RequestApproval = Callable[[ApprovalRequest], Awaitable[Optional[ApprovalDecision]]]
 BuildRunner = Callable[
   [EventLog, str, float],
@@ -362,6 +377,137 @@ class UiBlocksContractPin(BaseModel):
   contract_version: int = Field(strict=True)
 
 
+CHAT_ATTACHMENTS_CONTRACT = "chat-attachments-v1"
+CHAT_ATTACHMENT_MAX_COUNT = 8
+CHAT_ATTACHMENT_MAX_BYTES = 1024 * 1024
+CHAT_ATTACHMENT_MAX_BASE64_BYTES = 1_398_104
+CHAT_ATTACHMENT_MAX_TOTAL_BYTES = 4 * 1024 * 1024
+CHAT_ATTACHMENT_MAX_TOTAL_BASE64_BYTES = 5_592_416
+_CHAT_ATTACHMENT_NAME_RE = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
+_CHAT_ATTACHMENT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CHAT_ATTACHMENT_MEDIA_TYPES_BY_SUFFIX = {
+  ".txt": "text/plain",
+  ".md": "text/markdown",
+  ".markdown": "text/markdown",
+  ".json": "application/json",
+  ".csv": "text/csv",
+  ".tsv": "text/tab-separated-values",
+}
+
+
+def _expected_attachment_input_name(index: int) -> str:
+  return "source_document" if index == 1 else f"source_document_{index}"
+
+
+class ChatAttachmentV1(BaseModel):
+  """Closed first-cohort exact UTF-8 attachment envelope."""
+
+  model_config = ConfigDict(extra="forbid", frozen=True)
+
+  schema_version: Literal["chat-attachment/1"]
+  input_name: str
+  display_name: str
+  media_type: str
+  encoding: Literal["utf-8"]
+  content_bytes: int = Field(gt=0, le=CHAT_ATTACHMENT_MAX_BYTES)
+  content_sha256: str
+  content_b64: str = Field(min_length=4, max_length=CHAT_ATTACHMENT_MAX_BASE64_BYTES)
+  _decoded_content: bytes = PrivateAttr(default=b"")
+
+  @field_validator("input_name")
+  @classmethod
+  def _validate_input_name(cls, value: str) -> str:
+    if _CHAT_ATTACHMENT_NAME_RE.fullmatch(value) is None:
+      raise ValueError("input_name is invalid")
+    return value
+
+  @field_validator("display_name")
+  @classmethod
+  def _validate_display_name(cls, value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value).strip()
+    if value != normalized:
+      raise ValueError(
+        "display_name must be NFC-normalized without surrounding whitespace"
+      )
+    if not value or "/" in value or "\\" in value or value in {".", ".."}:
+      raise ValueError("display_name must be a basename")
+    if any(unicodedata.category(character) == "Cc" for character in value):
+      raise ValueError("display_name contains control characters")
+    if len(value.encode("utf-8")) > 255:
+      raise ValueError("display_name exceeds 255 UTF-8 bytes")
+    return value
+
+  @field_validator("content_sha256")
+  @classmethod
+  def _validate_content_sha256(cls, value: str) -> str:
+    if _CHAT_ATTACHMENT_SHA256_RE.fullmatch(value) is None:
+      raise ValueError("content_sha256 must be 64 lowercase hex characters")
+    return value
+
+  @model_validator(mode="after")
+  def _validate_content(self) -> "ChatAttachmentV1":
+    suffix = next(
+      (
+        candidate
+        for candidate in sorted(
+          _CHAT_ATTACHMENT_MEDIA_TYPES_BY_SUFFIX,
+          key=len,
+          reverse=True,
+        )
+        if self.display_name.lower().endswith(candidate)
+      ),
+      None,
+    )
+    expected_media_type = (
+      _CHAT_ATTACHMENT_MEDIA_TYPES_BY_SUFFIX.get(suffix)
+      if suffix is not None
+      else None
+    )
+    if expected_media_type is None or self.media_type != expected_media_type:
+      raise ValueError(
+        "media_type does not match the allowlisted display_name suffix"
+      )
+    if not self.content_b64 or self.content_b64.startswith("data:"):
+      raise ValueError("content_b64 must be canonical base64 without a data URL prefix")
+    try:
+      decoded = base64.b64decode(self.content_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+      raise ValueError("content_b64 is not valid base64") from exc
+    if base64.b64encode(decoded).decode("ascii") != self.content_b64:
+      raise ValueError("content_b64 is not canonical base64")
+    if len(decoded) != self.content_bytes:
+      raise ValueError("content_bytes does not match decoded content")
+    try:
+      decoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+      raise ValueError("attachment content must be valid UTF-8") from exc
+    if hashlib.sha256(decoded).hexdigest() != self.content_sha256:
+      raise ValueError("content_sha256 does not match decoded content")
+    self._decoded_content = decoded
+    return self
+
+  def decoded_bytes(self) -> bytes:
+    return self._decoded_content
+
+
+class InvestmentArtifactSelection(BaseModel):
+  """Untrusted coordinates for one explicit bounded Investment view."""
+
+  model_config = ConfigDict(extra="forbid", frozen=True)
+
+  artifact_id: str = Field(min_length=1, max_length=256)
+  view: Literal["summary", "excerpt"]
+
+  @field_validator("artifact_id")
+  @classmethod
+  def _validate_artifact_id(cls, value: str) -> str:
+    if value != value.strip() or any(
+      ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+      raise ValueError("artifact_id is invalid")
+    return value
+
+
 class ChatRequest(BaseModel):
   """Request body for `POST /chat`.
 
@@ -381,6 +527,8 @@ class ChatRequest(BaseModel):
   effort: Optional[str] = None
   catalog_revision: Optional[str] = None
   ui_blocks_contract: UiBlocksContractPin | None = None
+  attachments: tuple[ChatAttachmentV1, ...] = ()
+  investment_artifact_selection: InvestmentArtifactSelection | None = None
   drain_trailing: bool = False
   _commercial_work_start: "CommercialWorkStartContext | None" = PrivateAttr(
     default=None
@@ -423,6 +571,22 @@ class ChatRequest(BaseModel):
       raise ValueError("effort requires an explicit model_key")
     if self.catalog_revision is not None and self.model_key is None:
       raise ValueError("catalog_revision requires an explicit model_key")
+    if len(self.attachments) > CHAT_ATTACHMENT_MAX_COUNT:
+      raise ValueError(
+        f"attachments cannot contain more than {CHAT_ATTACHMENT_MAX_COUNT} files"
+      )
+    if sum(item.content_bytes for item in self.attachments) > CHAT_ATTACHMENT_MAX_TOTAL_BYTES:
+      raise ValueError("attachments exceed the aggregate decoded byte limit")
+    if sum(len(item.content_b64) for item in self.attachments) > (
+      CHAT_ATTACHMENT_MAX_TOTAL_BASE64_BYTES
+    ):
+      raise ValueError("attachments exceed the aggregate base64 byte limit")
+    for index, attachment in enumerate(self.attachments, start=1):
+      expected_name = _expected_attachment_input_name(index)
+      if attachment.input_name != expected_name:
+        raise ValueError(
+          f"attachments[{index - 1}].input_name must be {expected_name!r}"
+        )
     return self
 
   @property
@@ -560,6 +724,8 @@ class ChatTurnInputs:
   effort: str | None = None
   catalog_revision: str | None = None
   ui_blocks_contract: UiBlocksContractPin | None = None
+  attachments: tuple[ChatAttachmentV1, ...] = ()
+  investment_artifact_selection: InvestmentArtifactSelection | None = None
   commercial_work_start: "CommercialWorkStartContext | None" = field(
     default=None,
     repr=False,
@@ -602,16 +768,6 @@ class ToolApprovalRequest(BaseModel):
   nonce: str
   approved: bool
   allow_tool_type: bool = False
-  denied_by: Optional[str] = None
-
-  @model_validator(mode="after")
-  def _validate_denied_by(self) -> "ToolApprovalRequest":
-    if self.approved:
-      self.denied_by = None
-      return self
-    if self.denied_by not in (None, "relay_policy"):
-      raise ValueError("denied_by must be omitted or 'relay_policy'")
-    return self
 
 
 @dataclass
@@ -900,6 +1056,7 @@ class GatewayServerConfig:
   claim_signing_authority: GatewayClaimSigningAuthority | None = None
   channel_profile_allowlist: Mapping[str, frozenset[str]] | None = None
   build_chat_runtime: Optional[BuildChatRuntime] = None
+  selected_content_admitter: SelectedContentAdmitter | None = None
   on_event: Optional[Callable[..., Any]] = None
   on_tool_result: Optional[Callable[..., Any]] = None
   on_usage: Optional[Callable[..., Any]] = None

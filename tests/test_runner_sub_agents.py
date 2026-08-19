@@ -5,11 +5,15 @@ from typing import Any
 
 import pytest
 
-from agent_gateway import AgentRunner
+from agent_gateway.mcp_activation import McpActivationFold
+from agent_gateway import AgentRunner, ToolDispatcher
 from agent_gateway.capability_execution import BoundCapabilityExecution
+from agent_gateway.event_log import EventLog
+from agent_gateway.session import GatewaySession
 from agent_gateway.providers import ModelInfo, ModelProvider
 import agent_gateway.runner as gateway_runner
 from agent_gateway.runner_sub_agents import RunnerSubAgentMixin
+from agent_gateway.task_registry import TaskEntry
 from agent_workflow_contracts import (
   AgentOperationRef,
   AttemptRef,
@@ -18,6 +22,11 @@ from agent_workflow_contracts import (
   ResultRequirement,
   TaskResult,
   TaskResultProvenance,
+)
+from tests.admitted_authority_test_support import (
+  SOURCE_TOOL_ID,
+  provenance_of,
+  sealed_admitted_task,
 )
 from tests.capability_execution_test_support import (
   stub_bound_capability_execution,
@@ -82,12 +91,33 @@ def _execution(capability_id: str = "node.explore") -> BoundCapabilityExecution:
 
 
 class _Dispatcher:
+  def __init__(self) -> None:
+    self._event_log = EventLog()
+    self._session_id = "parent-session"
+
   def get_tool_definitions(self) -> list[dict[str, Any]]:
     return [{
       "name": "web_search",
       "description": "Search the web",
       "input_schema": {"type": "object"},
     }]
+
+
+class _NullMcp:
+  def is_mcp_tool(self, _name: str) -> bool:
+    return False
+
+
+def _approval_dispatcher(session: GatewaySession) -> ToolDispatcher:
+  return ToolDispatcher(
+    mcp_client=_NullMcp(),
+    event_log=EventLog(),
+    session_id="parent-session",
+    session=session,
+    store=object(),
+    policy=object(),
+    get_tool_definitions=_Dispatcher().get_tool_definitions,
+  )
 
 
 class _EventLog:
@@ -124,6 +154,74 @@ class _ChildRunner:
     self.closed = True
 
 
+class _FailedRetrievalChildRunner(_ChildRunner):
+  """A child whose only granted source-capability retrieval failed."""
+
+  async def run(self, **kwargs: Any) -> None:
+    self.run_kwargs = kwargs
+    self.kwargs["event_log"].append({
+      "type": "tool_call_complete",
+      "tool_call_id": "call-web-search",
+      "tool_name": SOURCE_TOOL_ID,
+      "is_error": True,
+    })
+    self.kwargs["event_log"].append({
+      "type": "stream_complete",
+      "usage": {"input_tokens": 11, "output_tokens": 7},
+    })
+
+
+class _ApprovalChildRunner(_ChildRunner):
+  approved = True
+
+  async def run(self, **kwargs: Any) -> None:
+    self.run_kwargs = kwargs
+    dispatcher = self.kwargs["dispatcher"]
+    approval_task = asyncio.create_task(
+      dispatcher._await_user_approval_via_pending_tools(
+        SimpleNamespace(
+          approval_id="approval-start-quant",
+          tool_call_id="call-start-quant",
+          tool_name="start_quant_research",
+          tool_args_redacted={"request": {"research_file_id": 42}},
+        ),
+        SimpleNamespace(
+          reason="state mutation requires approval",
+          allow_persistent_grant=False,
+        ),
+        nonce="nonce-start-quant",
+        resolved_qualifier="",
+        allow_persistent=False,
+        timeout_seconds=5,
+      )
+    )
+    session = dispatcher._session
+    for _ in range(100):
+      if "call-start-quant" in session.approval_queues:
+        break
+      await asyncio.sleep(0)
+    else:
+      raise AssertionError("child approval was not registered on parent session")
+    session.approval_queues["call-start-quant"].put_nowait({
+      "approved": self.approved,
+      "allow_tool_type": False,
+      "approval_id": "approval-start-quant",
+    })
+    self.approval_result = await approval_task
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+    dispatcher._event_log.append({
+      "type": "tool_call_complete",
+      "tool_call_id": "call-start-quant",
+      "tool_name": "start_quant_research",
+      "result": {"approved": self.approved},
+    })
+    self.kwargs["event_log"].append({
+      "type": "stream_complete",
+      "usage": {"input_tokens": 11, "output_tokens": 7},
+    })
+
+
 class _SessionLog:
   def __init__(self, text: str) -> None:
     self.text = text
@@ -149,7 +247,7 @@ def _parent(tmp_path: Path, *, session_log: _SessionLog | None) -> AgentRunner:
   runner._per_turn_timeout = 11.0
   runner._stream_stall_timeout = 12.0
   runner._mcp_client = None
-  runner._loaded_mcp_servers = set()
+  runner._mcp_activation_fold = McpActivationFold()
   runner._get_tool_definitions = lambda: []
   runner._on_tool_result = None
   runner._on_usage = None
@@ -193,6 +291,25 @@ def _spawn(parent: AgentRunner, **overrides: Any):
   }
   kwargs.update(overrides)
   return asyncio.run(parent.spawn_sub_agent("research this", **kwargs))
+
+
+def _resume(parent: AgentRunner, **overrides: Any):
+  kwargs = {
+    "original_task_id": "task:prior",
+    "reconstructed_messages": [{"role": "user", "content": "resume"}],
+    "parent_messages": [],
+    "capability_execution": _execution(),
+    "skill_name": "explore",
+    "logical_task": _LOGICAL_TASK,
+    "attempt": _ATTEMPT,
+    "result_requirement": _RESULT,
+    "result_provenance": _PROVENANCE,
+    "dispatcher": _Dispatcher(),
+    "max_turns": 4,
+    "timeout": None,
+  }
+  kwargs.update(overrides)
+  return asyncio.run(parent.resume_sub_agent(**kwargs))
 
 
 def test_runner_sub_agent_methods_are_inherited_from_mixin() -> None:
@@ -268,6 +385,80 @@ def test_spawn_sub_agent_uses_exact_child_skill_run_identity(
   assert _ChildRunner.instances[0].kwargs["skill_run_id"] == "child-skill-run"
 
 
+@pytest.mark.parametrize("method,approved", [
+  ("spawn", True),
+  ("spawn", False),
+  ("resume", True),
+  ("resume", False),
+])
+def test_child_approval_uses_parent_session_and_parent_visible_child_log(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  method: str,
+  approved: bool,
+) -> None:
+  _ChildRunner.instances.clear()
+  parent_events: list[tuple[dict[str, Any], str]] = []
+  parent = _parent(tmp_path, session_log=_SessionLog("Done."))
+  parent._log = EventLog(
+    on_event=lambda event, session_id: parent_events.append(
+      (event, session_id)
+    ),
+    session_id="parent-session",
+  )
+  parent._log.append({"type": "text_delta", "text": "before child"})
+  parent_session = GatewaySession(
+    session_id="parent-session",
+    api_key_hash="hash",
+    created_at=1,
+    expires_at=2,
+    user_id="owner",
+  )
+  dispatcher = _approval_dispatcher(parent_session)
+  _ApprovalChildRunner.approved = approved
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _ApprovalChildRunner)
+
+  result, error = (
+    _spawn(parent, dispatcher=dispatcher)
+    if method == "spawn"
+    else _resume(parent, dispatcher=dispatcher)
+  )
+
+  assert error is None
+  assert isinstance(result, TaskResult)
+  approval_event, delivery_session_id = next(
+    item for item in parent_events
+    if item[0]["type"] == "tool_approval_request"
+  )
+  assert approval_event == {
+    "type": "tool_approval_request",
+    "tool_call_id": "call-start-quant",
+    "approval_id": "approval-start-quant",
+    "nonce": "nonce-start-quant",
+    "tool_name": "start_quant_research",
+    "tool_input": {"request": {"research_file_id": 42}},
+    "resolved_qualifier": "",
+    "reason": "state mutation requires approval",
+    "allow_persistent_approval": False,
+    "ts": approval_event["ts"],
+    "sub_agent_id": "sub0:parent-session",
+  }
+  assert delivery_session_id == "parent-session"
+  assert [entry.seq for entry in parent._log.entries] == [1, 2]
+  assert parent._log.entries[1].event == approval_event
+  assert dispatcher._event_log is _ChildRunner.instances[0].kwargs[
+    "event_log"
+  ]
+  assert dispatcher._session_id == "parent-session"
+  assert _ChildRunner.instances[0].approval_result == {
+    "approved": approved,
+    "allow_tool_type": False,
+    "approval_id": "approval-start-quant",
+  }
+  assert parent_session.pending_tools == {}
+  assert parent_session.approval_queues == {}
+
+
 def test_spawn_sub_agent_requires_durable_terminal_message_log(
   tmp_path: Path,
 ) -> None:
@@ -284,3 +475,97 @@ def test_spawn_sub_agent_rejects_non_node_capability(tmp_path: Path) -> None:
       _parent(tmp_path, session_log=_SessionLog("Done.")),
       capability_execution=_execution("session.driver"),
     )
+
+
+def _admitted_entry() -> TaskEntry:
+  """A registry entry carrying the authority frozen at admission (B-3)."""
+
+  admitted = sealed_admitted_task(
+    logical_task=_LOGICAL_TASK,
+    attempt=_ATTEMPT,
+    result_requirement=_RESULT,
+  )
+  return TaskEntry(
+    task_id=_ATTEMPT.physical_task_id,
+    task_type="agent",
+    admitted_task=admitted,
+  )
+
+
+def test_spawn_settlement_derives_the_outcome_from_admitted_authority(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  # The runner-to-constructor handoff (B-3): ``spawn_sub_agent`` passes the
+  # entry's admitted task into settlement, so the derivation sees the grant
+  # and the bindings frozen at admission. Drop that pass and the settled
+  # result carries no outcome at all.
+  _ChildRunner.instances.clear()
+  entry = _admitted_entry()
+  parent = _parent(tmp_path, session_log=_SessionLog("Partial findings."))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _FailedRetrievalChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = _spawn(
+    parent,
+    result_provenance=provenance_of(entry.admitted_task),
+    task_entry=entry,
+  )
+
+  assert error is None
+  assert isinstance(result, TaskResult)
+  assert result.execution.status == "succeeded"
+  assert result.outcome is not None
+  assert result.outcome.assessment_source == "mechanically_derived"
+  # The grant intersected with the source-capability binding is exactly
+  # ``web_search``; its only retrieval failed.
+  assert result.outcome.disposition == "insufficient_evidence"
+  assert result.outcome.unmet_requirements == (SOURCE_TOOL_ID,)
+
+
+def test_spawn_settlement_without_an_admitted_entry_derives_no_outcome(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  # The negative control on the same execution: with no admitted authority in
+  # scope no assessment occurred, so the settled result stays unqualified.
+  # Together with the test above this pins that the outcome is read from the
+  # admitted task and never from the ambient tool surface.
+  _ChildRunner.instances.clear()
+  parent = _parent(tmp_path, session_log=_SessionLog("Partial findings."))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _FailedRetrievalChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = _spawn(parent)
+
+  assert error is None
+  assert isinstance(result, TaskResult)
+  assert result.execution.status == "succeeded"
+  assert result.outcome is None
+
+
+def test_resume_settlement_derives_the_outcome_from_admitted_authority(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  # The second settlement site: ``resume_sub_agent`` threads the same admitted
+  # authority, so a resumed segment settles with a mechanical qualifier too.
+  _ChildRunner.instances.clear()
+  entry = _admitted_entry()
+  parent = _parent(tmp_path, session_log=_SessionLog("Partial findings."))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _FailedRetrievalChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = _resume(
+    parent,
+    result_provenance=provenance_of(entry.admitted_task),
+    task_entry=entry,
+  )
+
+  assert error is None
+  assert isinstance(result, TaskResult)
+  assert result.execution.status == "succeeded"
+  assert result.outcome is not None
+  assert result.outcome.assessment_source == "mechanically_derived"
+  assert result.outcome.disposition == "insufficient_evidence"
+  assert result.outcome.unmet_requirements == (SOURCE_TOOL_ID,)

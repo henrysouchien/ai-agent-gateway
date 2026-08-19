@@ -29,7 +29,6 @@ from .runs_helpers import (
   _autonomous_task_for_user,
 )
 from .runs_models import DispatchScope
-from .market_scan_occurrence import materialize_market_scan_occurrence_dispatch
 
 
 logger = logging.getLogger(__name__)
@@ -1066,7 +1065,6 @@ class AgentRunScheduleRunner:
           role=claimed.get("dispatch_role"),
           now=now,
           claim_id=claim_id,
-          scheduled_occurrence=_parse_utc_datetime(claimed.get("next_run_at")),
         )
         if result is not None:
           results.append(result)
@@ -1123,7 +1121,6 @@ class AgentRunScheduleRunner:
     now: datetime | None = None,
     claim_id: str | None = None,
     advance_next_run: bool = True,
-    scheduled_occurrence: datetime | None = None,
   ) -> dict[str, Any] | None:
     registry = self.autonomous_registry
     schedule_id = str(record.get("schedule_id") or "")
@@ -1160,16 +1157,7 @@ class AgentRunScheduleRunner:
       return result
 
     try:
-      effective_dispatch = (
-        materialize_market_scan_occurrence_dispatch(
-          dispatch,
-          agent_run_schedule_id=schedule_id,
-          scheduled_for=scheduled_occurrence,
-        )
-        if scheduled_occurrence is not None
-        else dispatch
-      )
-      dispatch_scope = effective_dispatch.get("dispatch_scope")
+      dispatch_scope = dispatch.get("dispatch_scope")
       if not isinstance(dispatch_scope, dict):
         dispatch_scope = (
           record.get("dispatch_scope")
@@ -1179,30 +1167,29 @@ class AgentRunScheduleRunner:
       registry.set_user_event_bus(self.user_event_bus_factory() if self.user_event_bus_factory else None)
       start_payload = await registry.start(
         role=dispatch_role,
-        profile=str(effective_dispatch.get("profile") or ""),
-        mode=str(effective_dispatch.get("mode") or ""),
+        profile=str(dispatch.get("profile") or ""),
+        mode=str(dispatch.get("mode") or ""),
         task=(
-          effective_dispatch.get("task")
-          if isinstance(effective_dispatch.get("task"), str)
+          dispatch.get("task")
+          if isinstance(dispatch.get("task"), str)
           else None
         ),
         skill=(
-          effective_dispatch.get("skill")
-          if isinstance(effective_dispatch.get("skill"), str)
+          dispatch.get("skill")
+          if isinstance(dispatch.get("skill"), str)
           else None
         ),
         context=(
-          effective_dispatch.get("context")
-          if isinstance(effective_dispatch.get("context"), str)
+          dispatch.get("context")
+          if isinstance(dispatch.get("context"), str)
           else None
         ),
         ticker=(
-          effective_dispatch.get("ticker")
-          if isinstance(effective_dispatch.get("ticker"), str)
+          dispatch.get("ticker")
+          if isinstance(dispatch.get("ticker"), str)
           else None
         ),
         channel=str(record.get("channel") or "web"),
-        dev_mode=False,
         user_id=str(record.get("raw_user_id") or record.get("owner_user_id") or ""),
         user_email=record.get("user_email") if isinstance(record.get("user_email"), str) else None,
         owner_user_id=str(record.get("owner_user_id") or ""),
@@ -1291,7 +1278,7 @@ def _web_dev_schedule_dispatch_forbidden() -> HTTPException:
     status_code=status.HTTP_403_FORBIDDEN,
     detail={
       "error": "web_control_dev_dispatch_forbidden",
-      "message": "Web Agent Control cannot schedule fixture or dev-mode autonomous runs.",
+      "message": "Web Agent Control schedules require skill mode.",
     },
   )
 
@@ -1303,14 +1290,6 @@ def _require_agent_schedule_dispatch_allowed(
   if not _is_web_session(session):
     return
   if dispatch.mode != "skill":
-    raise _web_dev_schedule_dispatch_forbidden()
-  try:
-    from agent_gateway.fixture_gate import is_fixture_profile_name, is_fixture_skill_name
-  except Exception:
-    return
-  if is_fixture_profile_name(dispatch.profile) or (
-    dispatch.skill is not None and is_fixture_skill_name(dispatch.skill)
-  ):
     raise _web_dev_schedule_dispatch_forbidden()
 
 

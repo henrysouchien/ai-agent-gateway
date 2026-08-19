@@ -159,7 +159,10 @@ def test_runner_background_lifecycle_methods_are_inherited_from_mixin() -> None:
     "_background_task_payload",
     "_background_task_reminder_text",
     "_build_notification_reminder",
+    "_notification_delivery_set",
     "_consume_notifications",
+    "_settle_consumed_notifications",
+    "_ack_delivered_notifications",
     "_wait_for_background_notification",
     "_inject_system_prompt_reminder",
     "_run_background_agent",
@@ -183,13 +186,29 @@ def test_runner_background_lifecycle_resolves_parent_notification_helpers(monkey
     captured["max_count"] = max_count
     return "patched reminder"
 
+  def _notification_delivery_set(queue: Any, *, max_count: int) -> tuple[Any, ...]:
+    delivery_captured["queue"] = queue
+    delivery_captured["max_count"] = max_count
+    return ("delivered",)
+
+  delivery_captured: dict[str, Any] = {}
+
   monkeypatch.setattr(gateway_runner, "_build_notification_reminder", _build_notification_reminder)
   monkeypatch.setattr(gateway_runner, "_MAX_NOTIFICATIONS_PER_TURN", 9)
   monkeypatch.setattr(gateway_runner, "_consume_notifications", lambda queue, *, max_count: max_count + 1)
+  monkeypatch.setattr(
+    gateway_runner,
+    "_notification_delivery_set",
+    _notification_delivery_set,
+  )
 
   assert AgentRunner._build_notification_reminder(runner) == "patched reminder"
   assert captured == {"queue": runner._notification_queue, "max_count": 9}
   assert AgentRunner._consume_notifications(runner, 3) == 4
+  # A-M7: the delivery set resolves through the same runner indirection and
+  # the same per-turn cap as the reminder it belongs to.
+  assert AgentRunner._notification_delivery_set(runner) == ("delivered",)
+  assert delivery_captured == {"queue": runner._notification_queue, "max_count": 9}
 
 
 def test_wait_for_background_notification_wakes_before_child_callback_returns() -> None:
@@ -359,6 +378,7 @@ def test_runner_background_registration_resolves_parent_module_helpers(monkeypat
     admission_count = 0
     pending_notification_retrieval_count = 0
     notification_retrieval_retention_limit = 10
+    _max_inflight = 3
 
     def notification_retrieval_capacity_available(
       self,
@@ -367,6 +387,41 @@ def test_runner_background_registration_resolves_parent_module_helpers(monkeypat
     ) -> bool:
       _ = admission_count
       return True
+
+    def get(self, _task_id: str) -> None:
+      return None
+
+    def admit(
+      self,
+      task_type: str,
+      *,
+      agent_name: str | None = None,
+      task_id: str | None = None,
+      original_task_id: str | None = None,
+      reject_over_capacity: Any,
+      reject_retrieval_backpressure: Any,
+      **metadata_kwargs: Any,
+    ) -> tuple[Any, dict[str, Any] | None]:
+      _ = original_task_id
+      rejection = reject_over_capacity(self.admission_count, self._max_inflight)
+      if rejection is not None:
+        return None, rejection
+      if not self.notification_retrieval_capacity_available(
+        admission_count=self.admission_count,
+      ):
+        return None, reject_retrieval_backpressure(
+          self.pending_notification_retrieval_count,
+          self.notification_retrieval_retention_limit,
+        )
+      return (
+        self.register(
+          task_type,
+          agent_name=agent_name,
+          task_id=task_id,
+          **metadata_kwargs,
+        ),
+        None,
+      )
 
     def register(
       self,
@@ -378,6 +433,8 @@ def test_runner_background_registration_resolves_parent_module_helpers(monkeypat
         task_id=kwargs.get("task_id") or "bg_5",
         task_type=task_type,
         metadata={},
+        state=TaskState.PENDING,
+        initialization_task=None,
       )
 
     def transition(self, task_id: str, state: TaskState, **_kwargs: Any) -> None:
@@ -1442,6 +1499,18 @@ def test_runner_resumed_task_ids_delegates_after_registry_rebuild() -> None:
 def test_runner_register_background_task_returns_limit_error_before_hooks() -> None:
   class Registry:
     admission_count = 2
+    _max_inflight = 2
+
+    def admit(
+      self,
+      _task_type: str,
+      *,
+      reject_over_capacity: Any,
+      **_kwargs: Any,
+    ) -> tuple[Any, dict[str, Any] | None]:
+      rejection = reject_over_capacity(self.admission_count, self._max_inflight)
+      assert rejection is not None
+      return None, rejection
 
   runner = object.__new__(AgentRunner)
   runner._task_registry = Registry()

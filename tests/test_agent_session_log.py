@@ -114,7 +114,7 @@ def test_append_sync_is_fsynced_and_immediately_queryable(
   assert entries[0].event["outcome"] == "success"
 
 
-def test_cancelled_append_keeps_underlying_sync_future_tracked(
+def test_cancelled_append_joins_one_durable_write_before_propagating(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -136,18 +136,17 @@ def test_cancelled_append_keeps_underlying_sync_future_tracked(
     assert await asyncio.to_thread(sync_started.wait, 1.0)
 
     append_task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-      await append_task
+    append_task.cancel()
+    await asyncio.sleep(0)
+    assert not append_task.done()
 
     pending = log.pending_append_futures
     assert len(pending) == 1
     assert not pending[0].done()
 
     release_sync.set()
-    for _ in range(100):
-      if not log.pending_append_futures:
-        break
-      await asyncio.sleep(0)
+    with pytest.raises(asyncio.CancelledError):
+      await append_task
 
     assert log.pending_append_futures == ()
     entries, _ = await log.query(
@@ -156,6 +155,12 @@ def test_cancelled_append_keeps_underlying_sync_future_tracked(
     )
     assert len(entries) == 1
     assert entries[0].event["task_id"] == "bg_0"
+    await asyncio.sleep(0.01)
+    replayed, _ = await log.query(
+      event_types={"task_completed"},
+      order="asc",
+    )
+    assert [entry.seq for entry in replayed] == [1]
 
   _run(_case())
 

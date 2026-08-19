@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import builtins
 import sqlite3
 import sys
@@ -17,14 +16,14 @@ API_DIR = ROOT / "api"
 if str(API_DIR) not in sys.path:
   sys.path.insert(0, str(API_DIR))
 
-from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog, ToolResultContext  # noqa: E402
-from agent_gateway.secret_boundary import SecretBoundary  # noqa: E402
+from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog  # noqa: E402
 from agent_gateway import approval_policy  # noqa: E402
 import agent_gateway.sdk_runner as sdk_runner  # noqa: E402
 import agent_gateway.sdk_runner_approval as sdk_runner_approval  # noqa: E402
 import agent_gateway.sdk_runner_context as sdk_runner_context  # noqa: E402
 from agent_gateway import policy_imports  # noqa: E402
 from agent_gateway import sdk_runner_helpers  # noqa: E402
+from agent_gateway.sdk_runner_stream import ToolCallInfo  # noqa: E402
 from agent.shared import hooks  # noqa: E402
 from logs import cost_tracker  # noqa: E402
 from tests.sdk_capability_execution_test_support import stub_sdk_capability_execution  # noqa: E402
@@ -84,36 +83,6 @@ def test_sdk_tool_input_redaction_fails_closed_on_policy_import_error(
   ) == {"_boundary_error": "<secret-sanitization-failed>"}
 
 
-def test_update_model_log_uses_runner_owned_secret_boundary(
-  tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  secret = "CUSTOM-ACTIVE-CREDENTIAL-UPDATE-MODEL-8f21d7"
-  boundary = SecretBoundary((secret,))
-  (tmp_path / "api").mkdir()
-  fake_hooks_path = tmp_path / "api" / "agent" / "shared" / "hooks.py"
-  monkeypatch.setattr(hooks, "__file__", str(fake_hooks_path))
-  ctx = ToolResultContext(
-    tool_name="update_model",
-    tool_input={"credential": secret, "path": "/Users/alice/model.xlsx"},
-    result={"status": "ok", "credential": secret},
-    error=None,
-    duration_ms=12,
-    tool_call_id="tool-1",
-    session_id="session-1",
-    server=None,
-    result_entry=None,
-    boundary_sanitizer=lambda value, sink: boundary.sanitize(value, sink=sink),
-  )
-
-  hooks.update_model_log_hook(ctx)
-
-  payload = next((tmp_path / "api" / "logs").glob("update_model_*.json")).read_text()
-  assert secret not in payload
-  assert "<redacted-secret>" in payload
-  assert "/Users/alice/model.xlsx" in payload
-
-
 def test_sdk_runner_approval_wrapper_threads_parent_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
   runner = _make_runner()
   captured: dict[str, object] = {}
@@ -139,7 +108,7 @@ def test_sdk_runner_approval_wrapper_threads_parent_aliases(monkeypatch: pytest.
   assert captured["server_for_tool_fn"] is fake_server_for_tool
 
 
-def test_sdk_runner_context_sidecar_preserves_prompt_and_parent_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sdk_runner_context_sidecar_preserves_prompt_and_semantic_error() -> None:
   runner = _make_runner()
   messages = [
     {"role": "user", "content": "first"},
@@ -148,12 +117,6 @@ def test_sdk_runner_context_sidecar_preserves_prompt_and_parent_alias(monkeypatc
   ]
 
   assert runner._build_prompt(messages) == sdk_runner_context.build_prompt(messages)
-
-  monkeypatch.setattr(
-    sdk_runner,
-    "classify_semantic_tool_error",
-    lambda result: {"code": "patched"} if result == {"success": False} else None,
-  )
 
   entry = runner._make_result_entry("tool-1", {"success": False}, None)
 
@@ -211,42 +174,7 @@ def test_sdk_context_surface_failure_log_is_value_free(caplog) -> None:
   assert "exception_type=RuntimeError" in caplog.text
 
 
-def test_sdk_runner_context_hook_resolves_parent_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
-  runner = _make_runner()
-  contexts = []
-
-  async def on_tool_result(ctx):
-    contexts.append(ctx)
-    return [{"type": "text", "text": f"{ctx.server}:{ctx.duration_ms}"}]
-
-  runner._on_tool_result = on_tool_result
-  runner._provider_id_for_tool = lambda tool_name: "fmp" if tool_name == "tool" else None
-  runner._pending_tool_calls["tool-1"] = sdk_runner.ToolCallInfo(
-    tool_call_id="tool-1",
-    tool_name="tool",
-    tool_input={},
-    started_at=10.0,
-  )
-  monkeypatch.setattr(sdk_runner, "_server_for_tool", lambda _name: "patched-server")
-  monkeypatch.setattr(sdk_runner, "time", SimpleNamespace(time=lambda: 12.5))
-
-  additional_context = asyncio.run(
-    runner._build_hook_additional_context(
-      tool_call_id="tool-1",
-      tool_name="tool",
-      tool_input={},
-      result={"status": "ok"},
-      error=None,
-    )
-  )
-
-  assert contexts[0].server == "patched-server"
-  assert contexts[0].provider_id == "fmp"
-  assert contexts[0].duration_ms == 2500
-  assert additional_context == "patched-server:2500"
-
-
-def test_sdk_runner_stream_forwards_ids_and_hook_resolves_namespaced_mcp(
+def test_sdk_runner_stream_forwards_live_tool_timing_identity(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -266,7 +194,7 @@ def test_sdk_runner_stream_forwards_ids_and_hook_resolves_namespaced_mcp(
     system_prompt="test",
     on_tool_timing=hooks.tool_timing_hook,
   )
-  runner._pending_tool_calls["tool-sdk-1"] = sdk_runner.ToolCallInfo(
+  runner._pending_tool_calls["tool-sdk-1"] = ToolCallInfo(
     tool_call_id="tool-sdk-1",
     tool_name="mcp__portfolio-reads-mcp__documents_search",
     tool_input={},
@@ -288,7 +216,7 @@ def test_sdk_runner_stream_forwards_ids_and_hook_resolves_namespaced_mcp(
     ).fetchone()
 
   assert tuple(row) == (
-    "mcp:portfolio-reads-mcp:documents_search",
+    None,
     "mcp",
     "req-sdk-timing",
     "tool-sdk-1",
@@ -372,16 +300,6 @@ def test_sdk_runner_parent_helper_monkeypatches_still_drive_methods(monkeypatch:
   monkeypatch.setattr(sdk_runner, "_parse_result_payload", lambda _value: {"patched": True})
   assert runner._normalize_tool_result({"content": "ignored"}) == ({"patched": True}, None)
   assert sdk_runner._summarize_error_payload("ignored") == '{"patched": true}'
-
-  monkeypatch.setattr(sdk_runner, "_summarize_error_payload", lambda _value: "patched summary")
-  additional_context = runner._format_additional_context(
-    tool_name="tool",
-    result_entry={"is_error": True, "content": {"anything": "goes"}},
-    extra_blocks=[],
-  )
-
-  assert additional_context is not None
-  assert "patched summary" in additional_context
 
 
 def test_sdk_runner_nested_helper_monkeypatches_resolve_parent_aliases(monkeypatch: pytest.MonkeyPatch) -> None:

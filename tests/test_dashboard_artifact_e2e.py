@@ -20,11 +20,14 @@ for path in (PKG_DIR, API_DIR):
 
 from agent.shared.dashboard_artifact_tool import install_named_skill_emit_dashboard_artifact_handler
 from agent_gateway import AgentRunner, EventLog, ToolDispatcher
-from agent_gateway.fixture_gate import FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME, FIXTURE_MODEL_ID
-from agent_gateway.providers.fixture import FixtureProvider
 from schema.dashboard_payload import DashboardPayload
 from tests.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
+)
+from tests.deterministic_fixture_support import (
+  FIXTURE_DASHBOARD_ARTIFACT_SKILL_NAME,
+  FIXTURE_MODEL_ID,
+  FixtureProvider,
 )
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -53,7 +56,7 @@ def test_fixture_provider_run_emits_dashboard_artifact_and_endpoints_serve(
   monkeypatch,
 ) -> None:
   monkeypatch.setenv("APP_ENV", "test")
-  monkeypatch.setattr("agent_gateway.providers.fixture._fixture_run_seconds", lambda: 0.0)
+  monkeypatch.setattr("tests.deterministic_fixture_support._fixture_run_seconds", lambda: 0.0)
   fixture_payload = _fixture_payload("full")
   normalized_payload = DashboardPayload.model_validate(fixture_payload).model_dump(mode="json")
   workspace = _workspace(artifact_api)

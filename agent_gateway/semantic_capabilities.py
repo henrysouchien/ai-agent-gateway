@@ -78,9 +78,38 @@ class SemanticCapabilityRegistry:
       ) from exc
 
 DEFAULT_SEMANTIC_CAPABILITY_REGISTRY = SemanticCapabilityRegistry((
+  # The granular read domains (B-8).  ``research-evidence.read/v1`` used to sit
+  # here and was satisfied by *any* read effect — `file_read` would do — so a
+  # methodology could declare "I need evidence" and be admitted by a tool that
+  # could not supply it.  It is retired, not renamed: each row below names a
+  # distinct evidence universe.
   SemanticCapabilitySpec(
-    name="research-evidence.read/v1",
+    name="market-data.read/v1",
     live_tool_effects=frozenset({"read"}),
+  ),
+  SemanticCapabilitySpec(
+    name="filings.read/v1",
+    live_tool_effects=frozenset({"read"}),
+  ),
+  SemanticCapabilitySpec(
+    name="transcripts.read/v1",
+    live_tool_effects=frozenset({"read"}),
+  ),
+  SemanticCapabilitySpec(
+    name="web.read/v1",
+    live_tool_effects=frozenset({"read"}),
+  ),
+  SemanticCapabilitySpec(
+    name="corpus.read/v1",
+    live_tool_effects=frozenset({"read"}),
+  ),
+  SemanticCapabilitySpec(
+    name="computation.execute/v1",
+    live_tool_effects=frozenset({"read"}),
+  ),
+  SemanticCapabilitySpec(
+    name="workspace.write/v1",
+    live_tool_effects=frozenset({"write"}),
   ),
   SemanticCapabilitySpec(
     name="artifact.propose/v1",
@@ -92,6 +121,12 @@ DEFAULT_SEMANTIC_CAPABILITY_REGISTRY = SemanticCapabilityRegistry((
   ),
   SemanticCapabilitySpec(
     name="research.source/v1",
+  ),
+  # Dataset-shaped needs bind no live tool: they are read by the autonomous
+  # prefetch hook, which is why ``data_requirements`` could be deleted
+  # outright (D-B8-2).
+  SemanticCapabilitySpec(
+    name="market-data.history/v1",
   ),
 ))
 

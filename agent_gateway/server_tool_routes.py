@@ -88,7 +88,6 @@ async def tool_approval_response(
       allow_tool_type=payload.allow_tool_type,
       reason=None,
       app_state=request.app.state,
-      denied_by=payload.denied_by,
     )
   except ApprovalActionError as exc:
     return JSONResponse(exc.payload, status_code=exc.status_code)

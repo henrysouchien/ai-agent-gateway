@@ -137,8 +137,6 @@ class _ApprovalHoldingRunner:
         decided_at=None,
         decider_id=None,
         decision=None,
-        required_decider_count=1,
-        eligible_decider_count=1,
         persistent_grant_scope=None,
         policy_id="test-policy",
         policy_version="1",

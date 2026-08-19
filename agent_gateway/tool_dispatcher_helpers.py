@@ -17,14 +17,6 @@ from .event_log import EventLog
 if TYPE_CHECKING:
   from .ui_blocks_run import UiBlocksRunContext
 
-RELAY_POLICY_DENIED_SUB_CODE = "relay_policy_denied"
-RELAY_POLICY_DENIED_MESSAGE = (
-  "Denied automatically by relay chat policy — the user did not see or decline this request. "
-  "Do not tell the user they denied it. To run this tool, the user must send the request from "
-  "the Excel taskpane composer, where they can approve it interactively."
-)
-
-
 ToolResult = Tuple[Optional[Any], Optional[Dict[str, Any]]]
 NeedsApprovalCallback = Callable[[str, Dict[str, Any], str], bool]
 ApprovalKeyQualifier = Callable[[str, Dict[str, Any]], str]
@@ -721,7 +713,6 @@ class TransportApprovalResult:
 
   approved: bool
   allow_tool_type: bool = False
-  denied_by: str | None = None
 
 
 ApprovalCallback = Callable[[TransportApprovalRequest], Awaitable[Optional[TransportApprovalResult]]]
@@ -730,19 +721,6 @@ LocalToolHandler = Callable[..., Awaitable[ToolResult]]
 # Transport-layer aliases for callback-based integrations.
 ApprovalRequest = TransportApprovalRequest
 ApprovalDecision = TransportApprovalResult
-
-
-def resolve_denied_provenance(denied_by: str | None) -> tuple[str, dict[str, Any]]:
-  if denied_by == "relay_policy":
-    return (
-      RELAY_POLICY_DENIED_SUB_CODE,
-      {
-        "code": "user_denied",
-        "sub_code": RELAY_POLICY_DENIED_SUB_CODE,
-        "message": RELAY_POLICY_DENIED_MESSAGE,
-      },
-    )
-  return "user_denied", {"code": "user_denied", "message": "User denied execution"}
 
 
 @dataclass

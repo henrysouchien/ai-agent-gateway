@@ -4,6 +4,9 @@ from types import MappingProxyType
 from typing import Literal, TypedDict, cast
 
 
+CONTROL_RUN_CONTRACT_VERSION = "control-run-v1"
+
+
 ControlRunState = Literal[
   "starting",
   "queued",

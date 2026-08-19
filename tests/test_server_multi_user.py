@@ -50,6 +50,7 @@ from agent_gateway.server import (  # noqa: E402
   MaterializedCredential,
   create_gateway_app,
 )
+from agent_gateway.selected_content import SelectedContentAdmission  # noqa: E402
 
 
 def test_server_parent_aliases_moved_helpers() -> None:
@@ -63,8 +64,6 @@ def test_server_parent_aliases_moved_helpers() -> None:
   assert callable(server_module._stream_subscriber_sse)
   assert callable(server_module._register_stream_subscriber)
   assert server_module._init_approval_subsystem is chat_helpers_module._init_approval_subsystem
-  assert server_module.SQLiteApprovalStore is chat_helpers_module.SQLiteApprovalStore
-  assert server_module.resolve_policy is chat_helpers_module.resolve_policy
 
 
 def test_server_artifact_routes_use_parent_namespace_helpers(monkeypatch) -> None:
@@ -256,6 +255,7 @@ def _make_app(
   resolver_timeout_seconds: float = 5.0,
   channel_profile_allowlist: dict[str, frozenset[str]] | None = None,
   transcript_dir: Path | None = None,
+  selected_content_admitter=None,
 ):
   captured_requests: list[Any] = []
   run_calls: list[dict[str, Any]] = []
@@ -290,6 +290,7 @@ def _make_app(
       channel_profile_allowlist=channel_profile_allowlist,
       build_chat_runtime=_build_chat_runtime,
       transcript_dir=transcript_dir,
+      selected_content_admitter=selected_content_admitter,
     )
   )
   return app, captured_requests, run_calls
@@ -335,6 +336,43 @@ def _consume_chat_stream(client: TestClient, token: str, payload: dict[str, Any]
       response.read()
     assert response.status_code == 200, response.text
     list(response.iter_lines())
+
+
+def test_chat_route_passes_parsed_investment_selection_to_configured_admitter() -> None:
+  admitted: list[dict[str, Any]] = []
+
+  async def _admit(session, request) -> SelectedContentAdmission:
+    admitted.append({
+      "session_id": session.session_id,
+      "selection": request.investment_artifact_selection,
+    })
+    return SelectedContentAdmission()
+
+  app, captured_requests, _run_calls = _make_app(
+    selected_content_admitter=_admit,
+  )
+  with TestClient(app) as client:
+    init = _init_session(client, user_id="101")
+    _consume_chat_stream(
+      client,
+      init["session_token"],
+      {
+        "user_id": "101",
+        "messages": [{"role": "user", "content": "Use this result."}],
+        "investment_artifact_selection": {
+          "artifact_id": "artifact:quant-result-1",
+          "view": "summary",
+        },
+      },
+    )
+
+  assert len(admitted) == 1
+  assert admitted[0]["session_id"] == init["session_id"]
+  assert admitted[0]["selection"].artifact_id == "artifact:quant-result-1"
+  assert admitted[0]["selection"].view == "summary"
+  assert captured_requests[0]["request"].investment_artifact_selection is (
+    admitted[0]["selection"]
+  )
 
 
 def _auth_config_for(user_id: str) -> AuthConfig:

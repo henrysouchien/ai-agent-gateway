@@ -32,6 +32,7 @@ from .models import (
   TaskResult,
   WorkflowDeliverySpec,
   WorkflowResult,
+  WorkflowView,
 )
 
 SCHEMA_BUNDLE_VERSION = "1.0"
@@ -60,6 +61,7 @@ _PUBLIC_ROOTS: tuple[tuple[str, Any], ...] = (
   ("task-result", TaskResult),
   ("workflow-delivery-spec", WorkflowDeliverySpec),
   ("workflow-result", WorkflowResult),
+  ("workflow-view", WorkflowView),
 )
 
 

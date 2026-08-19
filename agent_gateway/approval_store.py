@@ -545,11 +545,6 @@ def _approval_vote_from_row(row: sqlite3.Row) -> ApprovalVote:
       else None
     ),
     decided_at=decided_at,
-    external_callback_id=(
-      str(row["external_callback_id"])
-      if row["external_callback_id"] is not None
-      else None
-    ),
   )
 
 
@@ -868,8 +863,6 @@ class ApprovalRequestStore(Protocol):
     state: ApprovalState,
     *,
     expected_state_version: int | None = None,
-    route_target_type: str | None = None,
-    route_target: str | None = None,
     expires_at: datetime | None = None,
     decider_id: str | None = None,
     decider_role: str | None = None,
@@ -1131,24 +1124,12 @@ class SQLiteApprovalStore:
           decider_role TEXT,
           decision TEXT,
           decision_reason TEXT,
-          required_decider_count INTEGER NOT NULL DEFAULT 1,
-          eligible_decider_count INTEGER NOT NULL DEFAULT 1,
-          votes_received_count INTEGER NOT NULL DEFAULT 0,
           args_predicate TEXT,
-          chain_trust_window_seconds INTEGER,
-          route_target TEXT,
-          route_target_type TEXT,
-          external_callback_id TEXT,
           policy_id TEXT NOT NULL,
           policy_version TEXT NOT NULL,
           policy_bundle_hash TEXT NOT NULL,
           persistent_grant_scope TEXT,
           tenant_id TEXT,
-          model_id TEXT,
-          model_version TEXT,
-          system_prompt_hash TEXT,
-          tool_schema_version TEXT,
-          mcp_server_version TEXT,
           skill TEXT,
           notification_policy TEXT NOT NULL DEFAULT 'auto',
           approval_constraint TEXT NOT NULL DEFAULT 'legacy_unknown'
@@ -1186,12 +1167,8 @@ class SQLiteApprovalStore:
           decision TEXT NOT NULL,
           decision_reason TEXT,
           decided_at TEXT NOT NULL,
-          external_callback_id TEXT,
           UNIQUE(approval_id, decider_id)
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_votes_external_callback
-          ON approval_votes(external_callback_id)
-          WHERE external_callback_id IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS persistent_grants (
           grant_id TEXT PRIMARY KEY,
@@ -1437,11 +1414,8 @@ class SQLiteApprovalStore:
             tool_name, tool_class, tool_args_redacted, args_hash, reason,
             blast_radius_summary, state, state_version, requested_at, decided_at,
             expires_at, decider_id, decider_role, decision, decision_reason,
-            required_decider_count, eligible_decider_count, votes_received_count,
-            args_predicate, chain_trust_window_seconds, route_target, route_target_type,
-            external_callback_id, policy_id, policy_version, policy_bundle_hash,
-            persistent_grant_scope, tenant_id, model_id, model_version,
-            system_prompt_hash, tool_schema_version, mcp_server_version, skill,
+            args_predicate, policy_id, policy_version, policy_bundle_hash,
+            persistent_grant_scope, tenant_id, skill,
             notification_policy, approval_constraint, required_owner_user_id,
             identity_source, change_set_id, change_hash,
             base_vector_hash, reviewed_change_binding_digest,
@@ -1453,11 +1427,8 @@ class SQLiteApprovalStore:
             :tool_name, :tool_class, :tool_args_redacted, :args_hash, :reason,
             :blast_radius_summary, :state, :state_version, :requested_at, :decided_at,
             :expires_at, :decider_id, :decider_role, :decision, :decision_reason,
-            :required_decider_count, :eligible_decider_count, :votes_received_count,
-            :args_predicate, :chain_trust_window_seconds, :route_target, :route_target_type,
-            :external_callback_id, :policy_id, :policy_version, :policy_bundle_hash,
-            :persistent_grant_scope, :tenant_id, :model_id, :model_version,
-            :system_prompt_hash, :tool_schema_version, :mcp_server_version, :skill,
+            :args_predicate, :policy_id, :policy_version, :policy_bundle_hash,
+            :persistent_grant_scope, :tenant_id, :skill,
             :notification_policy, :approval_constraint, :required_owner_user_id,
             :identity_source, :change_set_id, :change_hash,
             :base_vector_hash, :reviewed_change_binding_digest,
@@ -1663,12 +1634,7 @@ class SQLiteApprovalStore:
             args_hash = :args_hash,
             reason = :reason,
             blast_radius_summary = :blast_radius_summary,
-            required_decider_count = :required_decider_count,
-            eligible_decider_count = :eligible_decider_count,
             args_predicate = :args_predicate,
-            chain_trust_window_seconds = :chain_trust_window_seconds,
-            route_target = :route_target,
-            route_target_type = :route_target_type,
             policy_id = :policy_id,
             policy_version = :policy_version,
             policy_bundle_hash = :policy_bundle_hash,
@@ -1690,8 +1656,6 @@ class SQLiteApprovalStore:
     state: ApprovalState,
     *,
     expected_state_version: int | None = None,
-    route_target_type: str | None = None,
-    route_target: str | None = None,
     expires_at: datetime | None = None,
     decider_id: str | None = None,
     decider_role: str | None = None,
@@ -1731,8 +1695,6 @@ class SQLiteApprovalStore:
           current,
           state=state,
           state_version=current.state_version + 1,
-          route_target_type=route_target_type if route_target_type is not None else current.route_target_type,
-          route_target=route_target if route_target is not None else current.route_target,
           expires_at=expires_at if expires_at is not None else current.expires_at,
           decided_at=decided_at,
           decider_id=decider_id if decider_id is not None else current.decider_id,
@@ -1745,8 +1707,6 @@ class SQLiteApprovalStore:
           UPDATE approval_requests SET
             state = :state,
             state_version = :state_version,
-            route_target_type = :route_target_type,
-            route_target = :route_target,
             expires_at = :expires_at,
             decided_at = :decided_at,
             decider_id = :decider_id,
@@ -2221,8 +2181,8 @@ class SQLiteApprovalStore:
               """
               INSERT INTO approval_votes (
                 vote_id, approval_id, decider_id, decider_role, decision,
-                decision_reason, decided_at, external_callback_id
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                decision_reason, decided_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?)
               """,
               (
                 vote.vote_id,
@@ -2232,53 +2192,33 @@ class SQLiteApprovalStore:
                 vote.decision,
                 vote.decision_reason,
                 _dt_to_text(vote.decided_at),
-                vote.external_callback_id,
               ),
             )
             emitted_vote = True
+          elif (
+            str(existing["vote_id"]) != vote.vote_id
+            or str(existing["decision"]) != vote.decision
+          ):
+            raise ValueError("approval already has a different owner decision")
 
-          counts = conn.execute(
-            """
-            SELECT
-              COUNT(*) AS total,
-              SUM(CASE WHEN decision = 'approved' THEN 1 ELSE 0 END)
-                AS approved_count,
-              SUM(CASE WHEN decision = 'denied' THEN 1 ELSE 0 END)
-                AS denied_count
-            FROM approval_votes
-            WHERE approval_id = ?
-            """,
-            (approval_id,),
-          ).fetchone()
-          total = int(counts["total"] or 0)
-          approved_count = int(counts["approved_count"] or 0)
-          denied_count = int(counts["denied_count"] or 0)
-          terminal_state: ApprovalState | None = None
-          if denied_count >= current.required_decider_count:
-            terminal_state = "denied"
-          elif approved_count >= current.required_decider_count:
-            terminal_state = "approved"
-
-          updated = replace(current, votes_received_count=total)
-          if terminal_state is not None:
-            updated = replace(
-              updated,
-              state=terminal_state,
-              state_version=current.state_version + 1,
-              decided_at=vote.decided_at,
-              decider_id=vote.decider_id,
-              decider_role=vote.decider_role,
-              decision=terminal_state,
-              decision_reason=vote.decision_reason,
-            )
-            terminal_event = terminal_state
+          terminal_state: ApprovalState = vote.decision
+          updated = replace(
+            current,
+            state=terminal_state,
+            state_version=current.state_version + 1,
+            decided_at=vote.decided_at,
+            decider_id=vote.decider_id,
+            decider_role=vote.decider_role,
+            decision=terminal_state,
+            decision_reason=vote.decision_reason,
+          )
+          terminal_event = terminal_state
 
           conn.execute(
             """
             UPDATE approval_requests SET
               state = :state,
               state_version = :state_version,
-              votes_received_count = :votes_received_count,
               decided_at = :decided_at,
               decider_id = :decider_id,
               decider_role = :decider_role,
@@ -3652,7 +3592,7 @@ class SQLiteApprovalStore:
     rows = conn.execute(
       """
       SELECT * FROM approval_requests
-      WHERE state IN ('pending_user', 'routed_external')
+      WHERE state = 'pending_user'
         AND expires_at IS NOT NULL
         AND expires_at <= ?
       """,
@@ -3676,7 +3616,7 @@ class SQLiteApprovalStore:
           decided_at = :decided_at,
           decision = :decision
         WHERE approval_id = :approval_id
-          AND state IN ('pending_user', 'routed_external')
+          AND state = 'pending_user'
           AND state_version = :expected_state_version
         """,
         {
@@ -3806,7 +3746,7 @@ class SQLiteApprovalStore:
       "expired": _prepared_bm.PreparedBusinessModelLifecycle.EXPIRED,
     }.get(approval_state)
     if target is None:
-      if approval_state in {"created", "pending_user", "routed_external"}:
+      if approval_state in {"created", "pending_user"}:
         return TargetedPreparedReconciliationResult(record=record)
       return TargetedPreparedReconciliationResult(
         record=record,
@@ -4135,7 +4075,6 @@ class SQLiteApprovalStore:
       "auto_approved": "auto_approved",
       "auto_denied": "auto_denied",
       "pending_user": "user_hold_started",
-      "routed_external": "external_route_started",
       "approved": "approved",
       "denied": "denied",
       "expired": "expired",
