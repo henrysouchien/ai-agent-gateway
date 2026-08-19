@@ -18,6 +18,7 @@ from .runner_introspection import derive_sub_agent_id as _derive_sub_agent_id
 from .runner_session_lifecycle import _runner_attr
 from .runner_cleanup import cleanup_failure_notes
 from .runner_budget import (
+  ChildCostAccumulator,
   ObservationOnlyCostAccumulator,
 )
 from .runner_state import user_turn_message as _user_turn_message
@@ -34,19 +35,30 @@ log = logging.getLogger("agent_gateway.runner")
 _MISSING_SUB_AGENT_ID = object()
 
 
-def _child_cost_observation_accumulator(
+def _child_cost_accumulator(
   runner: Any,
   *,
   cost_observation_threshold_usd: float | None,
+  max_budget_usd: float | None,
 ) -> Any:
-  """Create non-authoritative child cost measurement state."""
+  """Create child hard-budget authority over observational telemetry."""
 
-  accumulator_cls = _runner_attr(
+  observation_accumulator_cls = _runner_attr(
     runner,
     "ObservationOnlyCostAccumulator",
     ObservationOnlyCostAccumulator,
   )
-  return accumulator_cls(cost_observation_threshold_usd)
+  observation_accumulator = observation_accumulator_cls(
+    cost_observation_threshold_usd
+  )
+  if max_budget_usd is None:
+    return observation_accumulator
+  child_accumulator_cls = _runner_attr(
+    runner,
+    "ChildCostAccumulator",
+    ChildCostAccumulator,
+  )
+  return child_accumulator_cls(observation_accumulator, max_budget_usd)
 
 
 def _validate_child_result_requirement(
@@ -184,14 +196,16 @@ class RunnerSubAgentMixin:
     parent_turn_id: str | None = None,
     task_entry: TaskEntry | None = None,
     cost_observation_threshold_usd: float | None = None,
+    max_budget_usd: float | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
     skill_run_id: str | None = None,
   ) -> Tuple[Optional[TaskResult], Optional[Dict[str, Any]]]:
     """Run a focused sub-agent task and return its canonical result.
 
     This method is used by the built-in `run_agent` tool. The sub-agent shares
-    usage aggregation with the parent but records cost in a non-enforcing
-    observation accumulator. It gets a fresh `EventLog`, its own structural
+    usage aggregation with the parent. An unbudgeted generic child uses a
+    non-enforcing observation accumulator; a named budgeted child uses a
+    child-local hard accumulator over that observer. It gets a fresh `EventLog`,
     turn limit, and its own dispatcher. Provider, credential, model, and effort
     are already frozen in ``capability_execution`` and are never inherited
     from the parent.
@@ -245,9 +259,10 @@ class RunnerSubAgentMixin:
       on_sub_event=on_sub_event,
     )
     dispatcher._event_log = sub_log
-    child_cost_accumulator = _child_cost_observation_accumulator(
+    child_cost_accumulator = _child_cost_accumulator(
       self,
       cost_observation_threshold_usd=cost_observation_threshold_usd,
+      max_budget_usd=max_budget_usd,
     )
     runner_cls = _runner_attr(self, "AgentRunner", type(self))
     sub_runner = runner_cls(
@@ -281,7 +296,7 @@ class RunnerSubAgentMixin:
       compaction_instructions=None,
       tool_call_timeout=self._tool_call_timeout,
       on_max_turns=self._on_max_turns,
-      max_budget_usd=None,
+      max_budget_usd=max_budget_usd,
       _cost_accumulator=child_cost_accumulator,
       _parent_aggregator=self._aggregator,
       max_concurrent_sub_agents=self._max_concurrent_sub_agents,
@@ -425,6 +440,7 @@ class RunnerSubAgentMixin:
     parent_turn_id: str | None = None,
     task_entry: TaskEntry | None = None,
     cost_observation_threshold_usd: float | None = None,
+    max_budget_usd: float | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
     skill_run_id: str | None = None,
   ) -> Tuple[Optional[TaskResult], Optional[Dict[str, Any]]]:
@@ -480,9 +496,10 @@ class RunnerSubAgentMixin:
       on_sub_event=on_sub_event,
     )
     dispatcher._event_log = sub_log
-    child_cost_accumulator = _child_cost_observation_accumulator(
+    child_cost_accumulator = _child_cost_accumulator(
       self,
       cost_observation_threshold_usd=cost_observation_threshold_usd,
+      max_budget_usd=max_budget_usd,
     )
     runner_cls = _runner_attr(self, "AgentRunner", type(self))
     sub_runner = runner_cls(
@@ -516,7 +533,7 @@ class RunnerSubAgentMixin:
       compaction_instructions=None,
       tool_call_timeout=self._tool_call_timeout,
       on_max_turns=self._on_max_turns,
-      max_budget_usd=None,
+      max_budget_usd=max_budget_usd,
       _cost_accumulator=child_cost_accumulator,
       _parent_aggregator=self._aggregator,
       max_concurrent_sub_agents=self._max_concurrent_sub_agents,

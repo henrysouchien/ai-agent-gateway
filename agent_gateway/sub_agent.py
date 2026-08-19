@@ -1503,6 +1503,9 @@ def make_run_agent_handler(
       max_tokens=effective_max_tokens,
       cost_observation_threshold_usd=cost_observation_threshold_usd,
       max_resume_chain_depth=getattr(runner, "_max_resume_chain_depth", 3),
+      max_budget_usd=(
+        profile.max_budget_usd if named_operation else None
+      ),
     )
     system_prompt = execution_snapshot.system_prompt
 
@@ -1845,6 +1848,7 @@ def make_run_agent_handler(
         cost_observation_threshold_usd=(
           execution_snapshot.cost_observation_threshold_usd
         ),
+        max_budget_usd=execution_snapshot.max_budget_usd,
         skill_run_id=skill_run_id,
         call_index=background_call_index,
         parent_turn_id=parent_turn_id,
@@ -2529,6 +2533,7 @@ def make_resume_handler(
         cost_observation_threshold_usd=(
           successor_execution_snapshot.cost_observation_threshold_usd
         ),
+        max_budget_usd=successor_execution_snapshot.max_budget_usd,
         on_sub_event=lambda event, _sid: sub_log.append(event),
       )
 

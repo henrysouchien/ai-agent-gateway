@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import re
 import secrets
 import unicodedata
@@ -105,6 +106,7 @@ class SessionExecutionPolicy:
 
   max_tokens: int | None = None
   max_turns: int | None = None
+  max_budget_usd: float | None = None
 
   def __post_init__(self) -> None:
     for field_name in ("max_tokens", "max_turns"):
@@ -113,6 +115,14 @@ class SessionExecutionPolicy:
         isinstance(value, bool) or not isinstance(value, int) or value <= 0
       ):
         raise ValueError(f"{field_name} must be a positive integer")
+    budget = self.max_budget_usd
+    if budget is not None and (
+      isinstance(budget, bool)
+      or not isinstance(budget, int | float)
+      or not math.isfinite(float(budget))
+      or float(budget) <= 0
+    ):
+      raise ValueError("max_budget_usd must be a finite positive number")
 
 
 SessionExecutionPolicyResolver = Callable[

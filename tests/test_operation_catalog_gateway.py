@@ -6,9 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from agent_workflow_contracts import (
+  AdmittedTask,
+  AgentExecutionSnapshot,
   CapabilityBind,
   ExecuteTaskDisposition,
   ToolGrant,
+  canonical_json_bytes,
   sha256_digest,
 )
 from agent_gateway.skills import SkillLoader
@@ -20,6 +23,7 @@ from agent_gateway.execution_snapshot import (
 from agent_gateway.sub_agent import (
   _canonical_result_requirement,
   _ordinary_admitted_task_factory,
+  seal_admitted_task_payload,
 )
 from agent_gateway.sub_agent_helpers import make_run_agent_tool_def
 
@@ -186,3 +190,69 @@ Explore the admitted question.
   }
   assert resumed.logical_task == first.logical_task
   assert resumed.attempt.resume_of_task_id == "bg_1"
+
+  legacy_payload = execution_snapshot.model_dump(mode="json")
+  assert "max_budget_usd" not in legacy_payload
+  legacy_bytes = canonical_json_bytes(legacy_payload)
+  legacy_digest = sha256_digest(legacy_payload)
+  parsed_legacy = AgentExecutionSnapshot.model_validate_json(legacy_bytes)
+  assert parsed_legacy.max_budget_usd is None
+  assert canonical_json_bytes(parsed_legacy) == legacy_bytes
+  assert sha256_digest(parsed_legacy) == legacy_digest
+
+  explicit_null = dict(legacy_payload, max_budget_usd=None)
+  parsed_null = AgentExecutionSnapshot.model_validate(explicit_null)
+  assert "max_budget_usd" not in parsed_null.model_dump(mode="json")
+  assert canonical_json_bytes(parsed_null) == legacy_bytes
+
+  budgeted = AgentExecutionSnapshot.model_validate({
+    **legacy_payload,
+    "max_budget_usd": 6.0,
+  })
+  assert budgeted.max_budget_usd == pytest.approx(6.0)
+  assert canonical_json_bytes(budgeted) != legacy_bytes
+  assert sha256_digest(budgeted) != legacy_digest
+  resumed_budgeted = resume_agent_execution_snapshot(
+    budgeted,
+    resume_instruction="Resume the exact admitted delegation.",
+  )
+  assert resumed_budgeted.max_budget_usd == pytest.approx(6.0)
+  budgeted_task_payload = first.model_dump(mode="json")
+  budgeted_task_payload.pop("admitted_task_digest")
+  budgeted_task_payload["execution_snapshot"] = budgeted.model_dump(
+    mode="json"
+  )
+  budgeted_task = AdmittedTask.model_validate(
+    seal_admitted_task_payload(budgeted_task_payload)
+  )
+  assert budgeted_task.admitted_task_digest != first.admitted_task_digest
+
+
+@pytest.mark.parametrize(
+  "value",
+  [True, "6", 0, -1, float("nan"), float("inf")],
+)
+def test_execution_snapshot_rejects_invalid_budget(
+  tmp_path: Path,
+  value: object,
+) -> None:
+  (tmp_path / "explore.md").write_text(
+    "---\nname: explore\nversion: '1.0'\nagent_callable: true\n"
+    "agent_description: Explore.\nmutation_mode: read_only\n---\nExplore.\n",
+    encoding="utf-8",
+  )
+  operation = SkillLoader(tmp_path).resolve_operation(None).snapshot
+  requirement = _canonical_result_requirement(operation=operation)
+  with pytest.raises(ValueError, match="max_budget_usd"):
+    build_agent_execution_snapshot(
+      operation=operation,
+      result_instructions=render_result_instructions(requirement),
+      admission_date="2026-08-19",
+      max_turns=1,
+      timeout_seconds=1,
+      client_timeout_seconds=1,
+      max_tokens=1,
+      cost_observation_threshold_usd=None,
+      max_resume_chain_depth=0,
+      max_budget_usd=value,  # type: ignore[arg-type]
+    )

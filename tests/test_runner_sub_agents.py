@@ -11,6 +11,10 @@ from agent_gateway.capability_execution import BoundCapabilityExecution
 from agent_gateway.event_log import EventLog
 from agent_gateway.session import GatewaySession
 from agent_gateway.providers import ModelInfo, ModelProvider
+from agent_gateway.runner_budget import (
+  ChildCostAccumulator,
+  ObservationOnlyCostAccumulator,
+)
 import agent_gateway.runner as gateway_runner
 from agent_gateway.runner_sub_agents import RunnerSubAgentMixin
 from agent_gateway.task_registry import TaskEntry
@@ -383,6 +387,67 @@ def test_spawn_sub_agent_uses_exact_child_skill_run_identity(
   assert error is None
   assert isinstance(result, TaskResult)
   assert _ChildRunner.instances[0].kwargs["skill_run_id"] == "child-skill-run"
+
+
+@pytest.mark.parametrize("method", ["spawn", "resume"])
+def test_named_child_budget_wraps_observation_accumulator(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  method: str,
+) -> None:
+  _ChildRunner.instances.clear()
+  parent = _parent(tmp_path, session_log=_SessionLog("Done."))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _ChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = (
+    _spawn(
+      parent,
+      max_budget_usd=6.0,
+      cost_observation_threshold_usd=3.0,
+    )
+    if method == "spawn"
+    else _resume(
+      parent,
+      max_budget_usd=6.0,
+      cost_observation_threshold_usd=3.0,
+    )
+  )
+
+  assert error is None
+  assert isinstance(result, TaskResult)
+  child_kwargs = _ChildRunner.instances[0].kwargs
+  accumulator = child_kwargs["_cost_accumulator"]
+  assert child_kwargs["max_budget_usd"] == pytest.approx(6.0)
+  assert isinstance(accumulator, ChildCostAccumulator)
+  assert isinstance(accumulator._parent, ObservationOnlyCostAccumulator)
+  assert accumulator._parent.observation_threshold_usd == pytest.approx(3.0)
+  accumulator.add(1.25)
+  assert accumulator.total == pytest.approx(1.25)
+  assert accumulator._parent.total == pytest.approx(1.25)
+
+
+@pytest.mark.parametrize("method", ["spawn", "resume"])
+def test_legacy_child_without_budget_remains_observation_only(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  method: str,
+) -> None:
+  _ChildRunner.instances.clear()
+  parent = _parent(tmp_path, session_log=_SessionLog("Done."))
+  monkeypatch.setattr(gateway_runner, "AgentRunner", _ChildRunner)
+  monkeypatch.setattr(gateway_runner, "EventLog", _EventLog)
+
+  result, error = _spawn(parent) if method == "spawn" else _resume(parent)
+
+  assert error is None
+  assert isinstance(result, TaskResult)
+  child_kwargs = _ChildRunner.instances[0].kwargs
+  assert child_kwargs["max_budget_usd"] is None
+  assert isinstance(
+    child_kwargs["_cost_accumulator"],
+    ObservationOnlyCostAccumulator,
+  )
 
 
 @pytest.mark.parametrize("method,approved", [

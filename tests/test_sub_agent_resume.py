@@ -826,6 +826,7 @@ async def _append_interrupted_skill_task(
   required_context: tuple[str, ...] = ("ticker",),
   ticker: str | None = "PCTY",
   research_file_id: int | None = None,
+  max_budget_usd: float | None = None,
 ) -> None:
   receipt = dict(capability_bind_receipt or _bind_receipt())
   model_bind = CapabilityBind.from_receipt(receipt)
@@ -874,6 +875,7 @@ async def _append_interrupted_skill_task(
     max_tokens=64_000,
     cost_observation_threshold_usd=5.0,
     max_resume_chain_depth=3,
+    max_budget_usd=max_budget_usd,
   )
   admission_parent = SimpleNamespace(
     tenant_id="tenant-test",
@@ -4792,6 +4794,7 @@ def test_resume_handler_uses_exact_admitted_prompt_after_skill_source_changes(
       task_id="bg_block",
       agent_name="earnings-review",
       user_message="Resume AAPL earnings review.",
+      max_budget_usd=6.0,
     )
     source_entry = runner._task_registry.get("bg_block")
     assert source_entry is not None
@@ -4843,6 +4846,7 @@ def test_resume_handler_uses_exact_admitted_prompt_after_skill_source_changes(
     assert captured["cost_observation_threshold_usd"] == (
       successor_snapshot.cost_observation_threshold_usd
     )
+    assert captured["max_budget_usd"] == pytest.approx(6.0)
     assert captured["dispatcher"]._should_avoid_permission_prompts is True
 
   _run(_case())

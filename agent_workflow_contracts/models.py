@@ -688,8 +688,28 @@ class AgentExecutionSnapshot(WireModel):
       "authorizes, admits, interrupts, gates, or settles execution."
     ),
   )
+  max_budget_usd: float | None = Field(
+    default=None,
+    gt=0,
+    allow_inf_nan=False,
+    exclude_if=lambda value: value is None,
+  )
   resume_mechanics: AgentResumeMechanics
   resume_instruction: NonEmptyText | None = None
+
+  @field_validator("max_budget_usd", mode="before")
+  @classmethod
+  def _validate_max_budget_usd(cls, value: Any) -> float | None:
+    if value is None:
+      return None
+    if (
+      isinstance(value, bool)
+      or not isinstance(value, int | float)
+      or not math.isfinite(float(value))
+      or float(value) <= 0
+    ):
+      raise ValueError("max_budget_usd must be a finite positive number")
+    return float(value)
 
   @model_validator(mode="after")
   def _prompt_contains_admitted_dynamic_instructions(

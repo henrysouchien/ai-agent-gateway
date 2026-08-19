@@ -303,6 +303,7 @@ def _write_operation(
   required_context: tuple[str, ...] = (),
   operation_name: str = "filing-review",
   investment_start_route: bool = False,
+  max_budget_usd: float | None = None,
 ) -> SkillLoader:
   path.mkdir(parents=True, exist_ok=True)
   required_context_yaml = (
@@ -332,6 +333,11 @@ def _write_operation(
     else ""
   )
   mutation_mode = "thesis_writer" if investment_start_route else "read_only"
+  budget_yaml = (
+    f"max_budget_usd: {max_budget_usd}\n"
+    if max_budget_usd is not None
+    else ""
+  )
   investment_capability_yaml = (
     """
     - name: state.mutate/v1
@@ -348,7 +354,7 @@ agent_callable: true
 agent_description: Review filing evidence.
 mutation_mode: {mutation_mode}
 resumable: {str(resumable).lower()}
-{scope_yaml}allowed_tools:
+{budget_yaml}{scope_yaml}allowed_tools:
 {allowed_tools_yaml}
 {mcp_tools_yaml}
 semantic_metadata:
@@ -1168,7 +1174,7 @@ def test_bare_operation_name_is_not_an_authority_reference(tmp_path: Path) -> No
 def test_background_registration_persists_exact_admitted_task(
   tmp_path: Path,
 ) -> None:
-  loader = _write_operation(tmp_path)
+  loader = _write_operation(tmp_path, max_budget_usd=6.0)
   runner = _Runner()
 
   result, error = asyncio.run(_handler(runner, loader=loader)({
@@ -1186,16 +1192,34 @@ def test_background_registration_persists_exact_admitted_task(
   assert admitted.execution_disposition.kind == "execute"
   assert admitted.operation.operation.name == "filing-review"
   assert admitted.execution_snapshot.cost_observation_threshold_usd == 3.25
+  assert admitted.execution_snapshot.max_budget_usd == pytest.approx(6.0)
   assert registration["task_id_override"] == admitted.attempt.physical_task_id
   assert registration["tool_input"]["operation"] == _operation(loader)
   assert registration["tool_input"]["result_requirement"] == (
     admitted.result_requirement.model_dump(mode="json")
   )
   assert registration["tool_input"]["cost_observation_threshold_usd"] == 3.25
+  assert "max_budget_usd" not in registration["tool_input"]
   assert ADMITTED_TASK_METADATA_KEY not in registration["tool_input"]
   assert "agent" not in registration["tool_input"]
   assert "task" not in registration["tool_input"]
   assert "child_tool_scope_receipt" not in registration["tool_input"]
+
+
+def test_unnamed_delegation_does_not_infer_a_skill_budget(tmp_path: Path) -> None:
+  runner = _Runner()
+
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=SkillLoader(tmp_path),
+  )({
+    "objective": "Explore the admitted evidence.",
+    "background": False,
+  }))
+
+  assert error is None
+  assert result is not None
+  assert runner.spawn_calls[0]["max_budget_usd"] is None
 
 
 @pytest.mark.parametrize("objective", [None, "", 0])

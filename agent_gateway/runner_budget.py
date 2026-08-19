@@ -181,38 +181,50 @@ def budget_cost_progress(
 def _remaining_budget(
   cost_accumulator: Any,
 ) -> tuple[float, float, str | None] | None:
+  def _hard_budget_candidate(
+    accumulator: Any,
+    reason: str | None,
+  ) -> tuple[float, float, str | None]:
+    try:
+      budget = accumulator.budget
+      total = accumulator.total
+    except Exception as exc:
+      raise ProviderRequestBudgetError(
+        "provider request budget authority is invalid"
+      ) from exc
+    if (
+      isinstance(budget, bool)
+      or not isinstance(budget, int | float)
+      or not math.isfinite(float(budget))
+      or float(budget) <= 0
+      or isinstance(total, bool)
+      or not isinstance(total, int | float)
+      or not math.isfinite(float(total))
+      or float(total) < 0
+    ):
+      raise ProviderRequestBudgetError(
+        "provider request budget authority is invalid"
+      )
+    return (
+      max(0.0, float(budget) - float(total)),
+      float(budget),
+      reason,
+    )
+
   if isinstance(cost_accumulator, ObservationOnlyCostAccumulator):
     return None
   if isinstance(cost_accumulator, ChildCostAccumulator):
     candidates = [
-      (
-        max(0.0, float(cost_accumulator.budget) - cost_accumulator.total),
-        float(cost_accumulator.budget),
-        "child_budget",
-      )
+      _hard_budget_candidate(cost_accumulator, "child_budget")
     ]
     parent = cost_accumulator._parent
-    if parent is not None:
-      candidates.append((
-        max(0.0, float(parent.budget) - parent.total),
-        float(parent.budget),
-        "parent_budget",
-      ))
+    if parent is not None and not isinstance(
+      parent,
+      ObservationOnlyCostAccumulator,
+    ):
+      candidates.append(_hard_budget_candidate(parent, "parent_budget"))
     return min(candidates, key=lambda item: item[0])
-  budget = getattr(cost_accumulator, "budget", None)
-  total = getattr(cost_accumulator, "total", None)
-  if (
-    isinstance(budget, bool)
-    or not isinstance(budget, int | float)
-    or not math.isfinite(float(budget))
-    or isinstance(total, bool)
-    or not isinstance(total, int | float)
-    or not math.isfinite(float(total))
-  ):
-    raise ProviderRequestBudgetError(
-      "provider request budget authority is invalid"
-    )
-  return max(0.0, float(budget) - float(total)), float(budget), None
+  return _hard_budget_candidate(cost_accumulator, None)
 
 
 def _project_provider_request_cost(

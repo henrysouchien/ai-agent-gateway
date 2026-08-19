@@ -51,6 +51,7 @@ def build_agent_execution_snapshot(
   cost_observation_threshold_usd: float | None,
   max_resume_chain_depth: int,
   resume_instruction: str | None = None,
+  max_budget_usd: float | None = None,
 ) -> AgentExecutionSnapshot:
   """Freeze every model-visible prompt byte and execution mechanic at admission."""
 
@@ -97,6 +98,7 @@ def build_agent_execution_snapshot(
     client_timeout_seconds=client_timeout_seconds,
     max_tokens=max_tokens,
     cost_observation_threshold_usd=cost_observation_threshold_usd,
+    max_budget_usd=max_budget_usd,
     resume_mechanics=AgentResumeMechanics(
       resumable=operation.resumable,
       max_chain_depth=(max_resume_chain_depth if operation.resumable else 0),

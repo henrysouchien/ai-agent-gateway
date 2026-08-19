@@ -372,7 +372,11 @@ When `skills_dir` is configured:
 Sub-agents are intentionally constrained:
 
 - they get their own runner and event log
-- they use one immutable capability bind and an explicit child budget resolved from call, profile, or configured default
+- they use one immutable capability bind; for a named operation, the registered
+  skill profile's finite budget is frozen into the immutable execution snapshot
+  and enforced again on durable resume
+- unnamed delegation keeps the legacy observation-only cost accumulator, and
+  `run_agent` has no model-authored hard-budget input
 - they cannot recursively spawn more sub-agents because `run_agent` is excluded by default
 
 ### Background Sub-Agents

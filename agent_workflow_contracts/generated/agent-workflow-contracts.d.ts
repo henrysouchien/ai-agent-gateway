@@ -53,6 +53,7 @@ export type AgentExecutionSnapshot = {
   readonly "admission_date": string;
   readonly "client_timeout_seconds": number;
   readonly "cost_observation_threshold_usd"?: (number) | (null);
+  readonly "max_budget_usd"?: (number) | (null);
   readonly "max_tokens": number;
   readonly "max_turns"?: (number) | (null);
   readonly "persisted_methodology_state": (JsonValue) | (null);

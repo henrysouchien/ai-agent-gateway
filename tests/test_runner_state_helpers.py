@@ -24,7 +24,23 @@ from agent_gateway.runner_state import (  # noqa: E402
 )
 from agent_gateway.runner_budget import (  # noqa: E402
   ObservationOnlyCostAccumulator,
+  ProviderRequestBudgetError,
 )
+
+
+class _LinearCostProvider:
+  @staticmethod
+  def estimate_cost(
+    _model: str,
+    input_tokens: int,
+    output_tokens: int,
+    **_kwargs: object,
+  ) -> object:
+    return type(
+      "Estimate",
+      (),
+      {"total": (input_tokens + output_tokens) / 1000.0},
+    )()
 
 
 def test_runner_preserves_state_helper_aliases() -> None:
@@ -186,6 +202,69 @@ def test_cost_observation_threshold_never_gates_provider_admission() -> None:
   assert accumulator.observation_threshold_crossed is True
   assert admission.max_output_tokens == 8_000
   assert admission.denied_state is None
+
+
+def test_child_provider_admission_uses_budget_over_observation_parent() -> None:
+  observation = ObservationOnlyCostAccumulator(2.0)
+  observation.add(100.0)
+  child = ChildCostAccumulator(observation, 0.06)
+
+  admission = admit_provider_request_budget(
+    child,
+    provider=_LinearCostProvider(),
+    model="test-model",
+    estimated_input_tokens=10,
+    requested_max_output_tokens=100,
+  )
+
+  assert admission.denied_state is None
+  assert admission.max_output_tokens == 50
+  assert admission.remaining_budget == pytest.approx(0.06)
+
+
+def test_child_provider_admission_uses_smaller_real_parent_budget() -> None:
+  child = ChildCostAccumulator(CostAccumulator(0.03), 0.10)
+
+  admission = admit_provider_request_budget(
+    child,
+    provider=_LinearCostProvider(),
+    model="test-model",
+    estimated_input_tokens=10,
+    requested_max_output_tokens=100,
+  )
+
+  assert admission.denied_state is None
+  assert admission.max_output_tokens == 20
+  assert admission.remaining_budget == pytest.approx(0.03)
+
+
+@pytest.mark.parametrize(
+  "budget,total",
+  [(None, 0.0), (1.0, float("nan")), (True, 0.0), (1.0, -1.0)],
+)
+def test_child_provider_admission_fails_closed_for_malformed_parent(
+  budget: object,
+  total: object,
+) -> None:
+  malformed_parent = type(
+    "MalformedParent",
+    (),
+    {"budget": budget, "total": total},
+  )()
+  child = ChildCostAccumulator(None, 1.0)
+  child._parent = malformed_parent  # type: ignore[assignment]
+
+  with pytest.raises(
+    ProviderRequestBudgetError,
+    match="provider request budget authority is invalid",
+  ):
+    admit_provider_request_budget(
+      child,
+      provider=_LinearCostProvider(),
+      model="test-model",
+      estimated_input_tokens=10,
+      requested_max_output_tokens=100,
+    )
 
 
 @pytest.mark.parametrize("value", [True, 0, -1, float("inf"), "1"])

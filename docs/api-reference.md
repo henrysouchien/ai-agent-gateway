@@ -513,6 +513,13 @@ Parse a standalone skill markdown file into a `SkillProfile`.
 
 Factory for the local `run_agent` handler.
 
+For a named operation, the handler freezes the registered skill profile's
+finite `max_budget_usd` into `AgentExecutionSnapshot`. Initial execution and
+durable resume enforce that frozen value while continuing to forward cost to
+the telemetry-only observation accumulator. The public tool input cannot set
+or increase this hard budget; unnamed delegation retains observation-only cost
+tracking.
+
 Key parameters:
 
 - `runner_ref`: single-element list holding the active `AgentRunner`
@@ -527,7 +534,9 @@ The handler supports `background=true` in the tool input. When set, the sub-agen
 
 ### `make_run_agent_tool_def(...)`
 
-Factory for the tool schema exposed to the model. Includes the `background` boolean property.
+Factory for the tool schema exposed to the model. Includes the `background`
+boolean property and deliberately excludes `max_budget_usd`; hard budget
+authority comes from the registered named profile and execution snapshot.
 
 ### `make_get_background_result_handler(runner_ref)`
 
