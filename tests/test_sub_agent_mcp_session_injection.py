@@ -68,7 +68,62 @@ def test_make_run_agent_handler_bounds_session_injection_to_admitted_scope() -> 
 
   assert error is None
   assert result == {"response": "ok"}
-  assert runner.calls[0]["dispatcher"]._mcp_session_inject_servers == set()
+  dispatcher = runner.calls[0]["dispatcher"]
+  assert dispatcher._mcp_session_inject_servers == set()
+  assert dispatcher._interceptors == []
+
+
+def test_make_run_agent_handler_forwards_exact_interceptor_sequence() -> None:
+  runner = _StubRunner()
+
+  async def first_interceptor(_context):
+    raise AssertionError("interceptor should not run during handler assembly")
+
+  async def second_interceptor(_context):
+    raise AssertionError("interceptor should not run during handler assembly")
+
+  interceptors = (first_interceptor, second_interceptor)
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=None,
+    mcp_client=_StubMcpClient(),
+    interceptors=interceptors,
+    local_tool_handlers={"file_read": _dummy_tool},
+    capability_execution_resolver=stub_capability_execution_resolver(),
+  )
+
+  result, error = _run(handler({
+    "background": False,
+    "objective": "Collect page state",
+  }))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  forwarded = runner.calls[0]["dispatcher"]._interceptors
+  assert len(forwarded) == 2
+  assert forwarded[0] is first_interceptor
+  assert forwarded[1] is second_interceptor
+
+
+def test_make_run_agent_handler_explicit_none_keeps_empty_interceptors() -> None:
+  runner = _StubRunner()
+  handler = make_run_agent_handler(
+    [runner],
+    skill_loader=None,
+    mcp_client=_StubMcpClient(),
+    interceptors=None,
+    local_tool_handlers={"file_read": _dummy_tool},
+    capability_execution_resolver=stub_capability_execution_resolver(),
+  )
+
+  result, error = _run(handler({
+    "background": False,
+    "objective": "Collect page state",
+  }))
+
+  assert error is None
+  assert result == {"response": "ok"}
+  assert runner.calls[0]["dispatcher"]._interceptors == []
 
 
 def test_named_child_does_not_inherit_loaded_servers_for_session_injection() -> None:

@@ -17,7 +17,15 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentRunner, AgentSessionLog, EventLog, TaskRegistry, TaskState, ToolDispatcher
+from agent_gateway import (
+  AgentRunner,
+  AgentSessionLog,
+  EventLog,
+  InterceptDecision,
+  TaskRegistry,
+  TaskState,
+  ToolDispatcher,
+)
 from agent_gateway.capability_binding import (
   CapabilityBind,
 )
@@ -38,6 +46,7 @@ from agent_gateway.sub_agent import (
   _research_file_id_admitted_input,
   _research_file_id_from_admitted_inputs,
   _ticker_admitted_input,
+  make_run_agent_handler,
   make_resume_handler as _make_resume_handler,
   make_resume_tool_def,
 )
@@ -971,6 +980,253 @@ async def _append_interrupted_skill_task(
       "content": user_message,
     }
   )
+
+
+def test_parent_initial_and_resume_share_one_stateful_interceptor_chain(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    observed: list[tuple[str, str]] = []
+    executions: list[str] = []
+
+    async def observe(context: Any) -> InterceptDecision:
+      observed.append(("observe", context.tool_call_id))
+      return InterceptDecision(action="allow")
+
+    class _AggregateLimit:
+      def __init__(self) -> None:
+        self.calls: list[str] = []
+
+      async def __call__(self, context: Any) -> InterceptDecision:
+        self.calls.append(context.tool_call_id)
+        if len(self.calls) > 2:
+          return InterceptDecision(
+            action="deny",
+            code="shared_aggregate_limit",
+            message="shared aggregate limit reached",
+          )
+        return InterceptDecision(action="allow")
+
+    limit = _AggregateLimit()
+    interceptors = (observe, limit)
+
+    async def web_search(_tool_input: dict[str, Any], **kwargs: Any):
+      executions.append(str(kwargs.get("tool_call_id") or "executed"))
+      return {"ok": True}, None
+
+    skills_dir = tmp_path / "skills"
+    _write_skill(
+      skills_dir,
+      "resume-shared-interceptors",
+      """
+allowed_tools:
+  - web_search
+mcp_tools: {}
+semantic_metadata:
+  required_context: []
+  tool_refs:
+    - kind: local
+      tool_id: web_search
+  capability_requirements:
+    - name: web.read/v1
+      required: true
+      binding_modes: [live_tool]
+""",
+      body="Review the admitted evidence and return a source-aware conclusion.",
+    )
+    loader = SkillLoader(skills_dir)
+    operation = next(
+      item.snapshot.operation.model_dump(mode="json")
+      for item in loader.list_callable_operations()
+      if item.snapshot.operation.name == "resume-shared-interceptors"
+    )
+
+    initial_runner = _runner(tmp_path)
+    initial_runner._runner_id = "runner-initial"
+    initial_runner._get_tool_definitions = lambda: [{  # type: ignore[method-assign]
+      "name": "web_search",
+      "description": "Read-only evidence search.",
+      "input_schema": {"type": "object"},
+    }]
+    initial_dispatch_started = asyncio.Event()
+    initial_call: dict[str, Any] = {}
+
+    async def _initial_spawn_sub_agent(task: str, **kwargs: Any):
+      initial_call.update({"task": task, **kwargs})
+      initial_dispatch_started.set()
+      await asyncio.Event().wait()
+
+    initial_runner.spawn_sub_agent = _initial_spawn_sub_agent  # type: ignore[method-assign]
+    initial_handler = make_run_agent_handler(
+      [initial_runner],
+      skill_loader=loader,
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"web_search": web_search},
+      interceptors=interceptors,
+      capability_execution_resolver=stub_capability_execution_resolver(),
+    )
+    parent_dispatcher = ToolDispatcher(
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"run_agent": initial_handler},
+      interceptors=interceptors,
+      session_id="parent",
+    )
+    initial_result, initial_error = await parent_dispatcher.dispatch(
+      "parent-run-agent",
+      "run_agent",
+      {
+        "operation": operation,
+        "objective": "Read the admitted evidence.",
+        "background": True,
+      },
+    )
+    assert initial_error is None
+    assert initial_result is not None
+    initial_entry = initial_runner._task_registry.get(initial_result["task_id"])
+    assert initial_entry is not None
+    assert initial_entry.admitted_task is not None
+    assert initial_entry.admitted_task.operation.operation.name == (
+      "resume-shared-interceptors"
+    )
+    await asyncio.wait_for(initial_dispatch_started.wait(), timeout=1.0)
+    initial_dispatcher = initial_call["dispatcher"]
+
+    resume_runner = _runner(tmp_path)
+    resume_runner._runner_id = "runner-resumed"
+    resume_runner._get_tool_definitions = lambda: [{  # type: ignore[method-assign]
+      "name": "web_search",
+      "description": "Read-only evidence search.",
+      "input_schema": {"type": "object"},
+    }]
+    resumed: dict[str, Any] = {}
+
+    async def _resume_sub_agent(**kwargs: Any):
+      resumed.update(kwargs)
+      return await _successful_resume_task_result(
+        kwargs,
+        "continued",
+        workspace_dir=tmp_path,
+      ), None
+
+    resume_runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    resume_handler = make_resume_handler(
+      [resume_runner],
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={"web_search": web_search},
+      interceptors=interceptors,
+      excluded_tools_resolver=frozenset,
+    )
+    resume_result, resume_error = await resume_handler({
+      "task_id": initial_entry.task_id,
+    })
+    assert resume_error is None
+    assert resume_result is not None
+    recovered_initial = resume_runner._task_registry.get(initial_entry.task_id)
+    assert recovered_initial is not None
+    assert recovered_initial.state == TaskState.INTERRUPTED
+    assert recovered_initial.admitted_task == initial_entry.admitted_task
+    resumed_entry = resume_runner._task_registry.get(resume_result["task_id"])
+    assert resumed_entry is not None
+    assert resumed_entry.original_task_id == initial_entry.task_id
+    assert resumed_entry.admitted_task is not None
+    assert (
+      resumed_entry.admitted_task.logical_task
+      == initial_entry.admitted_task.logical_task
+    )
+    await resumed_entry.asyncio_task
+    resume_dispatcher = resumed["dispatcher"]
+
+    for dispatcher in (
+      parent_dispatcher,
+      initial_dispatcher,
+      resume_dispatcher,
+    ):
+      assert dispatcher._interceptors[0] is observe
+      assert dispatcher._interceptors[1] is limit
+
+    initial_dispatch_result, initial_dispatch_error = (
+      await initial_dispatcher.dispatch(
+        "initial-call",
+        "web_search",
+        {},
+      )
+    )
+    resume_dispatch_result, resume_dispatch_error = (
+      await resume_dispatcher.dispatch(
+        "resume-call",
+        "web_search",
+        {},
+      )
+    )
+
+    assert initial_dispatch_result == {"ok": True}
+    assert initial_dispatch_error is None
+    assert resume_dispatch_result is None
+    assert resume_dispatch_error == {
+      "code": "shared_aggregate_limit",
+      "message": "shared aggregate limit reached",
+    }
+    assert observed == [
+      ("observe", "parent-run-agent"),
+      ("observe", "initial-call"),
+      ("observe", "resume-call"),
+    ]
+    assert limit.calls == [
+      "parent-run-agent",
+      "initial-call",
+      "resume-call",
+    ]
+    assert len(executions) == 1
+
+    assert initial_entry.asyncio_task is not None
+    initial_entry.termination_intent = "killed"
+    initial_entry.asyncio_task.cancel()
+    await asyncio.gather(initial_entry.asyncio_task, return_exceptions=True)
+
+  _run(_case())
+
+
+def test_resume_handler_explicit_none_keeps_empty_interceptors(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_empty_interceptors",
+      agent_name="resume-empty-interceptors",
+      user_message="Resume without interceptors.",
+      required_context=(),
+      ticker=None,
+    )
+    captured: dict[str, Any] = {}
+
+    async def _resume_sub_agent(**kwargs: Any):
+      captured.update(kwargs)
+      return await _successful_resume_task_result(
+        kwargs,
+        "continued",
+        workspace_dir=tmp_path,
+      ), None
+
+    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    handler = make_resume_handler(
+      [runner],
+      mcp_client=_NullMcpClient(),
+      interceptors=None,
+      excluded_tools_resolver=frozenset,
+    )
+
+    result, error = await handler({"task_id": "bg_empty_interceptors"})
+
+    assert error is None
+    assert result is not None
+    resumed_entry = runner._task_registry.get(result["task_id"])
+    assert resumed_entry is not None
+    await resumed_entry.asyncio_task
+    assert captured["dispatcher"]._interceptors == []
+
+  _run(_case())
 
 
 @pytest.mark.parametrize(

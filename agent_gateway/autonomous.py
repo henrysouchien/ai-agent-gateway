@@ -814,6 +814,7 @@ async def run_autonomous(
     raise ValueError(
       "capability execution max_tokens must be a positive integer"
     )
+  runtime_interceptors = tuple(interceptors or ())
   resolved_mcp_allowed_servers, resolved_mcp_server_aliases = (
     _trusted_autonomous_mcp_policy(
       mcp_servers=mcp_servers,
@@ -906,6 +907,7 @@ async def run_autonomous(
         skill_loader=skill_loader,
         mcp_client=mcp_client or _NullMcpClient(),
         needs_approval=needs_approval,
+        interceptors=runtime_interceptors,
         mcp_session_inject_servers=mcp_session_inject_servers,
         local_tool_handlers=local_handlers,
         excluded_tools=skills_excluded_tools,
@@ -947,7 +949,7 @@ async def run_autonomous(
       local_tool_handlers=local_handlers,
       needs_approval=needs_approval,
       event_log=event_log,
-      interceptors=interceptors,
+      interceptors=runtime_interceptors,
       session_id=sid,
       should_avoid_permission_prompts=True,
       mcp_session_inject_servers=mcp_session_inject_servers,

@@ -7,7 +7,7 @@ import secrets
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Mapping
-from collections.abc import Set as AbstractSet
+from collections.abc import Sequence, Set as AbstractSet
 
 from agent_workflow_contracts import (
   AgentCompletionEnvelope,
@@ -155,7 +155,7 @@ from .task_registry import (
   TaskState,
   task_state_for_result,
 )
-from .tool_dispatcher import ToolDispatcher
+from .tool_dispatcher import ToolDispatcher, ToolInterceptor
 from .transcript import (
   ChildRunSegment,
   build_synthetic_tool_results,
@@ -1132,6 +1132,7 @@ def make_run_agent_handler(
   skill_loader: SkillLoader | None = None,
   mcp_client: Any,
   needs_approval: Callable[..., bool] | None = None,
+  interceptors: Sequence[ToolInterceptor] | None = None,
   mcp_session_inject_servers: AbstractSet[str] | None = None,
   mcp_meta_inject_servers: frozenset[str] | None = None,
   user_id: str | None = None,
@@ -1753,6 +1754,7 @@ def make_run_agent_handler(
         else None
       ),
       event_log=sub_log,
+      interceptors=interceptors,
       session_id=getattr(runner, "_full_session_id", ""),
       should_avoid_permission_prompts=background,
       approval_key_qualifier=approval_key_qualifier,
@@ -1982,6 +1984,7 @@ def make_resume_handler(
   mcp_client: Any,
   needs_approval: Callable[..., bool] | None = None,
   needs_approval_resolver: NeedsApprovalResolver | None = None,
+  interceptors: Sequence[ToolInterceptor] | None = None,
   mcp_session_inject_servers: AbstractSet[str] | None = None,
   mcp_meta_inject_servers: frozenset[str] | None = None,
   user_id: str | None = None,
@@ -2447,6 +2450,7 @@ def make_resume_handler(
         else None
       ),
       event_log=sub_log,
+      interceptors=interceptors,
       session_id=getattr(runner, "_full_session_id", ""),
       should_avoid_permission_prompts=True,
       mcp_session_inject_servers=effective_session_inject_servers,

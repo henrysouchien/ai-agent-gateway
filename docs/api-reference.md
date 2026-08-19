@@ -66,6 +66,9 @@ Key parameters:
 - `delivery`: optional `DeliveryConfig` for webhook, Telegram, briefing file, or callback output
 - `max_concurrent_sub_agents`: optional concurrency limit for sub-agents
 - `compaction_instructions`: optional instructions for context compaction
+- `interceptors`: optional trusted interceptor sequence; automatic `run_agent`
+  children retain the same stateful instances in the same order as the parent
+  dispatcher
 
 Raw `model`, `api_key`, `auth_token`, `auth_config`, `provider_config`, and
 `max_tokens` selectors are not accepted. Split execution inputs are also
@@ -527,10 +530,20 @@ Key parameters:
 - `mcp_client`: MCP client manager shared with the parent
 - `local_tool_handlers`: local handlers forwarded to the sub-agent dispatcher
 - `excluded_tools`: additional tool names to block in sub-agents
+- `interceptors`: optional trusted sequence forwarded to the child dispatcher
+  without cloning or reordering its stateful elements
 - `on_before_background`: sync callback invoked just before a background task starts
 - `on_background_complete`: async callback invoked when a background task finishes
 
 The handler supports `background=true` in the tool input. When set, the sub-agent runs asynchronously and the tool returns immediately with a `task_id`. With automatic notifications enabled, the terminal result is delivered through a typed task notification; current-run tasks must not be polled.
+
+### `make_resume_handler(...)`
+
+Factory for the local `resume_background_agent` handler. Its optional trusted
+`interceptors` sequence is forwarded to every resumed child dispatcher without
+cloning or reordering its stateful elements. Production initial and resume
+wiring supplies the same finalized instances. A caller-supplied custom
+`run_agent` handler remains caller-owned and is not wrapped or replaced.
 
 ### `make_run_agent_tool_def(...)`
 

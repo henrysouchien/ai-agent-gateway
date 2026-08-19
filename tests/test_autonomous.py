@@ -1469,6 +1469,7 @@ def test_run_autonomous_simple(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     is authority["session"].run_context
   )
   assert captured["dispatcher_kwargs"]["role"] == authority["session"].role
+  assert captured["dispatcher_kwargs"]["interceptors"] == ()
   assert captured["dispatcher_kwargs"]["mcp_meta_inject_servers"] == frozenset(
     {"idea-workbench-mcp"}
   )
@@ -1604,6 +1605,143 @@ def test_run_autonomous_forwards_outputs_dir(
   assert captured["kwargs"]["outputs_dir"] == outputs_dir
   assert captured["kwargs"]["capability_execution_resolver"] is not None
   assert captured["kwargs"]["parent_session"] is authority["session"]
+
+
+def test_run_autonomous_shares_one_interceptor_tuple_with_automatic_child(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  captured: dict[str, Any] = {}
+
+  class _StubDispatcher:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+      _ = args
+      captured["parent_interceptors"] = kwargs["interceptors"]
+
+  class _StubRunner:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+      _ = args, kwargs
+
+  async def _fake_run_session(
+    runner: Any,
+    event_log: EventLog,
+    **_kwargs: Any,
+  ) -> autonomous.RunOutput:
+    _ = runner, event_log
+    return autonomous.RunOutput(
+      response="Completed.",
+      tools_used=[],
+      usage={},
+      error=None,
+      timed_out=False,
+    )
+
+  async def _fake_run_agent(_tool_input, **_kwargs):
+    return {"response": "ok"}, None
+
+  def _fake_make_run_agent_handler(*_args: Any, **kwargs: Any):
+    captured["child_interceptors"] = kwargs["interceptors"]
+    return _fake_run_agent
+
+  first = object()
+  second = object()
+  supplied = [first, second]
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  monkeypatch.setattr(autonomous, "ToolDispatcher", _StubDispatcher)
+  monkeypatch.setattr(autonomous, "AgentRunner", _StubRunner)
+  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
+  monkeypatch.setattr(
+    autonomous,
+    "make_run_agent_handler",
+    _fake_make_run_agent_handler,
+  )
+
+  _run(
+    autonomous.run_autonomous(
+      "You are helpful.",
+      "Run the task.",
+      **_bound_execution(),
+      skills_dir=skills_dir,
+      interceptors=supplied,
+      capability_execution_resolver=object(),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+  )
+
+  runtime_interceptors = captured["parent_interceptors"]
+  assert type(runtime_interceptors) is tuple
+  assert captured["child_interceptors"] is runtime_interceptors
+  assert runtime_interceptors[0] is first
+  assert runtime_interceptors[1] is second
+
+
+def test_run_autonomous_keeps_custom_run_agent_handler_caller_owned(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  captured: dict[str, Any] = {}
+
+  async def custom_run_agent(_tool_input, **_kwargs):
+    return {"response": "custom"}, None
+
+  class _StubDispatcher:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+      _ = args
+      captured["run_agent"] = kwargs["local_tool_handlers"]["run_agent"]
+      captured["interceptors"] = kwargs["interceptors"]
+
+  class _StubRunner:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+      _ = args, kwargs
+
+  async def _fake_run_session(
+    runner: Any,
+    event_log: EventLog,
+    **_kwargs: Any,
+  ) -> autonomous.RunOutput:
+    _ = runner, event_log
+    return autonomous.RunOutput(
+      response="Completed.",
+      tools_used=[],
+      usage={},
+      error=None,
+      timed_out=False,
+    )
+
+  def _unexpected_make_run_agent_handler(*_args: Any, **_kwargs: Any):
+    raise AssertionError("custom run_agent must not be replaced or wrapped")
+
+  interceptor = object()
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  monkeypatch.setattr(autonomous, "ToolDispatcher", _StubDispatcher)
+  monkeypatch.setattr(autonomous, "AgentRunner", _StubRunner)
+  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
+  monkeypatch.setattr(
+    autonomous,
+    "make_run_agent_handler",
+    _unexpected_make_run_agent_handler,
+  )
+
+  _run(
+    autonomous.run_autonomous(
+      "You are helpful.",
+      "Run the task.",
+      **_bound_execution(),
+      skills_dir=skills_dir,
+      tool_handlers={"run_agent": custom_run_agent},
+      interceptors=[interceptor],
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+  )
+
+  assert captured["run_agent"] is custom_run_agent
+  assert captured["interceptors"] == (interceptor,)
 
 
 def test_run_autonomous_skills_dir_registers_send_message_tool_and_builtin_name(
