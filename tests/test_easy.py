@@ -22,6 +22,8 @@ from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_
 from agent_gateway.auth import AuthConfig, ResolverResult
 from agent_gateway._provider_utils import _resolve_provider
 from agent_gateway.capability_binding import CapabilityResolutionError
+from agent_gateway.commercial_authority_cache import CommercialAuthorityStateCache
+from agent_gateway.commercial_authority_subscriber import CommercialAuthoritySubscriber
 from agent_gateway.model_registry import (
   INITIAL_MODEL_REGISTRY,
 )
@@ -332,6 +334,56 @@ def test_commercial_reconciliation_shipper_runs_for_app_lifecycle() -> None:
     assert started.wait(timeout=1)
     assert not stopped.is_set()
   assert stopped.wait(timeout=1)
+
+
+def test_commercial_authority_additive_v1_catches_up_before_easy_startup(
+  tmp_path: Path,
+) -> None:
+  class Client:
+    environment = "dev"
+
+    def fetch(self, cursor):
+      if cursor == 0:
+        return {
+          "schema_version": 1,
+          "events": [{
+            "sequence_id": 1,
+            "environment": "dev",
+            "kind": "entitlement",
+            "commercial_account_id": 7,
+            "entitlement_revision": 2,
+            "context_id": None,
+            "token_id": None,
+            "occurred_at": "2026-08-19T12:00:00Z",
+            "producer_extension": "compatible",
+          }],
+          "next_sequence": 1,
+          "high_water_sequence": 1,
+          "envelope_extension": "compatible",
+        }
+      return {
+        "schema_version": 1,
+        "events": [],
+        "next_sequence": cursor,
+        "high_water_sequence": cursor,
+      }
+
+  cursor_path = tmp_path / "authority.cursor.json"
+  subscriber = CommercialAuthoritySubscriber(
+    client=Client(),
+    cache=CommercialAuthorityStateCache(
+      lambda _: pytest.fail("loader must not run")
+    ),
+    cursor_path=cursor_path,
+  )
+  app = create_agent(
+    "test",
+    commercial_authority_subscriber=subscriber,
+  )
+
+  with TestClient(app):
+    assert json.loads(cursor_path.read_text()) == {"sequence": 1}
+    assert subscriber.health(max_staleness_seconds=30)["ok"] is True
 
 
 def _collect_sse_events(response) -> list[dict]:

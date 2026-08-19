@@ -608,6 +608,31 @@ class _InvestmentMcpClient(_NullMcpClient):
     }]
 
 
+class _JobsMcpClient(_NullMcpClient):
+  def __init__(self) -> None:
+    self.call_count = 0
+
+  @staticmethod
+  def is_mcp_tool(name: str) -> bool:
+    return name == "list_jobs"
+
+  @staticmethod
+  def get_server_for_tool(name: str) -> str | None:
+    return "jobs-mcp" if name == "list_jobs" else None
+
+  @staticmethod
+  def get_tool_definitions() -> list[dict[str, Any]]:
+    return [{
+      "name": "list_jobs",
+      "description": "List operator jobs.",
+      "input_schema": {"type": "object"},
+    }]
+
+  async def call_tool(self, name: str, tool_input: dict[str, Any]):
+    self.call_count += 1
+    return {"name": name, "input": tool_input}, None
+
+
 class _ResumeTestProvider(ModelProvider):
   name = "stub"
 
@@ -4349,6 +4374,41 @@ def test_resume_handler_adopts_old_interrupted_task_before_abandonment(
     assert adopted is not None
     assert adopted.state == TaskState.FAILED
     assert runner._task_registry.get("bg_2").state == TaskState.INTERRUPTED
+
+  _run(_case())
+
+
+def test_resume_handler_rejects_persisted_grant_for_now_denied_mcp_server(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_jobs",
+      agent_name="legacy-job-reader",
+      user_message="Inspect an operator job.",
+      allowed_tools=("list_jobs",),
+    )
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir, "legacy-job-reader")
+    mcp_client = _JobsMcpClient()
+    handler = make_resume_handler(
+      [runner],
+      mcp_client=mcp_client,
+      excluded_tools_resolver=frozenset,
+      denied_mcp_servers={"jobs-mcp"},
+    )
+
+    result, error = await handler({"task_id": "bg_jobs"})
+
+    _assert_resume_abandoned(
+      result,
+      error,
+      code="admitted_tool_route_unavailable",
+    )
+    assert mcp_client.call_count == 0
+    assert runner._task_registry.get("bg_jobs").state == TaskState.FAILED
 
   _run(_case())
 

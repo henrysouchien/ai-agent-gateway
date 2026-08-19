@@ -1,0 +1,125 @@
+{
+  "$defs": {
+    "CommercialAuthorityInvalidationEventV1": {
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      },
+      "properties": {
+        "commercial_account_id": {
+          "exclusiveMinimum": 0,
+          "title": "Commercial Account Id",
+          "type": "integer"
+        },
+        "context_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Context Id"
+        },
+        "entitlement_revision": {
+          "exclusiveMinimum": 0,
+          "title": "Entitlement Revision",
+          "type": "integer"
+        },
+        "environment": {
+          "enum": [
+            "dev",
+            "staging",
+            "prod"
+          ],
+          "title": "Environment",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "context",
+            "token",
+            "entitlement",
+            "agreement",
+            "emergency"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "sequence_id": {
+          "exclusiveMinimum": 0,
+          "title": "Sequence Id",
+          "type": "integer"
+        },
+        "token_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Token Id"
+        }
+      },
+      "required": [
+        "sequence_id",
+        "environment",
+        "kind",
+        "commercial_account_id",
+        "entitlement_revision",
+        "context_id",
+        "token_id",
+        "occurred_at"
+      ],
+      "title": "CommercialAuthorityInvalidationEventV1",
+      "type": "object"
+    },
+    "JsonValue": {}
+  },
+  "$id": "https://hank.investments/schemas/commercial/commercial-authority-invalidation-feed-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": {
+    "$ref": "#/$defs/JsonValue"
+  },
+  "properties": {
+    "events": {
+      "items": {
+        "$ref": "#/$defs/CommercialAuthorityInvalidationEventV1"
+      },
+      "title": "Events",
+      "type": "array"
+    },
+    "high_water_sequence": {
+      "minimum": 0,
+      "title": "High Water Sequence",
+      "type": "integer"
+    },
+    "next_sequence": {
+      "minimum": 0,
+      "title": "Next Sequence",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "events",
+    "next_sequence",
+    "high_water_sequence"
+  ],
+  "title": "CommercialAuthorityInvalidationFeedV1",
+  "type": "object"
+}

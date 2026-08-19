@@ -48,6 +48,7 @@ agent_gateway = [
   "dashboard_artifact/*.json",
   "contracts/control-run-v1/*.json",
   "contracts/claim-contract-v1/*.json",
+  "contracts/commercial-authority-v1/*.json",
   "contracts/commercial-usage-v3/*.json",
   "contracts/ui-blocks-v1/**/*.json",
   "contracts/canvas-kit-v1/**/*.json",

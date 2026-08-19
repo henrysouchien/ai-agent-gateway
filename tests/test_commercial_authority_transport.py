@@ -1,16 +1,54 @@
 import asyncio
 import hashlib
 import hmac
+from importlib.resources import files
 import json
 from pathlib import Path
 from uuid import uuid4
 
 import httpx
+from jsonschema import Draft202012Validator
 import pytest
 
 from agent_gateway.commercial_authority_cache import CommercialAuthorityStateCache
 from agent_gateway.commercial_authority_client import HttpCommercialAuthorityClient
+from agent_gateway.commercial_authority_feed import (
+  decode_commercial_authority_feed_v1,
+)
 from agent_gateway.commercial_authority_subscriber import CommercialAuthoritySubscriber
+
+
+def _feed(
+  *,
+  events: list[dict] | None = None,
+  next_sequence: int = 0,
+  high_water_sequence: int | None = None,
+  **additive,
+) -> dict:
+  return {
+    "schema_version": 1,
+    "events": events or [],
+    "next_sequence": next_sequence,
+    "high_water_sequence": (
+      next_sequence if high_water_sequence is None else high_water_sequence
+    ),
+    **additive,
+  }
+
+
+def _event(sequence: int, **changes) -> dict:
+  event = {
+    "sequence_id": sequence,
+    "kind": "entitlement",
+    "commercial_account_id": 7,
+    "entitlement_revision": 3,
+    "context_id": None,
+    "token_id": None,
+    "environment": "dev",
+    "occurred_at": "2026-07-12T12:00:00Z",
+  }
+  event.update(changes)
+  return event
 
 
 def test_client_signs_exact_request_and_parses_token_free_snapshot() -> None:
@@ -143,16 +181,16 @@ def test_client_rejects_wrong_authority_environment(endpoint) -> None:
 def test_startup_catch_up_consumes_every_page_before_returning(tmp_path: Path) -> None:
   context_id = uuid4()
   pages = iter([
-    {"events": [{
+    _feed(events=[{
       "sequence_id": 2, "kind": "context", "commercial_account_id": 7,
       "entitlement_revision": 3, "context_id": str(context_id), "token_id": None,
       "environment": "dev", "occurred_at": "2026-07-12T12:00:00Z",
-    }], "next_sequence": 2, "high_water_sequence": 4},
-    {"events": [{
+    }], next_sequence=2, high_water_sequence=4),
+    _feed(events=[{
       "sequence_id": 4, "kind": "entitlement", "commercial_account_id": 7,
       "entitlement_revision": 4, "context_id": None, "token_id": None,
       "environment": "dev", "occurred_at": "2026-07-12T12:00:01Z",
-    }], "next_sequence": 4, "high_water_sequence": 4},
+    }], next_sequence=4, high_water_sequence=4),
   ])
 
   class Client:
@@ -169,10 +207,176 @@ def test_startup_catch_up_consumes_every_page_before_returning(tmp_path: Path) -
   assert path.stat().st_mode & 0o077 == 0
 
 
+def test_packaged_feed_schema_is_valid_and_decoder_accepts_safe_additions() -> None:
+  schema_path = (
+    files("agent_gateway")
+    / "contracts"
+    / "commercial-authority-v1"
+    / "commercial-authority-invalidation-feed-v1.schema.json"
+  )
+  schema = json.loads(schema_path.read_text(encoding="utf-8"))
+  Draft202012Validator.check_schema(schema)
+
+  decoded = decode_commercial_authority_feed_v1(
+    _feed(
+      events=[_event(1, producer_extension={"future": True})],
+      next_sequence=1,
+      envelope_extension=["future"],
+    ),
+    cursor=0,
+    expected_environment="dev",
+  )
+
+  assert decoded.next_sequence == 1
+  assert decoded.high_water_sequence == 1
+  assert len(decoded.invalidations) == 1
+
+
+def test_subscriber_applies_additive_v1_page_after_complete_decode(
+  tmp_path: Path,
+) -> None:
+  context_id = uuid4()
+
+  class Client:
+    environment = "dev"
+
+    def fetch(self, cursor):
+      assert cursor == 0
+      return _feed(
+        events=[_event(
+          1,
+          kind="context",
+          context_id=str(context_id),
+          producer_extension="compatible",
+        )],
+        next_sequence=1,
+        envelope_extension="compatible",
+      )
+
+  cache = CommercialAuthorityStateCache(
+    lambda _: pytest.fail("loader must not run")
+  )
+  path = tmp_path / "cursor.json"
+  asyncio.run(CommercialAuthoritySubscriber(
+    client=Client(), cache=cache, cursor_path=path,
+  ).catch_up())
+
+  assert cache.resolve_context_state(context_id).active is False
+  assert json.loads(path.read_text()) == {"sequence": 1}
+
+
+@pytest.mark.parametrize("schema_version", [None, 2, True, "1"])
+def test_decoder_requires_known_integer_feed_version(schema_version) -> None:
+  page = _feed()
+  if schema_version is None:
+    page.pop("schema_version")
+  else:
+    page["schema_version"] = schema_version
+
+  with pytest.raises(ValueError, match="feed schema"):
+    decode_commercial_authority_feed_v1(
+      page, cursor=0, expected_environment="dev"
+    )
+
+
+def test_decoder_rejects_missing_event_field() -> None:
+  event = _event(1)
+  event.pop("token_id")
+
+  with pytest.raises(ValueError, match="feed schema"):
+    decode_commercial_authority_feed_v1(
+      _feed(events=[event], next_sequence=1),
+      cursor=0,
+      expected_environment="dev",
+    )
+
+
+@pytest.mark.parametrize(
+  ("changes", "match"),
+  [
+    ({"commercial_account_id": True}, "feed schema"),
+    ({"occurred_at": "not-a-timestamp"}, "occurrence time"),
+    ({"occurred_at": "2026-07-12T12:00:00"}, "occurrence time"),
+    ({"context_id": "not-a-uuid"}, "event is invalid"),
+    ({"environment": "prod"}, "environment is invalid"),
+  ],
+)
+def test_decoder_rejects_bad_known_type_format_or_environment(
+  changes: dict,
+  match: str,
+) -> None:
+  with pytest.raises(ValueError, match=match):
+    decode_commercial_authority_feed_v1(
+      _feed(events=[_event(1, **changes)], next_sequence=1),
+      cursor=0,
+      expected_environment="dev",
+    )
+
+
+def test_decoder_rejects_out_of_order_page() -> None:
+  with pytest.raises(ValueError, match="sequence is invalid"):
+    decode_commercial_authority_feed_v1(
+      _feed(events=[_event(2), _event(1)], next_sequence=1),
+      cursor=0,
+      expected_environment="dev",
+    )
+
+
+@pytest.mark.parametrize(
+  ("page", "cursor", "match"),
+  [
+    (_feed(next_sequence=1), 2, "page is invalid"),
+    (_feed(next_sequence=1, high_water_sequence=0), 0, "page is invalid"),
+    (_feed(events=[_event(1)], next_sequence=0), 0, "cursor mismatch"),
+  ],
+)
+def test_decoder_rejects_cursor_or_high_water_incoherence(
+  page: dict,
+  cursor: int,
+  match: str,
+) -> None:
+  with pytest.raises(ValueError, match=match):
+    decode_commercial_authority_feed_v1(
+      page, cursor=cursor, expected_environment="dev"
+    )
+
+
+def test_late_invalid_event_has_no_cache_or_cursor_effect(tmp_path: Path) -> None:
+  class Client:
+    environment = "dev"
+
+    def fetch(self, _cursor):
+      return _feed(
+        events=[
+          _event(1),
+          _event(2, occurred_at="2026-07-12T12:00:00"),
+        ],
+        next_sequence=2,
+      )
+
+  class Cache:
+    def __init__(self) -> None:
+      self.applied = []
+
+    def apply_invalidation(self, invalidation) -> None:
+      self.applied.append(invalidation)
+
+  cache = Cache()
+  path = tmp_path / "cursor.json"
+  subscriber = CommercialAuthoritySubscriber(
+    client=Client(), cache=cache, cursor_path=path,
+  )
+
+  with pytest.raises(ValueError, match="occurrence time"):
+    asyncio.run(subscriber.catch_up())
+  assert cache.applied == []
+  assert not path.exists()
+
+
 def test_startup_catch_up_rejects_non_progressing_feed(tmp_path: Path) -> None:
   class Client:
     def fetch(self, cursor):
-      return {"events": [], "next_sequence": cursor, "high_water_sequence": 3}
+      return _feed(next_sequence=cursor, high_water_sequence=3)
 
   cache = CommercialAuthorityStateCache(lambda _: pytest.fail("loader must not run"))
   with pytest.raises(ValueError, match="no catch-up progress"):
@@ -190,7 +394,7 @@ def test_subscriber_health_tracks_success_failure_and_staleness(tmp_path: Path) 
     def fetch(self, cursor):
       if self.fail:
         raise RuntimeError("authority unavailable")
-      return {"events": [], "next_sequence": cursor, "high_water_sequence": cursor}
+      return _feed(next_sequence=cursor)
 
   client = Client()
   cache = CommercialAuthorityStateCache(lambda _: pytest.fail("loader must not run"))
@@ -230,7 +434,7 @@ def test_subscriber_readiness_fails_while_live_feed_is_behind_high_water(
 ) -> None:
   class Client:
     def fetch(self, cursor):
-      return {"events": [], "next_sequence": cursor, "high_water_sequence": cursor}
+      return _feed(next_sequence=cursor)
 
   cache = CommercialAuthorityStateCache(lambda _: pytest.fail("loader must not run"))
   subscriber = CommercialAuthoritySubscriber(

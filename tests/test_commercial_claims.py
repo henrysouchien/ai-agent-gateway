@@ -114,7 +114,7 @@ def test_pushed_event_changes_irreversible_verifier_decision(tmp_path) -> None:
 
   class Client:
     def fetch(self, cursor):
-      return {"events": [{
+      return {"schema_version": 1, "events": [{
         "sequence_id": 1, "environment": "prod", "kind": "context",
         "commercial_account_id": 7, "entitlement_revision": 43,
         "context_id": str(CONTEXT_ID), "token_id": None,

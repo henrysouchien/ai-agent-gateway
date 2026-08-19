@@ -1985,6 +1985,7 @@ def make_resume_handler(
   local_tool_handlers: dict[str, Any] | None = None,
   fms_rebinder: Callable[[dict[str, Any], int], None] | None = None,
   excluded_tools_resolver: ExcludedToolsResolver | None = None,
+  denied_mcp_servers: AbstractSet[str] = frozenset(),
   default_max_turns: int = 15,
   default_timeout: float | None = DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
   default_max_tokens: int = 64000,
@@ -2369,6 +2370,13 @@ def make_resume_handler(
       )
     except OperationToolAdmissionError as exc:
       return await _abandon("admitted_tool_route_unavailable", str(exc))
+    denied_admitted_servers = set(admitted_mcp_scope) & set(denied_mcp_servers)
+    if denied_admitted_servers:
+      return await _abandon(
+        "admitted_tool_route_unavailable",
+        "admitted MCP server is no longer available: "
+        + ", ".join(sorted(denied_admitted_servers)),
+      )
     admitted_dispatch_tools = admitted_tool_ids
     candidate_local_names = set(sub_local)
     sub_local = {

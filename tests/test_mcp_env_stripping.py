@@ -40,6 +40,8 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
       "INVESTMENT_CAPABILITY_CLAIM_ED25519_PRIVATE_KEY": "private-signing-key",
       "INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY": "public-verification-key",
       "GOOGLE_API_KEY": "google-secret",
+      "SEC_BUDGET_SITE": "prod",
+      "SEC_USER_AGENT": "host-agent contact@example.com",
       "AWS_SECRET_ACCESS_KEY": "aws-secret",
       "UNRELATED_VAR": "drop-me",
     },
@@ -64,6 +66,8 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
   assert "AGENT_GATEWAY_CLAIM_SIGNING_AUTHORITY" not in env
   assert "INVESTMENT_CAPABILITY_CLAIM_ED25519_PRIVATE_KEY" not in env
   assert "INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY" not in env
+  assert "SEC_BUDGET_SITE" not in env
+  assert "SEC_USER_AGENT" not in env
   assert (
     "INVESTMENT_CAPABILITY_CLAIM_ED25519_PRIVATE_KEY"
     not in mcp_client_module._DEFAULT_ENV_ALLOWLIST
@@ -72,6 +76,8 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
     "INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY"
     not in mcp_client_module._DEFAULT_ENV_ALLOWLIST
   )
+  assert "SEC_BUDGET_SITE" not in mcp_client_module._DEFAULT_ENV_ALLOWLIST
+  assert "SEC_USER_AGENT" not in mcp_client_module._DEFAULT_ENV_ALLOWLIST
 
 
 def test_build_mcp_env_expands_explicit_investment_claim_public_key_only(
@@ -153,6 +159,7 @@ def test_build_mcp_env_expands_risk_module_dotenv_pointer(monkeypatch) -> None:
   "env_name",
   [
     "FMP_API_KEY",
+    "SEC_BUDGET_SITE",
     "SEC_USER_AGENT",
     "GMAIL_TOKEN_PATH",
     "GMAIL_CREDENTIALS_PATH",
@@ -212,6 +219,7 @@ def test_server_env_passthrough_uses_parent_value_without_literal(
   "env_name",
   [
     "FMP_API_KEY",
+    "SEC_BUDGET_SITE",
     "SEC_USER_AGENT",
     "GMAIL_TOKEN_PATH",
     "GMAIL_CREDENTIALS_PATH",
