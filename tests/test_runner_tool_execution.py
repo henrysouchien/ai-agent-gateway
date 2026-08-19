@@ -1191,7 +1191,7 @@ class _WorkflowEvidenceDispatcher:
     }, None
 
 
-def test_workflow_evidence_projection_registers_without_model_leak() -> None:
+def test_workflow_evidence_projection_does_not_leak_to_model_or_durable_event() -> None:
   runner = AgentRunner(
     event_log=EventLog(session_id="test"),
     dispatcher=_WorkflowEvidenceDispatcher(),  # type: ignore[arg-type]
@@ -1218,15 +1218,6 @@ def test_workflow_evidence_projection_registers_without_model_leak() -> None:
   events = [entry.event for entry in runner._log.entries]
   complete = next(event for event in events if event.get("type") == "tool_call_complete")
   assert "_workflow_evidence_projection" not in complete["result"]
-  assert runner._workflow_evidence_provenance == {
-    "workflow-1": {
-      "workflow_run_id": "workflow-1",
-      "evidence_tools": ["filings_search", "get_financials"],
-      "observed_sources": [
-        {"source_kind": "filing", "document_id": "edgar:1"},
-      ],
-    },
-  }
 
 
 def test_workflow_evidence_projection_reaches_the_tool_result_hook() -> None:

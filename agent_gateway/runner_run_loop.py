@@ -104,11 +104,6 @@ from .task_registry import (
   TaskState,
   format_parent_messages_for_model,
 )
-from .workflow_evidence_provenance import (
-  guard_visible_tools_used as _guard_visible_tools_used,
-)
-
-
 log = logging.getLogger("agent_gateway.runner")
 
 
@@ -1059,7 +1054,6 @@ class RunnerRunLoopMixin:
       delivery_turn_compelled = False
       unread_handle_reminded_task_ids: set[str] = set()
       tools_used: List[str] = []
-      final_answer_guard_fired = False
       max_tokens_continuations = 0
       max_tokens_continuation_pending = False
       is_child_logical_response = self._role == "sub_agent"
@@ -2045,62 +2039,6 @@ class RunnerRunLoopMixin:
         if not turn.tool_uses:
           if turn.stop_reason == "end_turn" and bool(turn.full_text.strip()):
             learning_real_final_response = True
-          final_answer_guard_allowed = turn.stop_reason not in {"max_tokens", "pause_turn", "compaction"}
-          if (
-            final_answer_guard_allowed
-            and not final_answer_guard_fired
-            and self._final_answer_guard is not None
-          ):
-            guard_message = self._final_answer_guard(
-              current_messages,
-              turn.full_text,
-              # Registered workflow-child evidence is verified provenance:
-              # merge it into the guard's tools view so already-performed
-              # workflow retrieval is not re-demanded from the parent.
-              _guard_visible_tools_used(
-                tools_used,
-                getattr(
-                  self,
-                  "_workflow_evidence_provenance",
-                  {},
-                ).values(),
-              ),
-              list(base_kwargs.get("tools") or []),
-              turn_count,
-            )
-            if guard_message:
-              final_answer_guard_fired = True
-              # The guard rejects this draft and starts a revised logical
-              # response. Never splice a prior max_tokens prefix across that
-              # semantic boundary.
-              reset_logical_response_lineage()
-              logger.info("[%s] Final-answer guard injected follow-up before completing turn", self._sid)
-              runtime_guard_event = build_runtime_guard_event(guard="final_answer", message=guard_message)
-              self._append(runtime_guard_event)
-              durable_runtime_guard_event = dict(runtime_guard_event)
-              durable_runtime_guard_event.update(
-                {
-                  "draft_content_blocks": list(turn.content_blocks),
-                  "draft_stop_reason": turn.stop_reason,
-                  "draft_model": upstream_model,
-                  "draft_provider": self._provider.name,
-                  "draft_usage": dict(turn_usage_payload),
-                }
-              )
-              await self._append_durable_event(durable_runtime_guard_event)
-              current_messages.append(
-                assistant_turn_message(
-                  turn.content_blocks,
-                  provider=self._provider.name,
-                  model=upstream_model,
-                  stop_reason=turn.stop_reason,
-                )
-              )
-              current_messages.append(user_turn_message(guard_message))
-              if exceeded_state is not None:
-                await emit_budget_exceeded_stop(exceeded_state)
-                break
-              continue
           await persist_assistant_message_once()
           if exceeded_state is not None:
             await emit_budget_exceeded_stop(exceeded_state)

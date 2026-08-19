@@ -1,9 +1,8 @@
-"""Compact verified workflow-evidence projection for parent-runner provenance.
+"""Compact verified workflow-evidence projection for parent citation provenance.
 
 Workflow children retain typed source observations and tool names in their
-durable ``TaskResult.evidence``. The parent runner's final-answer guard sees
-only the parent's flat ``tools_used`` list, so child evidence was invisible and
-the parent re-did retrieval that the workflow had already performed.
+durable ``TaskResult.evidence``. Parent citation validation needs the observed
+sources even though the workflow result keeps this runtime provenance private.
 
 This module owns the runtime-only bridge:
 
@@ -12,8 +11,8 @@ This module owns the runtime-only bridge:
   prose or transcripts);
 - the projection rides the ``workflow_run`` tool result under a private key
   that the runner strips before the model or the durable log can see it;
-- the runner registers the projection as provenance and merges its evidence
-  tool names into the guard's view of ``tools_used``.
+- the runner passes the projection to the tool-result hook so the parent source
+  registry can be seeded from what the children actually read.
 
 Agents never author any part of this projection. It is a bounded projection
 over already-durable run state, not a new receipt or ledger artifact.
@@ -21,7 +20,7 @@ over already-durable run state, not a new receipt or ledger artifact.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 
@@ -29,11 +28,6 @@ WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY = "_workflow_evidence_projection"
 
 _MAX_OBSERVED_SOURCES = 256
 _MAX_EVIDENCE_TOOLS = 128
-
-# Child arithmetic verification proves the child's own computation, not the
-# parent's final derived arithmetic, so it never carries over as provenance.
-_NON_TRANSFERABLE_EVIDENCE_TOOLS = frozenset({"code_execute"})
-
 
 def collect_child_evidence(
   results: Sequence[Any],
@@ -134,82 +128,9 @@ def build_child_evidence_projection(result: Any) -> dict[str, Any] | None:
   }
 
 
-def register_workflow_evidence_projection(
-  store: dict[str, dict[str, Any]],
-  payload: Any,
-) -> None:
-  """Record one runtime-built projection, keyed by workflow run identity.
-
-  Invalid payloads are dropped whole: registration fails closed to "no
-  provenance" rather than admitting a partially trusted record.
-  """
-
-  if not isinstance(payload, Mapping):
-    return
-  run_id = str(payload.get("workflow_run_id") or "").strip()
-  if not run_id:
-    return
-  raw_tools = payload.get("evidence_tools")
-  raw_sources = payload.get("observed_sources")
-  if not isinstance(raw_tools, list) or not isinstance(raw_sources, list):
-    return
-  evidence_tools: list[str] = []
-  seen_tools: set[str] = set()
-  for tool_name in raw_tools[:_MAX_EVIDENCE_TOOLS]:
-    name = str(tool_name or "").strip()
-    if name and name not in seen_tools:
-      seen_tools.add(name)
-      evidence_tools.append(name)
-  observed_sources = [
-    dict(record)
-    for record in raw_sources[:_MAX_OBSERVED_SOURCES]
-    if isinstance(record, Mapping)
-    and str(record.get("source_kind") or "").strip()
-    and str(record.get("document_id") or "").strip()
-  ]
-  if not evidence_tools and not observed_sources:
-    return
-  store[run_id] = {
-    "workflow_run_id": run_id,
-    "evidence_tools": evidence_tools,
-    "observed_sources": observed_sources,
-  }
-
-
-def guard_visible_tools_used(
-  tools_used: Iterable[str],
-  projections: Iterable[Mapping[str, Any]],
-) -> list[str]:
-  """Merge registered workflow evidence into the guard's tools view.
-
-  The final-answer guard reasons over tool-name sets, so verified child
-  retrieval provenance is exposed as additional tool names. The merge is
-  order-preserving and deduplicated; non-transferable verification tools are
-  excluded so the guard still demands parent-side arithmetic verification.
-  """
-
-  merged = [str(name) for name in tools_used]
-  seen = set(merged)
-  for projection in projections:
-    raw_tools = projection.get("evidence_tools")
-    for tool_name in raw_tools if isinstance(raw_tools, list) else []:
-      name = str(tool_name or "").strip()
-      if (
-        not name
-        or name in seen
-        or name in _NON_TRANSFERABLE_EVIDENCE_TOOLS
-      ):
-        continue
-      seen.add(name)
-      merged.append(name)
-  return merged
-
-
 __all__ = [
   "WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY",
   "build_child_evidence_projection",
   "build_workflow_evidence_projection",
   "collect_child_evidence",
-  "guard_visible_tools_used",
-  "register_workflow_evidence_projection",
 ]

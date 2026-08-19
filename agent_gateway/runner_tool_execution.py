@@ -41,7 +41,6 @@ from .tool_dispatch_classification import (
 )
 from .workflow_evidence_provenance import (
   WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY as _WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY,
-  register_workflow_evidence_projection as _register_workflow_evidence_projection,
 )
 from .workflow_output_attachment import (
   WorkflowOutputAttachment,
@@ -706,10 +705,6 @@ class RunnerToolExecutionMixin:
           None,
         )
         if isinstance(popped_workflow_evidence, dict):
-          _register_workflow_evidence_projection(
-            getattr(self, "_workflow_evidence_provenance", {}),
-            popped_workflow_evidence,
-          )
           # The private key is popped before the tool-result hooks run, so the
           # citation hook can never see the projection on the result itself.
           # Hand it forward on the context instead, so the parent registry can

@@ -1165,7 +1165,9 @@ def test_transcript_reconstructs_messages_and_preserves_thinking(tmp_path: Path)
   assert messages[2]["content"][0]["tool_use_id"] == "tool-a"
 
 
-def test_transcript_reconstructs_final_answer_guard_draft(tmp_path: Path) -> None:
+def test_transcript_reconstructs_historical_final_answer_draft_as_assistant_only(
+  tmp_path: Path,
+) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "guard-draft-transcript.jsonl")
   child_runner_id = "runner-child-guard"
   _run(
@@ -1217,10 +1219,6 @@ def test_transcript_reconstructs_final_answer_guard_draft(tmp_path: Path) -> Non
       "model": "claude-sonnet-4-6",
       "stop_reason": "end_turn",
       "provider": "anthropic",
-    },
-    {
-      "role": "user",
-      "content": "Verify the arithmetic with code_execute before final.",
     },
   ]
 

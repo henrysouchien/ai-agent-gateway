@@ -89,7 +89,9 @@ def test_context_builder_missing_regime_does_not_crash(tmp_path: Path) -> None:
   assert "Regime:" not in messages[0]["content"]
 
 
-def test_context_builder_replays_final_answer_guard_draft(tmp_path: Path) -> None:
+def test_context_builder_replays_historical_final_answer_draft_as_assistant_only(
+  tmp_path: Path,
+) -> None:
   log = AgentSessionLog(path=tmp_path / "sessions" / "guard-draft.jsonl")
   _run(
     log.append(
@@ -114,10 +116,6 @@ def test_context_builder_replays_final_answer_guard_draft(tmp_path: Path) -> Non
       "model": "claude-sonnet-4-6",
       "stop_reason": "end_turn",
       "provider": "anthropic",
-    },
-    {
-      "role": "user",
-      "content": "Verify the arithmetic with code_execute before final.",
     },
   ]
 

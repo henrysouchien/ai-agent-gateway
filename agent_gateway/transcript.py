@@ -232,9 +232,6 @@ def _messages_from_runtime_guard_event(event: dict[str, Any]) -> list[Message]:
     if event.get("draft_provider"):
       draft_message["provider"] = event["draft_provider"]
     messages.append(draft_message)
-  guard_message = event.get("message")
-  if isinstance(guard_message, str) and guard_message:
-    messages.append({"role": "user", "content": guard_message})
   return messages
 
 

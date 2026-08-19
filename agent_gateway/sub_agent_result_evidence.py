@@ -304,8 +304,8 @@ def collect_sub_agent_result_evidence(
 
   Live runner logs expose per-turn ``turn_complete`` deltas and normally finish
   with an authoritative ``stream_complete`` total. Durable logs instead retain
-  assistant-message usage; guarded drafts carry the same delta on
-  ``runtime_guard`` because no assistant message is committed for that draft.
+  assistant-message usage; historical final-answer drafts carry the same delta
+  on ``runtime_guard`` because no assistant message was committed for them.
   """
 
   entry_list = list(entries)

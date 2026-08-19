@@ -25,8 +25,6 @@ from agent_gateway.workflow_evidence_provenance import (
   build_child_evidence_projection,
   build_workflow_evidence_projection,
   collect_child_evidence,
-  guard_visible_tools_used,
-  register_workflow_evidence_projection,
 )
 
 
@@ -240,60 +238,6 @@ def test_child_evidence_collection_is_capped_and_deduplicated() -> None:
   assert len(observed_sources) == 256
   assert len(set(evidence_tools)) == len(evidence_tools)
   assert len({record["document_id"] for record in observed_sources}) == len(observed_sources)
-
-
-def test_registration_validates_and_keys_by_run_identity() -> None:
-  store: dict[str, dict[str, object]] = {}
-  register_workflow_evidence_projection(store, None)
-  register_workflow_evidence_projection(store, {"workflow_run_id": ""})
-  register_workflow_evidence_projection(
-    store,
-    {"workflow_run_id": "workflow-1", "evidence_tools": "filings_search"},
-  )
-  assert store == {}
-
-  register_workflow_evidence_projection(
-    store,
-    {
-      "workflow_run_id": "workflow-1",
-      "evidence_tools": ["filings_search", "filings_search", ""],
-      "observed_sources": [
-        {"source_kind": "filing", "document_id": "edgar:1"},
-        {"source_kind": "", "document_id": "edgar:2"},
-        "not-a-record",
-      ],
-    },
-  )
-
-  assert store["workflow-1"]["evidence_tools"] == ["filings_search"]
-  assert store["workflow-1"]["observed_sources"] == [
-    {"source_kind": "filing", "document_id": "edgar:1"},
-  ]
-
-
-def test_guard_receives_workflow_evidence_projection() -> None:
-  store: dict[str, dict[str, object]] = {}
-  register_workflow_evidence_projection(
-    store,
-    {
-      "workflow_run_id": "workflow-1",
-      "evidence_tools": ["filings_search", "get_financials", "code_execute"],
-      "observed_sources": [
-        {"source_kind": "filing", "document_id": "edgar:1"},
-      ],
-    },
-  )
-
-  merged = guard_visible_tools_used(["workflow_run"], store.values())
-
-  # Child retrieval provenance is visible; child arithmetic verification is
-  # not transferable to the parent's final arithmetic.
-  assert merged == ["workflow_run", "filings_search", "get_financials"]
-  assert "code_execute" not in merged
-
-
-def test_guard_view_is_unchanged_without_registered_provenance() -> None:
-  assert guard_visible_tools_used(["filings_read"], ()) == ["filings_read"]
 
 
 def test_private_result_key_is_stable() -> None:

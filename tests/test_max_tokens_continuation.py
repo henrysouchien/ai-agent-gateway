@@ -73,7 +73,6 @@ def _make_runner(
   provider: _StubProvider,
   *,
   auth_config: dict[str, Any] | None = None,
-  final_answer_guard: Any | None = None,
   session_id: str = "sess-max-tokens",
   agent_session_log: AgentSessionLog | None = None,
   message_inbox: asyncio.Queue[ParentMessage] | None = None,
@@ -95,7 +94,6 @@ def _make_runner(
       auth_config=auth_config,
     ),
     get_tool_definitions=lambda: [],
-    final_answer_guard=final_answer_guard,
     agent_session_log=agent_session_log,
     message_inbox=message_inbox,
     user_id="alice",
@@ -139,105 +137,6 @@ def test_max_tokens_turn_with_no_tool_use_continues_with_nudge() -> None:
     replayed_assistant = follow_up[-2]
     assert replayed_assistant["role"] == "assistant"
     assert all(block.get("type") != "tool_use" for block in replayed_assistant["content"])
-
-  _run(_case())
-
-
-def test_max_tokens_turn_bypasses_final_answer_guard_until_continuation() -> None:
-  async def _case() -> None:
-    guard_turns: list[int] = []
-
-    def guard(messages, answer_text, tools_used, tool_definitions, turn_count):
-      _ = messages, answer_text, tools_used, tool_definitions
-      guard_turns.append(turn_count)
-      return "verify before final" if turn_count == 1 else None
-
-    runner = _make_runner(_StubProvider(), final_answer_guard=guard)
-    seen_messages: list[list[dict[str, Any]]] = []
-
-    async def _fake_stream_turn(**kwargs: Any):
-      seen_messages.append(list(kwargs["current_messages"]))
-      if len(seen_messages) == 1:
-        return object(), StreamTurnResult(
-          full_text="truncated 43.5 / 47.0 - 1",
-          stop_reason="max_tokens",
-          content_blocks=[{"type": "text", "text": "truncated 43.5 / 47.0 - 1"}],
-        )
-      return object(), StreamTurnResult(
-        full_text="done",
-        stop_reason="end_turn",
-        content_blocks=[{"type": "text", "text": "done"}],
-      )
-
-    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
-    await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
-
-    assert len(seen_messages) == 2
-    assert seen_messages[1][-1] == {"role": "user", "content": _MAX_TOKENS_NUDGE}
-    assert guard_turns == [2]
-
-  _run(_case())
-
-
-def test_final_answer_guard_starts_new_logical_response_lineage(
-  tmp_path: Path,
-) -> None:
-  async def _case() -> None:
-    guard_calls = 0
-
-    def guard(*_args: Any) -> str | None:
-      nonlocal guard_calls
-      guard_calls += 1
-      return "revise the draft" if guard_calls == 1 else None
-
-    durable_log = AgentSessionLog(tmp_path / "guard.jsonl")
-    runner = _make_runner(
-      _StubProvider(),
-      final_answer_guard=guard,
-      agent_session_log=durable_log,
-    )
-    calls = 0
-
-    async def _fake_stream_turn(**_kwargs: Any):
-      nonlocal calls
-      calls += 1
-      if calls == 1:
-        return object(), StreamTurnResult(
-          full_text="prefix",
-          stop_reason="max_tokens",
-          content_blocks=[{"type": "text", "text": "prefix"}],
-        )
-      if calls == 2:
-        return object(), StreamTurnResult(
-          full_text="rejected draft",
-          stop_reason="end_turn",
-          content_blocks=[{"type": "text", "text": "rejected draft"}],
-        )
-      return object(), StreamTurnResult(
-        full_text="revised final",
-        stop_reason="end_turn",
-        content_blocks=[{"type": "text", "text": "revised final"}],
-      )
-
-    runner._stream_turn = _fake_stream_turn  # type: ignore[method-assign]
-    await runner.run(
-      messages=[{"role": "user", "content": "Start"}],
-      system_prompt="x",
-    )
-
-    entries, _ = await durable_log.query(
-      event_types={"assistant_message"},
-      runner_id=runner._runner_id,
-      order="asc",
-    )
-    assert len(entries) == 2
-    assert entries[0].event["stop_reason"] == "max_tokens"
-    assert entries[1].event["stop_reason"] == "end_turn"
-    assert entries[0].event["logical_response_id"] != (
-      entries[1].event["logical_response_id"]
-    )
-    assert entries[1].event["logical_response_segment_ordinal"] == 0
-    assert "continued_from_assistant_message_seq" not in entries[1].event
 
   _run(_case())
 

@@ -413,9 +413,6 @@ class SessionContextBuilder:
         if event.get("draft_provider"):
           draft_message["provider"] = event["draft_provider"]
         messages.append(draft_message)
-      guard_message = event.get("message")
-      if isinstance(guard_message, str) and guard_message:
-        messages.append({"role": "user", "content": guard_message})
       return messages or None
 
     if event_type == "tool_call_complete":

@@ -893,7 +893,7 @@ def test_reconciliation_failure_is_nonfatal_observable_and_summary_still_runs() 
   assert metrics == [("gateway.commercial_usage_reconciliation_error", 1)]
 
 
-class _TwoTurnTextProvider(_UsageProvider):
+class _OneTurnTextProvider(_UsageProvider):
   def __init__(self) -> None:
     self.requests: list[list[dict[str, Any]]] = []
 
@@ -912,9 +912,9 @@ class _TwoTurnTextProvider(_UsageProvider):
     return {"call_index": len(self.requests)}
 
   async def stream(self, client: Any, params: dict[str, Any]):
-    _ = client
+    _ = client, params
     yield StreamEvent(type="message_start", input_tokens=10)
-    text = "rough 25 bps" if params["call_index"] == 1 else "verified 26.1 bps"
+    text = "rough 25 bps"
     yield StreamEvent(type="text_delta", text=text)
     yield StreamEvent(type="text_end", raw_block={"type": "text", "text": text})
     yield StreamEvent(type="usage_update", output_tokens=5)
@@ -1055,21 +1055,16 @@ def test_runner_build_usage_event_preserves_timestamp_and_cost_delegates(
   assert event.provider == "stub"
 
 
-def test_final_answer_guard_can_inject_follow_up_turn() -> None:
+def test_no_tool_final_answer_completes_in_one_provider_request_without_guard() -> None:
   event_log = EventLog()
-  provider = _TwoTurnTextProvider()
+  provider = _OneTurnTextProvider()
   durable_events: list[dict[str, Any]] = []
-
-  def guard(messages, answer_text, tools_used, tool_definitions, turn_count):
-    _ = messages, answer_text, tools_used, tool_definitions
-    return "verify with tools before final" if turn_count == 1 else None
 
   runner = AgentRunner(
     event_log=event_log,
     dispatcher=_make_dispatcher(event_log),
     session_id="sess-parent",
     capability_execution=_runner_execution(provider),
-    final_answer_guard=guard,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -1083,126 +1078,16 @@ def test_final_answer_guard_can_inject_follow_up_turn() -> None:
 
   _run(runner.run(messages=[{"role": "user", "content": "compare margin bps"}]))
 
-  assert len(provider.requests) == 2
-  assert provider.requests[1][-1] == {"role": "user", "content": "verify with tools before final"}
-  assert any(entry.event.get("type") == "runtime_guard" for entry in event_log.entries)
+  assert len(provider.requests) == 1
+  assert not any(entry.event.get("type") == "runtime_guard" for entry in event_log.entries)
   assistant_messages = [
     event
     for event in durable_events
     if event.get("type") == "assistant_message"
   ]
-  runtime_guard_events = [
-    event
-    for event in durable_events
-    if event.get("type") == "runtime_guard"
-  ]
   assert len(assistant_messages) == 1
-  assert assistant_messages[0]["content_blocks"] == [{"type": "text", "text": "verified 26.1 bps"}]
-  assert len(runtime_guard_events) == 1
-  assert runtime_guard_events[0]["draft_content_blocks"] == [{"type": "text", "text": "rough 25 bps"}]
-  assert runtime_guard_events[0]["draft_usage"] == {
-    "input_tokens": 10,
-    "output_tokens": 5,
-    "reasoning_tokens_observed": 0,
-    "provider_units": 0,
-    "provider_unit_deltas": {},
-    "cache_read_input_tokens": 0,
-    "cache_creation_input_tokens": 0,
-    "estimated_cost": 0.0,
-    "capability_bind": runner.capability_execution.bind.receipt(),
-  }
-
-
-def test_final_answer_guard_records_draft_before_budget_stop() -> None:
-  event_log = EventLog()
-  provider = _TwoTurnTextProvider()
-  durable_events: list[dict[str, Any]] = []
-
-  def guard(messages, answer_text, tools_used, tool_definitions, turn_count):
-    _ = messages, answer_text, tools_used, tool_definitions
-    return "verify with tools before final" if turn_count == 1 else None
-
-  runner = AgentRunner(
-    event_log=event_log,
-    dispatcher=_make_dispatcher(event_log),
-    session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
-    final_answer_guard=guard,
-    user_id="alice",
-    billing_mode="byok",
-    rate_table_version="unknown",
-    max_budget_usd=0.002,
-  )
-
-  async def _append_durable_event(event: dict[str, Any]):
-    durable_events.append(dict(event))
-    runner._last_durable_seq = len(durable_events)
-    return SimpleNamespace(seq=len(durable_events))
-
-  runner._append_durable_event = _append_durable_event  # type: ignore[method-assign]
-
-  _run(runner.run(messages=[{"role": "user", "content": "compare margin bps"}]))
-
-  assert len(provider.requests) == 1
-  assert any(entry.event.get("type") == "budget_exceeded" for entry in event_log.entries)
-  assert [
-    event for event in durable_events if event.get("type") == "assistant_message"
-  ] == []
-  runtime_guard_events = [
-    event
-    for event in durable_events
-    if event.get("type") == "runtime_guard"
-  ]
-  assert len(runtime_guard_events) == 1
-  assert runtime_guard_events[0]["draft_content_blocks"] == [{"type": "text", "text": "rough 25 bps"}]
-
-
-def test_final_answer_guard_records_draft_before_operator_pause() -> None:
-  event_log = EventLog()
-  provider = _TwoTurnTextProvider()
-  durable_events: list[dict[str, Any]] = []
-  pause_event = asyncio.Event()
-
-  def guard(messages, answer_text, tools_used, tool_definitions, turn_count):
-    _ = messages, answer_text, tools_used, tool_definitions
-    if turn_count == 1:
-      pause_event.set()
-      return "verify with tools before final"
-    return None
-
-  runner = AgentRunner(
-    event_log=event_log,
-    dispatcher=_make_dispatcher(event_log),
-    session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
-    final_answer_guard=guard,
-    operator_pause_event=pause_event,
-    user_id="alice",
-    billing_mode="byok",
-    rate_table_version="unknown",
-  )
-
-  async def _append_durable_event(event: dict[str, Any]):
-    durable_events.append(dict(event))
-    runner._last_durable_seq = len(durable_events)
-    return SimpleNamespace(seq=len(durable_events))
-
-  runner._append_durable_event = _append_durable_event  # type: ignore[method-assign]
-
-  _run(runner.run(messages=[{"role": "user", "content": "compare margin bps"}]))
-
-  assert len(provider.requests) == 1
-  assert any(entry.event.get("type") == "operator_pause" for entry in event_log.entries)
-  assert [
-    event for event in durable_events if event.get("type") == "assistant_message"
-  ] == []
-  runtime_guard_events = [
-    event
-    for event in durable_events
-    if event.get("type") == "runtime_guard"
-  ]
-  assert len(runtime_guard_events) == 1
-  assert runtime_guard_events[0]["draft_content_blocks"] == [{"type": "text", "text": "rough 25 bps"}]
+  assert assistant_messages[0]["content_blocks"] == [{"type": "text", "text": "rough 25 bps"}]
+  assert not any(event.get("type") == "runtime_guard" for event in durable_events)
 
 
 def test_on_usage_fires_once_per_turn_with_usage_event_fields() -> None:
@@ -1898,41 +1783,3 @@ def test_failed_response_usage_reaches_runner_as_failed_billable() -> None:
   assert any(output > 0 for _, output, _ in states), (
     f"failed response billed zero output tokens: {states}"
   )
-
-
-def test_final_answer_guard_receives_registered_workflow_evidence() -> None:
-  event_log = EventLog()
-  provider = _TwoTurnTextProvider()
-  guard_tools_views: list[list[str]] = []
-
-  def guard(messages, answer_text, tools_used, tool_definitions, turn_count):
-    _ = messages, answer_text, tool_definitions, turn_count
-    guard_tools_views.append(list(tools_used))
-    return None
-
-  runner = AgentRunner(
-    event_log=event_log,
-    dispatcher=_make_dispatcher(event_log),
-    session_id="sess-parent",
-    capability_execution=_runner_execution(provider),
-    final_answer_guard=guard,
-    user_id="alice",
-    billing_mode="byok",
-    rate_table_version="unknown",
-  )
-  runner._workflow_evidence_provenance["workflow-1"] = {
-    "workflow_run_id": "workflow-1",
-    "evidence_tools": ["filings_search", "get_financials", "code_execute"],
-    "observed_sources": [
-      {"source_kind": "filing", "document_id": "edgar:1"},
-    ],
-  }
-
-  _run(runner.run(messages=[{"role": "user", "content": "compare margin bps"}]))
-
-  assert guard_tools_views
-  merged = guard_tools_views[0]
-  assert "filings_search" in merged
-  assert "get_financials" in merged
-  # Child arithmetic verification never transfers to the parent's final math.
-  assert "code_execute" not in merged

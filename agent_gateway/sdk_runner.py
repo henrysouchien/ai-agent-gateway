@@ -1168,8 +1168,8 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       else:
         result.pop("_load_servers", None)
         result.pop("_load_transaction_id", None)
-      # The SDK runner has no final-answer guard; the runtime projection is
-      # stripped so it never reaches the model or the durable transcript.
+      # This runtime citation projection is private, so strip it before the
+      # result reaches the model or the durable transcript.
       result.pop(_WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY, None)
       self._activate_skill_report_doors(result.pop(_ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY, None))
       self._activate_skill_allow(result.pop(_ACTIVE_SKILL_ALLOW_RESULT_KEY, None))

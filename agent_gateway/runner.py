@@ -192,12 +192,6 @@ _ACTIVE_SKILL_REPORT_DOORS_RESULT_KEY = "_active_skill_report_doors"
 # Report doors are the only auto-clear doors in scope and normally return noop;
 # staged is included defensively for preview-mode doors that stage artifacts.
 _REPORT_DOOR_CLEAR_SUCCESS_STATUSES = frozenset({"noop", "staged"})
-FinalAnswerGuard = Callable[
-  [List[Dict[str, Any]], str, List[str], List[Dict[str, Any]], int],
-  str | None,
-]
-
-
 OnToolResult = Callable[[ToolResultContext], Awaitable[List[Dict[str, Any]] | None]]
 OnUsage = Callable[[UsageEvent], Awaitable[None] | None]
 OnSessionSummary = Callable[[SessionUsageSummary], Awaitable[None] | None]
@@ -301,7 +295,6 @@ class AgentRunner(
     compaction_instructions: str | None = None,
     tool_call_timeout: float | None = 120.0,
     on_max_turns: OnMaxTurns | None = None,
-    final_answer_guard: FinalAnswerGuard | None = None,
     max_budget_usd: float | None = None,
     _cost_accumulator: CostAccumulator | None = None,
     _parent_aggregator: _UsageAggregator | None = None,
@@ -565,7 +558,6 @@ class AgentRunner(
     self._portable_compaction_floor_warned = False
     self._tool_call_timeout = tool_call_timeout
     self._on_max_turns = on_max_turns
-    self._final_answer_guard = final_answer_guard
     self._max_budget_usd = max_budget_usd if max_budget_usd is not None else (
       _cost_accumulator.budget if _cost_accumulator is not None else None
     )
@@ -723,9 +715,6 @@ class AgentRunner(
       str,
       WorkflowOutputAttachment,
     ] = {}
-    # Runtime-owned verified workflow evidence projections keyed by
-    # workflow_run_id; the final-answer guard consumes these as provenance.
-    self._workflow_evidence_provenance: dict[str, dict[str, Any]] = {}
     self._task_registry_rebuild_lock = asyncio.Lock()
     self._task_registry_rebuilt = False
     self._top_level_skill_started_event: dict[str, Any] | None = None
