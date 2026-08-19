@@ -337,6 +337,7 @@ def test_commercial_reconciliation_shipper_runs_for_app_lifecycle() -> None:
 
 
 def test_commercial_authority_additive_v1_catches_up_before_easy_startup(
+  monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
   class Client:
@@ -367,6 +368,12 @@ def test_commercial_authority_additive_v1_catches_up_before_easy_startup(
         "next_sequence": cursor,
         "high_water_sequence": cursor,
       }
+
+  user_data_dir = tmp_path / "user-data"
+  gateway_state_dir = user_data_dir / "gateway"
+  user_data_dir.mkdir(mode=0o700)
+  gateway_state_dir.mkdir(mode=0o700)
+  monkeypatch.setenv("USER_DATA_DIR", str(user_data_dir))
 
   cursor_path = tmp_path / "authority.cursor.json"
   subscriber = CommercialAuthoritySubscriber(
