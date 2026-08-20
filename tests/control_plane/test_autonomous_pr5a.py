@@ -56,6 +56,7 @@ from .manifest_helpers import TASK_MANIFEST_VERSION, write_v6_manifest
 
 API_KEY = "autonomous-pr5a-key"
 HMAC_KEY = "autonomous-pr5a-hmac-key-at-least-32-bytes"
+API_DIR = Path(__file__).resolve().parents[4] / "api"
 _MODEL_ENTRY = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5")
 _SERVICE_HANDLE = CredentialHandle(
   handle_id="service:test-product:anthropic",
@@ -274,6 +275,7 @@ def _make_app(
   control_skills_dir: Path | None = None,
   dispatch_scope_validator: Any | None = None,
   claim_signing_authority_installed: bool = True,
+  autonomous_api_dir: Path = API_DIR,
 ):
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(tmp_path / "autonomous-logs"))
@@ -295,6 +297,7 @@ def _make_app(
       model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
       autonomous_capability_binding_resolver=_autonomous_capability_binding,
+      autonomous_api_dir=autonomous_api_dir,
       control_skills_dir=control_skills_dir,
       dispatch_scope_validator=dispatch_scope_validator,
       claim_signing_authority=(
@@ -310,6 +313,24 @@ def _autonomous_log_dir(tmp_path: Path) -> Path:
   path = tmp_path / "autonomous-logs"
   path.mkdir(parents=True, exist_ok=True)
   return path
+
+
+def test_gateway_app_without_autonomous_api_dir_retains_source_default(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway.server_artifact_helpers import _default_autonomous_api_dir
+
+  app = _make_app(
+    monkeypatch,
+    tmp_path,
+    autonomous_api_dir=None,
+  )
+
+  assert (
+    app.state.subprocess_registry._api_dir.resolve()
+    == _default_autonomous_api_dir().resolve()
+  )
 
 
 def _write_rehydrate_manifest(
@@ -499,7 +520,11 @@ def test_autonomous_resume_uses_live_role_in_both_directions(
     assert "ANALYST_DEV_MODE" not in envs[1]
 
 
-def _install_fake_spawn(monkeypatch) -> tuple[list[_FakeAutonomousProcess], list[dict[str, str]]]:
+def _install_fake_spawn(
+  monkeypatch,
+  *,
+  invocations: list[dict[str, Any]] | None = None,
+) -> tuple[list[_FakeAutonomousProcess], list[dict[str, str]]]:
   from agent_gateway import autonomous_runner
 
   processes: list[_FakeAutonomousProcess] = []
@@ -517,6 +542,8 @@ def _install_fake_spawn(monkeypatch) -> tuple[list[_FakeAutonomousProcess], list
     process.retain_inherited_fds(tuple(kwargs["pass_fds"][1:]))
     processes.append(process)
     envs.append(dict(kwargs["env"]))
+    if invocations is not None:
+      invocations.append(dict(kwargs))
     return process
 
   monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
@@ -841,7 +868,11 @@ def test_autonomous_control_route_requires_and_uses_installed_claim_authority(
 
 
 def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_path) -> None:
-  _processes, envs = _install_fake_spawn(monkeypatch)
+  invocations: list[dict[str, Any]] = []
+  _processes, envs = _install_fake_spawn(
+    monkeypatch,
+    invocations=invocations,
+  )
   monkeypatch.setenv(
     "GATEWAY_USER_KEYS",
     json.dumps([
@@ -852,10 +883,37 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
         "email": "henry@example.com",
         "risk_user_id": 1,
         "role": "owner",
-      }
+      },
+      {
+        "key": "other-user-key",
+        "channel": "mcp",
+        "slug": "other",
+        "email": "other@example.com",
+        "risk_user_id": 2,
+        "role": "owner",
+      },
     ]),
   )
-  app = _make_app(monkeypatch, tmp_path)
+  application_api_dir = tmp_path / "installed-application-api"
+  application_api_dir.mkdir()
+  (application_api_dir / "user_identity.py").write_text(
+    """
+import json
+import os
+
+def get_mcp_user_key_entry(user_id, user_email=None):
+  for entry in json.loads(os.environ.get("GATEWAY_USER_KEYS", "[]")):
+    if entry.get("slug") == user_id or entry.get("email") == user_email:
+      return dict(entry)
+  return None
+""".lstrip(),
+    encoding="utf-8",
+  )
+  app = _make_app(
+    monkeypatch,
+    tmp_path,
+    autonomous_api_dir=application_api_dir,
+  )
 
   with TestClient(app) as client:
     henry_mcp = _control_session(client, "henry", email="henry@example.com")
@@ -865,6 +923,8 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
     assert henry_mcp["user_id"] == "1"
     assert henry_mcp["user_slug"] == "henry"
     assert henry_web["user_id"] == "1"
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.delitem(sys.modules, "user_identity", raising=False)
 
     start = client.post(
       "/api/control/runs",
@@ -901,6 +961,17 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
     assert authority.raw_user_id == "henry"
     assert "AUTONOMOUS_USER_ID" not in envs[0]
     assert "AUTONOMOUS_RAW_USER_ID" not in envs[0]
+    assert Path(invocations[0]["cwd"]).resolve() == application_api_dir.resolve()
+    assert json.loads(envs[0]["GATEWAY_USER_KEYS"]) == [
+      {
+        "key": API_KEY,
+        "slug": "henry",
+        "email": "henry@example.com",
+        "risk_user_id": 1,
+        "channel": "mcp",
+        "role": "owner",
+      }
+    ]
 
     manifest = json.loads((_autonomous_log_dir(tmp_path) / "bg_0.task.json").read_text(encoding="utf-8"))
     assert manifest["manifest_version"] == TASK_MANIFEST_VERSION

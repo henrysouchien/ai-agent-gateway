@@ -825,7 +825,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   autonomous_storage_root = _default_autonomous_log_dir()
   app.state.autonomous_storage_root = autonomous_storage_root
   app.state.subprocess_registry = AutonomousRegistry(
-    api_dir=_default_autonomous_api_dir(),
+    api_dir=(
+      config.autonomous_api_dir
+      if config.autonomous_api_dir is not None
+      else _default_autonomous_api_dir()
+    ),
     tenant_id=config.tenant_id,
     python_executable=os.getenv("AGENT_GATEWAY_AUTONOMOUS_PYTHON", "").strip() or sys.executable,
     log_dir=autonomous_storage_root,

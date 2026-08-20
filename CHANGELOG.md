@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.17.1 (2026-08-20)
+
+### Fixed
+
+- Added an explicit application API-directory configuration for autonomous
+  dispatch. Wheel-installed Gateway applications no longer derive the
+  authoritative `user_identity.py` location or autonomous child working
+  directory from the package's `site-packages` path.
+
 ## 0.17.0 (2026-08-20)
 
 This is a pre-1.0 breaking-minor release. It describes the complete public

@@ -982,6 +982,10 @@ class GatewayServerConfig:
       resolves and materializes the exact profile/skill-aware session-driver
       bind before an autonomous subprocess is launched. Resume requests carry
       the persisted bind as an exact requirement.
+    autonomous_api_dir: Optional application API directory containing the
+      autonomous child entry point and authoritative `user_identity.py`.
+      Applications installed separately from this package must set it
+      explicitly; source-integrated consumers retain the legacy default.
     claim_signing_authority: Process-local claim signer loaded from a one-shot
       descriptor before the gateway application is imported.
     channel_profile_allowlist: Optional mapping from authoritative session
@@ -1083,3 +1087,4 @@ class GatewayServerConfig:
   tool_input_redactor: Optional[Callable[..., dict[str, Any]]] = None
   log_name: str = "gateway"
   prefix: str = "/api"
+  autonomous_api_dir: Path | None = None
