@@ -95,6 +95,14 @@ package delta from 0.16.2, not only the final release-preparation changes.
   `RELAY_POLICY_DENIED_MESSAGE`, `RELAY_POLICY_DENIED_SUB_CODE`, and
   `resolve_denied_provenance`.
 - Removed the caller-supplied `AgentRunner(final_answer_guard=...)` surface.
+- Removed the development-only commercial contract verifier exports
+  (`CONTRACT_FILES`, `MANIFEST_FILE`, `USAGE_V3_CONTRACT_FILES`,
+  `USAGE_V3_MANIFEST_FILE`, `packaged_contract_directory`,
+  `verify_contract_directory`, and `verify_usage_v3_contract_directory`) from
+  `agent_gateway.commercial_contract`. The verifier now lives in the source
+  checkout at `scripts/verify_commercial_contracts.py`; installed consumers
+  should validate producer-owned manifests and use the packaged contract
+  resources directly.
 - Removed product-embedded fixture, development-mode, QA, market-scan,
   orchestration-dispatch, and Excel-relay runtime facades. Tests and product
   integrations must use their real provider, control-plane, or application
