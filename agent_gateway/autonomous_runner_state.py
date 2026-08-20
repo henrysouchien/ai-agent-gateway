@@ -17,7 +17,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, TypedDict
 
 from .autonomous_event_channel import (
   AutonomousEventAcknowledgement,
@@ -36,17 +37,98 @@ from .role_validation import require_exact_role
 _AUTONOMOUS_TASK_ID_RE = re.compile(r"^bg_\d+$")
 _AUTONOMOUS_RUN_FILE_RE = re.compile(r"^bg_(\d+)\..+")
 _AUTONOMOUS_MANIFEST_FILE_RE = re.compile(r"^bg_(\d+)\.task\.json$")
-_ACTIVE_AUTONOMOUS_PROCESS_STATES = {"starting", "queued", "waiting", "running", "approval_pending", "remediating"}
-_REHYDRATED_ACTIVE_STATES = {"running", "approval_pending", "queued", "waiting", "remediating"}
-_TERMINAL_AUTONOMOUS_STATES = {
-  "completed",
-  "failed",
-  "killed",
-  "interrupted",
-  "budget_limited",
-  "budget_exceeded",
-  "blocked",
-}
+
+
+class AutonomousRunStateClassification(TypedDict):
+  active_process: bool
+  rehydrated_active: bool
+  terminal: bool
+
+
+AUTONOMOUS_RUN_STATE_CLASSIFICATION: MappingProxyType[
+  str, AutonomousRunStateClassification
+] = MappingProxyType({
+  "starting": {
+    "active_process": True,
+    "rehydrated_active": False,
+    "terminal": False,
+  },
+  "queued": {
+    "active_process": True,
+    "rehydrated_active": True,
+    "terminal": False,
+  },
+  "waiting": {
+    "active_process": True,
+    "rehydrated_active": True,
+    "terminal": False,
+  },
+  "running": {
+    "active_process": True,
+    "rehydrated_active": True,
+    "terminal": False,
+  },
+  "approval_pending": {
+    "active_process": True,
+    "rehydrated_active": True,
+    "terminal": False,
+  },
+  "remediating": {
+    "active_process": True,
+    "rehydrated_active": True,
+    "terminal": False,
+  },
+  "completed": {
+    "active_process": False,
+    "rehydrated_active": False,
+    "terminal": True,
+  },
+  "failed": {
+    "active_process": False,
+    "rehydrated_active": False,
+    "terminal": True,
+  },
+  "killed": {
+    "active_process": False,
+    "rehydrated_active": False,
+    "terminal": True,
+  },
+  "interrupted": {
+    "active_process": False,
+    "rehydrated_active": False,
+    "terminal": True,
+  },
+  "budget_limited": {
+    "active_process": False,
+    "rehydrated_active": False,
+    "terminal": True,
+  },
+  "budget_exceeded": {
+    "active_process": False,
+    "rehydrated_active": False,
+    "terminal": True,
+  },
+  "blocked": {
+    "active_process": False,
+    "rehydrated_active": False,
+    "terminal": True,
+  },
+})
+
+
+def _autonomous_states_where(
+  classifier: str,
+) -> frozenset[str]:
+  return frozenset(
+    state
+    for state, classification in AUTONOMOUS_RUN_STATE_CLASSIFICATION.items()
+    if classification[classifier]
+  )
+
+
+_ACTIVE_AUTONOMOUS_PROCESS_STATES = _autonomous_states_where("active_process")
+_REHYDRATED_ACTIVE_STATES = _autonomous_states_where("rehydrated_active")
+AUTONOMOUS_TERMINAL_STATES = _autonomous_states_where("terminal")
 _REHYDRATION_INTERRUPTED_ERROR = "gateway restarted while run was active"
 _REHYDRATE_EVENTS_SIZE_CAP_BYTES = 5 * 1024 * 1024
 _REHYDRATE_EVENTS_TAIL_LINES = 2000
@@ -1577,7 +1659,10 @@ class AutonomousRegistryStateMixin:
     ):
       self._warn_once(manifest_path, "Skipping autonomous manifest with invalid terminal_reason: %s")
       return None
-    terminal_states = _runtime_attr("_TERMINAL_AUTONOMOUS_STATES", _TERMINAL_AUTONOMOUS_STATES)
+    terminal_states = _runtime_attr(
+      "AUTONOMOUS_TERMINAL_STATES",
+      AUTONOMOUS_TERMINAL_STATES,
+    )
     rehydrated_active_states = _runtime_attr("_REHYDRATED_ACTIVE_STATES", _REHYDRATED_ACTIVE_STATES)
     terminal_outcome, terminal_error, event_terminal_reason = (
       self._terminal_event_outcome(events)
@@ -1833,6 +1918,8 @@ class AutonomousRegistryStateMixin:
 
 
 __all__ = [
+  "AUTONOMOUS_RUN_STATE_CLASSIFICATION",
+  "AUTONOMOUS_TERMINAL_STATES",
   "AutonomousRegistryStateMixin",
   "AutonomousTask",
 ]

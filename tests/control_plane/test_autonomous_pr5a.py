@@ -2786,3 +2786,167 @@ def test_agents_mcp_relay_round_trips_all_autonomous_tools(monkeypatch, tmp_path
 
     waited = asyncio.run(gateway_client.autonomous_run_wait(config, "bg_0", timeout_sec=30, poll_interval_sec=0))
     assert waited["state"] == "cancelled"
+
+
+def test_autonomous_dispatch_once_mode_rejects_task_skill_ticker_and_context(monkeypatch, tmp_path) -> None:
+  processes, envs = _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+
+    for field, value in (
+      ("skill", "earnings-review"),
+      ("task", "summarize"),
+      ("ticker", "AAPL"),
+      ("context", "extra background"),
+    ):
+      response = client.post(
+        "/api/control/runs",
+        headers=_headers(alice),
+        json={
+          "kind": "autonomous",
+          "profile": "analyst",
+          "mode": "once",
+          field: value,
+        },
+      )
+
+      assert response.status_code == 422, response.text
+      assert "mode='once' does not accept skill, task, ticker, or context" in response.text
+
+  assert app.state.subprocess_registry._tasks == {}
+  assert processes == []
+  assert envs == []
+
+
+def test_autonomous_dispatch_task_and_skill_modes_are_mutually_exclusive(monkeypatch, tmp_path) -> None:
+  processes, envs = _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+
+  cases = (
+    (
+      {"mode": "task", "task": "summarize", "skill": "earnings-review"},
+      "mode='task' does not accept skill",
+    ),
+    ({"mode": "task"}, "mode='task' requires task"),
+    ({"mode": "task", "task": "   "}, "mode='task' requires task"),
+    (
+      {"mode": "skill", "skill": "earnings-review", "task": "summarize"},
+      "mode='skill' does not accept task",
+    ),
+    ({"mode": "skill"}, "mode='skill' requires skill"),
+  )
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+
+    for overrides, expected_detail in cases:
+      response = client.post(
+        "/api/control/runs",
+        headers=_headers(alice),
+        json={"kind": "autonomous", "profile": "analyst", **overrides},
+      )
+
+      assert response.status_code == 422, response.text
+      assert expected_detail in response.text
+
+  assert app.state.subprocess_registry._tasks == {}
+  assert processes == []
+  assert envs == []
+
+
+def test_autonomous_dispatch_once_mode_accepts_the_mcp_serializer_explicit_nulls(monkeypatch, tmp_path) -> None:
+  _processes, _envs = _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+
+    response = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "once",
+        "skill": None,
+        "context": None,
+        "ticker": None,
+        "channel": None,
+        "max_budget_usd": None,
+      },
+    )
+
+    assert response.status_code == 200, response.text
+    record = app.state.subprocess_registry._tasks["bg_0"]
+    assert record.cmd == [
+      sys.executable,
+      "-m",
+      "agent.autonomous",
+      "--profile",
+      "analyst",
+    ]
+
+
+def test_autonomous_dispatch_skill_mode_keeps_ticker_and_context(monkeypatch, tmp_path) -> None:
+  _processes, _envs = _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice")
+
+    response = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "skill",
+        "skill": "earnings-review",
+        "ticker": "AAPL",
+        "context": "focus on guidance",
+      },
+    )
+
+    assert response.status_code == 200, response.text
+    record = app.state.subprocess_registry._tasks["bg_0"]
+    assert "--skill" in record.cmd
+    assert "--task" not in record.cmd
+
+
+def test_agent_run_schedule_dispatch_rejects_the_opposite_mode_field() -> None:
+  from pydantic import ValidationError
+
+  from agent_gateway.control_plane.schedules import AgentRunScheduleDispatch
+
+  assert AgentRunScheduleDispatch(
+    kind="autonomous",
+    profile="analyst",
+    mode="task",
+    task="summarize",
+  ).task == "summarize"
+  assert AgentRunScheduleDispatch(
+    kind="autonomous",
+    profile="analyst",
+    mode="skill",
+    skill="earnings-review",
+    ticker="AAPL",
+  ).skill == "earnings-review"
+
+  with pytest.raises(ValidationError, match="task-mode schedule dispatch does not accept skill"):
+    AgentRunScheduleDispatch(
+      kind="autonomous",
+      profile="analyst",
+      mode="task",
+      task="summarize",
+      skill="earnings-review",
+    )
+  with pytest.raises(ValidationError, match="skill-mode schedule dispatch does not accept task"):
+    AgentRunScheduleDispatch(
+      kind="autonomous",
+      profile="analyst",
+      mode="skill",
+      skill="earnings-review",
+      task="summarize",
+    )

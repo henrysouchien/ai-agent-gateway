@@ -289,10 +289,16 @@ class AgentRunScheduleDispatch(BaseModel):
 
   @model_validator(mode="after")
   def _require_mode_payload(self) -> "AgentRunScheduleDispatch":
-    if self.mode == "task" and not (self.task or "").strip():
-      raise ValueError("task-mode schedule dispatch requires task")
-    if self.mode == "skill" and not (self.skill or "").strip():
+    if self.mode == "task":
+      if not (self.task or "").strip():
+        raise ValueError("task-mode schedule dispatch requires task")
+      if (self.skill or "").strip():
+        raise ValueError("task-mode schedule dispatch does not accept skill")
+      return self
+    if not (self.skill or "").strip():
       raise ValueError("skill-mode schedule dispatch requires skill")
+    if (self.task or "").strip():
+      raise ValueError("skill-mode schedule dispatch does not accept task")
     return self
 
 

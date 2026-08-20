@@ -282,6 +282,9 @@ def test_dispatcher_passes_authenticated_session_instead_of_identity_override():
     manager = _manager()
     manager._mcp_tool_names = {"tool"}
     session = _gateway_session()
+    # This asserts identity plumbing on the owner path; `tool` is a synthetic
+    # name with no policy class, which invite authority denies by default.
+    session.role = "owner"
     captured = {}
 
     async def call_tool(name, tool_input, **kwargs):

@@ -4,8 +4,8 @@ from collections.abc import Collection
 from typing import Any, Callable
 
 from .autonomous_runner_state import (
+  AUTONOMOUS_TERMINAL_STATES,
   _REHYDRATED_ACTIVE_STATES,
-  _TERMINAL_AUTONOMOUS_STATES,
   AutonomousTask,
 )
 from .autonomous_control_files import find_closed_json_record
@@ -40,7 +40,7 @@ def replay_seed_events_for_record(
 def record_replay_buffer_terminated(
   record: AutonomousTask,
   *,
-  terminal_states: Collection[str] = _TERMINAL_AUTONOMOUS_STATES,
+  terminal_states: Collection[str] = AUTONOMOUS_TERMINAL_STATES,
   rehydrated_active_states: Collection[str] = _REHYDRATED_ACTIVE_STATES,
 ) -> bool:
   if record.state in terminal_states or record.state == "finished":

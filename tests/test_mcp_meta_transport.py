@@ -423,7 +423,7 @@ def test_tool_dispatcher_defaults_portfolio_scope_for_portfolio_mcp_tool() -> No
     risk_user_id=42,
     channel="web",
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
-    session=SimpleNamespace(dispatch_scope=_dispatch_scope()),
+    session=SimpleNamespace(dispatch_scope=_dispatch_scope(), role="owner"),
     get_tool_definitions=lambda: [_portfolio_tool_def()],
   )
 
@@ -448,7 +448,7 @@ def test_tool_dispatcher_defaults_portfolio_scope_for_split_portfolio_mcp_tool()
     risk_user_id=42,
     channel="web",
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
-    session=SimpleNamespace(dispatch_scope=_dispatch_scope()),
+    session=SimpleNamespace(dispatch_scope=_dispatch_scope(), role="owner"),
     get_tool_definitions=lambda: [_portfolio_tool_def()],
   )
 
@@ -470,7 +470,7 @@ def test_tool_dispatcher_preserves_explicit_portfolio_tool_input() -> None:
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
-    session=SimpleNamespace(dispatch_scope=_dispatch_scope()),
+    session=SimpleNamespace(dispatch_scope=_dispatch_scope(), role="owner"),
     get_tool_definitions=lambda: [_portfolio_tool_def()],
   )
 
@@ -489,7 +489,7 @@ def test_tool_dispatcher_defaults_when_portfolio_tool_input_is_null_or_blank() -
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
-    session=SimpleNamespace(dispatch_scope=_dispatch_scope()),
+    session=SimpleNamespace(dispatch_scope=_dispatch_scope(), role="owner"),
     get_tool_definitions=lambda: [_portfolio_tool_def()],
   )
 
@@ -517,7 +517,7 @@ def test_tool_dispatcher_skips_portfolio_default_when_schema_does_not_accept_it(
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-1",
-    session=SimpleNamespace(dispatch_scope=_dispatch_scope()),
+    session=SimpleNamespace(dispatch_scope=_dispatch_scope(), role="owner"),
     get_tool_definitions=lambda: [
       _portfolio_tool_def(properties={"format": {"type": "string"}}),
     ],
@@ -569,7 +569,7 @@ def test_runner_tool_start_event_uses_effective_dispatch_scope_input() -> None:
     risk_user_id=42,
     channel="web",
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
-    session=SimpleNamespace(dispatch_scope=_dispatch_scope()),
+    session=SimpleNamespace(dispatch_scope=_dispatch_scope(), role="owner"),
     get_tool_definitions=lambda: [_portfolio_tool_def()],
   )
   runner = AgentRunner(

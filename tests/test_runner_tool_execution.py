@@ -145,6 +145,15 @@ class _HintedErrorDispatcher:
     }
 
 
+class _ApprovalTimeoutDispatcher:
+  async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
+    _ = tool_id, tool_name, tool_input, call_index
+    return None, {
+      "code": "approval_timeout",
+      "message": "User did not respond within timeout",
+    }
+
+
 class _ReadableResourceDispatcher:
   async def dispatch(self, tool_id: str, tool_name: str, tool_input: dict[str, Any], *, call_index: int = 0):
     _ = tool_id, tool_name, tool_input, call_index
@@ -1035,6 +1044,28 @@ def test_execute_single_tool_stops_after_repeated_generic_excluded_tool() -> Non
   assert error["data"]["stop_after_tool_results"] is True
   assert runner._stop_after_tool_results_reason == "repeated_tool_excluded"
   assert runner._stop_after_tool_results_tool_name == "apply_patch_ops"
+
+
+def test_execute_single_tool_stops_after_expired_approval() -> None:
+  runner = AgentRunner(
+    event_log=EventLog(session_id="test"),
+    dispatcher=_ApprovalTimeoutDispatcher(),  # type: ignore[arg-type]
+    session_id="test-approval-timeout",
+    capability_execution=_capability_execution(),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  )
+
+  live_entry, tool_name, _extra_blocks = _run(
+    runner._execute_single_tool("tool-1", "file_write", {"path": "x"}, {"tools": []})
+  )
+
+  assert tool_name == "file_write"
+  error = json.loads(live_entry["content"])["error"]
+  assert error["code"] == "approval_timeout"
+  assert runner._stop_after_tool_results_reason == "approval_timeout"
+  assert runner._stop_after_tool_results_tool_name == "file_write"
 
 
 def test_execute_single_tool_returns_typed_blocker_for_excluded_fms_commit_tool() -> None:

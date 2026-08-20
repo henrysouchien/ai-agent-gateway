@@ -26,7 +26,7 @@ dependencies = [
 anthropic = ["anthropic>=0.93.0"]
 openai = ["openai>=2.31.0"]
 all = ["anthropic>=0.93.0", "openai>=2.31.0"]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["matplotlib", "pytest", "pytest-asyncio"]
 docs = ["mkdocs>=1.6"]
 
 [tool.setuptools.packages.find]

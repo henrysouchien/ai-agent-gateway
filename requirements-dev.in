@@ -19,6 +19,7 @@ setuptools>=68
 wheel
 
 # Dev/publish tools
+matplotlib
 pytest
 pytest-asyncio
 pytest-xdist

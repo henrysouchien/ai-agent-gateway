@@ -4,7 +4,7 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 
 ## Always (every change)
 
-- [ ] **Tests pass** — `pytest packages/agent-gateway/tests/` all green
+- [ ] **Tests pass** — `make test-agent-gateway` runs the gateway and CLI suites from their standalone package directories
 - [ ] **Existing consumer tests pass** — `pytest tests/test_code_execute.py tests/test_tool_dispatcher.py tests/test_channel_registry.py tests/test_run_agent.py` etc.
 - [ ] **New code has docstrings** — every new public function/class gets a docstring at write time
 

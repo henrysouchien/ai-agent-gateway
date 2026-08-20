@@ -534,6 +534,7 @@ class ToolDispatcher:
     *,
     call_index: int,
     tool_ctx: ToolExecutionContext,
+    own_prepared: Callable[[Any], None] | None = None,
   ) -> tuple[TrustedToolPlan, Callable[..., Any]]:
     identity_source, planner, executor = hooks
     planned = planner(tool_input, call_index=call_index, tool_ctx=tool_ctx)
@@ -544,6 +545,8 @@ class ToolDispatcher:
         "planned local handler must return exactly (identity, prepared_payload)"
       )
     identity, prepared = planned
+    if own_prepared is not None:
+      own_prepared(prepared)
     trusted_plan = TrustedToolPlan.create(
       identity_source=identity_source,
       identity=identity,
@@ -598,6 +601,7 @@ class ToolDispatcher:
     tool_input: Dict[str, Any],
     *,
     tool_ctx: ToolExecutionContext,
+    own_prepared: Callable[[Any], None] | None = None,
   ) -> TrustedToolPlan:
     """Plan the shipped raw MCP write locally before any approval is created."""
 
@@ -627,6 +631,8 @@ class ToolDispatcher:
         tool_input.get("allow_business_overview_replacement") is True
       ),
     )
+    if own_prepared is not None:
+      own_prepared(prepared)
     trusted_plan = TrustedToolPlan.create(
       identity_source="reviewed_change_binding",
       identity=prepared.binding,
@@ -682,6 +688,49 @@ class ToolDispatcher:
     workspace_dir: str | None = None,
     batch_id: int | str | None = None,
     capture_readable_resource_snapshot: bool = False,
+  ) -> ToolResult:
+    """Execute one tool call while owning any private planning snapshot."""
+    prepared_to_close: Any | None = None
+
+    def own_prepared(prepared: Any) -> None:
+      nonlocal prepared_to_close
+      prepared_to_close = prepared
+
+    try:
+      return await self._dispatch(
+        tool_call_id,
+        tool_name,
+        tool_input,
+        call_index=call_index,
+        advertised_tool_names=advertised_tool_names,
+        abort_event=abort_event,
+        skill_run_id=skill_run_id,
+        step_id=step_id,
+        workspace_dir=workspace_dir,
+        batch_id=batch_id,
+        capture_readable_resource_snapshot=capture_readable_resource_snapshot,
+        own_prepared=own_prepared,
+      )
+    finally:
+      close = getattr(prepared_to_close, "close", None)
+      if callable(close):
+        close()
+
+  async def _dispatch(
+    self,
+    tool_call_id: str,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    *,
+    call_index: int = 0,
+    advertised_tool_names: AbstractSet[str] | None = None,
+    abort_event: asyncio.Event | None = None,
+    skill_run_id: str | None = None,
+    step_id: str | None = None,
+    workspace_dir: str | None = None,
+    batch_id: int | str | None = None,
+    capture_readable_resource_snapshot: bool = False,
+    own_prepared: Callable[[Any], None],
   ) -> ToolResult:
     """Execute one tool call and return `(result, error)`.
 
@@ -857,6 +906,7 @@ class ToolDispatcher:
             tool_input,
             call_index=call_index,
             tool_ctx=tool_ctx,
+            own_prepared=own_prepared,
           )
       except PlannedWritePlanningRejected as exc:
         return exc.tool_result()
@@ -900,6 +950,7 @@ class ToolDispatcher:
         trusted_plan = self._plan_raw_patch_mcp_write(
           tool_input,
           tool_ctx=tool_ctx,
+          own_prepared=own_prepared,
         )
       except TrustedToolPlanError as exc:
         log.error(

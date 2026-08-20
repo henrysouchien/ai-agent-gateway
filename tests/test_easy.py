@@ -622,6 +622,55 @@ def test_create_agent_threads_request_metadata_to_runner() -> None:
   assert runner._channel == "web"
 
 
+def test_create_agent_runner_binds_session_whose_slug_differs_from_owner() -> None:
+  """The embedded runner must key usage on the canonical owner, not the slug.
+
+  A risk-keyed session carries owner_user_id="7" while its reusable slug stays
+  "alice". Passing the slug tripped AgentRunner's identity guard, which compares
+  the supplied user_id against the session's canonical owner.
+  """
+
+  app = create_agent("test")
+  request = ChatRequest(
+    messages=[{"role": "user", "content": "hello"}],
+    request_id="req-owner",
+    context={"channel": "web"},
+  )
+  config = app.state.gateway_config
+  session = app.state.auth.session_store.create_session(
+    api_key_hash="hash",
+    user_id="alice",
+    risk_user_id=7,
+    auth_config={
+      "provider": "anthropic",
+      "api_key": "k",
+      "billing_mode": "metered",
+    },
+    tenant_id=config.tenant_id,
+    credential_principal="user",
+    allow_service_for_interactive=(
+      config.allow_service_credentials_for_interactive
+    ),
+    model_entitled_capabilities=frozenset({"session.driver"}),
+    model_entitled_keys=config.model_selection_policy.capabilities[
+      "session.driver"
+    ].allowed_model_keys,
+  )
+  session.channel = "web"
+  assert session.user_id == "alice"
+  assert session.owner_user_id == "7"
+
+  runtime, _prepared_request = _prepare_runtime_for_session(
+    app,
+    session=session,
+    request=request,
+  )
+  runner = runtime.build_runner(EventLog(), session.session_id)
+
+  assert runner._usage_user_id == "7"
+  assert runner._gateway_session is session
+
+
 def test_create_agent_openai_provider_string_uses_openai_defaults() -> None:
   app = create_agent(
     "test",

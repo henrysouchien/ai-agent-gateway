@@ -139,7 +139,7 @@ from .runner_usage import (
   usage_has_tokens as _usage_has_tokens,  # noqa: F401 - compatibility alias
 )
 from .session_recap import emit_recap_then_terminal
-from .session import GatewaySession
+from .session import GatewaySession, session_owner_user_id
 from .task_registry import (
   CoordinatorConfig,
   NotificationQueue,
@@ -335,7 +335,7 @@ class AgentRunner(
         session_id != gateway_session.session_id
         or (
           user_id is not None
-          and user_id != gateway_session.user_id
+          and user_id != session_owner_user_id(gateway_session)
         )
         or (
           channel is not None

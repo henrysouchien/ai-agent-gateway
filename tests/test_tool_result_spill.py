@@ -303,6 +303,63 @@ async def _dispatch_bundle_tool(bundle: Any, tool_name: str, tool_input: dict[st
   return await dispatcher.dispatch(f"{tool_name}_call", tool_name, tool_input)
 
 
+def test_truncate_keeps_typed_view_summary_behind_a_bulk_collection() -> None:
+  """A typed view's headline facts survive even when they serialize after the rows."""
+
+  view = {
+    "schema_id": "holdings-view",
+    "schema_version": "v2",
+    "view_data": {
+      "portfolio_name": "CURRENT_PORTFOLIO",
+      "total_positions": 32,
+      "holdings": [
+        {"ticker": f"TICK{index:03d}", "notes": "n" * 9_000}
+        for index in range(32)
+      ],
+      "summary": {"total_value": {"value": "395061.44", "display": "$395,061.44"}},
+      "quality": {"pricing": {"availability": "partial", "priced": 30, "unpriced": 2}},
+      "sources": [{"source": "positions", "availability": "available"}],
+    },
+  }
+  content = json.dumps(view)
+  assert len(content) > CAP
+
+  truncated, was_truncated = truncate_model_tool_result_content(
+    content,
+    tool_name="get_holdings_view",
+    max_chars=CAP,
+  )
+
+  assert was_truncated is True
+  assert len(truncated) <= CAP
+  projection = json.loads(truncated)["content_projection"]
+  view_data = projection["view_data"]
+  assert view_data["summary"] == view["view_data"]["summary"]
+  assert view_data["quality"] == view["view_data"]["quality"]
+  assert view_data["sources"] == view["view_data"]["sources"]
+  assert view_data["total_positions"] == 32
+  kept = [row for row in view_data["holdings"] if "_elided_items" not in row]
+  assert len(kept) < 32
+  assert view_data["holdings"][-1] == {"_elided_items": 32 - len(kept)}
+
+
+def test_truncate_fills_the_budget_for_a_result_that_is_one_large_string() -> None:
+  content = "report line. " * 20_000
+
+  truncated, was_truncated = truncate_model_tool_result_content(
+    content,
+    tool_name="file_read",
+    max_chars=CAP,
+  )
+
+  assert was_truncated is True
+  assert len(truncated) <= CAP
+  projection = json.loads(truncated)["content_projection"]
+  assert projection.startswith("report line. ")
+  assert "...<elided chars=" in projection
+  assert len(projection) > CAP // 2
+
+
 def test_truncate_tool_result_embeds_spill_pointer_only_when_provided() -> None:
   content = _large_content()
 

@@ -44,7 +44,7 @@ from .server import (
   _make_request_approval,
   create_gateway_app,
 )
-from .session import AuthManager, GatewaySession
+from .session import AuthManager, GatewaySession, session_owner_user_id
 from .skills import SkillLoader, SkillStateStore
 from .task_registry import CoordinatorConfig
 from .tool_dispatcher import LocalToolHandler
@@ -772,7 +772,7 @@ def create_agent(
         on_usage=_combined_on_usage if usage_ledger is not None or on_usage is not None else None,
         on_session_summary=_combined_on_session_summary,
         on_tool_timing=on_tool_timing,
-        user_id=session.user_id,
+        user_id=session_owner_user_id(session),
         request_id=request.request_id,
         billing_mode=resolved_billing_mode,
         rate_table_version=resolved_rate_table_version,

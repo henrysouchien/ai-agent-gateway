@@ -125,9 +125,11 @@ async def await_user_approval_via_pending_tools(
   queue_factory: Callable[..., Any] = asyncio.Queue,
   wait_for_fn: Callable[..., Any] = asyncio.wait_for,
   batch_admission: Any | None = None,
-) -> dict[str, Any] | None:
+) -> tuple[str, dict[str, Any] | None]:
+  # Discriminated outcome: ("approved" | "denied" | "expired", vote payload).
+  # Callers MUST read the discriminant first: an expiry is not a denial.
   if session is None:
-    return None
+    return "denied", None
   approval_queue: asyncio.Queue = queue_factory(maxsize=1)
   pending_entry = {
     "approval_id": request.approval_id,
@@ -173,7 +175,7 @@ async def await_user_approval_via_pending_tools(
         request.tool_call_id,
       )
   try:
-    return await wait_for_fn(
+    approval = await wait_for_fn(
       approval_queue.get(),
       timeout=max(0.1, timeout_seconds),
     )
@@ -193,7 +195,10 @@ async def await_user_approval_via_pending_tools(
           "Failed to expire timed-out approval request %s | failure=true",
           request.approval_id,
         )
-    return None
+    return "expired", None
+  else:
+    approved = bool(approval.get("approved")) if isinstance(approval, dict) else False
+    return ("approved" if approved else "denied"), approval
   finally:
     session.pending_tools.pop(request.tool_call_id, None)
     session.approval_queues.pop(request.tool_call_id, None)
@@ -355,16 +360,26 @@ async def _can_use_tool_callback_impl(
     expires_at=utc_now_fn() + timedelta(seconds=decision.expiry_seconds or 600),
     expected_state_version=request.state_version,
   )
-  approval = await runner._await_user_approval_via_pending_tools(
+  outcome, _approval = await runner._await_user_approval_via_pending_tools(
     request,
     decision,
     nonce=os_urandom_fn(8).hex(),
     batch_admission=batch_admission,
   )
-  if approval and approval.get("approved"):
+  if outcome == "approved":
     if raw_modified_tool_args is not None:
       return allow_cls(updated_input=raw_modified_tool_args)
     return allow_cls()
+  if outcome == "expired":
+    # An expiry is not a user vote. Interrupt the turn so the model cannot
+    # continue as if the user had answered.
+    return deny_cls(
+      message=(
+        "[approval_timeout] approval expired; a fresh tool call and "
+        "approval are required"
+      ),
+      interrupt=True,
+    )
   return deny_cls(message="user denied")
 
 

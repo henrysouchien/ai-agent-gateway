@@ -19,6 +19,10 @@ from agent_gateway.model_registry import (
   INITIAL_MODEL_SELECTION_POLICY,
 )
 from agent_gateway.control_plane.runs_chat_helpers import _finalize_control_chat_task
+from agent_gateway.control_run_lifecycle import (
+  is_control_run_resumable_state,
+  is_control_run_terminal_state,
+)
 from agent_gateway.event_log import EventLog
 from agent_gateway.server import (
   ChatMessage,
@@ -909,6 +913,106 @@ def test_chat_interrupted_terminal_projects_interrupted_control_state() -> None:
 
     assert response.status_code == 200, response.text
     assert response.json()["state"] == "interrupted"
+
+
+def test_chat_budget_stop_projects_budget_limited_control_state() -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    session = app.state.auth.session_store.get_session(chat["session_id"])
+    assert session is not None
+    session.event_history.append({
+      "type": "budget_exceeded",
+      "total_cost": 0.42,
+      "budget": 0.4,
+      "reason": "sdk_max_budget_usd",
+    })
+    session.event_history.append({
+      "type": "stream_complete",
+      "terminal_disposition": "interrupted",
+      "reason": "budget_exceeded",
+      "usage": {},
+    })
+
+    response = client.get(
+      f"/api/control/runs/{chat['session_id']}",
+      headers=_headers(control),
+    )
+    logs = client.get(
+      f"/api/control/runs/{chat['session_id']}/logs",
+      headers=_headers(control),
+    )
+
+    assert response.status_code == 200, response.text
+    state = response.json()["state"]
+    assert state == "budget_limited"
+    assert is_control_run_terminal_state(state) is True
+    assert is_control_run_resumable_state(state) is False
+    # The wire vocabulary is frozen: only the recorded run state is remapped.
+    assert logs.status_code == 200, logs.text
+    logged = [json.loads(line) for line in logs.json()["log_lines"]]
+    assert [event["type"] for event in logged][-2:] == [
+      "budget_exceeded",
+      "stream_complete",
+    ]
+    assert logged[-1]["reason"] == "budget_exceeded"
+    assert "budget_limited" not in logs.text
+
+
+def test_chat_interrupted_terminal_without_budget_reason_stays_interrupted() -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    session = app.state.auth.session_store.get_session(chat["session_id"])
+    assert session is not None
+    session.event_history.append({
+      "type": "stream_complete",
+      "terminal_disposition": "interrupted",
+      "usage": {},
+    })
+
+    response = client.get(
+      f"/api/control/runs/{chat['session_id']}",
+      headers=_headers(control),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "interrupted"
+
+
+def test_chat_budget_stop_with_channel_error_projects_failed() -> None:
+  app = _make_app()
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    session = app.state.auth.session_store.get_session(chat["session_id"])
+    assert session is not None
+    for event in [
+      {
+        "type": "budget_exceeded",
+        "total_cost": 0.42,
+        "budget": 0.4,
+        "reason": "sdk_max_budget_usd",
+      },
+      {"type": "stream_error", "error": "control event channel corrupted"},
+      {
+        "type": "stream_complete",
+        "terminal_disposition": "interrupted",
+        "reason": "budget_exceeded",
+        "usage": {},
+      },
+    ]:
+      session.event_history.append(event)
+
+    response = client.get(
+      f"/api/control/runs/{chat['session_id']}",
+      headers=_headers(control),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "failed"
 
 
 def test_chat_first_terminal_error_wins_over_trailing_completed_event() -> None:

@@ -381,6 +381,8 @@ def _make_credential_runner(
   max_budget_usd: float | None = None,
   gateway_session: GatewaySession | None = None,
   local_tool_handlers: dict[str, Any] | None = None,
+  user_id: str | None = "alice",
+  channel: str | None = None,
 ) -> AgentRunner:
   event_log = EventLog()
   dispatcher = ToolDispatcher(
@@ -405,7 +407,8 @@ def _make_credential_runner(
     get_tool_definitions=lambda: [],
     coordinator=coordinator,
     max_budget_usd=max_budget_usd,
-    user_id="alice",
+    user_id=user_id,
+    channel=channel,
     billing_mode="byok",
     rate_table_version="unknown",
   )
@@ -697,6 +700,92 @@ def test_bound_gateway_session_builds_post_turn_handoff() -> None:
     )
 
   asyncio.run(case())
+
+
+def _owner_keyed_gateway_session(
+  *,
+  session_id: str = "sess_run_loop",
+  user_id: str = "henry",
+  owner_user_id: str | None = "1",
+  channel: str | None = None,
+) -> GatewaySession:
+  """A trusted session whose reusable slug differs from its canonical owner."""
+
+  return GatewaySession(
+    session_id=session_id,
+    api_key_hash="hash",
+    created_at=1,
+    expires_at=2,
+    user_id=user_id,
+    owner_user_id=owner_user_id,
+    channel=channel,
+    auth_config={"provider": "stub"},
+    tenant_id="tenant-1",
+  )
+
+
+def test_runner_binds_session_whose_slug_differs_from_canonical_owner() -> None:
+  session = _owner_keyed_gateway_session(user_id="henry", owner_user_id="1")
+
+  runner = _make_credential_runner(gateway_session=session, user_id="1")
+
+  assert runner._gateway_session is session
+  assert runner._usage_user_id == "1"
+
+
+def test_runner_rejects_user_id_that_is_not_the_session_owner() -> None:
+  session = _owner_keyed_gateway_session(user_id="henry", owner_user_id="1")
+
+  with pytest.raises(
+    ValueError,
+    match="AgentRunner identity does not match GatewaySession",
+  ):
+    _make_credential_runner(gateway_session=session, user_id="2")
+
+
+def test_runner_rejects_session_slug_passed_as_identity() -> None:
+  session = _owner_keyed_gateway_session(user_id="henry", owner_user_id="1")
+
+  with pytest.raises(
+    ValueError,
+    match="AgentRunner identity does not match GatewaySession",
+  ):
+    _make_credential_runner(gateway_session=session, user_id="henry")
+
+
+def test_runner_rejects_mismatched_session_id_for_owner_keyed_session() -> None:
+  session = _owner_keyed_gateway_session(session_id="sess_other")
+
+  with pytest.raises(
+    ValueError,
+    match="AgentRunner identity does not match GatewaySession",
+  ):
+    _make_credential_runner(gateway_session=session, user_id="1")
+
+
+def test_runner_rejects_mismatched_channel_for_owner_keyed_session() -> None:
+  session = _owner_keyed_gateway_session(channel="web")
+
+  with pytest.raises(
+    ValueError,
+    match="AgentRunner identity does not match GatewaySession",
+  ):
+    _make_credential_runner(
+      gateway_session=session,
+      user_id="1",
+      channel="cli",
+    )
+
+
+def test_runner_identity_guard_short_circuits_on_absent_user_id() -> None:
+  session = _owner_keyed_gateway_session(user_id="henry", owner_user_id="1")
+
+  with pytest.raises(ValueError) as excinfo:
+    _make_credential_runner(gateway_session=session, user_id=None)
+
+  # The guard must not fire when no identity is supplied; construction still
+  # fails later because usage attribution requires a user_id.
+  assert str(excinfo.value) == "user_id is required for usage identity"
 
 
 def test_unexpected_post_turn_capture_error_does_not_fail_turn(
@@ -4792,6 +4881,83 @@ def test_run_loop_stops_after_tool_results_when_runner_requests_it(monkeypatch) 
       if block.get("type") == "text"
     ]
     assert "unwanted final prose" not in assistant_text
+
+  asyncio.run(_case())
+
+
+def test_run_loop_stops_after_expired_approval_tool_result(monkeypatch) -> None:
+  async def _case() -> None:
+    runner = _make_credential_runner()
+    stream_calls = {"count": 0}
+
+    async def fake_stream_turn(**kwargs: Any):
+      _ = kwargs
+      stream_calls["count"] += 1
+      if stream_calls["count"] == 1:
+        result = StreamTurnResult(
+          full_text="",
+          stop_reason="tool_use",
+          content_blocks=[
+            {
+              "type": "tool_use",
+              "id": "tool-1",
+              "name": "file_write",
+              "input": {"path": "x"},
+            }
+          ],
+        )
+        result.tool_uses = [("tool-1", "file_write", {"path": "x"})]
+        return object(), result
+      raise AssertionError(
+        "an expired approval must not be followed by another model turn"
+      )
+
+    tool_result_block = {
+      "type": "tool_result",
+      "tool_use_id": "tool-1",
+      "is_error": True,
+      "content": json.dumps(
+        {
+          "error": {
+            "code": "approval_timeout",
+            "message": "User did not respond within timeout",
+          }
+        }
+      ),
+    }
+
+    tool_loop_calls = {"count": 0}
+
+    async def fake_execute_tool_use_loop(*args: Any, **kwargs: Any) -> ToolUseLoopResult:
+      _ = args, kwargs
+      tool_loop_calls["count"] += 1
+      # Mirrors the native seam in runner_tool_execution._execute_single_tool.
+      runner._stop_after_tool_results_reason = "approval_timeout"
+      runner._stop_after_tool_results_tool_name = "file_write"
+      return ToolUseLoopResult(
+        tool_results_content=[dict(tool_result_block)],
+        tools_used=["file_write"],
+      )
+
+    runner._stream_turn = fake_stream_turn  # type: ignore[method-assign]
+    monkeypatch.setattr(
+      gateway_runner,
+      "_execute_tool_use_loop",
+      fake_execute_tool_use_loop,
+    )
+
+    await runner.run(
+      messages=[{"role": "user", "content": "write the file"}],
+      system_prompt="x",
+    )
+
+    assert tool_loop_calls["count"] == 1
+    assert stream_calls["count"] == 1
+    assert runner._stop_after_tool_results_reason == "approval_timeout"
+    events = [entry.event for entry in runner._log.entries]
+    error_events = [event for event in events if event.get("type") == "error"]
+    assert error_events
+    assert "approval_timeout" in error_events[-1]["error"]
 
   asyncio.run(_case())
 

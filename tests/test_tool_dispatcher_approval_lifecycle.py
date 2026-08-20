@@ -1051,9 +1051,18 @@ def _planned_handler(
   *,
   events: list[str],
   context_sink: dict[str, Any] | None = None,
+  prepared_path: Path | None = None,
+  execution_error: Exception | None = None,
 ) -> tuple[Any, ChangeSet, Any]:
   change_set = _planned_change_set()
   prepared = SimpleNamespace(change_set=change_set)
+
+  if prepared_path is not None:
+    def close() -> None:
+      if prepared_path.exists():
+        prepared_path.rmdir()
+
+    prepared.close = close
 
   async def legacy_handler(_tool_input: dict[str, Any], **_kwargs: Any):
     raise AssertionError("planned tools must not execute through the legacy handler")
@@ -1068,6 +1077,8 @@ def _planned_handler(
     assert call_index == 3
     assert tool_ctx.trusted_plan is None
     events.append("plan")
+    if prepared_path is not None:
+      prepared_path.mkdir()
     if context_sink is not None:
       context_sink["ctx"] = tool_ctx
     return change_set, prepared
@@ -1083,6 +1094,10 @@ def _planned_handler(
     tool_ctx: Any,
   ):
     events.append("execute")
+    if prepared_path is not None:
+      assert prepared_path.is_dir()
+    if execution_error is not None:
+      raise execution_error
     assert candidate is prepared
     assert authorized_identity is change_set
     assert tool_ctx.trusted_plan.prepared is prepared
@@ -1824,7 +1839,11 @@ def test_planned_dispatch_persists_identity_and_executes_exact_objects(
 ) -> None:
   events: list[str] = []
   resolved: list[Any] = []
-  handler, change_set, prepared = _planned_handler(events=events)
+  prepared_path = tmp_path / f"private-plan-{with_event_log}"
+  handler, change_set, prepared = _planned_handler(
+    events=events,
+    prepared_path=prepared_path,
+  )
 
   class Store(SQLiteApprovalStore):
     async def create(self, request):
@@ -1897,6 +1916,47 @@ def test_planned_dispatch_persists_identity_and_executes_exact_objects(
   assert request.execution_semantics_digest is None
   assert asyncio.run(store.get(request.approval_id)) == request
   assert prepared.change_set is change_set
+  assert not prepared_path.exists()
+
+
+def test_planned_dispatch_releases_private_snapshot_when_executor_raises(
+  tmp_path: Path,
+) -> None:
+  events: list[str] = []
+  prepared_path = tmp_path / "private-plan-executor-error"
+  handler, _change_set, _prepared = _planned_handler(
+    events=events,
+    prepared_path=prepared_path,
+    execution_error=RuntimeError("execution failed"),
+  )
+
+  class Policy:
+    policy_id = "planned-test"
+    policy_version = "1"
+
+    async def decide(self, **_kwargs: Any):
+      return PolicyApprovalDecision(outcome="auto_approve", reason="approved")
+
+    async def on_resolve(self, **_kwargs: Any):
+      return None
+
+  dispatcher = ToolDispatcher(
+    role="owner",
+    mcp_client=_NullMcp(),
+    local_tool_handlers={"planned": handler},
+    needs_approval=lambda *_args: True,
+    session=_planned_session(),
+    store=SQLiteApprovalStore(tmp_path / "approvals.sqlite3"),
+    policy=Policy(),
+  )
+
+  with pytest.raises(RuntimeError, match="execution failed"):
+    asyncio.run(
+      dispatcher.dispatch("call-error", "planned", {"x": 1}, call_index=3)
+    )
+
+  assert events == ["plan", "execute"]
+  assert not prepared_path.exists()
 
 
 def test_planned_dispatch_session_cache_still_creates_bound_row(tmp_path: Path) -> None:
@@ -2017,7 +2077,11 @@ def test_planned_dispatch_persistent_grant_still_creates_bound_row(
 def test_planned_dispatch_headless_denial_still_creates_bound_row(tmp_path: Path) -> None:
   events: list[str] = []
   resolved: list[Any] = []
-  handler, change_set, _prepared = _planned_handler(events=events)
+  prepared_path = tmp_path / "private-plan-denied"
+  handler, change_set, _prepared = _planned_handler(
+    events=events,
+    prepared_path=prepared_path,
+  )
 
   class Policy:
     async def decide(self, **_kwargs: Any):
@@ -2050,6 +2114,7 @@ def test_planned_dispatch_headless_denial_still_creates_bound_row(tmp_path: Path
   assert request.state == "auto_denied"
   assert request.change_set_id == change_set.change_set_id
   assert asyncio.run(store.get(request.approval_id)) == request
+  assert not prepared_path.exists()
 
 
 def test_planned_dispatch_headless_autonomous_allow_creates_bound_row(
@@ -2100,7 +2165,11 @@ def test_planned_dispatch_timeout_preserves_bound_row_and_skips_executor(
 ) -> None:
   events: list[str] = []
   planned_requests: list[Any] = []
-  handler, change_set, _prepared = _planned_handler(events=events)
+  prepared_path = tmp_path / "private-plan-timeout"
+  handler, change_set, _prepared = _planned_handler(
+    events=events,
+    prepared_path=prepared_path,
+  )
 
   class Policy:
     async def decide(self, *, payload, request, run_context):
@@ -2143,6 +2212,7 @@ def test_planned_dispatch_timeout_preserves_bound_row_and_skips_executor(
   assert stored.change_set_id == change_set.change_set_id
   assert session.pending_tools == {}
   assert session.approval_queues == {}
+  assert not prepared_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -2623,7 +2693,11 @@ def test_planned_dispatch_preserves_trusted_planning_rejection() -> None:
 
 def test_planned_dispatch_fails_closed_on_row_persistence_error(tmp_path: Path) -> None:
   events: list[str] = []
-  handler, _change_set, _prepared = _planned_handler(events=events)
+  prepared_path = tmp_path / "private-plan-persistence-error"
+  handler, _change_set, _prepared = _planned_handler(
+    events=events,
+    prepared_path=prepared_path,
+  )
 
   class Store(SQLiteApprovalStore):
     async def create(self, request):
@@ -2651,14 +2725,17 @@ def test_planned_dispatch_fails_closed_on_row_persistence_error(tmp_path: Path) 
   assert result is None
   assert error["code"] == "planned_write_authorization_persistence_failed"
   assert events == ["plan"]
+  assert not prepared_path.exists()
 
 
 def test_planned_dispatch_rejects_trusted_context_loss(tmp_path: Path) -> None:
   events: list[str] = []
   context_sink: dict[str, Any] = {}
+  prepared_path = tmp_path / "private-plan-contract-drift"
   handler, _change_set, _prepared = _planned_handler(
     events=events,
     context_sink=context_sink,
+    prepared_path=prepared_path,
   )
 
   class Policy:
@@ -2686,6 +2763,7 @@ def test_planned_dispatch_rejects_trusted_context_loss(tmp_path: Path) -> None:
   assert result is None
   assert error["code"] == "planned_write_trusted_plan_lost"
   assert events == ["plan"]
+  assert not prepared_path.exists()
 
 
 def test_planned_dispatch_requires_reinvocation_for_policy_modified_args(
@@ -2693,7 +2771,11 @@ def test_planned_dispatch_requires_reinvocation_for_policy_modified_args(
 ) -> None:
   events: list[str] = []
   resolved: list[Any] = []
-  handler, change_set, _prepared = _planned_handler(events=events)
+  prepared_path = tmp_path / "private-plan-modified-input"
+  handler, change_set, _prepared = _planned_handler(
+    events=events,
+    prepared_path=prepared_path,
+  )
 
   class Policy:
     async def decide(self, **_kwargs: Any):
@@ -2729,6 +2811,59 @@ def test_planned_dispatch_requires_reinvocation_for_policy_modified_args(
   assert request.state == "auto_approved"
   assert request.change_set_id == change_set.change_set_id
   assert asyncio.run(store.get(request.approval_id)) == request
+  assert not prepared_path.exists()
+
+
+def test_planned_dispatch_releases_private_snapshot_on_final_input_failure(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  events: list[str] = []
+  prepared_path = tmp_path / "private-plan-input-failure"
+  handler, _change_set, _prepared = _planned_handler(
+    events=events,
+    prepared_path=prepared_path,
+  )
+
+  class Policy:
+    async def decide(self, **_kwargs: Any):
+      return PolicyApprovalDecision(outcome="auto_approve", reason="approved")
+
+    async def on_resolve(self, **_kwargs: Any):
+      return None
+
+  dispatcher = ToolDispatcher(
+    role="owner",
+    mcp_client=_NullMcp(),
+    local_tool_handlers={"planned": handler},
+    needs_approval=lambda *_args: True,
+    session=_planned_session(),
+    store=SQLiteApprovalStore(tmp_path / "approvals.sqlite3"),
+    policy=Policy(),
+  )
+  validation_calls = 0
+
+  def validate(*_args: Any, **_kwargs: Any) -> dict[str, Any] | None:
+    nonlocal validation_calls
+    validation_calls += 1
+    if validation_calls == 2:
+      return {"code": "tool_input_validation_failed", "message": "invalid input"}
+    return None
+
+  monkeypatch.setattr(dispatcher, "_validate_local_tool_input", validate)
+
+  result, error = asyncio.run(
+    dispatcher.dispatch("call-input", "planned", {"x": 1}, call_index=3)
+  )
+
+  assert result is None
+  assert error == {
+    "code": "tool_input_validation_failed",
+    "message": "invalid input",
+  }
+  assert validation_calls == 2
+  assert events == ["plan"]
+  assert not prepared_path.exists()
 
 
 def test_local_handler_receives_context_when_event_logging_is_disabled() -> None:

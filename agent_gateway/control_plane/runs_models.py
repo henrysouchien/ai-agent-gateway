@@ -345,6 +345,30 @@ class AutonomousDispatchRequest(BaseModel):
       raise ValueError("max_budget_usd must be a finite positive number")
     return value
 
+  @model_validator(mode="after")
+  def _require_exclusive_mode_payload(self) -> "AutonomousDispatchRequest":
+    if self.mode is None:
+      return self
+    skill = (self.skill or "").strip()
+    task = (self.task or "").strip()
+    ticker = (self.ticker or "").strip()
+    context = (self.context or "").strip()
+    if self.mode == "once":
+      if skill or task or ticker or context:
+        raise ValueError("mode='once' does not accept skill, task, ticker, or context")
+      return self
+    if self.mode == "task":
+      if not task:
+        raise ValueError("mode='task' requires task")
+      if skill:
+        raise ValueError("mode='task' does not accept skill")
+      return self
+    if not skill:
+      raise ValueError("mode='skill' requires skill")
+    if task:
+      raise ValueError("mode='skill' does not accept task")
+    return self
+
 
 ControlRunDispatchRequest = Annotated[
   Union[ChatDispatchRequest, AutonomousDispatchRequest],

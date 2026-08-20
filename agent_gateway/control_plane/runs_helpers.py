@@ -190,6 +190,12 @@ def _state_from_session(session: GatewaySession, events: list[dict[str, Any]]) -
     if disposition == "completed":
       return "completed"
     if disposition == "interrupted":
+      # Mirrors the autonomous classification in
+      # AutonomousRunnerState._terminal_event_outcome. The `error`/`stream_error`
+      # branch above still wins, so a corrupted channel keeps reporting `failed`
+      # instead of the nicer budget label.
+      if event.get("reason") == "budget_exceeded":
+        return "budget_limited"
       return "interrupted"
     return "failed"
   return "starting"

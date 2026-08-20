@@ -465,6 +465,13 @@ def _chat_turn_state_from_events(events: list[dict[str, Any]]) -> str:
       if disposition == "completed":
         return "completed"
       if disposition == "interrupted":
+        # Mirrors the autonomous classification in
+        # AutonomousRunnerState._terminal_event_outcome: an interrupted terminal
+        # that names the budget ceiling is a finished, non-resumable stop, not a
+        # resumable interrupt. An `error` terminal earlier in the log still wins
+        # above, so a channel failure keeps reporting `failed`.
+        if event.get("reason") == "budget_exceeded":
+          return "budget_limited"
         return "interrupted"
       return "failed"
   return "completed" if events else "starting"

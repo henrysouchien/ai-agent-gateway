@@ -2438,6 +2438,12 @@ class RunnerRunLoopMixin:
               )
               + ".",
             )
+          elif stop_after_tool_results_reason == "approval_timeout":
+            terminal_failure = (
+              "approval_timeout",
+              "approval_timeout: approval expired before the user "
+              "answered; a fresh tool call and approval are required.",
+            )
           elif stop_after_tool_results_reason in {
             "terminal_tool_result",
             "child_report_accepted",

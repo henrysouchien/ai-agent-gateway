@@ -51,6 +51,7 @@ from .autonomous_runner_claims import (
   sign_user_claim as sign_user_claim,  # noqa: F401 - compatibility alias
 )
 from .autonomous_runner_state import (
+  AUTONOMOUS_TERMINAL_STATES,
   _ACTIVE_AUTONOMOUS_PROCESS_STATES,
   _AUTONOMOUS_MANIFEST_FILE_RE as _AUTONOMOUS_MANIFEST_FILE_RE,
   _AUTONOMOUS_RUN_FILE_RE as _AUTONOMOUS_RUN_FILE_RE,
@@ -63,7 +64,6 @@ from .autonomous_runner_state import (
   _SKIP_WARNED_FILE as _SKIP_WARNED_FILE,
   _SKIP_WARNED_LOADED_DIRS as _SKIP_WARNED_LOADED_DIRS,
   _TASK_MANIFEST_VERSION as _TASK_MANIFEST_VERSION,
-  _TERMINAL_AUTONOMOUS_STATES,
   AutonomousRegistryStateMixin,
   AutonomousTask,
   is_root_run_event,
@@ -359,7 +359,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
   def _record_replay_buffer_terminated(self, record: AutonomousTask) -> bool:
     return _runner_events.record_replay_buffer_terminated(
       record,
-      terminal_states=_TERMINAL_AUTONOMOUS_STATES,
+      terminal_states=AUTONOMOUS_TERMINAL_STATES,
       rehydrated_active_states=_REHYDRATED_ACTIVE_STATES,
     )
 

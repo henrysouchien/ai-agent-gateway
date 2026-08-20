@@ -898,9 +898,15 @@ class RunnerToolExecutionMixin:
       model_result = self._annotate_result(result, tool_name=tool_name)
 
     if error is not None:
+      error_code = str(error.get("code", "tool_error"))
+      if error_code == "approval_timeout":
+        # An expired approval is not an answer. Stop after this tool result
+        # instead of letting the model retry the same stale approval.
+        setattr(self, "_stop_after_tool_results_reason", "approval_timeout")
+        setattr(self, "_stop_after_tool_results_tool_name", tool_name)
       result_entry = self._make_error_result(
         tool_id,
-        str(error.get("code", "tool_error")),
+        error_code,
         str(error.get("message", "Tool failed")),
         sub_code=str(error.get("sub_code", "")),
         data=_model_error_data(error),

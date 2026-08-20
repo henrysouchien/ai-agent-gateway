@@ -1,40 +1,140 @@
 # Changelog
 
-## Unreleased (post-0.16.2)
+## 0.17.0 (2026-08-20)
+
+This is a pre-1.0 breaking-minor release. It describes the complete public
+package delta from 0.16.2, not only the final release-preparation changes.
 
 ### Added
 
 - Added explicit `WorkflowDeliverySpecV1` / `WorkflowDeliverySpecV2` and
-  `DeliveryEnvelopeV1` / `DeliveryEnvelopeV2` public construction models,
-  shared version-tolerant parsers, deterministic-preview models/constants,
-  generated JSON Schema and TypeScript unions, a frozen historical-v1 golden,
-  and complete/truncated v2 goldens in installed package resources.
+  `DeliveryEnvelopeV1` / `DeliveryEnvelopeV2` construction models, shared
+  version-tolerant readers, deterministic V2 preview models, and generated JSON
+  Schema, TypeScript, and golden resources. Exact published output remains the
+  authority behind every preview.
+- Added typed selected-content and workflow-content paging contracts, including
+  owner-bound read authorizations, integrity-checked cursors, Investment
+  artifact views, and exact read recipes for parent and child runs.
+- Added durable workflow continuation brackets, recorded `max_phases`, blocked
+  boundary recovery, a single `WorkflowView`, typed recovery hints, and
+  multi-valued evidence ports for tool-less operations that need upstream
+  evidence.
+- Added a platform tool catalog, capability resolver, execution identity, and
+  declared capability requirements. Operation admission, dispatcher scope, and
+  tool activation now project from those shared authorities.
+- Added an append-only MCP activation fold, producer-owned `control-run-v1`
+  lifecycle contract, and versioned `commercial-authority-v1` invalidation-feed
+  contract as installed package resources.
+- Added durable tool-dispatch source and outcome facts, mechanical settlement
+  qualifiers, and child-evidence projection into the parent's citation
+  registry. Child retrieval remains usable even when the child later fails;
+  child computation is not promoted to parent retrieval evidence.
 
 ### Changed
 
-- `WorkflowDeliverySpec` and `DeliveryEnvelope` are now public read unions.
-  Historical specs remain byte-exact and absent-version; v2 specs require an
-  explicit `schema_version="2.0"`, and settlements reject cross-version pairs.
-- Gateway attachments, CLI delivery, the Excel taskpane, and the gateway TUI
-  now read both versions. V1 authored-summary presentation is preserved; V2
-  renders an explicitly complete or truncated deterministic preview while the
-  exact `PublishedOutputRef` remains authoritative.
-- The workflow service now writes only explicit V2 starts and envelopes. It
-  derives the bounded preview from owner-authorized exact publication bytes,
-  retains V1 as a historical reader only, and replays an already-recorded
-  envelope without regeneration. An unsettled historical V1 specification is
-  durably completed as a typed delivery failure; it does not revive a V1 writer
-  or leave computation settlement indefinitely pending.
-- Expired sessions reject normal use immediately while privately retained
-  session resources remain available to already-owned workflow activity until
-  that activity completes. Deployment coordination remains outside product
-  health and workflow contracts; the release controller uses process absence,
-  journal inspection, and assembled-artifact verification.
-- Workflow lifecycle readers now accept exact integer AgentSessionLog outer
-  envelope versions 1 and 2 because that cutover changed only
-  `task_registered` payload semantics. Durable task rebuild remains strictly
-  version-2-only; malformed, missing, and unknown workflow envelope versions
-  fail closed.
+- Workflow starts and settlements write only explicit V2 delivery contracts.
+  Historical V1 records remain byte-exact and readable, but V1 is reader-only;
+  missing, unknown, or cross-version envelopes fail closed. Unsettled V1 starts
+  finish as typed delivery failures instead of reviving a V1 writer. Lifecycle
+  readers accept outer session-log versions 1 and 2, while durable task rebuild
+  remains version-2-only.
+- `WorkflowResult` is now schema version 2.0 and composes the canonical
+  `WorkflowView`. Failed or interrupted phases park at actionable boundaries;
+  continuation, finish, authoring recovery, evidence, cost, and legal actions
+  are projected consistently across API, CLI, attachment, and UI consumers.
+- Named `run_agent` operations freeze the registered skill's finite budget in
+  the execution snapshot and enforce it on initial execution and resume. Model
+  input can no longer set or increase the hard budget. Trusted dispatcher
+  interceptors propagate, in order and by identity, into delegated and resumed
+  agents.
+- Operation authority comes from catalog routes and declared capability
+  requirements rather than inferred read effects, copied allowlists, or
+  `data_requirements`. Unavailable operations are reported explicitly, and the
+  advertised MCP surface and dispatcher allowlist derive from the same durable
+  activation fold.
+- Background-task registration and delivery acknowledgement are transactional.
+  Active runs continue admitting tasks while results arrive; unread
+  handle-shaped results retain their identity and receive one stop-boundary
+  reminder. Notification renders and delivery nudges are durably observable.
+  Expired sessions reject new use while already-owned workflow resources remain
+  available until that work settles.
+- Control-run active and terminal states now come from the producer-owned
+  lifecycle table. Foreground interrupt issues an authoritative cancel,
+  approval expiry is distinct from user denial, budget stops project as
+  `budget_limited`, and autonomous terminal state and retention ownership no
+  longer maintain competing state sets.
+- Oversized tool results now preserve their typed structure while eliding bulk
+  arrays, mappings, strings, or deep nesting in place. The former serialized
+  byte-prefix and shallow scalar preview are removed.
+- Final answers are no longer intercepted and rewritten by a runtime
+  `FinalAnswerGuard`. Methodology, evidence requirements, and completion
+  decisions are owned by admitted operations and their explicit contracts.
+- Hosted model operations resolve the authenticated current-model identity and
+  verify descriptor-relative artifact bytes. Hosted parent, child, resume, and
+  autonomous schemas reject raw user/path selectors and expose categorical
+  identities instead of server file locations. Producer-owned Edgar and Risk
+  files remain behind their source services.
+
+### Fixed
+
+- Preserved session-owner identity across hosted and multi-user runner
+  construction, dispatch, spend attribution, workbook tenancy, children, and
+  resumes; ambiguous or mismatched identities fail closed.
+- Routed SEC access through the canonical machine egress client and kept its
+  machine configuration out of child environments.
+- Made commercial authority invalidation consume an explicitly versioned feed
+  with strict format parsing instead of relying on sibling-specific payload
+  assumptions.
+- Kept deterministic workflow delivery replay, content paging, notification
+  settlement, task reconstruction, nested approvals, and cancellation coherent
+  across restart and recovery seams.
+
+### Removed
+
+- Removed public exports `FixtureProvider`, `DataRequirement`,
+  `RELAY_POLICY_DENIED_MESSAGE`, `RELAY_POLICY_DENIED_SUB_CODE`, and
+  `resolve_denied_provenance`.
+- Removed the caller-supplied `AgentRunner(final_answer_guard=...)` surface.
+- Removed product-embedded fixture, development-mode, QA, market-scan,
+  orchestration-dispatch, and Excel-relay runtime facades. Tests and product
+  integrations must use their real provider, control-plane, or application
+  boundaries.
+- Removed legacy MCP configuration facades, copied live-tool views, inferred
+  research-evidence capability, and the `data_requirements` skill vocabulary.
+
+### Security and behavioral changes
+
+- Non-owner MCP execution is deny-by-default for unknown tools, and canonical
+  owner identity now scopes relay workbooks, model spend, dispatch authority,
+  and persisted execution state.
+- Hosted reads use bounded, no-follow, stable file access with digest checks;
+  raw paths, stale producer modes, private extraction tools, and foreign source
+  coordinates are refused before execution.
+- Source, credential, approval, lifecycle, notification, and child-evidence
+  facts are sanitized and durably bound at their producing boundaries rather
+  than reconstructed from model-visible output.
+
+### Breaking changes and migration
+
+- Regenerate workflow clients for schema version 2.0 and read status, actions,
+  recovery, evidence, and phase state from `WorkflowResult.view`. Continue to
+  parse historical delivery records through the public V1/V2 reader unions;
+  construct all new starts and envelopes with the explicit V2 classes.
+- Replace `SkillProfile.data_requirements` with declared capability
+  requirements. Tool-less fan-in operations must declare `evidence_ports`
+  with an explicit cardinality floor and ceiling.
+- Pass one resolved `DispatchIdentity`/`ExecutionIdentity` to new
+  `ToolDispatcher` integrations, and derive operation tool scope through the
+  platform capability resolver. Do not combine `identity=` with the retained
+  separate compatibility inputs.
+- Remove `max_budget_usd` from model-authored `run_agent` input. Set a finite
+  budget on the registered named skill when a hard child budget is required.
+- Replace removed fixture/dev/relay imports with test-owned fixtures or the real
+  provider and application boundary. There is no runtime replacement for the
+  retired final-answer guard.
+- Required runtime dependencies are unchanged from 0.16.2. The `dev` extra and
+  hashed development lock now include Matplotlib so code-execution plot capture
+  is available to the package test suite.
 
 ## 0.16.2 (2026-08-14)
 

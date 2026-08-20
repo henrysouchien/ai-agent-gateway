@@ -33,6 +33,23 @@ _WRITE_TOOL_CLASSES = (
   "portfolio_config",
   "irreversible",
 )
+HOSTED_PRIVATE_EDGAR_TOOLS = frozenset({"extract_filing_file"})
+HOSTED_UNAVAILABLE_NORMALIZER_TOOLS = frozenset({
+  "normalizer_activate",
+  "normalizer_detect",
+  "normalizer_list",
+  "normalizer_register_institution",
+  "normalizer_sample_csv",
+  "normalizer_stage",
+  "normalizer_test",
+  "normalizer_update",
+  "normalizer_validate",
+  "statement_normalizer_activate",
+  "statement_normalizer_list",
+  "statement_normalizer_sample_csv",
+  "statement_normalizer_stage",
+  "statement_normalizer_test",
+})
 
 
 def _load_portfolio_irreversible_tools() -> frozenset[str]:

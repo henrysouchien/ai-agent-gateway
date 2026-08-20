@@ -1327,11 +1327,20 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         status_code=409,
       )
     raw_purpose = (body.context or {}).get("purpose")
-    session.purpose = (
+    normalized_purpose = (
       raw_purpose.strip().lower()
       if isinstance(raw_purpose, str) and raw_purpose.strip()
       else None
     )
+    if normalized_purpose == "normalizer":
+      return JSONResponse(
+        {
+          "error": "purpose_unavailable",
+          "message": "The normalizer chat purpose is unavailable.",
+        },
+        status_code=400,
+      )
+    session.purpose = normalized_purpose
     try:
       pending_work_start = None
       if commercial_gate is None:

@@ -8,7 +8,11 @@ from typing import Any, Dict, List, Optional
 
 from .anthropic import AnthropicProvider
 from .base import CostEstimate
-from ..policy_imports import load_server_policy_helpers
+from ..policy_imports import (
+  load_server_policy_helpers,
+  load_server_policy_module,
+  resolve_effective_role,
+)
 
 
 SDK_PINNED_VERSION = "0.1.50"
@@ -89,11 +93,47 @@ def _resolve_mcp_config_path(config_path: Path | str | None | object = _UNSET) -
   return Path(config_path).expanduser()
 
 
+def _authority_role(session: Any | None) -> str:
+  raw_role = (
+    session.get("role")
+    if isinstance(session, dict)
+    else getattr(session, "role", None)
+  )
+  return resolve_effective_role(raw_role if isinstance(raw_role, str) else None)
+
+
+def _unclassified_tool_denials(available_tools: set[str]) -> set[str]:
+  """Deny every available identity that carries no reviewed policy class.
+
+  The SDK enforces availability through `disallowed_tools`, so deny-by-default
+  can only be expressed against the identities the query actually exposes.  An
+  identity whose bare tool name resolves to neither an MCP class nor a local
+  effect is unreviewed, and unreviewed reach is not invite authority.
+  """
+  policy_module = load_server_policy_module()
+  is_classified = (
+    getattr(policy_module, "tool_is_policy_classified", None)
+    if policy_module is not None
+    else None
+  )
+  denials: set[str] = set()
+  for raw_identity in available_tools:
+    identity = str(raw_identity or "").strip()
+    if not identity:
+      continue
+    # No host policy means no classification is knowable, so nothing is
+    # reviewed and everything available is denied.
+    if is_classified is None or not is_classified(identity):
+      denials.add(identity)
+  return denials
+
+
 def build_disallowed_tools(
   channel: Optional[str],
   channel_tiers: Dict[Optional[str], Dict[str, set[str]]],
   extra_blocked: set[str] | None = None,
   session: Any | None = None,
+  available_tools: set[str] | None = None,
 ) -> List[str]:
   tier = _resolve_channel_tier(channel, channel_tiers)
   allowed = set(SDK_SAFE_BUILTINS)
@@ -119,6 +159,8 @@ def build_disallowed_tools(
         blocked.add(tool_name)
         continue
       blocked.add(f"mcp__{server_name}__{tool_name}")
+  if available_tools and _authority_role(session) != "owner":
+    blocked |= _unclassified_tool_denials(set(available_tools))
   return sorted(blocked)
 
 

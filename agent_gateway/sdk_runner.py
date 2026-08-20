@@ -1378,7 +1378,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     *,
     nonce: str,
     batch_admission: Any | None = None,
-  ) -> dict[str, Any] | None:
+  ) -> tuple[str, dict[str, Any] | None]:
     return await _sdk_runner_approval.await_user_approval_via_pending_tools(
       session=self._session,
       approval_store=self._approval_store,

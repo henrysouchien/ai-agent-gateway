@@ -550,6 +550,88 @@ def test_sdk_runner_user_denial_uses_ordinary_message(
 
     assert denied.behavior == "deny"
     assert denied.message == "user denied"
+    assert not denied.interrupt
+
+  _run(_case())
+
+
+def test_sdk_runner_approval_expiry_interrupts_turn_instead_of_reading_as_denial(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  _install_fake_agent_sdk(monkeypatch)
+
+  class _Policy:
+    policy_bundle_hash = "test-policy"
+
+    def __init__(self) -> None:
+      self.request: ApprovalRequest | None = None
+
+    async def decide(
+      self,
+      *,
+      payload: ApprovalRequestPayload,
+      request: ApprovalRequest,
+      run_context: RunContext,
+    ):
+      _ = payload, run_context
+      self.request = request
+      return PolicyApprovalDecision(
+        outcome="request_user_approval",
+        reason="Tool requires approval",
+        expiry_seconds=0.2,
+        allow_persistent_grant=True,
+      )
+
+    async def on_resolve(self, *, request: ApprovalRequest) -> None:
+      _ = request
+
+    async def revoke_persistent_grant(self, *, grant_id: str, reason: str) -> None:
+      _ = grant_id, reason
+
+    def role_authorized_for_class(self, *, decider_role: str | None, tool_class: str) -> bool:
+      _ = decider_role, tool_class
+      return True
+
+  async def _case() -> None:
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    policy = _Policy()
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    runner = AgentSDKRunner(
+      event_log=EventLog(),
+      session_id=session.session_id,
+      sdk_config=AgentSDKConfig(
+        user_id="alice",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      ),
+      capability_execution=stub_sdk_capability_execution(),
+      system_prompt="test",
+      session=session,
+      store=store,
+      policy=policy,
+      run_context=RunContext(
+        user_id="alice",
+        request_id="request-1",
+        session_id=session.session_id,
+        channel="web",
+      ),
+    )
+
+    # Nobody ever votes: the queue wait must expire.
+    denied = await runner._can_use_tool_callback("file_write", {"path": "x"}, None)
+
+    assert denied.behavior == "deny"
+    assert denied.interrupt is True
+    assert "approval_timeout" in denied.message
+    assert "user denied" not in denied.message
+    assert session.pending_tools == {}
+    assert session.approval_queues == {}
+
+    assert policy.request is not None
+    stored = await store.get(policy.request.approval_id)
+    assert stored is not None
+    assert stored.state == "expired"
 
   _run(_case())
 
@@ -697,7 +779,7 @@ def test_sdk_projected_pending_tool_binds_stage_identity_to_projection_and_event
       batch_admission=_Admission(),
     )
 
-    assert result == {"approved": False}
+    assert result == ("denied", {"approved": False})
     assert events[0]["stage_run_seq"] == 3
     assert session.pending_tools == {}
     assert session.approval_queues == {}

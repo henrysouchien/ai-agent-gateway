@@ -777,6 +777,113 @@ def test_chat_cancel_endpoint_cancels_backend_turn(make_test_app) -> None:
   _run(case())
 
 
+def test_chat_cancel_rejects_different_session(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_HangingProvider(), runner_class=_ObservedAgentRunner)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      other = await client.post("/api/chat/init", json={"api_key": "gateway-key", "user_id": "bob"})
+      assert other.status_code == 200
+      other_session = other.json()
+
+      cancel_response = await client.post(
+        "/api/chat/cancel",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json={"session_id": other_session["session_id"]},
+      )
+
+      assert cancel_response.status_code == 403
+      assert cancel_response.json()["detail"] == "Cannot cancel a different session"
+      await app.state.user_event_bus.shutdown()
+
+  _run(case())
+
+
+def test_chat_cancel_no_active_turn_returns_404(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_HangingProvider(), runner_class=_ObservedAgentRunner)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+
+      cancel_response = await client.post(
+        "/api/chat/cancel",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json={"session_id": session_info["session_id"]},
+      )
+
+      assert cancel_response.status_code == 404
+      assert cancel_response.json()["detail"] == "No active turn for this session"
+      await app.state.user_event_bus.shutdown()
+
+  _run(case())
+
+
+def test_chat_cancel_missing_or_unknown_bearer_returns_401(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_HangingProvider(), runner_class=_ObservedAgentRunner)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      body = {"session_id": session_info["session_id"]}
+
+      missing_auth = await client.post("/api/chat/cancel", json=body)
+      assert missing_auth.status_code == 401
+
+      unknown_bearer = await client.post(
+        "/api/chat/cancel",
+        headers={"Authorization": "Bearer not-a-real-token"},
+        json=body,
+      )
+      assert unknown_bearer.status_code == 401
+      await app.state.user_event_bus.shutdown()
+
+  _run(case())
+
+
+def test_chat_cancel_does_not_persist_assistant_message(make_test_app) -> None:
+  async def case() -> None:
+    provider = _HangingProvider()
+    app = make_test_app(provider=provider, runner_class=_ObservedAgentRunner)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+
+      async with client.stream(
+        "POST",
+        "/api/chat",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json=_chat_payload(),
+      ) as response:
+        assert response.status_code == 200
+        first_event = await _read_sse_event(response)
+        assert first_event["type"] == "text_delta"
+
+      await _wait_for(
+        lambda: session.active_turn is not None
+        and session.active_turn.subscribers == {}
+        and session.active_turn.is_running,
+        timeout=1.0,
+      )
+
+      cancel_response = await client.post(
+        "/api/chat/cancel",
+        headers={"Authorization": f"Bearer {session_info['session_token']}"},
+        json={"session_id": session_info["session_id"]},
+      )
+
+      assert cancel_response.status_code == 200
+      assert cancel_response.json() == {"status": "cancelled", "session_id": session_info["session_id"]}
+      event_types = [entry.event.get("type") for entry in app.state.test_state.event_log.entries]
+      assert "assistant_message" not in event_types
+      await app.state.user_event_bus.shutdown()
+
+  _run(case())
+
+
 def test_no_double_disconnect_firing(make_test_app) -> None:
   async def case() -> None:
     app = make_test_app(provider=_HangingProvider())
@@ -1186,56 +1293,52 @@ def test_normal_stream_completion_unchanged(make_test_app) -> None:
   _run(case())
 
 
-def test_normalizer_purpose_excludes_trade_tools_from_model_definitions(
+def test_retired_normalizer_purpose_is_rejected_before_runtime(
   make_test_app,
 ) -> None:
   async def case() -> None:
     provider = _ToolCaptureCompletingProvider()
-    trade_tools = [
-      "execute_trade",
-      "execute_basket_trade",
-      "execute_futures_roll",
-      "execute_option_trade",
-    ]
-    tool_names = [*trade_tools, "memory_write", "normalizer_stage", "get_quote"]
-    tool_definitions = [
-      {
-        "name": tool_name,
-        "description": tool_name,
-        "input_schema": {"type": "object", "properties": {}},
-      }
-      for tool_name in tool_names
-    ]
-    app = make_test_app(
-      provider=provider,
-      tool_definitions=tool_definitions,
-    )
+    app = make_test_app(provider=provider)
 
     async with httpx.AsyncClient(
       transport=httpx.ASGITransport(app=app),
       base_url="http://test",
     ) as client:
-      session_info = await _init_session(client)
+      init_response = await client.post(
+        "/api/chat/init",
+        json={
+          "api_key": "gateway-key",
+          "user_id": "alice",
+          "context": {"purpose": "normalizer"},
+        },
+      )
+      assert init_response.status_code == 200, init_response.text
+      session_info = init_response.json()
+      session = app.state.auth.session_store.get_session(
+        session_info["session_id"]
+      )
+      assert session is not None
+      assert session.purpose is None
+      assert app.state.test_state.runtime is None
+      assert provider.tool_names == []
+
       payload = _chat_payload()
       payload["context"]["purpose"] = "normalizer"
 
-      async with client.stream(
-        "POST",
+      response = await client.post(
         "/api/chat",
         headers={"Authorization": f"Bearer {session_info['session_token']}"},
         json=payload,
-      ) as response:
-        assert response.status_code == 200
-        await _collect_sse_events(response)
+      )
 
-    session = app.state.test_state.session
-    assert session.purpose == "normalizer"
-    assert app.state.test_state.runtime.purpose == "normalizer"
-    assert app.state.test_state.runner._purpose == "normalizer"
-    assert set(trade_tools).isdisjoint(provider.tool_names)
-    assert "memory_write" not in provider.tool_names
-    assert "normalizer_stage" in provider.tool_names
-    assert "get_quote" in provider.tool_names
+    assert response.status_code == 400
+    assert response.json() == {
+      "error": "purpose_unavailable",
+      "message": "The normalizer chat purpose is unavailable.",
+    }
+    assert app.state.test_state.session is None
+    assert session.purpose is None
+    assert provider.tool_names == []
 
   _run(case())
 

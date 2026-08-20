@@ -1078,8 +1078,12 @@ def test_large_tool_result_is_compacted_only_for_model_context(tmp_path: Path, m
   parsed = json.loads(final_content)
   assert parsed["_runner_truncated"] is True
   assert parsed["tool_name"] == "large_lookup"
-  assert parsed["scalar_fields"]["status"] == "success"
-  assert parsed["scalar_fields"]["ticker"] == "BIG"
+  # The model-bound copy keeps the result's own shape and elides only bulk, so the
+  # small facts stay readable wherever the producer put them.
+  projection = parsed["content_projection"]
+  assert projection["status"] == "success"
+  assert projection["ticker"] == "BIG"
+  assert "...<elided chars=" in projection["payload"]
   assert parsed["original_chars"] > 4000
 
 

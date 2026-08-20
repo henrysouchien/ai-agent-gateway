@@ -43,18 +43,118 @@ def spill_truncated_tool_results_enabled() -> bool:
   return raw.strip().lower() not in {"0", "false", "no"}
 
 
-def scalar_preview_fields(value: Any) -> Dict[str, Any]:
-  if not isinstance(value, dict):
-    return {}
-  preview: Dict[str, Any] = {}
-  for key, item in value.items():
-    if isinstance(item, str):
-      preview[str(key)] = item if len(item) <= 500 else f"{item[:500]}... <truncated chars={len(item)}>"
-    elif isinstance(item, (int, float, bool)) or item is None:
-      preview[str(key)] = item
-    if len(preview) >= 24:
-      break
-  return preview
+_ELIDED_ITEMS_KEY = "_elided_items"
+_ELIDED_KEYS_KEY = "_elided_keys"
+_ELIDED_DEPTH_KEY = "_elided_depth"
+_ELIDED_CHARS_MARKER = "...<elided chars="
+_PROJECTION_MAX_DEPTH = 12
+
+# Successively harder elision settings: (max list items, max string chars, max dict
+# entries).  The first setting whose serialized payload fits the model budget wins,
+# so a result loses bulk before it loses shape.
+_PROJECTION_LADDER = (
+  (200, 8_000, 400),
+  (100, 4_000, 400),
+  (50, 2_000, 400),
+  (25, 1_000, 300),
+  (12, 500, 200),
+  (6, 300, 120),
+  (3, 200, 80),
+  (1, 120, 48),
+  (0, 80, 32),
+  (0, 40, 16),
+)
+
+
+def _project_value(
+  value: Any,
+  *,
+  max_items: int,
+  max_string_chars: int,
+  max_entries: int,
+  depth: int,
+) -> Any:
+  """Return ``value`` reshaped to the given elision settings, marking every cut.
+
+  Bulk (long strings, long lists, wide dicts, deep nesting) is dropped; scalars and
+  small subtrees are carried through unchanged so a caller can trust an unmarked
+  value.  This decides how *much* of a result survives, never which parts matter.
+  """
+
+  if isinstance(value, str):
+    if len(value) <= max_string_chars:
+      return value
+    return f"{value[:max_string_chars]}{_ELIDED_CHARS_MARKER}{len(value) - max_string_chars}>"
+  if isinstance(value, (int, float, bool)) or value is None:
+    return value
+  if isinstance(value, dict):
+    if depth >= _PROJECTION_MAX_DEPTH:
+      return {_ELIDED_DEPTH_KEY: "dict", _ELIDED_KEYS_KEY: len(value)}
+    projected: Dict[str, Any] = {}
+    for key, item in list(value.items())[:max_entries]:
+      projected[str(key)] = _project_value(
+        item,
+        max_items=max_items,
+        max_string_chars=max_string_chars,
+        max_entries=max_entries,
+        depth=depth + 1,
+      )
+    if len(value) > max_entries:
+      projected[_ELIDED_KEYS_KEY] = len(value) - max_entries
+    return projected
+  if isinstance(value, list):
+    if depth >= _PROJECTION_MAX_DEPTH:
+      return [{_ELIDED_DEPTH_KEY: "list", _ELIDED_ITEMS_KEY: len(value)}]
+    items = [
+      _project_value(
+        item,
+        max_items=max_items,
+        max_string_chars=max_string_chars,
+        max_entries=max_entries,
+        depth=depth + 1,
+      )
+      for item in value[:max_items]
+    ]
+    if len(value) > max_items:
+      items.append({_ELIDED_ITEMS_KEY: len(value) - max_items})
+    return items
+  return _project_value(
+    str(value),
+    max_items=max_items,
+    max_string_chars=max_string_chars,
+    max_entries=max_entries,
+    depth=depth,
+  )
+
+
+def _fit_content_projection(
+  value: Any,
+  *,
+  payload: Dict[str, Any],
+  max_chars: int,
+) -> str | None:
+  """Serialize ``payload`` with the most generous projection of ``value`` that fits."""
+
+  # A result that is one large string (or mostly one) should still fill the budget,
+  # so the first rung sizes its string cap from the space the envelope leaves free.
+  text_budget = max_chars - len(json.dumps(payload, default=str)) - 64
+  ladder = _PROJECTION_LADDER
+  if text_budget > _PROJECTION_LADDER[0][1]:
+    ladder = ((_PROJECTION_LADDER[0][0], text_budget, _PROJECTION_LADDER[0][2]), *ladder)
+
+  for max_items, max_string_chars, max_entries in ladder:
+    payload["content_projection"] = _project_value(
+      value,
+      max_items=max_items,
+      max_string_chars=max_string_chars,
+      max_entries=max_entries,
+      depth=0,
+    )
+    serialized = json.dumps(payload, default=str)
+    if len(serialized) <= max_chars:
+      return serialized
+  payload.pop("content_projection", None)
+  return None
 
 
 def _bounded_projection_text(value: Any, *, limit: int) -> str | None:
@@ -301,10 +401,12 @@ def truncate_model_tool_result_content(
     "tool_name": tool_name,
     "original_chars": len(content),
     "message": (
-      "The full tool result was retained in the gateway event log, but this "
-      "model-bound preview was truncated to stay within the provider context "
-      "window. Narrow the tool query (filters, pagination, fewer fields) if you "
-      "need more detail. If a spill file is listed below, read it for the full result."
+      "The full tool result was retained in the gateway event log. This model-bound "
+      "copy keeps the result's own shape and elides only bulk: every elision is marked "
+      f"in place with {_ELIDED_ITEMS_KEY}, {_ELIDED_KEYS_KEY}, {_ELIDED_DEPTH_KEY}, or "
+      f"'{_ELIDED_CHARS_MARKER}'. Unmarked values are complete and may be reported as-is. "
+      "Narrow the tool query (filters, pagination, fewer fields) if you need the elided "
+      "detail. If a spill file is listed below, read it for the full result."
     ),
   }
   if spill_filename is not None:
@@ -313,27 +415,14 @@ def truncate_model_tool_result_content(
     payload["spill_hint"] = spill_hint or _legacy_spill_hint(spill_filename)
     if spill_summary:
       payload["spill_summary"] = spill_summary
-  if isinstance(parsed, dict):
-    payload["top_level_keys"] = list(parsed.keys())[:50]
-    scalar_fields = scalar_preview_fields(parsed)
-    if scalar_fields:
-      payload["scalar_fields"] = scalar_fields
-  elif isinstance(parsed, list):
-    payload["top_level_type"] = "list"
-    payload["top_level_items"] = len(parsed)
 
-  prefix_budget = max(0, max_chars - len(json.dumps(payload, default=str)) - 200)
-  payload["content_prefix"] = content[:prefix_budget]
-  payload["retained_prefix_chars"] = len(payload["content_prefix"])
-
-  truncated = json.dumps(payload, default=str)
-  while len(truncated) > max_chars and prefix_budget > 0:
-    prefix_budget = max(0, prefix_budget - (len(truncated) - max_chars) - 100)
-    payload["content_prefix"] = content[:prefix_budget]
-    payload["retained_prefix_chars"] = len(payload["content_prefix"])
-    truncated = json.dumps(payload, default=str)
-  if len(truncated) <= max_chars:
-    return truncated, True
+  projected = _fit_content_projection(
+    parsed if parsed is not None else content,
+    payload=payload,
+    max_chars=max_chars,
+  )
+  if projected is not None:
+    return projected, True
 
   fallback_payload = {
     "_runner_truncated": True,

@@ -642,6 +642,52 @@ class _JobsMcpClient(_NullMcpClient):
     return {"name": name, "input": tool_input}, None
 
 
+_MODEL_READER_TOOLS = frozenset({
+  "model_summarize",
+  "model_valuation_summary",
+  "model_find",
+  "model_values",
+  "model_drivers",
+  "model_sensitivity",
+  "model_scenario",
+  "model_scenario_topology",
+  "model_find_scenario_anchor",
+})
+
+
+class _ModelMcpClient(_NullMcpClient):
+  @staticmethod
+  def is_mcp_tool(name: str) -> bool:
+    return name in _MODEL_READER_TOOLS
+
+  @staticmethod
+  def get_server_for_tool(name: str) -> str | None:
+    return "model-engine" if name in _MODEL_READER_TOOLS else None
+
+  @staticmethod
+  def _definition(name: str) -> dict[str, Any]:
+    return {
+      "name": name,
+      "description": "Read a caller-selected model path.",
+      "input_schema": {
+        "type": "object",
+        "properties": {"file_path": {"type": "string"}},
+        "required": ["file_path"],
+      },
+    }
+
+  @classmethod
+  def get_tool_definitions(cls) -> list[dict[str, Any]]:
+    return [cls._definition(name) for name in sorted(_MODEL_READER_TOOLS)]
+
+  @classmethod
+  def get_server_tool_definitions(
+    cls,
+    server_names: set[str] | frozenset[str],
+  ) -> list[dict[str, Any]]:
+    return cls.get_tool_definitions() if "model-engine" in server_names else []
+
+
 class _ResumeTestProvider(ModelProvider):
   name = "stub"
 
@@ -5272,6 +5318,72 @@ def test_resume_copies_admitted_ticker_and_ignores_later_prose(
     _run(_case())
   finally:
     memory.set_memory_store_factory(None)
+
+
+def test_resume_projects_all_private_model_reader_schemas(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_model_readers",
+      agent_name="model-review",
+      user_message="Resume exact model review.",
+      allowed_tools=tuple(sorted(_MODEL_READER_TOOLS)),
+    )
+    captured: dict[str, Any] = {}
+
+    async def _resume_sub_agent(**kwargs: Any):
+      captured.update(kwargs)
+      return await _successful_resume_task_result(
+        kwargs,
+        "continued",
+        workspace_dir=tmp_path,
+      ), None
+
+    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    runner._get_tool_definitions = lambda: []  # type: ignore[method-assign]
+
+    def _project(definition: dict[str, Any]) -> dict[str, Any]:
+      projected = {
+        **definition,
+        "description": "Read the authenticated current model.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "current_model": {"type": "object"},
+          },
+          "required": ["current_model"],
+        },
+      }
+      return projected
+
+    handler = make_resume_handler(
+      [runner],
+      mcp_client=_ModelMcpClient(),
+      local_tool_handlers={},
+      excluded_tools_resolver=frozenset,
+      tool_definition_projector=_project,
+    )
+    result, error = await handler({"task_id": "bg_model_readers"})
+    assert error is None
+    assert result is not None
+    resumed_entry = runner._task_registry.get(result["task_id"])
+    assert resumed_entry is not None
+    await resumed_entry.asyncio_task
+
+    definitions = {
+      definition["name"]: definition
+      for definition in captured["dispatcher"]._get_tool_definitions()
+    }
+    assert set(definitions) == set(_MODEL_READER_TOOLS)
+    for tool_name in _MODEL_READER_TOOLS:
+      schema = definitions[tool_name]["input_schema"]
+      assert "file_path" not in schema["properties"]
+      assert schema["required"] == ["current_model"]
+
+  _run(_case())
 
 
 def test_resume_ticker_owner_survives_two_exact_successor_hops(

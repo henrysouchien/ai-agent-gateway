@@ -307,6 +307,9 @@ def _operation_private_mcp_tool_definitions(
   profile: SkillProfile,
   mcp_client: Any,
   exact_tool_ids: frozenset[str],
+  tool_definition_projector: (
+    Callable[[dict[str, Any]], dict[str, Any] | None] | None
+  ) = None,
 ) -> list[dict[str, Any]]:
   """Read connected schemas for one operation without exposing them to its parent."""
 
@@ -318,12 +321,23 @@ def _operation_private_mcp_tool_definitions(
   if not callable(get_server_definitions):
     return []
   declared_servers = set(profile.mcp_tools or {})
-  return [
-    definition
-    for definition in get_server_definitions(declared_servers)
-    if isinstance(definition, dict)
-    and str(definition.get("name") or "") in exact_tool_ids
-  ]
+  projected: list[dict[str, Any]] = []
+  for definition in get_server_definitions(declared_servers):
+    if (
+      not isinstance(definition, dict)
+      or str(definition.get("name") or "") not in exact_tool_ids
+    ):
+      continue
+    candidate = (
+      tool_definition_projector(definition)
+      if tool_definition_projector is not None
+      else definition
+    )
+    if candidate is not None:
+      if not isinstance(candidate, dict):
+        raise TypeError("tool definition projector must return an object or None")
+      projected.append(candidate)
+  return projected
 
 
 def _operation_private_mcp_tool_ids(
@@ -1165,6 +1179,9 @@ def make_run_agent_handler(
   operation_mcp_activator: (
     Callable[[Any], dict[str, Any] | None] | None
   ) = None,
+  tool_definition_projector: (
+    Callable[[dict[str, Any]], dict[str, Any] | None] | None
+  ) = None,
 ):
   """Build the local handler used by the `run_agent` tool.
 
@@ -1632,6 +1649,7 @@ def make_run_agent_handler(
         profile=profile,
         mcp_client=mcp_client,
         exact_tool_ids=operation_private_mcp_tool_ids,
+        tool_definition_projector=tool_definition_projector,
       ))
 
     candidate_definitions_getter = _child_tool_definitions_getter(
@@ -2001,6 +2019,9 @@ def make_resume_handler(
   commercial_work_start: Any | None = None,
   commercial_irreversible_recheck: Callable[[Any], None] | None = None,
   commercial_mcp_servers: frozenset[str] | None = None,
+  tool_definition_projector: (
+    Callable[[dict[str, Any]], dict[str, Any] | None] | None
+  ) = None,
 ):
   if excluded_tools_resolver is None:
     raise ValueError("make_resume_handler requires excluded_tools_resolver")
@@ -2385,6 +2406,16 @@ def make_resume_handler(
         + ", ".join(sorted(denied_admitted_servers)),
       )
     admitted_dispatch_tools = admitted_tool_ids
+    resumed_mcp_profile = SimpleNamespace(mcp_tools={
+      server_name: tuple(admitted_dispatch_tools)
+      for server_name in admitted_mcp_scope
+    })
+    extra_tool_definitions.extend(_operation_private_mcp_tool_definitions(
+      profile=resumed_mcp_profile,
+      mcp_client=mcp_client,
+      exact_tool_ids=frozenset(admitted_dispatch_tools),
+      tool_definition_projector=tool_definition_projector,
+    ))
     candidate_local_names = set(sub_local)
     sub_local = {
       name: handler
