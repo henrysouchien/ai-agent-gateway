@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.3 (2026-08-21)
+
+### Fixed
+
+- Descriptor-bound v1 session-log inventory now preserves coherent historical
+  telemetry lineage after an authorized physical-root relocation. Historical
+  paths remain metadata only: the current file is still admitted and read by
+  its bound descriptor, family and filename identity must match, active and
+  rotated source IDs must be self-consistent, and conflicting lineage fails
+  closed. V2 canonical paths remain physically exact.
+
 ## 0.17.2 (2026-08-20)
 
 ### Fixed

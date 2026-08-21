@@ -7,6 +7,7 @@ and may classify a stream, but it can never introduce a path into inventory.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -440,6 +441,63 @@ def _classify_sidecar(payload: Mapping[str, Any] | None) -> SessionLogStreamKind
   return "unknown"
 
 
+def _v1_lineage_source_id(
+  logical_stream_id: str,
+  role: str,
+  suffix: str,
+) -> str:
+  stream_hash = hashlib.sha1(
+    logical_stream_id.encode("utf-8")
+  ).hexdigest()[:16]
+  return f"agent_session_log:{stream_hash}:{role}:{suffix}"
+
+
+def _require_v1_active_lineage(
+  item: SelectedAgentSessionLog,
+  payload: Mapping[str, Any],
+) -> tuple[str, int | None]:
+  """Validate v1 telemetry lineage without treating it as path authority."""
+
+  if payload.get("schema_version") != 2:
+    return str(item.path), None
+  logical_stream_id = payload.get("logical_stream_id")
+  active_generation = payload.get("active_generation")
+  if (
+    not isinstance(logical_stream_id, str)
+    or not logical_stream_id
+    or "\x00" in logical_stream_id
+  ):
+    raise SessionLogInventoryError(
+      "retained flat metadata has inconsistent historical lineage"
+    )
+  try:
+    lineage_path = Path(logical_stream_id)
+    canonical_lineage_path = str(absolute_lexical_path(lineage_path))
+  except (OSError, TypeError, ValueError) as exc:
+    raise SessionLogInventoryError(
+      "retained flat metadata has inconsistent historical lineage"
+    ) from exc
+  if (
+    not lineage_path.is_absolute()
+    or canonical_lineage_path != logical_stream_id
+    or lineage_path.parent.name != item.path.parent.name
+    or lineage_path.name != item.path.name
+    or isinstance(active_generation, bool)
+    or not isinstance(active_generation, int)
+    or active_generation < 0
+    or payload.get("telemetry_source_id")
+    != _v1_lineage_source_id(
+      logical_stream_id,
+      "active",
+      f"{active_generation:06d}",
+    )
+  ):
+    raise SessionLogInventoryError(
+      "retained flat metadata has inconsistent historical lineage"
+    )
+  return logical_stream_id, active_generation
+
+
 def _active_sidecar(
   location: AgentSessionLogLocation,
   files: tuple[SessionLogPhysicalFile, ...],
@@ -705,10 +763,7 @@ def _require_flat_stream(
     payload.get("tenant_id") not in {None, payload.get("product_id")}
   ):
     raise SessionLogInventoryError("retained flat metadata has ambiguous tenant attribution")
-  if payload.get("schema_version") == 2 and (
-    payload.get("file_role") != "active"
-    or payload.get("logical_stream_id") != str(item.path)
-  ):
+  if payload.get("schema_version") == 2 and payload.get("file_role") != "active":
     raise SessionLogInventoryError("retained flat metadata contradicts its physical stream")
   if slugify(str(payload["agent_id"])) != item.path.parent.name:
     raise SessionLogInventoryError("retained flat metadata does not match its family directory")
@@ -755,6 +810,10 @@ def _require_flat_stream(
       raise SessionLogInventoryError(
         "retained ephemeral metadata does not match its active path"
       )
+  logical_stream_id, active_generation = _require_v1_active_lineage(
+    item,
+    payload,
+  )
   if not strict_rotated:
     return str(payload["product_id"])
   segment_names: set[str] = set()
@@ -786,8 +845,8 @@ def _require_flat_stream(
       segment_payload.get("run_kind") not in {None, payload.get("run_kind")}
       or segment_payload.get("schema_version") != 2
       or segment_payload.get("file_role") != "segment"
-      or segment_payload.get("logical_stream_id") != str(item.path)
-      or segment_payload.get("rotated_from_path") != str(item.path)
+      or segment_payload.get("logical_stream_id") != logical_stream_id
+      or segment_payload.get("rotated_from_path") != logical_stream_id
       or segment_payload.get("segment_id") != physical.path.stem
     ):
       raise SessionLogInventoryError(
@@ -795,17 +854,57 @@ def _require_flat_stream(
       )
     filename_match = _SEGMENT_FILE_RE.fullmatch(physical.path.name)
     assert filename_match is not None
+    segment_id = physical.path.stem
+    generation = int(filename_match.group("generation"))
     expected_identity = {
       "st_dev": physical.file_identity.device,
       "st_ino": physical.file_identity.inode,
       "size": physical.file_identity.size,
       "mtime_ns": physical.file_identity.mtime_ns,
     }
+    rotated_identity = segment_payload.get("rotated_from_file_identity")
+    historical_lineage = logical_stream_id != str(item.path)
+    rotated_identity_valid = (
+      isinstance(rotated_identity, Mapping)
+      and set(rotated_identity) == _FILE_IDENTITY_FIELDS
+      and all(
+        not isinstance(rotated_identity.get(field), bool)
+        and isinstance(rotated_identity.get(field), int)
+        for field in _FILE_IDENTITY_FIELDS
+      )
+      and int(rotated_identity["st_dev"]) > 0
+      and int(rotated_identity["st_ino"]) > 0
+      and int(rotated_identity["size"]) >= 0
+      and int(rotated_identity["mtime_ns"]) >= 0
+      and (
+        (
+          historical_lineage
+          and rotated_identity.get("size") == expected_identity["size"]
+          and rotated_identity.get("mtime_ns") == expected_identity["mtime_ns"]
+        )
+        or (
+          not historical_lineage
+          and rotated_identity == expected_identity
+        )
+      )
+    )
     if (
       segment_payload.get("first_seq") != int(filename_match.group("first"))
       or segment_payload.get("last_seq") != int(filename_match.group("last"))
-      or segment_payload.get("rotated_from_file_identity")
-      != expected_identity
+      or segment_payload.get("active_generation") != generation
+      or segment_payload.get("telemetry_source_id")
+      != _v1_lineage_source_id(
+        logical_stream_id,
+        "segment",
+        segment_id,
+      )
+      or segment_payload.get("rotated_from_source_id")
+      != _v1_lineage_source_id(
+        logical_stream_id,
+        "active",
+        f"{generation:06d}",
+      )
+      or not rotated_identity_valid
     ):
       raise SessionLogInventoryError(
         "retained flat segment metadata does not match physical storage"
@@ -817,8 +916,26 @@ def _require_flat_stream(
         "retained flat rotated storage requires a valid manifest"
       )
     if (
-      manifest.get("logical_stream_id") != str(item.path)
+      manifest.get("schema_version") != 1
+      or manifest.get("logical_stream_id") not in {
+        str(item.path), logical_stream_id,
+      }
+      or manifest.get("agent_session_id") not in {
+        None, payload.get("agent_session_id"),
+      }
       or manifest.get("active_path") != f"../{item.path.name}"
+      or (
+        active_generation is not None
+        and (
+          manifest.get("active_generation") != active_generation
+          or manifest.get("active_telemetry_source_id")
+          != _v1_lineage_source_id(
+            str(manifest.get("logical_stream_id")),
+            "active",
+            f"{active_generation:06d}",
+          )
+        )
+      )
       or not isinstance(manifest.get("segments"), list)
     ):
       raise SessionLogInventoryError(
@@ -860,6 +977,14 @@ def _require_flat_stream(
         or descriptor.get("bytes") != physical.file_identity.size
         or descriptor.get("telemetry_source_id")
         != segment_payload.get("telemetry_source_id")
+        or descriptor.get("rotated_from_source_id")
+        != segment_payload.get("rotated_from_source_id")
+        or descriptor.get("rotated_from_path") not in {
+          logical_stream_id,
+          f"../{item.path.name}",
+        }
+        or descriptor.get("rotated_from_file_identity")
+        != segment_payload.get("rotated_from_file_identity")
       ):
         raise SessionLogInventoryError(
           "retained flat manifest contradicts physical segments"
