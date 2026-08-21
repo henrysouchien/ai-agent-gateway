@@ -15,6 +15,11 @@ import stat
 from typing import Any, Awaitable, BinaryIO, Callable, Literal, Mapping
 
 from .artifact_paths import canonicalize_ticker
+from .descriptor_paths import (
+  DirectoryChainSecurityError,
+  DirectoryIdentity,
+  open_directory_chain,
+)
 from .skill_completion_wal import (
   TopLevelSkillCompletionEffectPlan,
   canonical_json_bytes,
@@ -115,58 +120,6 @@ def _write_all_fd(fd: int, payload: bytes) -> None:
     offset += written
 
 
-def _require_regular_owned_path(
-  path: Path,
-  *,
-  expected_uid: int,
-  expected_identity: tuple[int, int] | None = None,
-  required_mode: int | None = None,
-) -> os.stat_result:
-  try:
-    path_stat = path.lstat()
-  except FileNotFoundError as exc:
-    raise RuntimeError(
-      f"Top-level skill admission path disappeared: {path}"
-    ) from exc
-  if stat.S_ISLNK(path_stat.st_mode):
-    raise RuntimeError(
-      f"Top-level skill admission rejects symlink path: {path}"
-    )
-  if not stat.S_ISREG(path_stat.st_mode):
-    raise RuntimeError(
-      f"Top-level skill admission requires a regular file: {path}"
-    )
-  if path_stat.st_uid != expected_uid:
-    raise RuntimeError(
-      f"Top-level skill admission owner changed for {path}"
-    )
-  if path_stat.st_nlink != 1:
-    raise RuntimeError(
-      f"Top-level skill admission requires one hard link for {path}"
-    )
-  path_mode = stat.S_IMODE(path_stat.st_mode)
-  if (
-    required_mode is not None
-    and path_mode != required_mode
-  ):
-    raise RuntimeError(
-      "Top-level skill admission requires mode "
-      f"{required_mode:04o} for {path}"
-    )
-  if required_mode is None and path_mode & 0o022:
-    raise RuntimeError(
-      f"Top-level skill admission rejects writable mode for {path}"
-    )
-  if (
-    expected_identity is not None
-    and (path_stat.st_dev, path_stat.st_ino) != expected_identity
-  ):
-    raise RuntimeError(
-      f"Top-level skill admission file identity changed for {path}"
-    )
-  return path_stat
-
-
 def _lease_fence_record(
   *,
   generation: int,
@@ -253,6 +206,7 @@ class TopLevelSkillAdmission:
   _lease_file: BinaryIO = field(repr=False)
   _owner_uid: int = field(repr=False)
   _lease_identity: tuple[int, int] = field(repr=False)
+  _parent_identity: DirectoryIdentity = field(repr=False)
   lease_generation: int
   lease_owner_token: str = field(repr=False)
   _initial_log_identity: tuple[int, int] | None = field(
@@ -278,19 +232,43 @@ class TopLevelSkillAdmission:
     canonical_lease_path = canonical_log_path.with_name(
       f"{canonical_log_path.name}.write_lease"
     )
-    canonical_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     owner_uid = os.geteuid()
     initial_log_identity: tuple[int, int] | None = None
+    parent_fd, parent_identity = open_directory_chain(
+      canonical_log_path.parent,
+      create=True,
+    )
     try:
-      initial_log_stat = canonical_log_path.lstat()
+      parent_stat = os.fstat(parent_fd)
+      if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != owner_uid
+      ):
+        raise RuntimeError(
+          "Top-level skill admission parent directory is unsafe"
+        )
+      initial_log_stat = os.stat(
+        canonical_log_path.name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+      )
     except FileNotFoundError:
       pass
+    except BaseException:
+      os.close(parent_fd)
+      raise
     else:
-      initial_log_stat = _require_regular_owned_path(
-        canonical_log_path,
-        expected_uid=owner_uid,
-      )
+      if (
+        not stat.S_ISREG(initial_log_stat.st_mode)
+        or initial_log_stat.st_uid != owner_uid
+        or initial_log_stat.st_nlink != 1
+        or stat.S_IMODE(initial_log_stat.st_mode) & 0o022
+      ):
+        os.close(parent_fd)
+        raise RuntimeError(
+          "Top-level skill admission initial log is unsafe"
+        )
       initial_log_identity = (
         initial_log_stat.st_dev,
         initial_log_stat.st_ino,
@@ -305,13 +283,18 @@ class TopLevelSkillAdmission:
     try:
       try:
         fd = os.open(
-          canonical_lease_path,
+          canonical_lease_path.name,
           flags | os.O_CREAT | os.O_EXCL,
           0o600,
+          dir_fd=parent_fd,
         )
         lease_created = True
       except FileExistsError:
-        fd = os.open(canonical_lease_path, flags)
+        fd = os.open(
+          canonical_lease_path.name,
+          flags,
+          dir_fd=parent_fd,
+        )
       lease_file = os.fdopen(fd, "a+b", buffering=0)
       fd = None
       lease_stat = os.fstat(lease_file.fileno())
@@ -338,12 +321,21 @@ class TopLevelSkillAdmission:
           f"{canonical_lease_path}"
         )
       lease_identity = (lease_stat.st_dev, lease_stat.st_ino)
-      _require_regular_owned_path(
-        canonical_lease_path,
-        expected_uid=owner_uid,
-        expected_identity=lease_identity,
-        required_mode=0o600,
+      named_lease = os.stat(
+        canonical_lease_path.name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
       )
+      if (
+        not stat.S_ISREG(named_lease.st_mode)
+        or named_lease.st_uid != owner_uid
+        or named_lease.st_nlink != 1
+        or stat.S_IMODE(named_lease.st_mode) != 0o600
+        or (named_lease.st_dev, named_lease.st_ino) != lease_identity
+      ):
+        raise RuntimeError(
+          "Top-level skill admission lease identity changed"
+        )
       try:
         fcntl.flock(
           lease_file.fileno(),
@@ -385,33 +377,32 @@ class TopLevelSkillAdmission:
           "Writer lease fence readback does not match the new generation"
         )
       if lease_created:
-        parent_flags = os.O_RDONLY | getattr(
-          os,
-          "O_DIRECTORY",
-          0,
-        )
-        parent_flags |= getattr(os, "O_CLOEXEC", 0)
-        parent_flags |= getattr(os, "O_NOFOLLOW", 0)
-        parent_fd = os.open(
-          canonical_lease_path.parent,
-          parent_flags,
-        )
-        try:
-          os.fsync(parent_fd)
-        finally:
-          os.close(parent_fd)
-      _require_regular_owned_path(
-        canonical_lease_path,
-        expected_uid=owner_uid,
-        expected_identity=lease_identity,
-        required_mode=0o600,
+        os.fsync(parent_fd)
+      persisted_lease = os.stat(
+        canonical_lease_path.name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
       )
+      if (
+        not stat.S_ISREG(persisted_lease.st_mode)
+        or persisted_lease.st_uid != owner_uid
+        or persisted_lease.st_nlink != 1
+        or stat.S_IMODE(persisted_lease.st_mode) != 0o600
+        or (persisted_lease.st_dev, persisted_lease.st_ino)
+        != lease_identity
+      ):
+        raise RuntimeError(
+          "Top-level skill admission persisted lease identity changed"
+        )
+      os.close(parent_fd)
+      parent_fd = -1
       return cls(
         log_path=canonical_log_path,
         write_lease_path=canonical_lease_path,
         _lease_file=lease_file,
         _owner_uid=owner_uid,
         _lease_identity=lease_identity,
+        _parent_identity=parent_identity,
         lease_generation=lease_generation,
         lease_owner_token=lease_owner_token,
         _initial_log_identity=initial_log_identity,
@@ -425,6 +416,8 @@ class TopLevelSkillAdmission:
         lease_file.close()
       elif fd is not None:
         os.close(fd)
+      if parent_fd >= 0:
+        os.close(parent_fd)
       raise
 
   @property
@@ -443,6 +436,71 @@ class TopLevelSkillAdmission:
     }
 
   def _validate_storage_identity(self) -> None:
+    try:
+      parent_fd, parent_identity = open_directory_chain(
+        self.log_path.parent
+      )
+    except DirectoryChainSecurityError as exc:
+      raise RuntimeError(
+        "Top-level skill admission parent directory is unavailable"
+      ) from exc
+    try:
+      if parent_identity != self._parent_identity:
+        raise RuntimeError(
+          "Top-level skill admission parent directory changed"
+        )
+      parent_stat = os.fstat(parent_fd)
+      if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != self._owner_uid
+      ):
+        raise RuntimeError(
+          "Top-level skill admission parent directory is unsafe"
+        )
+
+      named_lease = os.stat(
+        self.write_lease_path.name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+      )
+      if (
+        not stat.S_ISREG(named_lease.st_mode)
+        or named_lease.st_uid != self._owner_uid
+        or named_lease.st_nlink != 1
+        or stat.S_IMODE(named_lease.st_mode) != 0o600
+        or (named_lease.st_dev, named_lease.st_ino)
+        != self._lease_identity
+      ):
+        raise RuntimeError(
+          "Top-level skill admission lease identity changed"
+        )
+
+      current_log_stat = os.stat(
+        self.log_path.name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+      )
+      if (
+        not stat.S_ISREG(current_log_stat.st_mode)
+        or current_log_stat.st_uid != self._owner_uid
+        or current_log_stat.st_nlink != 1
+        or stat.S_IMODE(current_log_stat.st_mode) & 0o022
+        or (
+          self._initial_log_identity is not None
+          and (current_log_stat.st_dev, current_log_stat.st_ino)
+          != self._initial_log_identity
+        )
+      ):
+        raise RuntimeError(
+          "Top-level skill admission log identity changed"
+        )
+    except FileNotFoundError as exc:
+      raise RuntimeError(
+        "Top-level skill admission path disappeared"
+      ) from exc
+    finally:
+      os.close(parent_fd)
+
     lease_stat = os.fstat(self._lease_file.fileno())
     if not stat.S_ISREG(lease_stat.st_mode):
       raise RuntimeError(
@@ -467,17 +525,6 @@ class TopLevelSkillAdmission:
       raise RuntimeError(
         "Top-level skill admission lease descriptor identity changed"
       )
-    _require_regular_owned_path(
-      self.write_lease_path,
-      expected_uid=self._owner_uid,
-      expected_identity=self._lease_identity,
-      required_mode=0o600,
-    )
-    current_log_stat = _require_regular_owned_path(
-      self.log_path,
-      expected_uid=self._owner_uid,
-      expected_identity=self._initial_log_identity,
-    )
     if self._initial_log_identity is None:
       self._initial_log_identity = (
         current_log_stat.st_dev,

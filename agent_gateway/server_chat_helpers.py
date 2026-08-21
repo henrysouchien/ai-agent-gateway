@@ -43,6 +43,7 @@ from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 from .product_config import gateway_product_id
 from .providers import StreamEvent
 from .runner_introspection import exception_traceback_already_logged
+from .runner_background_lifecycle import StrictBackgroundTaskDrainUnavailable
 from .session import (
   GatewaySession,
   SessionStore,
@@ -239,6 +240,10 @@ def _clear_active_turn(session: GatewaySession, active_turn: SessionStream) -> N
     if pump_task is not None and not pump_task.done():
       pump_task.cancel()
   active_turn.subscribers.clear()
+  activity_lease = active_turn.research_file_activity_lease
+  active_turn.research_file_activity_lease = None
+  if activity_lease is not None:
+    activity_lease.release()
   session.active_turn = None
   session.stream_active = False
 
@@ -269,6 +274,69 @@ async def _cleanup_active_turn_on_expiry(session: GatewaySession) -> None:
     return
   await _cancel_active_turn_runner(active_turn)
   _clear_active_turn(session, active_turn)
+
+
+class ResearchFileSessionDrainUnavailable(RuntimeError):
+  """A matching live turn could not prove all child writers stopped."""
+
+
+async def quiesce_research_file_sessions(
+  sessions: tuple[GatewaySession, ...],
+  *,
+  owner_user_id: str,
+  research_file_ids: tuple[int, ...],
+) -> None:
+  """Cancel and drain exact owner/file live turns through their runtime owner."""
+
+  normalized_owner_user_id = str(owner_user_id or "").strip()
+  if not normalized_owner_user_id:
+    raise ValueError("owner_user_id is required")
+  normalized_file_ids = frozenset(
+    int(research_file_id)
+    for research_file_id in research_file_ids
+    if (
+      isinstance(research_file_id, int)
+      and not isinstance(research_file_id, bool)
+      and 0 < research_file_id < (1 << 63)
+    )
+  )
+  if len(normalized_file_ids) != len(research_file_ids):
+    raise ValueError("research_file_ids must be unique positive signed 64-bit integers")
+
+  targets: list[tuple[GatewaySession, SessionStream]] = []
+  for session in sessions:
+    if _session_storage_user_id(session) != normalized_owner_user_id:
+      continue
+    active_turn = session.active_turn
+    if (
+      active_turn is not None
+      and active_turn.research_file_id in normalized_file_ids
+    ):
+      targets.append((session, active_turn))
+
+  for session, active_turn in targets:
+    await _cancel_active_turn_runner(active_turn)
+    _cancel_active_turn_cleanup_handle(active_turn)
+    strict_drain = getattr(
+      active_turn.runtime_owner,
+      "cancel_and_require_background_tasks_drained",
+      None,
+    )
+    if callable(strict_drain):
+      try:
+        await strict_drain()
+      except StrictBackgroundTaskDrainUnavailable as exc:
+        raise ResearchFileSessionDrainUnavailable(
+          "document_erase_incomplete"
+        ) from exc
+    _clear_active_turn(session, active_turn)
+
+
+def _session_storage_user_id(session: GatewaySession) -> str:
+  risk_user_id = int(getattr(session, "risk_user_id", 0) or 0)
+  if risk_user_id > 0:
+    return str(risk_user_id)
+  return str(getattr(session, "user_id", "") or "").strip()
 
 
 def _event_for_wire(entry: Any, event_log: EventLog) -> Dict[str, Any]:
@@ -1109,6 +1177,8 @@ async def _dispatch_chat_turn_body(
   runtime: ChatRuntime | None = None
   runner: Any | None = None
   runner_task: asyncio.Task[Any] | None = None
+  selected_content_admission = SelectedContentAdmission()
+  selected_content_activity_transferred = False
 
   async def _safe_fire_disconnect() -> None:
     if runtime is None:
@@ -1179,7 +1249,6 @@ async def _dispatch_chat_turn_body(
         "_gateway_selected_content_admitter",
         None,
       )
-      selected_content_admission = SelectedContentAdmission()
       if selected_content_admitter is not None:
         selected_content_admission = selected_content_admitter(session, request)
         if inspect.isawaitable(selected_content_admission):
@@ -1199,6 +1268,7 @@ async def _dispatch_chat_turn_body(
               (selected_content_admission.model_context, False),
             ]
       runner = _build_runner_with_started_at(runtime.build_runner, event_log, sid, started_at)
+      active_turn.runtime_owner = runner
       bind_selected_content = getattr(runner, "bind_selected_content", None)
       if selected_content_admission.bindings and not callable(bind_selected_content):
         raise RuntimeError(
@@ -1227,6 +1297,36 @@ async def _dispatch_chat_turn_body(
       runner_on_disconnect = getattr(runner, "on_disconnect", None)
       if callable(runner_on_disconnect):
         runtime.disconnect_handler = runner_on_disconnect
+
+    research_file_activity_lease = active_turn.research_file_activity_lease
+    if research_file_activity_lease is not None:
+      bind_research_file_activity = getattr(
+        runner,
+        "bind_research_file_activity_lease",
+        None,
+      )
+      if not callable(bind_research_file_activity):
+        raise RuntimeError(
+          "chat runner cannot own research file activity"
+        )
+      bind_research_file_activity(research_file_activity_lease)
+      active_turn.research_file_activity_lease = None
+
+    selected_content_activity_lease = (
+      selected_content_admission.activity_lease
+    )
+    if selected_content_activity_lease is not None:
+      bind_selected_content_activity = getattr(
+        runner,
+        "bind_selected_content_activity_lease",
+        None,
+      )
+      if not callable(bind_selected_content_activity):
+        raise RuntimeError(
+          "chat runner cannot own selected content activity"
+        )
+      bind_selected_content_activity(selected_content_activity_lease)
+      selected_content_activity_transferred = True
 
     async def run_agent() -> None:
       try:
@@ -1303,6 +1403,30 @@ async def _dispatch_chat_turn_body(
     _emit_terminal({"type": "error", "error": "stream failed"})
     raise
   finally:
+    if (
+      runner is not None
+      and (runner_task is None or runner_task.done())
+    ):
+      for release_name in (
+        "release_research_file_activity_lease_if_owned",
+        "release_selected_content_activity_lease_if_owned",
+      ):
+        release_activity = getattr(runner, release_name, None)
+        if callable(release_activity):
+          release_activity()
+    if not selected_content_activity_transferred:
+      selected_content_activity_lease = (
+        selected_content_admission.activity_lease
+      )
+      if selected_content_activity_lease is not None:
+        selected_content_activity_lease.release()
+    if runner_task is None:
+      research_file_activity_lease = (
+        active_turn.research_file_activity_lease
+      )
+      active_turn.research_file_activity_lease = None
+      if research_file_activity_lease is not None:
+        research_file_activity_lease.release()
     if not log_has_terminal(event_log):
       _emit_terminal({"type": "error", "error": "stream closed"})
     event_log.close()

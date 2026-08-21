@@ -2,10 +2,61 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 from typing import Any, Callable
 
 from .agent_session_log_records import _atomic_write_sidecar, _now_iso
+from .descriptor_paths import DirectoryIdentity, open_directory_chain
+
+
+V2_STORAGE_IDENTITY_FIELDS = (
+  "storage_layout",
+  "tenant_id",
+  "workload_profile",
+  "provider",
+  "provider_session_epoch",
+  "storage_identity_digest",
+)
+FLAT_STREAM_IDENTITY_FIELDS = (
+  "run_kind",
+  "run_seq",
+  "batch_id",
+  "pipeline_id",
+  "ticker",
+  "stage",
+  "skill",
+)
+V2_ACTIVE_SIDECAR_FIELDS = frozenset({
+  "schema_version",
+  "agent_session_id",
+  "agent_id",
+  "user_id",
+  "product_id",
+  "tenant_id",
+  "file_kind",
+  "channel",
+  "profile",
+  "created_at",
+  "file_role",
+  "logical_stream_id",
+  "telemetry_source_id",
+  "active_generation",
+  *V2_STORAGE_IDENTITY_FIELDS,
+})
+V2_SEGMENT_SIDECAR_FIELDS = frozenset({
+  *V2_ACTIVE_SIDECAR_FIELDS,
+  "segment_id",
+  "first_seq",
+  "last_seq",
+  "rotated_from_source_id",
+  "rotated_from_path",
+  "rotated_from_file_identity",
+})
+
+class AgentSessionLogSidecarError(RuntimeError):
+  """A mandatory v2 session-log sidecar is unsafe or contradictory."""
 
 
 def logical_stream_id(path: Path) -> str:
@@ -86,6 +137,127 @@ def load_sidecar_payload(path: Path) -> dict[str, Any] | None:
   return payload if isinstance(payload, dict) else None
 
 
+def _strict_json_object(raw: bytes) -> dict[str, Any]:
+  def pairs_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+      if key in result:
+        raise AgentSessionLogSidecarError(
+          "v2 session-log sidecar contains duplicate fields"
+        )
+      result[key] = value
+    return result
+
+  try:
+    payload = json.loads(
+      raw.decode("utf-8"),
+      object_pairs_hook=pairs_object,
+    )
+  except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    raise AgentSessionLogSidecarError(
+      "v2 session-log sidecar is invalid"
+    ) from exc
+  if not isinstance(payload, dict):
+    raise AgentSessionLogSidecarError(
+      "v2 session-log sidecar must be an object"
+    )
+  return payload
+
+
+def validate_v2_active_sidecar(
+  *,
+  active_path: Path,
+  meta_path: Path,
+  parent_identity: DirectoryIdentity,
+  meta_device: int,
+  meta_inode: int,
+  max_bytes: int = 64 * 1024,
+) -> dict[str, Any]:
+  """Read and validate the exact mandatory v2 active sidecar.
+
+  The sidecar classifies the already authenticated storage stream; it never
+  admits a path. The directory and file identities must match the signed and
+  descriptor-bound authority before any payload field is trusted.
+  """
+
+  active = Path(active_path)
+  meta = Path(meta_path)
+  if (
+    not active.is_absolute()
+    or not meta.is_absolute()
+    or meta != active.with_suffix(".meta.json")
+  ):
+    raise AgentSessionLogSidecarError(
+      "v2 session-log sidecar path is invalid"
+    )
+  parent_descriptor = descriptor = -1
+  try:
+    parent_descriptor, opened_identity = open_directory_chain(meta.parent)
+    if opened_identity != parent_identity:
+      raise AgentSessionLogSidecarError(
+        "v2 session-log sidecar parent identity changed"
+      )
+    named = os.stat(
+      meta.name,
+      dir_fd=parent_descriptor,
+      follow_symlinks=False,
+    )
+    descriptor = os.open(
+      meta.name,
+      os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+      dir_fd=parent_descriptor,
+    )
+    opened = os.fstat(descriptor)
+    for info in (named, opened):
+      if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+      ):
+        raise AgentSessionLogSidecarError(
+          "v2 session-log sidecar file is unsafe"
+        )
+    expected_identity = (meta_device, meta_inode)
+    if (
+      (named.st_dev, named.st_ino) != expected_identity
+      or (opened.st_dev, opened.st_ino) != expected_identity
+    ):
+      raise AgentSessionLogSidecarError(
+        "v2 session-log sidecar identity changed"
+      )
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+      chunk = os.read(descriptor, min(8192, max_bytes + 1 - total))
+      if not chunk:
+        break
+      chunks.append(chunk)
+      total += len(chunk)
+      if total > max_bytes:
+        raise AgentSessionLogSidecarError(
+          "v2 session-log sidecar exceeds its byte bound"
+        )
+    payload = _strict_json_object(b"".join(chunks))
+  except AgentSessionLogSidecarError:
+    raise
+  except OSError as exc:
+    raise AgentSessionLogSidecarError(
+      "v2 session-log sidecar is unavailable"
+    ) from exc
+  finally:
+    if descriptor >= 0:
+      os.close(descriptor)
+    if parent_descriptor >= 0:
+      os.close(parent_descriptor)
+
+  # Semantic classification is deliberately owned by
+  # agent_session_log_layout.validate_v2_sidecar_payload. Keeping this helper
+  # limited to the descriptor-bound read avoids a second schema authority in
+  # the rotation module's dependency direction.
+  return payload
+
+
 def segment_sidecar_payload(
   path: Path,
   base: dict[str, Any],
@@ -99,7 +271,7 @@ def segment_sidecar_payload(
   telemetry_source_id_fn: Callable[[str, str], str],
   now_iso_fn: Callable[[], str] = _now_iso,
 ) -> dict[str, Any]:
-  return {
+  payload = {
     "schema_version": 2,
     "agent_session_id": str(base.get("agent_session_id") or path.stem),
     "agent_id": base.get("agent_id"),
@@ -120,6 +292,12 @@ def segment_sidecar_payload(
     "rotated_from_path": str(path),
     "rotated_from_file_identity": rotated_from_file_identity,
   }
+  payload.update({
+    key: base.get(key)
+    for key in (*V2_STORAGE_IDENTITY_FIELDS, *FLAT_STREAM_IDENTITY_FIELDS)
+    if key in base
+  })
+  return payload
 
 
 def fallback_sidecar_base(path: Path, *, now_iso_fn: Callable[[], str] = _now_iso) -> dict[str, Any]:
@@ -145,7 +323,18 @@ def sidecar_base_from_segment_meta(meta: dict[str, Any] | None) -> dict[str, Any
     return None
   base = {
     key: meta.get(key)
-    for key in ("agent_session_id", "agent_id", "user_id", "product_id", "file_kind", "channel", "profile", "created_at")
+    for key in (
+      "agent_session_id",
+      "agent_id",
+      "user_id",
+      "product_id",
+      "file_kind",
+      "channel",
+      "profile",
+      "created_at",
+      *FLAT_STREAM_IDENTITY_FIELDS,
+      *V2_STORAGE_IDENTITY_FIELDS,
+    )
     if key in meta
   }
   return base or None

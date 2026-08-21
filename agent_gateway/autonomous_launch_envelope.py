@@ -7,11 +7,16 @@ import math
 import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from .capability_binding import CapabilityBind, CredentialHandle
+from .agent_session_log_layout import (
+  AutonomousSessionLogAuthority,
+  SESSION_LOG_LAYOUT_V2,
+  derive_v2_agent_session_log_paths,
+)
 from .role_validation import require_exact_role
 from .session import GatewaySession
 
@@ -21,9 +26,9 @@ AUTONOMOUS_CAPABILITY_ENVELOPE_ENV = (
 )
 AUTONOMOUS_TASK_ID_ENV = "AGENT_AUTONOMOUS_TASK_ID"
 AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE = (
-  "agent-gateway.autonomous-capability/v4"
+  "agent-gateway.autonomous-capability/v5"
 )
-AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION = 4
+AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION = 5
 AUTONOMOUS_CAPABILITY_ENVELOPE_TTL_SECONDS = 60
 AUTONOMOUS_CAPABILITY_ENVELOPE_MAX_TTL_SECONDS = 300
 AUTONOMOUS_CAPABILITY_ENVELOPE_CLOCK_SKEW_SECONDS = 5
@@ -61,6 +66,7 @@ _WORKLOAD_FIELDS = frozenset({
   "dev_mode",
   "max_budget_usd",
   "deliver",
+  "session_log_authority",
 })
 _CONTROL_AUTHORITY_FIELDS = frozenset({
   "control_mode",
@@ -389,6 +395,13 @@ class AutonomousLaunchWorkload:
   dev_mode: bool
   max_budget_usd: float | None
   deliver: bool
+  # This is not an executable CLI argument, so the entrypoint's workload
+  # comparison intentionally ignores it.  It is nevertheless mandatory in
+  # every signed v5 receipt and is verified independently before bootstrap.
+  session_log_authority: AutonomousSessionLogAuthority | None = field(
+    default=None,
+    compare=False,
+  )
 
   def __post_init__(self) -> None:
     profile = _canonical_workload_text(
@@ -413,6 +426,14 @@ class AutonomousLaunchWorkload:
     if type(self.deliver) is not bool:
       raise ValueError(
         "autonomous launch workload deliver must be a boolean"
+      )
+    if (
+      self.session_log_authority is not None
+      and type(self.session_log_authority)
+      is not AutonomousSessionLogAuthority
+    ):
+      raise TypeError(
+        "autonomous launch workload session_log_authority must be exact"
       )
 
     task = _canonical_workload_text(
@@ -506,7 +527,20 @@ class AutonomousLaunchWorkload:
       field_name="workload",
       fields=_WORKLOAD_FIELDS,
     )
-    return cls(**payload)
+    try:
+      session_log_authority = AutonomousSessionLogAuthority.from_receipt(
+        payload["session_log_authority"]
+      )
+    except (TypeError, ValueError) as exc:
+      raise ValueError(
+        "autonomous launch workload session_log_authority is invalid"
+      ) from exc
+    return cls(
+      **{
+        **payload,
+        "session_log_authority": session_log_authority,
+      }
+    )
 
   def receipt(self) -> dict[str, Any]:
     return {
@@ -520,6 +554,12 @@ class AutonomousLaunchWorkload:
       "dev_mode": self.dev_mode,
       "max_budget_usd": self.max_budget_usd,
       "deliver": self.deliver,
+      "session_log_authority": (
+        self.session_log_authority.receipt()
+        if type(self.session_log_authority)
+        is AutonomousSessionLogAuthority
+        else None
+      ),
     }
 
 
@@ -1245,6 +1285,50 @@ def _validate_session_authority_bindings(
     )
 
 
+def _validate_session_log_authority_bindings(
+  workload: AutonomousLaunchWorkload,
+  *,
+  session_authority: AutonomousSessionAuthority,
+  owner_user_id: str,
+  bind: CapabilityBind,
+) -> None:
+  authority = workload.session_log_authority
+  if type(authority) is not AutonomousSessionLogAuthority:
+    raise TypeError(
+      "autonomous capability envelope workload requires exact "
+      "session-log authority"
+    )
+  ordinary = session_authority.ordinary_authority
+  if type(ordinary) is not OrdinaryAutonomousSessionAuthority:
+    raise TypeError(
+      "session-log authority requires exact ordinary session authority"
+    )
+  try:
+    root, active, meta, digest = derive_v2_agent_session_log_paths(
+      authority.base_path,
+      tenant=ordinary.tenant_id,
+      owner=owner_user_id,
+      workload_profile=workload.profile,
+      provider=bind.provider,
+      provider_session_epoch=authority.provider_session_epoch,
+    )
+  except (TypeError, ValueError) as exc:
+    raise ValueError(
+      "session-log authority identity is invalid"
+    ) from exc
+  if authority.layout != SESSION_LOG_LAYOUT_V2:
+    return
+  if (
+    authority.root_path != str(root)
+    or authority.active_path != str(active)
+    or authority.meta_path != str(meta)
+    or authority.storage_identity_digest != digest
+  ):
+    raise ValueError(
+      "session-log authority does not match authenticated workload identity"
+    )
+
+
 def sign_autonomous_launch_envelope(
   secret: bytes | str,
   *,
@@ -1335,6 +1419,12 @@ def sign_autonomous_launch_envelope(
     issued_at_ns=issued_at_ns,
     expires_at_ns=expires_at_ns,
     current_time_ns=issued_at_ns,
+  )
+  _validate_session_log_authority_bindings(
+    workload,
+    session_authority=session_authority,
+    owner_user_id=normalized_owner_user_id,
+    bind=bind,
   )
   unsigned_payload = {
     "audience": AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE,
@@ -1581,6 +1671,12 @@ def _decode_autonomous_launch_envelope(
     issued_at_ns=issued_at_ns,
     expires_at_ns=expires_at_ns,
     current_time_ns=current_time_ns,
+  )
+  _validate_session_log_authority_bindings(
+    workload,
+    session_authority=session_authority,
+    owner_user_id=owner_user_id,
+    bind=bind,
   )
   return AutonomousLaunchEnvelope(
     audience=audience,

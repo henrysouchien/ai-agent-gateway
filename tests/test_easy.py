@@ -37,6 +37,14 @@ DEFAULT_ANTHROPIC_MODEL = INITIAL_MODEL_REGISTRY.require(
 ).upstream_model
 
 
+class _EmptyOperationCatalog:
+  def resolve_operation(self, _selector):
+    raise FileNotFoundError("no operations")
+
+  def list_callable_operations_with_descriptions(self):
+    return []
+
+
 def _run(coro):
   return asyncio.run(coro)
 
@@ -972,6 +980,53 @@ def test_create_agent_skills_dir_registers_run_agent_handler_tool_def_and_builti
   assert "send_message" in runner._dispatcher._local
   assert {tool["name"] for tool in tool_defs} >= {"run_agent", "get_background_result", "send_message"}
   assert app.state.gateway_config.mcp_client._builtin_tool_names >= {"run_agent", "get_background_result", "send_message"}
+
+
+def test_create_agent_rejects_skills_dir_with_operation_catalog(
+  tmp_path: Path,
+) -> None:
+  with pytest.raises(ValueError, match="either skills_dir or operation_catalog"):
+    create_agent(
+      "test",
+      skills_dir=tmp_path / "skills",
+      operation_catalog=_EmptyOperationCatalog(),
+    )
+
+
+def test_create_agent_registers_injected_operation_catalog(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  catalog = _EmptyOperationCatalog()
+  captured: dict[str, object] = {}
+
+  async def _fake_run_agent(_tool_input, **_kwargs):
+    return {"response": "ok"}, None
+
+  def _fake_make_run_agent_handler(*args, **kwargs):
+    _ = args
+    captured.update(kwargs)
+    return _fake_run_agent
+
+  monkeypatch.setattr(
+    sub_agent_module,
+    "make_run_agent_handler",
+    _fake_make_run_agent_handler,
+  )
+  app = create_agent(
+    "test",
+    api_key="test-key",
+    operation_catalog=catalog,
+  )
+
+  _session, runtime = _build_runtime(app)
+
+  assert captured["operation_catalog"] is catalog
+  assert captured["skill_loader"] is None
+  assert {item["name"] for item in runtime.get_tool_definitions()} >= {
+    "run_agent",
+    "get_background_result",
+    "send_message",
+  }
 
 
 def test_create_agent_forwards_outputs_dir(

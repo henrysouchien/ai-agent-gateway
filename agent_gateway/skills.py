@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import hashlib
 import logging
 import os
 import re
@@ -20,8 +19,6 @@ from agent_workflow_contracts import (
   OperationUnavailable,
   PlatformToolCatalog,
   SemanticCapabilityRequirement,
-  canonical_json_bytes,
-  sha256_digest,
 )
 
 from .capability_resolution import (
@@ -33,6 +30,12 @@ from .canonical_json_target_lock import (
   lock_canonical_json_path,
   read_locked_canonical_json_target,
   write_locked_canonical_json_target,
+)
+from .operation_snapshot import (
+  OPERATION_LISTING_DESCRIPTION_MAX_CHARS,
+  build_agent_operation_snapshot,
+  operation_listing_description,
+  operation_workspace_scope,
 )
 from ._io import (
   _atomic_write_json as _atomic_write_json,
@@ -51,7 +54,7 @@ log = logging.getLogger("agent_gateway.skills")
 _FRONTMATTER_DELIMITER = "---"
 _BLOCK_REF_RE = re.compile(r"(?<!\\)\{\{([A-Z][A-Z0-9_]*)\}\}")
 _ESCAPE_SENTINEL = "\x00BLOCK_ESC\x00"
-AGENT_DESCRIPTION_MAX_CHARS = 240
+AGENT_DESCRIPTION_MAX_CHARS = OPERATION_LISTING_DESCRIPTION_MAX_CHARS
 AGENT_DESCRIPTION_PLACEHOLDER = "(no description)"
 SKILL_STATE_CLASSES = frozenset({
   "producer",
@@ -60,7 +63,6 @@ SKILL_STATE_CLASSES = frozenset({
   "deprecated",
 })
 Mode = Literal["read_only", "preview", "apply", "model_writer"]
-OperationResultMode = Literal["narrative"]
 DEFAULT_OPERATION_PROJECTION_CONTRACT = "report-base-v1"
 GENERIC_EXPLORE_OPERATION_NAME = "explore"
 GENERIC_EXPLORE_OPERATION_VERSION = "1.0"
@@ -100,14 +102,6 @@ _GENERIC_EXPLORE_INSTRUCTIONS = (
   "substantive result in your terminal assistant message. You cannot delegate "
   "to another agent."
 )
-_COMMON_OPERATION_INSTRUCTIONS = (
-  "You are a focused sub-agent working on behalf of another agent. Complete "
-  "the admitted objective thoroughly. If evidence access fails or returns "
-  "suspicious data, identify the limitation explicitly instead of silently "
-  "proceeding. You cannot delegate to another agent."
-)
-
-
 @dataclass(frozen=True, slots=True)
 class ResolvedAgentOperation:
   """One immutable executable operation plus its methodology source.
@@ -121,69 +115,22 @@ class ResolvedAgentOperation:
   methodology_profile: "SkillProfile"
 
 
-def _contract_ref(
-  *,
-  namespace: str,
-  name: str,
-  version: str,
-  payload: dict[str, Any],
-) -> ContractRef:
-  return ContractRef(
-    namespace=namespace,
-    name=name,
-    version=version,
-    digest=sha256_digest(payload),
+def _declared_allowed_effects(profile: "SkillProfile") -> frozenset[str]:
+  semantic = (
+    getattr(profile, "metadata", {}).get("semantic_metadata")
+    if isinstance(getattr(profile, "metadata", None), dict)
+    else None
   )
-
-
-def _operation_semantic_digest(payload: dict[str, Any]) -> str:
-  canonical = deepcopy(payload)
-  operation = canonical.get("operation")
-  if not isinstance(operation, dict):
-    raise ValueError("operation semantic payload requires an operation object")
-  canonical["operation"] = {
-    key: value for key, value in operation.items() if key != "digest"
-  }
-  return "sha256:" + hashlib.sha256(canonical_json_bytes(canonical)).hexdigest()
-
-
-def _workspace_scope(profile: "SkillProfile") -> Literal[
-  "read_only", "workspace_write", "model_write"
-]:
-  mode = str(profile.mutation_mode or "read_only").strip().lower().replace("-", "_")
-  if mode == "read_only":
-    return "read_only"
-  if mode in {"preview", "apply"}:
-    return "workspace_write"
-  if mode in {"model_writer", "thesis_writer"}:
-    semantic = (
-      getattr(profile, "metadata", {}).get("semantic_metadata")
-      if isinstance(getattr(profile, "metadata", None), dict)
-      else None
-    )
-    declared_effects = (
-      frozenset(
-        str(item).strip().lower()
-        for item in semantic.get("allowed_effects", ())
-        if str(item).strip()
-      )
-      if isinstance(semantic, dict)
-      and isinstance(semantic.get("allowed_effects"), (list, tuple))
-      else frozenset()
-    )
-    if (
-      mode == "model_writer"
-      and "artifact_write" in declared_effects
-      and "state_write" not in declared_effects
-      and "external_write" not in declared_effects
-    ):
-      # Some model workflows persist only server-owned immutable artifacts.
-      # Keep their model-writer tool exclusions while compiling the narrower
-      # artifact-proposal authority declared by the semantic effect contract.
-      return "workspace_write"
-    return "model_write"
-  # Missing/unknown legacy metadata must not silently grant write authority.
-  return "read_only"
+  if not isinstance(semantic, dict) or not isinstance(
+    semantic.get("allowed_effects"),
+    (list, tuple),
+  ):
+    return frozenset()
+  return frozenset(
+    str(item).strip().lower()
+    for item in semantic.get("allowed_effects", ())
+    if str(item).strip()
+  )
 
 
 def _declared_semantic_requirements(
@@ -334,7 +281,10 @@ def validate_operation_tool_coherence(profile: "SkillProfile") -> None:
     OperationDeclaration(
       operation_name=profile.name,
       grant_id=f"coherence:{profile.name}",
-      workspace_scope=_workspace_scope(profile),
+      workspace_scope=operation_workspace_scope(
+        profile.mutation_mode,
+        _declared_allowed_effects(profile),
+      ),
       required_capabilities=requirements,
       tool_ceiling=ceiling,
     ),
@@ -410,32 +360,7 @@ def compile_agent_operation(
   instructions = (resolved_instructions or methodology_text).strip()
   if not methodology_text or not instructions:
     raise ValueError(f"Methodology '{profile.name}' has empty instructions")
-  prompt_text = f"{instructions}\n\n{_COMMON_OPERATION_INSTRUCTIONS}"
-  methodology = _contract_ref(
-    namespace="skill-methodology",
-    name=profile.name,
-    version=version,
-    payload={
-      "namespace": "skill-methodology",
-      "name": profile.name,
-      "version": version,
-      "instructions": methodology_text,
-    },
-  )
-  prompt = _contract_ref(
-    namespace="agent-prompt",
-    name=profile.name,
-    version=version,
-    payload={
-      "namespace": "agent-prompt",
-      "name": profile.name,
-      "version": version,
-      "instructions": prompt_text,
-    },
-  )
   required_capabilities = _declared_semantic_requirements(profile)
-  result_modes: tuple[OperationResultMode, ...] = ("narrative",)
-  projection_contracts: tuple[ContractRef, ...] = ()
   required_context: tuple[str, ...] = ()
   semantic = (
     profile.metadata.get("semantic_metadata")
@@ -461,42 +386,22 @@ def compile_agent_operation(
     or (profile.metadata or {}).get("description")
     or f"Run the {profile.name} methodology."
   )
-  payload = {
-    "operation": {
-      "namespace": "agent-operation",
-      "name": profile.name,
-      "version": version,
-      "digest": "sha256:" + "0" * 64,
-    },
-    "methodology": methodology.model_dump(mode="json"),
-    "prompt": prompt.model_dump(mode="json"),
-    "description": str(description).strip(),
-    "instructions": prompt_text,
-    "execution_class": execution_class,
-    "required_capabilities": [
-      item.model_dump(mode="json") for item in required_capabilities
-    ],
-    "workspace_scope": _workspace_scope(profile),
-    "required_context": list(required_context),
-    **(
-      {"evidence_ports": [port.model_dump(mode="json") for port in evidence_ports]}
-      if evidence_ports
-      else {}
-    ),
-    "resumable": profile.resumable,
-    "result_modes": list(result_modes),
-    "projection_contracts": [
-      item.model_dump(mode="json") for item in projection_contracts
-    ],
-  }
-  operation = AgentOperationRef(
-    namespace="agent-operation",
+  return build_agent_operation_snapshot(
     name=profile.name,
     version=version,
-    digest=_operation_semantic_digest(payload),
+    methodology_instructions=methodology_text,
+    resolved_instructions=instructions,
+    description=str(description).strip(),
+    execution_class=execution_class,
+    required_capabilities=required_capabilities,
+    workspace_scope=operation_workspace_scope(
+      profile.mutation_mode,
+      _declared_allowed_effects(profile),
+    ),
+    required_context=required_context,
+    evidence_ports=evidence_ports,
+    resumable=profile.resumable,
   )
-  payload["operation"] = operation.model_dump(mode="json")
-  return AgentOperationSnapshot.model_validate(payload)
 
 
 def generic_explore_profile() -> "SkillProfile":
@@ -1093,12 +998,6 @@ def parse_skill_file(path: Path) -> SkillProfile:
   )
 
 
-def _cap_agent_description(description: str) -> str:
-  if len(description) <= AGENT_DESCRIPTION_MAX_CHARS:
-    return description
-  return description[: AGENT_DESCRIPTION_MAX_CHARS - 1].rstrip() + "…"
-
-
 def _warn_agent_description_if_needed(profile: SkillProfile) -> None:
   if not profile.agent_callable:
     return
@@ -1240,7 +1139,7 @@ class SkillLoader:
     return [
       (
         item.snapshot.operation,
-        _cap_agent_description(item.snapshot.description),
+        operation_listing_description(item.snapshot.description),
       )
       for item in self.list_callable_operations()
     ]
@@ -1258,7 +1157,7 @@ class SkillLoader:
       if not profile.agent_callable:
         continue
       description = profile.agent_description or AGENT_DESCRIPTION_PLACEHOLDER
-      entries.append((profile.name, _cap_agent_description(description)))
+      entries.append((profile.name, operation_listing_description(description)))
     return sorted(entries, key=lambda item: item[0])
 
   def exists(self, name: str) -> bool:

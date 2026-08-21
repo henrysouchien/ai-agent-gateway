@@ -33,6 +33,7 @@ from .capability_execution import (
 )
 from .event_log import EventLog
 from .mcp_client import McpClientManager
+from .operation_catalog import AgentOperationCatalog
 from .multi_user.billing import SessionUsageSummary, UsageEvent
 from .openai_history_fence import (
   OPENAI_SESSION_EPOCH_ENV,
@@ -700,6 +701,7 @@ async def run_autonomous(
   tool_handlers: dict[str, LocalToolHandler] | None = None,
   tool_definitions: list[dict[str, Any]] | None = None,
   skills_dir: str | Path | None = None,
+  operation_catalog: AgentOperationCatalog | None = None,
   skills_excluded_tools: set[str] | None = None,
   outputs_dir: str | Path | None = None,
   agent_session_log: AgentSessionLog | None = None,
@@ -751,6 +753,10 @@ async def run_autonomous(
   Standalone top-level skill callers must bind both `top_level_skill_name` and
   a unique `skill_run_id`; these values are trusted runtime context, not model input.
   """
+  if skills_dir is not None and operation_catalog is not None:
+    raise ValueError(
+      "run_autonomous accepts either skills_dir or operation_catalog, not both"
+    )
   if type(session) is not GatewaySession:
     raise TypeError("run_autonomous requires an exact GatewaySession")
   if not isinstance(capability_execution, BoundCapabilityExecution):
@@ -850,6 +856,9 @@ async def run_autonomous(
   )
   session.run_context = run_context
   skill_loader = SkillLoader(skills_dir) if skills_dir else None
+  operation_source = (
+    operation_catalog if operation_catalog is not None else skill_loader
+  )
   durable_session_log = (
     _autonomous_session_log(
       session,
@@ -857,11 +866,11 @@ async def run_autonomous(
       base_dir=_resolve_session_log_base_dir(session_log_base_dir),
       supplied=agent_session_log,
     )
-    if skill_loader is not None
+    if operation_source is not None
     else None
   )
   if (
-    skill_loader is not None
+    operation_source is not None
     and "run_agent" not in (tool_handlers or {})
     and capability_execution_resolver is None
   ):
@@ -874,7 +883,7 @@ async def run_autonomous(
   active_servers: set[str] = set()
   if mcp_servers or mcp_config_path:
     builtin_names = set((tool_handlers or {}).keys())
-    if skills_dir and "run_agent" not in builtin_names:
+    if operation_source is not None and "run_agent" not in builtin_names:
       builtin_names |= {
         "run_agent",
         "get_agent_result_content",
@@ -900,11 +909,12 @@ async def run_autonomous(
     extra_tool_defs = list(tool_definitions or [])
     runner_ref: list[Any] = [None]
 
-    if skill_loader is not None and "run_agent" not in local_handlers:
+    if operation_source is not None and "run_agent" not in local_handlers:
       local_handlers["run_agent"] = make_run_agent_handler(
         runner_ref,
         parent_session=session,
         skill_loader=skill_loader,
+        operation_catalog=operation_catalog,
         mcp_client=mcp_client or _NullMcpClient(),
         needs_approval=needs_approval,
         interceptors=runtime_interceptors,
@@ -920,7 +930,7 @@ async def run_autonomous(
       if "send_message" not in local_handlers:
         local_handlers["send_message"] = make_send_message_handler(runner_ref)
       if not any(definition.get("name") == "run_agent" for definition in extra_tool_defs):
-        extra_tool_defs.append(make_run_agent_tool_def(skill_loader))
+        extra_tool_defs.append(make_run_agent_tool_def(operation_source))
       if not any(definition.get("name") == "get_background_result" for definition in extra_tool_defs):
         extra_tool_defs.append(make_get_background_result_tool_def())
       if not any(definition.get("name") == "get_agent_result_content" for definition in extra_tool_defs):

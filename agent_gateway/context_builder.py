@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from .agent_session_log import AgentSessionLog, LogEntry
+from .research_file_current_projection import (
+  ResearchFileCurrentProjection,
+  load_research_file_current_projection,
+)
 from .secret_boundary import sanitize_tool_event
 
 Message = dict[str, Any]
@@ -32,35 +36,59 @@ class SessionContextBuilder:
   tail_token_budget: int = 20_000
 
   async def build(self) -> list[Message]:
-    summaries, _ = await self.agent_session_log.query(
+    snapshot_max_seq = await self.agent_session_log.latest_seq_current_strict()
+    current_projection = await load_research_file_current_projection(
+      self.agent_session_log,
+      snapshot_max_seq=snapshot_max_seq,
+    )
+    current_query = {
+      "before_seq": snapshot_max_seq,
+      "exclude_entry": current_projection.excludes,
+    }
+    summaries, _ = await self.agent_session_log.query_current_strict(
       event_types={"summary"},
       order="desc",
       limit=1,
+      **current_query,
     )
     latest_summary = summaries[0] if summaries else None
 
-    state_updates, _ = await self.agent_session_log.query(
+    state_updates, _ = await self.agent_session_log.query_current_strict(
       event_types={"state_update"},
       order="desc",
       limit=1,
+      **current_query,
     )
     latest_state_update = state_updates[0] if state_updates else None
-    interrupted_context = await self._latest_interrupted_run_context()
+    interrupted_context = await self._latest_interrupted_run_context(
+      current_projection=current_projection,
+      snapshot_max_seq=snapshot_max_seq,
+    )
 
     if latest_summary is not None:
       covers = latest_summary.event.get("covers") or {}
       covers_to_seq = int(covers.get("to_seq", 0) or 0)
-      tail_entries, _ = await self.agent_session_log.query(
-        after_seq=covers_to_seq + 1,
+      tail_entries, _ = await self.agent_session_log.query_current_strict(
+        after_seq=max(
+          covers_to_seq + 1,
+          current_projection.cutoff_seq + 1,
+        ),
         order="asc",
+        **current_query,
       )
     elif self.tail_window_seconds is None:
-      tail_entries, _ = await self.agent_session_log.query(order="asc")
+      tail_entries, _ = await self.agent_session_log.query_current_strict(
+        after_seq=current_projection.cutoff_seq + 1,
+        order="asc",
+        **current_query,
+      )
     else:
       since_ts = time.time() - self.tail_window_seconds
-      tail_entries, _ = await self.agent_session_log.query(
+      tail_entries, _ = await self.agent_session_log.query_current_strict(
+        after_seq=current_projection.cutoff_seq + 1,
         after_ts=since_ts,
         order="asc",
+        **current_query,
       )
 
     tail_entries = [
@@ -84,12 +112,20 @@ class SessionContextBuilder:
     messages.extend(self._entries_to_messages(tail_entries))
     return messages
 
-  async def _latest_interrupted_run_context(self) -> _InterruptedRunContext | None:
-    lifecycle_entries, _ = await self.agent_session_log.query(
+  async def _latest_interrupted_run_context(
+    self,
+    *,
+    current_projection: ResearchFileCurrentProjection,
+    snapshot_max_seq: int,
+  ) -> _InterruptedRunContext | None:
+    lifecycle_entries, _ = await self.agent_session_log.query_current_strict(
       event_types={"attach", "detach", "interrupted"},
       role="writer",
+      after_seq=current_projection.cutoff_seq + 1,
+      before_seq=snapshot_max_seq,
       order="desc",
       limit=100,
+      exclude_entry=current_projection.excludes,
     )
     if not lifecycle_entries:
       return None
@@ -119,18 +155,23 @@ class SessionContextBuilder:
     if interruption is None:
       return None
 
-    window_end_seq = before_seq if before_seq is not None else await self.agent_session_log.latest_seq()
-    window_start_after = segment_start_seq + 1
-    tool_interruptions, _ = await self.agent_session_log.query(
+    window_end_seq = before_seq if before_seq is not None else snapshot_max_seq
+    window_start_after = max(
+      segment_start_seq + 1,
+      current_projection.cutoff_seq + 1,
+    )
+    tool_interruptions, _ = await self.agent_session_log.query_current_strict(
       event_types={"tool_call_interrupted"},
       after_seq=window_start_after,
       before_seq=window_end_seq,
       order="asc",
+      exclude_entry=current_projection.excludes,
     )
-    window_entries, _ = await self.agent_session_log.query(
+    window_entries, _ = await self.agent_session_log.query_current_strict(
       after_seq=window_start_after,
       before_seq=window_end_seq,
       order="asc",
+      exclude_entry=current_projection.excludes,
     )
     covered_tail_seqs = {interruption.seq}
     covered_tail_seqs.update(entry.seq for entry in tool_interruptions)

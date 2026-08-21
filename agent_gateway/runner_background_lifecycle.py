@@ -116,6 +116,10 @@ _BACKGROUND_RESULT_PAGE_CONTENT_MAX_CHARS = 20_000
 _BACKGROUND_RESULT_SERIALIZED_MAX_CHARS = 32_768 + 4_096
 
 
+class StrictBackgroundTaskDrainUnavailable(RuntimeError):
+  """A deletion-specific drain could not prove every child writer stopped."""
+
+
 def _workflow_metadata_for_admitted_task(
   admitted_task: AdmittedTask,
 ) -> WorkflowTaskMetadata | None:
@@ -1541,7 +1545,20 @@ class RunnerBackgroundLifecycleMixin:
   ) -> TaskEntry | None:
     if getattr(self, "_agent_session_log", None) is None:
       return None
-    durable_entry = await self._lookup_task_in_log(bg_task.task_id)
+    lookup_override = vars(self).get("_lookup_task_in_log")
+    if callable(lookup_override):
+      durable_entry = await lookup_override(bg_task.task_id)
+    else:
+      lookup_sync = getattr(
+        self,
+        "_lookup_task_in_log_current_sync",
+        None,
+      )
+      durable_entry = (
+        lookup_sync(bg_task.task_id)
+        if callable(lookup_sync)
+        else await self._lookup_task_in_log(bg_task.task_id)
+      )
     if durable_entry is None or durable_entry.state not in {
       TaskState.COMPLETED,
       TaskState.FAILED,
@@ -3132,6 +3149,148 @@ class RunnerBackgroundLifecycleMixin:
       2 * retention_limit * per_generation_credits
       + 2 * queue_limit
     )
+
+  async def cancel_and_require_background_tasks_drained(
+    self,
+    *,
+    timeout: float | None = None,
+  ) -> None:
+    """Strict deletion-only cancellation for every live child writer.
+
+    Normal parent shutdown retains its bounded best-effort behavior. This
+    method is called only after the parent turn has been cancelled, and it
+    examines underlying asyncio tasks even when normal reconciliation has
+    already terminalized their task-registry projections.
+    """
+
+    selected_tasks: set[Any] = set()
+    for entry in self._task_registry.list_tasks():
+      for task in (
+        getattr(entry, "initialization_task", None),
+        getattr(entry, "asyncio_task", None),
+      ):
+        if (
+          task is not None
+          and callable(getattr(task, "done", None))
+          and not task.done()
+        ):
+          selected_tasks.add(task)
+    if not selected_tasks:
+      return
+
+    for task in selected_tasks:
+      task.cancel()
+    drain_timeout = (
+      max(0.0, float(timeout))
+      if timeout is not None
+      else max(
+        0.0,
+        float(
+          getattr(
+            self,
+            "_background_cancel_drain_timeout_seconds",
+            _BACKGROUND_CANCEL_DRAIN_TIMEOUT_SECONDS,
+          )
+        ),
+      )
+    )
+    done, pending = await asyncio.wait(
+      selected_tasks,
+      timeout=drain_timeout,
+    )
+    if done:
+      await asyncio.gather(*done, return_exceptions=True)
+    if pending:
+      raise StrictBackgroundTaskDrainUnavailable(
+        "document_erase_background_drain_unavailable"
+      )
+
+  def bind_research_file_activity_lease(self, lease: Any) -> None:
+    """Transfer one parent-run shared lease to the background-task owner."""
+
+    if lease is None or not callable(getattr(lease, "release", None)):
+      raise TypeError("research file activity lease is invalid")
+    if getattr(self, "_research_file_activity_lease", None) is not None:
+      raise RuntimeError("research file activity lease is already bound")
+    self._research_file_activity_lease = lease
+
+  def release_research_file_activity_lease_if_owned(self) -> None:
+    """Release an unstarted transfer, retaining it for any tracked children."""
+
+    RunnerBackgroundLifecycleMixin._release_activity_lease_after_children(
+      self,
+      lease_attribute="_research_file_activity_lease",
+      hold_attribute="_research_file_activity_release_hold",
+    )
+
+  def bind_selected_content_activity_lease(self, lease: Any) -> None:
+    """Transfer exact selected-content activity to the runner owner."""
+
+    if lease is None or not callable(getattr(lease, "release", None)):
+      raise TypeError("selected content activity lease is invalid")
+    if getattr(self, "_selected_content_activity_lease", None) is not None:
+      raise RuntimeError("selected content activity lease is already bound")
+    self._selected_content_activity_lease = lease
+
+  def release_selected_content_activity_lease_if_owned(self) -> None:
+    """Release an unstarted transfer, retaining it for any tracked children."""
+
+    RunnerBackgroundLifecycleMixin._release_activity_lease_after_children(
+      self,
+      lease_attribute="_selected_content_activity_lease",
+      hold_attribute="_selected_content_activity_release_hold",
+    )
+
+  def _release_research_file_activity_after_children(self) -> None:
+    RunnerBackgroundLifecycleMixin.release_research_file_activity_lease_if_owned(
+      self
+    )
+
+  def _release_selected_content_activity_after_children(self) -> None:
+    RunnerBackgroundLifecycleMixin.release_selected_content_activity_lease_if_owned(
+      self
+    )
+
+  def _release_activity_lease_after_children(
+    self,
+    *,
+    lease_attribute: str,
+    hold_attribute: str,
+  ) -> None:
+    lease = getattr(self, lease_attribute, None)
+    if lease is None:
+      return
+    setattr(self, lease_attribute, None)
+    pending = {
+      task
+      for entry in self._task_registry.list_tasks()
+      for task in (
+        getattr(entry, "initialization_task", None),
+        getattr(entry, "asyncio_task", None),
+      )
+      if (
+        task is not None
+        and callable(getattr(task, "done", None))
+        and not task.done()
+      )
+    }
+    if not pending:
+      lease.release()
+      return
+
+    hold = {"lease": lease, "pending": pending}
+    setattr(self, hold_attribute, hold)
+
+    def _release_when_last_child_finishes(task: Any) -> None:
+      hold["pending"].discard(task)
+      if hold["pending"]:
+        return
+      hold["lease"].release()
+      if getattr(self, hold_attribute, None) is hold:
+        setattr(self, hold_attribute, None)
+
+    for task in pending:
+      task.add_done_callback(_release_when_last_child_finishes)
 
   async def _shutdown_background_tasks(self, was_cancelled: bool) -> None:
     asyncio_module = _runner_attr(self, "asyncio", asyncio)

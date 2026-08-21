@@ -37,7 +37,10 @@ _TENANT_ID = "autonomous-event-channel-tests"
 
 
 @pytest.fixture(autouse=True)
-def _gateway_user_keys_for_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
+def _gateway_user_keys_for_spawn(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
   # Autonomous spawn narrows GATEWAY_USER_KEYS to the admitted user's mcp
   # entry and refuses when none matches; every test here starts as owner-1.
   # risk_user_id deliberately omitted: canonical identity resolution skips
@@ -53,6 +56,12 @@ def _gateway_user_keys_for_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
         "role": "owner",
       }
     ]),
+  )
+  session_log_base = tmp_path / "session-logs"
+  session_log_base.mkdir(mode=0o700)
+  monkeypatch.setenv(
+    "AGENT_SESSION_LOG_BASE_DIR",
+    str(session_log_base),
   )
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 # Spawn-time GATEWAY_USER_KEYS narrowing imports user_identity from the
@@ -152,6 +161,18 @@ from agent_gateway.autonomous_event_channel import (
   adopt_inherited_autonomous_event_channel,
 )
 envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
+session_log_authority=envelope["workload"]["session_log_authority"]
+if session_log_authority["layout"] == "v2":
+    for env_name, device_name, inode_name in (
+        ("AGENT_SESSION_LOG_ROOT_FD", "root_device", "root_inode"),
+        ("AGENT_SESSION_LOG_ACTIVE_FD", "active_device", "active_inode"),
+        ("AGENT_SESSION_LOG_META_FD", "meta_device", "meta_inode"),
+    ):
+        pinned=os.fstat(int(os.environ[env_name]))
+        assert (pinned.st_dev, pinned.st_ino) == (
+            session_log_authority[device_name],
+            session_log_authority[inode_name],
+        )
 channel=adopt_inherited_autonomous_event_channel(
   int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV]),
   channel_id=envelope["channel_id"],
@@ -263,6 +284,7 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
       recording_spawn,
     )
     monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", _HMAC_KEY)
+    monkeypatch.setenv("AGENT_SESSION_LOG_LAYOUT", "v2")
     registry = _registry(tmp_path, child_source=_SUCCESS_CHILD)
 
     payload = await _start(registry)
@@ -271,7 +293,7 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
 
     assert status["state"] == "completed"
     assert captured["start_new_session"] is True
-    assert len(captured["pass_fds"]) == 4
+    assert len(captured["pass_fds"]) == 7
     passed_fd = int(
       captured["env"]["AGENT_AUTONOMOUS_EVENT_CHANNEL_FD"]
     )
@@ -279,6 +301,23 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
     assert captured["env"]["AGENT_AUTONOMOUS_EVENT_CHANNEL_FD"] == str(
       passed_fd
     )
+    envelope = json.loads(
+      captured["env"]["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"]
+    )
+    log_authority = envelope["workload"]["session_log_authority"]
+    assert envelope["version"] == 5
+    assert log_authority["layout"] == "v2"
+    assert log_authority["base_path"] == captured["env"][
+      "AGENT_SESSION_LOG_BASE_DIR"
+    ]
+    assert tuple(
+      int(captured["env"][name])
+      for name in (
+        "AGENT_SESSION_LOG_ROOT_FD",
+        "AGENT_SESSION_LOG_ACTIVE_FD",
+        "AGENT_SESSION_LOG_META_FD",
+      )
+    ) == captured["pass_fds"][2:5]
     assert all(
       inheritable is False
       for inheritable in captured["passed_fd_inheritable"].values()
@@ -320,7 +359,7 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
     )
     assert manifest["events_path"] == str(events_path)
     lease_identity = captured["passed_fd_stats"][
-      captured["pass_fds"][3]
+      captured["pass_fds"][6]
     ]
     assert manifest["owner_lease_device"] == lease_identity.st_dev
     assert manifest["owner_lease_inode"] == lease_identity.st_ino

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,11 +13,13 @@ from agent_workflow_contracts import (
   ActivityHandle,
   AdmittedTask,
   AgentCompletionEnvelope,
+  AgentOperationRef,
   AnalyticalOutcome,
   CanonicalProjection,
   ContentHandle,
   ContractRef,
   ExecutionSettlement,
+  SemanticCapabilityRequirement,
   TaskObservation,
   TaskResult,
   TaskResultProvenance,
@@ -33,17 +36,24 @@ from agent_gateway.agent_result_content import (
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.event_log import EventLog
 from agent_gateway.final_narrative_artifact import publish_final_narrative
+from agent_gateway.operation_catalog import (
+  OperationRuntimePolicy,
+  ResolvedOperationRuntime,
+)
+from agent_gateway.operation_snapshot import build_agent_operation_snapshot
 from agent_gateway.tool_dispatcher_helpers import ToolExecutionContext
 from agent_gateway.session import GatewaySession
 from agent_gateway.skills import SkillLoader
 from agent_gateway.sub_agent import (
   _ticker_admitted_input,
   _ticker_from_admitted_inputs,
+  _runtime_policy_dispatch_projection,
   make_get_background_result_handler,
   make_get_background_result_tool_def,
   make_run_agent_handler,
   make_run_agent_tool_def,
   make_resume_tool_def,
+  make_resume_handler,
 )
 from agent_gateway.sub_agent_helpers import _resolve_context_ticker
 from agent_gateway.sub_agent_scope_receipt import ADMITTED_TASK_METADATA_KEY
@@ -253,10 +263,12 @@ def _handler(
   runner: _Runner | None,
   *,
   loader: SkillLoader | None,
+  operation_catalog: Any | None = None,
   resolver: _CapabilityResolver | None = None,
   background_handlers: dict[str, Any] | None = None,
   operation_mcp_activator: Any | None = None,
   mcp_meta_inject_servers: frozenset[str] | None = None,
+  mcp_session_inject_servers: frozenset[str] | None = None,
   fms_rebinder: Any | None = None,
   approval_store: Any | None = None,
   approval_policy: Any | None = None,
@@ -286,10 +298,12 @@ def _handler(
     [runner],
     parent_session=parent_session,
     skill_loader=loader,
+    operation_catalog=operation_catalog,
     mcp_client=mcp_client or _McpClient(),
     local_tool_handlers=handlers,
     capability_execution_resolver=resolver or _CapabilityResolver(),
     operation_mcp_activator=operation_mcp_activator,
+    mcp_session_inject_servers=mcp_session_inject_servers,
     mcp_meta_inject_servers=mcp_meta_inject_servers,
     fms_rebinder=fms_rebinder,
     trusted_research_file_id=trusted_research_file_id,
@@ -385,6 +399,124 @@ def _operation(loader: SkillLoader) -> dict[str, Any]:
   )
 
 
+def _catalog_runtime(
+  *,
+  name: str = "catalog-review",
+  exact_tool_ids: frozenset[str] = frozenset({"web_search"}),
+  mcp_tools_by_server: dict[str, frozenset[str]] | None = None,
+  required_capabilities: tuple[SemanticCapabilityRequirement, ...] = (),
+  session_inject_servers: frozenset[str] = frozenset(),
+  extra_excluded_tools: frozenset[str] = frozenset(),
+  max_budget_usd: float | None = 4.5,
+) -> ResolvedOperationRuntime:
+  snapshot = build_agent_operation_snapshot(
+    name=name,
+    version="1.0",
+    methodology_instructions="Review canonical evidence.",
+    resolved_instructions="Review canonical evidence.",
+    description="Review canonical evidence.",
+    execution_class="node.explore",
+    required_capabilities=required_capabilities,
+    resumable=True,
+  )
+  mcp_tools = mcp_tools_by_server or {}
+  return ResolvedOperationRuntime(
+    snapshot=snapshot,
+    policy=OperationRuntimePolicy(
+      semantic_scope="global",
+      state_class="producer",
+      persist_state=False,
+      resumable=True,
+      resume_mcp_session_reset_ok=True,
+      state_dir=None,
+      mutation_mode="read_only",
+      run_mode="full",
+      exact_tool_ids=exact_tool_ids,
+      mcp_tools_by_server=mcp_tools,
+      runtime_server_refs=frozenset(mcp_tools),
+      session_inject_servers=session_inject_servers,
+      timeout_overrides={},
+      extra_excluded_tools=extra_excluded_tools,
+      max_turns=7,
+      timeout_seconds=45,
+      max_tokens=2_222,
+      max_budget_usd=max_budget_usd,
+    ),
+  )
+
+
+class _Catalog:
+  def __init__(self, resolved: ResolvedOperationRuntime) -> None:
+    self.resolved = resolved
+    self.selectors: list[object] = []
+
+  def resolve_operation(self, selector: object) -> ResolvedOperationRuntime:
+    self.selectors.append(selector)
+    if selector is not None:
+      requested = AgentOperationRef.model_validate(selector)
+      if requested != self.resolved.snapshot.operation:
+        raise ValueError("unknown operation")
+    return self.resolved
+
+  def list_callable_operations_with_descriptions(
+    self,
+  ) -> list[tuple[AgentOperationRef, str]]:
+    return [(self.resolved.snapshot.operation, self.resolved.snapshot.description)]
+
+
+class _PrefixedMcpClient(_McpClient):
+  def __init__(self) -> None:
+    self.active = False
+
+  def activate(self) -> None:
+    self.active = True
+
+  def resolve_tool_name(
+    self,
+    server_name: str,
+    original_name: str,
+  ) -> str | None:
+    if (
+      self.active
+      and server_name == "research-corpus-mcp"
+      and original_name == "thesis_read"
+    ):
+      return "private_thesis_read"
+    return None
+
+  def get_server_for_tool(self, name: str) -> str | None:
+    return (
+      "research-corpus-mcp"
+      if self.active and name == "private_thesis_read"
+      else None
+    )
+
+  def get_original_tool_name(self, name: str) -> str:
+    return (
+      "thesis_read"
+      if name == "private_thesis_read"
+      else name
+    )
+
+  def is_mcp_tool(self, name: str) -> bool:
+    return self.get_server_for_tool(name) is not None
+
+  def get_server_tool_definitions(
+    self,
+    server_names: set[str],
+  ) -> list[dict[str, Any]]:
+    if not self.active or "research-corpus-mcp" not in server_names:
+      return []
+    return [{
+      "name": "private_thesis_read",
+      "description": "Read private research evidence.",
+      "input_schema": {"type": "object"},
+    }]
+
+  def get_tool_definitions(self) -> list[dict[str, Any]]:
+    return self.get_server_tool_definitions({"research-corpus-mcp"})
+
+
 def test_run_agent_tool_schema_is_operation_first(tmp_path: Path) -> None:
   schema = make_run_agent_tool_def(_write_operation(tmp_path))["input_schema"]
 
@@ -403,6 +535,437 @@ def test_run_agent_tool_schema_is_operation_first(tmp_path: Path) -> None:
   assert "max_budget_usd" not in schema["properties"]
   assert "agent" not in schema["properties"]
   assert "task" not in schema["properties"]
+
+
+def test_run_agent_handler_rejects_catalog_and_loader_together(
+  tmp_path: Path,
+) -> None:
+  loader = _write_operation(tmp_path)
+  catalog = _Catalog(_catalog_runtime())
+
+  with pytest.raises(ValueError, match="either skill_loader or operation_catalog"):
+    _handler(None, loader=loader, operation_catalog=catalog)
+
+
+def test_falsey_catalog_has_same_schema_and_handler_operation_view() -> None:
+  class _FalseyCatalog(_Catalog):
+    def __bool__(self) -> bool:
+      return False
+
+  runtime = _catalog_runtime()
+  catalog = _FalseyCatalog(runtime)
+  schema = make_run_agent_tool_def(catalog)["input_schema"]
+  runner = _Runner()
+
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=None,
+    operation_catalog=catalog,
+  )({
+    "operation": runtime.snapshot.operation.model_dump(mode="json"),
+    "objective": "Review canonical evidence.",
+    "background": False,
+  }))
+
+  assert "catalog-review@1.0" in schema["properties"]["operation"][
+    "description"
+  ]
+  assert error is None
+  assert result is not None
+  assert catalog.selectors == [
+    runtime.snapshot.operation.model_dump(mode="json")
+  ]
+
+
+def test_injected_catalog_admission_consumes_snapshot_and_policy_directly() -> None:
+  resolved = _catalog_runtime()
+  catalog = _Catalog(resolved)
+  runner = _Runner()
+  operation_ref = resolved.snapshot.operation.model_dump(mode="json")
+
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=None,
+    operation_catalog=catalog,
+  )({
+    "operation": operation_ref,
+    "objective": "Review canonical evidence.",
+    "background": False,
+  }))
+
+  assert error is None
+  assert result is not None
+  assert catalog.selectors == [operation_ref]
+  assert len(runner.spawn_calls) == 1
+  spawn = runner.spawn_calls[0]
+  assert spawn["max_turns"] == 7
+  assert spawn["timeout"] == 45
+  assert spawn["max_tokens"] == 2_222
+  assert spawn["max_budget_usd"] == 4.5
+  assert TaskResult.model_validate(result).logical_task.operation == (
+    resolved.snapshot.operation
+  )
+
+
+def test_default_catalog_explore_activates_prefixed_mcp_before_projection() -> None:
+  runtime = _catalog_runtime(
+    name="explore",
+    exact_tool_ids=frozenset({
+      "mcp__research-corpus-mcp__thesis_read"
+    }),
+    mcp_tools_by_server={
+      "research-corpus-mcp": frozenset({"thesis_read"}),
+    },
+    required_capabilities=(SemanticCapabilityRequirement(
+      name="corpus.read/v1",
+      required=False,
+      binding_modes=("live_tool",),
+    ),),
+    session_inject_servers=frozenset({"research-corpus-mcp"}),
+    max_budget_usd=8.25,
+  )
+  catalog = _Catalog(runtime)
+  mcp_client = _PrefixedMcpClient()
+  activated: list[ResolvedOperationRuntime] = []
+  runner = _Runner()
+
+  def _activate(resolved: ResolvedOperationRuntime) -> None:
+    activated.append(resolved)
+    mcp_client.activate()
+
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=None,
+    operation_catalog=catalog,
+    operation_mcp_activator=_activate,
+    mcp_client=mcp_client,
+  )({
+    "objective": "Explore the admitted research evidence.",
+    "background": False,
+  }))
+
+  assert error is None
+  assert result is not None
+  assert catalog.selectors == [None]
+  assert activated == [runtime]
+  spawn = runner.spawn_calls[0]
+  assert spawn["max_budget_usd"] == 8.25
+  assert spawn["dispatcher"]._allowed_mcp_tools_by_server == {
+    "research-corpus-mcp": {"private_thesis_read"},
+  }
+  assert {
+    definition["name"]
+    for definition in spawn["dispatcher"].get_tool_definitions()
+  } == {"private_thesis_read"}
+
+
+def test_catalog_session_injection_cannot_widen_caller_allowlist() -> None:
+  runtime = _catalog_runtime(
+    exact_tool_ids=frozenset({
+      "mcp__research-corpus-mcp__thesis_read"
+    }),
+    mcp_tools_by_server={
+      "research-corpus-mcp": frozenset({"thesis_read"}),
+    },
+    required_capabilities=(SemanticCapabilityRequirement(
+      name="corpus.read/v1",
+      required=False,
+      binding_modes=("live_tool",),
+    ),),
+    session_inject_servers=frozenset({"research-corpus-mcp"}),
+  )
+  mcp_client = _PrefixedMcpClient()
+  runner = _Runner()
+
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=None,
+    operation_catalog=_Catalog(runtime),
+    operation_mcp_activator=lambda _policy: mcp_client.activate(),
+    mcp_client=mcp_client,
+    mcp_session_inject_servers=frozenset(),
+  )({
+    "operation": runtime.snapshot.operation.model_dump(mode="json"),
+    "objective": "Review the admitted research evidence.",
+    "background": False,
+  }))
+
+  assert error is None
+  assert result is not None
+  dispatcher = runner.spawn_calls[0]["dispatcher"]
+  assert dispatcher._mcp_session_inject_servers == set()
+
+
+def test_default_catalog_explore_has_explicit_ref_lifecycle_parity() -> None:
+  runtime = _catalog_runtime(
+    name="explore",
+    required_capabilities=(SemanticCapabilityRequirement(
+      name="web.read/v1",
+      required=False,
+      binding_modes=("live_tool",),
+    ),),
+  )
+  runs: list[tuple[_Runner, dict[str, Any]]] = []
+  for selector in (
+    None,
+    runtime.snapshot.operation.model_dump(mode="json"),
+  ):
+    runner = _Runner()
+    invocation: dict[str, Any] = {
+      "objective": "Explore the admitted web evidence.",
+      "background": False,
+    }
+    if selector is not None:
+      invocation["operation"] = selector
+
+    result, error = asyncio.run(_handler(
+      runner,
+      loader=None,
+      operation_catalog=_Catalog(runtime),
+    )(invocation))
+
+    assert error is None
+    assert result is not None
+    runs.append((runner, result))
+
+  for runner, result in runs:
+    assert TaskResult.model_validate(result).execution.status == "succeeded"
+    assert [event["type"] for event in runner.durable_events] == [
+      "skill_run_started",
+      "skill_result_captured",
+    ]
+    started = runner.durable_events[0]
+    assert runner.spawn_calls[0]["skill_run_id"] == started["skill_run_id"]
+    assert (
+      runner.spawn_calls[0]["dispatcher"]._run_context.run_id
+      == started["skill_run_id"]
+    )
+
+
+def test_policy_projection_preserves_distinct_prefixed_same_name_routes() -> None:
+  class _TwoServerMcpClient:
+    routes = {
+      ("server-a", "shared_tool"): "a_shared_tool",
+      ("server-b", "shared_tool"): "b_shared_tool",
+    }
+
+    def resolve_tool_name(self, server: str, original: str) -> str | None:
+      return self.routes.get((server, original))
+
+    def get_server_for_tool(self, exposed: str) -> str | None:
+      return next((
+        server
+        for (server, _original), candidate in self.routes.items()
+        if candidate == exposed
+      ), None)
+
+    def get_original_tool_name(self, exposed: str) -> str:
+      return next((
+        original
+        for (_server, original), candidate in self.routes.items()
+        if candidate == exposed
+      ), exposed)
+
+  runtime = _catalog_runtime(
+    exact_tool_ids=frozenset({
+      "mcp__server-a__shared_tool",
+      "mcp__server-b__shared_tool",
+    }),
+    mcp_tools_by_server={
+      "server-a": frozenset({"shared_tool"}),
+      "server-b": frozenset({"shared_tool"}),
+    },
+  )
+
+  exact, excluded, canonical_to_exposed = (
+    _runtime_policy_dispatch_projection(
+      runtime.policy,
+      mcp_client=_TwoServerMcpClient(),
+    )
+  )
+
+  assert exact == frozenset({"a_shared_tool", "b_shared_tool"})
+  assert excluded == frozenset()
+  assert canonical_to_exposed == {
+    "mcp__server-a__shared_tool": "a_shared_tool",
+    "mcp__server-b__shared_tool": "b_shared_tool",
+  }
+
+
+def test_catalog_projection_callback_failure_is_operation_unavailable() -> None:
+  class _FailingMcpClient(_PrefixedMcpClient):
+    def resolve_tool_name(
+      self,
+      _server_name: str,
+      _original_name: str,
+    ) -> str | None:
+      raise RuntimeError("route registry failed")
+
+  runtime = _catalog_runtime(
+    exact_tool_ids=frozenset({
+      "mcp__research-corpus-mcp__thesis_read"
+    }),
+    mcp_tools_by_server={
+      "research-corpus-mcp": frozenset({"thesis_read"}),
+    },
+  )
+
+  result, error = asyncio.run(_handler(
+    _Runner(),
+    loader=None,
+    operation_catalog=_Catalog(runtime),
+    mcp_client=_FailingMcpClient(),
+  )({
+    "operation": runtime.snapshot.operation.model_dump(mode="json"),
+    "objective": "Review the canonical evidence.",
+    "background": False,
+  }))
+
+  assert result is None
+  assert error is not None
+  assert error["code"] == "operation_unavailable"
+  assert "live route resolution failed" in error["message"]
+
+
+@pytest.mark.parametrize(
+  ("exact_tool_ids", "mcp_tools_by_server", "extra_excluded_tools"),
+  (
+    (
+      frozenset({"mcp__research-corpus-mcp__thesis_read"}),
+      {"research-corpus-mcp": frozenset({"thesis_read"})},
+      frozenset(),
+    ),
+    (
+      frozenset({"web_search"}),
+      {},
+      frozenset({"mcp__research-corpus-mcp__thesis_read"}),
+    ),
+  ),
+)
+def test_catalog_mcp_alias_cannot_impersonate_live_local_handler(
+  exact_tool_ids: frozenset[str],
+  mcp_tools_by_server: dict[str, frozenset[str]],
+  extra_excluded_tools: frozenset[str],
+) -> None:
+  class _LocalAliasMcpClient(_PrefixedMcpClient):
+    def resolve_tool_name(
+      self,
+      server_name: str,
+      original_name: str,
+    ) -> str | None:
+      if (
+        self.active
+        and server_name == "research-corpus-mcp"
+        and original_name == "thesis_read"
+      ):
+        return "web_search"
+      return None
+
+    def get_server_for_tool(self, name: str) -> str | None:
+      return (
+        "research-corpus-mcp"
+        if self.active and name == "web_search"
+        else None
+      )
+
+    def get_original_tool_name(self, name: str) -> str:
+      return "thesis_read" if name == "web_search" else name
+
+  runtime = _catalog_runtime(
+    exact_tool_ids=exact_tool_ids,
+    mcp_tools_by_server=mcp_tools_by_server,
+    extra_excluded_tools=extra_excluded_tools,
+  )
+  mcp_client = _LocalAliasMcpClient()
+  runner = _Runner()
+
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=None,
+    operation_catalog=_Catalog(runtime),
+    operation_mcp_activator=lambda _resolved: mcp_client.activate(),
+    mcp_client=mcp_client,
+  )({
+    "operation": runtime.snapshot.operation.model_dump(mode="json"),
+    "objective": "Review the canonical evidence.",
+    "background": False,
+  }))
+
+  assert result is None
+  assert error is not None
+  assert error["code"] == "operation_unavailable"
+  assert "live local handlers collide" in error["message"]
+  assert runner.spawn_calls == []
+  assert runner.background_calls == []
+
+
+def test_policy_projection_does_not_mask_base_exceptions() -> None:
+  class _InterruptedMcpClient(_PrefixedMcpClient):
+    def resolve_tool_name(
+      self,
+      _server_name: str,
+      _original_name: str,
+    ) -> str | None:
+      raise KeyboardInterrupt
+
+  runtime = _catalog_runtime(
+    exact_tool_ids=frozenset({
+      "mcp__research-corpus-mcp__thesis_read"
+    }),
+    mcp_tools_by_server={
+      "research-corpus-mcp": frozenset({"thesis_read"}),
+    },
+  )
+
+  with pytest.raises(KeyboardInterrupt):
+    _runtime_policy_dispatch_projection(
+      runtime.policy,
+      mcp_client=_InterruptedMcpClient(),
+    )
+
+
+@pytest.mark.parametrize(
+  ("exact_tool_ids", "mcp_tools_by_server", "extra_excluded_tools"),
+  (
+    (
+      frozenset({"mcp__research-corpus-mcp__thesis_read"}),
+      {"research-corpus-mcp": frozenset({"thesis_read"})},
+      frozenset({"private_thesis_read"}),
+    ),
+    (
+      frozenset({"private_thesis_read"}),
+      {},
+      frozenset({"mcp__research-corpus-mcp__thesis_read"}),
+    ),
+  ),
+)
+def test_policy_projection_refuses_exact_excluded_alias_collisions(
+  exact_tool_ids: frozenset[str],
+  mcp_tools_by_server: dict[str, frozenset[str]],
+  extra_excluded_tools: frozenset[str],
+) -> None:
+  runtime = _catalog_runtime(
+    exact_tool_ids=exact_tool_ids,
+    mcp_tools_by_server=mcp_tools_by_server,
+    extra_excluded_tools=extra_excluded_tools,
+  )
+  mcp_client = _PrefixedMcpClient()
+  mcp_client.activate()
+
+  with pytest.raises(
+    ValueError,
+    match="exact dispatcher tools collide with projected exclusions",
+  ):
+    _runtime_policy_dispatch_projection(
+      runtime.policy,
+      mcp_client=mcp_client,
+    )
+
+
+def test_resume_handler_has_no_live_catalog_dependency() -> None:
+  assert "operation_catalog" not in inspect.signature(
+    make_resume_handler
+  ).parameters
 
 
 def test_ticker_precedence_equal_typed_and_verified_skips_fallback() -> None:

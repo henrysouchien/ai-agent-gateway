@@ -2969,14 +2969,19 @@ class RunnerRunLoopMixin:
       except BaseException as exc:
         finalizer_errors.append(exc)
       try:
-        if self._top_level_skill_lifecycle is not None:
-          await self._await_write_lease_handoff()
-        else:
-          self._release_write_lease()
+        await self._await_write_lease_handoff()
       except BaseException as exc:
         finalizer_errors.append(exc)
       try:
         await self.force_close()
+      except BaseException as exc:
+        finalizer_errors.append(exc)
+      try:
+        self._release_research_file_activity_after_children()
+      except BaseException as exc:
+        finalizer_errors.append(exc)
+      try:
+        self._release_selected_content_activity_after_children()
       except BaseException as exc:
         finalizer_errors.append(exc)
       self._background_delivery_grace_active = False

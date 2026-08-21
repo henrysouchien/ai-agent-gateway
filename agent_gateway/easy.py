@@ -26,6 +26,7 @@ from .dispatcher_factory import (
   build_tool_dispatcher,
 )
 from .mcp_client import McpClientManager
+from .operation_catalog import AgentOperationCatalog
 from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, SessionUsageSummary, UsageEvent, UsageLedger
 from .model_registry import (
   INITIAL_MODEL_REGISTRY,
@@ -229,6 +230,7 @@ def create_agent(
   tool_handlers: dict[str, LocalToolHandler] | None = None,
   tool_definitions: list[dict[str, Any]] | None = None,
   skills_dir: str | Path | None = None,
+  operation_catalog: AgentOperationCatalog | None = None,
   skills_excluded_tools: set[str] | None = None,
   skill_state_file: str | Path | None = None,
   outputs_dir: str | Path | None = None,
@@ -318,6 +320,8 @@ def create_agent(
     tool_definitions: Tool schemas exposed to the model for local handlers.
     skills_dir: Directory of markdown skill files. When set, `run_agent` is
       registered automatically unless you override it yourself.
+    operation_catalog: Application-supplied immutable operation catalog for
+      new admissions. Mutually exclusive with `skills_dir`.
     skills_excluded_tools: Tool names hidden from spawned sub-agents.
     skill_state_file: Optional JSON file used by callable skills with
       `persist_state: true`. Previous state is injected into the sub-agent
@@ -397,6 +401,10 @@ def create_agent(
     )
     ```
   """
+  if skills_dir is not None and operation_catalog is not None:
+    raise ValueError(
+      "create_agent accepts either skills_dir or operation_catalog, not both"
+    )
   if (
     commercial_work_start_gate is not None
     and commercial_work_start_gate.enabled
@@ -510,9 +518,12 @@ def create_agent(
     )
 
   skill_loader = SkillLoader(skills_dir) if skills_dir else None
+  operation_source = (
+    operation_catalog if operation_catalog is not None else skill_loader
+  )
   resolved_session_log_base_dir = (
     _resolve_session_log_base_dir(session_log_base_dir)
-    if skill_loader is not None
+    if operation_source is not None
     else None
   )
   mcp_client: McpClientManager | None = None
@@ -523,7 +534,7 @@ def create_agent(
     builtin_names = set((tool_handlers or {}).keys())
     if code_execution:
       builtin_names |= {"code_execute", "code_execute_status"}
-    if skills_dir and "run_agent" not in builtin_names:
+    if operation_source is not None and "run_agent" not in builtin_names:
       builtin_names |= {
         "run_agent",
         "get_agent_result_content",
@@ -613,7 +624,7 @@ def create_agent(
       local_handlers.update(ce_bundle.handlers)
       extra_tool_defs.extend(ce_bundle.tool_definitions)
 
-    if skill_loader is not None and "run_agent" not in local_handlers:
+    if operation_source is not None and "run_agent" not in local_handlers:
       from .sub_agent import (
         make_get_background_result_handler,
         make_get_background_result_tool_def,
@@ -628,6 +639,7 @@ def create_agent(
         runner_ref,
         parent_session=session,
         skill_loader=skill_loader,
+        operation_catalog=operation_catalog,
         mcp_client=mcp_client or _NullMcpClient(),
         needs_approval=user_needs_approval,
         mcp_session_inject_servers=mcp_session_inject_servers,
@@ -644,7 +656,7 @@ def create_agent(
       if "send_message" not in local_handlers:
         local_handlers["send_message"] = make_send_message_handler(runner_ref)
       if not any(definition.get("name") == "run_agent" for definition in extra_tool_defs):
-        extra_tool_defs.append(make_run_agent_tool_def(skill_loader))
+        extra_tool_defs.append(make_run_agent_tool_def(operation_source))
       if not any(definition.get("name") == "get_background_result" for definition in extra_tool_defs):
         extra_tool_defs.append(make_get_background_result_tool_def())
       if not any(definition.get("name") == "get_agent_result_content" for definition in extra_tool_defs):

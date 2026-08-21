@@ -443,6 +443,9 @@ class RunnerSubAgentMixin:
     max_budget_usd: float | None = None,
     on_sub_event: Optional[Callable[[Dict[str, Any], str], None]] = None,
     skill_run_id: str | None = None,
+    bind_research_file_activity_lease_func: (
+      Callable[[Any], None] | None
+    ) = None,
   ) -> Tuple[Optional[TaskResult], Optional[Dict[str, Any]]]:
     if not isinstance(capability_execution, BoundCapabilityExecution):
       raise TypeError(
@@ -549,6 +552,8 @@ class RunnerSubAgentMixin:
       batch_id=getattr(self, "_batch_id", None),
       context_surfaces=self._context_surfaces_provider or self._context_surfaces_static,
     )
+    if bind_research_file_activity_lease_func is not None:
+      bind_research_file_activity_lease_func(sub_runner)
     sub_runner._resume_parent_messages_for_ack = tuple(parent_messages)
     timed_out = False
     runtime_exception_detail: str | None = None

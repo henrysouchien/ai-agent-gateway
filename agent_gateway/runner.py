@@ -321,6 +321,7 @@ class AgentRunner(
     context_capture: ContextCapture | None = None,
     commercial_usage_producer: Any | None = None,
     gateway_session: GatewaySession | None = None,
+    context_research_file_id: int | None = None,
   ) -> None:
     if (
       gateway_session is not None
@@ -358,6 +359,17 @@ class AgentRunner(
       raise ValueError("max_concurrent_sub_agents must be positive when provided")
     if max_resume_chain_depth <= 0:
       raise ValueError("max_resume_chain_depth must be positive")
+    if (
+      context_research_file_id is not None
+      and (
+        type(context_research_file_id) is not int
+        or not 1 <= context_research_file_id < (1 << 63)
+      )
+    ):
+      raise ValueError(
+        "context_research_file_id must be a positive signed 64-bit integer"
+      )
+    self._context_research_file_id = context_research_file_id
     if (
       result_requirement is not None
       and not isinstance(result_requirement, ResultRequirement)

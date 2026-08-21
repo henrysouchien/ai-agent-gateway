@@ -26,6 +26,9 @@ from agent_gateway.capability_binding import (
   CredentialHandle,
 )
 from agent_gateway.session import GatewaySession
+from agent_gateway.agent_session_log_layout import (
+  AutonomousSessionLogAuthority,
+)
 
 
 _SECRET = "launch-envelope-test-secret-at-least-32-bytes"
@@ -94,6 +97,21 @@ def _workload(
     dev_mode=dev_mode,
     max_budget_usd=max_budget_usd,
     deliver=deliver,
+    session_log_authority=AutonomousSessionLogAuthority(
+      layout="v1",
+      provider_session_epoch=None,
+      base_path="/tmp/autonomous-session-logs",
+      root_path=None,
+      root_device=None,
+      root_inode=None,
+      active_path=None,
+      active_device=None,
+      active_inode=None,
+      meta_path=None,
+      meta_device=None,
+      meta_inode=None,
+      storage_identity_digest=None,
+    ),
   )
 
 
@@ -252,7 +270,7 @@ def _resign(payload: dict[str, object]) -> str:
   )
 
 
-def test_v4_round_trip_constructs_exact_gateway_session() -> None:
+def test_v5_round_trip_constructs_exact_gateway_session() -> None:
   dispatch_scope = AutonomousDispatchScope(
     kind="portfolio",
     source="user_selected",
@@ -276,7 +294,7 @@ def test_v4_round_trip_constructs_exact_gateway_session() -> None:
 
   envelope = _verify(raw)
   assert envelope.audience == AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE
-  assert envelope.version == AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION == 4
+  assert envelope.version == AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION == 5
   assert envelope.task_id == "bg_7"
   assert envelope.control_run_id == "run-7"
   assert envelope.owner_user_id == "42"
@@ -330,13 +348,48 @@ def test_envelope_rejects_hmac_secrets_shorter_than_32_bytes() -> None:
       now_ns=_NOW_NS,
       nonce=_NONCE,
     )
-
   with pytest.raises(ValueError, match="at least 32 bytes"):
     verify_autonomous_launch_envelope(
       b"too-short",
       _signed(),
       now_ns=_NOW_NS,
     )
+
+
+def test_v5_sign_rejects_workload_without_session_log_authority() -> None:
+  workload = AutonomousLaunchWorkload(
+    profile="analyst",
+    mode="run_once",
+    task=None,
+    skill=None,
+    pack=None,
+    context=None,
+    ticker=None,
+    dev_mode=False,
+    max_budget_usd=None,
+    deliver=True,
+  )
+  with pytest.raises(TypeError, match="requires exact session-log authority"):
+    sign_autonomous_launch_envelope(
+      _SECRET,
+      task_id="bg_7",
+      control_run_id="run-7",
+      owner_user_id="42",
+      channel_id=_CHANNEL_ID,
+      bind=_bind(),
+      workload=workload,
+      control_authority=_control_authority(),
+      session_authority=_ordinary_session_authority(),
+      now_ns=_NOW_NS,
+      nonce=_NONCE,
+    )
+
+
+def test_v5_verify_rejects_missing_session_log_authority() -> None:
+  payload = json.loads(_signed())
+  payload["workload"].pop("session_log_authority")
+  with pytest.raises(ValueError, match="workload is invalid"):
+    _verify(_resign(payload))
 
 
 @pytest.mark.parametrize(

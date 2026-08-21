@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import agent_gateway.sub_agent as sub_agent_module
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = ROOT / "packages" / "agent-gateway"
@@ -36,6 +37,15 @@ from agent_gateway.execution_snapshot import (
 from agent_gateway.final_narrative_artifact import publish_final_narrative
 from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.openai_history_fence import TEXT_SIGNATURE_MARKER
+from agent_gateway.research_file_activity_lock import (
+  try_acquire_research_file_activity,
+)
+from agent_gateway.research_file_current_projection import (
+  RESEARCH_FILE_CURRENT_PROJECTION_UNAVAILABLE_EVENT_TYPE,
+  build_current_projection_unavailable_event,
+  invalidate_owner_current_session_projections,
+)
+from agent_gateway.agent_session_log import AgentSessionRef, resolve_agent_session_id
 from agent_gateway.session import GatewaySession
 from agent_gateway.skills import SkillLoader, SkillProfile
 from agent_gateway.sub_agent import (
@@ -1413,6 +1423,289 @@ def test_required_research_resume_uses_sealed_identity_not_resume_prose(
       required=True,
       owner_invocation_id="bg_quant_research_identity",
     ) == 1
+
+  _run(_case())
+
+
+def test_resume_holds_recovered_research_file_activity_until_child_terminal(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_research_activity",
+      agent_name="quant-research",
+      user_message="Resume the admitted research task.",
+      required_context=("research_file_id",),
+      ticker=None,
+      research_file_id=41,
+    )
+    child_started = asyncio.Event()
+    release_child = asyncio.Event()
+
+    async def _resume_sub_agent(**kwargs: Any):
+      child_started.set()
+      await release_child.wait()
+      return await _successful_resume_task_result(
+        kwargs,
+        "continued",
+        workspace_dir=tmp_path,
+      ), None
+
+    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    handler = make_resume_handler(
+      [runner],
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+    )
+
+    result, error = await handler({"task_id": "bg_research_activity"})
+
+    assert error is None
+    assert result is not None
+    await asyncio.wait_for(child_started.wait(), timeout=1.0)
+    exclusive_during_resume = try_acquire_research_file_activity(
+      tmp_path,
+      research_file_id=41,
+      exclusive=True,
+    )
+    if exclusive_during_resume is not None:
+      exclusive_during_resume.release()
+    assert exclusive_during_resume is None
+
+    successor = runner._task_registry.get(result["task_id"])
+    assert successor is not None
+    assert successor.asyncio_task is not None
+    release_child.set()
+    await successor.asyncio_task
+
+    exclusive_after_resume = try_acquire_research_file_activity(
+      tmp_path,
+      research_file_id=41,
+      exclusive=True,
+    )
+    assert exclusive_after_resume is not None
+    exclusive_after_resume.release()
+
+  _run(_case())
+
+
+def test_resume_holds_recovered_activity_through_outer_completion_callback(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_outer_activity",
+      agent_name="quant-research",
+      user_message="Resume exact research task.",
+      required_context=("research_file_id",),
+      ticker=None,
+      research_file_id=41,
+    )
+
+    async def _resume_sub_agent(**kwargs: Any):
+      return await _successful_resume_task_result(
+        kwargs,
+        "continued",
+        workspace_dir=tmp_path,
+      ), None
+
+    runner.resume_sub_agent = _resume_sub_agent  # type: ignore[method-assign]
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+    invoke_callback = runner._invoke_background_completion_callback
+
+    async def _paused_callback(entry: TaskEntry) -> None:
+      callback_started.set()
+      await release_callback.wait()
+      await invoke_callback(entry)
+
+    runner._invoke_background_completion_callback = _paused_callback  # type: ignore[method-assign]
+    handler = make_resume_handler(
+      [runner],
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+    )
+    result, error = await handler({"task_id": "bg_outer_activity"})
+    assert error is None
+    assert result is not None
+    await asyncio.wait_for(callback_started.wait(), timeout=1.0)
+
+    exclusive_during_callback = try_acquire_research_file_activity(
+      tmp_path,
+      research_file_id=41,
+      exclusive=True,
+    )
+    if exclusive_during_callback is not None:
+      exclusive_during_callback.release()
+    assert exclusive_during_callback is None
+
+    successor = runner._task_registry.get(result["task_id"])
+    assert successor is not None
+    assert successor.asyncio_task is not None
+    release_callback.set()
+    await successor.asyncio_task
+    exclusive_after_callback = try_acquire_research_file_activity(
+      tmp_path,
+      research_file_id=41,
+      exclusive=True,
+    )
+    assert exclusive_after_callback is not None
+    exclusive_after_callback.release()
+
+  _run(_case())
+
+
+def test_same_generation_retry_advances_after_canonical_typed_task_registration(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    canonical_log = AgentSessionLog(
+      session_ref=AgentSessionRef(
+        user_id="alice",
+        agent_id="analyst",
+        agent_session_id=resolve_agent_session_id("alice", "analyst"),
+      ),
+      base_dir=tmp_path / "sessions",
+    )
+    await canonical_log.append({"type": "assistant_message", "text": "old"})
+    await invalidate_owner_current_session_projections(
+      tmp_path / "sessions",
+      owner_user_id="alice",
+      research_file_ids=(41,),
+      document_id="doc:" + "a" * 32,
+      document_generation="11111111-1111-4111-8111-111111111111",
+    )
+    runner = _runner(tmp_path)
+    runner._agent_session_log = canonical_log
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_typed_retry",
+      agent_name="quant-research",
+      user_message="Continue exact research work.",
+      required_context=("research_file_id",),
+      ticker=None,
+      research_file_id=41,
+    )
+
+    await invalidate_owner_current_session_projections(
+      tmp_path / "sessions",
+      owner_user_id="alice",
+      research_file_ids=(41,),
+      document_id="doc:" + "a" * 32,
+      document_generation="11111111-1111-4111-8111-111111111111",
+    )
+
+    markers, _ = await canonical_log.query(
+      event_types={RESEARCH_FILE_CURRENT_PROJECTION_UNAVAILABLE_EVENT_TYPE},
+    )
+    assert len(markers) == 2
+
+  _run(_case())
+
+
+def test_resume_rejects_task_hidden_by_completed_document_erase(
+  tmp_path: Path,
+) -> None:
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_erased",
+      agent_name="quant-research",
+      user_message="Resume erased evidence.",
+      required_context=("research_file_id",),
+      ticker=None,
+      research_file_id=41,
+    )
+    log = runner._agent_session_log
+    assert log is not None
+    await log.append(build_current_projection_unavailable_event(
+      invalidated_through_seq=await log.latest_seq_current_strict(),
+      research_file_ids=(41,),
+      document_id="doc:" + "a" * 32,
+      document_generation="11111111-1111-4111-8111-111111111111",
+    ))
+    handler = make_resume_handler(
+      [runner],
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+    )
+
+    result, error = await handler({"task_id": "bg_erased"})
+
+    assert result is None
+    assert error is not None
+    assert error["code"] == "current_projection_unavailable"
+
+  _run(_case())
+
+
+def test_resume_revalidates_current_task_after_research_file_lock(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def _case() -> None:
+    runner = _runner(tmp_path)
+    await _append_interrupted_skill_task(
+      runner,
+      task_id="bg_cutoff_race",
+      agent_name="quant-research",
+      user_message="Resume exact research.",
+      required_context=("research_file_id",),
+      ticker=None,
+      research_file_id=41,
+    )
+    log = runner._agent_session_log
+    assert log is not None
+    real_acquire = try_acquire_research_file_activity
+    erased = False
+
+    def _erase_before_first_shared_acquire(*args: Any, **kwargs: Any):
+      nonlocal erased
+      if not erased:
+        erased = True
+        log.append_sync(build_current_projection_unavailable_event(
+          invalidated_through_seq=log.latest_seq_current_strict_sync(),
+          research_file_ids=(41,),
+          document_id="doc:" + "a" * 32,
+          document_generation="11111111-1111-4111-8111-111111111111",
+        ))
+      return real_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(
+      sub_agent_module,
+      "try_acquire_research_file_activity",
+      _erase_before_first_shared_acquire,
+    )
+    monkeypatch.setattr(
+      sub_agent_module,
+      "reconstruct_child_run_lineage",
+      lambda *_args, **_kwargs: pytest.fail(
+        "transcript lineage must not be read after cutoff"
+      ),
+    )
+    handler = make_resume_handler(
+      [runner],
+      mcp_client=_NullMcpClient(),
+      excluded_tools_resolver=frozenset,
+    )
+
+    result, error = await handler({"task_id": "bg_cutoff_race"})
+
+    assert result is None
+    assert error is not None
+    assert error["code"] == "current_projection_unavailable"
+    exclusive = real_acquire(
+      tmp_path,
+      research_file_id=41,
+      exclusive=True,
+    )
+    assert exclusive is not None
+    exclusive.release()
 
   _run(_case())
 
@@ -3972,6 +4265,7 @@ def test_resume_handler_waits_for_same_run_uncertain_completion(
     assert parent_log.entries == []
 
     release_append.set()
+    await runner._await_write_lease_handoff()
     for _ in range(100):
       if original.state == TaskState.COMPLETED:
         break
@@ -4261,6 +4555,7 @@ def test_cancelled_resume_abandonment_is_bounded_while_append_hangs(
     assert entry.completion_persistence_state == "uncertain"
 
     release_append.set()
+    await runner._await_write_lease_handoff()
     for _ in range(100):
       if entry.state == TaskState.FAILED:
         break
@@ -4593,6 +4888,7 @@ def test_timed_out_completion_reconciles_late_post_fsync_commit(
     assert completed == []
 
     release_manifest.set()
+    await runner._await_write_lease_handoff()
     for _ in range(200):
       if entry.state == TaskState.COMPLETED:
         break
@@ -5717,7 +6013,8 @@ def test_resume_emit_dashboard_artifact_failure_emits_tool_write_failed(
         agent_name="portfolio-report",
         user_message="Resume portfolio HTML report.",
         allowed_tools=("emit_dashboard_artifact",),
-        required_context=(),
+        required_context=("research_file_id",),
+        research_file_id=41,
       )
       captured: dict[str, Any] = {}
 

@@ -32,14 +32,43 @@ Name = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9._-]{0,127}$")]
 Version = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")]
 Digest = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
 HexDigest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+AGENT_OPERATION_INSTRUCTIONS_MAX_CHARS = 262_144
 OpaqueId = Annotated[
   str,
   StringConstraints(strip_whitespace=True, min_length=1, max_length=512),
 ]
 NonEmptyText = Annotated[
   str,
-  StringConstraints(strip_whitespace=True, min_length=1, max_length=262_144),
+  StringConstraints(
+    strip_whitespace=True,
+    min_length=1,
+    max_length=AGENT_OPERATION_INSTRUCTIONS_MAX_CHARS,
+  ),
 ]
+
+COMMON_CHILD_OPERATION_INSTRUCTIONS = (
+  "You are a focused sub-agent working on behalf of another agent. Complete "
+  "the admitted objective thoroughly. If evidence access fails or returns "
+  "suspicious data, identify the limitation explicitly instead of silently "
+  "proceeding. You cannot delegate to another agent."
+)
+
+
+def compose_operation_instructions(instructions: str) -> str:
+  """Append the common child contract within the exact wire-text bound."""
+
+  if type(instructions) is not str:
+    raise TypeError("operation instructions must be a string")
+  methodology = instructions.strip()
+  if not methodology:
+    raise ValueError("operation instructions must be non-empty")
+  composed = f"{methodology}\n\n{COMMON_CHILD_OPERATION_INSTRUCTIONS}"
+  if len(composed) > AGENT_OPERATION_INSTRUCTIONS_MAX_CHARS:
+    raise ValueError(
+      "composed operation instructions exceed the 262144-character wire bound"
+    )
+  return composed
+
 
 _RAW_PATH = re.compile(r"^(?:/|~/|\.{1,2}/|file://|[A-Za-z]:[\\/])")
 _SECRET_KEY = re.compile(

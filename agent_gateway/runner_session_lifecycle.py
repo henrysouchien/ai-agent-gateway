@@ -14,6 +14,10 @@ from .agent_session_log_records import (
   is_current_event_schema_version,
 )
 from .product_config import gateway_product_id
+from .research_file_current_projection import (
+  load_research_file_current_projection,
+  load_research_file_current_projection_sync,
+)
 from .runner_introspection import format_exc as _format_exc
 from .runner_session_events import (
   build_assistant_message_event as _build_assistant_message_event,
@@ -116,6 +120,13 @@ class RunnerSessionLifecycleMixin:
       sink="durable_event",
       boundary=getattr(self, "_secret_boundary", None),
     )
+    context_research_file_id = getattr(
+      self,
+      "_context_research_file_id",
+      None,
+    )
+    if context_research_file_id is not None:
+      safe_event["context_research_file_id"] = context_research_file_id
     return durable_event_payload(
       safe_event,
       runner_id=self._runner_id,
@@ -328,10 +339,20 @@ class RunnerSessionLifecycleMixin:
     lifecycle = self._top_level_skill_lifecycle
     if lifecycle is None or self._agent_session_log is None:
       return []
-    entries, _ = await self._agent_session_log.query(
+    snapshot_max_seq = (
+      await self._agent_session_log.latest_seq_current_strict()
+    )
+    current_projection = await load_research_file_current_projection(
+      self._agent_session_log,
+      snapshot_max_seq=snapshot_max_seq,
+    )
+    entries, _ = await self._agent_session_log.query_current_strict(
       event_types=event_types,
       contains_text=lifecycle.skill_run_id,
+      after_seq=current_projection.cutoff_seq + 1,
+      before_seq=snapshot_max_seq,
       order="asc",
+      exclude_entry=current_projection.excludes,
     )
     return [
       entry
@@ -1601,7 +1622,14 @@ class RunnerSessionLifecycleMixin:
         self._task_registry_rebuilt = True
         return
 
-      entries, _ = await self._agent_session_log.query(
+      snapshot_max_seq = (
+        await self._agent_session_log.latest_seq_current_strict()
+      )
+      current_projection = await load_research_file_current_projection(
+        self._agent_session_log,
+        snapshot_max_seq=snapshot_max_seq,
+      )
+      entries, _ = await self._agent_session_log.query_current_strict(
         event_types={
           "task_registered",
           "task_completed",
@@ -1609,7 +1637,10 @@ class RunnerSessionLifecycleMixin:
           "parent_message_sent",
           "skill_result_captured",
         },
+        after_seq=current_projection.cutoff_seq + 1,
+        before_seq=snapshot_max_seq,
         order="desc",
+        exclude_entry=current_projection.excludes,
       )
       events: list[dict[str, Any]] = []
       registered_task_ids: set[str] = set()
@@ -1669,7 +1700,14 @@ class RunnerSessionLifecycleMixin:
   async def _lookup_task_in_log(self, task_id: str) -> TaskEntry | None:
     if self._agent_session_log is None:
       return None
-    entries, _ = await self._agent_session_log.query(
+    snapshot_max_seq = (
+      await self._agent_session_log.latest_seq_current_strict()
+    )
+    current_projection = await load_research_file_current_projection(
+      self._agent_session_log,
+      snapshot_max_seq=snapshot_max_seq,
+    )
+    entries, _ = await self._agent_session_log.query_current_strict(
       event_types={
         "task_registered",
         "task_completed",
@@ -1677,7 +1715,10 @@ class RunnerSessionLifecycleMixin:
         "parent_message_sent",
         "skill_result_captured",
       },
+      after_seq=current_projection.cutoff_seq + 1,
+      before_seq=snapshot_max_seq,
       order="desc",
+      exclude_entry=current_projection.excludes,
     )
     events: list[dict[str, Any]] = []
     found_registration = False
@@ -1695,6 +1736,55 @@ class RunnerSessionLifecycleMixin:
       return None
     registry_type = _runner_attr(self, "TaskRegistry", TaskRegistry)
     registry = registry_type(max_retained=max(1, getattr(self._task_registry, "_max_retained", 50)))
+    registry.load_from_events(events)
+    return registry.get(task_id)
+
+  def _lookup_task_in_log_current_sync(self, task_id: str) -> TaskEntry | None:
+    """Strict lookup without an executor hop at detached terminal barriers."""
+
+    if self._agent_session_log is None:
+      return None
+    snapshot_max_seq = (
+      self._agent_session_log.latest_seq_current_strict_sync()
+    )
+    current_projection = load_research_file_current_projection_sync(
+      self._agent_session_log,
+      snapshot_max_seq=snapshot_max_seq,
+    )
+    entries, _ = self._agent_session_log.query_current_strict_sync(
+      event_types={
+        "task_registered",
+        "task_completed",
+        "agent_completion",
+        "parent_message_sent",
+        "skill_result_captured",
+      },
+      after_seq=current_projection.cutoff_seq + 1,
+      before_seq=snapshot_max_seq,
+      order="desc",
+      exclude_entry=current_projection.excludes,
+    )
+    events: list[dict[str, Any]] = []
+    found_registration = False
+    for entry in entries:
+      event = entry.event
+      if event.get("task_id") != task_id:
+        continue
+      durable_event = dict(event)
+      durable_event["_durable_seq"] = entry.seq
+      events.append(durable_event)
+      if event.get("type") == "task_registered":
+        found_registration = True
+        break
+    if not found_registration:
+      return None
+    registry_type = _runner_attr(self, "TaskRegistry", TaskRegistry)
+    registry = registry_type(
+      max_retained=max(
+        1,
+        getattr(self._task_registry, "_max_retained", 50),
+      )
+    )
     registry.load_from_events(events)
     return registry.get(task_id)
 
@@ -2665,7 +2755,7 @@ class RunnerSessionLifecycleMixin:
       await self._assert_fresh_top_level_skill_lifecycle()
     else:
       fcntl_module = _runner_attr(self, "fcntl", fcntl)
-      lease_file = self._agent_session_log.write_lease_path.open("a+b")
+      lease_file = self._agent_session_log._open_writer_lease_file()
       try:
         fcntl_module.flock(lease_file.fileno(), fcntl_module.LOCK_EX | fcntl_module.LOCK_NB)
       except BlockingIOError as exc:
@@ -2673,31 +2763,46 @@ class RunnerSessionLifecycleMixin:
         raise WriterLeaseAlreadyHeldError(f"Writer lease already held for {self._agent_session_log.path}") from exc
       self._write_lease_file = lease_file
 
-    last_known_safe_seq = 0
-    safe_entries, _ = await self._agent_session_log.query(
+    snapshot_max_seq = (
+      await self._agent_session_log.latest_seq_current_strict()
+    )
+    current_projection = await load_research_file_current_projection(
+      self._agent_session_log,
+      snapshot_max_seq=snapshot_max_seq,
+    )
+    last_known_safe_seq = current_projection.cutoff_seq
+    safe_entries, _ = await self._agent_session_log.query_current_strict(
       event_types={"detach", "interrupted"},
       role="writer",
+      after_seq=current_projection.cutoff_seq + 1,
+      before_seq=snapshot_max_seq,
       order="desc",
       limit=1,
+      exclude_entry=current_projection.excludes,
     )
     if safe_entries:
       last_known_safe_seq = safe_entries[0].seq
       self._last_durable_seq = last_known_safe_seq
 
     prior_writer_runner_id: str | None = None
-    writer_lifecycle, _ = await self._agent_session_log.query(
+    writer_lifecycle, _ = await self._agent_session_log.query_current_strict(
       event_types={"attach", "detach", "interrupted"},
       role="writer",
+      after_seq=current_projection.cutoff_seq + 1,
+      before_seq=snapshot_max_seq,
       order="desc",
       limit=1,
+      exclude_entry=current_projection.excludes,
     )
     if writer_lifecycle and writer_lifecycle[0].event.get("type") == "attach":
       prior_writer_runner_id = str(writer_lifecycle[0].event.get("runner_id") or "")
 
-    orphan_entries, _ = await self._agent_session_log.query(
+    orphan_entries, _ = await self._agent_session_log.query_current_strict(
       event_types={"tool_call_start", "tool_call_complete", "tool_call_interrupted"},
       after_seq=last_known_safe_seq + 1,
+      before_seq=snapshot_max_seq,
       order="asc",
+      exclude_entry=current_projection.excludes,
     )
     discovered_at = _runner_attr(self, "time", time).time()
     for synthetic_event in _runner_attr(
@@ -2800,8 +2905,7 @@ class RunnerSessionLifecycleMixin:
   async def _await_write_lease_handoff(self) -> bool:
     """Drain every tracked append before handing off the writer lease."""
 
-    if self._write_lease_file is None:
-      return False
+    had_write_lease = self._write_lease_file is not None
     while True:
       agent_session_log = self._agent_session_log
       candidates = (
@@ -2844,6 +2948,9 @@ class RunnerSessionLifecycleMixin:
         name="writer-lease:drain-pending-appends",
       )
       await drain_owned_lifecycle_task(drain_task)
+
+    if not had_write_lease:
+      return False
 
     # A poison flag fences release while operations are unresolved. At this
     # point every tracked operation has settled and the final durable markers

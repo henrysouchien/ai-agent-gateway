@@ -7,6 +7,9 @@ import secrets
 import time
 from typing import Any, Callable, FrozenSet
 
+from agent_workflow_contracts.research_file_contract import (
+  extract_research_file_id as _extract_research_file_id_from_task,
+)
 from agent_workflow_contracts.ticker_contract import (
   is_entity_ticker,
   normalize_contract_ticker,
@@ -14,6 +17,7 @@ from agent_workflow_contracts.ticker_contract import (
 
 from .session import GatewaySession
 from .artifact_paths import canonicalize_ticker
+from .operation_catalog import AgentOperationCatalog
 from .skills import SkillLoader, SkillProfile, operation_tool_ids
 from .task_registry import ParentMessage
 
@@ -32,7 +36,6 @@ _DEFAULT_EXCLUDED_TOOLS = frozenset({
 # Skill profiles with an explicit `timeout` still override this.
 DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = 1800.0
 _ARTIFACT_EMIT_TOOLS = frozenset({"emit_canvas_artifact", "emit_dashboard_artifact"})
-_RESEARCH_FILE_ID_RE = re.compile(r"\b(?:research[_ ]file[_ ]id|RESEARCH_FILE_ID)\b\s*[:=]\s*(\d+)", re.IGNORECASE)
 ExcludedToolsResolver = Callable[[], FrozenSet[str]]
 NeedsApprovalResolver = Callable[[FrozenSet[str]], Callable[..., bool] | None]
 MutationModeExclusionsApplier = Callable[..., set[str]]
@@ -205,18 +208,6 @@ def _resolve_context_ticker(
   return normalize_contract_ticker(fallback) if fallback is not None else None
 
 
-def _extract_research_file_id_from_task(task: object) -> int | None:
-  if not isinstance(task, str):
-    return None
-  match = _RESEARCH_FILE_ID_RE.search(task)
-  if match is None:
-    return None
-  try:
-    return int(match.group(1))
-  except ValueError:
-    return None
-
-
 def _optional_research_file_id(value: object | None, *, default: int | None = None) -> int | None:
   if value is None or (isinstance(value, str) and not value.strip()):
     return default
@@ -287,6 +278,28 @@ def _dashboard_artifact_scope(profile: SkillProfile, context_ticker: str) -> str
   return "ticker" if _dashboard_artifact_ticker(profile, context_ticker) else "portfolio"
 
 
+def _artifact_ticker_for_scope(
+  semantic_scope: str,
+  context_ticker: str,
+) -> str | None:
+  return (
+    canonicalize_ticker(context_ticker)
+    if semantic_scope == "ticker" and context_ticker
+    else None
+  )
+
+
+def _artifact_scope_for_scope(
+  semantic_scope: str,
+  context_ticker: str,
+) -> str:
+  return (
+    "ticker"
+    if _artifact_ticker_for_scope(semantic_scope, context_ticker)
+    else "portfolio"
+  )
+
+
 def _current_context_ticker(
   value: str | Callable[[], str | None],
 ) -> str:
@@ -331,12 +344,22 @@ def _skill_artifact_excluded_tools(
 
 
 def _install_emit_canvas_artifact_handler(
-  *, sub_local: dict[str, Any], profile: SkillProfile, skill_run_id: str,
+  *, sub_local: dict[str, Any], profile: SkillProfile | None = None,
+  skill_name: str | None = None, semantic_scope: str | None = None,
+  skill_run_id: str,
   context_ticker: str | Callable[[], str | None],
   context_research_file_id: int | None,
   parent_session: GatewaySession | None, fallback_user_id: str | None,
   emit_parent_event: Callable[[dict[str, Any]], None],
 ) -> bool:
+  resolved_skill_name = skill_name or getattr(profile, "name", None)
+  resolved_scope = (
+    semantic_scope
+    if semantic_scope is not None
+    else (getattr(profile, "scope", None) or "global")
+  )
+  if not resolved_skill_name:
+    raise ValueError("artifact handler requires skill identity and scope")
   from .canvas_build_environment import preflight_canvas_build_environment
 
   preflight = preflight_canvas_build_environment()
@@ -367,9 +390,9 @@ def _install_emit_canvas_artifact_handler(
         copy_as_prompt=tool_input.get("copy_as_prompt"),
         copy_as_json=tool_input.get("copy_as_json"),
         sources=[SourceRecord.model_validate(value) for value in raw_sources],
-        source_skill=profile.name, skill_run_id=skill_run_id,
-        ticker=_artifact_ticker(
-          profile,
+        source_skill=resolved_skill_name, skill_run_id=skill_run_id,
+        ticker=_artifact_ticker_for_scope(
+          resolved_scope,
           _current_context_ticker(context_ticker),
         ),
         session_id=str(getattr(parent_session, "session_id", "") or "").strip() or None,
@@ -389,7 +412,9 @@ def _install_emit_canvas_artifact_handler(
 def _install_emit_dashboard_artifact_handler(
   *,
   sub_local: dict[str, Any],
-  profile: SkillProfile,
+  profile: SkillProfile | None = None,
+  skill_name: str | None = None,
+  semantic_scope: str | None = None,
   skill_run_id: str,
   context_ticker: str | Callable[[], str | None],
   context_research_file_id: int | None,
@@ -397,6 +422,14 @@ def _install_emit_dashboard_artifact_handler(
   fallback_user_id: str | None,
   emit_parent_event: Callable[[dict[str, Any]], None],
 ) -> None:
+  resolved_skill_name = skill_name or getattr(profile, "name", None)
+  resolved_scope = (
+    semantic_scope
+    if semantic_scope is not None
+    else (getattr(profile, "scope", None) or "global")
+  )
+  if not resolved_skill_name:
+    raise ValueError("artifact handler requires skill identity and scope")
   artifact_storage_user_id = _artifact_storage_user_id(parent_session, fallback_user_id)
 
   async def _handle_emit_dashboard_artifact(
@@ -406,8 +439,8 @@ def _install_emit_dashboard_artifact_handler(
     dashboard_tool_ctx = handler_kwargs.get("tool_ctx")
     tool_call_id = getattr(dashboard_tool_ctx, "tool_call_id", None)
     admitted_context_ticker = _current_context_ticker(context_ticker)
-    artifact_ticker = _dashboard_artifact_ticker(
-      profile,
+    artifact_ticker = _artifact_ticker_for_scope(
+      resolved_scope,
       admitted_context_ticker,
     )
     try:
@@ -441,7 +474,7 @@ def _install_emit_dashboard_artifact_handler(
       control_run_id = str(getattr(parent_session, "session_id", "") or "").strip() or None
       artifact = DashboardArtifact(
         artifact_id=artifact_id,
-        source_skill=profile.name,
+        source_skill=resolved_skill_name,
         payload_ref=f"{artifact_id}.payload.json",
         ts=now.isoformat(),
         research_file_id=research_file_id,
@@ -467,7 +500,10 @@ def _install_emit_dashboard_artifact_handler(
         "contract_name": "DashboardArtifact",
         "data_source": "live",
         "ts": time.time(),
-        "scope": _dashboard_artifact_scope(profile, admitted_context_ticker),
+        "scope": _artifact_scope_for_scope(
+          resolved_scope,
+          admitted_context_ticker,
+        ),
         "portfolio_id": None,
       })
       return {
@@ -493,15 +529,17 @@ def _install_emit_dashboard_artifact_handler(
 
   sub_local["emit_dashboard_artifact"] = _handle_emit_dashboard_artifact
 
-def make_run_agent_tool_def(skill_loader: SkillLoader | None = None) -> dict[str, Any]:
+def make_run_agent_tool_def(
+  operation_source: SkillLoader | AgentOperationCatalog | None = None,
+) -> dict[str, Any]:
   """Build the public tool schema for `run_agent`.
 
-  When a ``SkillLoader`` is provided, the operation description includes the
+  When an operation source is provided, the operation description includes the
   currently available immutable operation identities.
   """
   operations = (
-    skill_loader.list_callable_operations_with_descriptions()
-    if skill_loader
+    operation_source.list_callable_operations_with_descriptions()
+    if operation_source is not None
     else []
   )
 

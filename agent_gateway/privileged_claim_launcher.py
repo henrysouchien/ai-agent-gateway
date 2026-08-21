@@ -16,6 +16,9 @@ from typing import NoReturn, Sequence
 _SECRET_PATH = Path(
   "/etc/agent_gateway/agent-api-user-claim-hmac-key"
 )
+_SESSION_LOG_LAYOUT_PATH = Path(
+  "/etc/agent_gateway/session-log-layout"
+)
 _TARGET_USER = "ubuntu"
 _TARGET_ARGV = (
   "/var/www/agent_gateway/venv/bin/python3",
@@ -45,6 +48,7 @@ _TARGET_ENV = {
   "AGENT_SESSION_LOG_BASE_DIR": (
     "/mnt/hank-data/agent_gateway/data/agent-sessions"
   ),
+  "AGENT_SESSION_LOG_ARCHIVE_PRODUCT_IDS": "hank-dev",
   "AGENT_GATEWAY_SKILLS_DIR": (
     "/var/www/agent_gateway/api/memory/workspace/notes/skills"
   ),
@@ -81,17 +85,18 @@ _PR_CAP_AMBIENT = 47
 _PR_CAP_AMBIENT_CLEAR_ALL = 4
 
 
-def _open_secret(
+def _open_private_source(
   path: Path,
   *,
   expected_owner_uid: int,
+  source_name: str,
 ) -> int:
   if (
     not path.is_absolute()
     or path != Path(os.path.normpath(str(path)))
   ):
     raise RuntimeError(
-      "claim-signing credential path is not canonical"
+      f"{source_name} path is not canonical"
     )
   parent = path.parent
   try:
@@ -100,7 +105,7 @@ def _open_secret(
     before = path.lstat()
   except OSError as exc:
     raise RuntimeError(
-      "claim-signing credential is unavailable"
+      f"{source_name} is unavailable"
     ) from exc
   if (
     resolved_parent != parent
@@ -109,7 +114,7 @@ def _open_secret(
     or stat.S_IMODE(parent_info.st_mode) & 0o022
   ):
     raise RuntimeError(
-      "claim-signing credential parent is untrusted"
+      f"{source_name} parent is untrusted"
     )
   if (
     stat.S_ISLNK(before.st_mode)
@@ -119,7 +124,7 @@ def _open_secret(
     or before.st_nlink != 1
   ):
     raise RuntimeError(
-      "claim-signing credential is untrusted"
+      f"{source_name} is untrusted"
     )
   flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
   if hasattr(os, "O_NOFOLLOW"):
@@ -129,7 +134,7 @@ def _open_secret(
     opened = os.fstat(fd)
   except OSError as exc:
     raise RuntimeError(
-      "claim-signing credential could not be opened"
+      f"{source_name} could not be opened"
     ) from exc
   if (
     (opened.st_dev, opened.st_ino)
@@ -141,9 +146,21 @@ def _open_secret(
   ):
     os.close(fd)
     raise RuntimeError(
-      "claim-signing credential changed while opening"
+      f"{source_name} changed while opening"
     )
   return fd
+
+
+def _open_secret(
+  path: Path,
+  *,
+  expected_owner_uid: int,
+) -> int:
+  return _open_private_source(
+    path,
+    expected_owner_uid=expected_owner_uid,
+    source_name="claim-signing credential",
+  )
 
 
 def _consume_secret(
@@ -182,6 +199,35 @@ def _consume_secret(
       "claim-signing credential is not canonical"
     )
   return value
+
+
+def _consume_session_log_layout(
+  path: Path,
+  *,
+  expected_owner_uid: int,
+) -> str:
+  fd = _open_private_source(
+    Path(path),
+    expected_owner_uid=expected_owner_uid,
+    source_name="session-log layout choice",
+  )
+  try:
+    value = os.read(fd, 4)
+    if os.read(fd, 1):
+      raise RuntimeError(
+        "session-log layout choice exceeds its byte bound"
+      )
+  except OSError as exc:
+    raise RuntimeError(
+      "session-log layout choice could not be read"
+    ) from exc
+  finally:
+    os.close(fd)
+  if value not in {b"v1\n", b"v2\n"}:
+    raise RuntimeError(
+      "session-log layout choice must be canonical v1 or v2"
+    )
+  return value[:-1].decode("ascii")
 
 
 def _anonymous_secret_fd(secret: bytes) -> int:
@@ -290,6 +336,7 @@ def _drop_privileges(user_name: str) -> None:
 def launch_with_claim_signing_fd(
   *,
   secret_path: Path,
+  session_log_layout_path: Path = _SESSION_LOG_LAYOUT_PATH,
   target_user: str,
   target_argv: Sequence[str],
   expected_owner_uid: int = 0,
@@ -307,6 +354,10 @@ def launch_with_claim_signing_fd(
     raise ValueError(
       "privileged claim launcher target is invalid"
     )
+  session_log_layout = _consume_session_log_layout(
+    Path(session_log_layout_path),
+    expected_owner_uid=expected_owner_uid,
+  )
   secret = _consume_secret(
     Path(secret_path),
     expected_owner_uid=expected_owner_uid,
@@ -318,7 +369,9 @@ def launch_with_claim_signing_fd(
     env = dict(os.environ)
     env.pop("AGENT_API_USER_CLAIM_HMAC_KEY", None)
     env.pop("CREDENTIALS_DIRECTORY", None)
+    env.pop("AGENT_SESSION_LOG_LAYOUT", None)
     env.update(_TARGET_ENV)
+    env["AGENT_SESSION_LOG_LAYOUT"] = session_log_layout
     argv = [
       *target_argv,
       "--claim-signing-key-fd",
@@ -337,6 +390,7 @@ def main() -> NoReturn:
     )
   launch_with_claim_signing_fd(
     secret_path=_SECRET_PATH,
+    session_log_layout_path=_SESSION_LOG_LAYOUT_PATH,
     target_user=_TARGET_USER,
     target_argv=_TARGET_ARGV,
   )

@@ -1,21 +1,25 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Protocol
 
-from .agent_session_log_records import (
-  _MANIFEST_SCHEMA_VERSION,
-  _atomic_write_json,
-  _fsync_parent_dir,
-  _now_iso,
-)
+from .agent_session_log_records import _MANIFEST_SCHEMA_VERSION, _now_iso
 
 
 class _RotationOwner(Protocol):
   path: Path
   segments_dir: Path
   _max_active_bytes: int | None
+
+  def _active_file_size(self) -> int: ...
+
+  def _ensure_segments_directory(self) -> None: ...
+
+  def _create_or_bind_active_storage(
+    self,
+    *,
+    allow_identity_change: bool = False,
+  ) -> None: ...
 
   def _seq_bounds_for_file(self, path: Path) -> tuple[int, int]: ...
 
@@ -38,6 +42,14 @@ class _RotationOwner(Protocol):
     rotated_from_file_identity: dict[str, int],
   ) -> dict[str, Any]: ...
 
+  def _write_segment_sidecar(
+    self,
+    segment_path: Path,
+    payload: dict[str, Any],
+  ) -> None: ...
+
+  def _rotate_active_to_segment(self, segment_path: Path) -> None: ...
+
   def _telemetry_source_id(self, role: str, suffix: str) -> str: ...
 
   def _logical_stream_id(self) -> str: ...
@@ -46,17 +58,15 @@ class _RotationOwner(Protocol):
 
   def _active_sidecar_payload(self, base: dict[str, Any], *, active_generation: int) -> dict[str, Any]: ...
 
+  def _write_active_sidecar(self, payload: dict[str, Any]) -> None: ...
+
   def _clear_active_cache(self) -> None: ...
 
 
 def rotate_active_if_needed_locked(owner: _RotationOwner) -> None:
   if owner._max_active_bytes is None:
     return
-  try:
-    active_size = owner.path.stat().st_size
-  except FileNotFoundError:
-    owner.path.touch(exist_ok=True)
-    return
+  active_size = owner._active_file_size()
   if active_size == 0 or active_size <= owner._max_active_bytes:
     return
 
@@ -67,16 +77,14 @@ def rotate_active_if_needed_locked(owner: _RotationOwner) -> None:
   manifest = owner._load_manifest() or owner._new_manifest()
   active_generation = int(manifest.get("active_generation") or 0)
   segment_id = f"{first_seq:012d}-{last_seq:012d}-g{active_generation:06d}"
-  owner.segments_dir.mkdir(parents=True, exist_ok=True)
+  owner._ensure_segments_directory()
   segment_path = owner.segments_dir / f"{segment_id}.jsonl"
   file_identity = owner._file_identity(owner.path)
   base_meta = owner._load_sidecar_payload() or {}
 
-  os.replace(owner.path, segment_path)
-  _fsync_parent_dir(owner.segments_dir)
-  segment_meta_path = segment_path.with_suffix(".meta.json")
-  _atomic_write_json(
-    segment_meta_path,
+  owner._rotate_active_to_segment(segment_path)
+  owner._write_segment_sidecar(
+    segment_path,
     owner._segment_sidecar_payload(
       base_meta,
       segment_id=segment_id,
@@ -118,10 +126,9 @@ def rotate_active_if_needed_locked(owner: _RotationOwner) -> None:
   )
   owner._write_manifest(manifest)
 
-  owner.path.touch(exist_ok=True)
+  owner._create_or_bind_active_storage(allow_identity_change=True)
   if base_meta:
-    _atomic_write_json(
-      owner.path.with_suffix(".meta.json"),
+    owner._write_active_sidecar(
       owner._active_sidecar_payload(base_meta, active_generation=next_generation),
     )
   owner._clear_active_cache()

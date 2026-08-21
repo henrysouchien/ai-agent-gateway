@@ -188,18 +188,14 @@ def test_runner_append_durable_event_resolves_parent_module_payload_helpers(monk
 
 def test_runner_writer_recovery_resolves_parent_module_risk_helper(tmp_path: Path, monkeypatch: Any) -> None:
   events: list[dict[str, Any]] = []
-
-  class _SessionLog:
-    path = tmp_path / "session.jsonl"
-    write_lease_path = tmp_path / "session.jsonl.write_lease"
-
-    async def query(self, **kwargs: Any):
-      if kwargs.get("event_types") == {"tool_call_start", "tool_call_complete", "tool_call_interrupted"}:
-        return [SimpleNamespace(event={"type": "tool_call_start", "tool_call_id": "tool-1"})], None
-      return [], None
+  session_log = AgentSessionLog(tmp_path / "session.jsonl")
+  _run(session_log.append({
+    "type": "tool_call_start",
+    "tool_call_id": "tool-1",
+  }))
 
   runner = object.__new__(AgentRunner)
-  runner._agent_session_log = _SessionLog()
+  runner._agent_session_log = session_log
   runner._role = "writer"
   runner._write_lease_file = None
   runner._last_durable_seq = 0

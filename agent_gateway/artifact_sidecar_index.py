@@ -408,6 +408,43 @@ def mark_artifact_sidecar_index_row_stale(
   return cursor.rowcount > 0
 
 
+def delete_artifact_sidecar_index_rows(
+  *,
+  workspace_dir: Path,
+  user_id: str,
+  keys: tuple[tuple[str, str], ...],
+) -> None:
+  """Delete exact owner/kind/ref rows after their artifacts are unavailable."""
+
+  if type(keys) is not tuple:
+    raise TypeError("artifact index deletion keys must be a tuple")
+  normalized_keys: list[tuple[str, str]] = []
+  for key in keys:
+    if (
+      type(key) is not tuple
+      or len(key) != 2
+      or not all(type(value) is str and value for value in key)
+    ):
+      raise ValueError("artifact index deletion keys must be non-empty kind/ref pairs")
+    normalized_keys.append(key)
+  db_path = artifact_sidecar_index_path(workspace_dir)
+  if not db_path.is_file() or not normalized_keys:
+    return
+  effective_user_id = _effective_user_id(workspace_dir, user_id=user_id)
+  with sqlite3.connect(db_path) as conn:
+    _ensure_schema(conn)
+    conn.executemany(
+      """
+      DELETE FROM artifact_sidecar_index
+      WHERE user_id=? AND artifact_kind=? AND artifact_ref=?
+      """,
+      (
+        (effective_user_id, artifact_kind, artifact_ref)
+        for artifact_kind, artifact_ref in normalized_keys
+      ),
+    )
+
+
 def _upsert_index_row(*, workspace_dir: Path, row: dict[str, Any]) -> None:
   db_path = artifact_sidecar_index_path(workspace_dir)
   db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -782,6 +819,7 @@ def _now_ts() -> str:
 
 __all__ = [
   "artifact_sidecar_index_path",
+  "delete_artifact_sidecar_index_rows",
   "get_artifact_sidecar_index_row",
   "get_artifact_sidecar_index_row_by_ref",
   "list_artifact_sidecar_index_rows",

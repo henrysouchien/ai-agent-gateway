@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import unicodedata
-from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping, Sequence
 
 from agent_workflow_contracts import (
   ContentHandle,
@@ -77,6 +77,11 @@ class SelectedContentAdmission:
 
   bindings: tuple[SelectedContentBinding, ...] = ()
   model_context: str = ""
+  activity_lease: Any | None = field(
+    default=None,
+    repr=False,
+    compare=False,
+  )
 
 
 @dataclass(frozen=True)

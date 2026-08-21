@@ -20,6 +20,14 @@ def _run(coro):
   return asyncio.run(coro)
 
 
+class _EmptyOperationCatalog:
+  def resolve_operation(self, _selector):
+    raise FileNotFoundError("no operations")
+
+  def list_callable_operations_with_descriptions(self):
+    return []
+
+
 def _bound_execution() -> dict[str, Any]:
   resolver = stub_capability_execution_resolver(run_mode="autonomous")
   resolved = resolver.resolve("session.driver")
@@ -121,6 +129,74 @@ def test_run_autonomous_forwards_mcp_session_inject_servers_to_dispatcher(
   )
 
   assert captured["dispatcher_kwargs"]["mcp_session_inject_servers"] == {"browser"}
+
+
+def test_run_autonomous_rejects_skills_dir_with_operation_catalog() -> None:
+  async def _invoke() -> None:
+    await autonomous.run_autonomous(
+      "You are helpful.",
+      "Run the task.",
+      **_bound_execution(),
+      skills_dir="skills",
+      operation_catalog=_EmptyOperationCatalog(),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+
+  try:
+    _run(_invoke())
+  except ValueError as exc:
+    assert "either skills_dir or operation_catalog" in str(exc)
+  else:
+    raise AssertionError("expected mutually exclusive operation sources")
+
+
+def test_run_autonomous_forwards_injected_operation_catalog(
+  monkeypatch,
+  tmp_path: Path,
+) -> None:
+  catalog = _EmptyOperationCatalog()
+  captured: dict[str, Any] = {}
+
+  class _StubDispatcher:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+      _ = args, kwargs
+
+  class _StubRunner:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+      _ = args, kwargs
+
+  async def _fake_run_agent(_tool_input, **_kwargs):
+    return {"response": "ok"}, None
+
+  def _fake_make_run_agent_handler(*args, **kwargs):
+    _ = args
+    captured.update(kwargs)
+    return _fake_run_agent
+
+  monkeypatch.setattr(autonomous, "ToolDispatcher", _StubDispatcher)
+  monkeypatch.setattr(autonomous, "AgentRunner", _StubRunner)
+  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
+  monkeypatch.setattr(
+    autonomous,
+    "make_run_agent_handler",
+    _fake_make_run_agent_handler,
+  )
+
+  _run(autonomous.run_autonomous(
+    "You are helpful.",
+    "Run the task.",
+    **_bound_execution(),
+    operation_catalog=catalog,
+    session_log_base_dir=tmp_path,
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+  ))
+
+  assert captured["operation_catalog"] is catalog
+  assert captured["skill_loader"] is None
 
 
 def test_run_autonomous_forwards_mcp_timeout_overrides_to_manager(

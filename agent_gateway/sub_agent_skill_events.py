@@ -56,7 +56,8 @@ class SkillRunEventEmitter:
     self,
     *,
     skill_run_id: str,
-    profile: Any,
+    profile: Any | None = None,
+    skill_name: str | None = None,
     semantic_scope: str | None,
     context_ticker: str | None,
     portfolio_id: str | None,
@@ -71,6 +72,17 @@ class SkillRunEventEmitter:
   ) -> None:
     self._event_log_getter = event_log_getter
     self._tool_ctx = tool_ctx
+    resolved_skill_name = (
+      skill_name
+      if skill_name is not None
+      else getattr(profile, "name", None)
+    )
+    if (
+      type(resolved_skill_name) is not str
+      or not resolved_skill_name
+      or resolved_skill_name != resolved_skill_name.strip()
+    ):
+      raise ValueError("skill lifecycle requires a canonical skill name")
     artifact_identity = resolve_skill_lifecycle_artifact_identity(
       semantic_scope=semantic_scope,
       context_ticker=context_ticker,
@@ -78,7 +90,7 @@ class SkillRunEventEmitter:
     )
     self._lifecycle = TopLevelSkillLifecycleMetadata(
       skill_run_id=skill_run_id,
-      skill=profile.name,
+      skill=resolved_skill_name,
       **artifact_identity.identity_fields(),
     )
     self._durable_appender = durable_appender

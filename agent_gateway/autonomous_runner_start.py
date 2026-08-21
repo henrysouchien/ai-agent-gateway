@@ -5,6 +5,7 @@ import fcntl
 import functools
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import signal
 import time
@@ -52,6 +53,17 @@ from .autonomous_event_channel import (
   AUTONOMOUS_EVENT_CHANNEL_MAX_IO_TIMEOUT_SECONDS,
   AutonomousEventChannelChild,
   create_autonomous_event_channel,
+)
+from .agent_session_log_layout import (
+  AutonomousSessionLogAuthority,
+  PreparedAutonomousSessionLog,
+  SESSION_LOG_ACTIVE_FD_ENV,
+  SESSION_LOG_LAYOUT_ENV,
+  SESSION_LOG_LAYOUT_V2,
+  SESSION_LOG_META_FD_ENV,
+  SESSION_LOG_ROOT_FD_ENV,
+  prepare_autonomous_session_log,
+  resolve_agent_session_log_layout,
 )
 from .claim_signing_authority import GatewayClaimSigningAuthority
 from .autonomous_runner_commands import normalize_autonomous_profile, normalize_max_budget_usd
@@ -119,6 +131,7 @@ _AUTONOMOUS_CHILD_BASE_ENV_NAMES = frozenset({
   "AGENT_API_CLAIM_MAX_TTL_SECONDS",
   "AGENT_GATEWAY_SKILLS_DIR",
   "AGENT_SESSION_LOG_BASE_DIR",
+  SESSION_LOG_LAYOUT_ENV,
   "AGENT_SESSION_LOG_MAX_ACTIVE_BYTES",
   "AGENT_SDK_CWD",
   "SUB_AGENT_MAX_CONCURRENCY",
@@ -219,6 +232,9 @@ _RETIRED_AUTONOMOUS_CHILD_ENV_NAMES = (
   "AGENT_API_CLAIM_SIGNATURE",
   AUTONOMOUS_CLAIM_BROKER_FD_ENV,
   AUTONOMOUS_APPROVAL_CHANNEL_FD_ENV,
+  SESSION_LOG_ROOT_FD_ENV,
+  SESSION_LOG_ACTIVE_FD_ENV,
+  SESSION_LOG_META_FD_ENV,
   AUTONOMOUS_CREDENTIAL_HANDOFF_ENV,
   "AGENT_AUTONOMOUS_USER_CREDENTIAL_HANDOFF",
   "ANALYST_DEV_MODE",
@@ -324,24 +340,76 @@ import sys
 import threading
 import time
 
-event_fd = int(os.environ["AGENT_AUTONOMOUS_EVENT_CHANNEL_FD"])
-claim_broker_fd = int(
-    os.environ["AGENT_AUTONOMOUS_CLAIM_BROKER_FD"]
+def canonical_fd(raw, name):
+    try:
+        descriptor = int(raw, 10)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(name + " is not a descriptor") from exc
+    if descriptor < 0 or str(descriptor) != raw:
+        raise SystemExit(name + " is not a canonical descriptor")
+    return descriptor
+
+
+event_fd = canonical_fd(
+    os.environ["AGENT_AUTONOMOUS_EVENT_CHANNEL_FD"],
+    "event descriptor",
+)
+claim_broker_fd = canonical_fd(
+    os.environ["AGENT_AUTONOMOUS_CLAIM_BROKER_FD"],
+    "claim broker descriptor",
 )
 approval_fd_raw = os.environ.get(
     "AGENT_AUTONOMOUS_APPROVAL_CHANNEL_FD"
 )
-approval_fd = int(approval_fd_raw) if approval_fd_raw is not None else None
-child_descriptors = (
-    (event_fd, claim_broker_fd, approval_fd)
-    if approval_fd is not None
-    else (event_fd, claim_broker_fd)
+approval_fd = (
+    canonical_fd(approval_fd_raw, "approval descriptor")
+    if approval_fd_raw is not None
+    else None
+)
+session_log_layout = os.environ.get("AGENT_SESSION_LOG_LAYOUT", "v1")
+session_log_fd_names = (
+    "AGENT_SESSION_LOG_ROOT_FD",
+    "AGENT_SESSION_LOG_ACTIVE_FD",
+    "AGENT_SESSION_LOG_META_FD",
+)
+session_log_fd_raw = tuple(
+    os.environ.get(name) for name in session_log_fd_names
+)
+if session_log_layout == "v2":
+    if any(value is None for value in session_log_fd_raw):
+        raise SystemExit("v2 session-log descriptors are incomplete")
+    session_log_fds = tuple(
+        canonical_fd(value, name)
+        for name, value in zip(session_log_fd_names, session_log_fd_raw)
+    )
+elif session_log_layout == "v1":
+    if any(value is not None for value in session_log_fd_raw):
+        raise SystemExit("v1 launch inherited v2 session-log descriptors")
+    session_log_fds = ()
+else:
+    raise SystemExit("session-log layout is unsupported")
+child_descriptors = tuple(
+    descriptor
+    for descriptor in (
+        event_fd,
+        claim_broker_fd,
+        approval_fd,
+        *session_log_fds,
+    )
+    if descriptor is not None
 )
 credential_max_bytes = int(sys.argv[1])
-owner_lifeline_fd = int(sys.argv[2])
-owner_lease_fd = int(sys.argv[3])
+owner_lifeline_fd = canonical_fd(sys.argv[2], "owner lifeline descriptor")
+owner_lease_fd = canonical_fd(sys.argv[3], "owner lease descriptor")
 owner_cleanup_grace_seconds = float(sys.argv[4])
 target_cmd = sys.argv[5:]
+all_inherited_descriptors = (
+    *child_descriptors,
+    owner_lifeline_fd,
+    owner_lease_fd,
+)
+if len(all_inherited_descriptors) != len(set(all_inherited_descriptors)):
+    raise SystemExit("autonomous inherited descriptors collide")
 
 
 def emit_status(payload):
@@ -1010,6 +1078,7 @@ class AutonomousRegistryStartMixin:
     record: AutonomousTask,
     *,
     credential_handle: CredentialHandle,
+    session_log_authority: AutonomousSessionLogAuthority,
   ) -> str:
     if record.event_channel is None:
       raise RuntimeError(
@@ -1033,6 +1102,10 @@ class AutonomousRegistryStartMixin:
     if capability_bind is None:
       raise RuntimeError(
         "autonomous launch envelope requires a capability binding"
+      )
+    if type(session_log_authority) is not AutonomousSessionLogAuthority:
+      raise TypeError(
+        "autonomous launch envelope requires exact session-log authority"
       )
     if (
       type(credential_handle) is not CredentialHandle
@@ -1100,6 +1173,7 @@ class AutonomousRegistryStartMixin:
       dev_mode=False,
       max_budget_usd=record.max_budget_usd,
       deliver=record.deliver,
+      session_log_authority=session_log_authority,
     )
     control_authority = record.control_authority
     if type(control_authority) is not AutonomousControlAuthority:
@@ -1155,6 +1229,7 @@ class AutonomousRegistryStartMixin:
     approval_channel_child: AutonomousApprovalChannelChild | None = None
     claim_broker_child_fd = -1
     approval_channel_child_fd = -1
+    prepared_session_log: PreparedAutonomousSessionLog | None = None
     owner_lifeline_read_fd = -1
     owner_lifeline_write_fd = -1
     owner_lease_fd = -1
@@ -1463,16 +1538,61 @@ class AutonomousRegistryStartMixin:
       for retired_name in _RETIRED_AUTONOMOUS_CHILD_ENV_NAMES:
         env.pop(retired_name, None)
       env["PYTHONUNBUFFERED"] = "1"
+      session_log_base_dir = str(
+        env.get("AGENT_SESSION_LOG_BASE_DIR", "") or ""
+      ).strip()
+      if not session_log_base_dir:
+        raise RuntimeError(
+          "AGENT_SESSION_LOG_BASE_DIR is required for autonomous launch"
+        )
+      tenant_id = str(getattr(self, "_tenant_id", "") or "").strip()
+      if not tenant_id:
+        raise RuntimeError(
+          "tenant_id is required for autonomous session-log authority"
+        )
+      prepared_session_log = prepare_autonomous_session_log(
+        base_dir=session_log_base_dir,
+        layout=resolve_agent_session_log_layout(env),
+        tenant=tenant_id,
+        owner=record.owner_user_id or record.user_id,
+        workload_profile=record.profile,
+        provider=capability_binding.bind.provider,
+        provider_session_epoch=(
+          env.get("OPENAI_SESSION_EPOCH")
+          if capability_binding.bind.provider == "openai"
+          else None
+        ),
+        now_iso=lambda: datetime.now(timezone.utc).isoformat(),
+      )
+      env["AGENT_SESSION_LOG_BASE_DIR"] = (
+        prepared_session_log.authority.base_path
+      )
+      env[SESSION_LOG_LAYOUT_ENV] = prepared_session_log.authority.layout
+      if prepared_session_log.authority.layout == SESSION_LOG_LAYOUT_V2:
+        env[SESSION_LOG_ROOT_FD_ENV] = str(
+          prepared_session_log.root_fd
+        )
+        env[SESSION_LOG_ACTIVE_FD_ENV] = str(
+          prepared_session_log.active_fd
+        )
+        env[SESSION_LOG_META_FD_ENV] = str(
+          prepared_session_log.meta_fd
+        )
       envelope_json = self._signed_launch_envelope(
         record,
         credential_handle=(
           capability_binding.materialized_credential.handle
         ),
+        session_log_authority=prepared_session_log.authority,
       )
       verified_envelope = authority.verify_autonomous_launch_envelope(
         envelope_json
       )
       child_session = verified_envelope.session_authority.to_gateway_session()
+      child_session.autonomous_session_log_authority = (
+        verified_envelope.workload.session_log_authority
+      )
+      child_session.autonomous_session_log_location = None
       if (
         verified_envelope.task_id != record.task_id
         or verified_envelope.control_run_id
@@ -1557,6 +1677,7 @@ class AutonomousRegistryStartMixin:
                 if approval_channel_child_fd >= 0
                 else ()
               ),
+              *prepared_session_log.pass_fds,
               owner_lifeline_read_fd,
               owner_lease_fd,
             ),
@@ -1618,6 +1739,8 @@ class AutonomousRegistryStartMixin:
       ):
         if owned_fd >= 0:
           os.close(owned_fd)
+      if prepared_session_log is not None:
+        prepared_session_log.close()
       if not ownership_transferred:
         for created_path, created_device, created_inode in reversed(
           created_run_files

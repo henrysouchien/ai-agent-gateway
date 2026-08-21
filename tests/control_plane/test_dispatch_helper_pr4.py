@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -19,6 +20,10 @@ from agent_gateway.runner_introspection import (
   exception_traceback_already_logged,
   mark_exception_traceback_logged,
 )
+from agent_gateway.research_file_activity_lock import (
+  try_acquire_research_file_activity,
+)
+from agent_gateway.selected_content import SelectedContentAdmission
 from agent_gateway.server import (
   ChatMessage,
   ChatRuntime,
@@ -150,6 +155,29 @@ class _FailingRunner:
   ) -> None:
     _ = messages, system_prompt, max_turns
     raise RuntimeError("runner failed")
+
+
+class _ResearchFileLeaseRunner(_CompletingRunner):
+  def __init__(
+    self,
+    event_log: EventLog,
+    captured: dict[str, Any],
+    capability_execution: Any,
+  ) -> None:
+    super().__init__(event_log, captured, capability_execution)
+    self._research_file_activity_lease: Any | None = None
+
+  def bind_research_file_activity_lease(self, lease: Any) -> None:
+    assert self._research_file_activity_lease is None
+    self._research_file_activity_lease = lease
+
+  def release_research_file_activity_lease_if_owned(self) -> None:
+    lease, self._research_file_activity_lease = (
+      self._research_file_activity_lease,
+      None,
+    )
+    if lease is not None:
+      lease.release()
 
 
 class _MarkedFailingRunner(_FailingRunner):
@@ -435,5 +463,151 @@ def test_dispatch_chat_turn_rejects_concurrent_turn() -> None:
 
     assert exc_info.value.status_code == 409
     assert session.stream_active is True
+
+  _run(case())
+
+
+def test_dispatch_prestart_selected_content_failure_releases_research_file_lock(
+  tmp_path: Path,
+) -> None:
+  async def case() -> None:
+    session = _make_session()
+    event_log = EventLog()
+    captured: dict[str, Any] = {}
+
+    async def _build_chat_runtime(*, session, request, channel, auth_manager):
+      _ = channel, auth_manager
+      activity = try_acquire_research_file_activity(
+        tmp_path,
+        research_file_id=41,
+        exclusive=False,
+      )
+      assert activity is not None
+      assert session.active_turn is not None
+      session.active_turn.research_file_id = 41
+      session.active_turn.research_file_activity_lease = activity
+      return ChatRuntime(
+        system_prompt="system",
+        build_runner=lambda event_log, _sid, _started_at: _ResearchFileLeaseRunner(
+          event_log,
+          captured,
+          request.capability_execution,
+        ),
+        capability_execution=request.capability_execution,
+      )
+
+    async def _admit_selected_content(_session, _request):
+      return SelectedContentAdmission(bindings=(object(),))  # type: ignore[arg-type]
+
+    _configure_runtime_builder(_build_chat_runtime)
+    setattr(
+      _build_chat_runtime,
+      "_gateway_selected_content_admitter",
+      _admit_selected_content,
+    )
+
+    with pytest.raises(
+      RuntimeError,
+      match="chat runner cannot commit selected content",
+    ):
+      await _dispatch_chat_turn(
+        session,
+        ChatTurnInputs(
+          messages=[ChatMessage(role="user", content="fail before runner")],
+          request_id="request-prestart-lock",
+          context=None,
+          metadata=None,
+          model_key=None,
+        ),
+        event_log=event_log,
+        on_event=lambda _event: None,  # type: ignore[arg-type]
+        build_chat_runtime=_build_chat_runtime,
+        transcript_dir=None,
+      )
+
+    exclusive = try_acquire_research_file_activity(
+      tmp_path,
+      research_file_id=41,
+      exclusive=True,
+    )
+    assert exclusive is not None
+    exclusive.release()
+    assert "messages" not in captured
+
+  _run(case())
+
+
+def test_dispatch_prestart_activity_handoff_failure_releases_both_leases(
+  tmp_path: Path,
+) -> None:
+  async def case() -> None:
+    session = _make_session()
+    event_log = EventLog()
+    captured: dict[str, Any] = {}
+    selected_release: list[str] = []
+    selected_activity = type(
+      "SelectedActivity",
+      (),
+      {"release": lambda self: selected_release.append("released")},
+    )()
+
+    async def _build_chat_runtime(*, session, request, channel, auth_manager):
+      _ = channel, auth_manager
+      activity = try_acquire_research_file_activity(
+        tmp_path,
+        research_file_id=42,
+        exclusive=False,
+      )
+      assert activity is not None
+      assert session.active_turn is not None
+      session.active_turn.research_file_id = 42
+      session.active_turn.research_file_activity_lease = activity
+      return ChatRuntime(
+        system_prompt="system",
+        build_runner=lambda event_log, _sid, _started_at: _ResearchFileLeaseRunner(
+          event_log,
+          captured,
+          request.capability_execution,
+        ),
+        capability_execution=request.capability_execution,
+      )
+
+    async def _admit_selected_content(_session, _request):
+      return SelectedContentAdmission(activity_lease=selected_activity)
+
+    _configure_runtime_builder(_build_chat_runtime)
+    setattr(
+      _build_chat_runtime,
+      "_gateway_selected_content_admitter",
+      _admit_selected_content,
+    )
+    with pytest.raises(
+      RuntimeError,
+      match="chat runner cannot own selected content activity",
+    ):
+      await _dispatch_chat_turn(
+        session,
+        ChatTurnInputs(
+          messages=[ChatMessage(role="user", content="fail at handoff")],
+          request_id="request-activity-handoff",
+          context=None,
+          metadata=None,
+          model_key=None,
+        ),
+        event_log=event_log,
+        on_event=lambda _event: None,  # type: ignore[arg-type]
+        build_chat_runtime=_build_chat_runtime,
+        transcript_dir=None,
+      )
+
+    assert selected_release == ["released"]
+    assert "messages" not in captured
+    exclusive = try_acquire_research_file_activity(
+      tmp_path,
+      research_file_id=42,
+      exclusive=True,
+    )
+    assert exclusive is not None
+    exclusive.release()
 
   _run(case())

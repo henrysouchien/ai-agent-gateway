@@ -1429,7 +1429,15 @@ def test_autonomous_start_signs_exact_executable_workload(
     env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
   )
 
-  assert envelope.workload.receipt() == expected_workload
+  workload_receipt = envelope.workload.receipt()
+  session_log_authority = workload_receipt.pop(
+    "session_log_authority"
+  )
+  assert workload_receipt == expected_workload
+  assert session_log_authority["layout"] == "v1"
+  assert session_log_authority["base_path"] == env[
+    "AGENT_SESSION_LOG_BASE_DIR"
+  ]
 
 
 def test_autonomous_start_signs_dispatch_scope_without_unsigned_copy(

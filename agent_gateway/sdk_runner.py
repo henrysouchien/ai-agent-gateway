@@ -746,6 +746,8 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._agent_session_log = agent_session_log
     self._selected_content_bindings: tuple[SelectedContentBinding, ...] = ()
     self._selected_content_bindings_bound = False
+    self._research_file_activity_lease: Any | None = None
+    self._selected_content_activity_lease: Any | None = None
     self._approval_store = store or getattr(session, "approval_store", None)
     self._approval_policy = policy or getattr(session, "approval_policy", None)
     self._run_context = run_context
@@ -769,6 +771,32 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       raise TypeError("selected content must be an immutable binding tuple")
     self._selected_content_bindings = bindings
     self._selected_content_bindings_bound = True
+
+  def bind_research_file_activity_lease(self, lease: Any) -> None:
+    self._bind_activity_lease("_research_file_activity_lease", lease)
+
+  def bind_selected_content_activity_lease(self, lease: Any) -> None:
+    self._bind_activity_lease("_selected_content_activity_lease", lease)
+
+  def _bind_activity_lease(self, attribute: str, lease: Any) -> None:
+    if lease is None or not callable(getattr(lease, "release", None)):
+      raise TypeError("runner activity lease is invalid")
+    if getattr(self, attribute, None) is not None:
+      raise RuntimeError("runner activity lease is already bound")
+    setattr(self, attribute, lease)
+
+  def release_research_file_activity_lease_if_owned(self) -> None:
+    self._release_activity_lease("_research_file_activity_lease")
+
+  def release_selected_content_activity_lease_if_owned(self) -> None:
+    self._release_activity_lease("_selected_content_activity_lease")
+
+  def _release_activity_lease(self, attribute: str) -> None:
+    lease = getattr(self, attribute, None)
+    if lease is None:
+      return
+    setattr(self, attribute, None)
+    lease.release()
 
   @staticmethod
   def _normalize_context_surfaces(surfaces: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -1969,6 +1997,8 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
         self._stream_terminal_emitted = True
       raise
     finally:
+      self.release_research_file_activity_lease_if_owned()
+      self.release_selected_content_activity_lease_if_owned()
       clear_current_skill()
       self._active_skill_allow.clear()
       self._active_skill_deny.clear()

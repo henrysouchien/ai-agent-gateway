@@ -2482,6 +2482,67 @@ def test_admission_rejects_unsafe_existing_session_log_before_lease(
   ).exists()
 
 
+def test_admission_rejects_ancestor_symlink_without_outside_lease(
+  tmp_path: Path,
+) -> None:
+  base = tmp_path / "sessions"
+  log_path = base / "web" / "session.jsonl"
+  log_path.parent.mkdir(parents=True)
+  log_path.write_text("", encoding="utf-8")
+
+  displaced = tmp_path / "sessions.displaced"
+  base.rename(displaced)
+  outside_base = tmp_path / "outside-sessions"
+  outside_parent = outside_base / "web"
+  outside_parent.mkdir(parents=True)
+  base.symlink_to(outside_base, target_is_directory=True)
+
+  with pytest.raises(RuntimeError):
+    TopLevelSkillAdmission.acquire(log_path)
+
+  assert tuple(outside_parent.iterdir()) == ()
+
+
+@pytest.mark.parametrize("operation", ["validate", "transfer"])
+def test_admission_rejects_ancestor_rebinding_after_acquire(
+  tmp_path: Path,
+  operation: str,
+) -> None:
+  base = tmp_path / "sessions"
+  log_path = base / "web" / "session.jsonl"
+  log_path.parent.mkdir(parents=True)
+  log_path.write_text("", encoding="utf-8")
+  admission = TopLevelSkillAdmission.acquire(log_path)
+
+  displaced = tmp_path / "sessions.displaced"
+  base.rename(displaced)
+  outside_base = tmp_path / "outside-sessions"
+  outside_parent = outside_base / "web"
+  outside_parent.mkdir(parents=True)
+  displaced_log = displaced / "web" / log_path.name
+  displaced_lease = displaced_log.with_name(
+    f"{displaced_log.name}.write_lease"
+  )
+  displaced_log.rename(outside_parent / displaced_log.name)
+  displaced_lease.rename(outside_parent / displaced_lease.name)
+  base.symlink_to(outside_base, target_is_directory=True)
+
+  try:
+    with pytest.raises(RuntimeError):
+      if operation == "validate":
+        admission.validate_fence()
+      else:
+        admission.transfer(
+          log_path=log_path,
+          write_lease_path=log_path.with_name(
+            f"{log_path.name}.write_lease"
+          ),
+        )
+    assert admission.state == "held"
+  finally:
+    admission.release()
+
+
 @pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink", "writable"])
 def test_admission_rejects_unsafe_existing_lease_without_repair(
   tmp_path: Path,

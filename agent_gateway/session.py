@@ -145,6 +145,9 @@ class SessionStream:
 
   event_log: EventLog
   runner_task: asyncio.Task[Any] | None
+  research_file_id: int | None = None
+  research_file_activity_lease: Any | None = field(default=None, repr=False)
+  runtime_owner: Any | None = field(default=None, repr=False)
   subscribers: Dict[str, StreamSubscriber] = field(default_factory=dict)
   transcript_written_seqs: set[int] = field(default_factory=set)
   cleanup_handle: asyncio.TimerHandle | None = None

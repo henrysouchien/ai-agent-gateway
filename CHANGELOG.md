@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.17.2 (2026-08-20)
+
+### Fixed
+
+- Private-document erasure now invalidates the affected current session-log
+  projections without deleting durable history or crossing owner boundaries.
+- Autonomous canonical session logs can use a signed, descriptor-bound v2
+  stream directory whose exact root is admitted to the child Landlock policy;
+  the temporary `AGENT_SESSION_LOG_LAYOUT` choice remains `v1` in production
+  until the v2 cutover is separately validated.
+- Error-signal, telemetry, retention, workflow-erasure, and current-projection
+  consumers now share descriptor-bound session-log inventory and fail closed on
+  ambiguous metadata instead of following untrusted paths.
+
+### Changed
+
+- Added the dependency-neutral immutable operation-catalog projection used by
+  new Gateway admissions; persisted execution snapshots remain authoritative
+  for retry and resume.
+
 ## 0.17.1 (2026-08-20)
 
 ### Fixed

@@ -123,6 +123,8 @@ async def persist_skill_state(
   *,
   agent_name: str | None,
   profile: Any | None,
+  persist_state: bool | None = None,
+  operation_version: str | None = None,
   skill_state_store: Any | None,
   skill_state_lock: Any,
   effective_model: str,
@@ -130,8 +132,18 @@ async def persist_skill_state(
   result_response_text_fn: Any = result_response_text,
   logger: Any,
 ) -> None:
-  if not (agent_name and profile is not None and profile.persist_state and skill_state_store is not None):
+  resolved_persist_state = (
+    persist_state
+    if persist_state is not None
+    else bool(profile is not None and profile.persist_state)
+  )
+  if not (agent_name and resolved_persist_state and skill_state_store is not None):
     return
+  resolved_version = (
+    operation_version
+    if operation_version is not None
+    else getattr(profile, "version", None)
+  )
   classification = classify_child_outcome(result, error)
   model_state: dict[str, Any] = {}
   if classification.succeeded:
@@ -139,7 +151,11 @@ async def persist_skill_state(
     try:
       model_state = extract_state_update_fn(response_text)
     except Exception:
-      logger.warning("Failed to extract state update for skill %s", profile.name, exc_info=True)
+      logger.warning(
+        "Failed to extract state update for skill %s",
+        agent_name,
+        exc_info=True,
+      )
   async with skill_state_lock:
     try:
       def _mutate(
@@ -175,8 +191,8 @@ async def persist_skill_state(
           + 1
         )
         next_state["outcome_counts"] = outcome_counts
-        if profile.version is not None:
-          next_state["version"] = profile.version
+        if resolved_version is not None:
+          next_state["version"] = resolved_version
         if classification.error is not None:
           next_state["last_error"] = dict(
             classification.error
@@ -185,9 +201,13 @@ async def persist_skill_state(
           next_state.pop("last_error", None)
         return next_state
 
-      skill_state_store.update(profile.name, _mutate)
+      skill_state_store.update(agent_name, _mutate)
     except Exception:
-      logger.warning("Failed to persist state for skill %s", profile.name, exc_info=True)
+      logger.warning(
+        "Failed to persist state for skill %s",
+        agent_name,
+        exc_info=True,
+      )
 
 
 __all__ = [
