@@ -1329,6 +1329,13 @@ class AutonomousRegistryStartMixin:
           resumed_record.owner_user_id or resumed_record.user_id
         ) != normalized_owner_user_id:
           raise PermissionError("resumed autonomous run owner does not match launch owner")
+        if (
+          normalized_mode != resumed_record.mode
+          or normalized_skill != resumed_record.skill
+        ):
+          raise ValueError(
+            "resumed autonomous run mode and skill must match the origin"
+          )
         self._require_released_owner_lease(resumed_record)
         normalized_pack = resumed_record.pack
         normalized_deliver = resumed_record.deliver
@@ -1343,6 +1350,14 @@ class AutonomousRegistryStartMixin:
         context=context,
         ticker=ticker,
         max_budget_usd=normalized_max_budget_usd,
+      )
+      skill_resume_allowed = (
+        resumed_record.skill_resume_allowed
+        if resumed_record is not None
+        else self._resolve_initial_skill_resume_allowed(
+          mode=normalized_mode,
+          skill=normalized_skill,
+        )
       )
       os_module = _runtime_attr("os", os)
 
@@ -1497,6 +1512,7 @@ class AutonomousRegistryStartMixin:
         owner_lease_device=owner_lease_stat.st_dev,
         owner_lease_inode=owner_lease_stat.st_ino,
         started_at=time_module.time(),
+        skill_resume_allowed=skill_resume_allowed,
         max_budget_usd=normalized_max_budget_usd,
         state="starting",
         log_handle=log_handle,

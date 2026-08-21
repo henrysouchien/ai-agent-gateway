@@ -376,6 +376,7 @@ def _write_rehydrate_manifest(
     mode=mode,
     task=None if mode == "skill" else "summarize",
     skill=skill,
+    skill_resume_allowed=(mode == "skill" and skill == "resumable-skill"),
     context=context,
     channel=channel,
     cmd=[sys.executable, "-m", "agent.autonomous", "--profile", "analyst"],
@@ -1867,6 +1868,140 @@ def test_autonomous_resume_starts_linked_run_for_resumable_interrupted_skill(mon
     assert "resume from the latest safe point" in resumed_record.context
     assert "tighten scope" in resumed_record.context
     assert "prior log line" in resumed_record.context
+
+
+def test_frozen_true_resume_fact_survives_source_deletion_and_control_reads(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  processes, _envs = _install_fake_spawn(monkeypatch)
+  skills_dir = tmp_path / "skills"
+  _write_resumable_skill(skills_dir)
+  app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice", email="alice@example.com")
+    started = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "skill",
+        "skill": "resumable-skill",
+      },
+    )
+    assert started.status_code == 200, started.text
+    original = app.state.subprocess_registry._tasks["bg_0"]
+    assert original.skill_resume_allowed is True
+    original.state = "interrupted"
+    original.completed_at = time.time()
+    processes[0].returncode = 1
+    skill_path = skills_dir / "resumable-skill.md"
+    skill_path.write_text(
+      skill_path.read_text(encoding="utf-8").replace(
+        "resumable: true",
+        "resumable: false",
+      ),
+      encoding="utf-8",
+    )
+    app.state.subprocess_registry._skill_resume_allowed_resolver = (
+      lambda _skill: (_ for _ in ()).throw(
+        AssertionError("control and resume must not consult current source")
+      )
+    )
+
+    detail = client.get("/api/control/runs/bg_0", headers=_headers(alice))
+    skill_path.unlink()
+    deleted_detail = client.get(
+      "/api/control/runs/bg_0",
+      headers=_headers(alice),
+    )
+    listing = client.get("/api/control/runs", headers=_headers(alice))
+    message = client.post(
+      "/api/control/runs/bg_0/messages",
+      headers=_headers(alice),
+      json={"message": "continue", "message_id": "frozen-message"},
+    )
+    resumed = client.post(
+      "/api/control/runs/bg_0/resume",
+      headers=_headers(alice),
+      json={},
+    )
+
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["resumable"] is True
+    assert deleted_detail.status_code == 200, deleted_detail.text
+    assert deleted_detail.json()["resumable"] is True
+    assert listing.status_code == 200, listing.text
+    assert next(
+      item for item in listing.json()["runs"] if item["run_id"] == "bg_0"
+    )["resumable"] is True
+    assert message.status_code == 409, message.text
+    assert resumed.status_code == 200, resumed.text
+    successor = app.state.subprocess_registry._tasks["bg_1"]
+    assert successor.skill_resume_allowed is True
+    cancelled = client.delete(
+      "/api/control/runs/bg_1",
+      headers=_headers(alice),
+    )
+    assert cancelled.status_code == 200, cancelled.text
+
+
+def test_frozen_false_resume_fact_survives_later_source_promotion(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  processes, _envs = _install_fake_spawn(monkeypatch)
+  skills_dir = tmp_path / "skills"
+  _write_resumable_skill(skills_dir)
+  skill_path = skills_dir / "resumable-skill.md"
+  skill_path.write_text(
+    skill_path.read_text(encoding="utf-8").replace(
+      "resumable: true",
+      "resumable: false",
+    ),
+    encoding="utf-8",
+  )
+  app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
+
+  with TestClient(app) as client:
+    alice = _control_session(client, "alice", email="alice@example.com")
+    started = client.post(
+      "/api/control/runs",
+      headers=_headers(alice),
+      json={
+        "kind": "autonomous",
+        "profile": "analyst",
+        "mode": "skill",
+        "skill": "resumable-skill",
+      },
+    )
+    assert started.status_code == 200, started.text
+    original = app.state.subprocess_registry._tasks["bg_0"]
+    assert original.skill_resume_allowed is False
+    original.state = "interrupted"
+    original.completed_at = time.time()
+    processes[0].returncode = 1
+    skill_path.write_text(
+      skill_path.read_text(encoding="utf-8").replace(
+        "resumable: false",
+        "resumable: true",
+      ),
+      encoding="utf-8",
+    )
+
+    detail = client.get("/api/control/runs/bg_0", headers=_headers(alice))
+    resumed = client.post(
+      "/api/control/runs/bg_0/resume",
+      headers=_headers(alice),
+      json={},
+    )
+
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["resumable"] is False
+    assert resumed.status_code == 409, resumed.text
+    assert resumed.json()["detail"] == "Autonomous run is not resumable"
 
 
 def test_autonomous_resume_allows_only_one_active_replacement(monkeypatch, tmp_path) -> None:

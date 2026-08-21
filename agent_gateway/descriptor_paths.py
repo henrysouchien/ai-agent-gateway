@@ -23,7 +23,13 @@ def open_directory_chain(
   *,
   create: bool = False,
 ) -> tuple[int, DirectoryIdentity]:
-  """Open every absolute directory component relative to its verified parent."""
+  """Open an absolute directory through its verified descriptor chain.
+
+  On Linux, ancestors are lookup-only ``O_PATH`` descriptors.  The exact
+  target remains a readable directory descriptor, preserving the public fd
+  contract without requiring Landlock ``READ_DIR`` access to its ancestors.
+  Platforms without ``O_PATH`` retain the readable-directory walk.
+  """
 
   if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
     raise DirectoryChainSecurityError(
@@ -32,21 +38,34 @@ def open_directory_chain(
   path = absolute_lexical_path(raw_path)
   if not path.is_absolute():  # pragma: no cover - abspath guarantees this
     raise DirectoryChainSecurityError("directory path is not absolute")
-  flags = (
+  readable_flags = (
     os.O_RDONLY
     | os.O_DIRECTORY
     | os.O_NOFOLLOW
     | getattr(os, "O_CLOEXEC", 0)
   )
+  path_only = getattr(os, "O_PATH", None)
+  ancestor_flags = (
+    path_only
+    | os.O_DIRECTORY
+    | os.O_NOFOLLOW
+    | getattr(os, "O_CLOEXEC", 0)
+    if type(path_only) is int and path_only != 0
+    else readable_flags
+  )
+  components = path.parts[1:]
   current_descriptor = -1
   try:
-    current_descriptor = os.open(os.sep, flags)
+    current_descriptor = os.open(
+      os.sep,
+      readable_flags if not components else ancestor_flags,
+    )
     identities: list[tuple[int, int]] = []
     root_info = os.fstat(current_descriptor)
     if not stat.S_ISDIR(root_info.st_mode):  # pragma: no cover - POSIX root
       raise DirectoryChainSecurityError("filesystem root is unsafe")
     identities.append((root_info.st_dev, root_info.st_ino))
-    for component in path.parts[1:]:
+    for index, component in enumerate(components):
       try:
         named = os.stat(
           component,
@@ -73,7 +92,11 @@ def open_directory_chain(
       try:
         next_descriptor = os.open(
           component,
-          flags,
+          (
+            readable_flags
+            if index == len(components) - 1
+            else ancestor_flags
+          ),
           dir_fd=current_descriptor,
         )
         opened = os.fstat(next_descriptor)

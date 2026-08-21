@@ -84,6 +84,7 @@ def write_v6_manifest(
     "skill": "earnings-review",
     "pack": None,
     "deliver": True,
+    "skill_resume_allowed": False,
     "context": "Original work packet",
     "ticker": "MSFT",
     "channel": "tui",

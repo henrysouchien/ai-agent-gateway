@@ -87,6 +87,8 @@ _AUTONOMOUS_PROFILE_NAME_RE = _runner_commands._AUTONOMOUS_PROFILE_NAME_RE
 _LOGGER = logging.getLogger(__name__)
 _APPROVAL_DECISION_AUTONOMOUS_STATES = {"running", "approval_pending", "remediating"}
 
+SkillResumeAllowedResolver = Callable[[str], bool]
+
 
 def _required_control_text(
   value: Any,
@@ -250,6 +252,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     autonomous_capability_binding_resolver: (
       AutonomousCapabilityBindingResolver | None
     ) = None,
+    skill_resume_allowed_resolver: SkillResumeAllowedResolver | None = None,
     claim_signing_authority: (
       GatewayClaimSigningAuthority | None
     ) = None,
@@ -282,6 +285,12 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     self._autonomous_capability_binding_resolver = (
       autonomous_capability_binding_resolver
     )
+    if (
+      skill_resume_allowed_resolver is not None
+      and not callable(skill_resume_allowed_resolver)
+    ):
+      raise TypeError("skill_resume_allowed_resolver must be callable or None")
+    self._skill_resume_allowed_resolver = skill_resume_allowed_resolver
     if (
       claim_signing_authority is not None
       and type(claim_signing_authority)

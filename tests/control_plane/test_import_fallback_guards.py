@@ -9,7 +9,6 @@ from typing import Any, Callable
 import pytest
 
 from agent_gateway.control_plane import batches as batches_module
-from agent_gateway.control_plane import runs_helpers as runs_helpers_module
 from agent_gateway.control_plane import skills as skills_module
 from agent_gateway.control_plane import valuation_ready_tools as valuation_ready_tools_module
 
@@ -22,7 +21,6 @@ BROAD_API_FALLBACK_RE = re.compile(r"except ModuleNotFoundError:\s*\n\s+from api
   ("call_factory", "primary_name", "fallback_name"),
   [
     (lambda: skills_module._loader_api, "agent.skills", "api.agent.skills"),
-    (lambda: runs_helpers_module._loader_api, "agent.skills", "api.agent.skills"),
     (
       lambda: valuation_ready_tools_module._valuation_ready_defaults,
       "agent.skills.diligence_tracks",

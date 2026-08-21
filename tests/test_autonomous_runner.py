@@ -509,7 +509,12 @@ class ManifestObservingEventBus(RecordingEventBus):
     ))
 
 
-def _registry(tmp_path: Path, *, approval_store=None):
+def _registry(
+  tmp_path: Path,
+  *,
+  approval_store=None,
+  skill_resume_allowed_resolver=lambda _skill: False,
+):
   from agent_gateway.autonomous_runner import AutonomousRegistry
   from agent_gateway.claim_signing_authority import (
     GatewayClaimSigningAuthority,
@@ -525,6 +530,7 @@ def _registry(tmp_path: Path, *, approval_store=None):
       "anthropic": _test_service_credential_handle(),
     },
     autonomous_capability_binding_resolver=_test_autonomous_capability_binding,
+    skill_resume_allowed_resolver=skill_resume_allowed_resolver,
     claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
     approval_store=approval_store,
   )
@@ -1068,6 +1074,16 @@ def _write_manifest(tmp_path: Path, task_id: str = "bg_0", **overrides) -> dict:
   }
   manifest_overrides.update(overrides)
   return write_v6_manifest(tmp_path, task_id, **manifest_overrides)
+
+
+def _replace_manifest_payload(
+  tmp_path: Path,
+  manifest: dict,
+  task_id: str = "bg_0",
+) -> bytes:
+  encoded = (json.dumps(manifest, sort_keys=True) + "\n").encode("utf-8")
+  _manifest_path(tmp_path, task_id).write_bytes(encoded)
+  return encoded
 
 
 def _write_run_files(tmp_path: Path, task_id: str) -> None:
@@ -1747,6 +1763,490 @@ def test_autonomous_v7_manifest_without_containment_expectation_loads(
   registry = _registry(tmp_path)
 
   assert registry._tasks["bg_0"].manifest_version == 7
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+def test_missing_v7_skill_resume_fact_is_resolved_once_and_frozen(
+  tmp_path,
+  resolved,
+) -> None:
+  manifest = _write_manifest(tmp_path, skill="legacy-skill")
+  manifest.pop("skill_resume_allowed")
+  _replace_manifest_payload(tmp_path, manifest)
+  calls: list[str] = []
+
+  def resolver(skill: str) -> bool:
+    calls.append(skill)
+    return resolved
+
+  registry = _registry(
+    tmp_path,
+    skill_resume_allowed_resolver=resolver,
+  )
+
+  assert calls == ["legacy-skill"]
+  assert registry._tasks["bg_0"].skill_resume_allowed is resolved
+  assert _read_manifest(tmp_path)["skill_resume_allowed"] is resolved
+
+  second = _registry(
+    tmp_path,
+    skill_resume_allowed_resolver=lambda _skill: (_ for _ in ()).throw(
+      AssertionError("frozen manifest must not resolve source again")
+    ),
+  )
+  assert second._tasks["bg_0"].skill_resume_allowed is resolved
+
+
+def test_noncanonical_manifest_filename_cannot_resolve_or_overwrite_task(
+  tmp_path,
+) -> None:
+  _write_manifest(tmp_path, "bg_0", skill_resume_allowed=False)
+  original_bytes = _manifest_path(tmp_path, "bg_0").read_bytes()
+  misplaced = _write_manifest(
+    tmp_path,
+    "bg_1",
+    skill="legacy-skill",
+  )
+  misplaced["task_id"] = "bg_0"
+  misplaced["session_id"] = "bg_0"
+  misplaced.pop("skill_resume_allowed")
+  _replace_manifest_payload(tmp_path, misplaced, "bg_1")
+  calls: list[str] = []
+
+  registry = _registry(
+    tmp_path,
+    skill_resume_allowed_resolver=lambda skill: calls.append(skill) or True,
+  )
+
+  assert calls == []
+  assert set(registry._tasks) == {"bg_0"}
+  assert _manifest_path(tmp_path, "bg_0").read_bytes() == original_bytes
+  assert "skill_resume_allowed" not in _read_manifest(tmp_path, "bg_1")
+
+
+def test_missing_v7_non_skill_resume_fact_freezes_false_without_resolver(
+  tmp_path,
+) -> None:
+  manifest = _write_manifest(
+    tmp_path,
+    mode="task",
+    task="summarize",
+    skill=None,
+  )
+  manifest.pop("skill_resume_allowed")
+  _replace_manifest_payload(tmp_path, manifest)
+
+  registry = _registry(
+    tmp_path,
+    skill_resume_allowed_resolver=lambda _skill: (_ for _ in ()).throw(
+      AssertionError("non-skill migration must not resolve source")
+    ),
+  )
+
+  assert registry._tasks["bg_0"].skill_resume_allowed is False
+  assert _read_manifest(tmp_path)["skill_resume_allowed"] is False
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
+def test_present_v7_skill_resume_fact_requires_exact_bool(
+  tmp_path,
+  value,
+) -> None:
+  _write_manifest(tmp_path, skill_resume_allowed=value)
+
+  registry = _registry(
+    tmp_path,
+    skill_resume_allowed_resolver=lambda _skill: (_ for _ in ()).throw(
+      AssertionError("present malformed fact must not be rederived")
+    ),
+  )
+
+  assert registry._tasks == {}
+
+
+def test_present_v7_non_skill_true_resume_fact_is_rejected(tmp_path) -> None:
+  _write_manifest(
+    tmp_path,
+    mode="task",
+    task="summarize",
+    skill=None,
+    skill_resume_allowed=True,
+  )
+
+  assert _registry(tmp_path)._tasks == {}
+
+
+def test_missing_v7_resume_freeze_pre_replace_failure_preserves_old_bytes(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner_state
+
+  manifest = _write_manifest(tmp_path, skill="legacy-skill")
+  manifest.pop("skill_resume_allowed")
+  old_bytes = _replace_manifest_payload(tmp_path, manifest)
+
+  def fail_replace(_source: Path, _destination: Path) -> None:
+    raise OSError("injected pre-replace failure")
+
+  monkeypatch.setattr(autonomous_runner_state, "_os_replace", fail_replace)
+
+  with pytest.raises(
+    RuntimeError,
+    match="failed to persist autonomous skill resume compatibility fact",
+  ):
+    _registry(tmp_path, skill_resume_allowed_resolver=lambda _skill: True)
+
+  assert _manifest_path(tmp_path).read_bytes() == old_bytes
+
+
+def test_missing_v7_resume_resolver_failure_preserves_old_bytes(
+  tmp_path,
+) -> None:
+  manifest = _write_manifest(tmp_path, skill="legacy-skill")
+  manifest.pop("skill_resume_allowed")
+  old_bytes = _replace_manifest_payload(tmp_path, manifest)
+
+  with pytest.raises(RuntimeError, match="unexpected resolver failure"):
+    _registry(
+      tmp_path,
+      skill_resume_allowed_resolver=lambda _skill: (_ for _ in ()).throw(
+        RuntimeError("unexpected resolver failure")
+      ),
+    )
+
+  assert _manifest_path(tmp_path).read_bytes() == old_bytes
+
+
+def test_missing_v7_resume_freeze_post_replace_failure_aborts_then_rehydrates(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner_state
+
+  manifest = _write_manifest(tmp_path, skill="legacy-skill")
+  manifest.pop("skill_resume_allowed")
+  _replace_manifest_payload(tmp_path, manifest)
+  original_fsync = autonomous_runner_state.os.fsync
+
+  def fail_directory_fsync(fd: int) -> None:
+    if stat.S_ISDIR(os.fstat(fd).st_mode):
+      raise OSError("injected post-replace directory fsync failure")
+    original_fsync(fd)
+
+  monkeypatch.setattr(
+    autonomous_runner_state.os,
+    "fsync",
+    fail_directory_fsync,
+  )
+  with pytest.raises(
+    RuntimeError,
+    match="failed to persist autonomous skill resume compatibility fact",
+  ):
+    _registry(tmp_path, skill_resume_allowed_resolver=lambda _skill: True)
+
+  assert _read_manifest(tmp_path)["skill_resume_allowed"] is True
+  monkeypatch.setattr(autonomous_runner_state.os, "fsync", original_fsync)
+  registry = _registry(
+    tmp_path,
+    skill_resume_allowed_resolver=lambda _skill: (_ for _ in ()).throw(
+      AssertionError("complete replacement must be idempotent")
+    ),
+  )
+  assert registry._tasks["bg_0"].skill_resume_allowed is True
+
+
+@pytest.mark.parametrize("state", ["completed", "running"])
+def test_missing_v7_resume_freeze_refuses_active_prior_owner(
+  tmp_path,
+  state,
+) -> None:
+  manifest = _write_manifest(
+    tmp_path,
+    skill="legacy-skill",
+    state=state,
+    exit_code=None if state == "running" else 0,
+    completed_at=None if state == "running" else 125.0,
+  )
+  manifest.pop("skill_resume_allowed")
+  old_bytes = _replace_manifest_payload(tmp_path, manifest)
+  lease_fd = os.open(manifest["owner_lease_path"], os.O_RDONLY)
+  fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+  calls: list[str] = []
+  try:
+    with pytest.raises(RuntimeError, match="prior owner is active"):
+      _registry(
+        tmp_path,
+        skill_resume_allowed_resolver=lambda skill: calls.append(skill) or True,
+      )
+  finally:
+    os.close(lease_fd)
+
+  assert calls == []
+  assert _manifest_path(tmp_path).read_bytes() == old_bytes
+
+
+def test_gateway_generic_legacy_resume_resolver_preserves_source_semantics(
+  tmp_path,
+) -> None:
+  from agent_gateway.server import _generic_skill_resume_allowed_resolver
+
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  (skills_dir / "read-only.md").write_text(
+    """---
+name: read-only
+description: Read-only resumable work
+resumable: true
+mutation_mode: read_only
+catalog: false
+---
+Resume the read-only work.
+""",
+    encoding="utf-8",
+  )
+  (skills_dir / "writer.md").write_text(
+    """---
+name: writer
+description: Writer work
+resumable: true
+mutation_mode: model_writer
+---
+Do writer work.
+""",
+    encoding="utf-8",
+  )
+  (skills_dir / "malformed.md").write_text(
+    "---\nname: malformed\nresumable: []\n---\nMalformed policy.\n",
+    encoding="utf-8",
+  )
+  resolver = _generic_skill_resume_allowed_resolver(skills_dir)
+
+  assert resolver("read-only") is True
+  assert resolver("writer") is False
+  assert resolver("missing") is False
+  assert resolver("malformed") is False
+
+
+def test_effective_resume_projection_preserves_dynamic_narrowing_order(
+  tmp_path,
+) -> None:
+  from agent_gateway.control_plane.runs_helpers import (
+    _autonomous_task_resumable,
+  )
+
+  _write_manifest(
+    tmp_path,
+    state="interrupted",
+    skill="frozen-skill",
+    skill_resume_allowed=True,
+  )
+  record = _registry(tmp_path)._tasks["bg_0"]
+  capability_bind = record.capability_bind
+  assert _autonomous_task_resumable(record) is True
+
+  record.capability_bind = None
+  assert _autonomous_task_resumable(record) is False
+  record.capability_bind = capability_bind
+  record.mode = "task"
+  assert _autonomous_task_resumable(record) is False
+  record.mode = "skill"
+  record.state = "running"
+  assert _autonomous_task_resumable(record) is False
+  record.state = "interrupted"
+  record.skill_resume_allowed = False
+  assert _autonomous_task_resumable(record) is False
+
+
+@pytest.mark.parametrize("schedule_id", [None, "schedule-1"])
+def test_initial_direct_and_scheduled_skill_starts_freeze_resolver_fact(
+  monkeypatch,
+  tmp_path,
+  schedule_id,
+) -> None:
+  from agent_gateway import autonomous_runner
+
+  async def fake_exec(*_args, **_kwargs):
+    return FakeProcess()
+
+  calls: list[str] = []
+  monkeypatch.setattr(
+    autonomous_runner.asyncio,
+    "create_subprocess_exec",
+    fake_exec,
+  )
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+  registry = _registry(
+    tmp_path,
+    skill_resume_allowed_resolver=lambda skill: calls.append(skill) or True,
+  )
+
+  async def run_case() -> None:
+    payload = await registry.start(
+      role="owner",
+      profile="analyst",
+      mode="skill",
+      skill="frozen-skill",
+      user_id=USER_ID,
+      user_email=USER_EMAIL,
+      schedule_id=schedule_id,
+    )
+    try:
+      record = registry._tasks[payload["task_id"]]
+      assert record.skill_resume_allowed is True
+      assert _read_manifest(tmp_path, record.task_id)[
+        "skill_resume_allowed"
+      ] is True
+      assert record.capability_bind is not None
+      assert record.capability_bind.run_mode == (
+        "cron" if schedule_id is not None else "autonomous"
+      )
+    finally:
+      await registry.cancel(payload["task_id"])
+      await registry.shutdown(grace_sec=0.1)
+
+  asyncio.run(run_case())
+  assert calls == ["frozen-skill"]
+
+
+def test_invalid_skill_launch_shape_fails_before_resume_policy_resolution(
+  tmp_path,
+) -> None:
+  calls: list[str] = []
+  registry = _registry(
+    tmp_path,
+    skill_resume_allowed_resolver=lambda skill: calls.append(skill) or True,
+  )
+
+  with pytest.raises(ValueError, match="mode='skill' does not accept task"):
+    asyncio.run(
+      registry.start(
+        role="owner",
+        profile="analyst",
+        mode="skill",
+        skill="frozen-skill",
+        task="invalid extra task",
+        user_id=USER_ID,
+        user_email=USER_EMAIL,
+      )
+    )
+
+  assert calls == []
+
+
+def test_resumed_start_inherits_frozen_resume_fact_without_source_resolution(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway import autonomous_runner
+
+  async def fake_exec(*_args, **_kwargs):
+    return FakeProcess()
+
+  _write_manifest(
+    tmp_path,
+    control_run_id="original-run",
+    state="interrupted",
+    skill="frozen-skill",
+    skill_resume_allowed=True,
+  )
+  monkeypatch.setattr(
+    autonomous_runner.asyncio,
+    "create_subprocess_exec",
+    fake_exec,
+  )
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+  registry = _registry(
+    tmp_path,
+    skill_resume_allowed_resolver=lambda _skill: (_ for _ in ()).throw(
+      AssertionError("resume must inherit rather than resolve current source")
+    ),
+  )
+
+  async def run_case() -> None:
+    payload = await registry.start(
+      role="owner",
+      profile="analyst",
+      mode="skill",
+      skill="frozen-skill",
+      user_id=USER_ID,
+      user_email=USER_EMAIL,
+      resumed_from="original-run",
+    )
+    try:
+      resumed = registry._tasks[payload["task_id"]]
+      assert resumed.skill_resume_allowed is True
+      assert _read_manifest(tmp_path, resumed.task_id)[
+        "skill_resume_allowed"
+      ] is True
+    finally:
+      await registry.cancel(payload["task_id"])
+      await registry.shutdown(grace_sec=0.1)
+
+  asyncio.run(run_case())
+
+
+@pytest.mark.parametrize(
+  "resume_overrides",
+  [
+    {"mode": "skill", "skill": "different-skill"},
+    {"mode": "task", "skill": None, "task": "different task"},
+  ],
+)
+def test_resumed_start_refuses_changed_mode_or_skill_before_side_effects(
+  monkeypatch,
+  tmp_path,
+  resume_overrides,
+) -> None:
+  from agent_gateway import autonomous_runner
+
+  resolver_calls: list[str] = []
+  spawn_calls: list[bool] = []
+
+  async def fail_spawn(*_args, **_kwargs):
+    spawn_calls.append(True)
+    raise AssertionError("mismatched resume must not spawn")
+
+  _write_manifest(
+    tmp_path,
+    control_run_id="original-run",
+    state="interrupted",
+    skill="frozen-skill",
+    skill_resume_allowed=True,
+  )
+  monkeypatch.setattr(
+    autonomous_runner.asyncio,
+    "create_subprocess_exec",
+    fail_spawn,
+  )
+  registry = _registry(
+    tmp_path,
+    skill_resume_allowed_resolver=(
+      lambda skill: resolver_calls.append(skill) or True
+    ),
+  )
+
+  with pytest.raises(
+    ValueError,
+    match="mode and skill must match the origin",
+  ):
+    asyncio.run(
+      registry.start(
+        role="owner",
+        profile="analyst",
+        mode=resume_overrides["mode"],
+        skill=resume_overrides.get("skill"),
+        task=resume_overrides.get("task"),
+        user_id=USER_ID,
+        user_email=USER_EMAIL,
+        resumed_from="original-run",
+      )
+    )
+
+  assert resolver_calls == []
+  assert spawn_calls == []
+  assert set(registry._tasks) == {"bg_0"}
+  assert not _manifest_path(tmp_path, "bg_1").exists()
 
 
 def test_autonomous_v7_manifest_round_trips_invite_role(tmp_path) -> None:
@@ -2556,7 +3056,8 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "task",
         "skill",
         "pack",
-        "deliver",
+          "deliver",
+          "skill_resume_allowed",
         "context",
         "ticker",
         "channel",
@@ -2607,6 +3108,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       assert manifest["skill"] == "risk.scan"
       assert manifest["pack"] is None
       assert manifest["deliver"] is True
+      assert manifest["skill_resume_allowed"] is False
       assert manifest["context"] == "inspect current book"
       assert manifest["ticker"] == "MSFT"
       assert manifest["channel"] == "tui"

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
@@ -71,8 +70,6 @@ from .runs_helpers import (  # noqa: F401
   _autonomous_pending_approval_events,
   _autonomous_pending_entry_from_event,
   _deny_autonomous_pending_approvals_for_cancel,
-  _loader_api,
-  _skill_is_resumable,
   _autonomous_task_resumable,
   _autonomous_task_messageable,
   _autonomous_run_from_task,
@@ -130,11 +127,9 @@ def build_runs_router(
   *,
   auth: AuthManager,
   autonomous_registry: AutonomousRegistry | None = None,
-  skills_dir: Path | None = None,
   dispatch_scope_validator: Any | None = None,
 ) -> APIRouter:
   router = APIRouter(prefix="/runs")
-  skills_root = Path(skills_dir) if skills_dir is not None else None
 
   def _dispatch_scope_payload(scope: DispatchScope | None) -> dict[str, Any] | None:
     if scope is None:
@@ -323,7 +318,7 @@ def build_runs_router(
       status_code = 429 if "concurrency limit" in detail.lower() else 409
       raise HTTPException(status_code=status_code, detail=detail) from exc
     record = _autonomous_task_for_user(registry, str(start_payload["task_id"]), owner_user_id)
-    run = _autonomous_run_from_task(record, skills_dir=skills_root)
+    run = _autonomous_run_from_task(record)
     return AutonomousDispatchResponse(
       run=run,
       task_id=record.task_id,
@@ -371,7 +366,7 @@ def build_runs_router(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
           return RunEnvelopeResponse(
-            run=_autonomous_run_from_task(record, skills_dir=skills_root),
+            run=_autonomous_run_from_task(record),
             message_id=str(delivery.get("message_id") or ""),
             delivery_status=delivery.get("delivery_status"),  # type: ignore[arg-type]
           )
@@ -441,12 +436,12 @@ def build_runs_router(
     _require_autonomous_channel(record, authenticated.channel)
 
     async with record.resume_lock, registry.run_mutation_lock:
-      if not _autonomous_task_resumable(record, skills_root):
+      if not _autonomous_task_resumable(record):
         raise HTTPException(status_code=409, detail="Autonomous run is not resumable")
 
       for resumed_run_id in reversed(record.resumed_as):
         resumed_record = registry._find_by_control_run_id(resumed_run_id)
-        resumed_state = _autonomous_run_from_task(resumed_record, skills_dir=skills_root).state if resumed_record is not None else None
+        resumed_state = _autonomous_run_from_task(resumed_record).state if resumed_record is not None else None
         if is_control_run_active_state(resumed_state):
           raise HTTPException(status_code=409, detail="Autonomous run already has an active resume")
 
@@ -503,7 +498,7 @@ def build_runs_router(
       await registry._record_and_publish_event(resumed_record, resumed_event)
 
       return AutonomousDispatchResponse(
-        run=_autonomous_run_from_task(resumed_record, skills_dir=skills_root),
+        run=_autonomous_run_from_task(resumed_record),
         task_id=resumed_record.task_id,
         run_id=resumed_record.control_run_id,
         log_path=str(resumed_record.log_path),
@@ -539,7 +534,7 @@ def build_runs_router(
       )
     if kind in {None, "autonomous"} and autonomous_registry is not None:
       runs.extend(
-        _autonomous_run_from_task(record, skills_dir=skills_root)
+        _autonomous_run_from_task(record)
         for record in autonomous_registry._tasks.values()
         if _record_owner_user_id(record) == owner_user_id and _run_channel_matches(record.channel, authenticated.channel)
       )
@@ -559,7 +554,7 @@ def build_runs_router(
     ):
       record = _autonomous_task_for_user(autonomous_registry, control_run_id, owner_user_id)
       _require_autonomous_channel(record, authenticated.channel)
-      return _autonomous_run_from_task(record, skills_dir=skills_root)
+      return _autonomous_run_from_task(record)
     session = _chat_session_for_user(auth, control_run_id, owner_user_id)
     _require_run_channel(session.channel, authenticated.channel)
     return _chat_run_from_session(session)
@@ -679,7 +674,7 @@ def build_runs_router(
           ),
         },
       ) from approval_error
-    return _autonomous_run_from_task(record, skills_dir=skills_root)
+    return _autonomous_run_from_task(record)
 
   return router
 

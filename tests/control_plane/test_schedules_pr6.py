@@ -1115,6 +1115,7 @@ def test_web_agent_run_schedule_crud_is_safe_and_owner_scoped(fake_schedule_back
           owner_lease_device=manifest["owner_lease_device"],
           owner_lease_inode=manifest["owner_lease_inode"],
           started_at=1_700_000_000.0,
+          skill_resume_allowed=False,
           owner_user_id=kwargs.get("owner_user_id"),
           raw_user_id=str(kwargs["user_id"]),
           user_slug=kwargs.get("user_slug"),

@@ -100,6 +100,9 @@ DispatchScopeValidator = Callable[
   [GatewaySession, dict[str, Any]],
   Awaitable[dict[str, Any] | None] | dict[str, Any] | None,
 ]
+SkillResumeAllowedResolver = Callable[[str], bool]
+
+
 @dataclass(frozen=True)
 class SessionExecutionPolicy:
   """Trusted per-turn runner limits; model selection belongs to product policy."""
@@ -982,6 +985,9 @@ class GatewayServerConfig:
       resolves and materializes the exact profile/skill-aware session-driver
       bind before an autonomous subprocess is launched. Resume requests carry
       the persisted bind as an exact requirement.
+    autonomous_skill_resume_allowed_resolver: Trusted synchronous callback
+      deriving the static resume source-policy fact for a new skill admission.
+      Resumed admissions inherit the persisted fact and do not invoke it.
     autonomous_api_dir: Optional application API directory containing the
       autonomous child entry point and authoritative `user_identity.py`.
       Applications installed separately from this package must set it
@@ -1066,6 +1072,9 @@ class GatewayServerConfig:
   capability_adapter_resolver: CapabilityAdapterResolver | None = None
   autonomous_capability_binding_resolver: (
     AutonomousCapabilityBindingResolver | None
+  ) = None
+  autonomous_skill_resume_allowed_resolver: (
+    SkillResumeAllowedResolver | None
   ) = None
   claim_signing_authority: GatewayClaimSigningAuthority | None = None
   channel_profile_allowlist: Mapping[str, frozenset[str]] | None = None

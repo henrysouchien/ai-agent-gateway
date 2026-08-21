@@ -9,7 +9,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -35,6 +35,7 @@ from .auth import (
   MissingUserIdError,
 )
 from .autonomous_runner import AutonomousRegistry
+from .skills import SkillLoader
 from .control_plane import create_control_plane_router
 from .control_plane.middleware import add_control_plane_version_header_middleware
 from .control_plane.session import _resolve_control_identity
@@ -201,6 +202,21 @@ from .server_chat_helpers import (  # noqa: F401
   _dispatch_chat_turn,
   _init_approval_subsystem,
 )
+
+
+def _generic_skill_resume_allowed_resolver(
+  skills_dir: Path,
+) -> Callable[[str], bool]:
+  loader = SkillLoader(skills_dir)
+
+  def resolve(skill: str) -> bool:
+    try:
+      profile = loader.load(skill)
+    except (FileNotFoundError, ValueError):
+      return False
+    return bool(profile.resumable) and profile.mutation_mode != "model_writer"
+
+  return resolve
 
 
 (
@@ -823,6 +839,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     config.claim_signing_authority
   )
   autonomous_storage_root = _default_autonomous_log_dir()
+  control_skills_root = (
+    config.control_skills_dir or _default_control_skills_dir()
+  )
+  skill_resume_allowed_resolver = (
+    config.autonomous_skill_resume_allowed_resolver
+    if config.autonomous_skill_resume_allowed_resolver is not None
+    else _generic_skill_resume_allowed_resolver(control_skills_root)
+  )
   app.state.autonomous_storage_root = autonomous_storage_root
   app.state.subprocess_registry = AutonomousRegistry(
     api_dir=(
@@ -839,6 +863,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     autonomous_capability_binding_resolver=(
       config.autonomous_capability_binding_resolver
     ),
+    skill_resume_allowed_resolver=skill_resume_allowed_resolver,
     claim_signing_authority=config.claim_signing_authority,
   )
   from .control_plane.autonomous_approval_drainer import (
@@ -1680,7 +1705,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         config.allow_service_credentials_for_interactive
       ),
       route_prefix=route_prefix,
-      skills_dir=config.control_skills_dir or _default_control_skills_dir(),
+      skills_dir=control_skills_root,
       artifact_auth_dependency=_artifact_auth_dependency,
       autonomous_registry=app.state.subprocess_registry,
       agent_schedule_store_for=app.state.agent_run_schedule_store_for,

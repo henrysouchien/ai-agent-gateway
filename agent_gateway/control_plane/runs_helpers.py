@@ -5,7 +5,6 @@ import json
 import math
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -95,7 +94,6 @@ __all__ = [
   "VerdictSummaryResponse",
 ]
 
-_SKILL_LOADER_MODULE_NAMES = frozenset({"agent", "agent.skills", "agent.skills.loader"})
 
 _CHAT_RUN_STATES = set(CONTROL_RUN_STATES)
 _TERMINAL_RUN_STATES = set(CONTROL_TERMINAL_RUN_STATES)
@@ -824,38 +822,14 @@ async def _deny_autonomous_pending_approvals_for_cancel(
     )
 
 
-def _loader_api() -> Any:
-  try:
-    from agent.skills import loader as skill_loader
-  except ModuleNotFoundError as exc:
-    if exc.name not in _SKILL_LOADER_MODULE_NAMES:
-      raise
-    from api.agent.skills import loader as skill_loader  # type: ignore
-  return skill_loader
-
-
-def _skill_is_resumable(skills_dir: Path | None, skill: str | None) -> bool:
-  if skills_dir is None or not skill:
-    return False
-  try:
-    metadata = _loader_api().load_skill_metadata(skill, Path(skills_dir), include_catalog_false=True)
-  except (FileNotFoundError, ValueError):
-    return False
-  if metadata is None:
-    return False
-  if not bool(getattr(metadata, "resumable", False)):
-    return False
-  return str(getattr(metadata, "mutation_mode", "") or "").strip() != "model_writer"
-
-
-def _autonomous_task_resumable(record: AutonomousTask, skills_dir: Path | None) -> bool:
+def _autonomous_task_resumable(record: AutonomousTask) -> bool:
   if record.capability_bind is None:
     return False
   if record.mode != "skill" or not record.skill:
     return False
   if not is_autonomous_run_internal_resumable_state(record.state):
     return False
-  return _skill_is_resumable(skills_dir, record.skill)
+  return record.skill_resume_allowed
 
 
 def _autonomous_task_messageable(
@@ -878,7 +852,7 @@ def _autonomous_task_messageable(
   )
 
 
-def _autonomous_run_from_task(record: AutonomousTask, *, skills_dir: Path | None = None) -> AutonomousRunResponse:
+def _autonomous_run_from_task(record: AutonomousTask) -> AutonomousRunResponse:
   events = _autonomous_events(record)
   resumed_as = list(record.resumed_as)
   state = _autonomous_state(record.state)
@@ -916,7 +890,7 @@ def _autonomous_run_from_task(record: AutonomousTask, *, skills_dir: Path | None
     skill_run_ids=_skill_run_ids(events),
     current_verdict=_current_verdict(events),
     staged_proposals=_staged_proposals(events),
-    resumable=_autonomous_task_resumable(record, skills_dir),
+    resumable=_autonomous_task_resumable(record),
     resumed_from=record.resumed_from,
     resumed_as=resumed_as,
     latest_resume_run_id=resumed_as[-1] if resumed_as else None,

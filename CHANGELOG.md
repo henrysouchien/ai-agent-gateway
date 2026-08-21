@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.17.4 (2026-08-21)
+
+### Fixed
+
+- Descriptor-confined directory walks on Linux now use lookup-only `O_PATH`
+  descriptors for intermediate ancestors and retain a readable descriptor for
+  the exact target. Signed v2 session-log storage therefore remains usable
+  after child Landlock enforcement without granting directory-enumeration
+  access to the storage root's ancestors or sibling streams.
+
 ## 0.17.3 (2026-08-21)
 
 ### Fixed

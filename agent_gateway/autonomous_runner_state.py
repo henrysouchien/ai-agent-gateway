@@ -359,6 +359,7 @@ class AutonomousTask:
   owner_lease_device: int
   owner_lease_inode: int
   started_at: float
+  skill_resume_allowed: bool = field(kw_only=True)
   events_path: Path | None = None
   events_device: int | None = None
   events_inode: int | None = None
@@ -496,6 +497,10 @@ class AutonomousTask:
       )
     if not isinstance(self.deliver, bool):
       raise ValueError("autonomous task deliver must be a bool")
+    if type(self.skill_resume_allowed) is not bool:
+      raise ValueError("autonomous task skill_resume_allowed must be an exact bool")
+    if self.mode != "skill" and self.skill_resume_allowed:
+      raise ValueError("non-skill autonomous task cannot enable skill resume")
     if self.pack is not None and (
       not isinstance(self.pack, str)
       or not self.pack
@@ -730,6 +735,24 @@ def _manifest_identity_payload(manifest: dict[str, Any], *, user_id: str, user_e
 
 
 class AutonomousRegistryStateMixin:
+  def _resolve_initial_skill_resume_allowed(
+    self,
+    *,
+    mode: str,
+    skill: str | None,
+  ) -> bool:
+    if mode != "skill" or not skill:
+      return False
+    resolver = getattr(self, "_skill_resume_allowed_resolver", None)
+    if resolver is None:
+      raise RuntimeError(
+        "skill resume policy resolver is required for skill admission"
+      )
+    resolved = resolver(skill)
+    if type(resolved) is not bool:
+      raise TypeError("skill resume policy resolver must return an exact bool")
+    return resolved
+
   def _skip_warned_path(self) -> Path:
     return self._log_dir / _runtime_attr("_SKIP_WARNED_FILE", _SKIP_WARNED_FILE)
 
@@ -1041,6 +1064,7 @@ class AutonomousRegistryStateMixin:
       "skill": record.skill,
       "pack": record.pack,
       "deliver": record.deliver,
+      "skill_resume_allowed": record.skill_resume_allowed,
       "context": record.context,
       "ticker": record.ticker,
       "channel": record.channel,
@@ -1539,6 +1563,12 @@ class AutonomousRegistryStateMixin:
     ):
       self._warn_once(manifest_path, "Skipping autonomous manifest missing required fields: %s")
       return None
+    if manifest_path != self._manifest_path(task_id):
+      self._warn_once(
+        manifest_path,
+        "Skipping autonomous manifest whose filename does not match task_id: %s",
+      )
+      return None
     if "pack" not in manifest or "deliver" not in manifest:
       self._warn_once(manifest_path, "Skipping v7 autonomous manifest missing pack/deliver fields: %s")
       return None
@@ -1778,6 +1808,27 @@ class AutonomousRegistryStateMixin:
       self._warn_once(manifest_path, "Skipping autonomous manifest with non-autonomous capability bind: %s")
       return None
 
+    missing_skill_resume_allowed = "skill_resume_allowed" not in manifest
+    if missing_skill_resume_allowed:
+      # A validation-only value lets the complete existing task/owner
+      # invariants run before legacy source is consulted. It is never exposed
+      # or persisted: a valid record is frozen below before admission.
+      skill_resume_allowed = False
+    else:
+      skill_resume_allowed = manifest.get("skill_resume_allowed")
+      if type(skill_resume_allowed) is not bool:
+        self._warn_once(
+          manifest_path,
+          "Skipping autonomous manifest with invalid skill_resume_allowed: %s",
+        )
+        return None
+      if mode != "skill" and skill_resume_allowed:
+        self._warn_once(
+          manifest_path,
+          "Skipping non-skill autonomous manifest with skill resume enabled: %s",
+        )
+        return None
+
     record_kwargs = dict(
       task_id=task_id,
       control_run_id=control_run_id,
@@ -1823,6 +1874,7 @@ class AutonomousRegistryStateMixin:
       owner_lease_device=owner_lease_device,
       owner_lease_inode=owner_lease_inode,
       started_at=float(started_at) if isinstance(started_at, (int, float)) else rehydrate_time,
+      skill_resume_allowed=skill_resume_allowed,
       manifest_version=manifest_version,
       max_budget_usd=_positive_finite_float(manifest.get("max_budget_usd")),
       state=raw_state,
@@ -1867,14 +1919,14 @@ class AutonomousRegistryStateMixin:
       return None
     self._attach_manifest_tracking(record)
     try:
-      owner_cleanup_active = (
-        was_interrupted
-        and not autonomous_owner_lease_is_released(
+      owner_lease_released = True
+      if was_interrupted or missing_skill_resume_allowed:
+        owner_lease_released = autonomous_owner_lease_is_released(
           record.owner_lease_path,
           expected_device=record.owner_lease_device,
           expected_inode=record.owner_lease_inode,
         )
-      )
+      owner_cleanup_active = was_interrupted and not owner_lease_released
     except RuntimeError:
       _LOGGER.warning(
         "Skipping autonomous manifest with invalid owner lease: %s",
@@ -1882,11 +1934,28 @@ class AutonomousRegistryStateMixin:
         exc_info=True,
       )
       return None
+    if missing_skill_resume_allowed:
+      if not owner_lease_released:
+        raise RuntimeError(
+          "cannot migrate autonomous skill resume policy while the prior owner is active"
+        )
+      record.skill_resume_allowed = self._resolve_initial_skill_resume_allowed(
+        mode=record.mode,
+        skill=record.skill,
+      )
+    if missing_skill_resume_allowed and not self._write_task_manifest(
+      record,
+      checked=True,
+    ):
+      raise RuntimeError(
+        "failed to persist autonomous skill resume compatibility fact"
+      )
     if (
       (was_interrupted and not owner_cleanup_active)
       or record.state != raw_manifest_state and not owner_cleanup_active
     ):
-      self._write_task_manifest(record)
+      if not missing_skill_resume_allowed:
+        self._write_task_manifest(record)
     return record
 
   def rehydrate(self) -> None:

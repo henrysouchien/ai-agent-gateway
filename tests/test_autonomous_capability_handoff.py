@@ -203,6 +203,7 @@ def _registry(tmp_path: Path, resolver=_binding_for_request) -> AutonomousRegist
       "anthropic": _service_handle(),
     },
     autonomous_capability_binding_resolver=resolver,
+    skill_resume_allowed_resolver=lambda _skill: False,
     claim_signing_authority=GatewayClaimSigningAuthority(_SECRET),
   )
 
