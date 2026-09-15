@@ -5,9 +5,10 @@ import copy
 import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, TYPE_CHECKING
+from pathlib import Path
+from typing import Any, Protocol, TYPE_CHECKING
 
 from agent_workflow_contracts import (
   AgentOperationRef,
@@ -32,7 +33,7 @@ from .fork_scope_receipt import (
   fork_scope_receipt_dict,
   parse_fork_scope_receipt,
 )
-from .fork_task_registry import learn_fork_budget_usd
+from .fork_task_registry import ForkTaskRegistry, learn_fork_budget_usd
 from .runner_cleanup import cleanup_failure_notes
 from .runner_introspection import derive_sub_agent_id
 from .runner_session_lifecycle import _runner_attr
@@ -46,6 +47,7 @@ from .sub_agent_narrative_result import (
   task_result_from_execution,
 )
 from .task_registry import TaskEntry
+from .tool_dispatcher_helpers import LocalToolHandler
 from .transcript import (
   build_synthetic_tool_results,
   detect_orphan_tool_uses,
@@ -92,12 +94,34 @@ _LEARNING_FORK_OPERATION = AgentOperationRef(
 )
 
 
+class ForkMemoryWriteScope(Protocol):
+  def __call__(
+    self,
+    handler: LocalToolHandler,
+    *,
+    fork_id: str,
+    user_id: str,
+  ) -> LocalToolHandler: ...
+
+
+@dataclass(slots=True)
+class LearningForkConfig:
+  """Application-owned learning inputs and their lazy shared runtime."""
+
+  directive: str
+  scope_memory_write: ForkMemoryWriteScope
+  ledger_path: Callable[[str], Path]
+  _ledger: ForkLedger | None = field(default=None, init=False, repr=False)
+  _registry: ForkTaskRegistry | None = field(default=None, init=False, repr=False)
+
+
 @dataclass(slots=True)
 class LearningForkWorkItem:
   """Runtime-only owner plus the immutable handoff retained by the registry."""
 
   parent: AgentRunner
   handoff: ForkRequestHandoff
+  config: LearningForkConfig
   ledger: ForkLedger
   session_id: str
   owner: str
@@ -837,10 +861,6 @@ async def spawn_learning_fork(
   work_item = raw_work_item
   parent = work_item.parent
   handoff = work_item.handoff
-  from agent.shared.prompts.learn_directive import LEARN_DIRECTIVE
-  from agent.shared.tool_handlers.fork_memory_write import (
-    scope_fork_memory_write_handler,
-  )
   execution = _bind_learning_fork_execution(
     parent._capability_execution
   )
@@ -872,7 +892,7 @@ async def spawn_learning_fork(
   try:
     dispatcher = parent._dispatcher.with_scoped_local_handler(
       "memory_write",
-      lambda stock: scope_fork_memory_write_handler(
+      lambda stock: work_item.config.scope_memory_write(
         stock,
         fork_id=fork_id,
         user_id=work_item.user_id,
@@ -898,7 +918,7 @@ async def spawn_learning_fork(
     physical_task_id=physical_task_id,
     logical_task=logical_task,
     attempt=attempt,
-    objective=LEARN_DIRECTIVE,
+    objective=work_item.config.directive,
     result_requirement=result_requirement,
     execution=execution,
     scope_receipt=scope_receipt,
@@ -906,7 +926,7 @@ async def spawn_learning_fork(
   child_cost: list[float] = []
   result, error = await spawn_fork_agent(
     parent,
-    LEARN_DIRECTIVE,
+    work_item.config.directive,
     handoff=handoff,
     capability_execution=execution,
     logical_task=logical_task,
@@ -939,6 +959,7 @@ __all__ = [
   "ForkPolicyDispatcher",
   "LEARNING_FORK_ALLOWED_TOOLS",
   "LEARNING_FORK_MAX_TURNS",
+  "LearningForkConfig",
   "LearningForkWorkItem",
   "build_fork_messages",
   "build_learning_fork_tool_decisions",

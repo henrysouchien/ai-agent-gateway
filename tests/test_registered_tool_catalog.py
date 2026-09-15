@@ -52,6 +52,7 @@ from agent.shared.tool_policy_implementations import (
   PlanningRuntimeContext,
   RedactionRuntimeContext,
 )
+from agent.shared.trusted_plans import validate_trusted_tool_plan
 from agent_workflow_contracts.tool_registration import (
   McpInputPreparationRoute,
   RegisteredToolIdentity,
@@ -963,6 +964,7 @@ def test_product_planner_prepares_exact_repository_change_once(
       identity_source="reviewed_change_binding",
       identity=prepared.binding,
       prepared=prepared,
+      validator=validate_trusted_tool_plan,
     ).approval_identity()
   )
   assert registered_call.materialize_authorized_input(

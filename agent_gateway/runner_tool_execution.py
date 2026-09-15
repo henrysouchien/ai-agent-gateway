@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import time
-from typing import AbstractSet, TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
+from typing import AbstractSet, TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
 from agent_workflow_contracts import AgentCompletionEnvelope, TaskResult
 
@@ -69,9 +69,6 @@ _READABLE_RESOURCE_SNAPSHOT_RESULT_KEY = "_readable_resource_snapshot"
 _READABLE_RESOURCE_MAX_CONTENT_BYTES = 2_000_000
 _REPEATED_TOOL_EXCLUDED_STOP_AFTER_COUNT = 2
 
-@runtime_checkable
-class _OutputFileToolsGetter(Protocol):
-  def __call__(self) -> Iterable[object]: ...
 
 
 @runtime_checkable
@@ -181,22 +178,6 @@ class AgentRunnerDispatcher(Protocol):
     prepared_call: PreparedToolCall,
   ) -> ToolResultSettlement: ...
 
-_FMS_WRITER_TOOL_FALLBACKS = frozenset({
-  "fms_link_thesis",
-  "fms_persist_business_model",
-  "fms_persist_dcf_relative_valuation",
-  "fms_persist_earnings_scenarios",
-  "fms_persist_forecast_assumptions",
-  "fms_persist_model_update",
-  "fms_persist_scenario_multiple_pricing",
-  "fms_persist_ticker_triage",
-  "fms_persist_valuation_inputs",
-  "fms_record_decision_log",
-  "fms_report_business_quality_assessment",
-  "fms_report_idea_to_thesis",
-  "fms_report_thesis_consultation",
-  "fms_resolve_outcome_contracts",
-})
 _FMS_COMMIT_TOOL_ACTION_CODES = {
   "fms_link_thesis": "link_thesis",
   "fms_persist_business_model": "persist_business_model",
@@ -229,9 +210,6 @@ _FMS_COMMIT_TOOL_STAGES = {
   "fms_report_thesis_consultation": "diligence",
   "fms_resolve_outcome_contracts": "review",
 }
-_OUTPUT_FILE_GATED_TOOL_FALLBACKS = frozenset({
-  "analyze_stock",
-})
 _OUTPUT_FILE_GATED_TOOL_ALTERNATIVES: dict[str, dict[str, Any]] = {
   "analyze_stock": {
     "suggested_tools": ["get_quote", "industry_peer_comparison"],
@@ -407,33 +385,16 @@ def _readable_resource_event_from_snapshot(
 
 
 def _fms_commit_tool_names() -> frozenset[str]:
-  server_policies = load_server_policy_module()
-  if server_policies is None:
-    return _FMS_WRITER_TOOL_FALLBACKS
-  names: set[str] = set()
-  for attr_name in ("FMS_MODEL_WRITER_TOOLS", "FMS_THESIS_WRITER_TOOLS"):
-    raw_names = getattr(server_policies, attr_name, frozenset())
-    try:
-      names.update(str(tool_name) for tool_name in raw_names if str(tool_name or "").strip())
-    except TypeError:
-      continue
-  if names:
-    return frozenset(names)
-  return _FMS_WRITER_TOOL_FALLBACKS
+  policy = load_server_policy_module()
+  return frozenset(getattr(policy, "FMS_MODEL_WRITER_TOOLS", ())) | frozenset(
+    getattr(policy, "FMS_THESIS_WRITER_TOOLS", ())
+  )
 
 
 def _output_file_gated_tool_names() -> frozenset[str]:
-  server_policies = load_server_policy_module()
-  if server_policies is None:
-    return _OUTPUT_FILE_GATED_TOOL_FALLBACKS
-  getter = getattr(server_policies, "get_output_file_tools", None)
-  if not isinstance(getter, _OutputFileToolsGetter):
-    return _OUTPUT_FILE_GATED_TOOL_FALLBACKS
-  names = getter()
-  try:
-    return frozenset(str(tool_name) for tool_name in names if str(tool_name or "").strip())
-  except TypeError:
-    return _OUTPUT_FILE_GATED_TOOL_FALLBACKS
+  policy = load_server_policy_module()
+  getter = getattr(policy, "get_output_file_tools", None)
+  return frozenset(getter()) if getter is not None else frozenset()
 
 
 def _fms_commit_blocker_error(tool_name: str) -> Dict[str, Any] | None:

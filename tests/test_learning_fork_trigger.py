@@ -25,7 +25,6 @@ from agent_gateway.runner_fork_agents import (
   cross_check_learning_memory_writes,
 )
 from agent_gateway.runner_notifications import build_notification_reminder
-from agent_gateway.sub_agent_result_contract import LearningReport
 from agent_gateway.task_registry import NotificationQueue
 from agent_gateway.tool_dispatcher import ToolDispatcher
 
@@ -36,6 +35,8 @@ if str(API_DIR) not in sys.path:
 
 import memory  # noqa: E402
 from agent.interactive.tool_dispatcher import ExcelToolDispatcher  # noqa: E402
+from agent.shared.learning_forks import configure_learning_forks  # noqa: E402
+from agent.shared.learning_report import LearningReport  # noqa: E402
 from agent.shared.tool_handlers import fork_memory_write  # noqa: E402
 from agent.shared.tool_handlers.fork_memory_write import (  # noqa: E402
   scope_fork_memory_write_handler,
@@ -77,6 +78,7 @@ def _runner(
     learning_fork_ledger=ledger,
     learning_fork_registry=registry,
   )
+  configure_learning_forks(session)
   dispatcher = SimpleNamespace(
     _session=session,
     run_context=SimpleNamespace(profile=profile),

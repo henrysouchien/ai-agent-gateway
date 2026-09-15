@@ -30,6 +30,7 @@ from agent_gateway.model_registry import (
 from agent_gateway.model_preferences import ModelPreferenceStore
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.session import bind_session_credentials
+from user_identity import resolve_canonical_user_identity
 
 
 _SELECTABLE_CAPABILITIES = frozenset({
@@ -89,6 +90,7 @@ def _make_app(
 
   return create_gateway_app(
     GatewayServerConfig(
+      identity_resolver=resolve_canonical_user_identity,
       tenant_id="test-product",
       model_registry=model_registry or INITIAL_MODEL_REGISTRY,
       model_selection_policy=model_selection_policy or INITIAL_MODEL_SELECTION_POLICY,

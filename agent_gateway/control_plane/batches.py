@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
 
@@ -77,6 +77,40 @@ _DURABLE_CORPUS_REJECTION_CODES = frozenset({
 })
 log = logging.getLogger("agent_gateway.control_plane.batches")
 _SERVICE_BATCH_SESSION_LIFETIME_SECONDS = 24 * 60 * 60
+
+
+class BatchDispatchReplayError(RuntimeError):
+  """Backend exception carrying the already-admitted durable batch identity."""
+
+  batch_id: int
+
+
+class BatchDispatchRejectedError(RuntimeError):
+  """Backend exception carrying a durable dispatch rejection response."""
+
+  status_code: int
+  detail: object
+
+
+@dataclass(frozen=True)
+class BatchBackend:
+  """Application-owned batch execution and durable storage dependencies."""
+
+  registry_for_user: Callable[[str], Any]
+  controller: Any
+  open_captured_run_context: Callable[..., Any]
+  terminal_event_payload: Callable[[int, dict[str, Any]], dict[str, Any]]
+  active_batch_error: type[Exception]
+  dispatch_replay: type[BatchDispatchReplayError]
+  dispatch_rejected: type[BatchDispatchRejectedError]
+  dispatch_rejection_record: type
+
+
+def _batch_backend(app_state: Any) -> BatchBackend:
+  backend = getattr(app_state, "batch_backend", None)
+  if backend is None:
+    raise HTTPException(status_code=503, detail="Batch backend is not configured")
+  return backend
 
 
 class _PublishBatchTerminalEvent(Protocol):
@@ -482,7 +516,7 @@ class BatchTaskRegistry:
           digest = registry.get_batch_digest(batch_id)
         if str(digest.get("status") or "") not in _TERMINAL_BATCH_STATUSES:
           raise RuntimeError("batch task monitor did not reach a terminal state")
-        event = _batch_terminal_event_payload_from_digest(
+        event = _batch_backend(app_state).terminal_event_payload(
           batch_id,
           digest,
         )
@@ -540,7 +574,7 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     owner_user_id = _session_owner_user_id(authenticated)
-    registry = _registry_for_user(owner_user_id)
+    registry = _batch_backend(request.app.state).registry_for_user(owner_user_id)
     try:
       rows = registry.list_batches(owner_user_id, limit=limit)
       batches = [registry.get_batch_digest(int(row["batch_id"])) for row in rows]
@@ -566,6 +600,7 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
     _require_control_session(authenticated)
     return read_batch_for_user(
       batch_id,
+      app_state=request.app.state,
       user_id=_session_owner_user_id(authenticated),
       top_n=top_n,
     )
@@ -575,7 +610,7 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     owner_user_id = _session_owner_user_id(authenticated)
-    registry = _registry_for_user(owner_user_id)
+    registry = _batch_backend(request.app.state).registry_for_user(owner_user_id)
     try:
       existing_batch = _require_batch_owner(
         registry,
@@ -695,7 +730,7 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     owner_user_id = _session_owner_user_id(authenticated)
-    source_registry = _registry_for_user(owner_user_id)
+    source_registry = _batch_backend(request.app.state).registry_for_user(owner_user_id)
     try:
       prior = _require_batch_owner(source_registry, batch_id, owner_user_id)
       failures = source_registry.get_batch_failures(batch_id)
@@ -1034,7 +1069,7 @@ async def _dispatch_batch_for_authenticated(
       dispatch_key=dispatch_key,
       required_bind=required_bind,
     )
-  except _active_batch_error_type() as exc:
+  except _batch_backend(request.app.state).active_batch_error as exc:
     raise HTTPException(
       status_code=409,
       detail=str(exc),
@@ -1093,7 +1128,7 @@ async def dispatch_batch_in_process(
     if required_bind.run_mode != "batch":
       raise ValueError("batch retry requires a batch-mode bind")
   dispatch_request_spec = deepcopy(payload)
-  replay_registry = _registry_for_user(user_id)
+  replay_registry = _batch_backend(app_state).registry_for_user(user_id)
   try:
     task_registry = _task_registry_for_state(app_state)
     replay = replay_registry.lookup_batch_dispatch(
@@ -1102,7 +1137,7 @@ async def dispatch_batch_in_process(
       request_spec=dispatch_request_spec,
     )
     if replay is not None:
-      if isinstance(replay, _batch_dispatch_rejection_record_type()):
+      if isinstance(replay, _batch_backend(app_state).dispatch_rejection_record):
         raise _BatchDispatchNotAdmitted(
           replay.status_code,
           replay.detail,
@@ -1160,7 +1195,7 @@ async def dispatch_batch_in_process(
       or exc.code not in _DURABLE_CORPUS_REJECTION_CODES
     ):
       raise
-    rejection_registry = _registry_for_user(user_id)
+    rejection_registry = _batch_backend(app_state).registry_for_user(user_id)
     try:
       return await _record_or_reconcile_batch_dispatch_rejection(
         registry=rejection_registry,
@@ -1174,7 +1209,7 @@ async def dispatch_batch_in_process(
       )
     finally:
       rejection_registry.close()
-  registry = _registry_for_user(user_id)
+  registry = _batch_backend(app_state).registry_for_user(user_id)
   try:
     task_registry = _task_registry_for_state(app_state)
     try:
@@ -1197,7 +1232,7 @@ async def dispatch_batch_in_process(
         capability_execution_resolver=capability_execution_resolver,
         session_driver_execution=session_driver_execution,
       )
-    except _batch_dispatch_replay_type() as exc:
+    except _batch_backend(app_state).dispatch_replay as exc:
       response = await _reconcile_batch_dispatch_replay(
         registry=registry,
         task_registry=task_registry,
@@ -1207,7 +1242,7 @@ async def dispatch_batch_in_process(
       )
       registry.close()
       return response
-    except _batch_dispatch_rejected_type() as exc:
+    except _batch_backend(app_state).dispatch_rejected as exc:
       raise _BatchDispatchNotAdmitted(
         exc.status_code,
         exc.detail,
@@ -1257,7 +1292,7 @@ async def _record_or_reconcile_batch_dispatch_rejection(
     status_code=status_code,
     detail=detail,
   )
-  if isinstance(outcome, _batch_dispatch_rejection_record_type()):
+  if isinstance(outcome, _batch_backend(app_state).dispatch_rejection_record):
     raise _BatchDispatchNotAdmitted(
       outcome.status_code,
       outcome.detail,
@@ -1300,7 +1335,7 @@ async def _reconcile_active_batches_before_fresh_admission(
     try:
       await task_registry.publish_terminal_event(
         app_state=app_state,
-        event=_batch_terminal_event_payload_from_digest(
+        event=_batch_backend(app_state).terminal_event_payload(
           batch_id,
           digest,
         ),
@@ -1339,7 +1374,7 @@ async def _reconcile_batch_dispatch_replay(
       raise _BatchDispatchReconciliationError(
         "orphaned batch replay could not be terminalized"
       )
-    event = _batch_terminal_event_payload_from_digest(
+    event = _batch_backend(app_state).terminal_event_payload(
       batch_id,
       digest,
     )
@@ -1421,7 +1456,7 @@ def _acquire_and_start_batch(
     raise RuntimeError("batch compiled skill application is unavailable")
 
   try:
-    batch_id, _user_id, _user_email = _controller().acquire_batch_run(
+    batch_id, _user_id, _user_email = _batch_backend(app_state).controller.acquire_batch_run(
       payload,
       registry=registry,
       host=socket.gethostname(),
@@ -1433,9 +1468,9 @@ def _acquire_and_start_batch(
       user_id=user_id,
       user_email=user_email,
     )
-  except _batch_dispatch_replay_type():
+  except _batch_backend(app_state).dispatch_replay:
     raise
-  except _batch_dispatch_rejected_type():
+  except _batch_backend(app_state).dispatch_rejected:
     raise
   except (TypeError, ValueError) as exc:
     raise _BatchDispatchValidationError(str(exc)) from exc
@@ -1468,7 +1503,7 @@ def _acquire_and_start_batch(
       task_id: str,
       session_driver_execution: BoundCapabilityExecution,
     ) -> Any:
-      return await _captured_run_opener()(
+      return await _batch_backend(app_state).open_captured_run_context(
         parent_session=parent_session,
         origin="batch" if scope is not None else "service",
         run_id=run_id,
@@ -1481,7 +1516,7 @@ def _acquire_and_start_batch(
 
     return asyncio.create_task(
       _run_acquired_batch_containing_system_exit(
-        _controller(),
+        _batch_backend(app_state).controller,
         batch_id,
         payload,
         registry=registry,
@@ -1716,7 +1751,7 @@ async def _complete_authorized_batch_cancellation(
     progress.boundary_crossed = True
   if str(batch_digest.get("status") or "") not in _TERMINAL_BATCH_STATUSES:
     raise RuntimeError("batch cancellation did not reach a terminal state")
-  terminal_event = _batch_terminal_event_payload_from_digest(
+  terminal_event = _batch_backend(app_state).terminal_event_payload(
     batch_id,
     batch_digest,
   )
@@ -1931,8 +1966,10 @@ def _has_active_credential(auth_config: dict[str, Any] | None) -> bool:
   )
 
 
-def read_batch_for_user(batch_id: int, *, user_id: str, top_n: int = 10) -> dict[str, Any]:
-  registry = _registry_for_user(user_id)
+def read_batch_for_user(
+  batch_id: int, *, app_state: Any, user_id: str, top_n: int = 10,
+) -> dict[str, Any]:
+  registry = _batch_backend(app_state).registry_for_user(user_id)
   try:
     _require_batch_owner(registry, batch_id, user_id)
     return _batch_detail_payload(registry, batch_id, top_n=top_n)
@@ -2120,6 +2157,7 @@ async def _publish_batch_terminal_event(
 def terminal_batch_event_for_user(
   run_id: str,
   *,
+  app_state: Any,
   user_id: str,
 ) -> dict[str, Any] | None:
   if not run_id.startswith("batch_"):
@@ -2130,49 +2168,19 @@ def terminal_batch_event_for_user(
   batch_id = int(raw_batch_id)
   if batch_id < 1:
     raise HTTPException(status_code=404, detail="Run not found")
-  detail = read_batch_for_user(batch_id, user_id=user_id)
+  detail = read_batch_for_user(batch_id, app_state=app_state, user_id=user_id)
   batch = detail.get("batch")
   if not isinstance(batch, dict):
     raise HTTPException(status_code=503, detail="Batch event authority unavailable")
   status = str(batch.get("status") or "").strip().lower()
   if status not in _TERMINAL_BATCH_STATUSES:
     return None
-  return _batch_terminal_event_payload_from_digest(
+  return _batch_backend(app_state).terminal_event_payload(
     batch_id,
     batch,
   )
 
 
-def _registry_for_user(user_id: str):
-  from memory import get_workspace_dir
-  from agent.batch.registry import BatchRegistry
-
-  return BatchRegistry(Path(get_workspace_dir(user_id)) / "batch_registry.db")
-
-
-def _controller():
-  from agent.batch import controller
-
-  return controller
-
-
-def _captured_run_opener():
-  from agent.autonomous.captured_run_context import (
-    open_captured_run_context,
-  )
-
-  return open_captured_run_context
-
-
-def _batch_terminal_event_payload_from_digest(
-  batch_id: int,
-  digest: dict[str, Any],
-) -> dict[str, Any]:
-  from agent.batch.controller_finalization import (
-    batch_terminal_event_payload_from_digest,
-  )
-
-  return batch_terminal_event_payload_from_digest(batch_id, digest)
 
 
 def _batch_workflow_catalog(app_state: Any) -> dict[str, Any]:
@@ -2183,7 +2191,7 @@ def _batch_workflow_catalog(app_state: Any) -> dict[str, Any]:
   )
   if skill_application is None:
     raise RuntimeError("batch compiled skill application is unavailable")
-  workflows = _controller().batch_workflow_catalog(
+  workflows = _batch_backend(app_state).controller.batch_workflow_catalog(
     skill_application=skill_application,
   )
   if type(workflows) is not dict:
@@ -2191,28 +2199,6 @@ def _batch_workflow_catalog(app_state: Any) -> dict[str, Any]:
   return workflows
 
 
-def _active_batch_error_type():
-  from agent.batch.registry import ActiveBatchError
-
-  return ActiveBatchError
-
-
-def _batch_dispatch_replay_type():
-  from agent.batch.registry import BatchDispatchReplay
-
-  return BatchDispatchReplay
-
-
-def _batch_dispatch_rejected_type():
-  from agent.batch.registry import BatchDispatchRejected
-
-  return BatchDispatchRejected
-
-
-def _batch_dispatch_rejection_record_type():
-  from agent.batch.registry import BatchDispatchRejection
-
-  return BatchDispatchRejection
 
 
 def _required_batch_dispatch_key(request: Request) -> str:
@@ -2248,6 +2234,9 @@ def _task_registry_for_state(app_state: Any) -> BatchTaskRegistry:
 
 
 __all__ = [
+  "BatchBackend",
+  "BatchDispatchRejectedError",
+  "BatchDispatchReplayError",
   "BatchTaskRegistry",
   "build_batches_router",
   "dispatch_batch_in_process",

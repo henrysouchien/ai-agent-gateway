@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import hashlib
 from itertools import count
 import json
@@ -59,7 +58,9 @@ from agent_gateway.skill_limits import (
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.session import GatewaySession
 
+from agent.shared import server_policies
 from .manifest_helpers import TASK_MANIFEST_VERSION, write_v6_manifest
+from .identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
 
 
 API_KEY = "autonomous-pr5a-key"
@@ -294,6 +295,8 @@ def _make_app(
   dispatch_scope_validator: Any | None = None,
   claim_signing_authority_installed: bool = True,
   autonomous_api_dir: Path | None = API_DIR,
+  identity_resolver=fake_identity_resolver,
+  mcp_user_key_lookup=fake_mcp_user_key_lookup,
 ):
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(tmp_path / "autonomous-logs"))
@@ -323,6 +326,7 @@ def _make_app(
       jwt_secret="autonomous-pr5a-test-secret-0123456789",
       valid_api_keys={API_KEY},
       tenant_id="test-product",
+      server_policy=server_policies,
       model_registry=INITIAL_MODEL_REGISTRY,
       model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
@@ -336,6 +340,8 @@ def _make_app(
       control_profile_names_provider=control_profile_names_provider,
       control_profile_loader=control_profile_loader,
       dispatch_scope_validator=dispatch_scope_validator,
+      identity_resolver=identity_resolver,
+      mcp_user_key_lookup=mcp_user_key_lookup,
       claim_signing_authority=(
         GatewayClaimSigningAuthority(HMAC_KEY)
         if claim_signing_authority_installed
@@ -1005,46 +1011,38 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
     monkeypatch,
     invocations=invocations,
   )
-  monkeypatch.setenv(
-    "GATEWAY_USER_KEYS",
-    json.dumps([
-      {
-        "key": API_KEY,
-        "channel": "mcp",
-        "slug": "henry",
-        "email": "henry@example.com",
-        "risk_user_id": 1,
-        "role": "owner",
-      },
-      {
-        "key": "other-user-key",
-        "channel": "mcp",
-        "slug": "other",
-        "email": "other@example.com",
-        "risk_user_id": 2,
-        "role": "owner",
-      },
-    ]),
-  )
+  def resolve_identity(user_id, **kwargs):
+    if user_id not in ("henry", "1"):
+      return fake_identity_resolver(user_id, **kwargs)
+    identity = fake_identity_resolver(
+      user_id,
+      risk_user_id=1,
+      user_email="henry@example.com",
+    )
+    identity.user_slug = "henry"
+    identity.aliases = ("1", "henry", "henry@example.com")
+    identity.identity_status = "gateway_user_key_mapping"
+    return identity
+
+  def lookup_key(user_id, user_email):
+    assert user_id == "1"
+    assert user_email == "henry@example.com"
+    return {
+      "key": API_KEY,
+      "channel": "mcp",
+      "slug": "henry",
+      "email": "henry@example.com",
+      "risk_user_id": 1,
+      "role": "owner",
+    }
   application_api_dir = tmp_path / "installed-application-api"
   application_api_dir.mkdir()
-  (application_api_dir / "user_identity.py").write_text(
-    """
-import json
-import os
-
-def get_mcp_user_key_entry(user_id, user_email=None):
-  for entry in json.loads(os.environ.get("GATEWAY_USER_KEYS", "[]")):
-    if entry.get("slug") == user_id or entry.get("email") == user_email:
-      return dict(entry)
-  return None
-""".lstrip(),
-    encoding="utf-8",
-  )
   app = _make_app(
     monkeypatch,
     tmp_path,
     autonomous_api_dir=application_api_dir,
+    identity_resolver=resolve_identity,
+    mcp_user_key_lookup=lookup_key,
   )
 
   with TestClient(app) as client:
@@ -1055,16 +1053,6 @@ def get_mcp_user_key_entry(user_id, user_email=None):
     assert henry_mcp["user_id"] == "1"
     assert henry_mcp["user_slug"] == "henry"
     assert henry_web["user_id"] == "1"
-    identity_module_path = application_api_dir / "user_identity.py"
-    identity_spec = importlib.util.spec_from_file_location(
-      "user_identity",
-      identity_module_path,
-    )
-    assert identity_spec is not None
-    assert identity_spec.loader is not None
-    identity_api = importlib.util.module_from_spec(identity_spec)
-    monkeypatch.setitem(sys.modules, "user_identity", identity_api)
-    identity_spec.loader.exec_module(identity_api)
 
     start = client.post(
       "/api/control/runs",

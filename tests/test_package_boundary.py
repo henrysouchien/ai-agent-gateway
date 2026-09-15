@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+from importlib import metadata
 import os
 import subprocess
 import sys
 import textwrap
+import tomllib
 from pathlib import Path
 from typing import Any
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 from agent_gateway.approval_audit import ApprovalAuditEmitter, build_audit_entry
 from agent_gateway.approval_policy import ApprovalRequest, utc_now
@@ -59,34 +63,75 @@ async def _build_chat_runtime_impl(
 _build_chat_runtime: BuildChatRuntime = _build_chat_runtime_impl
 
 
-def test_leaf_imports_do_not_require_monorepo_schema(tmp_path: Path) -> None:
+def test_all_modules_import_without_checkout_trees(tmp_path: Path) -> None:
   package_dir = Path(__file__).resolve().parents[1]
+  dependency_dir = tmp_path / "dependencies"
+  dependency_dir.mkdir()
+  manifest = tomllib.loads((package_dir / "pyproject.toml").read_text())
+  pending = [Requirement(value) for value in manifest["project"]["dependencies"]]
+  visited: set[tuple[str, frozenset[str]]] = set()
+  while pending:
+    requirement = pending.pop()
+    key = (canonicalize_name(requirement.name), frozenset(requirement.extras))
+    if key in visited:
+      continue
+    visited.add(key)
+    distribution = metadata.distribution(requirement.name)
+    # Expose only the distributions in the declared dependency closure, not
+    # site-packages wholesale (which can conceal another checkout reach).
+    for file in distribution.files or ():
+      top = file.parts[0]
+      if top in {".", ".."} or top.endswith(".pth"):
+        continue
+      target = dependency_dir / top
+      if not target.exists():
+        source = Path(distribution.locate_file(top))
+        if source.exists():
+          target.symlink_to(source, target_is_directory=source.is_dir())
+    for value in distribution.requires or ():
+      dependency = Requirement(value)
+      if dependency.marker is None or any(
+        dependency.marker.evaluate({"extra": extra})
+        for extra in requirement.extras or {""}
+      ):
+        pending.append(dependency)
   script = textwrap.dedent(
     """
     import importlib
-    import importlib.util
+    import importlib.abc
+    import pkgutil
+    import sys
+    forbidden = {
+      "api", "agent", "schema", "memory", "research", "mcp_servers",
+      "investment_tools", "scripts", "fms", "user_identity",
+    }
 
-    if importlib.util.find_spec("schema") is not None:
-      raise SystemExit("schema unexpectedly importable before agent_gateway import")
+    class CheckoutImportGuard(importlib.abc.MetaPathFinder):
+      def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".", 1)[0] in forbidden:
+          raise AssertionError(f"gateway imported checkout module {fullname!r}")
 
+    sys.meta_path.insert(0, CheckoutImportGuard())
     import agent_gateway
-    from agent_gateway.code_execution import CodeExecutionConfig
-    from agent_gateway.session import GatewaySession
-
-    if importlib.util.find_spec("schema") is not None:
-      raise SystemExit("schema unexpectedly importable after leaf imports")
-
-    assert CodeExecutionConfig is not None
-    assert GatewaySession is not None
+    names = sorted(
+      module.name
+      for module in pkgutil.walk_packages(
+        agent_gateway.__path__, prefix="agent_gateway."
+      )
+    )
+    for name in names:
+      importlib.import_module(name)
+    assert names
     assert agent_gateway.__version__
+    print(f"Imported {len(names)} gateway modules without checkout trees")
     """
   )
   env = os.environ.copy()
-  env["PYTHONPATH"] = str(package_dir)
+  env["PYTHONPATH"] = os.pathsep.join((str(package_dir), str(dependency_dir)))
   env.pop("PRODUCT_ID", None)
 
   result = subprocess.run(
-    [sys.executable, "-c", script],
+    [sys.executable, "-S", "-c", script],
     cwd=tmp_path,
     env=env,
     capture_output=True,
@@ -94,7 +139,7 @@ def test_leaf_imports_do_not_require_monorepo_schema(tmp_path: Path) -> None:
     check=False,
   )
 
-  assert result.returncode == 0, result.stderr
+  assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_create_agent_does_not_require_monorepo_schema(tmp_path: Path) -> None:

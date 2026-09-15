@@ -46,6 +46,10 @@ from agent_gateway.tool_dispatcher import LocalToolHandler
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 from agent_gateway.session import GatewaySession
 from agent_gateway.single_user_policy import SingleUserApprovalPolicy
+from agent.shared.trusted_plans import (
+  render_trusted_tool_plan_review,
+  validate_trusted_tool_plan,
+)
 
 
 class _NullMcp(McpClientManager):
@@ -163,7 +167,7 @@ def test_no_approval_route_is_the_only_sessionless_variant() -> None:
 def _planned_handler(events: list[str]) -> LocalToolHandler:
   """A real PLANNING_IDENTITY handler over a real ARTIFACT_ONLY ChangeSet."""
 
-  from api.fms.core.change_set import (
+  from fms.core.change_set import (
     ArtifactOnlyPlan,
     ArtifactPayload,
     BaseRevision,
@@ -298,6 +302,8 @@ def test_dispatcher_without_a_route_has_no_ledger_and_refuses_at_the_door(
     role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": _planned_handler(events)},
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
     needs_approval=lambda *_a: True,
     request_approval=None,
   )

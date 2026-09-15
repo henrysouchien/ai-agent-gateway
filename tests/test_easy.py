@@ -6,6 +6,7 @@ import sys
 import threading
 from pathlib import Path
 from uuid import UUID
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -36,6 +37,7 @@ from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProv
 from agent_gateway.skills import SkillStateStore
 from agent_gateway.server import ChatRequest, ChatTurnInputs
 from agent_gateway.server_chat_helpers import prepare_session_driver_turn
+from agent_gateway.policy_imports import configure_server_policy
 from agent_gateway.work_authorization_consumption import (
   WorkAuthorizationConsumptionRecord,
 )
@@ -1331,6 +1333,11 @@ Research deeply.
       },
     ],
   )
+  configure_server_policy(SimpleNamespace(
+    get_local_tool_effect=lambda name: (
+      "read" if name in {"file_read", "web_search"} else None
+    ),
+  ))
 
   session, runtime = _build_runtime(
     app,

@@ -1,7 +1,6 @@
 # ruff: noqa: E402
 
 import asyncio
-import builtins
 import logging
 from datetime import timedelta
 import sys
@@ -18,7 +17,6 @@ PKG_DIR = ROOT / "packages" / "agent-gateway"
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import policy_imports
 import agent_gateway.mcp_client as mcp_client_module
 from agent_gateway.mcp_client import McpClientManager, _ConnectedServerState, _ServerState
 from agent_gateway.mcp_client_connections import McpClientSession
@@ -99,23 +97,6 @@ def _run(coro):
   return asyncio.run(coro)
 
 
-def _install_source_html_resolver(monkeypatch, resolver) -> None:
-  research_module = ModuleType("research")
-  source_html_module = ModuleType("research.source_html")
-  monkeypatch.setattr(
-    source_html_module,
-    "sec_native_symbol_cached_only",
-    resolver,
-    raising=False,
-  )
-  monkeypatch.setattr(
-    research_module,
-    "source_html",
-    source_html_module,
-    raising=False,
-  )
-  monkeypatch.setitem(sys.modules, "research", research_module)
-  monkeypatch.setitem(sys.modules, "research.source_html", source_html_module)
 
 
 def _brk_resolver(value):
@@ -899,28 +880,6 @@ def test_gsheets_read_classification_survives_policy_import_failure_with_base_st
   assert reconnects == ["gsheets_read_range"]
 
 
-def test_policy_owner_invariant_raises_when_policy_import_dependency_breaks(
-  monkeypatch,
-) -> None:
-  def fake_import_module(_name: str):
-    raise ModuleNotFoundError("No module named 'broken_dependency'", name="broken_dependency")
-
-  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
-  manager = McpClientManager(config_path=None)
-  manager._servers = {
-    "portfolio-reads-mcp": _ServerState(
-      name="portfolio-reads-mcp",
-      session=_UnusedClientSession(),
-      exit_contexts=[],
-      tool_definitions=[
-        {"name": "execute_trade", "description": "stale residual", "input_schema": {}},
-      ],
-      tool_names={"execute_trade"},
-    ),
-  }
-
-  with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
-    manager._apply_collision_filtering()
 
 
 def test_policy_owner_invariant_uses_original_name_for_prefixed_tools(monkeypatch) -> None:
@@ -958,8 +917,7 @@ def test_policy_owner_invariant_uses_original_name_for_prefixed_tools(monkeypatc
 
 
 def test_provider_symbol_translation_allows_scalar_symbol_and_ticker_keys(monkeypatch) -> None:
-  _install_source_html_resolver(monkeypatch, _brk_resolver)
-  manager = McpClientManager(config_path=None)
+  manager = McpClientManager(config_path=None, provider_symbol_resolver=_brk_resolver)
   _inject_provider_routes(
     manager,
     ("market-data-mcp", "fetch_financials", "scalar", ("symbol",)),
@@ -990,8 +948,7 @@ def test_provider_symbol_translation_allows_scalar_symbol_and_ticker_keys(monkey
 
 
 def test_provider_symbol_translation_leaves_non_allowlisted_tool_untouched(monkeypatch) -> None:
-  _install_source_html_resolver(monkeypatch, _brk_resolver)
-  manager = McpClientManager(config_path=None)
+  manager = McpClientManager(config_path=None, provider_symbol_resolver=_brk_resolver)
   payload = {"symbol": "BRKB"}
 
   assert manager._translate_provider_symbol(
@@ -1003,8 +960,7 @@ def test_provider_symbol_translation_leaves_non_allowlisted_tool_untouched(monke
 
 
 def test_provider_symbol_translation_uses_original_name_for_prefixed_tool(monkeypatch) -> None:
-  _install_source_html_resolver(monkeypatch, _brk_resolver)
-  manager = McpClientManager(config_path=None)
+  manager = McpClientManager(config_path=None, provider_symbol_resolver=_brk_resolver)
   _inject_provider_routes(
     manager,
     ("edgar-parser-mcp", "get_filings", "scalar", ("ticker",)),
@@ -1047,8 +1003,7 @@ def test_provider_symbol_translation_uses_original_name_for_prefixed_tool(monkey
 
 
 def test_provider_symbol_translation_fmp_profile_dual_key_atomicity(monkeypatch) -> None:
-  _install_source_html_resolver(monkeypatch, _brk_resolver)
-  manager = McpClientManager(config_path=None)
+  manager = McpClientManager(config_path=None, provider_symbol_resolver=_brk_resolver)
   _inject_provider_routes(
     manager,
     (
@@ -1074,8 +1029,7 @@ def test_provider_symbol_translation_fmp_profile_dual_key_atomicity(monkeypatch)
 
 
 def test_provider_symbol_translation_comma_tokens(monkeypatch) -> None:
-  _install_source_html_resolver(monkeypatch, _brk_resolver)
-  manager = McpClientManager(config_path=None)
+  manager = McpClientManager(config_path=None, provider_symbol_resolver=_brk_resolver)
   _inject_provider_routes(
     manager,
     ("market-data-mcp", "get_news", "comma-separated", ("symbols",)),
@@ -1093,7 +1047,6 @@ def test_provider_symbol_translation_comma_tokens(monkeypatch) -> None:
 def test_provider_symbol_translation_never_matches_same_bare_name_on_wrong_server(
   monkeypatch,
 ) -> None:
-  _install_source_html_resolver(monkeypatch, _brk_resolver)
   route = McpInputPreparationRoute(
     logical_server_id="market-data-mcp",
     logical_name="fetch_financials",
@@ -1103,6 +1056,7 @@ def test_provider_symbol_translation_never_matches_same_bare_name_on_wrong_serve
   manager = McpClientManager(
     config_path=None,
     input_preparation_routes=(route,),
+    provider_symbol_resolver=_brk_resolver,
   )
   original = {"symbol": "BRKB"}
 
@@ -1113,9 +1067,8 @@ def test_provider_symbol_translation_never_matches_same_bare_name_on_wrong_serve
   ) is original
 
 
-def test_provider_symbol_translation_excludes_list_nested_and_secondary_fields(monkeypatch) -> None:
-  _install_source_html_resolver(monkeypatch, _brk_resolver)
-  manager = McpClientManager(config_path=None)
+def test_provider_symbol_translation_excludes_list_nested_and_secondary_fields() -> None:
+  manager = McpClientManager(config_path=None, provider_symbol_resolver=_brk_resolver)
   _inject_provider_routes(
     manager,
     ("market-data-mcp", "compare_peers", "scalar", ("symbol",)),
@@ -1186,10 +1139,10 @@ def test_provider_symbol_translation_excludes_list_nested_and_secondary_fields(m
   }
 
 
-def test_provider_symbol_translation_copy_not_mutate_and_retry_reuses_effective_input(monkeypatch) -> None:
-  _install_source_html_resolver(monkeypatch, _brk_resolver)
+def test_provider_symbol_translation_copy_not_mutate_and_retry_reuses_effective_input() -> None:
   manager = McpClientManager(
     config_path=None,
+    provider_symbol_resolver=_brk_resolver,
     logical_server_routes={"market-data-mcp": "fmp-mcp"},
     input_preparation_routes=(
       McpInputPreparationRoute(
@@ -1334,21 +1287,13 @@ def test_call_tool_requires_exact_bool_for_uncertain_replay(value) -> None:
     _run(manager.call_tool("missing", {}, allow_uncertain_replay=value))
 
 
-def test_provider_symbol_translation_import_failure_returns_original(monkeypatch) -> None:
+def test_provider_symbol_translation_without_resolver_preserves_original() -> None:
   manager = McpClientManager(config_path=None)
   _inject_provider_routes(
     manager,
     ("market-data-mcp", "fetch_financials", "scalar", ("symbol",)),
   )
   payload = {"symbol": "BRKB"}
-  real_import = builtins.__import__
-
-  def fail_research_source_html_import(name, globals=None, locals=None, fromlist=(), level=0):
-    if name == "research.source_html":
-      raise ImportError("blocked")
-    return real_import(name, globals, locals, fromlist, level)
-
-  monkeypatch.setattr(builtins, "__import__", fail_research_source_html_import)
 
   assert manager._translate_provider_symbol(
     "market-data-mcp",
@@ -1357,12 +1302,11 @@ def test_provider_symbol_translation_import_failure_returns_original(monkeypatch
   ) is payload
 
 
-def test_provider_symbol_translation_resolver_error_returns_original(monkeypatch) -> None:
+def test_provider_symbol_translation_resolver_error_returns_original() -> None:
   def raising_resolver(_value):
     raise RuntimeError("resolver failed")
 
-  _install_source_html_resolver(monkeypatch, raising_resolver)
-  manager = McpClientManager(config_path=None)
+  manager = McpClientManager(config_path=None, provider_symbol_resolver=raising_resolver)
   _inject_provider_routes(
     manager,
     ("market-data-mcp", "fetch_financials", "scalar", ("symbol",)),

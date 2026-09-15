@@ -6,7 +6,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import logging
 import os
-from pathlib import Path
 import time
 from typing import Any
 import uuid
@@ -46,8 +45,6 @@ class LearningReceiptDelivery:
 
 
 _process_instance_id = f"gateway-{uuid.uuid4().hex}"
-_process_ledger: ForkLedger | None = None
-_process_registry: ForkTaskRegistry | None = None
 
 
 def _nonnegative_env_int(name: str, default: int) -> int:
@@ -210,21 +207,15 @@ def _registry_telemetry(event: str, fields: Mapping[str, Any]) -> None:
   log.info("Learning-fork registry event %s: %s", event, dict(fields))
 
 
-def _default_ledger_path(owner: str) -> Path:
-  import memory
-
-  user_data_dir = Path(memory.get_user_data_dir(owner))
-  return user_data_dir.parent.parent / "fork-ledger.sqlite3"
-
-
 def _runtime_for_runner(
   runner: Any,
   *,
   create: bool,
 ) -> tuple[ForkLedger, ForkTaskRegistry] | None:
-  global _process_ledger, _process_registry
-
   session = _gateway_session(runner)
+  config = getattr(session, "learning_fork_config", None)
+  if config is None:
+    return None
   injected_ledger = getattr(session, "learning_fork_ledger", None)
   injected_registry = getattr(session, "learning_fork_registry", None)
   if isinstance(injected_ledger, ForkLedger) and isinstance(
@@ -232,15 +223,15 @@ def _runtime_for_runner(
     ForkTaskRegistry,
   ):
     return injected_ledger, injected_registry
-  if _process_ledger is not None and _process_registry is not None:
-    return _process_ledger, _process_registry
+  if config._ledger is not None and config._registry is not None:
+    return config._ledger, config._registry
   if not create or session is None:
     return None
 
   from .runner_fork_agents import spawn_learning_fork
 
   ledger = ForkLedger(
-    _default_ledger_path(_owner(session)),
+    config.ledger_path(_owner(session)),
     process_instance_id=_process_instance_id,
   )
   ledger.reconcile_startup(
@@ -252,8 +243,8 @@ def _runtime_for_runner(
     telemetry=_registry_telemetry,
     owner_operated_interactive=True,
   )
-  _process_ledger = ledger
-  _process_registry = registry
+  config._ledger = ledger
+  config._registry = registry
   return ledger, registry
 
 
@@ -367,7 +358,7 @@ def submit_learning_fork_after_turn(
   """Best-effort post-delivery trigger handoff into the process registry."""
 
   session = _gateway_session(runner)
-  if session is None:
+  if session is None or getattr(session, "learning_fork_config", None) is None:
     return None
   try:
     factors, run_context_present, profile = _cohort_factors(runner, session)
@@ -431,6 +422,7 @@ def submit_learning_fork_after_turn(
     work_item = LearningForkWorkItem(
       parent=runner,
       handoff=handoff,
+      config=session.learning_fork_config,
       ledger=ledger,
       session_id=str(session.session_id),
       owner=_owner(session),

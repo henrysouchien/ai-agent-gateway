@@ -5,6 +5,8 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from agent.shared import server_policies
+from .identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
 
 from agent_gateway.capability_binding import (
   CredentialHandle,
@@ -114,6 +116,9 @@ def _make_app(captured: dict[str, Any] | None = None) -> FastAPI:
 
   return create_gateway_app(
     GatewayServerConfig(
+      server_policy=server_policies,
+      identity_resolver=fake_identity_resolver,
+      mcp_user_key_lookup=fake_mcp_user_key_lookup,
       jwt_secret="dispatch-pr5b-test-secret-0123456789",
       valid_api_keys={API_KEY},
       tenant_id="dispatch-pr5b",

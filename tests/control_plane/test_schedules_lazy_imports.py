@@ -6,15 +6,10 @@ import sys
 from pathlib import Path
 
 
-def test_schedules_module_imports_with_stripped_gateway_pythonpath() -> None:
-  repo_root = Path(__file__).resolve().parents[4]
+def test_schedules_module_imports_without_application_pythonpath() -> None:
+  package_root = Path(__file__).resolve().parents[2]
   env = os.environ.copy()
-  env["PYTHONPATH"] = os.pathsep.join(
-    [
-      str(repo_root / "api"),
-      str(repo_root / "packages" / "agent-gateway"),
-    ]
-  )
+  env["PYTHONPATH"] = str(package_root)
 
   completed = subprocess.run(
     [sys.executable, "-c", "import agent_gateway.control_plane.schedules; print('OK')"],

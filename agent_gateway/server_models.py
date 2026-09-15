@@ -82,6 +82,8 @@ from .tool_dispatcher import ApprovalDecision, ApprovalRequest
 from .tool_redaction import get_audit_hmac_key_id, get_audit_hmac_secret
 
 if TYPE_CHECKING:
+  from .control_plane.batches import BatchBackend
+  from .control_plane.schedules import OperatorScheduleBackend
   from .commercial_work_start import (
     CommercialWorkStartContext,
     CommercialWorkStartGate,
@@ -997,9 +999,8 @@ class GatewayServerConfig:
       deriving the static resume fact and execution limits coherently for a
       new skill admission. Resumed admissions inherit persisted facts.
     autonomous_api_dir: Optional application API directory containing the
-      autonomous child entry point and authoritative `user_identity.py`.
-      Applications installed separately from this package must set it
-      explicitly; source-integrated consumers retain the legacy default.
+      autonomous child entry point. Application identity is supplied separately
+      through identity_resolver and mcp_user_key_lookup.
     claim_signing_authority: Process-local claim signer loaded from a one-shot
       descriptor before the gateway application is imported.
     channel_profile_allowlist: Optional mapping from authoritative session
@@ -1031,6 +1032,13 @@ class GatewayServerConfig:
       profiles exposed by the control plane.
     skill_application: Optional opaque application-owned compiled skill view
       passed only to application batch execution. Gateway does not inspect it.
+    batch_backend: Optional application-owned batch execution and persistence.
+    operator_schedule_backend: Optional operator scheduler and jobs API.
+      User-owned agent-run schedules do not require this backend.
+    identity_resolver: Optional canonical account identity resolver shared by
+      interactive, control, and autonomous sessions.
+    mcp_user_key_lookup: Application lookup for the exact MCP key passed into
+      an autonomous child's narrowed credential environment.
     audit_hmac_secret_resolver: Callback returning the approval-audit HMAC
       secret bytes. Defaults to agent_gateway's environment-backed resolver.
     audit_hmac_key_id_resolver: Callback returning the approval-audit HMAC key
@@ -1077,6 +1085,7 @@ class GatewayServerConfig:
   mcp_meta_inject_servers: frozenset[str] | None = None
   tool_registration_catalog: Any | None = None
   tool_policy_implementations: Any | None = None
+  server_policy: Any | None = None
   redaction_context_factory: Callable[[Any], object | None] | None = None
   sdk_config: AgentSDKConfig | None = None
   per_turn_timeout: int = 300
@@ -1114,6 +1123,10 @@ class GatewayServerConfig:
   control_profile_names_provider: ControlProfileNamesProvider | None = None
   control_profile_loader: ControlProfileLoader | None = None
   skill_application: object | None = None
+  batch_backend: BatchBackend | None = None
+  operator_schedule_backend: OperatorScheduleBackend | None = None
+  identity_resolver: Callable[..., Any] | None = None
+  mcp_user_key_lookup: Callable[[str, str | None], dict[str, Any] | None] | None = None
   audit_hmac_secret_resolver: Callable[[], bytes] = get_audit_hmac_secret
   audit_hmac_key_id_resolver: Callable[[], str] = get_audit_hmac_key_id
   tool_input_redactor: Optional[Callable[..., dict[str, Any]]] = None

@@ -458,7 +458,7 @@ def test_projected_stream_rehydrates_terminal_batch_event_after_restart(
     bus = UserEventBus()
     calls: list[tuple[str, str]] = []
 
-    def terminal_event(run_id: str, *, user_id: str) -> dict[str, Any]:
+    def terminal_event(run_id: str, *, app_state: Any, user_id: str) -> dict[str, Any]:
       calls.append((run_id, user_id))
       return {
         "type": "run_state_changed",
@@ -515,7 +515,7 @@ def test_batch_terminal_rehydrate_wakes_already_subscribed_follower(
     monkeypatch.setattr(
       batches_module,
       "terminal_batch_event_for_user",
-      lambda run_id, *, user_id: {
+      lambda run_id, *, app_state, user_id: {
         "type": "run_state_changed",
         "run_id": run_id,
         "control_run_id": run_id,
@@ -527,6 +527,7 @@ def test_batch_terminal_rehydrate_wakes_already_subscribed_follower(
       },
     )
     assert await events_module._seed_batch_replay_buffer(
+      app_state=SimpleNamespace(user_event_bus=bus),
       user_event_bus=bus,
       run_id="batch_17",
       user_id="alice",

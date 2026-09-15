@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
-import sys
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
@@ -127,16 +124,6 @@ def _resolver_contract_error(message: str, *, user_id: str | None) -> JSONRespon
   return JSONResponse(payload, status_code=400)
 
 
-def _user_identity_api() -> Any | None:
-  api_dir = Path(__file__).resolve().parents[4] / "api"
-  if api_dir.exists() and str(api_dir) not in sys.path:
-    sys.path.insert(0, str(api_dir))
-  try:
-    return importlib.import_module("user_identity")
-  except ModuleNotFoundError as exc:
-    if exc.name != "user_identity":
-      raise
-    return None
 
 
 def _fallback_control_identity(
@@ -174,9 +161,9 @@ def _resolve_control_identity(
   user_email: str | None,
   role: str | None,
   channel: str | None,
+  identity_resolver: Callable[..., Any] | None = None,
 ) -> Any:
-  api = _user_identity_api()
-  if api is None:
+  if identity_resolver is None:
     return _fallback_control_identity(
       user_id=user_id,
       risk_user_id=risk_user_id,
@@ -184,16 +171,7 @@ def _resolve_control_identity(
       role=role,
       channel=channel,
     )
-  resolver = getattr(api, "resolve_canonical_user_identity", None)
-  if not callable(resolver):
-    return _fallback_control_identity(
-      user_id=user_id,
-      risk_user_id=risk_user_id,
-      user_email=user_email,
-      role=role,
-      channel=channel,
-    )
-  return resolver(
+  return identity_resolver(
     user_id,
     risk_user_id=risk_user_id,
     user_email=user_email,
@@ -218,6 +196,7 @@ def build_session_router(
   resolver_timeout_seconds: float,
   tenant_id: str | None,
   allow_service_credentials_for_interactive: bool,
+  identity_resolver: Callable[..., Any] | None = None,
   approval_store: Any | None = None,
   approval_policy: Any | None = None,
 ) -> APIRouter:
@@ -324,6 +303,7 @@ def build_session_router(
         user_email=resolved_user_email,
         role=resolved_role,
         channel=resolved_channel,
+        identity_resolver=identity_resolver,
       )
     except (ValueError, SystemExit) as exc:
       return _resolver_contract_error(str(exc), user_id=resolved_user_id)

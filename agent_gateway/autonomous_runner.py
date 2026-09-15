@@ -253,6 +253,8 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     *,
     api_dir: Path,
     tenant_id: str | None = None,
+    identity_resolver: Callable[..., Any] | None = None,
+    mcp_user_key_lookup: Callable[[str, str | None], dict[str, Any] | None] | None = None,
     python_executable: str | None = None,
     log_dir: Path | None = None,
     max_running: int = 2,
@@ -281,6 +283,8 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
   ) -> None:
     self._api_dir = Path(api_dir)
     self._tenant_id = str(tenant_id or "").strip() or None
+    self._identity_resolver = identity_resolver
+    self._mcp_user_key_lookup = mcp_user_key_lookup
     self._python = python_executable or sys.executable
     self._log_dir = (log_dir or Path("~/.cache/agent-gateway/autonomous").expanduser()).expanduser()
     self._max_running = max_running

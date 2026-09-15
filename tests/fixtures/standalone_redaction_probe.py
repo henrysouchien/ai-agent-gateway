@@ -8,7 +8,7 @@ import json
 import logging
 from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -98,25 +98,10 @@ class _Mcp(McpClientManager):
   pass
 
 
-class _HostRedactionModule(ModuleType):
-  @staticmethod
-  def get_audit_hmac_secret() -> bytes:
-    return b"broken-host-secret"
-
-  @staticmethod
-  def redact_tool_input(
-    *_args: object,
-    **_kwargs: object,
-  ) -> dict[str, object]:
-    raise RuntimeError("broken selected host redactor")
 
 
-class _SharedModule(ModuleType):
-  tool_redaction: _HostRedactionModule
 
 
-class _AgentModule(ModuleType):
-  shared: _SharedModule
 
 
 def _execution(provider: OpenAIProvider) -> BoundCapabilityExecution:
@@ -302,46 +287,30 @@ async def _main() -> None:
   logging.getLogger("agent_gateway.runner").addHandler(log_handler)
   logging.getLogger("agent_gateway.runner").setLevel(logging.INFO)
 
-  from agent_gateway import runner_tool_audit
+  packaged = await _run_scenario("packaged", VALID_INPUT)
 
-  secret_loader, packaged_redactor = runner_tool_audit._tool_input_redactor()
-  _ = secret_loader
-  fallback = await _run_scenario("fallback", VALID_INPUT)
+  from agent_gateway import runner_tool_audit, tool_redaction
 
-  agent_module = _AgentModule("agent")
-  agent_module.__path__ = []
-  shared_module = _SharedModule("agent.shared")
-  shared_module.__path__ = []
-  host_redaction_module = _HostRedactionModule(
-    "agent.shared.tool_redaction"
-  )
+  def broken_redactor(*_args: object, **_kwargs: object) -> dict[str, object]:
+    raise RuntimeError("broken redaction projection")
 
-  agent_module.shared = shared_module
-  shared_module.tool_redaction = host_redaction_module
-  sys.modules["agent"] = agent_module
-  sys.modules["agent.shared"] = shared_module
-  sys.modules["agent.shared.tool_redaction"] = host_redaction_module
-
-  broken_valid = await _run_scenario(
-    "broken-valid",
-    VALID_INPUT,
-  )
+  tool_redaction.redact_tool_input = broken_redactor
+  runner_tool_audit.redact_tool_input = broken_redactor
+  broken_valid = await _run_scenario("broken-valid", VALID_INPUT)
   broken_malformed = await _run_scenario(
-    "broken-malformed",
-    {"credential_note": SECRET},
+    "broken-malformed", {"credential_note": SECRET}
   )
   all_logs = log_buffer.getvalue()
   print(json.dumps({
     "agent_gateway_file": str(Path(agent_gateway.__file__).resolve()),
-    "fallback_handler_exact": fallback["handler_inputs"] == [VALID_INPUT],
-    "fallback_history_has_fields": all(
-      marker in fallback["history"]
+    "packaged_handler_exact": packaged["handler_inputs"] == [VALID_INPUT],
+    "packaged_history_has_fields": all(
+      marker in packaged["history"]
       for marker in ("AAPL", "2025-01-01", "2025-01-31")
     ),
-    "fallback_redactor_module": packaged_redactor.__module__,
-    "fallback_surface_has_redaction": "<redacted-secret>" in fallback["surface"],
-    "fallback_surface_has_secret": SECRET in fallback["surface"],
-    "fallback_surface_has_tombstone": "_boundary_error" in fallback["surface"],
+    "packaged_surface_has_redaction": "<redacted-secret>" in packaged["surface"],
+    "packaged_surface_has_secret": SECRET in packaged["surface"],
+    "packaged_surface_has_tombstone": "_boundary_error" in packaged["surface"],
     "broken_malformed_handler_count": len(broken_malformed["handler_inputs"]),
     "broken_malformed_validation_errors": broken_malformed["validation_errors"],
     "broken_surface_has_secret": (

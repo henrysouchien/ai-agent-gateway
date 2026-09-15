@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.18.2 (2026-09-15)
+
+### Fixed
+
+- Removed checkout-tree imports from the wheel, including lazy policy, artifact,
+  batch, schedule, learning-fork, and reviewed-plan paths. Applications now supply
+  their product implementations through explicit runtime configuration.
+- Moved Hank's schema-backed artifact persistence, rendering and routes into the
+  product API. Generic gateway installations no longer require Hank's schema,
+  research, memory, scheduler, or Investment checkout.
+- Added whole-package isolated import coverage against declared dependencies.
+
 ## 0.18.1 (2026-09-15)
 
 ### Fixed

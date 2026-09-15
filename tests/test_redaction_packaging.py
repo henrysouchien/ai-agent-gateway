@@ -78,12 +78,11 @@ def test_installed_wheel_runs_with_packaged_redaction_and_raw_schema_boundary(
   observed = json.loads(completed.stdout)
 
   assert Path(observed["agent_gateway_file"]).is_relative_to(installed)
-  assert observed["fallback_redactor_module"] == "agent_gateway.tool_redaction"
-  assert observed["fallback_handler_exact"] is True
-  assert observed["fallback_history_has_fields"] is True
-  assert observed["fallback_surface_has_redaction"] is True
-  assert observed["fallback_surface_has_secret"] is False
-  assert observed["fallback_surface_has_tombstone"] is False
+  assert observed["packaged_handler_exact"] is True
+  assert observed["packaged_history_has_fields"] is True
+  assert observed["packaged_surface_has_redaction"] is True
+  assert observed["packaged_surface_has_secret"] is False
+  assert observed["packaged_surface_has_tombstone"] is False
   assert observed["logs_have_secret"] is False
   assert observed["broken_valid_handler_exact"] is True
   assert observed["broken_valid_surface_has_tombstone"] is True

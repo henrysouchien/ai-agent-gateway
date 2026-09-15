@@ -3,6 +3,9 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+import json
+import os
+import signal
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -204,7 +207,7 @@ def test_rejected_startup_closes_all_connected_transports(reconnect_transport):
 
 
 @pytest.mark.parametrize("allow_uncertain_replay", [False, True], ids=["future", "replay"])
-def test_delayed_reconnect_keeps_one_live_generation(
+def test_eof_and_delayed_tool_failures_keep_one_live_generation(
   reconnect_transport, allow_uncertain_replay,
 ):
   async def scenario():
@@ -235,7 +238,8 @@ def test_delayed_reconnect_keeps_one_live_generation(
         )))
         await asyncio.wait_for(entered.wait(), timeout=1)
       second = queue(["alpha"], generation=2)
-      third = queue(["alpha"], generation=3)
+      queue(["alpha"], generation=3)
+      manager._servers["first"].stdio_eof.set()
       failure_releases[0].set()
       first_outcome = await asyncio.wait_for(calls[0], timeout=1)
       failure_releases[1].set()
@@ -250,8 +254,6 @@ def test_delayed_reconnect_keeps_one_live_generation(
       assert result == {"tool": "alpha", "generation": 2}
       assert manager._servers["first"].session is second
       assert first.closed and not second.closed
-      if not allow_uncertain_replay:
-        assert third.closed
       assert len([context for context in opened_contexts if not context.closed]) == 2
     finally:
       for release in failure_releases:
@@ -259,6 +261,80 @@ def test_delayed_reconnect_keeps_one_live_generation(
       await asyncio.gather(*calls, return_exceptions=True)
       await manager.shutdown()
     assert all(context.closed for context in opened_contexts)
+
+  asyncio.run(scenario())
+
+
+def test_idle_stdio_child_reconnects_after_generation_swap_and_rollback(tmp_path):
+  server_script = tmp_path / "mcp_server.py"
+  generation_file = tmp_path / "generation"
+  starts = tmp_path / "starts"
+  calls = tmp_path / "calls"
+  server_script.write_text("""
+import json
+import os
+from pathlib import Path
+from mcp.server.fastmcp import FastMCP
+
+generation = Path("generation").read_text()
+identity = {"pid": os.getpid(), "generation": generation, "cwd": os.getcwd()}
+with Path("starts").open("a") as stream:
+    stream.write(json.dumps(identity) + "\\n")
+mcp = FastMCP("generation")
+
+@mcp.tool(name="read_" + generation)
+def read_generation() -> dict:
+    with Path("calls").open("a") as stream:
+        stream.write(generation + "\\n")
+    return identity
+
+mcp.run()
+""")
+  generation_file.write_text("first")
+
+  async def scenario():
+    manager = McpClientManager(config_path=None, inline_servers={
+      "generation": {
+        "command": sys.executable, "args": [str(server_script)], "cwd": str(tmp_path),
+      },
+    })
+    await manager.startup()
+
+    async def wait_for_catalog(tool):
+      async with asyncio.timeout(15):
+        while manager.get_server_for_tool(tool) != "generation":
+          await asyncio.sleep(0.01)
+
+    try:
+      await wait_for_catalog("read_first")
+      first = json.loads(starts.read_text().splitlines()[0])
+      generation_file.write_text("second")
+      os.kill(first["pid"], signal.SIGTERM)
+      await wait_for_catalog("read_second")
+      assert manager.get_server_for_tool("read_first") is None
+      first, second = [json.loads(line) for line in starts.read_text().splitlines()]
+      assert second["pid"] != first["pid"]
+      assert second["cwd"] == str(tmp_path)
+      assert not calls.exists()
+
+      generation_file.write_text("first")
+      os.kill(second["pid"], signal.SIGTERM)
+      await wait_for_catalog("read_first")
+      assert manager.get_server_for_tool("read_second") is None
+      first, second, restored = [json.loads(line) for line in starts.read_text().splitlines()]
+      assert restored["pid"] not in {first["pid"], second["pid"]}
+      assert not calls.exists()
+      result, error = await manager.call_tool("read_first", {})
+      assert error is None
+      assert result == restored
+      assert calls.read_text().splitlines() == ["first"]
+    finally:
+      await manager.shutdown()
+    await asyncio.sleep(0.05)
+    assert len(starts.read_text().splitlines()) == 3
+    for line in starts.read_text().splitlines():
+      with pytest.raises(ProcessLookupError):
+        os.kill(json.loads(line)["pid"], 0)
 
   asyncio.run(scenario())
 

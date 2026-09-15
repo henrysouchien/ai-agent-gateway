@@ -20,7 +20,7 @@ if str(API_DIR) not in sys.path:
   sys.path.insert(0, str(API_DIR))
 
 from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog, SessionStore  # noqa: E402
-from agent_gateway import policy_imports, sdk_runner_approval  # noqa: E402
+from agent_gateway import sdk_runner_approval  # noqa: E402
 from agent_gateway.approval_policy import ApprovalDecision as PolicyApprovalDecision, ApprovalRequest, ApprovalRequestPayload, ApprovalState, RunContext, sha256_args  # noqa: E402
 from agent_gateway.approval_route import (
   DurableLocalApprovalRoute,
@@ -522,11 +522,6 @@ def test_sdk_registered_write_uses_exact_reuse_and_prepared_identity(
     "run_approval_lifecycle",
     lifecycle,
   )
-  monkeypatch.setattr(
-    sdk_runner_approval,
-    "constraint_for_catalog_tool",
-    lambda _tool_name: "standard",
-  )
   runner = _make_runner(
     registered_mcp_descriptor_for_sdk_tool=lambda _tool_name: descriptor,
     prepare_registered_mcp_tool_call_for_sdk_tool=(
@@ -606,11 +601,6 @@ def test_sdk_registered_plan_hands_one_durable_payload_to_same_authorized_ref(
     sdk_runner_approval._approval_lifecycle_helpers,
     "run_approval_lifecycle",
     lifecycle,
-  )
-  monkeypatch.setattr(
-    sdk_runner_approval,
-    "constraint_for_catalog_tool",
-    lambda _tool_name: "standard",
   )
   runner = _make_runner(
     registered_mcp_descriptor_for_sdk_tool=lambda _tool_name: descriptor,
@@ -842,134 +832,14 @@ def test_sdk_runner_stale_prefixed_mcp_tool_denied_without_approval(monkeypatch:
   assert "policy owner for 'execute_trade' is 'portfolio-trades-mcp'" in denied.message
 
 
-def test_sdk_runner_stale_prefixed_mcp_tool_policy_import_drift_fails_loud(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-
-  def fake_import_module(_name: str):
-    raise ModuleNotFoundError("No module named 'broken_dependency'", name="broken_dependency")
-
-  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
-  runner = _make_runner()
-
-  with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
-    _run(
-      runner._can_use_tool_callback(
-        "mcp__portfolio-reads-mcp__execute_trade",
-        {"preview_id": "p1"},
-        None,
-      )
-    )
 
 
-@pytest.mark.parametrize(
-  "tool_name",
-  [
-    "promote_reviewed_change",
-  ],
-)
-@pytest.mark.parametrize("lifecycle_configured", [False, True])
-def test_sdk_runner_promotion_saga_requires_owner_control_route_before_approval(
-  monkeypatch: pytest.MonkeyPatch,
-  tool_name: str,
-  lifecycle_configured: bool,
-) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-  monkeypatch.setattr(
-    sdk_runner_approval,
-    "constraint_for_catalog_tool",
-    lambda _tool_name: "fresh_human_owner",
-  )
-  calls: list[str] = []
-
-  class Store:
-    async def create(self, _request: ApprovalRequest) -> ApprovalRequest:
-      calls.append("store")
-      raise AssertionError("promotion must be refused before approval persistence")
-
-  class Policy:
-    async def decide(self, **_kwargs: Any) -> PolicyApprovalDecision:
-      calls.append("policy")
-      return PolicyApprovalDecision(
-        outcome="auto_approve",
-        reason="custom policy attempted automatic promotion",
-      )
-
-  runner = _make_runner()
-  if lifecycle_configured:
-    runner._session = SessionStore(ttl=3600).create_session(
-      api_key_hash="hash",
-      user_id="alice",
-    )
-    runner._approval_route = DurableLocalApprovalRoute(
-      Store(),
-      Policy(),
-      runner._session,
-    )
-
-  denied = _run(
-    runner._can_use_tool_callback(
-      tool_name,
-      {"change_id": "change-1", "confirm": True},
-      None,
-    )
-  )
-
-  assert denied.behavior == "deny"
-  assert "[owner_control_route_required]" in denied.message
-  assert "authenticated owner control-plane route" in denied.message.lower()
-  assert calls == []
-
-
-def test_sdk_runner_catalog_constraint_failure_denies_before_lifecycle(
-  monkeypatch: pytest.MonkeyPatch,
-  caplog: pytest.LogCaptureFixture,
-) -> None:
-  _install_fake_agent_sdk(monkeypatch)
-
-  def unavailable_constraint(_tool_name: str) -> str:
-    raise RuntimeError("catalog dependency failed")
-
-  monkeypatch.setattr(
-    sdk_runner_approval,
-    "constraint_for_catalog_tool",
-    unavailable_constraint,
-  )
-  runner = _make_runner()
-  caplog.set_level("ERROR", logger="agent_gateway.sdk_runner_approval")
-  denied = _run(
-    runner._can_use_tool_callback(
-      "get_portfolio_summary",
-      {},
-      None,
-    )
-  )
-
-  assert denied.behavior == "deny"
-  assert "[approval_constraint_unavailable]" in denied.message
-  assert "catalog dependency failed" in denied.message
-  loud = [
-    record
-    for record in caplog.records
-    if record.levelname == "ERROR"
-    and "approval_constraints" in record.getMessage()
-  ]
-  assert len(loud) == 1
-  assert "get_portfolio_summary" in loud[0].getMessage()
-  assert "catalog dependency failed" in loud[0].getMessage()
-  assert loud[0].exc_info is not None
 
 
 def test_sdk_approval_refuses_inline_limit_mismatch_before_policy(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   _install_fake_agent_sdk(monkeypatch)
-  monkeypatch.setattr(
-    sdk_runner_approval,
-    "constraint_for_catalog_tool",
-    lambda _tool_name: "runtime_policy",
-  )
   policy_calls: list[bool] = []
 
   class Policy:

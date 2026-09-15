@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, overload, TYPE_CHECKING
+from typing import Any, Literal, overload
 
 from .approval_route import (
   NO_APPROVAL_ROUTE,
@@ -15,11 +15,6 @@ from .tool_dispatcher import (
   ApprovalKeyQualifier,
   ToolDispatcher,
 )
-
-if TYPE_CHECKING:
-  from agent.interactive.tool_dispatcher import ExcelToolDispatcher
-else:
-  ExcelToolDispatcher = Any
 
 
 @dataclass(frozen=True)
@@ -135,7 +130,7 @@ def build_tool_dispatcher(
   registered_approval_overlay: Any = None,
   addin_input_preparation_context_factory: Any = None,
   **passthrough: Any,
-) -> ExcelToolDispatcher: ...
+) -> Any: ...
 
 
 @overload
@@ -166,7 +161,7 @@ def build_tool_dispatcher(
   registered_approval_overlay: Any = None,
   addin_input_preparation_context_factory: Any = None,
   **passthrough: Any,
-) -> ExcelToolDispatcher: ...
+) -> Any: ...
 
 
 @overload
@@ -228,7 +223,7 @@ def build_tool_dispatcher(
   registered_approval_overlay: Any = None,
   addin_input_preparation_context_factory: Any = None,
   **passthrough: Any,
-) -> ToolDispatcher | ExcelToolDispatcher: ...
+) -> Any: ...
 
 
 def build_tool_dispatcher(
@@ -258,7 +253,7 @@ def build_tool_dispatcher(
   registered_approval_overlay: Any = None,
   addin_input_preparation_context_factory: Any = None,
   **passthrough: Any,
-) -> ToolDispatcher | ExcelToolDispatcher:
+) -> Any:
   if (deps.tool_registration_catalog is None) != (
     deps.tool_policy_implementations is None
   ):

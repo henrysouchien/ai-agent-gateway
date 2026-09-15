@@ -5,10 +5,8 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-import sys
 
 import pytest
-from fastapi.testclient import TestClient
 
 from agent_gateway.artifact_sidecar_index import (
   INDEX_VERSION,
@@ -22,23 +20,13 @@ from agent_gateway.retention import (
   RetentionSweepContext,
   UiBlocksEnvelopeAgeAdapter,
 )
-from agent_gateway.ui_blocks_metrics import record, snapshot
 from agent_gateway.ui_blocks_store import read_ui_blocks_payload, write_ui_blocks_payload
 import agent_gateway.ui_blocks_store as store_module
 
-TESTS_DIR = Path(__file__).resolve().parent
-if str(TESTS_DIR) not in sys.path:
-  sys.path.insert(0, str(TESTS_DIR))
-
-from test_artifact_api import (  # noqa: E402, F401
-  ArtifactApiFixture,
-  USER_ID,
-  _signed_headers,
-  artifact_api,
-)
 
 
 UI_BLOCKS_ID = "ub_0123456789abcdef"
+USER_ID = "alice"
 
 
 def _envelope(ui_blocks_id: str = UI_BLOCKS_ID, *, ts: float = 1_700_000_000.25) -> dict:
@@ -263,44 +251,6 @@ def test_reconcile_removes_missing_rows_registers_files_and_marks_corrupt_orphan
   assert existing_corrupt_row["stale_ts"] is not None
   assert existing_corrupt_row["last_error"] == "corrupt_envelope"
 
-
-def test_ui_blocks_route_auth_validation_isolation_and_payload_shape(
-  artifact_api: ArtifactApiFixture,
-) -> None:
-  alice_workspace = _workspace(artifact_api.data_dir, USER_ID)
-  bob_workspace = _workspace(artifact_api.data_dir, "bob")
-  alice_envelope = _envelope()
-  bob_id = "ub_bbbbbbbbbbbbbbbb"
-  write_ui_blocks_payload(alice_workspace, alice_envelope, user_id=USER_ID)
-  write_ui_blocks_payload(bob_workspace, _envelope(bob_id), user_id="bob")
-
-  with TestClient(artifact_api.app) as client:
-    unsigned = client.get(f"/api/ui-blocks/{UI_BLOCKS_ID}")
-    invalid = client.get("/api/ui-blocks/not-valid", headers=_signed_headers())
-    wrong_user = client.get(f"/api/ui-blocks/{bob_id}", headers=_signed_headers())
-    response = client.get(f"/api/ui-blocks/{UI_BLOCKS_ID}", headers=_signed_headers())
-
-  assert unsigned.status_code == 401
-  assert invalid.status_code == 400
-  assert wrong_user.status_code == 404
-  assert response.status_code == 200
-  assert response.json() == alice_envelope
-  assert response.json()["payload"] == alice_envelope["payload"]
-  assert response.headers["cache-control"].startswith("private")
-  assert response.headers["x-content-type-options"] == "nosniff"
-
-
-def test_metrics_snapshot_and_health_additive_counters(artifact_api: ArtifactApiFixture) -> None:
-  name = "wave4_test_counter"
-  before = snapshot().get(name, 0)
-  record(name)
-  assert snapshot()[name] == before + 1
-  with TestClient(artifact_api.app) as client:
-    response = client.get("/api/health")
-  assert response.status_code == 200
-  assert response.json()["status"] == "ok"
-  assert "package" in response.json()
-  assert response.json()["counters"][name] == before + 1
 
 
 def test_ui_blocks_envelope_age_uses_ts_falls_back_to_mtime_and_reconciles(

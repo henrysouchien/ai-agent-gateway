@@ -1,8 +1,8 @@
 """Gateway-local reader for the declarative ``source_identity`` descriptors.
 
 The dispatch record settles at the tool boundary inside ``agent_gateway``,
-which never statically imports ``agent.*`` (policy reads go through
-:mod:`agent_gateway.policy_imports` soft imports).  The api-side extraction
+which never imports product policy modules (policy reads go through
+:mod:`agent_gateway.policy_imports` explicit application binding). The api-side extraction
 chain in ``agent.shared.citation_source_extractors`` therefore cannot be
 called from here, so :mod:`agent_gateway.tool_dispatch_declarations` declares
 *what* a tool's source identity looks like and this module interprets that

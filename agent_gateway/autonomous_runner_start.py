@@ -83,7 +83,6 @@ from .autonomous_runner_state import (
   _normalize_identity_aliases,
   _positive_int,
   _runtime_attr,
-  _user_identity_api,
   autonomous_owner_lease_is_released,
 )
 if TYPE_CHECKING:
@@ -740,23 +739,16 @@ def _create_owner_lifeline() -> tuple[int, int]:
 
 def _narrowed_mcp_gateway_user_keys(
   *,
-  api_dir: Path,
+  mcp_user_key_lookup: Callable[[str, str | None], dict[str, Any] | None] | None,
   user_id: str,
   user_email: str | None,
 ) -> str:
-  try:
-    api = _user_identity_api(api_dir=api_dir)
-  except (Exception, SystemExit) as exc:
+  if mcp_user_key_lookup is None:
     raise RuntimeError(
-      "autonomous spawn refused: user identity API import failed"
-    ) from exc
-  lookup = getattr(api, "get_mcp_user_key_entry", None) if api is not None else None
-  if not callable(lookup):
-    raise RuntimeError(
-      "autonomous spawn refused: user identity API is unavailable"
+      "autonomous spawn refused: MCP user key lookup is not configured"
     )
   try:
-    entry = lookup(user_id, user_email)
+    entry = mcp_user_key_lookup(user_id, user_email)
   except SystemExit as exc:
     raise RuntimeError(
       "autonomous spawn refused: GATEWAY_USER_KEYS is malformed"
@@ -801,56 +793,42 @@ def _start_identity_payload(
   risk_user_id: int | None,
   user_aliases: list[str] | tuple[str, ...] | None,
   identity_status: str | None,
+  identity_resolver: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
   explicit_owner = str(owner_user_id or "").strip() or None
   normalized_slug = str(user_slug or "").strip() or None
   normalized_risk = _positive_int(risk_user_id)
 
-  if explicit_owner is None:
+  if explicit_owner is None and identity_resolver is not None:
     try:
-      api = _user_identity_api()
-    except (Exception, SystemExit) as exc:
-      raise RuntimeError(
-        "autonomous spawn refused: user identity API import failed"
-      ) from exc
-    if TYPE_CHECKING:
-      from user_identity import resolve_canonical_user_identity as resolver
-    else:
-      resolver = (
-        getattr(api, "resolve_canonical_user_identity", None)
-        if api is not None
-        else None
+      identity = identity_resolver(
+        raw_user_id,
+        risk_user_id=risk_user_id,
+        user_email=user_email,
+        mapped_slug=normalized_slug,
+        allow_legacy_fallback=True,
       )
-    if callable(resolver):
-      try:
-        identity = resolver(
-          raw_user_id,
-          risk_user_id=risk_user_id,
-          user_email=user_email,
-          mapped_slug=normalized_slug,
-          allow_legacy_fallback=True,
-        )
-        return {
-          "owner_user_id": str(identity.owner_user_id),
-          "raw_user_id": raw_user_id,
-          "user_slug": identity.user_slug,
-          "risk_user_id": int(identity.risk_user_id),
-          "user_aliases": _normalize_identity_aliases(
-            identity.owner_user_id,
-            identity.raw_user_id,
-            identity.user_slug,
-            identity.user_email,
-            identity.aliases,
-            user_aliases,
-          ),
-          "identity_status": identity_status or str(identity.identity_status),
-        }
-      except SystemExit as exc:
-        raise RuntimeError(
-          "autonomous spawn refused: GATEWAY_USER_KEYS is malformed"
-        ) from exc
-      except ValueError as exc:
-        raise ValueError(f"Unable to resolve canonical autonomous user identity for {raw_user_id!r}") from exc
+      return {
+        "owner_user_id": str(identity.owner_user_id),
+        "raw_user_id": raw_user_id,
+        "user_slug": identity.user_slug,
+        "risk_user_id": int(identity.risk_user_id),
+        "user_aliases": _normalize_identity_aliases(
+          identity.owner_user_id,
+          identity.raw_user_id,
+          identity.user_slug,
+          identity.user_email,
+          identity.aliases,
+          user_aliases,
+        ),
+        "identity_status": identity_status or str(identity.identity_status),
+      }
+    except SystemExit as exc:
+      raise RuntimeError(
+        "autonomous spawn refused: GATEWAY_USER_KEYS is malformed"
+      ) from exc
+    except ValueError as exc:
+      raise ValueError(f"Unable to resolve canonical autonomous user identity for {raw_user_id!r}") from exc
 
   fallback_owner = explicit_owner or (str(normalized_risk) if normalized_risk is not None else raw_user_id)
   fallback_slug = normalized_slug
@@ -884,6 +862,8 @@ class AutonomousRegistryStartMixin:
     )
     _api_dir: Path
     _approval_store: _AutonomousApprovalAckStore | None
+    _identity_resolver: Callable[..., Any] | None
+    _mcp_user_key_lookup: Callable[[str, str | None], dict[str, Any] | None] | None
 
     async def _expire_autonomous_gateway_session(
       self,
@@ -1400,6 +1380,7 @@ class AutonomousRegistryStartMixin:
       if not raw_user_id:
         raise ValueError("user_id is required")
       identity = _start_identity_payload(
+        identity_resolver=self._identity_resolver,
         raw_user_id=raw_user_id,
         user_email=user_email,
         owner_user_id=owner_user_id,
@@ -1791,7 +1772,7 @@ class AutonomousRegistryStartMixin:
         session_token=session_token,
       )
       env["GATEWAY_USER_KEYS"] = _narrowed_mcp_gateway_user_keys(
-        api_dir=self._api_dir,
+        mcp_user_key_lookup=self._mcp_user_key_lookup,
         user_id=child_session.user_id,
         user_email=child_session.user_email,
       )

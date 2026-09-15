@@ -47,7 +47,7 @@ from .secret_boundary import (
   sanitization_failure_tool_input,
 )
 from .skill_limits import reconcile_skill_admission
-from .tool_redaction import resolve_redaction_provider
+from . import tool_redaction as _redaction
 
 if TYPE_CHECKING:
   from .prepared_business_model_store import PreparedBusinessModelChange
@@ -143,7 +143,6 @@ class _ApprovalLifecycleAuthority(
   """The route aggregate needed to reach both lifecycle-local gates."""
 
 
-_redaction = resolve_redaction_provider()
 
 
 _APPROVAL_EXECUTABLE_STATES = frozenset({

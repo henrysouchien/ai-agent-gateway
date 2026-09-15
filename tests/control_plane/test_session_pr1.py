@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
-import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -20,6 +17,9 @@ from agent_gateway.runner import AgentRunner
 from agent_gateway.control_plane import session as control_session_module
 from agent_gateway.control_plane.session import CONTROL_SESSION_TTL_SECONDS
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
+from agent.shared import server_policies
+
+from .identity_helpers import fake_identity_resolver
 
 
 def _unused_runner(
@@ -28,19 +28,6 @@ def _unused_runner(
   _started_at: float,
 ) -> AgentRunner:
   raise AssertionError("control session tests never run a chat turn")
-
-
-def _gateway_user_keys(*, key: str, slug: str, email: str, risk_user_id: int, channel: str) -> str:
-  return json.dumps([
-    {
-      "key": key,
-      "channel": channel,
-      "slug": slug,
-      "email": email,
-      "risk_user_id": risk_user_id,
-      "role": "owner",
-    }
-  ])
 
 
 def test_control_session_lifecycle_create_use_expire_recreate(
@@ -54,16 +41,6 @@ def test_control_session_lifecycle_create_use_expire_recreate(
 ) -> None:
   fake_now = [1_700_000_000]
   monkeypatch.setattr(session_module.time, "time", lambda: fake_now[0])
-  monkeypatch.setenv(
-    "GATEWAY_USER_KEYS",
-    _gateway_user_keys(
-      key=test_api_key,
-      slug=test_user_id,
-      email="tui@example.com",
-      risk_user_id=101,
-      channel=test_channel,
-    ),
-  )
 
   first = client.post(
     control_session_url,
@@ -127,7 +104,7 @@ def test_control_session_lifecycle_create_use_expire_recreate(
   assert second.json()["expires_at"] == fake_now[0] + CONTROL_SESSION_TTL_SECONDS
 
 
-def test_control_session_stores_identity_derived_numeric_risk_user_id_without_resolver() -> None:
+def test_control_session_stores_numeric_identity_without_credentials_resolver() -> None:
   async def _build_chat_runtime(_session, _request, _channel, _auth_manager, *, storage_root: Path | None = None):
     return ChatRuntime(
       system_prompt="test",
@@ -139,9 +116,11 @@ def test_control_session_stores_identity_derived_numeric_risk_user_id_without_re
     GatewayServerConfig(
       jwt_secret="control-plane-test-secret-0123456789",
       valid_api_keys={"legacy-key"},
+      server_policy=server_policies,
       tenant_id="test-product",
       model_registry=INITIAL_MODEL_REGISTRY,
       model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      identity_resolver=fake_identity_resolver,
       build_chat_runtime=_build_chat_runtime,
     )
   )
@@ -166,17 +145,13 @@ def test_control_session_stores_identity_derived_numeric_risk_user_id_without_re
   assert claims["risk_user_id"] == 101
 
 
-def test_control_session_stores_identity_mapped_email_without_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
-  monkeypatch.setenv(
-    "GATEWAY_USER_KEYS",
-    _gateway_user_keys(
-      key="mapped-key",
-      slug="henry",
-      email="henry@example.com",
+def test_control_session_stores_email_from_supplied_identity_resolver() -> None:
+  def resolve_identity(user_id, **_kwargs):
+    return fake_identity_resolver(
+      user_id,
       risk_user_id=1,
-      channel="mcp",
-    ),
-  )
+      user_email="henry@example.com",
+    )
 
   async def _build_chat_runtime(_session, _request, _channel, _auth_manager, *, storage_root: Path | None = None):
     return ChatRuntime(
@@ -189,9 +164,11 @@ def test_control_session_stores_identity_mapped_email_without_resolver(monkeypat
     GatewayServerConfig(
       jwt_secret="control-plane-test-secret-0123456789",
       valid_api_keys={"legacy-key"},
+      server_policy=server_policies,
       tenant_id="test-product",
       model_registry=INITIAL_MODEL_REGISTRY,
       model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      identity_resolver=resolve_identity,
       build_chat_runtime=_build_chat_runtime,
     )
   )
@@ -232,9 +209,7 @@ def test_control_session_channel_mismatch_returns_401(
   assert response.json()["user_id"] == test_user_id
 
 
-def test_control_identity_falls_back_when_imported_helper_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-  monkeypatch.setitem(sys.modules, "user_identity", SimpleNamespace())
-
+def test_control_identity_uses_supplied_metadata_without_resolver() -> None:
   identity = control_session_module._resolve_control_identity(
     user_id="henry",
     risk_user_id=1,

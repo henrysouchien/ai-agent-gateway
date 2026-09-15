@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-import importlib
 import json
 import math
 import re
@@ -15,6 +14,7 @@ from typing import Any, Literal, Mapping, NoReturn, Protocol
 
 from .ui_blocks_run import UiBlocksRunContext, current_ui_blocks_run
 from .skill_limits import SkillExecutionLimits
+from .policy_imports import load_server_policy_module
 
 
 ToolClass = Literal[
@@ -110,26 +110,11 @@ def _require_plain_json(value: Any) -> None:
   raise TypeError(f"unsupported JSON value: {type(value).__name__}")
 
 
-def _reviewed_change_contract() -> Any:
-  """Load the monorepo's dependency-light identity owner on exact-plan paths."""
-
-  module_name = "research.reviewed_change_binding"
-  try:
-    return importlib.import_module(module_name)
-  except ModuleNotFoundError as exc:
-    if exc.name not in {module_name, module_name.split(".")[0]}:
-      raise
-    raise ValueError(
-      "reviewed change identity contract is unavailable"
-    ) from exc
-
-
-def _normalize_review_reference(value: dict[str, Any]) -> dict[str, Any]:
-  contract = _reviewed_change_contract()
-  try:
-    return contract.ReviewReference.from_dict(value).to_dict()
-  except contract.ReviewedChangeBindingError as exc:
-    raise ValueError("review_reference must use the typed review contract") from exc
+def _validate_approval_identity(request: ApprovalRequest) -> None:
+  policy = load_server_policy_module()
+  validator = getattr(policy, "validate_approval_identity", None)
+  if validator is not None:
+    validator(request)
 
 
 def sha256_args(value: Any) -> str:
@@ -361,7 +346,6 @@ class ApprovalRequest:
         canonical_json_strict(self.review_reference)
       except (TypeError, ValueError) as exc:
         raise ValueError("review_reference must contain strict JSON values") from exc
-      self.review_reference = _normalize_review_reference(self.review_reference)
     if self.identity_source == "change_set":
       for label, value in (
         ("change_set_id", self.change_set_id),
@@ -374,6 +358,7 @@ class ApprovalRequest:
         raise ValueError("change_set identity cannot carry a reviewed binding digest")
       if self.execution_semantics_digest is not None:
         raise ValueError("change_set identity cannot carry execution semantics digest")
+      _validate_approval_identity(self)
       return
     for label, value in (
       ("change_hash", self.change_hash),
@@ -392,19 +377,7 @@ class ApprovalRequest:
     ):
       if not isinstance(value, str) or _SHA256_DIGEST_RE.fullmatch(value) is None:
         raise ValueError(f"{label} must be a canonical sha256 digest")
-    contract = _reviewed_change_contract()
-    try:
-      contract.verify_reviewed_change_identity_v1(
-        reviewed_change_binding_digest=self.reviewed_change_binding_digest,
-        change_set_id=self.change_set_id,
-        change_hash=self.change_hash,
-        base_vector_hash=self.base_vector_hash,
-        execution_semantics_digest=self.execution_semantics_digest,
-      )
-    except contract.ReviewedChangeBindingError as exc:
-      raise ValueError(
-        "reviewed binding identity fields are not canonically linked"
-      ) from exc
+    _validate_approval_identity(self)
 
 
 def revalidate_approval_request(request: ApprovalRequest) -> ApprovalRequest:

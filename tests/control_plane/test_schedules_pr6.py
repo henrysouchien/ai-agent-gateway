@@ -31,8 +31,10 @@ from agent_gateway.server import (
 )
 from agent_gateway.skill_limits import SkillExecutionLimits
 from agent_gateway.session import AuthManager, GatewaySession
+from agent.shared import server_policies
 
 from .manifest_helpers import write_v6_manifest
+from .identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
 
 
 API_KEY = "schedules-pr6-key"
@@ -40,7 +42,11 @@ LAUNCHD_PREFIX = "com.henrychien."
 _MODEL_ENTRY = INITIAL_MODEL_REGISTRY.require("anthropic.claude-opus-5")
 
 
-def _make_app(*, dispatch_scope_validator: Any | None = None):
+def _make_app(
+  operator_schedule_backend: schedules_module.OperatorScheduleBackend,
+  *,
+  dispatch_scope_validator: Any | None = None,
+):
   def _unused_runner(*_args: object):
     raise AssertionError("schedule tests never run a chat turn")
 
@@ -64,12 +70,16 @@ def _make_app(*, dispatch_scope_validator: Any | None = None):
   return create_gateway_app(
     GatewayServerConfig(
       jwt_secret="schedules-pr6-test-secret-0123456789",
+      server_policy=server_policies,
       valid_api_keys={API_KEY},
       tenant_id="test-product",
       model_registry=INITIAL_MODEL_REGISTRY,
       model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       build_chat_runtime=_build_chat_runtime,
       dispatch_scope_validator=dispatch_scope_validator,
+      operator_schedule_backend=operator_schedule_backend,
+      identity_resolver=fake_identity_resolver,
+      mcp_user_key_lookup=fake_mcp_user_key_lookup,
     )
   )
 
@@ -330,7 +340,6 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     return {"status": "error", "code": "not_found", "error": f"Schedule not found: {schedule_id}"}
 
   scheduler_fake = types.SimpleNamespace(
-    _PLIST_PREFIX=LAUNCHD_PREFIX,
     schedule_list=schedule_list,
     schedule_show=schedule_show,
     schedule_create=schedule_create,
@@ -345,10 +354,13 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     update_schedule=update_job_schedule,
     delete_schedule=delete_job_schedule,
   )
-  monkeypatch.setattr(schedules_module, "_scheduler_mcp", lambda: scheduler_fake)
-  monkeypatch.setattr(schedules_module, "_jobs_api", lambda: jobs_fake)
 
   return {
+    "backend": schedules_module.OperatorScheduleBackend(
+      scheduler=scheduler_fake,
+      jobs=jobs_fake,
+      label_prefix=LAUNCHD_PREFIX,
+    ),
     "launchd": launchd_store,
     "jobs": jobs_store,
     "calls": calls,
@@ -356,9 +368,7 @@ def fake_schedule_backends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
   }
 
 
-def test_jobs_schedule_list_passes_backend_frequency_through(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_jobs_schedule_list_passes_backend_frequency_through() -> None:
   detail_calls: list[tuple[str, str | None]] = []
   scheduler = types.SimpleNamespace(
     schedule_list=lambda **_kwargs: {
@@ -385,9 +395,12 @@ def test_jobs_schedule_list_passes_backend_frequency_through(
     },
     schedule_show=lambda name, source=None: detail_calls.append((name, source)),
   )
-  monkeypatch.setattr(schedules_module, "_scheduler_mcp", lambda: scheduler)
+  backend = schedules_module.OperatorScheduleBackend(
+    scheduler=scheduler,
+    jobs=types.SimpleNamespace(),
+  )
 
-  schedules = schedules_module._list_schedules("jobs-mcp")
+  schedules = schedules_module._list_schedules("jobs-mcp", backend=backend)
 
   assert [schedule.name for schedule in schedules] == ["novel", "incomplete"]
   first, second = schedules
@@ -398,15 +411,10 @@ def test_jobs_schedule_list_passes_backend_frequency_through(
   assert detail_calls == []
 
 
-def test_launchd_schedule_create_is_rejected_before_backend_resolution(
+def test_launchd_schedule_create_is_rejected_before_backend_call(
   fake_schedule_backends,
-  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  def _unexpected_scheduler_resolution():
-    raise AssertionError("launchd create must fail before resolving the scheduler backend")
-
-  monkeypatch.setattr(schedules_module, "_scheduler_mcp", _unexpected_scheduler_resolution)
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", role="owner")
     headers = _headers(session)
@@ -446,7 +454,7 @@ def test_existing_launchd_schedule_list_show_logs_toggle_delete(fake_schedule_ba
     "last_exit_status": None,
     "recent_log_lines": ["launchd line 1", "launchd line 2"],
   }
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", role="owner")
     headers = _headers(session)
@@ -481,7 +489,7 @@ def test_existing_launchd_schedule_list_show_logs_toggle_delete(fake_schedule_ba
 
 
 def test_jobs_mcp_schedule_create_list_show_toggle_delete(fake_schedule_backends) -> None:
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", role="owner")
     headers = _headers(session)
@@ -587,7 +595,7 @@ def test_operator_schedule_surfaces_are_owner_only(fake_schedule_backends) -> No
     "next_run_at": "2026-06-01T08:15:00Z",
   }
 
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     alice = _control_session(client, "alice", role="owner")
     bob = _control_session(client, "bob", role="invite")
@@ -684,7 +692,7 @@ def test_web_schedule_reads_are_projected_and_raw_fields_redacted(fake_schedule_
     "next_run_at": "2026-06-01T08:15:00Z",
   }
 
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", channel="web", role="owner")
     headers = _headers(session)
@@ -742,7 +750,7 @@ def test_web_schedule_reads_are_projected_and_raw_fields_redacted(fake_schedule_
 
 
 def test_web_raw_schedule_writes_are_rejected_before_backends(fake_schedule_backends) -> None:
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", channel="web", role="owner")
     headers = _headers(session)
@@ -869,7 +877,7 @@ def test_schedule_create_rejects_mixed_case_role(tmp_path: Path) -> None:
 def test_schedule_dispatch_authority_tracks_dispatch_revision_and_enable_gate(
   fake_schedule_backends,
 ) -> None:
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session_payload = _control_session(client, "alice", channel="web")
     headers = _headers(session_payload)
@@ -999,7 +1007,7 @@ def test_schedule_dispatch_authority_tracks_dispatch_revision_and_enable_gate(
 
 
 def test_web_agent_run_schedule_crud_is_safe_and_owner_scoped(fake_schedule_backends) -> None:
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     alice = _control_session(client, "alice", channel="web")
     bob = _control_session(client, "bob", channel="web")
@@ -1248,7 +1256,7 @@ def test_web_agent_run_schedule_create_validates_dispatch_scope(fake_schedule_ba
     seen_scopes.append(dict(scope))
     return canonical_scope
 
-  app = _make_app(dispatch_scope_validator=validator)
+  app = _make_app(fake_schedule_backends["backend"], dispatch_scope_validator=validator)
   with TestClient(app) as client:
     alice = _control_session(client, "alice", channel="web")
     create = client.post(
@@ -1291,7 +1299,7 @@ def test_web_agent_run_schedule_create_rejects_unknown_dispatch_scope(fake_sched
   def validator(_session: Any, _scope: dict[str, Any]) -> None:
     raise ValueError("portfolio not visible")
 
-  app = _make_app(dispatch_scope_validator=validator)
+  app = _make_app(fake_schedule_backends["backend"], dispatch_scope_validator=validator)
   with TestClient(app) as client:
     alice = _control_session(client, "alice", channel="web")
     response = client.post(
@@ -1323,7 +1331,7 @@ def test_web_agent_run_schedule_create_rejects_unknown_dispatch_scope(fake_sched
 
 
 def test_web_agent_run_schedule_rejects_task_mode_dispatch(fake_schedule_backends) -> None:
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", channel="web")
     response = client.post(
@@ -1357,7 +1365,7 @@ def test_operator_raw_schedule_routes_are_not_shadowed_by_owned_agent_schedule(f
     "last_exit_status": None,
     "recent_log_lines": [],
   }
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", role="owner")
     headers = _headers(session)
@@ -1507,7 +1515,7 @@ def test_agent_run_schedule_store_claims_due_records_until_stale(tmp_path: Path)
 def test_per_user_schedule_files_are_isolated_and_one_tick_fires_both_owners(
   fake_schedule_backends: Any,
 ) -> None:
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
 
   class FakeRegistry(AutonomousRegistry):
     def __init__(self) -> None:
@@ -1794,7 +1802,7 @@ def test_agent_run_schedule_runner_rejects_interactive_profile_before_spawn(
 
 
 def test_jobs_mcp_create_contract_rejects_wrong_day_types_and_frequency(fake_schedule_backends) -> None:
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", role="owner")
     headers = _headers(session)

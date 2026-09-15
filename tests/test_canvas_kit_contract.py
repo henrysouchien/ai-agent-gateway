@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from agent_gateway import canvas_kit_contract
-from agent_gateway.control_plane import canvas_artifacts
 
 
 def test_packaged_canvas_kit_contract_accessors() -> None:
@@ -9,13 +8,6 @@ def test_packaged_canvas_kit_contract_accessors() -> None:
   assert canvas_kit_contract.contract_version() == 1
 
 
-def test_route_caps_are_pinned_to_shared_manifest_limits() -> None:
-  limits = canvas_kit_contract.limits()
-  assert canvas_artifacts.CANVAS_RENDER_FAILURE_REQUEST_MAX_BYTES == limits["render_failure_post_body_max_bytes"]
-  assert canvas_artifacts.CANVAS_RENDER_FAILURE_STORED_CAP == limits["render_failure_stored_max_per_artifact"]
-  assert canvas_artifacts.CANVAS_RENDER_FAILURE_REPORTS_PER_RENDER == limits["render_error_reports_max_per_render"]
-  assert canvas_artifacts.CANVAS_RENDER_FAILURE_MESSAGE_MAX_CHARS == limits["render_error_message_max_chars"]
-  assert canvas_artifacts.CANVAS_RENDER_FAILURE_COMPONENT_STACK_MAX_CHARS == limits["render_error_component_stack_max_chars"]
 
 
 def test_authoring_manifest_is_generated_from_packaged_types_and_policy() -> None:

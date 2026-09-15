@@ -1,7 +1,7 @@
 """Exact static dispatch semantics and their legacy gateway projection.
 
-``agent_gateway`` never statically imports ``agent.*`` — every policy read goes
-through :mod:`agent_gateway.policy_imports` soft imports — so the declaration
+``agent_gateway`` never imports product policy modules — every policy read goes
+through :mod:`agent_gateway.policy_imports` explicit application binding — so the declaration
 the dispatch boundary needs lives here, beside the boundary that reads it.
 
 Each row declares, for one tool:

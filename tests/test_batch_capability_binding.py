@@ -1,21 +1,12 @@
 from __future__ import annotations
 
-# ruff: noqa: E402
-
 import asyncio
-import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-
-ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = ROOT / "packages" / "agent-gateway"
-for path in (ROOT, PKG_DIR):
-  if str(path) not in sys.path:
-    sys.path.insert(0, str(path))
 
 from agent_gateway.capability_binding import (
   AuthContext,
@@ -463,8 +454,26 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
         return True
 
     registry = _Registry()
+    controller = _Controller()
     task_registry = batches.BatchTaskRegistry()
     app_state = SimpleNamespace(
+      batch_backend=batches.BatchBackend(
+        registry_for_user=lambda _user_id: registry,
+        controller=controller,
+        open_captured_run_context=controller.open_captured_run_context,
+        terminal_event_payload=lambda batch_id, digest: {
+          "type": "run_state_changed",
+          "run_id": f"batch_{batch_id}",
+          "control_run_id": f"batch_{batch_id}",
+          "batch_id": batch_id,
+          "user_id": digest["user_id"],
+          "state": digest["status"],
+        },
+        active_batch_error=RuntimeError,
+        dispatch_replay=batches.BatchDispatchReplayError,
+        dispatch_rejected=batches.BatchDispatchRejectedError,
+        dispatch_rejection_record=SimpleNamespace,
+      ),
       gateway_config=_config(
         service_handle=service_handle,
         materialized_handles=materialized_handles,
@@ -478,18 +487,6 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
       ),
       autonomous_storage_root=tmp_path,
       gateway_skill_application=object(),
-    )
-    controller = _Controller()
-    monkeypatch.setattr(batches, "_controller", lambda: controller)
-    monkeypatch.setattr(
-      batches,
-      "_captured_run_opener",
-      lambda: controller.open_captured_run_context,
-    )
-    monkeypatch.setattr(
-      batches,
-      "_registry_for_user",
-      lambda _user_id: registry,
     )
     monkeypatch.setattr(
       batches,

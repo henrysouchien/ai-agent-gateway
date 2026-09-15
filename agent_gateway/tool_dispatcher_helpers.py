@@ -1,22 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
-import hashlib
-import importlib
-import json
 import logging
 from collections.abc import Sequence as AbcSequence
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Protocol, Sequence, Tuple, TYPE_CHECKING, TypeGuard
+from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Protocol, Sequence, Tuple, TYPE_CHECKING
 
 from . import approval_settings
 
 if TYPE_CHECKING:
-  from fms.core.change_set import ChangeSet, SnapshotPayload, StoreWritePayload
-  from research.reviewed_change_binding import ReviewedChangeBinding
-
   from .ui_blocks_run import UiBlocksRunContext
 
 class EventLogWriter(Protocol):
@@ -30,6 +22,8 @@ ApprovalKeyQualifier = Callable[[str, Dict[str, Any]], str]
 ToolResult.__doc__ = "Standard tool return type: `(result, error)`."
 
 PlanningIdentity = Literal["change_set", "reviewed_change_binding"]
+TrustedPlanValidator = Callable[[str, object, object], Mapping[str, Any]]
+TrustedPlanReviewRenderer = Callable[[str, object, object], dict[str, Any]]
 
 
 class TrustedToolPlanError(RuntimeError):
@@ -50,258 +44,9 @@ class PlannedWritePlanningRejected(RuntimeError):
     return self.result, self.error
 
 
-_MODEL_STATE_STORE_IDS = frozenset({
-  "valuation_override",
-  "workbook",
-})
 
 
-def _enum_value(value: Any) -> Any:
-  raw = getattr(value, "value", value)
-  return raw if isinstance(raw, (str, int, float, bool)) or raw is None else str(raw)
 
-
-def _effect_review_row(effect: Any) -> dict[str, Any]:
-  payload = effect.payload
-  row: dict[str, Any] = {
-    "effect_id": effect.effect_id,
-    "kind": _enum_value(effect.kind),
-    "criticality": _enum_value(effect.criticality),
-    "depends_on": list(effect.depends_on),
-  }
-  for field_name in (
-    "store_id",
-    "target_key",
-    "research_file_id",
-    "ticker",
-    "proposal_id",
-    "queue",
-    "transaction_key",
-    "target_path",
-    "promotion_id",
-    "base_hash",
-    "target_hash",
-    "expected_content_digest",
-    "op_hash",
-  ):
-    value = getattr(payload, field_name, None)
-    if value is not None:
-      row[field_name] = _enum_value(value)
-  semantic_intent = getattr(payload, "semantic_intent", None)
-  if semantic_intent is not None:
-    row["semantic_intent_digest"] = getattr(
-      semantic_intent,
-      "content_digest",
-      None,
-    )
-  content = getattr(payload, "content", None)
-  if content is not None:
-    row["content_digest"] = getattr(content, "content_digest", None)
-  return row
-
-
-def _workbook_write_review(
-  contract: Any,
-  effect: Any,
-  *,
-  snapshot_store_ids: frozenset[str],
-) -> dict[str, Any]:
-  payload = effect.payload
-  if type(payload) is not contract.StoreWritePayload:
-    raise TrustedToolPlanError("workbook write effect has the wrong payload type")
-  content = payload.content
-  if type(content) is not contract.InlinePayload:
-    raise TrustedToolPlanError(
-      "workbook write approval requires inline exact execution payload"
-    )
-  try:
-    execution = json.loads(content.content.decode("utf-8"))
-  except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-    raise TrustedToolPlanError(
-      "workbook write approval payload is not valid JSON"
-    ) from exc
-  if not isinstance(execution, dict):
-    raise TrustedToolPlanError("workbook write approval payload must be an object")
-  if execution.get("execution_kind") != "canonical_normal_workbook_bundle_v1":
-    raise TrustedToolPlanError(
-      "workbook write approval requires the canonical staged workbook bundle"
-    )
-  if execution.get("workbook_source_target_hash") != payload.target_hash:
-    raise TrustedToolPlanError(
-      "workbook write approval source target does not match the write target"
-    )
-  compute_engine_version = execution.get("compute_engine_version")
-  if not isinstance(compute_engine_version, str) or not compute_engine_version:
-    raise TrustedToolPlanError(
-      "workbook write approval requires a compute engine version"
-    )
-  mutation = execution.get("mutation")
-  if not isinstance(mutation, dict):
-    raise TrustedToolPlanError(
-      "workbook write approval requires an exact mutation object"
-    )
-  operations = mutation.get("operations")
-  if not isinstance(operations, list) or not all(
-    isinstance(operation, dict) for operation in operations
-  ):
-    raise TrustedToolPlanError(
-      "workbook write approval mutation lacks exact operations"
-    )
-  if "expected_readback" in mutation:
-    raise TrustedToolPlanError(
-      "workbook write approval mutation must not duplicate expected readback"
-    )
-  expected_readback = execution.get("expected_readback")
-  if not isinstance(expected_readback, dict):
-    raise TrustedToolPlanError(
-      "workbook write approval requires exact expected readback"
-    )
-
-  exact_bundle: dict[str, str] = {
-    "execution_kind": "canonical_normal_workbook_bundle_v1",
-    "workbook_content_sha256": _verified_bundle_member_sha256(
-      execution,
-      member_name="workbook",
-    ),
-    "sidecar_content_sha256": _verified_bundle_member_sha256(
-      execution,
-      member_name="sidecar",
-    ),
-    "workbook_source_target_hash": payload.target_hash,
-    "compute_engine_version": compute_engine_version,
-  }
-  return {
-    "effect_id": effect.effect_id,
-    "target_key": payload.target_key,
-    "base_hash": payload.base_hash,
-    "target_hash": payload.target_hash,
-    "precommit_snapshot_present": payload.store_id in snapshot_store_ids,
-    "operation_count": len(operations),
-    "mutation": dict(mutation),
-    "exact_bundle": exact_bundle,
-    "execution_payload_digest": content.content_digest,
-    "expected_readback_digest": contract.CanonicalPayload.from_value(
-      expected_readback
-    ).content_digest,
-  }
-
-
-def _verified_bundle_member_sha256(
-  execution: Mapping[str, Any],
-  *,
-  member_name: Literal["workbook", "sidecar"],
-) -> str:
-  encoded = execution.get(f"{member_name}_content_base64")
-  declared_sha256 = execution.get(f"{member_name}_content_sha256")
-  if not isinstance(encoded, str) or not isinstance(declared_sha256, str):
-    raise TrustedToolPlanError(
-      f"workbook write approval lacks exact {member_name} bytes and digest"
-    )
-  try:
-    member_bytes = base64.b64decode(encoded, validate=True)
-  except (binascii.Error, ValueError) as exc:
-    raise TrustedToolPlanError(
-      f"workbook write approval {member_name} bytes are not valid base64"
-    ) from exc
-  if hashlib.sha256(member_bytes).hexdigest() != declared_sha256:
-    raise TrustedToolPlanError(
-      f"workbook write approval {member_name} bytes do not match their digest"
-    )
-  return declared_sha256
-
-
-def _model_writer_undo_review(
-  *,
-  snapshot_store_ids: frozenset[str],
-  model_write_store_ids: frozenset[str],
-) -> dict[str, Any]:
-  # The owner (api/fms/core/persist_runner.py) retired after-commit durable
-  # Undo issuance in 1dac98bc1 ("Cut FMS mutations over to explicit model
-  # scope"); no persist subcommand issues a durable token anymore, so this
-  # review derives availability from the snapshots actually staged in the
-  # exact plan instead of probing a deleted private capability constant.
-  scope = "workbook_and_ticker_override_state"
-  if not model_write_store_ids:
-    return {
-      "scope": scope,
-      "status": "not_required",
-      "reason": "plan_has_no_workbook_or_ticker_override_state_write",
-    }
-  missing_snapshots = sorted(model_write_store_ids.difference(snapshot_store_ids))
-  return {
-    "scope": scope,
-    "status": "not_available_for_this_subcommand",
-    "reason": (
-      "precommit_snapshot_missing"
-      if missing_snapshots
-      else "subcommand_does_not_issue_durable_undo"
-    ),
-    "missing_snapshot_store_ids": missing_snapshots,
-  }
-
-
-def _planning_contract_module_for_identity(
-  identity: object,
-  *module_names: str,
-) -> Any:
-  module_name = type(identity).__module__
-  if module_name not in module_names:
-    raise TrustedToolPlanError("planned-write identity came from an unsupported owner")
-  try:
-    return importlib.import_module(module_name)
-  except ModuleNotFoundError as exc:
-    if exc.name not in {module_name, module_name.split(".")[0]}:
-      raise
-    raise TrustedToolPlanError(
-      "planned-write identity contract is unavailable"
-    ) from exc
-
-def _is_exact_snapshot_payload(
-  payload: object,
-  payload_type: type["SnapshotPayload"],
-) -> TypeGuard["SnapshotPayload"]:
-  return type(payload) is payload_type
-
-
-def _is_exact_store_write_payload(
-  payload: object,
-  payload_type: type["StoreWritePayload"],
-) -> TypeGuard["StoreWritePayload"]:
-  return type(payload) is payload_type
-
-
-def _is_exact_change_set(
-  identity: object,
-  identity_type: type[object],
-) -> TypeGuard["ChangeSet"]:
-  return type(identity) is identity_type
-
-
-def _require_exact_change_set(
-  identity: object,
-  identity_type: type[object],
-) -> "ChangeSet":
-  if not _is_exact_change_set(identity, identity_type):
-    raise TrustedToolPlanError("change_set planner returned the wrong identity type")
-  return identity
-
-
-def _is_exact_reviewed_change_binding(
-  identity: object,
-  identity_type: type[object],
-) -> TypeGuard["ReviewedChangeBinding"]:
-  return type(identity) is identity_type
-
-
-def _require_exact_reviewed_change_binding(
-  identity: object,
-  identity_type: type[object],
-) -> "ReviewedChangeBinding":
-  if not _is_exact_reviewed_change_binding(identity, identity_type):
-    raise TrustedToolPlanError(
-      "reviewed_change_binding planner returned the wrong identity type"
-    )
-  return identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +63,8 @@ class TrustedToolPlan:
   change_set_id: str
   change_hash: str
   base_vector_hash: str
+  validator: TrustedPlanValidator = field(repr=False, compare=False)
+  review_renderer: TrustedPlanReviewRenderer | None = field(default=None, repr=False, compare=False)
   reviewed_change_binding_digest: str | None = None
   review_reference: dict[str, Any] | None = None
   execution_semantics_digest: str | None = None
@@ -329,55 +76,19 @@ class TrustedToolPlan:
     identity_source: str,
     identity: object,
     prepared: object,
+    validator: TrustedPlanValidator,
+    review_renderer: TrustedPlanReviewRenderer | None = None,
   ) -> "TrustedToolPlan":
-    if identity_source == "change_set":
-      contract = _planning_contract_module_for_identity(
-        identity,
-        "fms.core.change_set",
-      )
-      change_set = _require_exact_change_set(identity, contract.ChangeSet)
-      change_set.verify_identity()
-      if getattr(prepared, "change_set", None) is not change_set:
-        raise TrustedToolPlanError("prepared FMS payload is not linked to the exact ChangeSet")
-      return cls(
-        identity_source="change_set",
-        identity=change_set,
-        prepared=prepared,
-        change_set_id=change_set.change_set_id,
-        change_hash=change_set.change_hash,
-        base_vector_hash=contract.compute_base_vector_hash(change_set.base_vector),
-      )
-    if identity_source == "reviewed_change_binding":
-      contract = _planning_contract_module_for_identity(
-        identity,
-        "research.reviewed_change_binding",
-      )
-      reviewed_binding = _require_exact_reviewed_change_binding(
-        identity,
-        contract.ReviewedChangeBinding,
-      )
-      reviewed_binding.verify_identity()
-      if getattr(prepared, "binding", None) is not reviewed_binding:
-        raise TrustedToolPlanError(
-          "prepared reviewed-change payload is not linked to the exact binding"
-        )
-      review_reference = (
-        None
-        if reviewed_binding.review_reference is None
-        else reviewed_binding.review_reference.to_dict()
-      )
-      return cls(
-        identity_source="reviewed_change_binding",
-        identity=reviewed_binding,
-        prepared=prepared,
-        change_set_id=reviewed_binding.change_set_id,
-        change_hash=reviewed_binding.change_hash,
-        base_vector_hash=reviewed_binding.base_vector_hash,
-        reviewed_change_binding_digest=reviewed_binding.reviewed_change_binding_digest,
-        review_reference=review_reference,
-        execution_semantics_digest=reviewed_binding.execution_semantics_digest,
-      )
-    raise TrustedToolPlanError(f"unsupported planning identity: {identity_source!r}")
+    if identity_source not in ("change_set", "reviewed_change_binding"):
+      raise TrustedToolPlanError(f"unsupported planning identity: {identity_source!r}")
+    return cls(
+      identity_source=identity_source,
+      identity=identity,
+      prepared=prepared,
+      validator=validator,
+      review_renderer=review_renderer,
+      **validator(identity_source, identity, prepared),
+    )
 
   def approval_identity(self) -> dict[str, Any]:
     """Return the canonical additive approval-row identity mapping."""
@@ -397,83 +108,12 @@ class TrustedToolPlan:
     }
 
   def approval_review(self) -> dict[str, Any]:
-    """Return a safe operator review derived from the exact executable plan."""
+    """Return the product's operator review of the verified executable plan."""
 
     self.verify_integrity()
-    if self.identity_source != "change_set":
-      raise TrustedToolPlanError(
-        "planned-change approval review requires a ChangeSet identity"
-      )
-    contract = _planning_contract_module_for_identity(
-      self.identity,
-      "fms.core.change_set",
-    )
-    change_set = _require_exact_change_set(
-      self.identity,
-      contract.ChangeSet,
-    )
-    snapshot_store_ids = frozenset(
-      str(payload.store_id)
-      for effect in change_set.effects
-      if _is_exact_snapshot_payload(
-        payload := effect.payload,
-        contract.SnapshotPayload,
-      )
-    )
-    model_write_store_ids = frozenset(
-      str(payload.store_id)
-      for effect in change_set.effects
-      if (
-        _is_exact_store_write_payload(
-          payload := effect.payload,
-          contract.StoreWritePayload,
-        )
-        and str(payload.store_id) in _MODEL_STATE_STORE_IDS
-      )
-    )
-    workbook_writes = [
-      _workbook_write_review(
-        contract,
-        effect,
-        snapshot_store_ids=snapshot_store_ids,
-      )
-      for effect in change_set.effects
-      if (
-        _is_exact_store_write_payload(
-          payload := effect.payload,
-          contract.StoreWritePayload,
-        )
-        and str(payload.store_id) == "workbook"
-      )
-    ]
-    return {
-      "schema_version": "planned-change-review.v1",
-      "change_set_id": change_set.change_set_id,
-      "change_hash": change_set.change_hash,
-      "intent": {"subcommand": change_set.intent.subcommand},
-      "target": {
-        "ticker": change_set.target.ticker,
-        "research_file_id": change_set.target.research_file_id,
-        "workspace": change_set.target.workspace,
-        "scope": _enum_value(change_set.target.scope),
-      },
-      "commit_strategy": _enum_value(change_set.commit_strategy),
-      "effects": [
-        _effect_review_row(effect) for effect in change_set.effects
-      ],
-      "precommit_snapshot_store_ids": sorted(snapshot_store_ids),
-      "workbook": {
-        "will_write": bool(workbook_writes),
-        "operation_count": sum(
-          int(write["operation_count"]) for write in workbook_writes
-        ),
-        "writes": workbook_writes,
-      },
-      "undo": _model_writer_undo_review(
-        snapshot_store_ids=snapshot_store_ids,
-        model_write_store_ids=model_write_store_ids,
-      ),
-    }
+    if self.review_renderer is None:
+      raise TrustedToolPlanError("planned-change approval review renderer is not configured")
+    return self.review_renderer(self.identity_source, self.identity, self.prepared)
 
   def verify_integrity(self) -> None:
     """Reject identity drift, prepared-payload substitution, or carrier mutation."""
@@ -482,6 +122,8 @@ class TrustedToolPlan:
       identity_source=self.identity_source,
       identity=self.identity,
       prepared=self.prepared,
+      validator=self.validator,
+      review_renderer=self.review_renderer,
     )
     comparable_fields = (
       "change_set_id",

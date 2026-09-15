@@ -31,32 +31,18 @@ from agent_gateway.model_registry import (
   INITIAL_MODEL_SELECTION_POLICY,
 )
 
+from .control_plane.identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
+
 
 _HMAC_KEY = "autonomous-runner-event-channel-test-key"
 _TENANT_ID = "autonomous-event-channel-tests"
 
 
 @pytest.fixture(autouse=True)
-def _gateway_user_keys_for_spawn(
+def _session_log_root_for_spawn(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
-  # Autonomous spawn narrows GATEWAY_USER_KEYS to the admitted user's mcp
-  # entry and refuses when none matches; every test here starts as owner-1.
-  # risk_user_id deliberately omitted: canonical identity resolution skips
-  # the entry (owner stays "owner-1"), while the spawn matcher admits it.
-  monkeypatch.setenv(
-    "GATEWAY_USER_KEYS",
-    json.dumps([
-      {
-        "key": "event-channel-test-mcp-key",
-        "channel": "mcp",
-        "slug": "owner-1",
-        "email": "owner@example.test",
-        "role": "owner",
-      }
-    ]),
-  )
   session_log_base = tmp_path / "session-logs"
   session_log_base.mkdir(mode=0o700)
   monkeypatch.setenv(
@@ -64,9 +50,6 @@ def _gateway_user_keys_for_spawn(
     str(session_log_base),
   )
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-# Spawn-time GATEWAY_USER_KEYS narrowing imports user_identity from the
-# registry's api_dir (origin-validated), so the harness registry must point at
-# the real api tree — fake children only write to explicit argv paths.
 _REPO_API_DIR = Path(__file__).resolve().parents[3] / "api"
 _CHILD_IMPORT_PREFIX = (
   "import sys;"
@@ -133,6 +116,8 @@ def _registry(
       "anthropic": _service_credential_handle(),
     },
     autonomous_capability_binding_resolver=_binding,
+    identity_resolver=fake_identity_resolver,
+    mcp_user_key_lookup=fake_mcp_user_key_lookup,
     claim_signing_authority=GatewayClaimSigningAuthority(_HMAC_KEY),
   )
   registry._build_cmd = lambda **_kwargs: [

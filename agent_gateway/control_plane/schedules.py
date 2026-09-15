@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import asyncio
 import hashlib
 import inspect
@@ -11,6 +10,7 @@ import re
 import secrets
 import time as monotonic_time
 
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, Union
@@ -132,18 +132,21 @@ def agent_run_schedule_users_root() -> Path:
   return _user_data_dir("schedule-store-root-probe").parent
 
 
-@functools.cache
-def _scheduler_mcp():
-  from mcp_servers.scheduler_mcp import server
+@dataclass(frozen=True)
+class OperatorScheduleBackend:
+  """Application-supplied operator scheduler and jobs API."""
 
-  return server
+  scheduler: Any
+  jobs: Any
+  label_prefix: str = ""
 
 
-@functools.cache
-def _jobs_api():
-  from investment_tools.jobs import api
-
-  return api
+def _require_operator_backend(
+  backend: OperatorScheduleBackend | None,
+) -> OperatorScheduleBackend:
+  if backend is None:
+    raise HTTPException(status_code=503, detail="Operator schedule backend is not configured")
+  return backend
 
 
 class ScheduleBaseResponse(BaseModel):
@@ -476,18 +479,6 @@ class CreateJobsMcpScheduleRequest(BaseModel):
   day_of_month: StrictInt | None = None
   params: dict[str, Any] = Field(default_factory=dict)
 
-  @field_validator("frequency")
-  @classmethod
-  def _frequency_admitted_by_jobs_backend(cls, value: str) -> str:
-    # The jobs backend owns the frequency vocabulary; admit exactly its set
-    # at the boundary where caller input enters. Resolved lazily so the
-    # autonomous child never imports investment_tools at module import.
-    admitted = _jobs_api().VALID_FREQUENCIES
-    if value not in admitted:
-      raise ValueError(
-        f"frequency must be one of: {', '.join(sorted(admitted))}"
-      )
-    return value
 
 
 CreateScheduleRequest = Annotated[
@@ -1373,20 +1364,21 @@ def _as_string_list(value: Any) -> list[str]:
   return [str(item) for item in value]
 
 
-def _launchd_name(raw: dict[str, Any]) -> str:
+def _launchd_name(raw: dict[str, Any], *, label_prefix: str) -> str:
   if raw.get("name") is not None:
     return str(raw["name"])
   label = str(raw.get("label") or "")
-  prefix = str(getattr(_scheduler_mcp(), "_PLIST_PREFIX", "com.henrychien."))
-  return label[len(prefix):] if label.startswith(prefix) else label
+  return label[len(label_prefix):] if label.startswith(label_prefix) else label
 
 
-def _normalize_operator_schedule(raw: dict[str, Any]) -> OperatorScheduleResponse:
+def _normalize_operator_schedule(
+  raw: dict[str, Any], *, label_prefix: str = "",
+) -> OperatorScheduleResponse:
   source = raw.get("source")
   if source == "launchd":
     return LaunchdScheduleResponse(
       source="launchd",
-      name=_launchd_name(raw),
+      name=_launchd_name(raw, label_prefix=label_prefix),
       label=str(raw.get("label") or ""),
       enabled=bool(raw.get("enabled")),
       schedule_description=str(raw.get("schedule_description") or ""),
@@ -1424,37 +1416,50 @@ def _normalize_schedule(raw: dict[str, Any]) -> ScheduleResponse:
   return _normalize_operator_schedule(raw)
 
 
-def _show_schedule(name: str, *, source: ScheduleSource | None = None) -> OperatorScheduleResponse:
-  result = _scheduler_mcp().schedule_show(name, source=source)
+def _show_schedule(
+  name: str, *, backend: OperatorScheduleBackend | None, source: ScheduleSource | None = None,
+) -> OperatorScheduleResponse:
+  if backend is None:
+    raise HTTPException(status_code=404, detail=f"Schedule not found: {name}")
+  result = backend.scheduler.schedule_show(name, source=source)
   return _normalize_operator_schedule(
-    _require_backend_success(result, action="schedule_show", not_found_status=status.HTTP_404_NOT_FOUND)
+    _require_backend_success(result, action="schedule_show", not_found_status=status.HTTP_404_NOT_FOUND),
+    label_prefix=backend.label_prefix,
   )
 
 
-def _show_schedule_or_none(name: str, *, source: ScheduleSource | None = None) -> OperatorScheduleResponse | None:
+def _show_schedule_or_none(
+  name: str, *, backend: OperatorScheduleBackend | None, source: ScheduleSource | None = None,
+) -> OperatorScheduleResponse | None:
   try:
-    return _show_schedule(name, source=source)
+    return _show_schedule(name, backend=backend, source=source)
   except HTTPException as exc:
     if exc.status_code == status.HTTP_404_NOT_FOUND:
       return None
     raise
 
 
-def _show_jobs_schedule(name: str) -> JobsMcpScheduleResponse:
-  schedule = _show_schedule(name, source="jobs-mcp")
+def _show_jobs_schedule(
+  name: str, *, backend: OperatorScheduleBackend | None,
+) -> JobsMcpScheduleResponse:
+  schedule = _show_schedule(name, backend=backend, source="jobs-mcp")
   if not isinstance(schedule, JobsMcpScheduleResponse):
     raise HTTPException(status_code=400, detail=f"Schedule is not a jobs-mcp schedule: {name}")
   return schedule
 
 
-def _list_schedules(source: ScheduleSource | None) -> list[ScheduleResponse]:
-  result = _scheduler_mcp().schedule_list(source=source)
+def _list_schedules(
+  source: ScheduleSource | None, *, backend: OperatorScheduleBackend | None,
+) -> list[ScheduleResponse]:
+  if backend is None:
+    return []
+  result = backend.scheduler.schedule_list(source=source)
   payload = _require_backend_success(result, action="schedule_list")
   schedules: list[ScheduleResponse] = []
   for raw in payload.get("schedules") or []:
     if not isinstance(raw, dict):
       continue
-    schedules.append(_normalize_operator_schedule(raw))
+    schedules.append(_normalize_operator_schedule(raw, label_prefix=backend.label_prefix))
   return schedules
 
 
@@ -1488,11 +1493,13 @@ def _project_schedule_for_web(schedule: ScheduleResponse | dict[str, Any]) -> Br
 def build_schedules_router(
   *,
   auth: AuthManager,
+  operator_schedule_backend: OperatorScheduleBackend | None = None,
   agent_schedule_store_for: Callable[[object], AgentRunScheduleStore] | None = None,
   agent_schedule_runner: AgentRunScheduleRunner | None = None,
   dispatch_scope_validator: Callable[[Any, dict[str, Any]], Any] | None = None,
 ) -> APIRouter:
   router = APIRouter(prefix="/schedules")
+  backend = operator_schedule_backend
   store_for = agent_schedule_store_for or schedule_store_for
   operator_global_description = (
     "Owner-only operator-global launchd and jobs-mcp schedule management."
@@ -1572,7 +1579,7 @@ def build_schedules_router(
     session = _require_bearer_session(request, auth)
     schedules = []
     if _can_access_operator_schedules(session):
-      schedules = await asyncio.to_thread(_list_schedules, source)
+      schedules = await asyncio.to_thread(_list_schedules, source, backend=backend)
     if source is None:
       owner_user_id = _schedule_owner_user_id(session)
       schedules.extend(
@@ -1600,9 +1607,9 @@ def build_schedules_router(
       owned_schedule = store_for(owner_user_id).get_for_owner(owner_user_id, name)
       if owned_schedule is not None:
         return _project_schedule_for_web(owned_schedule)
-      schedule = _show_schedule(name)
+      schedule = _show_schedule(name, backend=backend)
       return _project_schedule_for_web(schedule)
-    raw_schedule = _show_schedule_or_none(name)
+    raw_schedule = _show_schedule_or_none(name, backend=backend)
     if raw_schedule is not None:
       return raw_schedule
     owned_schedule = store_for(owner_user_id).get_for_owner(owner_user_id, name)
@@ -1631,7 +1638,7 @@ def build_schedules_router(
           "message": "Web Agent Control cannot read raw scheduler logs.",
         },
       )
-    result = _scheduler_mcp().schedule_logs(name, lines=lines)
+    result = _require_operator_backend(backend).scheduler.schedule_logs(name, lines=lines)
     payload = _require_backend_success(result, action="schedule_logs", not_found_status=status.HTTP_404_NOT_FOUND)
     return ScheduleLogsResponse(name=name, log_lines=_as_string_list(payload.get("lines")))
 
@@ -1657,7 +1664,13 @@ def build_schedules_router(
     if payload.source == "launchd":
       raise _launchd_schedule_creation_forbidden()
 
-    result = _jobs_api().create_schedule(
+    jobs = _require_operator_backend(backend).jobs
+    if payload.frequency not in jobs.VALID_FREQUENCIES:
+      raise HTTPException(
+        status_code=422,
+        detail=f"frequency must be one of: {', '.join(sorted(jobs.VALID_FREQUENCIES))}",
+      )
+    result = jobs.create_schedule(
       payload.name,
       payload.job_type,
       payload.frequency,
@@ -1667,7 +1680,7 @@ def build_schedules_router(
       params=payload.params,
     )
     _require_backend_success(result, action="jobs-mcp create_schedule")
-    return ScheduleEnvelopeResponse(schedule=_show_jobs_schedule(payload.name))
+    return ScheduleEnvelopeResponse(schedule=_show_jobs_schedule(payload.name, backend=backend))
 
   @router.patch(
     "/{name}",
@@ -1775,7 +1788,7 @@ def build_schedules_router(
         )
         return ScheduleEnvelopeResponse(schedule=_project_schedule_for_web(updated))
       raise _raw_web_schedule_write_forbidden()
-    schedule = _show_schedule_or_none(name)
+    schedule = _show_schedule_or_none(name, backend=backend)
     if schedule is None:
       owned_schedule = agent_store.get_for_owner(owner_user_id, name)
       if owned_schedule is not None:
@@ -1790,20 +1803,20 @@ def build_schedules_router(
       raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Schedule not found: {name}")
     if isinstance(schedule, LaunchdScheduleResponse):
       result = (
-        _scheduler_mcp().schedule_enable(name)
+        _require_operator_backend(backend).scheduler.schedule_enable(name)
         if payload.enabled
-        else _scheduler_mcp().schedule_disable(name)
+        else _require_operator_backend(backend).scheduler.schedule_disable(name)
       )
       _require_backend_success(result, action="schedule_enable" if payload.enabled else "schedule_disable")
-      return ScheduleEnvelopeResponse(schedule=_show_schedule(name, source="launchd"))
+      return ScheduleEnvelopeResponse(schedule=_show_schedule(name, backend=backend, source="launchd"))
 
-    result = _jobs_api().update_schedule(schedule.schedule_id, enabled=payload.enabled)
+    result = _require_operator_backend(backend).jobs.update_schedule(schedule.schedule_id, enabled=payload.enabled)
     _require_backend_success(
       result,
       action="jobs-mcp update_schedule",
       not_found_status=status.HTTP_404_NOT_FOUND,
     )
-    return ScheduleEnvelopeResponse(schedule=_show_jobs_schedule(name))
+    return ScheduleEnvelopeResponse(schedule=_show_jobs_schedule(name, backend=backend))
 
   @router.delete(
     "/{name}",
@@ -1843,7 +1856,7 @@ def build_schedules_router(
     if not confirm:
       raise HTTPException(status_code=400, detail="confirm=true is required to delete a schedule")
 
-    schedule = _show_schedule_or_none(name)
+    schedule = _show_schedule_or_none(name, backend=backend)
     if schedule is None:
       owned_schedule = agent_store.get_for_owner(owner_user_id, name)
       if owned_schedule is not None:
@@ -1855,11 +1868,11 @@ def build_schedules_router(
         )
       raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Schedule not found: {name}")
     if isinstance(schedule, LaunchdScheduleResponse):
-      result = _scheduler_mcp().schedule_delete(name, confirm=True)
+      result = _require_operator_backend(backend).scheduler.schedule_delete(name, confirm=True)
       _require_backend_success(result, action="schedule_delete", not_found_status=status.HTTP_404_NOT_FOUND)
       return ScheduleDeleteResponse(deleted=True, name=schedule.name, source="launchd")
 
-    result = _jobs_api().delete_schedule(schedule.schedule_id, dry_run=False)
+    result = _require_operator_backend(backend).jobs.delete_schedule(schedule.schedule_id, dry_run=False)
     _require_backend_success(
       result,
       action="jobs-mcp delete_schedule",

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
-import importlib
 import json
 import logging
 import math
@@ -659,36 +658,6 @@ def _normalize_dispatch_scope(value: Any) -> dict[str, Any] | None:
   return normalized
 
 
-def _user_identity_api(*, api_dir: Path | None = None) -> Any | None:
-  explicit_api_dir = api_dir is not None
-  resolved_api_dir = (
-    api_dir.resolve()
-    if api_dir is not None
-    else Path(__file__).resolve().parents[3] / "api"
-  )
-  expected_module_path = resolved_api_dir / "user_identity.py"
-  if explicit_api_dir and not expected_module_path.is_file():
-    return None
-  if resolved_api_dir.exists() and str(resolved_api_dir) not in sys.path:
-    sys.path.insert(0, str(resolved_api_dir))
-  try:
-    module = importlib.import_module("user_identity")
-  except ModuleNotFoundError as exc:
-    if exc.name != "user_identity":
-      raise
-    return None
-  if explicit_api_dir:
-    module_origin = getattr(getattr(module, "__spec__", None), "origin", None)
-    if not isinstance(module_origin, str):
-      module_origin = getattr(module, "__file__", None)
-    if not isinstance(module_origin, str):
-      return None
-    try:
-      if Path(module_origin).resolve() != expected_module_path.resolve():
-        return None
-    except OSError:
-      return None
-  return module
 
 
 def _fallback_identity_payload(

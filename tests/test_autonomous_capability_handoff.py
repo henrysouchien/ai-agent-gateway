@@ -43,6 +43,8 @@ from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )
 
+from .control_plane.identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
+
 
 _SECRET = "autonomous-handoff-test-secret-at-least-32-bytes"
 _API_DIR = Path(__file__).resolve().parents[3] / "api"
@@ -72,17 +74,6 @@ class _FakeProcess:
 def _fake_process_groups(monkeypatch):
   from agent_gateway import autonomous_runner
 
-  monkeypatch.setenv(
-    "GATEWAY_USER_KEYS",
-    json.dumps([{
-      "key": "test-mcp-key",
-      "slug": "",
-      "email": "owner@example.com",
-      "risk_user_id": 42,
-      "channel": "mcp",
-      "role": "owner",
-    }]),
-  )
 
   def fake_getpgid(pid: int) -> int:
     if pid not in _FAKE_PROCESSES:
@@ -220,6 +211,8 @@ def _registry(
       )
     ),
     claim_signing_authority=GatewayClaimSigningAuthority(_SECRET),
+    identity_resolver=fake_identity_resolver,
+    mcp_user_key_lookup=fake_mcp_user_key_lookup,
     **kwargs,
   )
 

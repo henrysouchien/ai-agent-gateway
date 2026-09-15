@@ -56,7 +56,6 @@ DEFAULT_SUBAGENT_RETURN_CONTRACT = "report-base-v1"
 EXPLORE_FINDINGS_RETURN_CONTRACT = "explore-findings-v1"
 VERIFY_FINDING_RETURN_CONTRACT = "verify-finding-v1"
 ARTIFACT_BRIEF_RETURN_CONTRACT = "artifact-brief-v1"
-LEARNING_REPORT_RETURN_CONTRACT = "learning-report-v1"
 TERMINAL_TOOL_RESULT_RETURN_CONTRACT = "terminal-tool-result-v1"
 FUNDAMENTAL_RESEARCH_PROPOSAL_RETURN_CONTRACT = (
   "fundamental-research-proposal-v1"
@@ -76,14 +75,6 @@ REPORT_SERIALIZED_MAX_BYTES = 24_000
 CHILD_EVIDENCE_EXTERNALIZATION_MAX_BYTES = 64 * 1024 * 1024
 CHILD_EVIDENCE_EXTERNALIZATION_MAX_NODES = 100_000
 CHILD_EVIDENCE_EXTERNALIZATION_MAX_DEPTH = 64
-
-def _learning_draft_body_max_bytes() -> int:
-  from agent.skills.authoring.learning_draft import (
-    LEARNING_DRAFT_BODY_MAX_BYTES,
-  )
-
-  return LEARNING_DRAFT_BODY_MAX_BYTES
-
 
 def report_contract_ref(contract_name: str) -> ContractRef:
   """Return the immutable wire identity for one gateway projection contract."""
@@ -551,85 +542,6 @@ class FundamentalResearchProposalReport(ReportBase):
     return value
 
 
-class LearningMemoryWrite(BaseModel):
-  """One immutable learning-memory note claimed by the fork."""
-
-  model_config = ConfigDict(extra="forbid", frozen=True)
-
-  path: NonEmptyReferenceValue
-  summary: FindingClaim
-
-
-class LearningDraftReference(BaseModel):
-  """Reference to a learning draft written by the learning workflow."""
-
-  model_config = ConfigDict(extra="forbid", frozen=True)
-
-  path: NonEmptyReferenceValue
-  draft_status: Literal["clean", "flagged"]
-  findings: list[
-    Literal[
-      "description_too_short",
-      "body_empty",
-      "body_missing_markdown_heading",
-      "amendment_missing_existing_reference",
-    ]
-  ] = Field(
-    default_factory=list,
-    max_length=4,
-  )
-
-
-class LearningSkillDraftCandidate(BaseModel):
-  """Draft proposal before write, or its file reference after write."""
-
-  model_config = ConfigDict(extra="forbid")
-
-  name: Annotated[
-    str,
-    StringConstraints(
-      strip_whitespace=True,
-      min_length=1,
-      max_length=64,
-      pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
-    ),
-  ]
-  description: FindingClaim
-  body: str | LearningDraftReference
-  kind: Literal["new_skill", "amendment"]
-  references_existing: NonEmptyReferenceValue | None = None
-
-  @field_validator("body")
-  @classmethod
-  def _bound_raw_draft_body(
-    cls,
-    value: str | LearningDraftReference,
-  ) -> str | LearningDraftReference:
-    if isinstance(value, str):
-      body_size = len(value.encode("utf-8"))
-      body_max_bytes = _learning_draft_body_max_bytes()
-      if body_size > body_max_bytes:
-        raise ValueError(
-          "body exceeds "
-          f"{body_max_bytes} raw UTF-8 bytes ({body_size})"
-        )
-    return value
-
-
-class LearningReport(ReportBase):
-  """Structured outcome of a post-session self-learning fork."""
-
-  model_config = ConfigDict(extra="forbid")
-
-  decision: Literal["memory_update", "skill_draft", "both", "no_op"]
-  memory_writes: list[LearningMemoryWrite] = Field(
-    default_factory=list,
-    max_length=REPORT_ARTIFACTS_MAX_ITEMS,
-  )
-  skill_draft_candidate: LearningSkillDraftCandidate | None = None
-  rationale: SummaryText
-
-
 def _evidence_fits_externalization_bound(
   *,
   usage: Mapping[str, Any] | None,
@@ -909,11 +821,6 @@ __all__ = [
   "FUNDAMENTAL_RESEARCH_PROPOSAL_RETURN_CONTRACT",
   "FundamentalResearchProposalReport",
   "FmsArtifactReference",
-  "LEARNING_REPORT_RETURN_CONTRACT",
-  "LearningDraftReference",
-  "LearningMemoryWrite",
-  "LearningReport",
-  "LearningSkillDraftCandidate",
   "PlanJournalReference",
   "REPORT_ARTIFACTS_MAX_ITEMS",
   "REPORT_CAVEATS_MAX_ITEMS",

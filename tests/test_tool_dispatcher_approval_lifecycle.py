@@ -63,7 +63,11 @@ from agent_gateway.tool_definition import LiveToolRouteBinding, OriginatedToolDe
 from agent_gateway.tool_registration import RegisteredMcpToolDescriptor
 from agent_gateway.tool_policy_registry import PlanDecision, PreparedToolCall
 from agent_workflow_contracts.tool_registration import RegisteredToolIdentity
-from api.fms.core.change_set import (
+from agent.shared.trusted_plans import (
+  render_trusted_tool_plan_review,
+  validate_trusted_tool_plan,
+)
+from fms.core.change_set import (
   ArtifactOnlyPlan,
   ArtifactPayload,
   BaseRevision,
@@ -299,42 +303,13 @@ def test_tool_dispatcher_resolve_tool_class_uses_policy_owner(
     else None,
   )
 
-  monkeypatch.setattr(
-    policy_imports.importlib,
-    "import_module",
-    lambda name: policy_module if name == "agent.shared.server_policies" else None,
-  )
+  policy_imports.configure_server_policy(policy_module)
 
-  dispatcher = ToolDispatcher(mcp_client=_NullMcp(), local_tool_handlers={}, event_log=EventLog())
+  dispatcher = ToolDispatcher(mcp_client=_NullMcp(), local_tool_handlers={}, event_log=EventLog(), plan_validator=validate_trusted_tool_plan, plan_review_renderer=render_trusted_tool_plan_review)
 
   assert dispatcher._resolve_tool_class("execute_trade") == "irreversible"
 
 
-def test_tool_dispatcher_resolve_tool_class_preserves_parent_policy_resolver_seam(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  calls: list[dict[str, Any]] = []
-
-  def fake_resolve_server_policy_tool_class(tool_name: str, **kwargs: Any) -> str:
-    calls.append({"tool_name": tool_name, **kwargs})
-    return "artifact_write"
-
-  monkeypatch.setattr(
-    dispatcher_module,
-    "resolve_server_policy_tool_class",
-    fake_resolve_server_policy_tool_class,
-  )
-  dispatcher = ToolDispatcher(mcp_client=_NullMcp(), local_tool_handlers={}, event_log=EventLog())
-
-  assert dispatcher._resolve_tool_class("emit_artifact") == "artifact_write"
-  assert calls == [
-    {
-      "tool_name": "emit_artifact",
-      "policy_tool_name": "emit_artifact",
-      "runtime_server": None,
-      "default": "",
-    }
-  ]
 
 
 def test_tool_dispatcher_resolve_tool_class_does_not_require_mcp_lookup_methods(
@@ -350,16 +325,14 @@ def test_tool_dispatcher_resolve_tool_class_does_not_require_mcp_lookup_methods(
     else None,
   )
 
-  monkeypatch.setattr(
-    policy_imports.importlib,
-    "import_module",
-    lambda name: policy_module if name == "agent.shared.server_policies" else None,
-  )
+  policy_imports.configure_server_policy(policy_module)
 
   dispatcher = ToolDispatcher(
     mcp_client=_NoMcpLookup(),  # pyright: ignore[reportArgumentType]  # negative: MCP lookup absence is the behavior under test
     local_tool_handlers={},
     event_log=EventLog(),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   assert dispatcher._resolve_tool_class("record_workflow_action") == "state_write"
@@ -378,13 +351,9 @@ def test_tool_dispatcher_resolve_tool_class_uses_original_name_for_prefixed_mcp_
     else None,
   )
 
-  monkeypatch.setattr(
-    policy_imports.importlib,
-    "import_module",
-    lambda name: policy_module if name == "agent.shared.server_policies" else None,
-  )
+  policy_imports.configure_server_policy(policy_module)
 
-  dispatcher = ToolDispatcher(mcp_client=_PrefixedMcp(), local_tool_handlers={}, event_log=EventLog())
+  dispatcher = ToolDispatcher(mcp_client=_PrefixedMcp(), local_tool_handlers={}, event_log=EventLog(), plan_validator=validate_trusted_tool_plan, plan_review_renderer=render_trusted_tool_plan_review)
 
   assert dispatcher._resolve_tool_class("trades_execute_trade") == "irreversible"
 
@@ -402,46 +371,20 @@ def test_tool_dispatcher_resolve_tool_class_uses_policy_owner_after_split_runtim
     else None,
   )
 
-  monkeypatch.setattr(
-    policy_imports.importlib,
-    "import_module",
-    lambda name: policy_module if name == "agent.shared.server_policies" else None,
-  )
+  policy_imports.configure_server_policy(policy_module)
 
-  dispatcher = ToolDispatcher(mcp_client=_PrefixedMcp(), local_tool_handlers={}, event_log=EventLog())
+  dispatcher = ToolDispatcher(mcp_client=_PrefixedMcp(), local_tool_handlers={}, event_log=EventLog(), plan_validator=validate_trusted_tool_plan, plan_review_renderer=render_trusted_tool_plan_review)
 
   assert dispatcher._resolve_tool_class("trades_execute_trade") == "irreversible"
 
 
-def test_tool_dispatcher_resolve_tool_class_falls_back_when_policy_modules_absent(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  def fake_import_module(name: str) -> Any:
-    if name == "agent.shared.server_policies":
-      raise ModuleNotFoundError("No module named 'agent'", name="agent")
-    if name == "api.agent.shared.server_policies":
-      raise ModuleNotFoundError("No module named 'api'", name="api")
-    raise AssertionError(f"unexpected import: {name}")
-
-  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
-  dispatcher = ToolDispatcher(mcp_client=_NullMcp(), local_tool_handlers={}, event_log=EventLog())
+def test_tool_dispatcher_resolve_tool_class_falls_back_without_bound_policy() -> None:
+  policy_imports.configure_server_policy(None)
+  dispatcher = ToolDispatcher(mcp_client=_NullMcp(), local_tool_handlers={}, event_log=EventLog(), plan_validator=validate_trusted_tool_plan, plan_review_renderer=render_trusted_tool_plan_review)
 
   assert dispatcher._resolve_tool_class("unmapped_tool") == "state_write"
 
 
-def test_tool_dispatcher_resolve_tool_class_raises_when_policy_import_dependency_breaks(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  def fake_import_module(_name: str) -> Any:
-    raise ModuleNotFoundError("No module named 'broken_dependency'", name="broken_dependency")
-
-  # Construct first: since S1 fail-closed roles, __init__ resolves the
-  # effective role through the policy import machinery being broken here.
-  dispatcher = ToolDispatcher(mcp_client=_NullMcp(), local_tool_handlers={}, event_log=EventLog())
-  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
-
-  with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
-    dispatcher._resolve_tool_class("execute_trade")
 
 
 def test_tool_dispatcher_resolve_tool_class_raises_when_policy_module_lacks_class_helper(
@@ -454,12 +397,8 @@ def test_tool_dispatcher_resolve_tool_class_raises_when_policy_module_lacks_clas
     else None,
   )
 
-  monkeypatch.setattr(
-    policy_imports.importlib,
-    "import_module",
-    lambda name: policy_module if name == "agent.shared.server_policies" else None,
-  )
-  dispatcher = ToolDispatcher(mcp_client=_NullMcp(), local_tool_handlers={}, event_log=EventLog())
+  policy_imports.configure_server_policy(policy_module)
+  dispatcher = ToolDispatcher(mcp_client=_NullMcp(), local_tool_handlers={}, event_log=EventLog(), plan_validator=validate_trusted_tool_plan, plan_review_renderer=render_trusted_tool_plan_review)
 
   with pytest.raises(AttributeError, match="get_tool_class"):
     dispatcher._resolve_tool_class("execute_trade")
@@ -858,6 +797,8 @@ def test_tool_dispatcher_pending_approval_wrapper_threads_instance_state(monkeyp
     local_tool_handlers={},
     event_log=EventLog(),
     approval_route=DurableLocalApprovalRoute("store", "policy", session),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
   request = _request()
   decision = _decision()
@@ -942,6 +883,8 @@ def test_native_approval_store_event_are_sanitized_while_policy_and_execution_re
         channel="web",
         decider_role="owner",
       ),
+      plan_validator=validate_trusted_tool_plan,
+      plan_review_renderer=render_trusted_tool_plan_review,
     )
     dispatcher.bind_secret_boundary(SecretBoundary((secret,)))
     task = asyncio.create_task(
@@ -1014,6 +957,8 @@ def test_dispatcher_owned_event_projection_removes_exact_secret() -> None:
         "additionalProperties": False,
       },
     }],
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
   dispatcher.bind_secret_boundary(SecretBoundary((secret,)))
 
@@ -1046,6 +991,8 @@ def test_tool_dispatcher_run_approval_lifecycle_wrapper_threads_instance_state(m
     local_tool_handlers={},
     event_log=EventLog(),
     approval_route=route,
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result = asyncio.run(
@@ -1256,6 +1203,8 @@ def test_requires_approval_includes_durable_planned_write_wait() -> None:
       object(),
       _planned_session(),
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   assert dispatcher.requires_approval("planned_tool", {"x": 1}) is True
@@ -1353,6 +1302,8 @@ def test_fms_business_model_non_accept_uses_generic_exact_plan() -> None:
     identity_source="change_set",
     identity=change_set,
     prepared=gateway_prepared,
+    validator=validate_trusted_tool_plan,
+    review_renderer=render_trusted_tool_plan_review,
   )
 
   assert ToolDispatcher._prepared_business_model_authorization(
@@ -1403,6 +1354,8 @@ def test_fms_business_model_approval_row_uses_prepared_owner_scope(
       channel="cli",
       decider_role="owner",
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   _result, error = asyncio.run(
@@ -1479,6 +1432,8 @@ def test_fms_business_model_exact_write_persists_attempt_lifecycle(
       channel="web",
       decider_role="owner",
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   _result, error = asyncio.run(
@@ -1589,6 +1544,8 @@ def test_fms_business_model_missing_restoration_proof_does_not_supersede(
       channel="web",
       decider_role="owner",
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -1682,6 +1639,8 @@ def test_fms_business_model_pending_record_reconciles_original_approval(
       channel="web",
       decider_role="owner",
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   first_result, first_error = asyncio.run(
@@ -1834,6 +1793,8 @@ def test_batch_admission_cancel_between_pending_commit_and_publish_cleans_all_re
         channel="tui",
         decider_role="owner",
       ),
+      plan_validator=validate_trusted_tool_plan,
+      plan_review_renderer=render_trusted_tool_plan_review,
     )
     original_enqueue = store.enqueue_pending_approval_notification
     pending_committed = asyncio.Event()
@@ -1954,6 +1915,8 @@ def test_batch_admission_requires_cleanup_store_contract(
         channel="tui",
         decider_role="owner",
       ),
+      plan_validator=validate_trusted_tool_plan,
+      plan_review_renderer=render_trusted_tool_plan_review,
     )
 
     with pytest.raises(
@@ -2041,6 +2004,8 @@ def test_planned_dispatch_persists_identity_and_executes_exact_objects(
       channel="web",
       decider_role="owner",
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -2095,6 +2060,8 @@ def test_planned_dispatch_releases_private_snapshot_when_executor_raises(
       Policy(),
       _planned_session(),
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   with pytest.raises(RuntimeError, match="execution failed"):
@@ -2133,6 +2100,8 @@ def test_planned_dispatch_session_cache_still_creates_bound_row(tmp_path: Path) 
       Policy(),
       _planned_session(),
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -2167,6 +2136,8 @@ def test_planned_dispatch_persistent_grant_still_creates_bound_row(
       policy,
       _planned_session(),
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
   scope_hint = f"{dispatcher._resolve_tool_class('planned')}:planned"
   prior_approval = replace(
@@ -2255,6 +2226,8 @@ def test_planned_dispatch_headless_denial_still_creates_bound_row(tmp_path: Path
       Policy(),
       _planned_session(),
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -2299,6 +2272,8 @@ def test_planned_dispatch_headless_autonomous_allow_creates_bound_row(
       Policy(),
       _planned_session(),
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -2356,6 +2331,8 @@ def test_planned_dispatch_timeout_preserves_bound_row_and_skips_executor(
       Policy(),
       session,
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -2398,6 +2375,8 @@ def test_planned_dispatch_fails_closed_without_an_admitted_route(
     local_tool_handlers={"planned": handler},
     needs_approval=lambda *_args: True,
     request_approval=callback,
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   assert isinstance(dispatcher._approval_route, NoApprovalRoute)
@@ -2526,6 +2505,8 @@ def test_registered_raw_patch_nonplanning_inputs_execute_without_approval(
     tool_policy_implementations=composition.policy_implementations,
     approval_predicate_context_factory=lambda *_args: None,
     redaction_context_factory=product_redaction_context_factory,
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -2542,172 +2523,21 @@ def test_registered_raw_patch_nonplanning_inputs_execute_without_approval(
   assert calls == [tool_input]
 
 
-def _missing_catalog_module(name: str) -> ModuleNotFoundError:
-  return ModuleNotFoundError(f"No module named {name!r}", name=name)
 
 
-def _catalog_module(*tool_names: str) -> SimpleNamespace:
-  return SimpleNamespace(
-    ACTION_CATALOG=tuple(
-      SimpleNamespace(
-        local_tool_name=tool_name,
-        planning_identity="change_set",
-      )
-      for tool_name in tool_names
-    )
-  )
-
-
-def test_catalog_planning_identity_prefers_fms_layout(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  calls: list[str] = []
-
-  def fake_import_module(name: str) -> Any:
-    calls.append(name)
-    if name != "fms.action_catalog":
-      raise AssertionError("the fallback catalog must not be merged")
-    return _catalog_module("planned")
-
-  monkeypatch.setattr(dispatcher_module, "import_module", fake_import_module)
-
-  assert ToolDispatcher._catalog_planning_identity("planned") == "change_set"
-  assert calls == ["fms.action_catalog"]
-
-
-@pytest.mark.parametrize("missing_name", ["fms", "fms.action_catalog"])
-def test_catalog_planning_identity_fails_closed_when_catalog_layout_is_absent(
-  monkeypatch: pytest.MonkeyPatch,
-  missing_name: str,
-) -> None:
-  calls: list[str] = []
-
-  def fake_import_module(name: str) -> Any:
-    calls.append(name)
-    raise _missing_catalog_module(missing_name)
-
-  monkeypatch.setattr(dispatcher_module, "import_module", fake_import_module)
-
-  with pytest.raises(
-    dispatcher_module.TrustedToolPlanError,
-    match="trusted FMS action catalog is unavailable",
-  ):
-    ToolDispatcher._catalog_planning_identity("planned")
-  assert calls == ["fms.action_catalog"]
-
-
-def test_catalog_planning_identity_rethrows_nested_dependency_failure(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  error = _missing_catalog_module("catalog_dependency")
-  calls: list[str] = []
-
-  def fake_import_module(name: str) -> Any:
-    calls.append(name)
-    raise error
-
-  monkeypatch.setattr(dispatcher_module, "import_module", fake_import_module)
-
-  with pytest.raises(ModuleNotFoundError) as exc_info:
-    ToolDispatcher._catalog_planning_identity("planned")
-  assert exc_info.value is error
-  assert calls == ["fms.action_catalog"]
-
-
-def test_catalog_planning_identity_rethrows_other_import_failure(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  error = RuntimeError("catalog import failed")
-
-  def fake_import_module(_name: str) -> Any:
-    raise error
-
-  monkeypatch.setattr(dispatcher_module, "import_module", fake_import_module)
-
-  with pytest.raises(RuntimeError) as exc_info:
-    ToolDispatcher._catalog_planning_identity("planned")
-  assert exc_info.value is error
-
-
-def test_loaded_catalog_true_miss_does_not_consult_fallback(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  calls: list[str] = []
-
-  def fake_import_module(name: str) -> Any:
-    calls.append(name)
-    if name != "fms.action_catalog":
-      raise AssertionError("a loaded catalog miss must be authoritative")
-    return _catalog_module()
-
-  monkeypatch.setattr(dispatcher_module, "import_module", fake_import_module)
-
-  assert ToolDispatcher._catalog_planning_identity("ordinary") is None
-  assert calls == ["fms.action_catalog"]
-
-
-def test_loaded_catalog_duplicate_row_remains_a_typed_contract_error(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  monkeypatch.setattr(
-    dispatcher_module,
-    "import_module",
-    lambda _name: _catalog_module("planned", "planned"),
-  )
-
-  with pytest.raises(
-    dispatcher_module.TrustedToolPlanError,
-    match="duplicate local tool",
-  ):
-    ToolDispatcher._catalog_planning_identity("planned")
-
-
-def test_missing_catalog_blocks_even_generic_local_handler(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  calls: list[str] = []
-
-  def fake_import_module(name: str) -> Any:
-    missing_name = "fms" if name == "fms.action_catalog" else "api"
-    raise _missing_catalog_module(missing_name)
-
-  async def handler(*_args: Any, **_kwargs: Any):
-    calls.append("handler")
-    return {"status": "unexpected"}, None
-
-  monkeypatch.setattr(dispatcher_module, "import_module", fake_import_module)
-  dispatcher = ToolDispatcher(
-    role="owner",
-    mcp_client=_NullMcp(),
-    local_tool_handlers={"ordinary": handler},
-  )
-
-  result, error = asyncio.run(dispatcher.dispatch("call-ordinary", "ordinary", {}))
-
-  assert result is None
-  assert error is not None
-  assert error["code"] == "planned_write_contract_invalid"
-  assert calls == []
-
-
-def test_loaded_catalog_true_miss_preserves_generic_local_handler(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_configured_catalog_miss_preserves_generic_local_handler() -> None:
   calls: list[str] = []
 
   async def handler(*_args: Any, **_kwargs: Any):
     calls.append("handler")
     return {"status": "ok"}, None
 
-  monkeypatch.setattr(
-    dispatcher_module,
-    "import_module",
-    lambda _name: _catalog_module(),
-  )
   dispatcher = ToolDispatcher(
     role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"ordinary": handler},
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(dispatcher.dispatch("call-ordinary", "ordinary", {}))
@@ -2717,79 +2547,6 @@ def test_loaded_catalog_true_miss_preserves_generic_local_handler(
   assert calls == ["handler"]
 
 
-@pytest.mark.parametrize(
-  "approval_path",
-  ["session_cache", "headless", "custom_auto", "no_lifecycle"],
-)
-def test_promotion_saga_generic_dispatch_requires_owner_control_route_before_approval_paths(
-  tmp_path: Path,
-  approval_path: str,
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  calls: list[str] = []
-
-  async def handler(*_args: Any, **_kwargs: Any):
-    calls.append("handler")
-    return {"status": "unexpected"}, None
-
-  class Store(SQLiteApprovalStore):
-    async def create(self, request):
-      calls.append("store")
-      return await super().create(request)
-
-  class Policy:
-    policy_id = "promotion-test"
-    policy_version = "1"
-    policy_bundle_hash = "promotion-test-bundle"
-
-    async def decide(self, **_kwargs: Any):
-      calls.append("policy")
-      return PolicyApprovalDecision(
-        outcome="auto_approve",
-        reason="custom policy attempted automatic promotion",
-      )
-
-    async def on_resolve(self, **_kwargs: Any):
-      calls.append("resolve")
-
-  dispatcher_kwargs: dict[str, Any] = {
-    "mcp_client": _NullMcp(),
-    "role": "owner",
-    "local_tool_handlers": {"promote_reviewed_change": handler},
-    "needs_approval": lambda *_args: approval_path != "no_lifecycle",
-  }
-  monkeypatch.setattr(
-    dispatcher_module,
-    "constraint_for_catalog_action",
-    lambda _action: "fresh_human_owner",
-  )
-  if approval_path != "no_lifecycle":
-    dispatcher_kwargs.update(
-      approval_route=DurableLocalApprovalRoute(
-        Store(tmp_path / "approvals.sqlite3"),
-        Policy(),
-        _planned_session(),
-      ),
-    )
-  if approval_path == "session_cache":
-    dispatcher_kwargs["approved_tool_types"] = {"promote_reviewed_change"}
-  if approval_path == "headless":
-    dispatcher_kwargs["should_avoid_permission_prompts"] = True
-
-  dispatcher = ToolDispatcher(**dispatcher_kwargs)
-  result, error = asyncio.run(
-    dispatcher.dispatch(
-      "call-promotion",
-      "promote_reviewed_change",
-      {"change_id": "change-1", "confirm": True},
-    )
-  )
-
-  assert result is None
-  assert error is not None
-  assert error["code"] == "owner_control_route_required"
-  assert "authenticated owner control-plane route" in error["message"].lower()
-  assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -2829,6 +2586,8 @@ def test_planned_dispatch_partial_hook_triplet_fails_closed(
     role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler_double},
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -2858,6 +2617,8 @@ def test_catalogued_exact_write_cannot_fall_back_to_legacy_handler(
     role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={tool_name: legacy_handler},
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -2904,6 +2665,8 @@ def test_planned_dispatch_preserves_trusted_planning_rejection() -> None:
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned": handler_double},
     needs_approval=lambda *_args: True,
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -2946,6 +2709,8 @@ def test_planned_dispatch_fails_closed_on_row_persistence_error(tmp_path: Path) 
       Policy(),
       _planned_session(),
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -2987,6 +2752,8 @@ def test_planned_dispatch_rejects_trusted_context_loss(tmp_path: Path) -> None:
       Policy(),
       _planned_session(),
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -3033,6 +2800,8 @@ def test_planned_dispatch_requires_reinvocation_for_policy_modified_args(
       Policy(),
       _planned_session(),
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(
@@ -3079,6 +2848,8 @@ def test_planned_dispatch_releases_private_snapshot_on_final_input_failure(
       Policy(),
       _planned_session(),
     ),
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
   validation_calls = 0
 
@@ -3118,6 +2889,8 @@ def test_local_handler_receives_context_when_event_logging_is_disabled() -> None
     mcp_client=_NullMcp(),
     local_tool_handlers={"read": handler},
     event_log=None,
+    plan_validator=validate_trusted_tool_plan,
+    plan_review_renderer=render_trusted_tool_plan_review,
   )
 
   result, error = asyncio.run(dispatcher.dispatch("call-1", "read", {}))
@@ -3265,7 +3038,7 @@ def test_model_writer_undo_review_derives_from_staged_snapshots() -> None:
   # The FMS owner retired after-commit durable Undo issuance (persist_runner
   # 1dac98bc1); the review must report honestly instead of raising on a
   # deleted private capability constant.
-  from agent_gateway.tool_dispatcher_helpers import _model_writer_undo_review
+  from agent.shared.trusted_plans import _model_writer_undo_review
 
   assert _model_writer_undo_review(
     snapshot_store_ids=frozenset(),

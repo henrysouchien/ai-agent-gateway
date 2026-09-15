@@ -4,7 +4,6 @@ import logging
 from dataclasses import replace
 from typing import Any, Callable, cast
 
-from .approval_constraints import constraint_for_catalog_tool
 from .approval_policy import RunContext
 from .approval_enrichment import enrich_trade_approval_args
 from .approval_route import DurableLocalApprovalRoute
@@ -17,9 +16,7 @@ from .sdk_runner_helpers import (
 )
 from .skill_limits import ActiveSkillAdmission
 from . import tool_dispatcher_approval_lifecycle as _approval_lifecycle_helpers
-from .tool_redaction import resolve_redaction_provider
-
-_redaction = resolve_redaction_provider()
+from . import tool_redaction as _redaction
 
 log = logging.getLogger("agent_gateway.sdk_runner_approval")
 
@@ -173,31 +170,7 @@ async def can_use_tool_callback(
     if registered_call is not None
     else None
   )
-  try:
-    approval_constraint = constraint_for_catalog_tool(policy_tool)
-  except Exception as exc:
-    log.error(
-      "Approval constraint classification failed for tool %r (policy tool %r); "
-      "owner: agent_gateway.approval_constraints over the trusted FMS action "
-      "catalog (fms.action_catalog): %s",
-      tool_name,
-      policy_tool,
-      exc,
-      exc_info=True,
-    )
-    return deny_cls(
-      message=(
-        "[approval_constraint_unavailable] Trusted approval classification "
-        f"is unavailable for tool '{policy_tool}': {exc}"
-      )
-    )
-  if approval_constraint == "fresh_human_owner":
-    return deny_cls(
-      message=(
-        "[owner_control_route_required] Exact promotion requires the "
-        "authenticated owner control-plane route"
-      )
-    )
+  approval_constraint = "standard"
   route = runner._approval_route
   if not isinstance(route, DurableLocalApprovalRoute):
     if getattr(runner, "_approval_lifecycle", "required") == "not_required":

@@ -141,8 +141,6 @@ from .sub_agent_helpers import (
   _DEFAULT_SYSTEM_PROMPT_TEMPLATE as _DEFAULT_SYSTEM_PROMPT_TEMPLATE,
   _DEFAULT_EXCLUDED_TOOLS as _DEFAULT_EXCLUDED_TOOLS,
   _extract_ticker_from_task as _extract_ticker_from_task,
-  _install_emit_dashboard_artifact_handler as _install_emit_dashboard_artifact_handler,
-  _install_emit_canvas_artifact_handler as _install_emit_canvas_artifact_handler,
   _optional_research_file_id as _optional_research_file_id,
   _resolve_context_ticker as _resolve_context_ticker,
   _skill_extra_excluded_tool_names as _skill_extra_excluded_tool_names,
@@ -555,11 +553,6 @@ def _tool_grant_has_investment_claim_routes(
   )
 
 
-def _artifact_emit_tool_definitions(installed_tool_names: set[str]) -> list[dict[str, Any]]:
-  return _sub_agent_tool_definitions.artifact_emit_tool_definitions(
-    installed_tool_names,
-    artifact_emit_tools=_ARTIFACT_EMIT_TOOLS,
-  )
 
 
 def _result_response_text(result: Any | None) -> str:
@@ -1336,6 +1329,7 @@ def make_run_agent_handler(
   parent_user_email: str | None = None,
   credentials_resolver_active: bool = False,
   local_tool_handlers: dict[str, Any] | None = None,
+  artifact_tools_installer: Callable[..., list[dict[str, Any]]] | None = None,
   fms_rebinder: Callable[[dict[str, Any], int], None] | None = None,
   excluded_tools: set[str] | None = None,
   default_max_turns: int = 15,
@@ -1890,6 +1884,7 @@ def make_run_agent_handler(
         logger=log,
       )
 
+    extra_tool_definitions: list[dict[str, Any]] = []
     if skill_run_id and agent_name:
       child_excluded = (
         (
@@ -1906,20 +1901,9 @@ def make_run_agent_handler(
           skill_profile=profile,
         )
       )
-      if "emit_canvas_artifact" not in child_excluded:
-        _install_emit_canvas_artifact_handler(
-          sub_local=sub_local,
-          profile=profile,
-          skill_name=agent_name,
-          semantic_scope=operation_scope,
-          skill_run_id=skill_run_id,
-          context_ticker=_admitted_context_ticker,
-          context_research_file_id=context_research_file_id,
-          parent_session=parent_session, fallback_user_id=effective_parent_user_id,
-          emit_parent_event=_emit_parent_event,
-        )
-      if "emit_dashboard_artifact" not in child_excluded:
-        _install_emit_dashboard_artifact_handler(
+      if artifact_tools_installer is not None:
+        extra_tool_definitions = artifact_tools_installer(
+          excluded_tools=child_excluded,
           sub_local=sub_local,
           profile=profile,
           skill_name=agent_name,
@@ -1933,11 +1917,6 @@ def make_run_agent_handler(
         )
 
     child_excluded |= role_denied_tools
-    extra_tool_definitions = (
-      _artifact_emit_tool_definitions(set(sub_local))
-      if profile is not None or runtime_policy is not None
-      else []
-    )
     if registered_runtime:
       extra_tool_definitions.extend(_operation_private_mcp_tool_definitions(
         profile=profile,
@@ -2096,6 +2075,8 @@ def make_run_agent_handler(
     sub_dispatcher = ToolDispatcher(
       mcp_client=mcp_client,
       local_tool_handlers=sub_local,
+      plan_validator=getattr(getattr(runner, "_dispatcher", None), "plan_validator", None),
+      plan_review_renderer=getattr(getattr(runner, "_dispatcher", None), "plan_review_renderer", None),
       needs_approval=needs_approval,
       approved_tool_types=(
         parent_session.approved_tool_types
@@ -2359,6 +2340,7 @@ def make_resume_handler(
   user_id: str | None = None,
   credentials_resolver_active: bool = False,
   local_tool_handlers: dict[str, Any] | None = None,
+  artifact_tools_installer: Callable[..., list[dict[str, Any]]] | None = None,
   fms_rebinder: Callable[[dict[str, Any], int], None] | None = None,
   excluded_tools_resolver: ExcludedToolsResolver | None = None,
   denied_mcp_servers: AbstractSet[str] = frozenset(),
@@ -2909,20 +2891,9 @@ def make_resume_handler(
       if skill_event_emitter is not None:
         await skill_event_emitter.emit_started()
 
-    if "emit_canvas_artifact" not in child_excluded:
-      _install_emit_canvas_artifact_handler(
-        sub_local=sub_local,
-        skill_name=agent_name,
-        semantic_scope=operation_semantic_scope,
-        skill_run_id=skill_run_id,
-        context_ticker=_successor_context_ticker,
-        context_research_file_id=context_research_file_id,
-        parent_session=parent_session,
-        fallback_user_id=user_id or getattr(parent_session, "user_id", None),
-        emit_parent_event=_emit_parent_event,
-      )
-    if "emit_dashboard_artifact" not in child_excluded:
-      _install_emit_dashboard_artifact_handler(
+    if artifact_tools_installer is not None:
+      artifact_tools_installer(
+        excluded_tools=child_excluded,
         sub_local=sub_local,
         skill_name=agent_name,
         semantic_scope=operation_semantic_scope,
@@ -3014,6 +2985,8 @@ def make_resume_handler(
     sub_dispatcher = ToolDispatcher(
       mcp_client=mcp_client,
       local_tool_handlers=sub_local,
+      plan_validator=getattr(getattr(runner, "_dispatcher", None), "plan_validator", None),
+      plan_review_renderer=getattr(getattr(runner, "_dispatcher", None), "plan_review_renderer", None),
       needs_approval=child_needs_approval,
       approved_tool_types=(
         parent_session.approved_tool_types

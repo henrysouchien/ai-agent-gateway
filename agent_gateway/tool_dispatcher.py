@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import time
-from importlib import import_module
 from typing import AbstractSet, Any, Callable, cast, Dict, get_args, Mapping, Optional, Protocol, Sequence, Set, TYPE_CHECKING, TypeGuard
 
 from agent_workflow_contracts.tool_registration import (
@@ -33,10 +32,6 @@ from .approval_policy import (
   utc_now,
 )
 from .approval_enrichment import effective_trade_approval_expiry_seconds, enrich_trade_approval_args
-from .approval_constraints import (
-  constraint_for_catalog_action,
-  trusted_catalog_action,
-)
 from .approval_route import (
   NO_APPROVAL_ROUTE,
   ApprovalRoute,
@@ -58,6 +53,7 @@ from .investment_capability_claim import (
 from .mcp_client_catalog import tool_argument_guidance
 from .mcp_client import RegisteredMcpPlannedToolCall, RegisteredMcpToolCall, registered_mcp_dispatch_scope
 from .policy_imports import (
+  load_server_policy_module,
   authority_policy_denies_tool,
   resolve_effective_role,
   resolve_server_policy_tool_class,
@@ -92,7 +88,6 @@ from . import tool_dispatcher_audit as _audit_helpers
 from . import tool_dispatcher_approval_lifecycle as _approval_lifecycle_helpers
 from . import tool_dispatcher_runtime as _runtime_helpers
 from . import tool_dispatcher_skill_tools as _skill_tool_helpers
-from . import tool_dispatcher_source_pack as _source_pack_helpers
 from .tool_dispatcher_helpers import (
   ApprovalCallback as ApprovalCallback,
   ApprovalDecision as ApprovalDecision,
@@ -331,6 +326,8 @@ class ToolDispatcher:
     commercial_mcp_servers: frozenset[str] | None = None,
     local_tool_class_resolver: Callable[[str], ToolClass] | None = None,
     local_catalog_action_resolver: Callable[[str], Any | None] | None = None,
+    plan_validator: Callable[..., Mapping[str, Any]] | None = None,
+    plan_review_renderer: Callable[..., dict[str, Any]] | None = None,
     tool_registration_catalog: ToolRegistrationCatalog | None = None,
     tool_policy_implementations: ToolPolicyImplementationRegistry | None = None,
     input_preparation_context_factory: (
@@ -351,6 +348,8 @@ class ToolDispatcher:
   ) -> None:
     self._mcp = mcp_client
     self._local = local_tool_handlers or {}
+    self._plan_validator = plan_validator
+    self._plan_review_renderer = plan_review_renderer
     if (local_tool_class_resolver is None) != (
       local_catalog_action_resolver is None
     ):
@@ -474,7 +473,6 @@ class ToolDispatcher:
             f"invalid local tool class for {local_tool_name!r}: {tool_class!r}"
           )
         catalog_action = local_catalog_action_resolver(local_tool_name)
-        constraint_for_catalog_action(catalog_action)
         self._planned_handler_hooks(
           local_tool_name,
           local_handler,
@@ -602,6 +600,16 @@ class ToolDispatcher:
     """The run context policy is enforced against; ``None`` outside a run."""
 
     return self._run_context
+
+  @property
+  def plan_validator(self) -> Callable[..., Mapping[str, Any]] | None:
+    """Identity authority inherited by delegated dispatchers."""
+    return self._plan_validator
+
+  @property
+  def plan_review_renderer(self) -> Callable[..., dict[str, Any]] | None:
+    """Product review projection inherited with its plan validator."""
+    return self._plan_review_renderer
 
   def with_scoped_local_handler(
     self,
@@ -815,44 +823,9 @@ class ToolDispatcher:
     if loaded_local_tools is None or tool_name in loaded_local_tools:
       return None
 
-    try:
-      if TYPE_CHECKING:
-        from agent.shared import tool_catalog
-      else:
-        tool_catalog = import_module("agent.shared.tool_catalog")
-    except ModuleNotFoundError as exc:
-      if exc.name not in {
-        "agent",
-        "agent.shared",
-        "agent.shared.tool_catalog",
-      }:
-        raise
-      return None
-    if TYPE_CHECKING:
-      get_deferred_local_tool_names = (
-        tool_catalog.get_deferred_local_tool_names
-      )
-      tool_packs = tool_catalog.FMS_LOCAL_TOOL_PACKS
-    else:
-      get_deferred_local_tool_names = getattr(
-        tool_catalog,
-        "get_deferred_local_tool_names",
-        None,
-      )
-      tool_packs = getattr(tool_catalog, "FMS_LOCAL_TOOL_PACKS", None)
-    if (
-      not callable(get_deferred_local_tool_names)
-      or not isinstance(tool_packs, Mapping)
-      or tool_name not in get_deferred_local_tool_names(self._channel)
-    ):
-      return None
-    pack_names = [
-      str(pack_name)
-      for pack_name, pack in sorted(tool_packs.items())
-      if isinstance(pack, Mapping)
-      and tool_name in (pack.get("local_tools") or ())
-    ]
-    return pack_names[0] if len(pack_names) == 1 else None
+    policy = load_server_policy_module()
+    resolve_pack = getattr(policy, "deferred_local_tool_pack", None)
+    return resolve_pack(tool_name, self._channel) if resolve_pack is not None else None
 
   def _request_advertisement_error(
     self,
@@ -904,12 +877,10 @@ class ToolDispatcher:
 
   @staticmethod
   def _catalog_action(tool_name: str) -> Any | None:
-    """Return one row from the first supported trusted catalog layout."""
-
-    try:
-      return trusted_catalog_action(tool_name, import_module_fn=import_module)
-    except ApprovalConstraintError as exc:
-      raise TrustedToolPlanError(str(exc)) from exc
+    """Read the embedding application's explicitly bound action catalog."""
+    policy = load_server_policy_module()
+    resolver = getattr(policy, "catalog_action_for_tool", None)
+    return resolver(tool_name) if resolver is not None else None
 
   def _resolved_catalog_action(self, tool_name: str) -> Any | None:
     if self._local_catalog_actions is not None and tool_name in self._local:
@@ -967,8 +938,8 @@ class ToolDispatcher:
       )
     return str(identity_marker), planner, executor
 
-  @staticmethod
   async def _plan_local_write(
+    self,
     hooks: tuple[str, Callable[..., Any], Callable[..., Any]],
     tool_input: Dict[str, Any],
     *,
@@ -976,6 +947,8 @@ class ToolDispatcher:
     tool_ctx: ToolExecutionContext,
     own_prepared: Callable[[Any], None] | None = None,
   ) -> tuple[TrustedToolPlan, Callable[..., Any]]:
+    if self._plan_validator is None:
+      raise TrustedToolPlanError("planned local handler requires an identity validator")
     identity_source, planner, executor = hooks
     planned = planner(tool_input, call_index=call_index, tool_ctx=tool_ctx)
     if inspect.isawaitable(planned):
@@ -991,6 +964,8 @@ class ToolDispatcher:
       identity_source=identity_source,
       identity=identity,
       prepared=prepared,
+      validator=self._plan_validator,
+      review_renderer=self._plan_review_renderer,
     )
     tool_ctx.trusted_plan = trusted_plan
     return trusted_plan, executor
@@ -1932,13 +1907,6 @@ class ToolDispatcher:
           tool_ctx.durable_business_model_payload = durable.prepared_payload
       try:
         catalog_action = self._resolved_catalog_action(tool_name)
-        if constraint_for_catalog_action(catalog_action) == "fresh_human_owner":
-          return None, {
-            "code": "owner_control_route_required",
-            "message": (
-              "Exact promotion requires the authenticated owner control-plane route."
-            ),
-          }
         planned_hooks = self._planned_handler_hooks(
           tool_name,
           local_handler,
@@ -3818,53 +3786,13 @@ class ToolDispatcher:
       if hint:
         error = dict(error)
         error["tool_usage_hint"] = hint
-    if tool_name == "get_filing_evidence" and result is not None and error is None:
-      self._capture_filing_source_pack(result, tool_input)
+    if result is not None and error is None:
+      policy = load_server_policy_module()
+      capture = getattr(policy, "capture_tool_source_pack", None)
+      if capture is not None:
+        capture(tool_name, self._source_pack_session, result, tool_input, log)
     return result, error
 
-  def _capture_filing_source_pack(self, result: Any, tool_input: Dict[str, Any]) -> None:
-    _source_pack_helpers.capture_filing_source_pack(
-      self._source_pack_session,
-      result,
-      tool_input,
-      log,
-      planner_result_payload_fn=self._planner_result_payload,
-      derive_fiscal_period_fn=self._derive_fiscal_period,
-      payload_get_fn=self._payload_get,
-    )
-
-  @classmethod
-  def _planner_result_payload(cls, result: Any) -> Any | None:
-    return _source_pack_helpers.planner_result_payload_with_hooks(
-      result,
-      candidates_fn=cls._planner_result_candidates,
-      looks_like_fn=cls._looks_like_source_pack_payload,
-      coerce_fn=cls._coerce_planner_result_payload,
-    )
-
-  @classmethod
-  def _planner_result_candidates(cls, result: Any) -> list[Any]:
-    return _source_pack_helpers.planner_result_candidates(result)
-
-  @staticmethod
-  def _coerce_planner_result_payload(payload: Any) -> Any:
-    return _source_pack_helpers.coerce_planner_result_payload(payload)
-
-  @staticmethod
-  def _looks_like_source_pack_payload(payload: Any) -> bool:
-    return _source_pack_helpers.looks_like_source_pack_payload(payload)
-
-  @staticmethod
-  def _payload_get(payload: Any, key: str) -> Any:
-    return _source_pack_helpers.payload_get(payload, key)
-
-  @classmethod
-  def _derive_fiscal_period(cls, tool_input: Dict[str, Any], planner_result: Any) -> str | None:
-    return _source_pack_helpers.derive_fiscal_period(
-      tool_input,
-      planner_result,
-      payload_get_fn=cls._payload_get,
-    )
 
   @staticmethod
   def _normalize_needs_approval(

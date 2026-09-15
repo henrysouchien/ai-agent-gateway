@@ -1,16 +1,33 @@
+"""Explicit process policy binding for MCP, dispatch, SDK, and runner consumers.
+
+The application passes its policy module as ``GatewayServerConfig.server_policy``;
+``create_gateway_app`` installs it before constructing runtime services. Headless
+product entrypoints call ``configure_server_policy`` before connecting MCP or
+building a runner. The binding is process-scoped: all runtimes in a process
+share one product policy. Tests restore the previous binding after each test.
+
+Without a binding, the package has no product tool classifications or denials.
+Sessionless explicit owners retain generic authority; invites have no admitted
+tool reach, and sessions require the host authority evaluator.
+"""
 from __future__ import annotations
 
-import importlib
+
 from typing import Any, Literal, Mapping
 
 
+_server_policy: Any | None = None
+
+
+def configure_server_policy(policy: Any | None) -> None:
+  """Install the application's policy module; ``None`` selects package defaults."""
+  global _server_policy
+  _server_policy = policy
+
+
 def load_server_policy_module() -> Any | None:
-  try:
-    return importlib.import_module("agent.shared.server_policies")
-  except ModuleNotFoundError as exc:
-    if exc.name not in {"agent", "agent.shared", "agent.shared.server_policies"}:
-      raise
-    return None
+  """Return only the configured policy, without discovering application modules."""
+  return _server_policy
 
 
 def load_server_policy_helpers(*, require_tool_class: bool = False) -> tuple[Any | None, Any | None, Any | None]:

@@ -19,6 +19,23 @@ if TYPE_CHECKING:
   from agent_gateway.server import ChatRuntime
 
 
+@pytest.fixture(autouse=True)
+def _bind_product_server_policy():
+  """Bind product semantics explicitly for the existing integration fixtures."""
+  from agent.shared import server_policies
+  from agent_gateway.policy_imports import (
+    configure_server_policy,
+    load_server_policy_module,
+  )
+
+  previous = load_server_policy_module()
+  configure_server_policy(server_policies)
+  try:
+    yield
+  finally:
+    configure_server_policy(previous)
+
+
 @dataclass
 class _TestAppState:
   runtime: ChatRuntime | None = None
@@ -35,6 +52,7 @@ def auth_config_model_free() -> dict[str, Any]:
 
 @pytest.fixture
 def make_test_app():
+  from agent.shared import server_policies
   from agent_gateway.event_log import EventLog
   from agent_gateway import (
     CAPABILITY_IDS,
@@ -336,6 +354,7 @@ def make_test_app():
 
     app = create_gateway_app(
       GatewayServerConfig(
+        server_policy=server_policies,
         jwt_secret="stream-lifecycle-test-secret-0123456789",
         valid_api_keys={"gateway-key"},
         default_provider=provider if execution_transport == "native" else None,

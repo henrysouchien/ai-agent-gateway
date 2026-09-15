@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import datetime
-import logging
 import re
-import secrets
-import time
 from collections.abc import Sequence
 from typing import Any, Callable, FrozenSet
 
@@ -13,8 +9,6 @@ from agent_workflow_contracts.ticker_contract import (
   normalize_contract_ticker,
 )
 
-from .session import GatewaySession
-from .artifact_paths import canonicalize_ticker
 from .operation_catalog import AgentOperationCatalog
 from .skills import SkillLoader, SkillProfile, operation_tool_ids
 
@@ -41,7 +35,6 @@ def _catalog_operation_entries(
 ) -> list[tuple[Any, str]]:
   return list(operation_source.list_callable_operations_with_descriptions())
 
-log = logging.getLogger("agent_gateway.sub_agent")
 
 _DEFAULT_EXCLUDED_TOOLS = frozenset({
   "run_agent",
@@ -141,14 +134,6 @@ _TICKER_STOPWORDS = {
 }
 
 
-def _artifact_storage_user_id(parent_session: GatewaySession | None, fallback_user_id: str | None) -> str | None:
-  risk_user_id = int(getattr(parent_session, "risk_user_id", 0) or 0)
-  if risk_user_id > 0:
-    return str(risk_user_id)
-  return fallback_user_id
-
-
-
 def _extract_ticker_from_task(task: str) -> str | None:
   candidates: list[str] = []
   for match in _TICKER_DISCOVERY_TOKEN_RE.finditer(task):
@@ -217,35 +202,6 @@ def _optional_research_file_id(value: object | None, *, default: int | None = No
   return parsed
 
 
-def _artifact_ticker_for_scope(
-  semantic_scope: str,
-  context_ticker: str,
-) -> str | None:
-  return (
-    canonicalize_ticker(context_ticker)
-    if semantic_scope == "ticker" and context_ticker
-    else None
-  )
-
-
-def _artifact_scope_for_scope(
-  semantic_scope: str,
-  context_ticker: str,
-) -> str:
-  return (
-    "ticker"
-    if _artifact_ticker_for_scope(semantic_scope, context_ticker)
-    else "portfolio"
-  )
-
-
-def _current_context_ticker(
-  value: str | Callable[[], str | None],
-) -> str:
-  resolved = value() if callable(value) else value
-  return resolved or ""
-
-
 def _skill_extra_excluded_tool_names(skill_profile: SkillProfile | None) -> set[str]:
   raw_tools = getattr(skill_profile, "extra_excluded_tools", None)
   if raw_tools is None:
@@ -282,183 +238,6 @@ def _skill_artifact_excluded_tools(
   return excluded
 
 
-def _install_emit_canvas_artifact_handler(
-  *, sub_local: dict[str, Any], profile: SkillProfile | None = None,
-  skill_name: str | None = None, semantic_scope: str | None = None,
-  skill_run_id: str,
-  context_ticker: str | Callable[[], str | None],
-  context_research_file_id: int | None,
-  parent_session: GatewaySession | None, fallback_user_id: str | None,
-  emit_parent_event: Callable[[dict[str, Any]], None],
-) -> bool:
-  resolved_skill_name = skill_name or getattr(profile, "name", None)
-  resolved_scope = (
-    semantic_scope
-    if semantic_scope is not None
-    else (getattr(profile, "scope", None) or "global")
-  )
-  if not resolved_skill_name:
-    raise ValueError("artifact handler requires skill identity and scope")
-  from .canvas_build_environment import preflight_canvas_build_environment
-
-  preflight = preflight_canvas_build_environment()
-  if preflight is None:
-    return False
-  artifact_storage_user_id = _artifact_storage_user_id(parent_session, fallback_user_id)
-
-  async def _handle_emit_canvas_artifact(tool_input: dict[str, Any], **_: Any):
-    from memory import get_workspace_dir
-    from .canvas_artifact_pipeline import emit_canvas_artifact_async
-
-    research_file_id = _optional_research_file_id(
-      tool_input.get("research_file_id"), default=context_research_file_id,
-    )
-    def _emit_canvas_event(event: dict[str, Any]) -> None:
-      emit_parent_event(event)
-
-    result = await emit_canvas_artifact_async(
-      workspace_dir=get_workspace_dir(artifact_storage_user_id), preflight=preflight,
-      title=str(tool_input["title"]), purpose=str(tool_input["purpose"]),
-      summary=str(tool_input["summary"]), tsx_source=str(tool_input["tsx_source"]),
-      copy_as_markdown=str(tool_input["copy_as_markdown"]),
-      copy_as_prompt=tool_input.get("copy_as_prompt"),
-      copy_as_json=tool_input.get("copy_as_json"),
-      sources=tool_input.get("sources"),
-      source_skill=resolved_skill_name, skill_run_id=skill_run_id,
-      ticker=_artifact_ticker_for_scope(
-        resolved_scope,
-        _current_context_ticker(context_ticker),
-      ),
-      session_id=str(getattr(parent_session, "session_id", "") or "").strip() or None,
-      research_file_id=research_file_id,
-      control_run_id=str(getattr(parent_session, "session_id", "") or "").strip() or None,
-      user_id=artifact_storage_user_id or "", emit_event=_emit_canvas_event,
-    )
-    return result, None
-
-  sub_local["emit_canvas_artifact"] = _handle_emit_canvas_artifact
-  return True
-
-
-def _install_emit_dashboard_artifact_handler(
-  *,
-  sub_local: dict[str, Any],
-  profile: SkillProfile | None = None,
-  skill_name: str | None = None,
-  semantic_scope: str | None = None,
-  skill_run_id: str,
-  context_ticker: str | Callable[[], str | None],
-  context_research_file_id: int | None,
-  parent_session: GatewaySession | None,
-  fallback_user_id: str | None,
-  emit_parent_event: Callable[[dict[str, Any]], None],
-) -> None:
-  resolved_skill_name = skill_name or getattr(profile, "name", None)
-  resolved_scope = (
-    semantic_scope
-    if semantic_scope is not None
-    else (getattr(profile, "scope", None) or "global")
-  )
-  if not resolved_skill_name:
-    raise ValueError("artifact handler requires skill identity and scope")
-  artifact_storage_user_id = _artifact_storage_user_id(parent_session, fallback_user_id)
-
-  async def _handle_emit_dashboard_artifact(
-    tool_input: dict[str, Any],
-    **handler_kwargs: Any,
-  ):
-    dashboard_tool_ctx = handler_kwargs.get("tool_ctx")
-    tool_call_id = getattr(dashboard_tool_ctx, "tool_call_id", None)
-    admitted_context_ticker = _current_context_ticker(context_ticker)
-    artifact_ticker = _artifact_ticker_for_scope(
-      resolved_scope,
-      admitted_context_ticker,
-    )
-    try:
-      from memory import get_workspace_dir
-      from schema.dashboard_artifact import DashboardArtifact
-
-      from .dashboard_artifact import build_dashboard_artifact
-      from .dashboard_artifact_store import write_dashboard_artifact
-
-      profile_name = str(tool_input.get("profile") or "production")
-      built = build_dashboard_artifact(
-        tool_input.get("payload"),
-        profile_name,
-        str(tool_input.get("summary") or ""),
-      )
-      if built.get("error") == "dashboard_validation_failed":
-        return {
-          "error": "dashboard_validation_failed",
-          "hard_failures": list(built.get("hard_failures") or []),
-          "warnings": list(built.get("warnings") or []),
-        }, None
-
-      now = datetime.datetime.now(datetime.timezone.utc)
-      artifact_id = f"{now.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(8)}"
-      artifact_path = f"artifacts/_dashboards/{artifact_id}.json"
-      payload_path = f"artifacts/_dashboards/{artifact_id}.payload.json"
-      research_file_id = _optional_research_file_id(
-        tool_input.get("research_file_id"),
-        default=context_research_file_id,
-      )
-      control_run_id = str(getattr(parent_session, "session_id", "") or "").strip() or None
-      artifact = DashboardArtifact(
-        artifact_id=artifact_id,
-        source_skill=resolved_skill_name,
-        payload_ref=f"{artifact_id}.payload.json",
-        ts=now.isoformat(),
-        research_file_id=research_file_id,
-        control_run_id=control_run_id,
-        origin_kind=None if research_file_id is not None else "product",
-        visibility=None if research_file_id is not None else "default",
-        **dict(built["sidecar_fields"]),
-      )
-      workspace_dir = get_workspace_dir(artifact_storage_user_id)
-      write_dashboard_artifact(
-        workspace_dir=workspace_dir,
-        artifact=artifact,
-        payload_json=built["payload_json"],
-      )
-      emit_parent_event({
-        "type": "artifact_ready",
-        "skill_run_id": skill_run_id,
-        "ticker": artifact_ticker,
-        "skill": "_dashboard",
-        "artifact_id": artifact_id,
-        "artifact_path": artifact_path,
-        "binary_artifact_path": payload_path,
-        "contract_name": "DashboardArtifact",
-        "data_source": "live",
-        "ts": time.time(),
-        "scope": _artifact_scope_for_scope(
-          resolved_scope,
-          admitted_context_ticker,
-        ),
-        "portfolio_id": None,
-      })
-      return {
-        "artifact_id": artifact_id,
-        "sidecar_path": artifact_path,
-        "payload_ref": payload_path,
-        "warnings": list(built.get("warnings") or []),
-      }, None
-    except Exception as exc:
-      log.warning("emit_dashboard_artifact failed: %s", exc)
-      emit_parent_event({
-        "type": "artifact_failed",
-        "skill_run_id": skill_run_id,
-        "ticker": artifact_ticker,
-        "skill": "_dashboard",
-        "error_code": "tool_write_failed",
-        "error_detail": str(exc),
-        "source_path": None,
-        "tool_call_id": tool_call_id,
-        "ts": time.time(),
-      })
-      return None, {"code": "internal_error", "message": str(exc)}
-
-  sub_local["emit_dashboard_artifact"] = _handle_emit_dashboard_artifact
 
 def make_run_agent_tool_def(
   operation_source: SkillLoader | AgentOperationCatalog | None = None,

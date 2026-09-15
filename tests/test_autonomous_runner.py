@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, TypedDict
 import pytest
 
 from .control_plane.manifest_helpers import write_v6_manifest
+from .control_plane.identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
 
 if TYPE_CHECKING:
   from agent_gateway.capability_binding import RunMode
@@ -309,17 +310,6 @@ def _fake_subprocess_ownership_and_event_channel(monkeypatch):
 
   global _LAST_FAKE_EVENT_CHANNEL
   _LAST_FAKE_EVENT_CHANNEL = None
-  monkeypatch.setenv(
-    "GATEWAY_USER_KEYS",
-    json.dumps([{
-      "key": "test-mcp-key",
-      "slug": "",
-      "email": USER_EMAIL,
-      "risk_user_id": 1,
-      "channel": "mcp",
-      "role": "owner",
-    }]),
-  )
 
   def fake_channel_factory(**_kwargs):
     global _LAST_FAKE_EVENT_CHANNEL
@@ -468,6 +458,8 @@ def _registry(
   autonomous_skill_admission_policy_resolver: (
     AutonomousSkillAdmissionPolicyResolver | None
   ) = None,
+  identity_resolver=fake_identity_resolver,
+  mcp_user_key_lookup=fake_mcp_user_key_lookup,
 ) -> AutonomousRegistry:
   from agent_gateway.autonomous_runner import AutonomousRegistry
   from agent_gateway.claim_signing_authority import (
@@ -498,6 +490,8 @@ def _registry(
     },
     autonomous_capability_binding_resolver=_test_autonomous_capability_binding,
     autonomous_skill_admission_policy_resolver=admission_policy,
+    identity_resolver=identity_resolver,
+    mcp_user_key_lookup=mcp_user_key_lookup,
     claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
   )
 
@@ -1109,6 +1103,8 @@ async def _start_and_capture_env(
   ttl_seconds: int | None = None,
   dispatch_scope: dict | None = None,
   start_overrides: dict | None = None,
+  identity_resolver=fake_identity_resolver,
+  mcp_user_key_lookup=fake_mcp_user_key_lookup,
 ) -> dict[str, str]:
   from agent_gateway import autonomous_runner
 
@@ -1125,7 +1121,11 @@ async def _start_and_capture_env(
   else:
     monkeypatch.setenv("AGENT_API_CLAIM_TTL_SECONDS", str(ttl_seconds))
 
-  registry = _registry(tmp_path)
+  registry = _registry(
+    tmp_path,
+    identity_resolver=identity_resolver,
+    mcp_user_key_lookup=mcp_user_key_lookup,
+  )
   start_kwargs = {
     "role": "owner",
     "profile": "analyst",
@@ -1269,6 +1269,8 @@ def test_autonomous_start_keeps_approval_store_parent_only_and_inherits_channel(
       "anthropic": _test_service_credential_handle(),
     },
     autonomous_capability_binding_resolver=_test_autonomous_capability_binding,
+    identity_resolver=fake_identity_resolver,
+    mcp_user_key_lookup=fake_mcp_user_key_lookup,
     claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
   )
 
@@ -1545,6 +1547,8 @@ def test_autonomous_start_refuses_missing_session_authority_source(
     max_running=1,
     service_provider_handles=service_provider_handles,
     autonomous_capability_binding_resolver=binding_resolver,
+    identity_resolver=fake_identity_resolver,
+    mcp_user_key_lookup=fake_mcp_user_key_lookup,
     claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
   )
 
@@ -2496,22 +2500,8 @@ def test_autonomous_registry_rejects_v4_manifest_without_pack_deliver_contract(
 
 
 def test_autonomous_registry_rejects_v1_slug_manifest(
-  monkeypatch,
   tmp_path,
 ) -> None:
-  monkeypatch.setenv(
-    "GATEWAY_USER_KEYS",
-    json.dumps([
-      {
-        "key": "mcp-key",
-        "channel": "mcp",
-        "slug": "henry",
-        "email": "henry@example.com",
-        "risk_user_id": 1,
-        "role": "owner",
-      }
-    ]),
-  )
   _write_manifest(
     tmp_path,
     "bg_4",
@@ -3185,17 +3175,6 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
 
     monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
-    monkeypatch.setenv(
-      "GATEWAY_USER_KEYS",
-      json.dumps([{
-        "key": "test-mcp-key",
-        "slug": "",
-        "email": "",
-        "risk_user_id": 1,
-        "channel": "mcp",
-        "role": "owner",
-      }]),
-    )
     registry = _registry(tmp_path)
     payload = await registry.start(
       role="owner",
@@ -4906,42 +4885,28 @@ def test_autonomous_start_resolves_slug_metadata_to_canonical_owner(monkeypatch,
     verify_autonomous_launch_envelope,
   )
 
-  monkeypatch.setenv(
-    "GATEWAY_USER_KEYS",
-    json.dumps([
-      {
-        "key": "mcp-key-for-henry",
-        "channel": "mcp",
-        "slug": "henry",
-        "email": USER_EMAIL,
-        "risk_user_id": 1,
-        "role": "owner",
-        "extraneous_secret": "must-not-reach-child",
-      },
-      {
-        "key": "excel-key-for-henry",
-        "channel": "excel",
-        "slug": "henry",
-        "email": USER_EMAIL,
-        "risk_user_id": 1,
-        "role": "owner",
-      },
-      {
-        "key": "mcp-key-for-other-user",
-        "channel": "mcp",
-        "slug": "other",
-        "email": "other@example.com",
-        "risk_user_id": 2,
-        "role": "invite",
-      },
-    ]),
+  identity = fake_identity_resolver(
+    "henry",
+    risk_user_id=1,
+    user_email=USER_EMAIL,
   )
+  entry = {
+    "key": "mcp-key-for-henry",
+    "channel": "mcp",
+    "slug": "henry",
+    "email": USER_EMAIL,
+    "risk_user_id": 1,
+    "role": "owner",
+    "extraneous_secret": "must-not-reach-child",
+  }
   env = asyncio.run(
     _start_and_capture_env(
       monkeypatch,
       tmp_path,
       user_id="henry",
       user_email=USER_EMAIL,
+      identity_resolver=lambda *_args, **_kwargs: identity,
+      mcp_user_key_lookup=lambda *_args: entry,
     )
   )
 
@@ -4963,25 +4928,24 @@ def test_autonomous_start_resolves_slug_metadata_to_canonical_owner(monkeypatch,
     "role": "owner",
   }]
   assert "must-not-reach-child" not in env["GATEWAY_USER_KEYS"]
-  assert "mcp-key-for-other-user" not in env["GATEWAY_USER_KEYS"]
-  assert "excel-key-for-henry" not in env["GATEWAY_USER_KEYS"]
 
 
 def test_autonomous_start_narrows_mcp_key_by_envelope_session_slug(
   monkeypatch,
   tmp_path,
 ) -> None:
-  monkeypatch.setenv(
-    "GATEWAY_USER_KEYS",
-    json.dumps([{
+  lookups = []
+
+  def lookup(user_id, user_email):
+    lookups.append((user_id, user_email))
+    return {
       "key": "mcp-key-for-henry",
       "channel": "mcp",
       "slug": "henry",
       "email": USER_EMAIL,
       "risk_user_id": 1,
       "role": "owner",
-    }]),
-  )
+    }
 
   env = asyncio.run(
     _start_and_capture_env(
@@ -4991,20 +4955,17 @@ def test_autonomous_start_narrows_mcp_key_by_envelope_session_slug(
       user_email=USER_EMAIL,
       owner_user_id="henry",
       user_slug="henry",
+      mcp_user_key_lookup=lookup,
     )
   )
 
   assert json.loads(env["GATEWAY_USER_KEYS"])[0]["slug"] == "henry"
+  assert lookups == [("henry", USER_EMAIL)]
 
 
-@pytest.mark.parametrize(
-  "gateway_user_keys",
-  ("{not-json", json.dumps({"channel": "mcp"})),
-)
-def test_autonomous_start_contains_malformed_gateway_user_keys_system_exit(
+def test_autonomous_start_contains_mcp_lookup_system_exit(
   monkeypatch,
   tmp_path,
-  gateway_user_keys,
 ) -> None:
   from agent_gateway import autonomous_runner
 
@@ -5016,8 +4977,10 @@ def test_autonomous_start_contains_malformed_gateway_user_keys_system_exit(
     return FakeProcess()
 
   monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
-  monkeypatch.setenv("GATEWAY_USER_KEYS", gateway_user_keys)
-  registry = _registry(tmp_path)
+  def malformed_lookup(*_args):
+    raise SystemExit("sensitive lookup detail")
+
+  registry = _registry(tmp_path, mcp_user_key_lookup=malformed_lookup)
 
   with pytest.raises(
     RuntimeError,
@@ -5055,14 +5018,7 @@ def test_autonomous_start_contains_malformed_gateway_user_keys_system_exit(
       "entry key is empty",
     ),
     (
-      {
-        "key": "secret-for-someone-else",
-        "slug": "other",
-        "email": "other@example.com",
-        "risk_user_id": 2,
-        "channel": "mcp",
-        "role": "invite",
-      },
+      None,
       "no GATEWAY_USER_KEYS channel='mcp' entry for user '1'",
     ),
   ),
@@ -5079,8 +5035,7 @@ def test_autonomous_start_refuses_unusable_mcp_entry_without_spawning(
     raise AssertionError("MCP key refusal must precede spawn")
 
   monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
-  monkeypatch.setenv("GATEWAY_USER_KEYS", json.dumps([entry]))
-  registry = _registry(tmp_path)
+  registry = _registry(tmp_path, mcp_user_key_lookup=lambda *_args: entry)
 
   with pytest.raises(RuntimeError, match=error) as exc_info:
     asyncio.run(
@@ -5094,40 +5049,25 @@ def test_autonomous_start_refuses_unusable_mcp_entry_without_spawning(
       )
     )
 
-  if entry["key"]:
+  if entry and entry["key"]:
     assert entry["key"] not in str(exc_info.value)
   assert registry._tasks == {}
   assert registry._reserved_slots == 0
 
 
-def test_autonomous_start_refuses_absent_api_identity_module_even_when_cached(
+def test_autonomous_start_refuses_absent_mcp_lookup(
   monkeypatch,
   tmp_path,
 ) -> None:
   from agent_gateway import autonomous_runner
-  from agent_gateway.autonomous_runner import AutonomousRegistry
-  from agent_gateway.autonomous_runner_state import _user_identity_api
-  from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
-
-  cached_api = _user_identity_api()
-  assert cached_api is not None
-  assert Path(cached_api.__file__).resolve() == (API_DIR / "user_identity.py").resolve()
 
   async def fake_exec(*_args, **_kwargs):
-    raise AssertionError("absent identity module must precede spawn")
+    raise AssertionError("missing MCP lookup must precede spawn")
 
   monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
-  registry = AutonomousRegistry(
-    api_dir=tmp_path,
-    tenant_id=TENANT_ID,
-    python_executable="python3",
-    log_dir=tmp_path,
-    service_provider_handles={"anthropic": _test_service_credential_handle()},
-    autonomous_capability_binding_resolver=_test_autonomous_capability_binding,
-    claim_signing_authority=GatewayClaimSigningAuthority(HMAC_KEY),
-  )
+  registry = _registry(tmp_path, mcp_user_key_lookup=None)
 
-  with pytest.raises(RuntimeError, match="user identity API is unavailable"):
+  with pytest.raises(RuntimeError, match="MCP user key lookup is not configured"):
     asyncio.run(
       registry.start(
         role="owner",
@@ -5143,25 +5083,22 @@ def test_autonomous_start_refuses_absent_api_identity_module_even_when_cached(
   assert registry._reserved_slots == 0
 
 
-def test_autonomous_start_refuses_identity_module_import_failure(
+def test_autonomous_start_contains_identity_resolver_system_exit(
   monkeypatch,
   tmp_path,
 ) -> None:
   from agent_gateway import autonomous_runner
-  from agent_gateway import autonomous_runner_start
 
-  def fail_import(*, api_dir=None):
-    _ = api_dir
-    raise ImportError("sensitive import detail")
+  def fail_resolution(*_args, **_kwargs):
+    raise SystemExit("sensitive identity detail")
 
   async def fake_exec(*_args, **_kwargs):
-    raise AssertionError("identity import failure must precede spawn")
+    raise AssertionError("identity resolution failure must precede spawn")
 
-  monkeypatch.setattr(autonomous_runner_start, "_user_identity_api", fail_import)
   monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
-  registry = _registry(tmp_path)
+  registry = _registry(tmp_path, identity_resolver=fail_resolution)
 
-  with pytest.raises(RuntimeError, match="user identity API import failed") as exc_info:
+  with pytest.raises(RuntimeError, match="GATEWAY_USER_KEYS is malformed") as exc_info:
     asyncio.run(
       registry.start(
         role="owner",
@@ -5173,7 +5110,7 @@ def test_autonomous_start_refuses_identity_module_import_failure(
       )
     )
 
-  assert "sensitive import detail" not in str(exc_info.value)
+  assert "sensitive identity detail" not in str(exc_info.value)
   assert registry._tasks == {}
   assert registry._reserved_slots == 0
 
@@ -5272,6 +5209,8 @@ def test_autonomous_start_fails_without_installed_claim_authority(
     autonomous_capability_binding_resolver=(
       _test_autonomous_capability_binding
     ),
+    identity_resolver=fake_identity_resolver,
+    mcp_user_key_lookup=fake_mcp_user_key_lookup,
   )
 
   with pytest.raises(

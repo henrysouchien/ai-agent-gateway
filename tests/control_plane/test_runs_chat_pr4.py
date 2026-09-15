@@ -13,6 +13,8 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from fastapi.routing import APIRoute
+from agent.shared import server_policies
+from .identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
 
 from agent_gateway.auth import AuthConfig, ResolverResult
 from agent_gateway.capability_execution import BoundCapabilityExecution
@@ -52,6 +54,9 @@ _TEST_SERVICE_HANDLE = CredentialHandle(
 
 def _test_gateway_config(**kwargs: Any) -> GatewayServerConfig:
   return GatewayServerConfig(
+    server_policy=server_policies,
+    identity_resolver=fake_identity_resolver,
+    mcp_user_key_lookup=fake_mcp_user_key_lookup,
     tenant_id=_TEST_TENANT_ID,
     allow_service_credentials_for_interactive=True,
     model_registry=INITIAL_MODEL_REGISTRY,
@@ -278,6 +283,9 @@ def _make_capability_app(captured_requests: list[ChatRequest]) -> FastAPI:
 
   return create_gateway_app(
     GatewayServerConfig(
+      server_policy=server_policies,
+      identity_resolver=fake_identity_resolver,
+      mcp_user_key_lookup=fake_mcp_user_key_lookup,
       jwt_secret="runs-pr4-capability-secret-0123456789",
       valid_api_keys={API_KEY},
       tenant_id="control-parity-test",

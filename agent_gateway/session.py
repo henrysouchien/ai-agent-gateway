@@ -31,8 +31,6 @@ from .session_event_history import SessionEventHistory
 from .session_capabilities import normalize_session_capabilities
 
 if TYPE_CHECKING:
-  from agent.batch.run_ref import RunRef
-
   from .agent_session_log import AgentSessionLog, AgentSessionLogLocation
   from .agent_session_log_layout import AutonomousSessionLogAuthority
   from .approval_audit import ApprovalAuditEmitter
@@ -40,6 +38,7 @@ if TYPE_CHECKING:
   from .autonomous_approval_channel import AutonomousApprovalChannelChild
   from .autonomous_launch_envelope import AutonomousControlAuthority
   from .batch_approval_projection import BatchApprovalScope
+  from .runner_fork_agents import LearningForkConfig
   from .multi_user.billing import SessionUsageSummary
   from .tool_result_spill import SpillSink
   from .dispatcher_factory import GatewayDispatcherDeps
@@ -267,7 +266,7 @@ class GatewaySession:
   )
   batch_approval_projected: bool | None = None
   batch_approval_scope: BatchApprovalScope | None = field(default=None, repr=False)
-  batch_run_ref: RunRef | None = None
+  batch_run_ref: Any | None = None
   batch_id: int | None = None
   batch_stage_run_seq: int | None = None
   tool_result_spill_sink: SpillSink | None = field(default=None, repr=False)
@@ -281,6 +280,7 @@ class GatewaySession:
   purpose: str | None = None
   learn_memory_nudge_turns: int = 0
   learn_skill_nudge_iters: int = 0
+  learning_fork_config: LearningForkConfig | None = field(default=None, repr=False)
   learning_fork_ledger: Any | None = field(default=None, repr=False)
   learning_fork_registry: Any | None = field(default=None, repr=False)
   workflow_output_reader: WorkflowOutputReader | None = field(

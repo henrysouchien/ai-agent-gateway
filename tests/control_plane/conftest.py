@@ -2,7 +2,6 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 
-import json
 import sys
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
@@ -33,7 +32,10 @@ from agent.skills.composition import compile_skill_application
 from agent.shared.tool_registration import (
   build_product_tool_registration_composition,
 )
+from agent.shared import server_policies
 from memory import get_skills_root
+
+from .identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
 
 
 class _ControlTestRunner(AgentRunner):
@@ -90,34 +92,6 @@ def _canonical_gateway_state_root(
   monkeypatch.delenv(
     "GATEWAY_APPROVAL_DB_PATH",
     raising=False,
-  )
-  # Autonomous spawn narrows GATEWAY_USER_KEYS to the admitted user's mcp
-  # entry and refuses when none matches. Cover every identity these suites
-  # dispatch as, by slug match, with emails equal to the dispatch emails (the
-  # matcher refuses on id-match + email-mismatch). risk_user_id is
-  # deliberately OMITTED so canonical identity resolution skips these entries
-  # (owners stay legacy ids like "alice", which the suites assert on); real
-  # deployments can't do this — gateway boot auth-validates full entries.
-  monkeypatch.setenv(
-    "GATEWAY_USER_KEYS",
-    json.dumps([
-      {
-        "key": f"control-test-mcp-key-{slug}",
-        "channel": "mcp",
-        "slug": slug,
-        "email": email,
-        "role": "owner",
-      }
-      for slug, email in (
-        ("alice", "alice@example.com"),
-        ("bob", "bob@example.com"),
-        ("carol", "carol@example.com"),
-        ("owner-1", "owner-1@example.com"),
-        ("tui-user", "tui@example.com"),
-        ("1", "one@example.com"),
-        ("101", "one-oh-one@example.com"),
-      )
-    ]),
   )
 
 
@@ -216,6 +190,9 @@ def control_plane_app(
       jwt_secret="control-plane-test-secret-0123456789",
       valid_api_keys={test_api_key},
       tenant_id="test-product",
+      identity_resolver=fake_identity_resolver,
+      server_policy=server_policies,
+      mcp_user_key_lookup=fake_mcp_user_key_lookup,
       credentials_resolver=credentials_resolver,
       model_registry=INITIAL_MODEL_REGISTRY,
       model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,

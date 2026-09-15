@@ -25,21 +25,12 @@ from fastapi import APIRouter, Body, FastAPI, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 if TYPE_CHECKING:
   from .mcp_client import McpClientManager
 
-from .artifact_paths import (
-  ArtifactPathError as ArtifactPathError,
-  artifact_json_paths_for_request as artifact_json_paths_for_request,
-  artifact_json_path_for_request as artifact_json_path_for_request,
-  letter_docx_path_for_request as letter_docx_path_for_request,
-  reject_unsafe_path as reject_unsafe_path,
-  ticker_artifact_paths_for_request as ticker_artifact_paths_for_request,
-  user_workspace_root as user_workspace_root,
-)
 from .auth import (
   ChannelMismatchError,
   CredentialsTimeoutError,
@@ -94,11 +85,9 @@ from .session import (
   session_owner_user_id,
 )
 from .ui_blocks_metrics import snapshot as ui_blocks_metrics_snapshot
-from .ui_blocks_store import read_ui_blocks_payload as read_ui_blocks_payload
 
 from . import server_chat_helpers as _server_chat_helpers  # noqa: F401 - dynamic streaming deps alias
 from . import server_chat_control_routes as _server_chat_control_routes
-from . import server_artifact_routes as _server_artifact_routes
 from . import server_streaming as _server_streaming
 from . import server_tool_routes as _server_tool_routes
 from . import server_workflow_output_routes as _server_workflow_output_routes
@@ -108,8 +97,6 @@ from .server_models import (  # noqa: F401
   RequestApproval,
   BuildRunner,
   _AGENT_API_CLAIM_AUDIENCE,
-  _ARTIFACT_DOCX_MEDIA_TYPE,
-  _ARTIFACT_INDEX_RECENT_LIMIT,
   _STREAM_SUBSCRIBER_QUEUE_MAX,
   _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS,
   _STREAM_SUBSCRIBER_DONE,
@@ -141,15 +128,6 @@ from .server_artifact_helpers import (  # noqa: F401
   _resolve_compaction_trigger,
   _json_dumps,
   _artifact_auth_dependency,
-  _artifact_json_response,
-  _artifact_payload_from_path,
-  _decorate_artifact_payload,
-  _artifact_request_filters,
-  _artifact_payload_matches_filters,
-  _int_or_none,
-  _assert_artifact_path_still_safe,
-  _file_cache_headers,
-  _letter_filename,
   _normalize_request_user_id,
   _resolver_contract_payload,
   _error_payload,
@@ -320,6 +298,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   Returns:
     A FastAPI application ready to serve the gateway HTTP API.
   """
+  from .policy_imports import configure_server_policy
+
+  configure_server_policy(config.server_policy)
   build_chat_runtime = config.build_chat_runtime
   if build_chat_runtime is None:
     raise ValueError("GatewayServerConfig.build_chat_runtime is required")
@@ -871,6 +852,8 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       else _default_autonomous_api_dir()
     ),
     tenant_id=config.tenant_id,
+    identity_resolver=config.identity_resolver,
+    mcp_user_key_lookup=config.mcp_user_key_lookup,
     python_executable=os.getenv("AGENT_GATEWAY_AUTONOMOUS_PYTHON", "").strip() or sys.executable,
     log_dir=autonomous_storage_root,
     max_running=int(os.getenv("AGENT_GATEWAY_AUTONOMOUS_MAX_RUNNING", "2") or "2"),
@@ -927,6 +910,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     )
 
   app.state.batch_task_registry = BatchTaskRegistry()
+  app.state.batch_backend = config.batch_backend
   control_prefix = _route_path(route_prefix, "/control")
   add_control_plane_version_header_middleware(
     app,
@@ -1062,6 +1046,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         user_email=resolved_user_email,
         role=resolved_role,
         channel=resolved_channel,
+        identity_resolver=config.identity_resolver,
       )
     except (ValueError, SystemExit) as exc:
       status, error_payload = _resolver_contract_payload(str(exc), user_id=resolved_user_id)
@@ -1639,38 +1624,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       download=download,
     )
 
-  @router.get("/artifacts/{ticker}/{skill}/latest")
-  async def artifact_latest(request: Request, ticker: str, skill: str) -> JSONResponse:
-    return _server_artifact_routes.artifact_latest_response(globals(), request, ticker, skill)
-
-  @router.get("/artifacts/{ticker}/{skill}/{artifact_id}")
-  async def artifact_by_id(
-    request: Request,
-    ticker: str,
-    skill: str,
-    artifact_id: str,
-  ) -> JSONResponse:
-    return _server_artifact_routes.artifact_by_id_response(globals(), request, ticker, skill, artifact_id)
-
-  @router.get("/artifacts/{ticker}")
-  async def artifact_index(request: Request, ticker: str) -> JSONResponse:
-    return _server_artifact_routes.artifact_index_response(globals(), request, ticker)
-
-  @router.get("/ui-blocks/{ui_blocks_id}")
-  async def ui_blocks_by_id(request: Request, ui_blocks_id: str) -> JSONResponse:
-    return _server_artifact_routes.ui_blocks_by_id_response(globals(), request, ui_blocks_id)
-
-  @router.get("/letters/{ticker}/{artifact_id}")
-  async def letter_by_id(request: Request, ticker: str, artifact_id: str) -> FileResponse:
-    return _server_artifact_routes.letter_by_id_response(globals(), request, ticker, artifact_id)
-
-  @router.get("/artifacts/{artifact_path:path}")
-  async def artifact_path_guard(request: Request, artifact_path: str) -> JSONResponse:
-    return _server_artifact_routes.artifact_path_guard_response(globals(), request, artifact_path)
-
-  @router.get("/letters/{letter_path:path}")
-  async def letter_path_guard(request: Request, letter_path: str) -> JSONResponse:
-    return _server_artifact_routes.letter_path_guard_response(globals(), request, letter_path)
 
   @router.post("/chat/tool-result")
   async def tool_result(request: Request, payload: ToolResultRequest) -> JSONResponse:
@@ -1722,13 +1675,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       ),
     )
 
-  from .control_plane.dashboard_artifacts import build_dashboard_artifacts_router
-  from .control_plane.canvas_artifacts import build_canvas_artifacts_router
-  from .control_plane.html_artifacts import build_html_artifacts_router
-
-  router.include_router(build_dashboard_artifacts_router(artifact_auth_dependency=_artifact_auth_dependency))
-  router.include_router(build_canvas_artifacts_router(artifact_auth_dependency=_artifact_auth_dependency))
-  router.include_router(build_html_artifacts_router(artifact_auth_dependency=_artifact_auth_dependency))
   app.include_router(router)
   app.include_router(
     create_control_plane_router(
@@ -1743,10 +1689,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       control_skill_catalog=control_skill_catalog,
       control_profile_names_provider=config.control_profile_names_provider,
       control_profile_loader=config.control_profile_loader,
-      artifact_auth_dependency=_artifact_auth_dependency,
+      identity_resolver=config.identity_resolver,
       autonomous_registry=app.state.subprocess_registry,
       agent_schedule_store_for=app.state.agent_run_schedule_store_for,
       agent_schedule_runner=app.state.agent_run_schedule_runner,
+      operator_schedule_backend=config.operator_schedule_backend,
       approval_store=app.state.gateway_approval_store,
       approval_policy=app.state.gateway_approval_policy,
       dispatch_scope_validator=config.dispatch_scope_validator,
@@ -1763,10 +1710,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     app.routes,
     "control_health",
   )
-  app.state.gateway_artifact_latest = artifact_latest
-  app.state.gateway_artifact_by_id = artifact_by_id
-  app.state.gateway_artifact_index = artifact_index
-  app.state.gateway_letter_by_id = letter_by_id
   app.state.gateway_tool_result = tool_result
   app.state.gateway_tool_approval = tool_approval
   app.state.gateway_health = health

@@ -14,6 +14,12 @@ It does not own an embedding product's profiles, prompts, channel policy,
 domain tools, research data, or business schemas. Applications supply those
 through `create_gateway_app()` or the higher-level `create_agent()` inputs.
 
+The wheel imports without an application checkout. Product integrations bind
+policy and identity callbacks plus optional batch/operator-schedule backends in
+`GatewayServerConfig`; schema-backed artifact tools and routes belong to the
+embedding application. `server_policy` is process-scoped: configure it before
+building runtimes and use one product policy per gateway process.
+
 ## Main entrypoints
 
 | Source | Primary symbol | Use it for |

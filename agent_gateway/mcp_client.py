@@ -359,6 +359,9 @@ class _ServerState:
   config: Dict[str, Any] | None = None
   exported_tool_names: frozenset[str] | None = None
   tool_metadata: Mapping[str, Mapping[str, Any] | None] = field(default_factory=dict)
+  stdio_eof: asyncio.Event | None = None
+  stdio_watch_task: asyncio.Task[Any] | None = None
+  reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
   published_tool_definitions: List[Dict[str, Any]] = field(init=False)
 
   def __post_init__(self) -> None:
@@ -585,6 +588,7 @@ class McpClientManager:
     redaction_context_factory: Callable[
       [RegisteredMcpToolDescriptor], object
     ] | None = None,
+    provider_symbol_resolver: Callable[[Any], Any] | None = None,
   ) -> None:
     self._lock = asyncio.Lock()
     self._started = False
@@ -702,6 +706,7 @@ class McpClientManager:
     )
     self._planning_context_factory = planning_context_factory
     self._redaction_context_factory = redaction_context_factory
+    self._provider_symbol_resolver = provider_symbol_resolver
     if self._tool_registration_catalog is not None and (
       timeout_overrides or tool_timeout_overrides
     ):
@@ -912,7 +917,7 @@ class McpClientManager:
     for state in states:
       displaced = self._servers.get(state.name)
       if displaced is not None and displaced is not state:
-        await self._close_contexts(displaced.exit_contexts)
+        await self._close_server(displaced)
     for name, state in servers.items():
       state.published_tool_definitions = candidate._servers[name].published_tool_definitions
       state.tool_names = candidate._servers[name].tool_names
@@ -930,6 +935,9 @@ class McpClientManager:
     self._registered_mcp_descriptors_by_exposed_name = (
       candidate._registered_mcp_descriptors_by_exposed_name
     )
+    for state in states:
+      if state.stdio_eof is not None and state.stdio_watch_task is None:
+        state.stdio_watch_task = asyncio.create_task(self._reconnect_stdio_on_eof(state))
     return True
 
   async def _connect_or_warn(self, name: str, config: Dict[str, Any]) -> _ConnectedServerState | None:
@@ -2166,10 +2174,12 @@ class McpClientManager:
       if route is None:
         return tool_input
 
-      from research.source_html import sec_native_symbol_cached_only
+      resolver = self._provider_symbol_resolver
+      if resolver is None:
+        return tool_input
 
       def translate(value: Any) -> Any:
-        return sec_native_symbol_cached_only(value) or value
+        return resolver(value) or value
 
       if route.mode == "consistent-present-keys":
         translated = dict(tool_input)
@@ -2788,19 +2798,7 @@ class McpClientManager:
       message,
     )
     try:
-      async with self._lock:
-        retry_server = self._servers.get(server_name)
-        if retry_server is server:
-          await self._close_contexts(server.exit_contexts)
-      if retry_server is server:
-        replacement = await self._connect_stdio_with_retries(server_name, config)
-        try:
-          async with self._lock:
-            await self._publish_server_states([replacement], replacing=server)
-            retry_server = self._servers.get(server_name)
-        except BaseException:
-          await self._close_contexts(replacement.exit_contexts)
-          raise
+      retry_server = await self._replace_stdio_server(server_name, server)
     except Exception as reconnect_exc:
       reconnect_message = str(reconnect_exc).strip() or type(reconnect_exc).__name__
       log.warning(
@@ -2844,16 +2842,7 @@ class McpClientManager:
       type(cause).__name__,
     )
     try:
-      async with self._lock:
-        await self._close_contexts(server.exit_contexts)
-      replacement = await self._connect_stdio_with_retries(server_name, config)
-      try:
-        async with self._lock:
-          if not await self._publish_server_states([replacement], replacing=server):
-            return False
-      except BaseException:
-        await self._close_contexts(replacement.exit_contexts)
-        raise
+      return await self._replace_stdio_server(server_name, server) is not None
     except Exception as reconnect_exc:
       log.warning(
         "MCP stdio server %s could not reconnect for future calls (%s)",
@@ -2862,7 +2851,46 @@ class McpClientManager:
       )
       return False
 
-    return True
+  async def _replace_stdio_server(
+    self, server_name: str, server: _ServerState,
+  ) -> _ServerState | None:
+    # EOF and an in-flight call can observe the same disconnect. One owner
+    # closes/spawns/publishes; the other uses the already published generation.
+    async with server.reconnect_lock:
+      async with self._lock:
+        current = self._servers.get(server_name)
+        if current is not server:
+          return current
+        config = server.config
+        assert config is not None
+        await self._close_server(server)
+      replacement = await self._connect_stdio_with_retries(server_name, config)
+      try:
+        async with self._lock:
+          await self._publish_server_states([replacement], replacing=server)
+          return self._servers.get(server_name)
+      except BaseException:
+        await self._close_contexts(replacement.exit_contexts)
+        raise
+
+  async def _reconnect_stdio_on_eof(self, server: _ServerState) -> None:
+    assert server.stdio_eof is not None
+    await server.stdio_eof.wait()
+    log.warning("MCP stdio server %s closed stdout; reconnecting", server.name)
+    try:
+      await self._replace_stdio_server(server.name, server)
+    except Exception as exc:
+      log.warning(
+        "MCP stdio server %s could not reconnect after EOF (%s)",
+        server.name, type(exc).__name__,
+      )
+
+  async def _close_server(self, server: _ServerState) -> None:
+    watch = server.stdio_watch_task
+    if watch is not None and watch is not asyncio.current_task():
+      watch.cancel()
+      await asyncio.gather(watch, return_exceptions=True)
+    await self._close_contexts(server.exit_contexts)
 
   async def shutdown(self) -> None:
     async with self._lock:
@@ -2877,7 +2905,7 @@ class McpClientManager:
         await asyncio.gather(reaper_task, return_exceptions=True)
 
       for server in reversed(list(self._servers.values())):
-        await self._close_contexts(server.exit_contexts)
+        await self._close_server(server)
 
       for state in list(self._per_user_servers.values()):
         await self._close_contexts(state.server.exit_contexts)

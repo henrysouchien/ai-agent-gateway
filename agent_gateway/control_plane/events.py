@@ -337,6 +337,7 @@ async def _seed_autonomous_replay_buffer(
 async def _seed_batch_replay_buffer(
   *,
   user_event_bus: UserEventBus,
+  app_state: Any,
   run_id: str | None,
   user_id: str,
 ) -> str | None:
@@ -348,6 +349,7 @@ async def _seed_batch_replay_buffer(
     event = await asyncio.to_thread(
       terminal_batch_event_for_user,
       run_id,
+      app_state=app_state,
       user_id=user_id,
     )
   except HTTPException:
@@ -549,6 +551,7 @@ def build_events_router(
       else:
         scoped_run_id = await _seed_batch_replay_buffer(
           user_event_bus=user_event_bus,
+          app_state=request.app.state,
           run_id=scoped_run_id,
           user_id=session_owner_user_id(authenticated),
         ) or scoped_run_id

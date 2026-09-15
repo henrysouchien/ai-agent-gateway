@@ -93,7 +93,7 @@ def make_valuation_ready_skill_tool_bundle(*, app_state: Any, session: Any) -> d
     ],
     "handlers": {
       "valuation_ready_batch_dispatch": _make_dispatch_handler(app_state=app_state, session=session),
-      "valuation_ready_batch_read": _make_read_handler(session=session),
+      "valuation_ready_batch_read": _make_read_handler(app_state=app_state, session=session),
     },
   }
 
@@ -134,7 +134,7 @@ def _valuation_ready_defaults(app_state: Any) -> dict[str, Any]:
   )
   if skill_application is None:
     raise RuntimeError("batch compiled skill application is unavailable")
-  defaults = batches._controller().batch_workflow_defaults(
+  defaults = batches._batch_backend(app_state).controller.batch_workflow_defaults(
     VALUATION_READY_TEMPLATE,
     skill_application=skill_application,
   )
@@ -272,7 +272,7 @@ def _make_dispatch_handler(*, app_state: Any, session: Any) -> LocalToolHandler:
         channel=getattr(session, "channel", None),
         authenticated_session=session,
       )
-    except batches._active_batch_error_type() as exc:
+    except batches._batch_backend(app_state).active_batch_error as exc:
       return None, {"code": "active_batch_conflict", "message": str(exc)}
     except CorpusReadinessGateError as exc:
       return None, exc.to_payload()
@@ -292,7 +292,7 @@ def _make_dispatch_handler(*, app_state: Any, session: Any) -> LocalToolHandler:
   return _handle
 
 
-def _make_read_handler(*, session: Any) -> ToolHandler:
+def _make_read_handler(*, app_state: Any, session: Any) -> ToolHandler:
   async def _handle(tool_input: dict[str, Any], **_: Any) -> tuple[Any | None, dict[str, Any] | None]:
     unsupported = _guard_active_skill()
     if unsupported is not None:
@@ -311,6 +311,7 @@ def _make_read_handler(*, session: Any) -> ToolHandler:
     try:
       return batches.read_batch_for_user(
         batch_id,
+        app_state=app_state,
         user_id=_session_owner_user_id(session),
         top_n=top_n,
       ), None

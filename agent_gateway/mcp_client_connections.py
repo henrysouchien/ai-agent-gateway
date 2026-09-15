@@ -8,6 +8,43 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
+from anyio import EndOfStream
+
+
+class _StdioReadStream:
+  """Observe peer EOF without consuming messages ahead of ClientSession."""
+
+  def __init__(self, stream: Any) -> None:
+    self._stream = stream
+    self.eof = asyncio.Event()
+
+  async def __aenter__(self) -> _StdioReadStream:
+    await self._stream.__aenter__()
+    return self
+
+  async def __aexit__(self, *args: Any) -> None:
+    await self._stream.__aexit__(*args)
+
+  def __aiter__(self) -> _StdioReadStream:
+    return self
+
+  async def __anext__(self) -> Any:
+    try:
+      return await self.receive()
+    except EndOfStream:
+      raise StopAsyncIteration from None
+
+  async def receive(self) -> Any:
+    try:
+      return await self._stream.receive()
+    except EndOfStream:
+      self.eof.set()
+      raise
+
+  async def aclose(self) -> None:
+    await self._stream.aclose()
+
+
 
 class McpToolCallResult(Protocol):
   @property
@@ -239,6 +276,7 @@ async def connect_stdio(
     stdio_cm = runtime.stdio_client_factory(server_params, errlog=devnull)
     read_stream, write_stream = await stdio_cm.__aenter__()
     exit_contexts.append(stdio_cm)
+    read_stream = _StdioReadStream(read_stream)
 
     session = runtime.client_session_factory(read_stream, write_stream)
     await session.__aenter__()
@@ -253,6 +291,7 @@ async def connect_stdio(
     )
     await manager._verify_stdio_session_stable(session)
     state.config = dict(config)
+    state.stdio_eof = read_stream.eof
     success = True
     return state
   finally:

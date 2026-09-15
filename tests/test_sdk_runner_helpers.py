@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import builtins
 import sqlite3
 import sys
 from pathlib import Path
@@ -84,95 +83,16 @@ def _make_runner(
   )
 
 
-def test_sdk_runner_helper_aliases_remain_on_parent_module() -> None:
-  assert sdk_runner._sdk_runner_approval is sdk_runner_approval
-  assert sdk_runner._as_dict is sdk_runner_helpers.as_dict
-  assert sdk_runner._as_plain_dict is sdk_runner_helpers.as_plain_dict
-  assert sdk_runner._extract_text is sdk_runner_helpers.extract_text
-  assert sdk_runner._get_attr is sdk_runner_helpers.get_attr
-  assert sdk_runner._join_system_prompt is sdk_runner_helpers.join_system_prompt
-  assert sdk_runner._parse_result_payload is sdk_runner_helpers.parse_result_payload
-  assert (
-    sdk_runner._catalogless_tool_name
-    is sdk_runner_helpers.catalogless_tool_name
-  )
-  assert not hasattr(sdk_runner, "_redact_tool_input_for_event")
-  assert sdk_runner._server_for_tool is sdk_runner_helpers.server_for_tool
-  assert sdk_runner._should_escrow_raw_tool_input is sdk_runner_helpers.should_escrow_raw_tool_input
-  assert sdk_runner._summarize_error_payload is sdk_runner_helpers.summarize_error_payload
-  assert sdk_runner._PATCH_OP_RAW_INPUT_TOOLS is sdk_runner_helpers.PATCH_OP_RAW_INPUT_TOOLS
 
 
-def test_sdk_tool_input_redaction_fails_closed_on_policy_import_error(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  original_import = builtins.__import__
-
-  def import_without_redaction(name: str, *args, **kwargs):
-    if name == "agent.shared.tool_redaction":
-      raise ImportError("forced missing redaction policy")
-    return original_import(name, *args, **kwargs)
-
-  monkeypatch.setattr(builtins, "__import__", import_without_redaction)
-
-  assert sdk_runner_helpers.redact_tool_input_for_event(
-    "lookup",
-    {"credential": "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"},
-  ) == {"_boundary_error": "<secret-sanitization-failed>"}
-
-
-def test_redaction_provider_resolves_host_module_when_present() -> None:
-  from agent.shared import tool_redaction as host_redaction
-  from agent_gateway.tool_redaction import resolve_redaction_provider
-
-  assert resolve_redaction_provider() is host_redaction
-
-
-def test_redaction_provider_falls_back_when_host_cleanly_absent(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  import agent_gateway.tool_redaction as local_redaction
-
-  original_import = builtins.__import__
-
-  def import_without_host(name: str, *args, **kwargs):
-    if name in {"agent.shared", "agent.shared.tool_redaction"}:
-      raise ModuleNotFoundError("No module named 'agent'", name="agent")
-    return original_import(name, *args, **kwargs)
-
-  monkeypatch.setattr(builtins, "__import__", import_without_host)
-
-  assert local_redaction.resolve_redaction_provider() is local_redaction
-
-
-def test_redaction_provider_raises_loudly_on_broken_host_install(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  from agent_gateway.tool_redaction import resolve_redaction_provider
-
-  original_import = builtins.__import__
-
-  def import_with_broken_host_dependency(name: str, *args, **kwargs):
-    if name in {"agent.shared", "agent.shared.tool_redaction"}:
-      raise ModuleNotFoundError(
-        "No module named 'host_redaction_dependency'",
-        name="host_redaction_dependency",
-      )
-    return original_import(name, *args, **kwargs)
-
-  monkeypatch.setattr(builtins, "__import__", import_with_broken_host_dependency)
-
-  with pytest.raises(ModuleNotFoundError, match="host_redaction_dependency"):
-    resolve_redaction_provider()
-
-
-def test_redact_for_approval_request_uses_resolved_provider() -> None:
+def test_catalogless_approval_redacts_secrets_and_hashes_original_input() -> None:
   redacted, args_hash = sdk_runner_approval.redact_for_approval_request(
     "data_historical_prices",
-    {"symbol": "AAPL"},
+    {"symbol": "AAPL", "credential": "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"},
   )
 
   assert redacted.get("symbol") == "AAPL"
+  assert redacted["credential"] == "<redacted-secret>"
   assert args_hash.startswith("hmac-sha256-v1:")
 
 
@@ -437,31 +357,12 @@ def test_sdk_runner_helpers_detect_catalogless_policy_owner_mismatch(monkeypatch
   assert sdk_runner_helpers.catalogless_policy_owner_mismatch("mcp__portfolio-trades-mcp__execute_trade") is None
 
 
-def test_sdk_runner_helpers_catalogless_owner_is_unset_when_policy_modules_absent(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  def fake_import_module(name: str):
-    if name == "agent.shared.server_policies":
-      raise ModuleNotFoundError("No module named 'agent'", name="agent")
-    if name == "api.agent.shared.server_policies":
-      raise ModuleNotFoundError("No module named 'api'", name="api")
-    raise AssertionError(f"unexpected import: {name}")
-
-  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
+def test_sdk_runner_helpers_catalogless_owner_is_unset_without_bound_policy() -> None:
+  policy_imports.configure_server_policy(None)
 
   assert sdk_runner_helpers.catalogless_policy_owner_mismatch("mcp__portfolio-reads-mcp__execute_trade") is None
 
 
-def test_sdk_runner_helpers_catalogless_owner_raises_when_policy_import_breaks(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  def fake_import_module(_name: str):
-    raise ModuleNotFoundError("No module named 'broken_dependency'", name="broken_dependency")
-
-  monkeypatch.setattr(policy_imports.importlib, "import_module", fake_import_module)
-
-  with pytest.raises(ModuleNotFoundError, match="broken_dependency"):
-    sdk_runner_helpers.catalogless_policy_owner_mismatch("mcp__portfolio-reads-mcp__execute_trade")
 
 
 def test_sdk_runner_parent_helper_monkeypatches_still_drive_nested_helpers(

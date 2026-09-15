@@ -15,6 +15,8 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.requests import Request
+from agent.shared import server_policies
+from .identity_helpers import fake_identity_resolver, fake_mcp_user_key_lookup
 
 from agent_gateway.control_skill_catalog import ControlSkillCatalog
 from agent_gateway.autonomous_capability_handoff import AutonomousCapabilityBinding
@@ -261,6 +263,9 @@ def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
   assert isinstance(control_catalog, ControlSkillCatalog)
   return create_gateway_app(
     GatewayServerConfig(
+      server_policy=server_policies,
+      identity_resolver=fake_identity_resolver,
+      mcp_user_key_lookup=fake_mcp_user_key_lookup,
       jwt_secret="events-pr5b-test-secret-0123456789",
       valid_api_keys={API_KEY},
       tenant_id="events-pr5b",

@@ -359,7 +359,7 @@ def test_all_agent_schedule_routes_return_exact_top_level_503(
 ) -> None:
   store_path = _per_user_store_path(fake_schedule_backends["tmp_path"])
   store_path.write_bytes(b"{")
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   with TestClient(app) as client:
     session = _control_session(client, "alice", channel="web")
     response = client.request(
@@ -532,7 +532,7 @@ def test_run_now_route_returns_success_after_started_result_persistence_failure(
 ) -> None:
   path = _per_user_store_path(fake_schedule_backends["tmp_path"])
   _write_payload(path, _record())
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   def _corrupt_store() -> None:
     path.write_bytes(b"{")
 
@@ -676,7 +676,7 @@ def test_cross_path_outage_has_one_store_owned_transition_and_recovery(
 ) -> None:
   path = _per_user_store_path(fake_schedule_backends["tmp_path"])
   path.write_bytes(b"{")
-  app = _make_app()
+  app = _make_app(fake_schedule_backends["backend"])
   app.state.agent_run_schedule_runner.autonomous_registry = _Registry()
   caplog.set_level(logging.INFO, logger=STORE_LOGGER)
 

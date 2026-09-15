@@ -350,6 +350,18 @@ Key fields:
 - `cors_origins`, `prefix`: HTTP surface
 - `on_event`, `on_startup`, `on_shutdown`: app lifecycle hooks
 - `transcript_dir`: JSONL transcript output
+- `server_policy`: explicitly bound product policy callbacks; one policy per
+  gateway process, installed before runtime construction (no checkout discovery)
+- `identity_resolver`, `mcp_user_key_lookup`: application identity and per-user
+  credential projection for control sessions and autonomous children
+- `batch_backend`: application-owned batch registry/controller and captured-run
+  operations; omit when the embedding application does not offer batches
+- `operator_schedule_backend`: application-owned operator scheduler/jobs API;
+  independent of the generic per-user agent-run schedule store
+
+Schema-backed artifact stores, emitters and HTTP routes are application code,
+not exports of this package. Applications mount those routes after creating
+the gateway app and supply an `artifact_tools_installer` for product sub-agents.
 
 ### `ChatRuntime`
 

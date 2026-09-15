@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict
 
 from .tool_result_spill import SpillPublication, SpillSink, normalize_spill_sink, write_spill_set
 from .tool_result_semantics import status_error_has_detail
+from .policy_imports import load_server_policy_module
 
 MODEL_TOOL_RESULT_MAX_CHARS = 60_000
 MODEL_TOOL_RESULT_MAX_CHARS_ENV = "AGENT_GATEWAY_MAX_MODEL_TOOL_RESULT_CHARS"
@@ -77,14 +78,10 @@ def _project_value(
   if isinstance(value, str):
     if len(value) <= max_string_chars:
       return value
-    # Owner-minted context refs are shape, not bulk: whole or (envelope
-    # fallback) absent, never shortened. schema is a Hank checkout extra,
-    # not an ai-agent-gateway dependency — import only here.
-    try:
-      from schema.context_ref_wire import is_context_ref_wire_value
-    except ImportError:
-      is_context_ref_wire_value = None
-    if is_context_ref_wire_value is not None and is_context_ref_wire_value(value):
+    # Product-minted locators must survive projection whole, never truncated.
+    policy = load_server_policy_module()
+    preserve = getattr(policy, "preserve_tool_result_string", None)
+    if preserve is not None and preserve(value):
       return value
     return f"{value[:max_string_chars]}{_ELIDED_CHARS_MARKER}{len(value) - max_string_chars}>"
   if isinstance(value, (int, float, bool)) or value is None:
